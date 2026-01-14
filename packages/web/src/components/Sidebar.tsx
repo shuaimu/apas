@@ -126,8 +126,13 @@ export function Sidebar() {
                   }`}
                 />
                 <div className="flex-1 min-w-0">
+                  {project.hostname && (
+                    <div className="text-xs text-gray-500 truncate">
+                      {project.hostname}
+                    </div>
+                  )}
                   <div className="font-medium truncate">
-                    {project.hostname ? `${project.hostname}:` : ""}{project.workingDir}
+                    {project.workingDir}
                   </div>
                   <div className="text-xs text-gray-500 truncate">
                     {project.isActive
