@@ -1,14 +1,14 @@
-//! Hybrid mode - local interactive terminal + streaming to remote server
+//! Hybrid mode - local Claude CLI + streaming structured output to remote server
 //!
-//! This mode runs Claude locally with full interactive terminal support
-//! while also streaming all output to the remote server for observation.
+//! This mode runs Claude locally using `--output-format stream-json` mode
+//! and streams structured JSON messages to the remote server for observation.
 
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
-use shared::{CliToServer, OutputType, ServerToCli};
-use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
+use shared::{CliToServer, ClaudeStreamMessage, ServerToCli};
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,19 +17,21 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
 
 use crate::config::Config;
-use crate::pty::{self, PtyProcess};
+use crate::project;
 
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Run in hybrid mode - local interactive terminal + streaming to remote server
+/// Run in hybrid mode - local Claude CLI + streaming to remote server
 pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()> {
     let config = Config::load().unwrap_or_default();
     let claude_path = config.local.claude_path.clone();
 
-    // Generate a session ID for this local session
-    let session_id = Uuid::new_v4();
+    // Get or create project metadata - use project ID as session ID
+    let project_meta = project::get_or_create_project(working_dir)?;
+    let session_id = project_meta.id;
+    let project_name = project_meta.name.clone();
 
     // Channel for sending output to server (buffered to handle reconnections)
     let (server_tx, server_rx) = mpsc::channel::<CliToServer>(256);
@@ -46,15 +48,13 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
         run_server_connection(&server_url_owned, &token_owned, session_id, &working_dir_str, server_rx, shutdown_clone).await
     });
 
-    // Set terminal to raw mode
-    let original_termios = pty::set_raw_mode()?;
-
-    // Ensure we restore terminal on exit
-    let result = run_pty_session(&claude_path, working_dir, session_id, server_tx, &shutdown).await;
-
-    // Restore terminal
-    let _ = pty::restore_terminal(&original_termios);
-    println!(); // New line after session ends
+    // Run Claude with stream-json output (blocking I/O in a separate thread)
+    let claude_path_owned = claude_path.clone();
+    let working_dir_owned = working_dir.to_path_buf();
+    let shutdown_for_claude = shutdown.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        run_stream_json_session(&claude_path_owned, &working_dir_owned, session_id, project_name, server_tx, &shutdown_for_claude)
+    }).await?;
 
     // Signal shutdown
     shutdown.store(true, Ordering::SeqCst);
@@ -62,447 +62,185 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     result
 }
 
-async fn run_pty_session(
+/// Run Claude CLI in interactive mode using --print for each prompt
+/// Uses --session-id to maintain conversation continuity across invocations
+fn run_stream_json_session(
     claude_path: &str,
     working_dir: &Path,
     session_id: Uuid,
+    project_name: Option<String>,
     server_tx: mpsc::Sender<CliToServer>,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<()> {
-    // Spawn Claude in a PTY
-    let pty_process = PtyProcess::spawn(claude_path, working_dir)?;
-    let master_fd = pty_process.master_fd();
+    let display_name = project_name.as_deref().unwrap_or("unnamed");
+    println!("Project: {} (ID: {})", display_name, session_id);
+    println!("Type your prompts (Ctrl+D to exit):\n");
 
-    // Clone stdin fd for reading
-    let stdin_fd = std::io::stdin().as_raw_fd();
-
-    // Use tokio's blocking task for PTY I/O since PTY fds don't work well with async
-    let shutdown_clone = shutdown.clone();
-
-    // Spawn a thread for stdin -> PTY
-    let master_fd_write = master_fd;
-    let stdin_thread = std::thread::spawn(move || {
-        let mut stdin = std::io::stdin();
-        let mut buf = [0u8; 1024];
-
-        loop {
-            // Check shutdown flag
-            if shutdown_clone.load(Ordering::SeqCst) {
-                break;
-            }
-
-            // Use select/poll to check if stdin has data
-            unsafe {
-                let mut fds: libc::fd_set = std::mem::zeroed();
-                libc::FD_SET(stdin_fd, &mut fds);
-
-                let mut timeout = libc::timeval {
-                    tv_sec: 0,
-                    tv_usec: 100_000, // 100ms timeout
-                };
-
-                let result = libc::select(
-                    stdin_fd + 1,
-                    &mut fds,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    &mut timeout,
-                );
-
-                if result > 0 && libc::FD_ISSET(stdin_fd, &fds) {
-                    match stdin.read(&mut buf) {
-                        Ok(0) => break, // EOF
-                        Ok(n) => {
-                            // Write to PTY master
-                            let _ = libc::write(master_fd_write, buf.as_ptr() as *const libc::c_void, n);
-                        }
-                        Err(_) => break,
-                    }
-                }
-            }
-        }
-    });
-
-    // Main loop: read from PTY and write to stdout + server
-    let mut stdout = std::io::stdout();
-    let mut buf = [0u8; 4096];
-    let mut line_buffer = String::new();
+    let local_stdin = std::io::stdin();
 
     loop {
-        // Check if child has exited
-        if let Some(exit_code) = pty_process.try_wait() {
-            tracing::debug!("Claude process exited with code: {}", exit_code);
+        if shutdown.load(Ordering::SeqCst) {
             break;
         }
 
-        // Read from PTY
-        match pty_process.read(&mut buf) {
+        print!("> ");
+        std::io::stdout().flush()?;
+
+        let mut input = String::new();
+        match local_stdin.read_line(&mut input) {
             Ok(0) => {
-                // No data available, sleep briefly
-                std::thread::sleep(Duration::from_millis(10));
+                // EOF (Ctrl+D)
+                println!("\nExiting...");
+                break;
             }
-            Ok(n) => {
-                let data = &buf[..n];
+            Ok(_) => {
+                let input = input.trim();
+                if input.is_empty() {
+                    continue;
+                }
 
-                // Write to local stdout
-                let _ = stdout.write_all(data);
-                let _ = stdout.flush();
+                // Send user input to server for web UI display
+                let user_input_msg = CliToServer::UserInput {
+                    session_id,
+                    text: input.to_string(),
+                };
+                if server_tx.blocking_send(user_input_msg).is_err() {
+                    tracing::debug!("Failed to send user input to server");
+                }
 
-                // Buffer and send to server (accumulate until newline for cleaner output)
-                if let Ok(text) = std::str::from_utf8(data) {
-                    line_buffer.push_str(text);
+                // Run Claude with --print for this single prompt
+                let mut args = vec![
+                    "--print".to_string(),
+                    "--output-format".to_string(), "stream-json".to_string(),
+                    "--verbose".to_string(),
+                    "--dangerously-skip-permissions".to_string(),
+                ];
 
-                    // Send complete lines to server
-                    while let Some(pos) = line_buffer.find('\n') {
-                        let line = line_buffer[..pos].to_string();
-                        line_buffer = line_buffer[pos + 1..].to_string();
+                // Always use --resume with our project-based session ID
+                // Claude CLI will create the session if it doesn't exist, or continue if it does
+                args.push("--resume".to_string());
+                args.push(session_id.to_string());
 
-                        // Clean output for readable server display
-                        let cleaned = clean_output(&line);
-                        if !cleaned.is_empty() {
-                            let _ = server_tx.try_send(CliToServer::Output {
+                // Add the prompt as the last argument
+                args.push(input.to_string());
+
+                // Spawn Claude for this prompt
+                let mut child = Command::new(claude_path)
+                    .args(&args)
+                    .current_dir(working_dir)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()?;
+
+                let stdout = child.stdout.take()
+                    .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout"))?;
+                let stderr = child.stderr.take()
+                    .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
+
+                // Spawn thread to read stderr
+                let stderr_thread = std::thread::spawn(move || {
+                    let reader = BufReader::new(stderr);
+                    for line in reader.lines() {
+                        if let Ok(line) = line {
+                            eprintln!("{}", line);
+                        }
+                    }
+                });
+
+                // Read JSON lines from stdout
+                let reader = BufReader::new(stdout);
+                for line in reader.lines() {
+                    if shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+
+                    let line = match line {
+                        Ok(l) => l,
+                        Err(e) => {
+                            tracing::debug!("Error reading stdout: {}", e);
+                            break;
+                        }
+                    };
+
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    // Parse JSON line
+                    match serde_json::from_str::<ClaudeStreamMessage>(&line) {
+                        Ok(message) => {
+                            // Print locally for visibility
+                            print_stream_message(&message);
+
+                            // Forward to server
+                            let msg = CliToServer::StreamMessage {
                                 session_id,
-                                data: cleaned,
-                                output_type: OutputType::Text,
-                            });
+                                message,
+                            };
+                            if server_tx.blocking_send(msg).is_err() {
+                                tracing::debug!("Server channel closed");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("Failed to parse stream message: {} - line: {}", e, line);
                         }
                     }
                 }
+
+                // Wait for child to exit
+                let status = child.wait()?;
+                tracing::debug!("Claude exited with status: {}", status);
+
+                // Wait for stderr thread
+                let _ = stderr_thread.join();
+
+                println!(); // Add blank line between responses
             }
             Err(e) => {
-                tracing::debug!("PTY read error: {}", e);
+                tracing::debug!("Error reading input: {}", e);
                 break;
             }
         }
     }
-
-    // Send any remaining buffered content
-    if !line_buffer.is_empty() {
-        let cleaned = clean_output(&line_buffer);
-        if !cleaned.is_empty() {
-            let _ = server_tx.try_send(CliToServer::Output {
-                session_id,
-                data: cleaned,
-                output_type: OutputType::Text,
-            });
-        }
-    }
-
-    // Signal shutdown
-    shutdown.store(true, Ordering::SeqCst);
-
-    // Wait for stdin thread (with timeout)
-    let _ = stdin_thread.join();
 
     Ok(())
 }
 
-/// Strip ANSI escape codes and control characters from a string
-/// This handles CSI, OSC, and other escape sequences comprehensively
-fn strip_ansi_codes(s: &str) -> String {
-    let mut result = String::new();
-    let mut chars = s.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            // ESC character - start of escape sequence
-            match chars.peek() {
-                Some('[') => {
-                    chars.next(); // consume '['
-                    // CSI sequence: ESC [ ... <letter>
-                    // Skip parameters and intermediate bytes until final byte
-                    while let Some(&next) = chars.peek() {
-                        chars.next();
-                        // Final byte is in range 0x40-0x7E (@ to ~)
-                        if next >= '@' && next <= '~' {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    chars.next(); // consume ']'
-                    // OSC sequence: ESC ] ... (BEL | ESC \)
-                    // These are Operating System Commands like window title
-                    while let Some(&next) = chars.peek() {
-                        if next == '\x07' {
-                            // BEL terminates OSC
-                            chars.next();
-                            break;
-                        } else if next == '\x1b' {
-                            // Check for ST (String Terminator): ESC \
-                            chars.next();
-                            if chars.peek() == Some(&'\\') {
-                                chars.next();
-                            }
-                            break;
-                        } else {
-                            chars.next();
-                        }
-                    }
-                }
-                Some('P') => {
-                    chars.next(); // consume 'P'
-                    // DCS sequence: ESC P ... ST
-                    // Device Control String - skip until String Terminator
-                    while let Some(&next) = chars.peek() {
-                        if next == '\x1b' {
-                            chars.next();
-                            if chars.peek() == Some(&'\\') {
-                                chars.next();
-                            }
-                            break;
-                        } else {
-                            chars.next();
-                        }
-                    }
-                }
-                Some('(') | Some(')') | Some('*') | Some('+') => {
-                    // Charset designation: ESC ( <char>
-                    chars.next();
-                    chars.next();
-                }
-                Some('#') | Some('%') => {
-                    // Line size / charset: ESC # <digit> or ESC % <char>
-                    chars.next();
-                    chars.next();
-                }
-                Some(' ') => {
-                    // 7/8-bit controls: ESC SP <char>
-                    chars.next();
-                    chars.next();
-                }
-                Some(c) if *c >= '0' && *c <= '~' => {
-                    // Single character function: ESC <char>
-                    chars.next();
-                }
-                _ => {
-                    // Unknown, just skip ESC
-                }
+/// Print stream message locally for user visibility
+fn print_stream_message(message: &ClaudeStreamMessage) {
+    match message {
+        ClaudeStreamMessage::System { subtype, model, tools, .. } => {
+            if subtype == "init" {
+                println!("\n[Session started - Model: {}, Tools: {}]\n", model, tools.len());
             }
-        } else if c == '\u{009b}' {
-            // CSI introduced by single byte (8-bit): C1 control code
-            while let Some(&next) = chars.peek() {
-                chars.next();
-                if next >= '@' && next <= '~' {
-                    break;
-                }
-            }
-        } else if c == '\u{009d}' {
-            // OSC introduced by single byte (8-bit): C1 control code
-            while let Some(&next) = chars.peek() {
-                if next == '\x07' || next == '\u{009c}' {
-                    chars.next();
-                    break;
-                }
-                chars.next();
-            }
-        } else if c == '\r' || c == '\x07' || c == '\x08' {
-            // Skip carriage return, bell, and backspace
-        } else if c.is_control() && c != '\n' && c != '\t' {
-            // Skip other control characters except newline and tab
-        } else {
-            result.push(c);
         }
-    }
-
-    result
-}
-
-/// Spinner and progress indicator characters to filter out
-const SPINNER_CHARS: &[char] = &[
-    '✳', '✶', '✻', '✽', '✢', '✣', '✤', '✥',
-    '●', '○', '◐', '◓', '◑', '◒', '◔', '◕',
-    '◴', '◵', '◶', '◷', '◰', '◱', '◲', '◳',
-    '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', // Braille spinner
-    '⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷',
-    '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█', // Progress bars
-    '▏', '▎', '▍', '▌', '▋', '▊', '▉',
-    '⏳', '⌛', '🔄',
-];
-
-/// Box drawing and decorative characters that are often just visual noise
-const DECORATIVE_CHARS: &[char] = &[
-    '─', '━', '│', '┃', '┌', '┐', '└', '┘', '├', '┤', '┬', '┴', '┼',
-    '╭', '╮', '╯', '╰', '╱', '╲', '╳',
-    '═', '║', '╔', '╗', '╚', '╝', '╠', '╣', '╦', '╩', '╬',
-    '▶', '▷', '◀', '◁', '▲', '△', '▼', '▽',
-    '❯', '❮', '›', '‹', '»', '«',
-];
-
-/// Clean up output for display - remove terminal artifacts and format for web
-fn clean_output(s: &str) -> String {
-    // First strip all ANSI escape sequences
-    let stripped = strip_ansi_codes(s);
-
-    // Handle the "]0;..." pattern that appears when OSC isn't fully stripped
-    // This can happen if the ESC was already removed but the rest remains
-    let mut cleaned = String::new();
-    let mut chars = stripped.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        // Detect orphaned OSC content: ]0;... or ]1;... etc
-        // This handles cases where ESC was stripped but ]0;title remains
-        if c == ']' {
-            if let Some(&next) = chars.peek() {
-                if next.is_ascii_digit() {
-                    chars.next(); // consume digit
-                    // Check for optional second digit
-                    if let Some(&d) = chars.peek() {
-                        if d.is_ascii_digit() {
-                            chars.next();
-                        }
+        ClaudeStreamMessage::Assistant { message: msg, .. } => {
+            for block in &msg.content {
+                match block {
+                    shared::ClaudeContentBlock::Text { text } => {
+                        println!("{}", text);
                     }
-                    if chars.peek() == Some(&';') {
-                        chars.next(); // consume ';'
-                        // Skip the title/content
-                        // Since BEL may already be stripped, we look for:
-                        // - BEL character
-                        // - Another ] (start of new OSC)
-                        // - Newline
-                        // - Or transition from "title-like" chars to regular content
-                        // Title chars are typically: letters, digits, spaces, and some punctuation
-                        let mut saw_space = false;
-                        while let Some(&ch) = chars.peek() {
-                            if ch == '\x07' || ch == '\n' || ch == ']' {
-                                if ch == '\x07' {
-                                    chars.next();
-                                }
-                                break;
-                            }
-                            // Heuristic: titles don't usually have multiple consecutive spaces
-                            // or contain certain characters that indicate start of real content
-                            if ch == ' ' {
-                                if saw_space {
-                                    // Two spaces - probably end of title
-                                    break;
-                                }
-                                saw_space = true;
-                            } else {
-                                saw_space = false;
-                            }
-                            // Check for spinner chars which indicate we've gone past the title
-                            if SPINNER_CHARS.contains(&ch) {
-                                break;
-                            }
-                            chars.next();
-                        }
-                        continue;
+                    shared::ClaudeContentBlock::ToolUse { name, input, .. } => {
+                        println!("\n[Tool: {} - {}]\n", name, serde_json::to_string(input).unwrap_or_default());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        ClaudeStreamMessage::User { tool_use_result, .. } => {
+            if let Some(result) = tool_use_result {
+                if let Some(file_info) = result.get("file") {
+                    if let Some(path) = file_info.get("filePath") {
+                        println!("[Tool result: Read {}]", path);
                     }
                 }
             }
         }
-
-        // Filter out spinner characters
-        if SPINNER_CHARS.contains(&c) {
-            continue;
-        }
-
-        // Filter out decorative box-drawing characters
-        if DECORATIVE_CHARS.contains(&c) {
-            // Replace with space to maintain word separation
-            if !cleaned.ends_with(' ') && !cleaned.ends_with('\n') {
-                cleaned.push(' ');
-            }
-            continue;
-        }
-
-        // Skip other control-like Unicode characters
-        if c != ' ' && c != '\n' && c != '\t' {
-            let cat = unicode_general_category(c);
-            if cat == UnicodeCategory::Control ||
-               cat == UnicodeCategory::Format ||
-               cat == UnicodeCategory::PrivateUse {
-                continue;
-            }
-        }
-
-        cleaned.push(c);
-    }
-
-    // Normalize whitespace
-    normalize_whitespace(&cleaned)
-}
-
-/// Simple Unicode general category detection for common cases
-#[derive(PartialEq, Debug)]
-enum UnicodeCategory {
-    Control,
-    Format,
-    PrivateUse,
-    Other,
-}
-
-fn unicode_general_category(c: char) -> UnicodeCategory {
-    let cp = c as u32;
-
-    // Control characters
-    if cp <= 0x1F || (cp >= 0x7F && cp <= 0x9F) {
-        return UnicodeCategory::Control;
-    }
-
-    // Format characters (common ranges)
-    if cp == 0x00AD || // Soft hyphen
-       (cp >= 0x0600 && cp <= 0x0605) ||
-       cp == 0x061C ||
-       cp == 0x06DD ||
-       cp == 0x070F ||
-       (cp >= 0x200B && cp <= 0x200F) || // Zero-width spaces
-       (cp >= 0x2028 && cp <= 0x202E) || // Line/paragraph separators, bidi
-       (cp >= 0x2060 && cp <= 0x206F) || // Word joiner, invisible operators
-       cp == 0xFEFF || // BOM
-       (cp >= 0xFFF9 && cp <= 0xFFFB) {
-        return UnicodeCategory::Format;
-    }
-
-    // Private use areas
-    if (cp >= 0xE000 && cp <= 0xF8FF) ||
-       (cp >= 0xF0000 && cp <= 0xFFFFD) ||
-       (cp >= 0x100000 && cp <= 0x10FFFD) {
-        return UnicodeCategory::PrivateUse;
-    }
-
-    UnicodeCategory::Other
-}
-
-/// Normalize whitespace: collapse multiple spaces/newlines, trim
-fn normalize_whitespace(s: &str) -> String {
-    let mut result = String::new();
-    let mut last_was_space = false;
-    let mut last_was_newline = false;
-    let mut pending_newline = false;
-
-    for c in s.chars() {
-        match c {
-            '\n' => {
-                if !last_was_newline && !result.is_empty() {
-                    pending_newline = true;
-                    last_was_newline = true;
-                }
-                last_was_space = true;
-            }
-            ' ' | '\t' => {
-                if !last_was_space && !result.is_empty() {
-                    // Don't add space yet, wait to see if there's content
-                    last_was_space = true;
-                }
-            }
-            _ => {
-                // We have actual content
-                if pending_newline {
-                    result.push('\n');
-                    pending_newline = false;
-                    last_was_space = false;
-                } else if last_was_space && !result.is_empty() {
-                    result.push(' ');
-                }
-                result.push(c);
-                last_was_space = false;
-                last_was_newline = false;
-            }
+        ClaudeStreamMessage::Result { subtype, total_cost_usd, duration_ms, .. } => {
+            println!("\n[{} - Cost: ${:.4}, Duration: {}ms]\n", subtype, total_cost_usd, duration_ms);
         }
     }
-
-    result
 }
 
 /// Manage WebSocket connection to server with auto-reconnect
@@ -654,191 +392,4 @@ async fn connect_to_server(
     send_task.abort();
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ==================== strip_ansi_codes tests ====================
-
-    #[test]
-    fn test_strip_ansi_codes_basic() {
-        // Plain text should pass through unchanged
-        assert_eq!(strip_ansi_codes("hello world"), "hello world");
-        assert_eq!(strip_ansi_codes("line1\nline2"), "line1\nline2");
-    }
-
-    #[test]
-    fn test_strip_ansi_codes_csi_sequences() {
-        // CSI sequences (colors, cursor movement, etc.)
-        assert_eq!(strip_ansi_codes("\x1b[32mgreen\x1b[0m"), "green");
-        assert_eq!(strip_ansi_codes("\x1b[1;31mbold red\x1b[0m"), "bold red");
-        assert_eq!(strip_ansi_codes("\x1b[2Kcleared line"), "cleared line");
-        // Cursor movement
-        assert_eq!(strip_ansi_codes("\x1b[10;20Htext"), "text");
-        assert_eq!(strip_ansi_codes("\x1b[?25l\x1b[?25h"), ""); // Hide/show cursor
-    }
-
-    #[test]
-    fn test_strip_ansi_codes_osc_sequences() {
-        // OSC sequences (window title, etc.)
-        assert_eq!(strip_ansi_codes("\x1b]0;Window Title\x07text"), "text");
-        assert_eq!(strip_ansi_codes("prefix\x1b]0;title\x07suffix"), "prefixsuffix");
-        // OSC with ST terminator
-        assert_eq!(strip_ansi_codes("\x1b]0;Title\x1b\\text"), "text");
-    }
-
-    #[test]
-    fn test_strip_ansi_codes_dcs_sequences() {
-        // Device Control String sequences
-        assert_eq!(strip_ansi_codes("\x1bPsome data\x1b\\text"), "text");
-    }
-
-    #[test]
-    fn test_strip_ansi_codes_control_characters() {
-        // Carriage return, bell, and backspace should be stripped
-        assert_eq!(strip_ansi_codes("hello\rworld"), "helloworld");
-        assert_eq!(strip_ansi_codes("beep\x07beep"), "beepbeep");
-        assert_eq!(strip_ansi_codes("back\x08space"), "backspace");
-    }
-
-    #[test]
-    fn test_strip_ansi_codes_preserves_newlines_and_tabs() {
-        assert_eq!(strip_ansi_codes("line1\nline2\ttabbed"), "line1\nline2\ttabbed");
-    }
-
-    #[test]
-    fn test_strip_ansi_codes_8bit_controls() {
-        // 8-bit CSI (0x9B) and OSC (0x9D) - C1 control codes
-        assert_eq!(strip_ansi_codes("\u{009b}32mtext\u{009b}0m"), "text");
-        assert_eq!(strip_ansi_codes("\u{009d}title\x07text"), "text");
-    }
-
-    // ==================== clean_output tests ====================
-
-    #[test]
-    fn test_clean_output_basic() {
-        assert_eq!(clean_output("hello world"), "hello world");
-    }
-
-    #[test]
-    fn test_clean_output_collapses_whitespace() {
-        assert_eq!(clean_output("hello   world"), "hello world");
-        assert_eq!(clean_output("  leading space"), "leading space");
-        assert_eq!(clean_output("trailing space  "), "trailing space");
-    }
-
-    #[test]
-    fn test_clean_output_collapses_newlines() {
-        assert_eq!(clean_output("line1\n\n\nline2"), "line1\nline2");
-    }
-
-    #[test]
-    fn test_clean_output_removes_spinner_characters() {
-        assert_eq!(clean_output("Loading✳..."), "Loading...");
-        assert_eq!(clean_output("●◐◓◑◒"), "");
-        assert_eq!(clean_output("text ✳ more text"), "text more text");
-        // Braille spinners
-        assert_eq!(clean_output("⠋⠙⠹loading"), "loading");
-    }
-
-    #[test]
-    fn test_clean_output_removes_box_drawing() {
-        // Box drawing characters should be replaced with spaces
-        let input = "───text───";
-        let output = clean_output(input);
-        assert_eq!(output, "text");
-    }
-
-    #[test]
-    fn test_clean_output_removes_decorative_arrows() {
-        assert_eq!(clean_output("❯ prompt"), "prompt");
-        assert_eq!(clean_output("▶ playing"), "playing");
-    }
-
-    #[test]
-    fn test_clean_output_with_ansi_codes() {
-        // Combined test - ANSI codes + whitespace + spinners
-        let input = "\x1b[32m  hello  \x1b[0m  ✳  \x1b[1mworld\x1b[0m  ";
-        let output = clean_output(input);
-        assert_eq!(output, "hello world");
-    }
-
-    #[test]
-    fn test_clean_output_preserves_unicode() {
-        // Regular unicode should pass through
-        assert_eq!(clean_output("日本語テスト"), "日本語テスト");
-        assert_eq!(clean_output("emoji 👋 test"), "emoji 👋 test");
-        assert_eq!(clean_output("Ñoño café"), "Ñoño café");
-    }
-
-    #[test]
-    fn test_clean_output_orphaned_osc() {
-        // When ESC is stripped but ]0;title remains
-        // Note: BEL (\x07) gets stripped by strip_ansi_codes before clean_output sees it
-        // So we rely on heuristics like double spaces or spinner chars to find title end
-
-        // Title followed by double space and content
-        assert_eq!(clean_output("]0;Window Title  actual content"), "actual content");
-
-        // Title followed by spinner char
-        assert_eq!(clean_output("]0;Window Title✳ content"), "content");
-
-        // Real-world pattern: OSC stripped but title visible, then content
-        assert_eq!(clean_output("]0;My Title  hello world"), "hello world");
-
-        // Multiple OSC patterns
-        assert_eq!(clean_output("]0;first  ]1;second  text"), "text");
-    }
-
-    #[test]
-    fn test_clean_output_real_world_claude_spinner() {
-        // Simulating Claude's spinner output pattern
-        let input = "\x1b]0;✳ Initial Greeting\x07\x1b[2K\x1b[1G✳ hello · Blanching…";
-        let output = clean_output(input);
-        // Should not contain spinner or control sequences
-        assert!(!output.contains("✳"));
-        assert!(!output.contains('\x1b'));
-        assert!(!output.contains(']'));
-        // Should contain actual content
-        assert!(output.contains("hello") || output.contains("Blanching"));
-    }
-
-    #[test]
-    fn test_clean_output_complex_terminal_output() {
-        // More complex real-world terminal output
-        let input = "\x1b[2K\x1b[1G❯ \x1b[32mhello\x1b[0m\n\x1b[2K✳ Processing...\r✳ Done!";
-        let output = clean_output(input);
-        assert!(output.contains("hello"));
-        assert!(!output.contains("✳"));
-        assert!(!output.contains("❯"));
-    }
-
-    #[test]
-    fn test_clean_output_removes_zero_width_chars() {
-        // Zero-width spaces and joiners
-        let input = "hello\u{200B}world\u{200C}test\u{200D}end";
-        let output = clean_output(input);
-        assert_eq!(output, "helloworldtestend");
-    }
-
-    #[test]
-    fn test_normalize_whitespace() {
-        assert_eq!(normalize_whitespace("a  b"), "a b");
-        assert_eq!(normalize_whitespace("a\n\nb"), "a\nb");
-        assert_eq!(normalize_whitespace("  a  "), "a");
-        assert_eq!(normalize_whitespace("a \n b"), "a\nb");
-    }
-
-    #[test]
-    fn test_unicode_category_detection() {
-        assert_eq!(unicode_general_category('\x00'), UnicodeCategory::Control);
-        assert_eq!(unicode_general_category('\x1b'), UnicodeCategory::Control);
-        assert_eq!(unicode_general_category('\u{200B}'), UnicodeCategory::Format);
-        assert_eq!(unicode_general_category('\u{FEFF}'), UnicodeCategory::Format);
-        assert_eq!(unicode_general_category('\u{E000}'), UnicodeCategory::PrivateUse);
-        assert_eq!(unicode_general_category('a'), UnicodeCategory::Other);
-        assert_eq!(unicode_general_category('日'), UnicodeCategory::Other);
-    }
 }

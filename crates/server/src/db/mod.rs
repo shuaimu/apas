@@ -60,8 +60,9 @@ impl Database {
             r#"
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL REFERENCES users(id),
-                cli_client_id TEXT REFERENCES cli_clients(id),
+                user_id TEXT NOT NULL,
+                cli_client_id TEXT,
+                working_dir TEXT,
                 status TEXT DEFAULT 'pending',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -70,6 +71,11 @@ impl Database {
         )
         .execute(&self.pool)
         .await?;
+
+        // Add working_dir column if it doesn't exist (migration for existing DBs)
+        let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN working_dir TEXT")
+            .execute(&self.pool)
+            .await;
 
         sqlx::query(
             r#"
@@ -167,11 +173,12 @@ impl Database {
     // Session operations
     pub async fn create_session(&self, session: &Session) -> Result<()> {
         sqlx::query(
-            "INSERT INTO sessions (id, user_id, cli_client_id, status) VALUES (?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO sessions (id, user_id, cli_client_id, working_dir, status) VALUES (?, ?, ?, ?, ?)",
         )
         .bind(&session.id)
         .bind(&session.user_id)
         .bind(&session.cli_client_id)
+        .bind(&session.working_dir)
         .bind(&session.status)
         .execute(&self.pool)
         .await?;
@@ -191,12 +198,21 @@ impl Database {
 
     pub async fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let session = sqlx::query_as::<_, Session>(
-            "SELECT id, user_id, cli_client_id, status, created_at, updated_at FROM sessions WHERE id = ?",
+            "SELECT id, user_id, cli_client_id, working_dir, status, created_at, updated_at FROM sessions WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(session)
+    }
+
+    pub async fn get_all_sessions(&self) -> Result<Vec<Session>> {
+        let sessions = sqlx::query_as::<_, Session>(
+            "SELECT id, user_id, cli_client_id, working_dir, status, created_at, updated_at FROM sessions ORDER BY created_at DESC LIMIT 50",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(sessions)
     }
 
     // Message operations

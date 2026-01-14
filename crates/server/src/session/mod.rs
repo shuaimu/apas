@@ -38,6 +38,8 @@ impl SessionManager {
         self.cli_senders.insert(cli_id, sender);
         self.cli_sessions.insert(cli_id, Vec::new());
         tracing::info!("CLI client registered: {}", cli_id);
+        // Broadcast updated client list to all web clients
+        self.broadcast_cli_clients_update();
     }
 
     pub fn unregister_cli(&self, cli_id: &Uuid) {
@@ -50,6 +52,8 @@ impl SessionManager {
             }
         }
         tracing::info!("CLI client unregistered: {}", cli_id);
+        // Broadcast updated client list to all web clients
+        self.broadcast_cli_clients_update();
     }
 
     // Web client management
@@ -109,6 +113,8 @@ impl SessionManager {
             sessions.push(session_id);
         }
         tracing::info!("CLI session created: {} (cli: {})", session_id, cli_id);
+        // Broadcast updated client list to all web clients (shows active session)
+        self.broadcast_cli_clients_update();
     }
 
     /// Attach a web client to an existing session (to observe CLI output)
@@ -202,6 +208,20 @@ impl SessionManager {
                 }
             })
             .collect()
+    }
+
+    /// Broadcast CLI clients list to all connected web clients
+    fn broadcast_cli_clients_update(&self) {
+        let clients = self.get_cli_clients_info();
+        let msg = ServerToWeb::CliClients { clients };
+
+        for entry in self.web_senders.iter() {
+            let sender = entry.value().clone();
+            let msg_clone = msg.clone();
+            tokio::spawn(async move {
+                let _ = sender.send(msg_clone).await;
+            });
+        }
     }
 }
 

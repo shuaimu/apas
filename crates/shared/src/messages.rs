@@ -31,6 +31,18 @@ pub enum CliToServer {
 
     /// Heartbeat to keep connection alive
     Heartbeat,
+
+    /// Structured message from Claude CLI stream-json output
+    StreamMessage {
+        session_id: Uuid,
+        message: ClaudeStreamMessage,
+    },
+
+    /// User input/prompt from CLI (to be displayed in web UI)
+    UserInput {
+        session_id: Uuid,
+        text: String,
+    },
 }
 
 /// Messages sent from server to CLI client
@@ -93,6 +105,12 @@ pub enum WebToServer {
 
     /// Send signal (e.g., cancel/interrupt)
     Signal { signal: String },
+
+    /// List all sessions (persisted)
+    ListSessions,
+
+    /// Get messages for a specific session
+    GetSessionMessages { session_id: Uuid },
 }
 
 /// Messages sent from server to web client
@@ -123,6 +141,44 @@ pub enum ServerToWeb {
 
     /// List of available CLI clients
     CliClients { clients: Vec<CliClientInfo> },
+
+    /// Structured message from Claude CLI stream-json output
+    StreamMessage {
+        session_id: Uuid,
+        message: ClaudeStreamMessage,
+    },
+
+    /// List of persisted sessions
+    Sessions { sessions: Vec<SessionInfo> },
+
+    /// Messages for a session
+    SessionMessages { session_id: Uuid, messages: Vec<MessageInfo> },
+
+    /// User input/prompt from CLI (displayed in web UI)
+    UserInput {
+        session_id: Uuid,
+        text: String,
+    },
+}
+
+/// Information about a persisted session
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub id: Uuid,
+    pub cli_client_id: Option<Uuid>,
+    pub working_dir: Option<String>,
+    pub status: String,
+    pub created_at: Option<String>,
+}
+
+/// Information about a persisted message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageInfo {
+    pub id: String,
+    pub role: String,
+    pub content: String,
+    pub message_type: String,
+    pub created_at: Option<String>,
 }
 
 // ============================================================================
@@ -187,6 +243,102 @@ pub enum CliClientStatus {
     Online,
     Offline,
     Busy,
+}
+
+// ============================================================================
+// Claude Stream-JSON Message Types
+// These match the output format of `claude --output-format stream-json`
+// ============================================================================
+
+/// Top-level message from Claude CLI stream-json output
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClaudeStreamMessage {
+    /// System initialization message
+    System {
+        subtype: String,
+        session_id: String,
+        #[serde(default)]
+        tools: Vec<String>,
+        #[serde(default)]
+        model: String,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(flatten)]
+        extra: serde_json::Value,
+    },
+    /// Assistant (Claude) message with content blocks
+    Assistant {
+        message: ClaudeAssistantMessage,
+        session_id: String,
+        #[serde(flatten)]
+        extra: serde_json::Value,
+    },
+    /// User message (typically tool results)
+    User {
+        message: ClaudeUserMessage,
+        session_id: String,
+        #[serde(default)]
+        tool_use_result: Option<serde_json::Value>,
+        #[serde(flatten)]
+        extra: serde_json::Value,
+    },
+    /// Final result message
+    Result {
+        subtype: String,
+        #[serde(default)]
+        result: String,
+        #[serde(default)]
+        total_cost_usd: f64,
+        #[serde(default)]
+        duration_ms: u64,
+        session_id: String,
+        #[serde(default)]
+        is_error: bool,
+        #[serde(flatten)]
+        extra: serde_json::Value,
+    },
+}
+
+/// Claude assistant message structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeAssistantMessage {
+    pub content: Vec<ClaudeContentBlock>,
+    #[serde(default)]
+    pub model: String,
+    #[serde(flatten)]
+    pub extra: serde_json::Value,
+}
+
+/// Claude user message structure (for tool results)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeUserMessage {
+    pub content: Vec<ClaudeContentBlock>,
+    #[serde(default)]
+    pub role: String,
+}
+
+/// Content block types in Claude messages
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClaudeContentBlock {
+    /// Text content from Claude
+    Text {
+        text: String,
+    },
+    /// Tool use request from Claude
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    /// Tool result (in user messages)
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        #[serde(default)]
+        is_error: bool,
+    },
 }
 
 // ============================================================================
@@ -403,6 +555,91 @@ mod tests {
         let msg = WebToServer::AttachSession { session_id };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"attach_session\""));
+        assert!(json.contains(&session_id.to_string()));
+    }
+
+    #[test]
+    fn test_claude_stream_message_system() {
+        let json = r#"{"type":"system","subtype":"init","session_id":"abc-123","tools":["Read","Edit"],"model":"claude-opus","cwd":"/home/user"}"#;
+        let msg: ClaudeStreamMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            ClaudeStreamMessage::System { subtype, tools, model, .. } => {
+                assert_eq!(subtype, "init");
+                assert_eq!(tools, vec!["Read", "Edit"]);
+                assert_eq!(model, "claude-opus");
+            }
+            _ => panic!("Expected System variant"),
+        }
+    }
+
+    #[test]
+    fn test_claude_stream_message_assistant_text() {
+        let json = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello world"}],"model":"claude"},"session_id":"abc-123"}"#;
+        let msg: ClaudeStreamMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            ClaudeStreamMessage::Assistant { message, .. } => {
+                assert_eq!(message.content.len(), 1);
+                match &message.content[0] {
+                    ClaudeContentBlock::Text { text } => assert_eq!(text, "Hello world"),
+                    _ => panic!("Expected Text content block"),
+                }
+            }
+            _ => panic!("Expected Assistant variant"),
+        }
+    }
+
+    #[test]
+    fn test_claude_stream_message_assistant_tool_use() {
+        let json = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tool-1","name":"Read","input":{"file_path":"/tmp/test.txt"}}],"model":"claude"},"session_id":"abc-123"}"#;
+        let msg: ClaudeStreamMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            ClaudeStreamMessage::Assistant { message, .. } => {
+                match &message.content[0] {
+                    ClaudeContentBlock::ToolUse { id, name, input } => {
+                        assert_eq!(id, "tool-1");
+                        assert_eq!(name, "Read");
+                        assert_eq!(input["file_path"], "/tmp/test.txt");
+                    }
+                    _ => panic!("Expected ToolUse content block"),
+                }
+            }
+            _ => panic!("Expected Assistant variant"),
+        }
+    }
+
+    #[test]
+    fn test_claude_stream_message_result() {
+        let json = r#"{"type":"result","subtype":"success","result":"Done","total_cost_usd":0.05,"duration_ms":1000,"session_id":"abc-123","is_error":false}"#;
+        let msg: ClaudeStreamMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            ClaudeStreamMessage::Result { subtype, result, total_cost_usd, is_error, .. } => {
+                assert_eq!(subtype, "success");
+                assert_eq!(result, "Done");
+                assert!((total_cost_usd - 0.05).abs() < 0.001);
+                assert!(!is_error);
+            }
+            _ => panic!("Expected Result variant"),
+        }
+    }
+
+    #[test]
+    fn test_cli_to_server_stream_message() {
+        let session_id = Uuid::new_v4();
+        let stream_msg = ClaudeStreamMessage::Result {
+            subtype: "success".to_string(),
+            result: "Done".to_string(),
+            total_cost_usd: 0.01,
+            duration_ms: 500,
+            session_id: "test".to_string(),
+            is_error: false,
+            extra: serde_json::Value::Null,
+        };
+        let msg = CliToServer::StreamMessage {
+            session_id,
+            message: stream_msg,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"stream_message\""));
         assert!(json.contains(&session_id.to_string()));
     }
 }

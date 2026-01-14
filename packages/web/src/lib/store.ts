@@ -29,6 +29,14 @@ export interface CliClient {
   activeSession?: string;
 }
 
+export interface SessionInfo {
+  id: string;
+  cliClientId?: string;
+  workingDir?: string;
+  status: string;
+  createdAt?: string;
+}
+
 export type OutputType =
   | { type: "text" }
   | { type: "code"; language?: string }
@@ -43,9 +51,14 @@ interface AppState {
   connected: boolean;
   sessionId: string | null;
   ws: WebSocket | null;
+  refreshInterval: NodeJS.Timeout | null;
+  isAttached: boolean; // Whether we're attached to an active session
 
   // CLI clients
   cliClients: CliClient[];
+
+  // Persisted sessions
+  sessions: SessionInfo[];
 
   // Messages
   messages: Message[];
@@ -61,15 +74,22 @@ interface AppState {
   startSession: (cliClientId?: string) => void;
   attachSession: (sessionId: string) => void;
   refreshCliClients: () => void;
+  listSessions: () => void;
+  loadSessionMessages: (sessionId: string) => void;
+  startAutoRefresh: () => void;
+  stopAutoRefresh: () => void;
 }
 
-const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8081";
+const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://130.245.173.105:8081";
 
 export const useStore = create<AppState>((set, get) => ({
   connected: false,
   sessionId: null,
   ws: null,
+  refreshInterval: null,
+  isAttached: false,
   cliClients: [],
+  sessions: [],
   messages: [],
 
   connect: () => {
@@ -103,10 +123,11 @@ export const useStore = create<AppState>((set, get) => ({
 
   disconnect: () => {
     const { ws } = get();
+    get().stopAutoRefresh();
     if (ws) {
       ws.close();
     }
-    set({ connected: false, ws: null, sessionId: null, cliClients: [] });
+    set({ connected: false, ws: null, sessionId: null, cliClients: [], isAttached: false });
   },
 
   startSession: (cliClientId?: string) => {
@@ -133,8 +154,8 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
 
-    // Clear previous messages
-    set({ messages: [] });
+    // Clear previous messages and mark as attached
+    set({ messages: [], isAttached: true });
 
     // Attach to existing session
     ws.send(JSON.stringify({
@@ -149,6 +170,23 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
     ws.send(JSON.stringify({ type: "list_cli_clients" }));
+  },
+
+  listSessions: () => {
+    const { ws } = get();
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    ws.send(JSON.stringify({ type: "list_sessions" }));
+  },
+
+  loadSessionMessages: (sessionId: string) => {
+    const { ws } = get();
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    set({ sessionId, messages: [], isAttached: false });
+    ws.send(JSON.stringify({ type: "get_session_messages", session_id: sessionId }));
   },
 
   sendMessage: (text: string) => {
@@ -198,6 +236,39 @@ export const useStore = create<AppState>((set, get) => ({
   clearMessages: () => {
     set({ messages: [] });
   },
+
+  startAutoRefresh: () => {
+    const { refreshInterval } = get();
+    if (refreshInterval) return; // Already running
+
+    const interval = setInterval(() => {
+      const { connected, sessionId, isAttached, cliClients } = get();
+      if (!connected) return;
+
+      // Refresh CLI clients and sessions list
+      get().refreshCliClients();
+      get().listSessions();
+
+      // If we're viewing a session but not attached, check if it became active
+      if (sessionId && !isAttached) {
+        const activeClient = cliClients.find(c => c.activeSession === sessionId);
+        if (activeClient) {
+          // Session is now active, attach to it for real-time updates
+          get().attachSession(sessionId);
+        }
+      }
+    }, 3000); // Refresh every 3 seconds
+
+    set({ refreshInterval: interval });
+  },
+
+  stopAutoRefresh: () => {
+    const { refreshInterval } = get();
+    if (refreshInterval) {
+      clearInterval(refreshInterval);
+      set({ refreshInterval: null });
+    }
+  },
 }));
 
 function handleServerMessage(
@@ -209,8 +280,9 @@ function handleServerMessage(
     case "authenticated":
       set({ connected: true });
       console.log("Authenticated as user:", data.user_id);
-      // Request CLI clients list after authentication
+      // Request CLI clients and sessions list after authentication
       get().refreshCliClients();
+      get().listSessions();
       break;
 
     case "authentication_failed":
@@ -265,6 +337,48 @@ function handleServerMessage(
       };
       set((state) => ({ messages: [...state.messages, errorMessage] }));
       break;
+
+    case "sessions": {
+      const sessions = (data.sessions as Array<Record<string, unknown>>) || [];
+      set({
+        sessions: sessions.map((s) => ({
+          id: s.id as string,
+          cliClientId: s.cli_client_id as string | undefined,
+          workingDir: s.working_dir as string | undefined,
+          status: s.status as string,
+          createdAt: s.created_at as string | undefined,
+        })),
+      });
+      break;
+    }
+
+    case "session_messages": {
+      const messages = (data.messages as Array<Record<string, unknown>>) || [];
+      set({
+        sessionId: data.session_id as string,
+        messages: messages.map((m) => ({
+          id: m.id as string,
+          role: m.role as "user" | "assistant" | "system",
+          content: m.content as string,
+          timestamp: new Date(m.created_at as string || Date.now()),
+          outputType: { type: m.message_type as "text" | "system" || "text" } as OutputType,
+        })),
+      });
+      break;
+    }
+
+    case "user_input": {
+      // User input from CLI (displayed as user message)
+      const userMessage: Message = {
+        id: generateId(),
+        role: "user",
+        content: data.text as string,
+        timestamp: new Date(),
+        outputType: { type: "text" },
+      };
+      set((state) => ({ messages: [...state.messages, userMessage] }));
+      break;
+    }
 
     default:
       console.log("Unknown message type:", data.type);

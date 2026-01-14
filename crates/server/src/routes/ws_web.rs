@@ -6,7 +6,7 @@ use axum::{
     response::IntoResponse,
 };
 use futures::{SinkExt, StreamExt};
-use shared::{ServerToCli, ServerToWeb, SessionStatus, WebToServer};
+use shared::{MessageInfo, ServerToCli, ServerToWeb, SessionInfo, SessionStatus, WebToServer};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -219,6 +219,28 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 },
                             )
                             .await;
+
+                        // Also load existing messages from file storage
+                        if let Ok(stored_messages) = state.storage.get_messages(&sid).await {
+                            let messages: Vec<MessageInfo> = stored_messages
+                                .into_iter()
+                                .map(|m| MessageInfo {
+                                    id: m.id,
+                                    role: m.role,
+                                    content: m.content,
+                                    message_type: m.message_type,
+                                    created_at: Some(m.created_at),
+                                })
+                                .collect();
+                            state
+                                .sessions
+                                .send_to_web(
+                                    &connection_id,
+                                    ServerToWeb::SessionMessages { session_id: sid, messages },
+                                )
+                                .await;
+                        }
+
                         tracing::info!("Web client attached to CLI session {}", sid);
                     } else {
                         state
@@ -230,6 +252,75 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 },
                             )
                             .await;
+                    }
+                }
+                Ok(WebToServer::ListSessions) => {
+                    // Get all persisted sessions from database
+                    match state.db.get_all_sessions().await {
+                        Ok(db_sessions) => {
+                            let sessions: Vec<SessionInfo> = db_sessions
+                                .into_iter()
+                                .map(|s| SessionInfo {
+                                    id: Uuid::parse_str(&s.id).unwrap_or_default(),
+                                    cli_client_id: s.cli_client_id.and_then(|id| Uuid::parse_str(&id).ok()),
+                                    working_dir: s.working_dir,
+                                    status: s.status,
+                                    created_at: s.created_at,
+                                })
+                                .collect();
+                            state
+                                .sessions
+                                .send_to_web(&connection_id, ServerToWeb::Sessions { sessions })
+                                .await;
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to get sessions: {}", e);
+                            state
+                                .sessions
+                                .send_to_web(
+                                    &connection_id,
+                                    ServerToWeb::Error {
+                                        message: "Failed to load sessions".to_string(),
+                                    },
+                                )
+                                .await;
+                        }
+                    }
+                }
+                Ok(WebToServer::GetSessionMessages { session_id: sid }) => {
+                    // Get messages for a specific session from file storage
+                    match state.storage.get_messages(&sid).await {
+                        Ok(stored_messages) => {
+                            let messages: Vec<MessageInfo> = stored_messages
+                                .into_iter()
+                                .map(|m| MessageInfo {
+                                    id: m.id,
+                                    role: m.role,
+                                    content: m.content,
+                                    message_type: m.message_type,
+                                    created_at: Some(m.created_at),
+                                })
+                                .collect();
+                            state
+                                .sessions
+                                .send_to_web(
+                                    &connection_id,
+                                    ServerToWeb::SessionMessages { session_id: sid, messages },
+                                )
+                                .await;
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to get messages from file: {}", e);
+                            state
+                                .sessions
+                                .send_to_web(
+                                    &connection_id,
+                                    ServerToWeb::Error {
+                                        message: "Failed to load messages".to_string(),
+                                    },
+                                )
+                                .await;
+                        }
                     }
                 }
                 Err(e) => {

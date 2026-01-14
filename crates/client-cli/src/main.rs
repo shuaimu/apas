@@ -5,8 +5,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod config;
 mod claude;
 mod mode;
-#[cfg(unix)]
-mod pty;
+mod project;
 
 // Default server URL
 const DEFAULT_SERVER: &str = "ws://130.245.173.105:8081";

@@ -69,7 +69,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // Register this CLI connection
     state.sessions.register_cli(cli_id, tx);
 
-    // Update database
+    // Update database - first ensure user exists (dev mode creates random users)
+    let dev_user = crate::db::User {
+        id: user_id.to_string(),
+        email: format!("dev-{}@local", user_id),
+        password_hash: "dev".to_string(),
+        created_at: None,
+    };
+    if let Err(e) = state.db.create_user(&dev_user).await {
+        // Ignore duplicate user errors
+        if !e.to_string().contains("UNIQUE constraint") {
+            tracing::warn!("Failed to create dev user: {}", e);
+        }
+    }
+
     let cli_client = crate::db::CliClient {
         id: cli_id.to_string(),
         user_id: user_id.to_string(),
@@ -78,7 +91,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         status: "online".to_string(),
         created_at: None,
     };
-    let _ = state.db.upsert_cli_client(&cli_client).await;
+    if let Err(e) = state.db.upsert_cli_client(&cli_client).await {
+        tracing::error!("Failed to upsert cli_client: {}", e);
+    }
 
     // Task to forward messages from channel to WebSocket
     let mut send_sender = sender;
@@ -99,10 +114,25 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 match parsed {
                     Ok(CliToServer::SessionStart {
                         session_id,
-                        working_dir: _,
+                        working_dir,
                     }) => {
                         // CLI is starting a local session (hybrid mode)
                         state.sessions.create_cli_session(session_id, cli_id);
+
+                        // Persist session to database
+                        let session = crate::db::Session {
+                            id: session_id.to_string(),
+                            user_id: user_id.to_string(),
+                            cli_client_id: Some(cli_id.to_string()),
+                            working_dir,
+                            status: "active".to_string(),
+                            created_at: None,
+                            updated_at: None,
+                        };
+                        if let Err(e) = state.db.create_session(&session).await {
+                            tracing::error!("Failed to persist session to database: {}", e);
+                        }
+
                         tracing::info!("CLI {} started local session {}", cli_id, session_id);
                     }
                     Ok(CliToServer::Output {
@@ -122,7 +152,50 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             )
                             .await;
                     }
+                    Ok(CliToServer::StreamMessage { session_id, message }) => {
+                        // Save message to file storage
+                        if let Some(stored_message) = stream_message_to_stored(&session_id, &message) {
+                            if let Err(e) = state.storage.append_message(&session_id, &stored_message).await {
+                                tracing::error!("Failed to save message to file: {}", e);
+                            }
+                        }
+
+                        // Route structured stream message to web client
+                        state
+                            .sessions
+                            .route_to_web(
+                                &session_id,
+                                ServerToWeb::StreamMessage { session_id, message },
+                            )
+                            .await;
+                    }
+                    Ok(CliToServer::UserInput { session_id, text }) => {
+                        tracing::info!("Received UserInput for session {}: {}", session_id, text);
+                        // Save user input to file storage
+                        let stored_message = crate::storage::StoredMessage {
+                            id: Uuid::new_v4().to_string(),
+                            role: "user".to_string(),
+                            content: text.clone(),
+                            message_type: "text".to_string(),
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                        };
+                        if let Err(e) = state.storage.append_message(&session_id, &stored_message).await {
+                            tracing::error!("Failed to save user input to file: {}", e);
+                        }
+
+                        // Forward user input to web client
+                        state
+                            .sessions
+                            .route_to_web(
+                                &session_id,
+                                ServerToWeb::UserInput { session_id, text },
+                            )
+                            .await;
+                    }
                     Ok(CliToServer::SessionEnd { session_id, reason }) => {
+                        // Update session status in database
+                        let _ = state.db.update_session_status(&session_id.to_string(), "ended").await;
+
                         state
                             .sessions
                             .route_to_web(
@@ -161,4 +234,48 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let _ = state.db.update_cli_client_status(&cli_id.to_string(), "offline").await;
     send_task.abort();
     tracing::info!("CLI client disconnected: {}", cli_id);
+}
+
+/// Convert a ClaudeStreamMessage to a StoredMessage for file storage
+fn stream_message_to_stored(session_id: &Uuid, message: &shared::ClaudeStreamMessage) -> Option<crate::storage::StoredMessage> {
+    use shared::{ClaudeStreamMessage, ClaudeContentBlock};
+
+    match message {
+        ClaudeStreamMessage::Assistant { message: msg, .. } => {
+            // Extract text content from assistant message
+            let text_content: Vec<String> = msg.content.iter()
+                .filter_map(|block| {
+                    match block {
+                        ClaudeContentBlock::Text { text } => Some(text.clone()),
+                        ClaudeContentBlock::ToolUse { name, input, .. } => {
+                            Some(format!("[Tool: {}] {}", name, serde_json::to_string(input).unwrap_or_default()))
+                        }
+                        _ => None,
+                    }
+                })
+                .collect();
+
+            if text_content.is_empty() {
+                return None;
+            }
+
+            Some(crate::storage::StoredMessage {
+                id: Uuid::new_v4().to_string(),
+                role: "assistant".to_string(),
+                content: text_content.join("\n"),
+                message_type: "text".to_string(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            })
+        }
+        ClaudeStreamMessage::Result { subtype, total_cost_usd, duration_ms, .. } => {
+            Some(crate::storage::StoredMessage {
+                id: Uuid::new_v4().to_string(),
+                role: "system".to_string(),
+                content: format!("{} - Cost: ${:.4}, Duration: {}ms", subtype, total_cost_usd, duration_ms),
+                message_type: "result".to_string(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            })
+        }
+        _ => None, // Skip system and user messages for now
+    }
 }

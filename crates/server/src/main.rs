@@ -7,6 +7,7 @@ mod error;
 mod routes;
 mod session;
 mod state;
+mod storage;
 
 use state::AppState;
 
