@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: apas-server
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config:ro
+    environment:
+      - RUST_LOG=apas_server=info,tower_http=debug
+      - APAS_CONFIG=/app/config/apas-server.toml
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    container_name: apas-web
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_WS_URL=ws://server:8080
+    depends_on:
+      - server
+    restart: unless-stopped
+
+networks:
+  default:
+    name: apas-network

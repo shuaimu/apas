@@ -1,0 +1,11 @@
+[server]
+host = "0.0.0.0"
+port = 8081
+
+[database]
+path = "./data/apas.db"
+
+[auth]
+# IMPORTANT: Change this in production!
+jwt_secret = "change-me-in-production-use-a-secure-random-string"
+token_expiry_hours = 24

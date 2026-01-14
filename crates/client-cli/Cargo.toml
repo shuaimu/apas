@@ -1,0 +1,42 @@
+[package]
+name = "apas"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "apas"
+path = "src/main.rs"
+
+[dependencies]
+shared = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+
+# WebSocket client
+tokio-tungstenite = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Config
+toml = { workspace = true }
+directories = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Unix signals and PTY (Unix only)
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal", "term", "ioctl", "fs", "process"] }
+libc = "0.2"
