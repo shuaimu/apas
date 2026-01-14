@@ -24,6 +24,7 @@ pub struct Session {
     pub user_id: String,
     pub cli_client_id: Option<String>,
     pub working_dir: Option<String>,
+    pub hostname: Option<String>,
     pub status: String,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,

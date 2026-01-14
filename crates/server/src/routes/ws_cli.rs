@@ -115,6 +115,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     Ok(CliToServer::SessionStart {
                         session_id,
                         working_dir,
+                        hostname,
                     }) => {
                         // CLI is starting a local session (hybrid mode)
                         state.sessions.create_cli_session(session_id, cli_id);
@@ -125,6 +126,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             user_id: user_id.to_string(),
                             cli_client_id: Some(cli_id.to_string()),
                             working_dir,
+                            hostname,
                             status: "active".to_string(),
                             created_at: None,
                             updated_at: None,

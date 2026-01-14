@@ -14,6 +14,7 @@ export function Sidebar() {
       id: string;
       name: string;
       workingDir: string;
+      hostname?: string;
       isActive: boolean;
       createdAt?: string;
     }>();
@@ -37,6 +38,7 @@ export function Sidebar() {
           id: session.id,
           name,
           workingDir,
+          hostname: session.hostname,
           isActive: session.status === "active",
           createdAt: session.createdAt,
         });
@@ -124,7 +126,9 @@ export function Sidebar() {
                   }`}
                 />
                 <div className="flex-1 min-w-0">
-                  <div className="font-medium truncate">{project.name}</div>
+                  <div className="font-medium truncate">
+                    {project.hostname ? `${project.hostname}:` : ""}{project.workingDir}
+                  </div>
                   <div className="text-xs text-gray-500 truncate">
                     {project.isActive
                       ? "Active"

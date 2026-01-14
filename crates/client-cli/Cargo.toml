@@ -36,3 +36,4 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
+hostname = "0.4.2"

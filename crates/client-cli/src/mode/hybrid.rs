@@ -324,9 +324,13 @@ async fn connect_to_server(
     }
 
     // Send SessionStart to register our local session with the server
+    let hostname = hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok());
     let session_start_msg = CliToServer::SessionStart {
         session_id,
         working_dir: Some(working_dir.to_string()),
+        hostname,
     };
     let msg_text = serde_json::to_string(&session_start_msg)?;
     ws_sender.send(Message::Text(msg_text.into())).await?;

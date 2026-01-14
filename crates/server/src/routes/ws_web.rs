@@ -264,6 +264,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     id: Uuid::parse_str(&s.id).unwrap_or_default(),
                                     cli_client_id: s.cli_client_id.and_then(|id| Uuid::parse_str(&id).ok()),
                                     working_dir: s.working_dir,
+                                    hostname: s.hostname,
                                     status: s.status,
                                     created_at: s.created_at,
                                 })

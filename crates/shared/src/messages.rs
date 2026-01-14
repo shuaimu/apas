@@ -16,6 +16,7 @@ pub enum CliToServer {
     SessionStart {
         session_id: Uuid,
         working_dir: Option<String>,
+        hostname: Option<String>,
     },
 
     /// Claude output to be forwarded to web client
@@ -167,6 +168,7 @@ pub struct SessionInfo {
     pub id: Uuid,
     pub cli_client_id: Option<Uuid>,
     pub working_dir: Option<String>,
+    pub hostname: Option<String>,
     pub status: String,
     pub created_at: Option<String>,
 }

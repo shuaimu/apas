@@ -2,7 +2,6 @@
 
 import { useEffect } from "react";
 import { MessageList } from "@/components/chat/MessageList";
-import { InputBox } from "@/components/chat/InputBox";
 import { Sidebar } from "@/components/Sidebar";
 import { useStore } from "@/lib/store";
 import { Settings, Wifi, WifiOff } from "lucide-react";
@@ -56,7 +55,6 @@ export default function Home() {
         {sessionId ? (
           <main className="flex-1 overflow-hidden flex flex-col">
             <MessageList />
-            <InputBox />
           </main>
         ) : (
           <div className="flex-1 flex items-center justify-center text-gray-400">
