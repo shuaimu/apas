@@ -231,11 +231,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     }
 
-    // Cleanup
+    // Cleanup - mark all sessions for this CLI as inactive
+    let session_ids = state.sessions.get_cli_session_ids(&cli_id);
+    for session_id in &session_ids {
+        if let Err(e) = state.db.update_session_status(&session_id.to_string(), "inactive").await {
+            tracing::error!("Failed to update session {} status: {}", session_id, e);
+        }
+    }
+
     state.sessions.unregister_cli(&cli_id);
     let _ = state.db.update_cli_client_status(&cli_id.to_string(), "offline").await;
     send_task.abort();
-    tracing::info!("CLI client disconnected: {}", cli_id);
+    tracing::info!("CLI client disconnected: {} (marked {} sessions as inactive)", cli_id, session_ids.len());
 }
 
 /// Convert a ClaudeStreamMessage to a StoredMessage for file storage

@@ -134,6 +134,14 @@ impl SessionManager {
             .and_then(|sessions| sessions.last().copied())
     }
 
+    /// Get all session IDs for a CLI client
+    pub fn get_cli_session_ids(&self, cli_id: &Uuid) -> Vec<Uuid> {
+        self.cli_sessions
+            .get(cli_id)
+            .map(|sessions| sessions.clone())
+            .unwrap_or_default()
+    }
+
     pub fn get_session(&self, session_id: &Uuid) -> Option<SessionState> {
         self.sessions.get(session_id).map(|s| SessionState {
             session_id: s.session_id,
