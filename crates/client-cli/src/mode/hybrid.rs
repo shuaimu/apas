@@ -86,6 +86,11 @@ async fn run_pty_session(
         let mut buf = [0u8; 1024];
 
         loop {
+            // Check shutdown flag
+            if shutdown_clone.load(Ordering::SeqCst) {
+                break;
+            }
+
             // Use select/poll to check if stdin has data
             unsafe {
                 let mut fds: libc::fd_set = std::mem::zeroed();
