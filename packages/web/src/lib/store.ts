@@ -33,6 +33,7 @@ export interface SessionInfo {
   id: string;
   cliClientId?: string;
   workingDir?: string;
+  hostname?: string;
   status: string;
   createdAt?: string;
 }
@@ -283,6 +284,8 @@ function handleServerMessage(
       // Request CLI clients and sessions list after authentication
       get().refreshCliClients();
       get().listSessions();
+      // Start auto-refresh for real-time updates
+      get().startAutoRefresh();
       break;
 
     case "authentication_failed":
@@ -345,6 +348,7 @@ function handleServerMessage(
           id: s.id as string,
           cliClientId: s.cli_client_id as string | undefined,
           workingDir: s.working_dir as string | undefined,
+          hostname: s.hostname as string | undefined,
           status: s.status as string,
           createdAt: s.created_at as string | undefined,
         })),
@@ -377,6 +381,51 @@ function handleServerMessage(
         outputType: { type: "text" },
       };
       set((state) => ({ messages: [...state.messages, userMessage] }));
+      break;
+    }
+
+    case "stream_message": {
+      // Real-time Claude output from attached session
+      const msg = data.message as Record<string, unknown>;
+      if (!msg) break;
+
+      const msgType = msg.type as string;
+      if (msgType === "assistant") {
+        const message = msg.message as Record<string, unknown>;
+        const content = message?.content as Array<Record<string, unknown>>;
+        if (content) {
+          for (const block of content) {
+            if (block.type === "text") {
+              const assistantMessage: Message = {
+                id: generateId(),
+                role: "assistant",
+                content: block.text as string,
+                timestamp: new Date(),
+                outputType: { type: "text" },
+              };
+              set((state) => ({ messages: [...state.messages, assistantMessage] }));
+            } else if (block.type === "tool_use") {
+              const toolMessage: Message = {
+                id: generateId(),
+                role: "assistant",
+                content: `Using ${block.name}: ${JSON.stringify(block.input)}`,
+                timestamp: new Date(),
+                outputType: { type: "tool_use", tool: block.name as string, input: block.input },
+              };
+              set((state) => ({ messages: [...state.messages, toolMessage] }));
+            }
+          }
+        }
+      } else if (msgType === "result") {
+        const resultMessage: Message = {
+          id: generateId(),
+          role: "system",
+          content: `${msg.subtype} - Cost: $${(msg.total_cost_usd as number || 0).toFixed(4)}, Duration: ${msg.duration_ms}ms`,
+          timestamp: new Date(),
+          outputType: { type: "system" },
+        };
+        set((state) => ({ messages: [...state.messages, resultMessage] }));
+      }
       break;
     }
 
