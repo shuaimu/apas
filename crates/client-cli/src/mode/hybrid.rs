@@ -6,7 +6,7 @@
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
 use shared::{CliToServer, ClaudeStreamMessage, ServerToCli};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +23,16 @@ const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
+const DEFAULT_PROMPT: &str = r#"Work on tasks defined in TODO.md. Repeat the following steps, don't stop until interrupted. Don't ask me for advice, just pick the best option you think that is honest, complete, and not corner-cutting:
+
+1. Pick a task: First check if there are any repeated task that needs to be run again. If yes this is the task we need to do and go to step 2. If no repeated task needs to run, pick the top undone task with highest priority (high-medium-low), choose its first leaf task. If there are no task at all, (no fit repeated task and no undone TODO items left), sleep a minute and git pull and restart step 1 (so this step is a dead loop until you find a todo item).
+2. Analyze the task, check if this can be done with not too many LOC (i.e., smaller than 500 lines code give or take). If not, try to analyze this task and break it down into several smaller tasks, expanding it in the TODO.md. The breakdown can be nested and hierarchical. Try to make each leaf task small enough (<500 lines LOC). You can document your analysis in the doc folder for future reference.
+3. Try to execute the first leaf task. Make a plan for the task before execute, put the plan in the docs folder, and add the file name in the item in TODO.md for reference. You can all write your key findings as a few sentences in the TODO item.
+4. Make sure to add comprehensive test for the task executed. Run the whole ci test to make sure no regression happens. Put the test log in the logs folder as proof for manual review, log file name prefixed with datetime and commithash. If tests fail, fix them using the best, honest, complete approach, run test suites again to verify fixes work. Do not cheat such as disabling the borrow checker. Repeat this step until no tests fail.
+5. Prepare for git commit, first check if you wrote any rusty unsafe code, if yes, then revert the changes and go back to Step 3 to redo task. Remove all temporary files, especially not to commit any binary files. For plan files, extract from implementation plan the design rational and user manual and put it in the docs folder. we can keep the plan files in docs/dev/ folder. Mark the task as done (or last done for repeated task) in the TODO.md with a timestamp [yy:mm:dd, hh:mm]
+6. Git commit the changes. First do git pull --rebase, and fix conflicts if any. Remember to update submodule. If remote has any updates (merged through rebase), then run full ci tests again to make sure everything pass. If not pass, investigate and fix, repeat until pass all ci tests. Then do git push (if remote rejected because updates during we doing this step, restart this step).
+7. Go back to step 1 for next task; don't ask me whether to continue, just continue. (The TODO.md file is possibly updated, so make sure you read the updated TODO.)"#;
+
 /// Run in hybrid mode - local Claude CLI + streaming to remote server
 pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()> {
     let config = Config::load().unwrap_or_default();
@@ -32,6 +42,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     let project_meta = project::get_or_create_project(working_dir)?;
     let session_id = project_meta.id;
     let project_name = project_meta.name.clone();
+    let prompt = project_meta.prompt.clone().unwrap_or_else(|| DEFAULT_PROMPT.to_string());
 
     // Channel for sending output to server (buffered to handle reconnections)
     let (server_tx, server_rx) = mpsc::channel::<CliToServer>(256);
@@ -53,7 +64,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     let working_dir_owned = working_dir.to_path_buf();
     let shutdown_for_claude = shutdown.clone();
     let result = tokio::task::spawn_blocking(move || {
-        run_stream_json_session(&claude_path_owned, &working_dir_owned, session_id, project_name, server_tx, &shutdown_for_claude)
+        run_dead_loop_session(&claude_path_owned, &working_dir_owned, session_id, project_name, &prompt, server_tx, &shutdown_for_claude)
     }).await?;
 
     // Signal shutdown
@@ -62,145 +73,137 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     result
 }
 
-/// Run Claude CLI in interactive mode using --print for each prompt
-/// Uses --session-id to maintain conversation continuity across invocations
-fn run_stream_json_session(
+/// Run Claude CLI in a dead loop, continuously sending the same prompt
+/// Uses --resume to maintain conversation continuity across invocations
+fn run_dead_loop_session(
     claude_path: &str,
     working_dir: &Path,
     session_id: Uuid,
     project_name: Option<String>,
+    prompt: &str,
     server_tx: mpsc::Sender<CliToServer>,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<()> {
     let display_name = project_name.as_deref().unwrap_or("unnamed");
     println!("Project: {} (ID: {})", display_name, session_id);
-    println!("Type your prompts (Ctrl+D to exit):\n");
+    println!("Running in autonomous mode (Ctrl+C to stop)");
+    println!("Prompt: {}...\n", &prompt.chars().take(100).collect::<String>());
 
-    let local_stdin = std::io::stdin();
+    let mut iteration = 0u64;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
+            println!("\nShutdown requested, exiting...");
             break;
         }
 
-        print!("> ");
-        std::io::stdout().flush()?;
+        iteration += 1;
+        println!("\n=== Iteration {} ===", iteration);
 
-        let mut input = String::new();
-        match local_stdin.read_line(&mut input) {
-            Ok(0) => {
-                // EOF (Ctrl+D)
-                println!("\nExiting...");
-                break;
-            }
-            Ok(_) => {
-                let input = input.trim();
-                if input.is_empty() {
-                    continue;
-                }
+        // Send prompt to server for web UI display
+        let user_input_msg = CliToServer::UserInput {
+            session_id,
+            text: format!("[Iteration {}] {}", iteration, &prompt.chars().take(100).collect::<String>()),
+        };
+        if server_tx.blocking_send(user_input_msg).is_err() {
+            tracing::debug!("Failed to send user input to server");
+        }
 
-                // Send user input to server for web UI display
-                let user_input_msg = CliToServer::UserInput {
-                    session_id,
-                    text: input.to_string(),
-                };
-                if server_tx.blocking_send(user_input_msg).is_err() {
-                    tracing::debug!("Failed to send user input to server");
-                }
+        // Run Claude with --print for this prompt
+        let args = vec![
+            "--print".to_string(),
+            "--output-format".to_string(), "stream-json".to_string(),
+            "--verbose".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+            "--resume".to_string(),
+            session_id.to_string(),
+            prompt.to_string(),
+        ];
 
-                // Run Claude with --print for this single prompt
-                let mut args = vec![
-                    "--print".to_string(),
-                    "--output-format".to_string(), "stream-json".to_string(),
-                    "--verbose".to_string(),
-                    "--dangerously-skip-permissions".to_string(),
-                ];
-
-                // Always use --resume with our project-based session ID
-                // Claude CLI will create the session if it doesn't exist, or continue if it does
-                args.push("--resume".to_string());
-                args.push(session_id.to_string());
-
-                // Add the prompt as the last argument
-                args.push(input.to_string());
-
-                // Spawn Claude for this prompt
-                let mut child = Command::new(claude_path)
-                    .args(&args)
-                    .current_dir(working_dir)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()?;
-
-                let stdout = child.stdout.take()
-                    .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout"))?;
-                let stderr = child.stderr.take()
-                    .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
-
-                // Spawn thread to read stderr
-                let stderr_thread = std::thread::spawn(move || {
-                    let reader = BufReader::new(stderr);
-                    for line in reader.lines() {
-                        if let Ok(line) = line {
-                            eprintln!("{}", line);
-                        }
-                    }
-                });
-
-                // Read JSON lines from stdout
-                let reader = BufReader::new(stdout);
-                for line in reader.lines() {
-                    if shutdown.load(Ordering::SeqCst) {
-                        break;
-                    }
-
-                    let line = match line {
-                        Ok(l) => l,
-                        Err(e) => {
-                            tracing::debug!("Error reading stdout: {}", e);
-                            break;
-                        }
-                    };
-
-                    if line.is_empty() {
-                        continue;
-                    }
-
-                    // Parse JSON line
-                    match serde_json::from_str::<ClaudeStreamMessage>(&line) {
-                        Ok(message) => {
-                            // Print locally for visibility
-                            print_stream_message(&message);
-
-                            // Forward to server
-                            let msg = CliToServer::StreamMessage {
-                                session_id,
-                                message,
-                            };
-                            if server_tx.blocking_send(msg).is_err() {
-                                tracing::debug!("Server channel closed");
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!("Failed to parse stream message: {} - line: {}", e, line);
-                        }
-                    }
-                }
-
-                // Wait for child to exit
-                let status = child.wait()?;
-                tracing::debug!("Claude exited with status: {}", status);
-
-                // Wait for stderr thread
-                let _ = stderr_thread.join();
-
-                println!(); // Add blank line between responses
-            }
+        // Spawn Claude for this prompt
+        let mut child = match Command::new(claude_path)
+            .args(&args)
+            .current_dir(working_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
             Err(e) => {
-                tracing::debug!("Error reading input: {}", e);
+                eprintln!("Failed to spawn Claude: {}", e);
+                std::thread::sleep(Duration::from_secs(5));
+                continue;
+            }
+        };
+
+        let stdout = child.stdout.take()
+            .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout"))?;
+        let stderr = child.stderr.take()
+            .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
+
+        // Spawn thread to read stderr
+        let stderr_thread = std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    eprintln!("{}", line);
+                }
+            }
+        });
+
+        // Read JSON lines from stdout
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            if shutdown.load(Ordering::SeqCst) {
                 break;
             }
+
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::debug!("Error reading stdout: {}", e);
+                    break;
+                }
+            };
+
+            if line.is_empty() {
+                continue;
+            }
+
+            // Parse JSON line
+            match serde_json::from_str::<ClaudeStreamMessage>(&line) {
+                Ok(message) => {
+                    // Print locally for visibility
+                    print_stream_message(&message);
+
+                    // Forward to server
+                    let msg = CliToServer::StreamMessage {
+                        session_id,
+                        message,
+                    };
+                    if server_tx.blocking_send(msg).is_err() {
+                        tracing::debug!("Server channel closed");
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to parse stream message: {} - line: {}", e, line);
+                }
+            }
+        }
+
+        // Wait for child to exit
+        let status = child.wait()?;
+        tracing::debug!("Claude exited with status: {}", status);
+
+        // Wait for stderr thread
+        let _ = stderr_thread.join();
+
+        println!("\n[Iteration {} completed]", iteration);
+
+        // Small delay between iterations to avoid hammering
+        if !shutdown.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_secs(2));
         }
     }
 

@@ -13,6 +13,9 @@ pub struct ProjectMetadata {
     pub name: Option<String>,
     /// When the project was first initialized
     pub created_at: String,
+    /// Custom prompt to use (if not set, uses default)
+    #[serde(default)]
+    pub prompt: Option<String>,
 }
 
 impl ProjectMetadata {
@@ -21,6 +24,7 @@ impl ProjectMetadata {
             id: Uuid::new_v4(),
             name: None,
             created_at: chrono::Utc::now().to_rfc3339(),
+            prompt: None,
         }
     }
 
@@ -29,6 +33,7 @@ impl ProjectMetadata {
             id: Uuid::new_v4(),
             name: Some(name),
             created_at: chrono::Utc::now().to_rfc3339(),
+            prompt: None,
         }
     }
 }
@@ -53,6 +58,7 @@ pub fn get_or_create_project(dir: &Path) -> Result<ProjectMetadata> {
             id: Uuid::new_v4(),
             name,
             created_at: chrono::Utc::now().to_rfc3339(),
+            prompt: None,
         };
 
         // Save to file
