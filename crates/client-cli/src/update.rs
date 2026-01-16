@@ -11,19 +11,18 @@ const REPO_URL: &str = "https://github.com/shuaimu/apas.git";
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 const CURRENT_VERSION: &str = env!("APAS_VERSION");
 
-/// Parse version string (YY-MM-DD-COMMIT) into comparable number
+/// Parse version string (YY.MM.COMMIT) into comparable number
 fn parse_version(v: &str) -> Option<u64> {
-    // Format: YY-MM-DD-COMMIT (e.g., 26-01-15-42)
-    let parts: Vec<&str> = v.split('-').collect();
-    if parts.len() != 4 {
+    // Format: YY.MM.COMMIT (e.g., 26.01.42)
+    let parts: Vec<&str> = v.split('.').collect();
+    if parts.len() != 3 {
         return None;
     }
     let yy: u64 = parts[0].parse().ok()?;
     let mm: u64 = parts[1].parse().ok()?;
-    let dd: u64 = parts[2].parse().ok()?;
-    let commit: u64 = parts[3].parse().ok()?;
-    // Create comparable number: YYMMDD * 10000 + commit
-    Some(yy * 100_000_000 + mm * 1_000_000 + dd * 10_000 + commit)
+    let commit: u64 = parts[2].parse().ok()?;
+    // Create comparable number: YYMM * 10000 + commit
+    Some(yy * 1_000_000 + mm * 10_000 + commit)
 }
 
 /// Get the path to the update check timestamp file
@@ -87,9 +86,9 @@ fn get_remote_version() -> Option<String> {
 
     let commit_count = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-    // Get date
+    // Get date in YY.MM format
     let output = Command::new("date")
-        .args(["+%y-%m-%d"])
+        .args(["+%y.%m"])
         .output()
         .ok()?;
 
@@ -98,7 +97,7 @@ fn get_remote_version() -> Option<String> {
     // Cleanup
     fs::remove_dir_all(&build_dir).ok();
 
-    Some(format!("{}-{}", date, commit_count))
+    Some(format!("{}.{}", date, commit_count))
 }
 
 /// Check for updates and install if available

@@ -1,12 +1,12 @@
 use std::process::Command;
 
 fn main() {
-    // Get current date in YY-MM-DD format
+    // Get current date in YY.MM format
     let date = Command::new("date")
-        .args(["+%y-%m-%d"])
+        .args(["+%y.%m"])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|_| "00-00-00".to_string());
+        .unwrap_or_else(|_| "00.00".to_string());
 
     // Get commit count
     let commit_count = Command::new("git")
@@ -15,8 +15,8 @@ fn main() {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|_| "0".to_string());
 
-    // Generate version: YY-MM-DD-COMMITCOUNT
-    let version = format!("{}-{}", date, commit_count);
+    // Generate version: YY.MM.COMMITCOUNT
+    let version = format!("{}.{}", date, commit_count);
 
     println!("cargo:rustc-env=APAS_VERSION={}", version);
     println!("cargo:rerun-if-changed=.git/HEAD");
