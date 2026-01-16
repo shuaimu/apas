@@ -5,25 +5,18 @@ use semver::Version;
 use serde::Deserialize;
 use std::env;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 const REPO: &str = "shuaimu/apas";
-const BINARY_NAME: &str = "apas";
+const REPO_URL: &str = "https://github.com/shuaimu/apas.git";
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
-    assets: Vec<GitHubAsset>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubAsset {
-    name: String,
-    browser_download_url: String,
 }
 
 /// Get the path to the update check timestamp file
@@ -54,28 +47,7 @@ fn should_check_for_updates() -> bool {
 /// Mark that we checked for updates
 fn mark_update_checked() {
     let check_file = update_check_file();
-    // Touch the file
     fs::write(&check_file, "").ok();
-}
-
-/// Get the platform string for downloads
-fn get_platform() -> Option<String> {
-    let os = env::consts::OS;
-    let arch = env::consts::ARCH;
-
-    let os_str = match os {
-        "linux" => "linux",
-        "macos" => "darwin",
-        _ => return None,
-    };
-
-    let arch_str = match arch {
-        "x86_64" => "x86_64",
-        "aarch64" => "aarch64",
-        _ => return None,
-    };
-
-    Some(format!("{}-{}", os_str, arch_str))
 }
 
 /// Get the path to the current executable
@@ -94,7 +66,7 @@ pub async fn check_and_update() -> Result<()> {
     mark_update_checked();
 
     let current_version = Version::parse(CURRENT_VERSION)?;
-    tracing::debug!("Current version: {}", current_version);
+    println!("Current version: {}", current_version);
 
     // Fetch latest release from GitHub
     let client = reqwest::Client::builder()
@@ -103,91 +75,98 @@ pub async fn check_and_update() -> Result<()> {
         .build()?;
 
     let url = format!("https://api.github.com/repos/{}/releases/latest", REPO);
-    let response = client.get(&url).send().await?;
+    let response = client.get(&url).send().await;
 
-    if !response.status().is_success() {
-        tracing::debug!("Failed to fetch release info: {}", response.status());
-        return Ok(());
-    }
+    let latest_version = match response {
+        Ok(resp) if resp.status().is_success() => {
+            let release: GitHubRelease = resp.json().await?;
+            let latest_tag = release.tag_name.trim_start_matches('v');
+            Version::parse(latest_tag)?
+        }
+        _ => {
+            // No releases yet, check Cargo.toml from main branch
+            println!("No releases found, checking main branch...");
+            let cargo_url = format!(
+                "https://raw.githubusercontent.com/{}/master/Cargo.toml",
+                REPO
+            );
+            let resp = client.get(&cargo_url).send().await?;
+            if !resp.status().is_success() {
+                println!("Could not check for updates");
+                return Ok(());
+            }
+            let cargo_toml = resp.text().await?;
+            // Parse version from Cargo.toml
+            let version_line = cargo_toml
+                .lines()
+                .find(|l| l.starts_with("version = "))
+                .unwrap_or("version = \"0.1.0\"");
+            let version_str = version_line
+                .split('"')
+                .nth(1)
+                .unwrap_or("0.1.0");
+            Version::parse(version_str)?
+        }
+    };
 
-    let release: GitHubRelease = response.json().await?;
-    let latest_tag = release.tag_name.trim_start_matches('v');
-    let latest_version = Version::parse(latest_tag)?;
-
-    tracing::debug!("Latest version: {}", latest_version);
+    println!("Latest version: {}", latest_version);
 
     if latest_version <= current_version {
-        tracing::debug!("Already up to date");
+        println!("Already up to date!");
         return Ok(());
     }
 
-    println!("New version available: {} -> {}", current_version, latest_version);
+    println!("\nNew version available: {} -> {}", current_version, latest_version);
+    println!("Building from source...\n");
 
-    // Find the right asset for our platform
-    let platform = match get_platform() {
-        Some(p) => p,
-        None => {
-            println!("Cannot auto-update: unsupported platform");
-            return Ok(());
-        }
-    };
+    // Build from source
+    let build_dir = env::temp_dir().join(format!("apas-update-{}", std::process::id()));
 
-    let asset_name = format!("{}-{}", BINARY_NAME, platform);
-    let asset = release.assets.iter().find(|a| a.name == asset_name);
+    // Clone repo
+    println!("Cloning repository...");
+    let status = Command::new("git")
+        .args(["clone", "--depth", "1", REPO_URL, build_dir.to_str().unwrap()])
+        .status()?;
 
-    let asset = match asset {
-        Some(a) => a,
-        None => {
-            println!("Cannot auto-update: no binary available for {}", platform);
-            println!("Download manually from: https://github.com/{}/releases", REPO);
-            return Ok(());
-        }
-    };
-
-    // Download the new binary
-    println!("Downloading update...");
-    let binary_response = client.get(&asset.browser_download_url).send().await?;
-
-    if !binary_response.status().is_success() {
-        println!("Failed to download update: {}", binary_response.status());
-        return Ok(());
+    if !status.success() {
+        anyhow::bail!("Failed to clone repository");
     }
 
-    let binary_data = binary_response.bytes().await?;
+    // Build
+    println!("Building...");
+    let status = Command::new("cargo")
+        .args(["build", "--release", "-p", "apas"])
+        .current_dir(&build_dir)
+        .status()?;
+
+    if !status.success() {
+        fs::remove_dir_all(&build_dir).ok();
+        anyhow::bail!("Failed to build");
+    }
 
     // Get current executable path
-    let current_exe = match get_current_exe() {
-        Some(p) => p,
-        None => {
-            println!("Cannot auto-update: unable to determine executable path");
-            return Ok(());
-        }
-    };
+    let current_exe = get_current_exe()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine executable path"))?;
 
-    // Write to a temporary file first
-    let tmp_path = current_exe.with_extension("new");
-    fs::write(&tmp_path, &binary_data)?;
+    // Copy new binary
+    let new_binary = build_dir.join("target/release/apas");
 
-    // Make it executable
-    let mut perms = fs::metadata(&tmp_path)?.permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&tmp_path, perms)?;
-
-    // Replace the old binary
+    // Backup and replace
     let backup_path = current_exe.with_extension("old");
-    fs::rename(&current_exe, &backup_path).ok(); // Backup old version
+    fs::rename(&current_exe, &backup_path).ok();
 
-    if let Err(e) = fs::rename(&tmp_path, &current_exe) {
-        // Try to restore backup
+    if let Err(e) = fs::copy(&new_binary, &current_exe) {
+        // Restore backup
         fs::rename(&backup_path, &current_exe).ok();
-        println!("Failed to install update: {}", e);
-        return Ok(());
+        fs::remove_dir_all(&build_dir).ok();
+        anyhow::bail!("Failed to install: {}", e);
     }
 
-    // Remove backup
+    // Cleanup
     fs::remove_file(&backup_path).ok();
+    fs::remove_dir_all(&build_dir).ok();
 
-    println!("Updated to version {}!", latest_version);
+    println!("\nUpdated to version {}!", latest_version);
     println!("Restart apas to use the new version.");
 
     Ok(())
@@ -196,8 +175,68 @@ pub async fn check_and_update() -> Result<()> {
 /// Check for updates in the background (non-blocking)
 pub fn check_for_updates_background() {
     tokio::spawn(async {
-        if let Err(e) = check_and_update().await {
-            tracing::debug!("Update check failed: {}", e);
+        match check_update_available().await {
+            Ok(Some(new_version)) => {
+                println!("Update available: {} (run 'apas update' to install)", new_version);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::debug!("Update check failed: {}", e);
+            }
         }
     });
+}
+
+/// Check if update is available without installing
+async fn check_update_available() -> Result<Option<String>> {
+    if !should_check_for_updates() {
+        return Ok(None);
+    }
+
+    mark_update_checked();
+
+    let current_version = Version::parse(CURRENT_VERSION)?;
+
+    let client = reqwest::Client::builder()
+        .user_agent("apas-updater")
+        .timeout(Duration::from_secs(5))
+        .build()?;
+
+    // Try releases first
+    let url = format!("https://api.github.com/repos/{}/releases/latest", REPO);
+    if let Ok(resp) = client.get(&url).send().await {
+        if resp.status().is_success() {
+            if let Ok(release) = resp.json::<GitHubRelease>().await {
+                let latest_tag = release.tag_name.trim_start_matches('v');
+                if let Ok(latest) = Version::parse(latest_tag) {
+                    if latest > current_version {
+                        return Ok(Some(latest.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Check Cargo.toml as fallback
+    let cargo_url = format!(
+        "https://raw.githubusercontent.com/{}/master/Cargo.toml",
+        REPO
+    );
+    if let Ok(resp) = client.get(&cargo_url).send().await {
+        if resp.status().is_success() {
+            if let Ok(text) = resp.text().await {
+                if let Some(line) = text.lines().find(|l| l.starts_with("version = ")) {
+                    if let Some(ver) = line.split('"').nth(1) {
+                        if let Ok(latest) = Version::parse(ver) {
+                            if latest > current_version {
+                                return Ok(Some(latest.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(None)
 }

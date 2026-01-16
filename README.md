@@ -11,15 +11,15 @@ APAS is an autonomous coding agent that wraps Claude Code CLI and runs in a cont
 
 ## Installation
 
-### Quick Install (Recommended)
+### Quick Install
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/shuaimu/apas/master/install.sh | bash
 ```
 
-This will download and install the latest release to `~/.local/bin/`.
+This will clone and build from source, installing to `~/.local/bin/`. Requires Rust (will install via rustup if not present).
 
-### Build from Source
+### Manual Build
 
 ```bash
 git clone https://github.com/shuaimu/apas.git
@@ -34,7 +34,7 @@ cp target/release/apas ~/.local/bin/
 apas update
 ```
 
-Or the CLI will automatically check for updates every 24 hours.
+This rebuilds from the latest source. The CLI also checks for updates every 24 hours and notifies you if a new version is available.
 
 ## Usage
 
