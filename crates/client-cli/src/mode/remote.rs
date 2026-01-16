@@ -13,6 +13,7 @@ use crate::config::Config;
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const VERSION: &str = env!("APAS_VERSION");
 
 /// Run in remote mode - connect to backend server and stream I/O
 /// Automatically reconnects on connection loss with exponential backoff
@@ -84,9 +85,10 @@ async fn run_connection(
     let (ws_stream, _) = connect_async(&ws_url).await?;
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
-    // Send registration message
+    // Send registration message with version
     let register_msg = CliToServer::Register {
         token: token.to_string(),
+        version: Some(VERSION.to_string()),
     };
     let msg_text = serde_json::to_string(&register_msg)?;
     ws_sender.send(Message::Text(msg_text.into())).await?;
@@ -106,6 +108,14 @@ async fn run_connection(
                     }
                     ServerToCli::RegistrationFailed { reason } => {
                         return Err(anyhow::anyhow!("Registration failed: {}", reason));
+                    }
+                    ServerToCli::VersionUnsupported { client_version, min_version } => {
+                        eprintln!("\n========================================");
+                        eprintln!("ERROR: Client version {} is no longer supported!", client_version);
+                        eprintln!("Minimum required version: {}", min_version);
+                        eprintln!("Please update by running: apas update");
+                        eprintln!("========================================\n");
+                        std::process::exit(1);
                     }
                     _ => continue,
                 }
@@ -206,8 +216,10 @@ async fn run_connection(
                     Ok(ServerToCli::Heartbeat) => {
                         // Heartbeat acknowledged
                     }
-                    Ok(ServerToCli::Registered { .. }) | Ok(ServerToCli::RegistrationFailed { .. }) => {
-                        // Already handled
+                    Ok(ServerToCli::Registered { .. })
+                    | Ok(ServerToCli::RegistrationFailed { .. })
+                    | Ok(ServerToCli::VersionUnsupported { .. }) => {
+                        // Already handled during registration
                     }
                     Err(e) => {
                         tracing::warn!("Failed to parse server message: {}", e);

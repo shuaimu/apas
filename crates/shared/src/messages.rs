@@ -9,8 +9,12 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CliToServer {
-    /// CLI registers with the server using auth token
-    Register { token: String },
+    /// CLI registers with the server using auth token and version
+    Register {
+        token: String,
+        #[serde(default)]
+        version: Option<String>,
+    },
 
     /// CLI starts a local session (hybrid mode)
     SessionStart {
@@ -55,6 +59,12 @@ pub enum ServerToCli {
 
     /// Registration failed
     RegistrationFailed { reason: String },
+
+    /// Client version is too old
+    VersionUnsupported {
+        client_version: String,
+        min_version: String,
+    },
 
     /// New session assigned to this CLI
     SessionAssigned { session_id: Uuid, working_dir: Option<String> },

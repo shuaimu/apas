@@ -12,6 +12,32 @@ use uuid::Uuid;
 
 use crate::state::AppState;
 
+/// Minimum supported client version (YY.MM.COMMIT format)
+/// Update this when making breaking API changes
+const MIN_CLIENT_VERSION: &str = "26.01.0";
+
+/// Parse version string (YY.MM.COMMIT) into comparable number
+fn parse_version(v: &str) -> Option<u64> {
+    let parts: Vec<&str> = v.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let yy: u64 = parts[0].parse().ok()?;
+    let mm: u64 = parts[1].parse().ok()?;
+    let commit: u64 = parts[2].parse().ok()?;
+    Some(yy * 1_000_000 + mm * 10_000 + commit)
+}
+
+/// Check if client version is supported
+fn is_version_supported(client_version: &str) -> bool {
+    let min = parse_version(MIN_CLIENT_VERSION);
+    let client = parse_version(client_version);
+    match (min, client) {
+        (Some(m), Some(c)) => c >= m,
+        _ => true, // Allow if we can't parse (be permissive)
+    }
+}
+
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
@@ -31,7 +57,24 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             Some(Ok(Message::Text(text))) => {
                 let parsed: Result<CliToServer, _> = serde_json::from_str(&text);
                 match parsed {
-                    Ok(CliToServer::Register { token: _ }) => {
+                    Ok(CliToServer::Register { token: _, version }) => {
+                        // Check client version
+                        let client_version = version.as_deref().unwrap_or("unknown");
+                        if !is_version_supported(client_version) {
+                            tracing::warn!(
+                                "Client version {} is unsupported (min: {})",
+                                client_version,
+                                MIN_CLIENT_VERSION
+                            );
+                            let response = ServerToCli::VersionUnsupported {
+                                client_version: client_version.to_string(),
+                                min_version: MIN_CLIENT_VERSION.to_string(),
+                            };
+                            let text = serde_json::to_string(&response).unwrap();
+                            let _ = sender.send(Message::Text(text.into())).await;
+                            return;
+                        }
+
                         // Dev mode: skip authentication, accept all connections
                         user_id = Uuid::new_v4();
                         cli_id = Uuid::new_v4();
@@ -42,7 +85,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         if sender.send(Message::Text(text.into())).await.is_err() {
                             return;
                         }
-                        tracing::info!("CLI client registered: {} (dev mode)", cli_id);
+                        tracing::info!("CLI client registered: {} (version: {}, dev mode)", cli_id, client_version);
                         break;
                     }
                     _ => {

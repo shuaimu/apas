@@ -22,6 +22,7 @@ use crate::project;
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const VERSION: &str = env!("APAS_VERSION");
 
 const DEFAULT_PROMPT: &str = r#"Work on tasks defined in TODO.md. Repeat the following steps, don't stop until interrupted. Don't ask me for advice, just pick the best option you think that is honest, complete, and not corner-cutting:
 
@@ -292,9 +293,10 @@ async fn connect_to_server(
     let (ws_stream, _) = connect_async(&ws_url).await?;
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
-    // Send registration
+    // Send registration with version
     let register_msg = CliToServer::Register {
         token: token.to_string(),
+        version: Some(VERSION.to_string()),
     };
     let msg_text = serde_json::to_string(&register_msg)?;
     ws_sender.send(Message::Text(msg_text.into())).await?;
@@ -311,6 +313,14 @@ async fn connect_to_server(
                     }
                     ServerToCli::RegistrationFailed { reason } => {
                         return Err(anyhow::anyhow!("Registration failed: {}", reason));
+                    }
+                    ServerToCli::VersionUnsupported { client_version, min_version } => {
+                        eprintln!("\n========================================");
+                        eprintln!("ERROR: Client version {} is no longer supported!", client_version);
+                        eprintln!("Minimum required version: {}", min_version);
+                        eprintln!("Please update by running: apas update");
+                        eprintln!("========================================\n");
+                        std::process::exit(1);
                     }
                     _ => continue,
                 }
