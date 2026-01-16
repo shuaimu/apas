@@ -115,8 +115,6 @@ fn run_dead_loop_session(
             "--output-format".to_string(), "stream-json".to_string(),
             "--verbose".to_string(),
             "--dangerously-skip-permissions".to_string(),
-            "--resume".to_string(),
-            session_id.to_string(),
             prompt.to_string(),
         ];
 
