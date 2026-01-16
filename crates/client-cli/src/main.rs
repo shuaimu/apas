@@ -6,6 +6,7 @@ mod config;
 mod claude;
 mod mode;
 mod project;
+mod update;
 
 // Default server URL
 const DEFAULT_SERVER: &str = "ws://130.245.173.105:8081";
@@ -46,6 +47,8 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Check for updates and install if available
+    Update,
 }
 
 #[derive(Subcommand)]
@@ -81,9 +84,19 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Handle config subcommand
-    if let Some(Commands::Config { action }) = cli.command {
-        return handle_config_command(action).await;
+    // Check for updates in the background (non-blocking)
+    update::check_for_updates_background();
+
+    // Handle subcommands
+    if let Some(command) = cli.command {
+        match command {
+            Commands::Config { action } => return handle_config_command(action).await,
+            Commands::Update => {
+                println!("Checking for updates...");
+                update::check_and_update().await?;
+                return Ok(());
+            }
+        }
     }
 
     // Get working directory
