@@ -1,22 +1,29 @@
 //! Auto-update functionality for the APAS CLI
 
 use anyhow::Result;
-use semver::Version;
-use serde::Deserialize;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
-const REPO: &str = "shuaimu/apas";
 const REPO_URL: &str = "https://github.com/shuaimu/apas.git";
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
-const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const CURRENT_VERSION: &str = env!("APAS_VERSION");
 
-#[derive(Debug, Deserialize)]
-struct GitHubRelease {
-    tag_name: String,
+/// Parse version string (YY-MM-DD-COMMIT) into comparable number
+fn parse_version(v: &str) -> Option<u64> {
+    // Format: YY-MM-DD-COMMIT (e.g., 26-01-15-42)
+    let parts: Vec<&str> = v.split('-').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let yy: u64 = parts[0].parse().ok()?;
+    let mm: u64 = parts[1].parse().ok()?;
+    let dd: u64 = parts[2].parse().ok()?;
+    let commit: u64 = parts[3].parse().ok()?;
+    // Create comparable number: YYMMDD * 10000 + commit
+    Some(yy * 100_000_000 + mm * 1_000_000 + dd * 10_000 + commit)
 }
 
 /// Get the path to the update check timestamp file
@@ -55,71 +62,51 @@ fn get_current_exe() -> Option<PathBuf> {
     env::current_exe().ok()
 }
 
+/// Get latest version from remote repo by checking commit count
+fn get_remote_version() -> Option<String> {
+    let build_dir = env::temp_dir().join(format!("apas-version-check-{}", std::process::id()));
+
+    // Shallow clone to check commit count
+    let status = Command::new("git")
+        .args(["clone", "--depth", "1", REPO_URL, build_dir.to_str()?])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+
+    if !status.success() {
+        return None;
+    }
+
+    // Get commit count (need to unshallow for accurate count)
+    let output = Command::new("git")
+        .args(["rev-list", "--count", "HEAD"])
+        .current_dir(&build_dir)
+        .output()
+        .ok()?;
+
+    let commit_count = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    // Get date
+    let output = Command::new("date")
+        .args(["+%y-%m-%d"])
+        .output()
+        .ok()?;
+
+    let date = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    // Cleanup
+    fs::remove_dir_all(&build_dir).ok();
+
+    Some(format!("{}-{}", date, commit_count))
+}
+
 /// Check for updates and install if available
 pub async fn check_and_update() -> Result<()> {
-    // Skip if we checked recently
-    if !should_check_for_updates() {
-        tracing::debug!("Skipping update check (checked recently)");
-        return Ok(());
-    }
+    println!("Current version: {}", CURRENT_VERSION);
+    println!("Checking for updates...\n");
 
-    mark_update_checked();
-
-    let current_version = Version::parse(CURRENT_VERSION)?;
-    println!("Current version: {}", current_version);
-
-    // Fetch latest release from GitHub
-    let client = reqwest::Client::builder()
-        .user_agent("apas-updater")
-        .timeout(Duration::from_secs(10))
-        .build()?;
-
-    let url = format!("https://api.github.com/repos/{}/releases/latest", REPO);
-    let response = client.get(&url).send().await;
-
-    let latest_version = match response {
-        Ok(resp) if resp.status().is_success() => {
-            let release: GitHubRelease = resp.json().await?;
-            let latest_tag = release.tag_name.trim_start_matches('v');
-            Version::parse(latest_tag)?
-        }
-        _ => {
-            // No releases yet, check Cargo.toml from main branch
-            println!("No releases found, checking main branch...");
-            let cargo_url = format!(
-                "https://raw.githubusercontent.com/{}/master/Cargo.toml",
-                REPO
-            );
-            let resp = client.get(&cargo_url).send().await?;
-            if !resp.status().is_success() {
-                println!("Could not check for updates");
-                return Ok(());
-            }
-            let cargo_toml = resp.text().await?;
-            // Parse version from Cargo.toml
-            let version_line = cargo_toml
-                .lines()
-                .find(|l| l.starts_with("version = "))
-                .unwrap_or("version = \"0.1.0\"");
-            let version_str = version_line
-                .split('"')
-                .nth(1)
-                .unwrap_or("0.1.0");
-            Version::parse(version_str)?
-        }
-    };
-
-    println!("Latest version: {}", latest_version);
-
-    if latest_version <= current_version {
-        println!("Already up to date!");
-        return Ok(());
-    }
-
-    println!("\nNew version available: {} -> {}", current_version, latest_version);
-    println!("Building from source...\n");
-
-    // Build from source
+    // Clone and build from source
     let build_dir = env::temp_dir().join(format!("apas-update-{}", std::process::id()));
 
     // Clone repo
@@ -166,7 +153,16 @@ pub async fn check_and_update() -> Result<()> {
     fs::remove_file(&backup_path).ok();
     fs::remove_dir_all(&build_dir).ok();
 
-    println!("\nUpdated to version {}!", latest_version);
+    // Get new version
+    let output = Command::new(&current_exe)
+        .args(["--version"])
+        .output();
+
+    let new_version = output
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    println!("\nUpdated! {} -> {}", CURRENT_VERSION, new_version);
     println!("Restart apas to use the new version.");
 
     Ok(())
@@ -174,69 +170,21 @@ pub async fn check_and_update() -> Result<()> {
 
 /// Check for updates in the background (non-blocking)
 pub fn check_for_updates_background() {
-    tokio::spawn(async {
-        match check_update_available().await {
-            Ok(Some(new_version)) => {
-                println!("Update available: {} (run 'apas update' to install)", new_version);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::debug!("Update check failed: {}", e);
-            }
-        }
-    });
-}
-
-/// Check if update is available without installing
-async fn check_update_available() -> Result<Option<String>> {
+    // Skip if we checked recently
     if !should_check_for_updates() {
-        return Ok(None);
+        return;
     }
 
     mark_update_checked();
 
-    let current_version = Version::parse(CURRENT_VERSION)?;
+    std::thread::spawn(|| {
+        let current = parse_version(CURRENT_VERSION);
+        let remote = get_remote_version().and_then(|v| parse_version(&v));
 
-    let client = reqwest::Client::builder()
-        .user_agent("apas-updater")
-        .timeout(Duration::from_secs(5))
-        .build()?;
-
-    // Try releases first
-    let url = format!("https://api.github.com/repos/{}/releases/latest", REPO);
-    if let Ok(resp) = client.get(&url).send().await {
-        if resp.status().is_success() {
-            if let Ok(release) = resp.json::<GitHubRelease>().await {
-                let latest_tag = release.tag_name.trim_start_matches('v');
-                if let Ok(latest) = Version::parse(latest_tag) {
-                    if latest > current_version {
-                        return Ok(Some(latest.to_string()));
-                    }
-                }
+        if let (Some(curr), Some(rem)) = (current, remote) {
+            if rem > curr {
+                println!("Update available! Run 'apas update' to install.");
             }
         }
-    }
-
-    // Check Cargo.toml as fallback
-    let cargo_url = format!(
-        "https://raw.githubusercontent.com/{}/master/Cargo.toml",
-        REPO
-    );
-    if let Ok(resp) = client.get(&cargo_url).send().await {
-        if resp.status().is_success() {
-            if let Ok(text) = resp.text().await {
-                if let Some(line) = text.lines().find(|l| l.starts_with("version = ")) {
-                    if let Some(ver) = line.split('"').nth(1) {
-                        if let Ok(latest) = Version::parse(ver) {
-                            if latest > current_version {
-                                return Ok(Some(latest.to_string()));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(None)
+    });
 }

@@ -14,7 +14,7 @@ const DEFAULT_SERVER: &str = "ws://130.245.173.105:8081";
 #[derive(Parser)]
 #[command(name = "apas")]
 #[command(about = "Claude Code wrapper - runs locally and streams output to remote server")]
-#[command(version)]
+#[command(version = env!("APAS_VERSION"))]
 struct Cli {
     /// Run in offline/local mode only - no server connection
     #[arg(long, visible_alias = "local", conflicts_with = "remote")]
