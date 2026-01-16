@@ -87,7 +87,7 @@ fn run_dead_loop_session(
     let display_name = project_name.as_deref().unwrap_or("unnamed");
     println!("Project: {} (ID: {})", display_name, session_id);
     println!("Running in autonomous mode (Ctrl+C to stop)");
-    println!("Prompt: {}...\n", &prompt.chars().take(100).collect::<String>());
+    println!("\nPrompt:\n{}\n", prompt);
 
     let mut iteration = 0u64;
 
@@ -103,7 +103,7 @@ fn run_dead_loop_session(
         // Send prompt to server for web UI display
         let user_input_msg = CliToServer::UserInput {
             session_id,
-            text: format!("[Iteration {}] {}", iteration, &prompt.chars().take(100).collect::<String>()),
+            text: format!("[Iteration {}]\n{}", iteration, prompt),
         };
         if server_tx.blocking_send(user_input_msg).is_err() {
             tracing::debug!("Failed to send user input to server");
