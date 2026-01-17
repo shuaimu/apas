@@ -220,8 +220,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             )
                             .await;
 
-                        // Also load existing messages from file storage
-                        if let Ok(stored_messages) = state.storage.get_messages(&sid).await {
+                        // Also load existing messages from file storage (limit to recent 100)
+                        if let Ok(stored_messages) = state.storage.get_messages_with_limit(&sid, Some(100)).await {
                             let messages: Vec<MessageInfo> = stored_messages
                                 .into_iter()
                                 .map(|m| MessageInfo {
@@ -289,8 +289,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                 }
                 Ok(WebToServer::GetSessionMessages { session_id: sid }) => {
-                    // Get messages for a specific session from file storage
-                    match state.storage.get_messages(&sid).await {
+                    // Get messages for a specific session from file storage (limit to recent 100)
+                    match state.storage.get_messages_with_limit(&sid, Some(100)).await {
                         Ok(stored_messages) => {
                             let messages: Vec<MessageInfo> = stored_messages
                                 .into_iter()

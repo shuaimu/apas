@@ -39,7 +39,8 @@ export function Sidebar() {
           name,
           workingDir,
           hostname: session.hostname,
-          isActive: session.status === "active",
+          // Don't trust database status - only trust actual CLI connections
+          isActive: false,
           createdAt: session.createdAt,
         });
       }

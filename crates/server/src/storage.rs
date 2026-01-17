@@ -61,8 +61,13 @@ impl FileStorage {
         Ok(())
     }
 
-    /// Read all messages for a session
+    /// Read all messages for a session (with optional limit for recent messages)
     pub async fn get_messages(&self, session_id: &Uuid) -> Result<Vec<StoredMessage>> {
+        self.get_messages_with_limit(session_id, None).await
+    }
+
+    /// Read messages for a session, optionally limited to the most recent N
+    pub async fn get_messages_with_limit(&self, session_id: &Uuid, limit: Option<usize>) -> Result<Vec<StoredMessage>> {
         let file_path = self.messages_file(session_id);
 
         if !file_path.exists() {
@@ -83,6 +88,13 @@ impl FileStorage {
                 Err(e) => {
                     tracing::warn!("Failed to parse message line: {}", e);
                 }
+            }
+        }
+
+        // If limit specified, return only the most recent messages
+        if let Some(limit) = limit {
+            if messages.len() > limit {
+                messages = messages.split_off(messages.len() - limit);
             }
         }
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useCallback } from "react";
 import { useStore, Message } from "@/lib/store";
 import { UserMessage } from "./UserMessage";
 import { AssistantMessage } from "./AssistantMessage";
@@ -8,10 +8,28 @@ import { AssistantMessage } from "./AssistantMessage";
 export function MessageList() {
   const messages = useStore((state) => state.messages);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const shouldAutoScroll = useRef(true);
 
-  // Auto-scroll to bottom when new messages arrive
+  // Check if user is near the bottom (within 100px)
+  const checkIfAtBottom = useCallback(() => {
+    const container = containerRef.current;
+    if (!container) return true;
+    const threshold = 100;
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    return distanceFromBottom <= threshold;
+  }, []);
+
+  // Update auto-scroll flag on scroll
+  const handleScroll = useCallback(() => {
+    shouldAutoScroll.current = checkIfAtBottom();
+  }, [checkIfAtBottom]);
+
+  // Auto-scroll to bottom only if user was already at bottom
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (shouldAutoScroll.current) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
   }, [messages]);
 
   if (messages.length === 0) {
@@ -26,7 +44,11 @@ export function MessageList() {
   }
 
   return (
-    <div className="flex-1 overflow-y-auto px-4 py-6 space-y-4">
+    <div
+      ref={containerRef}
+      onScroll={handleScroll}
+      className="flex-1 overflow-y-auto px-4 py-6 space-y-4"
+    >
       {messages.map((message) => (
         <MessageComponent key={message.id} message={message} />
       ))}
