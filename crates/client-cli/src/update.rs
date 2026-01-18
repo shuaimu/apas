@@ -65,9 +65,9 @@ fn get_current_exe() -> Option<PathBuf> {
 fn get_remote_version() -> Option<String> {
     let build_dir = env::temp_dir().join(format!("apas-version-check-{}", std::process::id()));
 
-    // Shallow clone to check commit count
+    // Full clone needed for accurate commit count
     let status = Command::new("git")
-        .args(["clone", "--depth", "1", REPO_URL, build_dir.to_str()?])
+        .args(["clone", REPO_URL, build_dir.to_str()?])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -77,7 +77,7 @@ fn get_remote_version() -> Option<String> {
         return None;
     }
 
-    // Get commit count (need to unshallow for accurate count)
+    // Get commit count
     let output = Command::new("git")
         .args(["rev-list", "--count", "HEAD"])
         .current_dir(&build_dir)
@@ -108,10 +108,10 @@ pub async fn check_and_update() -> Result<()> {
     // Clone and build from source
     let build_dir = env::temp_dir().join(format!("apas-update-{}", std::process::id()));
 
-    // Clone repo
+    // Clone repo (full clone needed for accurate commit count in version)
     println!("Cloning repository...");
     let status = Command::new("git")
-        .args(["clone", "--depth", "1", REPO_URL, build_dir.to_str().unwrap()])
+        .args(["clone", REPO_URL, build_dir.to_str().unwrap()])
         .status()?;
 
     if !status.success() {
