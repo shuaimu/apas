@@ -8,9 +8,9 @@ use futures::{SinkExt, StreamExt};
 use shared::{CliToServer, ClaudeStreamMessage, ServerToCli};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -51,6 +51,23 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     // Flag to signal shutdown
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    // Shared handle to current Claude child process (for cleanup on Ctrl+C)
+    let child_process: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+
+    // Set up Ctrl+C handler to kill Claude process on exit
+    let shutdown_for_ctrlc = shutdown.clone();
+    let child_for_ctrlc = child_process.clone();
+    ctrlc::set_handler(move || {
+        println!("\nShutting down...");
+        shutdown_for_ctrlc.store(true, Ordering::SeqCst);
+        // Kill the Claude process if running
+        if let Ok(mut guard) = child_for_ctrlc.lock() {
+            if let Some(ref mut child) = *guard {
+                let _ = child.kill();
+            }
+        }
+    }).expect("Failed to set Ctrl+C handler");
+
     // Spawn server connection task (runs in background with auto-reconnect)
     let server_url_owned = server_url.to_string();
     let token_owned = token.to_string();
@@ -65,7 +82,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     let working_dir_owned = working_dir.to_path_buf();
     let shutdown_for_claude = shutdown.clone();
     let result = tokio::task::spawn_blocking(move || {
-        run_dead_loop_session(&claude_path_owned, &working_dir_owned, session_id, project_name, &prompt, server_tx, &shutdown_for_claude)
+        run_dead_loop_session(&claude_path_owned, &working_dir_owned, session_id, project_name, &prompt, server_tx, &shutdown_for_claude, child_process)
     }).await?;
 
     // Signal shutdown
@@ -84,6 +101,7 @@ fn run_dead_loop_session(
     prompt: &str,
     server_tx: mpsc::Sender<CliToServer>,
     shutdown: &Arc<AtomicBool>,
+    child_handle: Arc<Mutex<Option<Child>>>,
 ) -> Result<()> {
     let display_name = project_name.as_deref().unwrap_or("unnamed");
     println!("Project: {} (ID: {})", display_name, session_id);
@@ -141,6 +159,13 @@ fn run_dead_loop_session(
         let stderr = child.stderr.take()
             .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
 
+        // Store child in shared handle so Ctrl+C handler can kill it
+        if let Ok(mut guard) = child_handle.lock() {
+            *guard = Some(child);
+        }
+        // Get a reference back for waiting
+        let child_handle_clone = child_handle.clone();
+
         // Spawn thread to read stderr
         let stderr_thread = std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
@@ -191,9 +216,27 @@ fn run_dead_loop_session(
             }
         }
 
-        // Wait for child to exit
-        let status = child.wait()?;
-        tracing::debug!("Claude exited with status: {}", status);
+        // Wait for child to exit (get it back from the shared handle)
+        let status = if let Ok(mut guard) = child_handle_clone.lock() {
+            if let Some(ref mut child) = *guard {
+                // If shutdown requested, kill the child
+                if shutdown.load(Ordering::SeqCst) {
+                    let _ = child.kill();
+                }
+                let status = child.wait();
+                *guard = None; // Clear the handle
+                status
+            } else {
+                Err(std::io::Error::new(std::io::ErrorKind::Other, "Child process not found"))
+            }
+        } else {
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to lock child handle"))
+        };
+
+        match status {
+            Ok(s) => tracing::debug!("Claude exited with status: {}", s),
+            Err(e) => tracing::debug!("Error waiting for Claude: {}", e),
+        }
 
         // Wait for stderr thread
         let _ = stderr_thread.join();
