@@ -109,6 +109,8 @@ fn run_dead_loop_session(
     println!("\nPrompt:\n{}\n", prompt);
 
     let mut iteration = 0u64;
+    let mut backoff_seconds = 2u64; // Start with 2 seconds, will grow exponentially on errors
+    const MAX_BACKOFF: u64 = 3600; // Max 1 hour backoff
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -166,18 +168,32 @@ fn run_dead_loop_session(
         // Get a reference back for waiting
         let child_handle_clone = child_handle.clone();
 
-        // Spawn thread to read stderr
+        // Spawn thread to read stderr and detect rate limits
+        let rate_limit_detected = Arc::new(AtomicBool::new(false));
+        let rate_limit_clone = rate_limit_detected.clone();
         let stderr_thread = std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
             for line in reader.lines() {
                 if let Ok(line) = line {
                     eprintln!("{}", line);
+                    // Check for rate limit / usage limit keywords
+                    let lower = line.to_lowercase();
+                    if lower.contains("rate limit")
+                        || lower.contains("rate_limit")
+                        || lower.contains("usage limit")
+                        || lower.contains("too many requests")
+                        || lower.contains("quota exceeded")
+                        || lower.contains("capacity")
+                        || lower.contains("overloaded") {
+                        rate_limit_clone.store(true, Ordering::SeqCst);
+                    }
                 }
             }
         });
 
         // Read JSON lines from stdout
         let reader = BufReader::new(stdout);
+        let mut error_in_stream = false;
         for line in reader.lines() {
             if shutdown.load(Ordering::SeqCst) {
                 break;
@@ -197,14 +213,29 @@ fn run_dead_loop_session(
 
             // Parse JSON line
             match serde_json::from_str::<ClaudeStreamMessage>(&line) {
-                Ok(message) => {
+                Ok(ref message) => {
+                    // Check for error results (rate limit, etc.)
+                    if let ClaudeStreamMessage::Result { is_error, subtype, result, .. } = message {
+                        if *is_error || subtype == "error" || subtype.contains("error") {
+                            error_in_stream = true;
+                            // Check if it's a rate limit specifically
+                            let lower_result = result.to_lowercase();
+                            if lower_result.contains("rate")
+                                || lower_result.contains("limit")
+                                || lower_result.contains("quota")
+                                || lower_result.contains("capacity") {
+                                rate_limit_detected.store(true, Ordering::SeqCst);
+                            }
+                        }
+                    }
+
                     // Print locally for visibility
-                    print_stream_message(&message);
+                    print_stream_message(message);
 
                     // Forward to server
                     let msg = CliToServer::StreamMessage {
                         session_id,
-                        message,
+                        message: message.clone(),
                     };
                     if server_tx.blocking_send(msg).is_err() {
                         tracing::debug!("Server channel closed");
@@ -233,7 +264,7 @@ fn run_dead_loop_session(
             Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to lock child handle"))
         };
 
-        match status {
+        match &status {
             Ok(s) => tracing::debug!("Claude exited with status: {}", s),
             Err(e) => tracing::debug!("Error waiting for Claude: {}", e),
         }
@@ -241,11 +272,37 @@ fn run_dead_loop_session(
         // Wait for stderr thread
         let _ = stderr_thread.join();
 
-        println!("\n[Iteration {} completed]", iteration);
+        // Check if we hit a rate limit or error
+        let hit_rate_limit = rate_limit_detected.load(Ordering::SeqCst);
+        let had_error = error_in_stream || hit_rate_limit || !matches!(status, Ok(ref s) if s.success());
 
-        // Small delay between iterations to avoid hammering
-        if !shutdown.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_secs(2));
+        if had_error {
+            if hit_rate_limit {
+                println!("\n[Rate limit detected! Backing off for {} seconds...]", backoff_seconds);
+            } else {
+                println!("\n[Error detected. Backing off for {} seconds...]", backoff_seconds);
+            }
+
+            // Wait with backoff (check shutdown flag periodically)
+            let wait_until = std::time::Instant::now() + Duration::from_secs(backoff_seconds);
+            while std::time::Instant::now() < wait_until {
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+
+            // Increase backoff for next error (exponential)
+            backoff_seconds = std::cmp::min(backoff_seconds * 2, MAX_BACKOFF);
+        } else {
+            println!("\n[Iteration {} completed]", iteration);
+            // Reset backoff on success
+            backoff_seconds = 2;
+
+            // Small delay between iterations to avoid hammering
+            if !shutdown.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_secs(2));
+            }
         }
     }
 
