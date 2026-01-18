@@ -152,13 +152,17 @@ pub async fn check_and_update() -> Result<()> {
     fs::remove_file(&backup_path).ok();
     fs::remove_dir_all(&build_dir).ok();
 
-    // Get new version
+    // Get new version (--version outputs "apas X.Y.Z", extract just version)
     let output = Command::new(&current_exe)
         .args(["--version"])
         .output();
 
     let new_version = output
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .map(|o| {
+            let full = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            // Extract version number after "apas "
+            full.strip_prefix("apas ").unwrap_or(&full).to_string()
+        })
         .unwrap_or_else(|_| "unknown".to_string());
 
     println!("\nUpdated! {} -> {}", CURRENT_VERSION, new_version);
