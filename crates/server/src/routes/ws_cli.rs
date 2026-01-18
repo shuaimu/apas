@@ -159,6 +159,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         session_id,
                         working_dir,
                         hostname,
+                        pane_type: _,
                     }) => {
                         // CLI is starting a local session (hybrid mode)
                         state.sessions.create_cli_session(session_id, cli_id);
@@ -193,11 +194,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 ServerToWeb::Output {
                                     content: data,
                                     output_type,
+                                    pane_type: None,
                                 },
                             )
                             .await;
                     }
-                    Ok(CliToServer::StreamMessage { session_id, message }) => {
+                    Ok(CliToServer::StreamMessage { session_id, message, pane_type }) => {
                         // Save message to file storage
                         if let Some(stored_message) = stream_message_to_stored(&session_id, &message) {
                             if let Err(e) = state.storage.append_message(&session_id, &stored_message).await {
@@ -210,11 +212,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .sessions
                             .route_to_web(
                                 &session_id,
-                                ServerToWeb::StreamMessage { session_id, message },
+                                ServerToWeb::StreamMessage { session_id, message, pane_type },
                             )
                             .await;
                     }
-                    Ok(CliToServer::UserInput { session_id, text }) => {
+                    Ok(CliToServer::UserInput { session_id, text, pane_type }) => {
                         tracing::info!("Received UserInput for session {}: {}", session_id, text);
                         // Save user input to file storage
                         let stored_message = crate::storage::StoredMessage {
@@ -233,7 +235,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .sessions
                             .route_to_web(
                                 &session_id,
-                                ServerToWeb::UserInput { session_id, text },
+                                ServerToWeb::UserInput { session_id, text, pane_type },
                             )
                             .await;
                     }

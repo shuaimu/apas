@@ -2,12 +2,13 @@
 
 import { useEffect } from "react";
 import { MessageList } from "@/components/chat/MessageList";
+import { DualPaneView } from "@/components/chat/DualPaneView";
 import { Sidebar } from "@/components/Sidebar";
 import { useStore } from "@/lib/store";
 import { Settings, Wifi, WifiOff } from "lucide-react";
 
 export default function Home() {
-  const { connected, connect, sessionId } = useStore();
+  const { connected, connect, sessionId, isDualPane } = useStore();
 
   useEffect(() => {
     // Auto-connect on mount (dev mode - no auth needed)
@@ -54,7 +55,7 @@ export default function Home() {
         {/* Chat area or placeholder */}
         {sessionId ? (
           <main className="flex-1 overflow-hidden flex flex-col">
-            <MessageList />
+            {isDualPane ? <DualPaneView /> : <MessageList />}
           </main>
         ) : (
           <div className="flex-1 flex items-center justify-center text-gray-400">

@@ -21,6 +21,8 @@ pub enum CliToServer {
         session_id: Uuid,
         working_dir: Option<String>,
         hostname: Option<String>,
+        #[serde(default)]
+        pane_type: Option<PaneType>,
     },
 
     /// Claude output to be forwarded to web client
@@ -41,12 +43,16 @@ pub enum CliToServer {
     StreamMessage {
         session_id: Uuid,
         message: ClaudeStreamMessage,
+        #[serde(default)]
+        pane_type: Option<PaneType>,
     },
 
     /// User input/prompt from CLI (to be displayed in web UI)
     UserInput {
         session_id: Uuid,
         text: String,
+        #[serde(default)]
+        pane_type: Option<PaneType>,
     },
 }
 
@@ -106,7 +112,11 @@ pub enum WebToServer {
     AttachSession { session_id: Uuid },
 
     /// User input to send to Claude
-    Input { text: String },
+    Input {
+        text: String,
+        #[serde(default)]
+        pane_type: Option<PaneType>,
+    },
 
     /// Approve a tool call
     Approve { tool_call_id: String },
@@ -141,7 +151,11 @@ pub enum ServerToWeb {
     AuthenticationFailed { reason: String },
 
     /// Session started
-    SessionStarted { session_id: Uuid },
+    SessionStarted {
+        session_id: Uuid,
+        #[serde(default)]
+        pane_type: Option<PaneType>,
+    },
 
     /// Session status update
     SessionStatus { status: SessionStatus },
@@ -151,6 +165,8 @@ pub enum ServerToWeb {
         content: String,
         #[serde(default)]
         output_type: OutputType,
+        #[serde(default)]
+        pane_type: Option<PaneType>,
     },
 
     /// Error message
@@ -163,6 +179,8 @@ pub enum ServerToWeb {
     StreamMessage {
         session_id: Uuid,
         message: ClaudeStreamMessage,
+        #[serde(default)]
+        pane_type: Option<PaneType>,
     },
 
     /// List of persisted sessions
@@ -180,6 +198,8 @@ pub enum ServerToWeb {
     UserInput {
         session_id: Uuid,
         text: String,
+        #[serde(default)]
+        pane_type: Option<PaneType>,
     },
 }
 
@@ -207,6 +227,17 @@ pub struct MessageInfo {
 // ============================================================================
 // Shared Types
 // ============================================================================
+
+/// Pane type for dual-pane mode
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneType {
+    /// Autonomous deadloop worker (left pane)
+    #[default]
+    Deadloop,
+    /// Interactive user session (right pane)
+    Interactive,
+}
 
 /// Type of output content
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -391,6 +422,7 @@ impl ServerToWeb {
         Self::Output {
             content: content.into(),
             output_type: OutputType::Text,
+            pane_type: None,
         }
     }
 

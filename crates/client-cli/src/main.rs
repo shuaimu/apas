@@ -6,6 +6,7 @@ mod config;
 mod claude;
 mod mode;
 mod project;
+mod tui;
 mod update;
 
 // Default server URL
@@ -23,6 +24,10 @@ struct Cli {
     /// Run in remote-only mode - no local I/O, server controls everything
     #[arg(long, conflicts_with = "offline")]
     remote: bool,
+
+    /// Run in dual-pane mode - split terminal with deadloop and interactive sessions
+    #[arg(long, conflicts_with_all = ["offline", "remote"])]
+    dual_pane: bool,
 
     /// Server URL (overrides config)
     #[arg(long)]
@@ -109,6 +114,18 @@ async fn main() -> Result<()> {
         // Offline/local mode - no server connection
         tracing::info!("Starting in offline mode (no server connection)");
         mode::local::run(&working_dir).await?;
+    } else if cli.dual_pane {
+        // Dual-pane mode - split terminal with deadloop and interactive
+        let config = config::Config::load()?;
+        let server = cli.server
+            .or(config.remote.server)
+            .unwrap_or_else(|| DEFAULT_SERVER.to_string());
+        let token = cli.token
+            .or(config.remote.token)
+            .unwrap_or_else(|| "dev".to_string());
+
+        tracing::info!("Starting in dual-pane mode (streaming to {})", server);
+        mode::dual_pane::run(&server, &token, &working_dir).await?;
     } else if cli.remote {
         // Remote-only mode - no local I/O
         let config = config::Config::load()?;

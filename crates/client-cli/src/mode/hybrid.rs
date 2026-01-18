@@ -125,6 +125,7 @@ fn run_dead_loop_session(
         let user_input_msg = CliToServer::UserInput {
             session_id,
             text: format!("[Iteration {}]\n{}", iteration, prompt),
+            pane_type: None,
         };
         if server_tx.blocking_send(user_input_msg).is_err() {
             tracing::debug!("Failed to send user input to server");
@@ -236,6 +237,7 @@ fn run_dead_loop_session(
                     let msg = CliToServer::StreamMessage {
                         session_id,
                         message: message.clone(),
+                        pane_type: None,
                     };
                     if server_tx.blocking_send(msg).is_err() {
                         tracing::debug!("Server channel closed");
@@ -442,6 +444,7 @@ async fn connect_to_server(
         session_id,
         working_dir: Some(working_dir.to_string()),
         hostname,
+        pane_type: None,
     };
     let msg_text = serde_json::to_string(&session_start_msg)?;
     ws_sender.send(Message::Text(msg_text.into())).await?;

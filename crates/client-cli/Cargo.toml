@@ -38,3 +38,7 @@ tracing-subscriber = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 hostname = "0.4.2"
 ctrlc = "3.4"
+
+# TUI for dual-pane mode
+ratatui = "0.29"
+crossterm = "0.28"

@@ -47,6 +47,8 @@ export type OutputType =
   | { type: "system" }
   | { type: "error" };
 
+export type PaneType = "deadloop" | "interactive";
+
 interface AppState {
   // Connection state
   connected: boolean;
@@ -61,10 +63,15 @@ interface AppState {
   // Persisted sessions
   sessions: SessionInfo[];
 
-  // Messages
+  // Messages (single pane mode)
   messages: Message[];
   hasMoreMessages: boolean; // Whether there are older messages to load
   isLoadingMore: boolean; // Prevent multiple simultaneous loads
+
+  // Dual pane mode
+  isDualPane: boolean;
+  deadloopMessages: Message[];
+  interactiveMessages: Message[];
 
   // Actions
   connect: () => void;
@@ -81,6 +88,8 @@ interface AppState {
   loadSessionMessages: (sessionId: string) => void;
   loadMoreMessages: () => void; // Load older messages
   prependMessages: (messages: Message[], hasMore: boolean) => void; // Prepend older messages
+  sendMessageToPane: (text: string, pane: PaneType) => void; // Send to specific pane
+  addMessageToPane: (message: Message, pane: PaneType) => void; // Add message to specific pane
   startAutoRefresh: () => void;
   stopAutoRefresh: () => void;
 }
@@ -98,6 +107,9 @@ export const useStore = create<AppState>((set, get) => ({
   messages: [],
   hasMoreMessages: false,
   isLoadingMore: false,
+  isDualPane: false,
+  deadloopMessages: [],
+  interactiveMessages: [],
 
   connect: () => {
     const ws = new WebSocket(`${WS_URL}/ws/web`);
@@ -161,8 +173,14 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
 
-    // Clear previous messages and mark as attached
-    set({ messages: [], isAttached: true });
+    // Clear previous messages and reset dual pane state
+    set({
+      messages: [],
+      deadloopMessages: [],
+      interactiveMessages: [],
+      isDualPane: false,
+      isAttached: true
+    });
 
     // Attach to existing session
     ws.send(JSON.stringify({
@@ -276,6 +294,39 @@ export const useStore = create<AppState>((set, get) => ({
     }));
   },
 
+  sendMessageToPane: (text: string, pane: PaneType) => {
+    const { ws, sessionId } = get();
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      console.error("WebSocket not connected");
+      return;
+    }
+
+    // Add user message to appropriate pane
+    const userMessage: Message = {
+      id: generateId(),
+      role: "user",
+      content: text,
+      timestamp: new Date(),
+      outputType: { type: "text" },
+    };
+    get().addMessageToPane(userMessage, pane);
+
+    // Send to server with pane type
+    ws.send(JSON.stringify({
+      type: "input",
+      text,
+      pane_type: pane
+    }));
+  },
+
+  addMessageToPane: (message: Message, pane: PaneType) => {
+    if (pane === "deadloop") {
+      set((state) => ({ deadloopMessages: [...state.deadloopMessages, message] }));
+    } else {
+      set((state) => ({ interactiveMessages: [...state.interactiveMessages, message] }));
+    }
+  },
+
   startAutoRefresh: () => {
     const { refreshInterval } = get();
     if (refreshInterval) return; // Already running
@@ -309,6 +360,37 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 }));
+
+// Helper function to route messages to correct array based on pane type
+function addMessageWithPaneRouting(
+  set: (partial: Partial<AppState> | ((state: AppState) => Partial<AppState>)) => void,
+  get: () => AppState,
+  message: Message,
+  paneType: string | undefined
+) {
+  let { isDualPane } = get();
+
+  // Auto-detect dual pane mode when we receive a pane_type
+  if (paneType && !isDualPane) {
+    set({ isDualPane: true });
+    isDualPane = true;
+  }
+
+  if (isDualPane && paneType) {
+    // Dual pane mode - route to specific array
+    if (paneType === "deadloop") {
+      set((state) => ({ deadloopMessages: [...state.deadloopMessages, message] }));
+    } else if (paneType === "interactive") {
+      set((state) => ({ interactiveMessages: [...state.interactiveMessages, message] }));
+    } else {
+      // Unknown pane type, add to main messages
+      set((state) => ({ messages: [...state.messages, message] }));
+    }
+  } else {
+    // Single pane mode - add to main messages
+    set((state) => ({ messages: [...state.messages, message] }));
+  }
+}
 
 function handleServerMessage(
   data: Record<string, unknown>,
@@ -430,7 +512,8 @@ function handleServerMessage(
         timestamp: new Date(),
         outputType: { type: "text" },
       };
-      set((state) => ({ messages: [...state.messages, userMessage] }));
+      const paneType = data.pane_type as string | undefined;
+      addMessageWithPaneRouting(set, get, userMessage, paneType);
       break;
     }
 
@@ -439,6 +522,7 @@ function handleServerMessage(
       const msg = data.message as Record<string, unknown>;
       if (!msg) break;
 
+      const paneType = data.pane_type as string | undefined;
       const msgType = msg.type as string;
       if (msgType === "assistant") {
         const message = msg.message as Record<string, unknown>;
@@ -453,7 +537,7 @@ function handleServerMessage(
                 timestamp: new Date(),
                 outputType: { type: "text" },
               };
-              set((state) => ({ messages: [...state.messages, assistantMessage] }));
+              addMessageWithPaneRouting(set, get, assistantMessage, paneType);
             } else if (block.type === "tool_use") {
               const toolMessage: Message = {
                 id: generateId(),
@@ -462,7 +546,7 @@ function handleServerMessage(
                 timestamp: new Date(),
                 outputType: { type: "tool_use", tool: block.name as string, input: block.input },
               };
-              set((state) => ({ messages: [...state.messages, toolMessage] }));
+              addMessageWithPaneRouting(set, get, toolMessage, paneType);
             }
           }
         }
@@ -474,7 +558,7 @@ function handleServerMessage(
           timestamp: new Date(),
           outputType: { type: "system" },
         };
-        set((state) => ({ messages: [...state.messages, resultMessage] }));
+        addMessageWithPaneRouting(set, get, resultMessage, paneType);
       }
       break;
     }

@@ -109,6 +109,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             &connection_id,
                             ServerToWeb::SessionStarted {
                                 session_id: new_session_id,
+                                pane_type: None,
                             },
                         )
                         .await;
@@ -128,9 +129,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                     tracing::info!("Session started: {} (CLI: {:?})", new_session_id, cli_id);
                 }
-                Ok(WebToServer::Input { text }) => {
+                Ok(WebToServer::Input { text, pane_type }) => {
                     if let Some(sid) = session_id {
-                        // Route input to CLI
+                        // Route input to CLI (pane_type will be used for dual-pane routing)
+                        let _ = pane_type; // TODO: Use pane_type for routing to correct session
                         let sent = state
                             .sessions
                             .route_to_cli(
@@ -207,7 +209,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .sessions
                             .send_to_web(
                                 &connection_id,
-                                ServerToWeb::SessionStarted { session_id: sid },
+                                ServerToWeb::SessionStarted {
+                                    session_id: sid,
+                                    pane_type: None,
+                                },
                             )
                             .await;
                         state
