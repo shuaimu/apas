@@ -25,17 +25,8 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
 
     // Load or create project metadata
     let metadata = get_or_create_project(working_dir)?;
-    let deadloop_session_id = metadata.id;
-    // Create a derived UUID for interactive session by XORing with a fixed pattern
-    let interactive_bytes: [u8; 16] = {
-        let mut bytes = *deadloop_session_id.as_bytes();
-        // XOR with pattern to create different but deterministic UUID
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b ^= 0x55 ^ (i as u8);
-        }
-        bytes
-    };
-    let interactive_session_id = Uuid::from_bytes(interactive_bytes);
+    // Use same session_id for both panes - pane_type differentiates them
+    let session_id = metadata.id;
 
     let prompt = metadata.prompt.clone().unwrap_or_else(|| {
         "You are an autonomous AI developer. Review, fix, and improve the codebase.".to_string()
@@ -81,8 +72,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
         run_server_connection(
             &server_url_clone,
             &token_clone,
-            deadloop_session_id,
-            interactive_session_id,
+            session_id,
             &working_dir_clone,
             server_rx,
             shutdown_clone,
@@ -102,7 +92,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
         run_deadloop_session(
             &deadloop_claude_path,
             &deadloop_working_dir,
-            deadloop_session_id,
+            session_id,
             &deadloop_prompt,
             deadloop_output_tx,
             deadloop_server_tx,
@@ -121,7 +111,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
         run_interactive_session(
             &interactive_claude_path,
             &interactive_working_dir,
-            interactive_session_id,
+            session_id,
             input_rx,
             interactive_output_tx,
             interactive_server_tx,
@@ -456,8 +446,7 @@ fn format_stream_message(message: &ClaudeStreamMessage) -> String {
 async fn run_server_connection(
     server_url: &str,
     token: &str,
-    deadloop_session_id: Uuid,
-    interactive_session_id: Uuid,
+    session_id: Uuid,
     working_dir: &str,
     mut output_rx: tokio_mpsc::Receiver<CliToServer>,
     shutdown: Arc<AtomicBool>,
@@ -514,24 +503,19 @@ async fn run_server_connection(
                     }
                 }
 
-                // Register both sessions
+                // Register session (pane_type in messages will differentiate deadloop vs interactive)
                 let hostname = hostname::get()
                     .ok()
                     .and_then(|h| h.into_string().ok());
 
-                for (session_id, pane_type) in [
-                    (deadloop_session_id, PaneType::Deadloop),
-                    (interactive_session_id, PaneType::Interactive),
-                ] {
-                    let session_start = CliToServer::SessionStart {
-                        session_id,
-                        working_dir: Some(working_dir.to_string()),
-                        hostname: hostname.clone(),
-                        pane_type: Some(pane_type),
-                    };
-                    let msg_text = serde_json::to_string(&session_start)?;
-                    ws_sender.send(Message::Text(msg_text.into())).await?;
-                }
+                let session_start = CliToServer::SessionStart {
+                    session_id,
+                    working_dir: Some(working_dir.to_string()),
+                    hostname,
+                    pane_type: None, // Single session, pane_type on individual messages
+                };
+                let msg_text = serde_json::to_string(&session_start)?;
+                ws_sender.send(Message::Text(msg_text.into())).await?;
 
                 // Main loop
                 loop {
