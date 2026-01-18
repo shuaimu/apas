@@ -57,6 +57,10 @@ export function MessageList() {
   );
 }
 
+function formatTime(date: Date): string {
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
 function MessageComponent({ message }: { message: Message }) {
   switch (message.role) {
     case "user":
@@ -66,7 +70,8 @@ function MessageComponent({ message }: { message: Message }) {
     case "system":
       return (
         <div className="text-center text-sm text-gray-500 py-2">
-          {message.content}
+          <span>{message.content}</span>
+          <span className="text-xs text-gray-400 ml-2">{formatTime(message.timestamp)}</span>
         </div>
       );
     default:

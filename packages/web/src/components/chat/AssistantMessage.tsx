@@ -11,6 +11,10 @@ interface AssistantMessageProps {
   message: Message;
 }
 
+function formatTime(date: Date): string {
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
 export function AssistantMessage({ message }: AssistantMessageProps) {
   const outputType = message.outputType;
 
@@ -21,6 +25,9 @@ export function AssistantMessage({ message }: AssistantMessageProps) {
       </div>
       <div className="max-w-[80%] flex-1">
         {renderContent(message, outputType)}
+        <div className="text-xs text-gray-400 mt-1">
+          {formatTime(message.timestamp)}
+        </div>
       </div>
     </div>
   );
