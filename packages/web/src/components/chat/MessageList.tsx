@@ -104,8 +104,16 @@ export function MessageList() {
   );
 }
 
-function formatTime(date: Date): string {
-  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+function formatTimestamp(date: Date): string {
+  const now = new Date();
+  const isToday = date.toDateString() === now.toDateString();
+
+  if (isToday) {
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  } else {
+    return date.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' +
+           date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
 }
 
 function MessageComponent({ message }: { message: Message }) {
@@ -118,7 +126,7 @@ function MessageComponent({ message }: { message: Message }) {
       return (
         <div className="text-center text-sm text-gray-500 py-2">
           <span>{message.content}</span>
-          <span className="text-xs text-gray-400 ml-2">{formatTime(message.timestamp)}</span>
+          <span className="text-xs text-gray-400 ml-2">{formatTimestamp(message.timestamp)}</span>
         </div>
       );
     default:

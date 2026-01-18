@@ -7,8 +7,16 @@ interface UserMessageProps {
   message: Message;
 }
 
-function formatTime(date: Date): string {
-  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+function formatTimestamp(date: Date): string {
+  const now = new Date();
+  const isToday = date.toDateString() === now.toDateString();
+
+  if (isToday) {
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  } else {
+    return date.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' +
+           date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
 }
 
 export function UserMessage({ message }: UserMessageProps) {
@@ -19,7 +27,7 @@ export function UserMessage({ message }: UserMessageProps) {
           <p className="whitespace-pre-wrap">{message.content}</p>
         </div>
         <div className="text-xs text-gray-400 mt-1 text-right">
-          {formatTime(message.timestamp)}
+          {formatTimestamp(message.timestamp)}
         </div>
       </div>
       <div className="flex-shrink-0 w-8 h-8 rounded-full bg-blue-100 dark:bg-blue-900 flex items-center justify-center">
