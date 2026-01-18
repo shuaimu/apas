@@ -63,6 +63,8 @@ interface AppState {
 
   // Messages
   messages: Message[];
+  hasMoreMessages: boolean; // Whether there are older messages to load
+  isLoadingMore: boolean; // Prevent multiple simultaneous loads
 
   // Actions
   connect: () => void;
@@ -77,6 +79,8 @@ interface AppState {
   refreshCliClients: () => void;
   listSessions: () => void;
   loadSessionMessages: (sessionId: string) => void;
+  loadMoreMessages: () => void; // Load older messages
+  prependMessages: (messages: Message[], hasMore: boolean) => void; // Prepend older messages
   startAutoRefresh: () => void;
   stopAutoRefresh: () => void;
 }
@@ -92,6 +96,8 @@ export const useStore = create<AppState>((set, get) => ({
   cliClients: [],
   sessions: [],
   messages: [],
+  hasMoreMessages: false,
+  isLoadingMore: false,
 
   connect: () => {
     const ws = new WebSocket(`${WS_URL}/ws/web`);
@@ -238,6 +244,38 @@ export const useStore = create<AppState>((set, get) => ({
     set({ messages: [] });
   },
 
+  loadMoreMessages: () => {
+    const { ws, sessionId, messages, isLoadingMore, hasMoreMessages } = get();
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    if (!sessionId || isLoadingMore || !hasMoreMessages) {
+      return;
+    }
+    if (messages.length === 0) {
+      return;
+    }
+
+    // Get the ID of the oldest message we have
+    const oldestMessage = messages[0];
+    set({ isLoadingMore: true });
+
+    ws.send(JSON.stringify({
+      type: "get_session_messages",
+      session_id: sessionId,
+      limit: 50,
+      before_id: oldestMessage.id
+    }));
+  },
+
+  prependMessages: (newMessages: Message[], hasMore: boolean) => {
+    set((state) => ({
+      messages: [...newMessages, ...state.messages],
+      hasMoreMessages: hasMore,
+      isLoadingMore: false
+    }));
+  },
+
   startAutoRefresh: () => {
     const { refreshInterval } = get();
     if (refreshInterval) return; // Already running
@@ -358,16 +396,28 @@ function handleServerMessage(
 
     case "session_messages": {
       const messages = (data.messages as Array<Record<string, unknown>>) || [];
-      set({
-        sessionId: data.session_id as string,
-        messages: messages.map((m) => ({
-          id: m.id as string,
-          role: m.role as "user" | "assistant" | "system",
-          content: m.content as string,
-          timestamp: new Date(m.created_at as string || Date.now()),
-          outputType: { type: m.message_type as "text" | "system" || "text" } as OutputType,
-        })),
-      });
+      const hasMore = data.has_more as boolean || false;
+      const parsedMessages: Message[] = messages.map((m) => ({
+        id: m.id as string,
+        role: m.role as "user" | "assistant" | "system",
+        content: m.content as string,
+        timestamp: new Date(m.created_at as string || Date.now()),
+        outputType: { type: m.message_type as "text" | "system" || "text" } as OutputType,
+      }));
+
+      // Check if this is a "load more" request (prepend) or initial load (replace)
+      const { isLoadingMore } = get();
+      if (isLoadingMore) {
+        // Prepend older messages
+        get().prependMessages(parsedMessages, hasMore);
+      } else {
+        // Initial load - replace all messages
+        set({
+          sessionId: data.session_id as string,
+          messages: parsedMessages,
+          hasMoreMessages: hasMore,
+        });
+      }
       break;
     }
 

@@ -221,7 +221,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
 
                         // Also load existing messages from file storage (limit to recent 100)
-                        if let Ok(stored_messages) = state.storage.get_messages_with_limit(&sid, Some(100)).await {
+                        if let Ok((stored_messages, has_more)) = state.storage.get_messages_paginated(&sid, Some(100), None).await {
                             let messages: Vec<MessageInfo> = stored_messages
                                 .into_iter()
                                 .map(|m| MessageInfo {
@@ -236,7 +236,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 .sessions
                                 .send_to_web(
                                     &connection_id,
-                                    ServerToWeb::SessionMessages { session_id: sid, messages },
+                                    ServerToWeb::SessionMessages { session_id: sid, messages, has_more },
                                 )
                                 .await;
                         }
@@ -288,10 +288,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         }
                     }
                 }
-                Ok(WebToServer::GetSessionMessages { session_id: sid }) => {
-                    // Get messages for a specific session from file storage (limit to recent 100)
-                    match state.storage.get_messages_with_limit(&sid, Some(100)).await {
-                        Ok(stored_messages) => {
+                Ok(WebToServer::GetSessionMessages { session_id: sid, limit, before_id }) => {
+                    // Get messages for a specific session from file storage with pagination
+                    let limit = limit.unwrap_or(100);
+                    match state.storage.get_messages_paginated(&sid, Some(limit), before_id.as_deref()).await {
+                        Ok((stored_messages, has_more)) => {
                             let messages: Vec<MessageInfo> = stored_messages
                                 .into_iter()
                                 .map(|m| MessageInfo {
@@ -306,7 +307,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 .sessions
                                 .send_to_web(
                                     &connection_id,
-                                    ServerToWeb::SessionMessages { session_id: sid, messages },
+                                    ServerToWeb::SessionMessages { session_id: sid, messages, has_more },
                                 )
                                 .await;
                         }

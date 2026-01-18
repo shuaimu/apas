@@ -120,8 +120,14 @@ pub enum WebToServer {
     /// List all sessions (persisted)
     ListSessions,
 
-    /// Get messages for a specific session
-    GetSessionMessages { session_id: Uuid },
+    /// Get messages for a specific session (with optional pagination)
+    GetSessionMessages {
+        session_id: Uuid,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        before_id: Option<String>, // Load messages before this message ID
+    },
 }
 
 /// Messages sent from server to web client
@@ -163,7 +169,12 @@ pub enum ServerToWeb {
     Sessions { sessions: Vec<SessionInfo> },
 
     /// Messages for a session
-    SessionMessages { session_id: Uuid, messages: Vec<MessageInfo> },
+    SessionMessages {
+        session_id: Uuid,
+        messages: Vec<MessageInfo>,
+        #[serde(default)]
+        has_more: bool, // True if there are older messages to load
+    },
 
     /// User input/prompt from CLI (displayed in web UI)
     UserInput {

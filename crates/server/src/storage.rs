@@ -68,37 +68,65 @@ impl FileStorage {
 
     /// Read messages for a session, optionally limited to the most recent N
     pub async fn get_messages_with_limit(&self, session_id: &Uuid, limit: Option<usize>) -> Result<Vec<StoredMessage>> {
+        let (messages, _) = self.get_messages_paginated(session_id, limit, None).await?;
+        Ok(messages)
+    }
+
+    /// Read messages for a session with pagination support
+    /// Returns (messages, has_more)
+    pub async fn get_messages_paginated(
+        &self,
+        session_id: &Uuid,
+        limit: Option<usize>,
+        before_id: Option<&str>,
+    ) -> Result<(Vec<StoredMessage>, bool)> {
         let file_path = self.messages_file(session_id);
 
         if !file_path.exists() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
 
         let file = fs::File::open(&file_path).await?;
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
-        let mut messages = Vec::new();
+        let mut all_messages = Vec::new();
 
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
                 continue;
             }
             match serde_json::from_str::<StoredMessage>(&line) {
-                Ok(msg) => messages.push(msg),
+                Ok(msg) => all_messages.push(msg),
                 Err(e) => {
                     tracing::warn!("Failed to parse message line: {}", e);
                 }
             }
         }
 
-        // If limit specified, return only the most recent messages
-        if let Some(limit) = limit {
-            if messages.len() > limit {
-                messages = messages.split_off(messages.len() - limit);
+        // If before_id is specified, find messages before that ID
+        let messages = if let Some(before_id) = before_id {
+            // Find the index of the message with before_id
+            if let Some(idx) = all_messages.iter().position(|m| m.id == before_id) {
+                // Take messages before this index
+                all_messages[..idx].to_vec()
+            } else {
+                // ID not found, return empty
+                Vec::new()
             }
-        }
+        } else {
+            all_messages
+        };
 
-        Ok(messages)
+        // Apply limit (take from the end to get most recent)
+        let limit = limit.unwrap_or(100);
+        let has_more = messages.len() > limit;
+        let result = if messages.len() > limit {
+            messages[messages.len() - limit..].to_vec()
+        } else {
+            messages
+        };
+
+        Ok((result, has_more))
     }
 
     /// List all session IDs that have message files

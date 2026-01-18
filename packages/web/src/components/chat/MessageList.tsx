@@ -7,9 +7,14 @@ import { AssistantMessage } from "./AssistantMessage";
 
 export function MessageList() {
   const messages = useStore((state) => state.messages);
+  const hasMoreMessages = useStore((state) => state.hasMoreMessages);
+  const isLoadingMore = useStore((state) => state.isLoadingMore);
+  const loadMoreMessages = useStore((state) => state.loadMoreMessages);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const shouldAutoScroll = useRef(true);
+  const previousScrollHeight = useRef<number>(0);
+  const previousMessageCount = useRef<number>(0);
 
   // Check if user is near the bottom (within 100px)
   const checkIfAtBottom = useCallback(() => {
@@ -20,12 +25,42 @@ export function MessageList() {
     return distanceFromBottom <= threshold;
   }, []);
 
-  // Update auto-scroll flag on scroll
+  // Check if user is near the top (within 50px)
+  const checkIfAtTop = useCallback(() => {
+    const container = containerRef.current;
+    if (!container) return false;
+    return container.scrollTop <= 50;
+  }, []);
+
+  // Update auto-scroll flag on scroll and check for loading more
   const handleScroll = useCallback(() => {
     shouldAutoScroll.current = checkIfAtBottom();
-  }, [checkIfAtBottom]);
 
-  // Auto-scroll to bottom only if user was already at bottom
+    // Load more when scrolled to top
+    if (checkIfAtTop() && hasMoreMessages && !isLoadingMore) {
+      loadMoreMessages();
+    }
+  }, [checkIfAtBottom, checkIfAtTop, hasMoreMessages, isLoadingMore, loadMoreMessages]);
+
+  // Preserve scroll position when prepending messages
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    // If messages were prepended (count increased but we were loading more)
+    if (messages.length > previousMessageCount.current && previousScrollHeight.current > 0) {
+      const scrollDiff = container.scrollHeight - previousScrollHeight.current;
+      if (scrollDiff > 0 && container.scrollTop < 100) {
+        // Restore scroll position relative to old content
+        container.scrollTop = scrollDiff;
+      }
+    }
+
+    previousScrollHeight.current = container.scrollHeight;
+    previousMessageCount.current = messages.length;
+  }, [messages]);
+
+  // Auto-scroll to bottom only if user was already at bottom (for new messages at bottom)
   useEffect(() => {
     if (shouldAutoScroll.current) {
       messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -49,6 +84,18 @@ export function MessageList() {
       onScroll={handleScroll}
       className="flex-1 overflow-y-auto px-4 py-6 space-y-4"
     >
+      {/* Loading indicator at top */}
+      {isLoadingMore && (
+        <div className="text-center text-sm text-gray-400 py-2">
+          Loading older messages...
+        </div>
+      )}
+      {/* Show hint if there are more messages */}
+      {hasMoreMessages && !isLoadingMore && (
+        <div className="text-center text-xs text-gray-500 py-1">
+          Scroll up to load more
+        </div>
+      )}
       {messages.map((message) => (
         <MessageComponent key={message.id} message={message} />
       ))}
