@@ -25,9 +25,9 @@ struct Cli {
     #[arg(long, conflicts_with = "offline")]
     remote: bool,
 
-    /// Run in dual-pane mode - split terminal with deadloop and interactive sessions
+    /// Run in hybrid mode - single pane with local terminal + streaming (legacy)
     #[arg(long, conflicts_with_all = ["offline", "remote"])]
-    dual_pane: bool,
+    hybrid: bool,
 
     /// Server URL (overrides config)
     #[arg(long)]
@@ -114,18 +114,6 @@ async fn main() -> Result<()> {
         // Offline/local mode - no server connection
         tracing::info!("Starting in offline mode (no server connection)");
         mode::local::run(&working_dir).await?;
-    } else if cli.dual_pane {
-        // Dual-pane mode - split terminal with deadloop and interactive
-        let config = config::Config::load()?;
-        let server = cli.server
-            .or(config.remote.server)
-            .unwrap_or_else(|| DEFAULT_SERVER.to_string());
-        let token = cli.token
-            .or(config.remote.token)
-            .unwrap_or_else(|| "dev".to_string());
-
-        tracing::info!("Starting in dual-pane mode (streaming to {})", server);
-        mode::dual_pane::run(&server, &token, &working_dir).await?;
     } else if cli.remote {
         // Remote-only mode - no local I/O
         let config = config::Config::load()?;
@@ -138,8 +126,8 @@ async fn main() -> Result<()> {
 
         tracing::info!("Starting in remote-only mode, connecting to {}", server);
         mode::remote::run(&server, &token, &working_dir).await?;
-    } else {
-        // Default: hybrid mode - local terminal + streaming to server
+    } else if cli.hybrid {
+        // Hybrid mode - single pane local terminal + streaming to server
         let config = config::Config::load()?;
         let server = cli.server
             .or(config.remote.server)
@@ -150,6 +138,18 @@ async fn main() -> Result<()> {
 
         tracing::info!("Starting in hybrid mode (local + streaming to {})", server);
         mode::hybrid::run(&server, &token, &working_dir).await?;
+    } else {
+        // Default: dual-pane mode - split terminal with deadloop and interactive
+        let config = config::Config::load()?;
+        let server = cli.server
+            .or(config.remote.server)
+            .unwrap_or_else(|| DEFAULT_SERVER.to_string());
+        let token = cli.token
+            .or(config.remote.token)
+            .unwrap_or_else(|| "dev".to_string());
+
+        tracing::info!("Starting in dual-pane mode (streaming to {})", server);
+        mode::dual_pane::run(&server, &token, &working_dir).await?;
     }
 
     Ok(())
