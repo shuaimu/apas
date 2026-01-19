@@ -203,7 +203,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         tracing::info!("Received StreamMessage for session {} with pane_type {:?}", session_id, pane_type);
 
                         // Save message to file storage
-                        if let Some(stored_message) = stream_message_to_stored(&session_id, &message) {
+                        if let Some(stored_message) = stream_message_to_stored(&session_id, &message, pane_type) {
                             if let Err(e) = state.storage.append_message(&session_id, &stored_message).await {
                                 tracing::error!("Failed to save message to file: {}", e);
                             }
@@ -228,6 +228,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             content: text.clone(),
                             message_type: "text".to_string(),
                             created_at: chrono::Utc::now().to_rfc3339(),
+                            pane_type: pane_type.map(|p| format!("{:?}", p).to_lowercase()),
                         };
                         if let Err(e) = state.storage.append_message(&session_id, &stored_message).await {
                             tracing::error!("Failed to save user input to file: {}", e);
@@ -294,8 +295,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 }
 
 /// Convert a ClaudeStreamMessage to a StoredMessage for file storage
-fn stream_message_to_stored(session_id: &Uuid, message: &shared::ClaudeStreamMessage) -> Option<crate::storage::StoredMessage> {
+fn stream_message_to_stored(
+    _session_id: &Uuid,
+    message: &shared::ClaudeStreamMessage,
+    pane_type: Option<shared::PaneType>,
+) -> Option<crate::storage::StoredMessage> {
     use shared::{ClaudeStreamMessage, ClaudeContentBlock};
+
+    let pane_type_str = pane_type.map(|p| format!("{:?}", p).to_lowercase());
 
     match message {
         ClaudeStreamMessage::Assistant { message: msg, .. } => {
@@ -322,6 +329,7 @@ fn stream_message_to_stored(session_id: &Uuid, message: &shared::ClaudeStreamMes
                 content: text_content.join("\n"),
                 message_type: "text".to_string(),
                 created_at: chrono::Utc::now().to_rfc3339(),
+                pane_type: pane_type_str,
             })
         }
         ClaudeStreamMessage::Result { subtype, total_cost_usd, duration_ms, .. } => {
@@ -331,6 +339,7 @@ fn stream_message_to_stored(session_id: &Uuid, message: &shared::ClaudeStreamMes
                 content: format!("{} - Cost: ${:.4}, Duration: {}ms", subtype, total_cost_usd, duration_ms),
                 message_type: "result".to_string(),
                 created_at: chrono::Utc::now().to_rfc3339(),
+                pane_type: pane_type_str,
             })
         }
         _ => None, // Skip system and user messages for now

@@ -485,6 +485,13 @@ function handleServerMessage(
     case "session_messages": {
       const messages = (data.messages as Array<Record<string, unknown>>) || [];
       const hasMore = data.has_more as boolean || false;
+
+      // Check if any messages have pane_type - if so, enable dual pane
+      const hasPaneType = messages.some((m) => m.pane_type);
+      if (hasPaneType) {
+        set({ isDualPane: true });
+      }
+
       const parsedMessages: Message[] = messages.map((m) => ({
         id: m.id as string,
         role: m.role as "user" | "assistant" | "system",
@@ -494,12 +501,38 @@ function handleServerMessage(
       }));
 
       // Check if this is a "load more" request (prepend) or initial load (replace)
-      const { isLoadingMore } = get();
+      const { isLoadingMore, isDualPane } = get();
       if (isLoadingMore) {
         // Prepend older messages
         get().prependMessages(parsedMessages, hasMore);
+      } else if (isDualPane || hasPaneType) {
+        // Dual pane mode - route messages to correct arrays
+        const deadloopMsgs: Message[] = [];
+        const interactiveMsgs: Message[] = [];
+        const mainMsgs: Message[] = [];
+
+        messages.forEach((m, i) => {
+          const paneType = m.pane_type as string | undefined;
+          const msg = parsedMessages[i];
+          if (paneType === "deadloop") {
+            deadloopMsgs.push(msg);
+          } else if (paneType === "interactive") {
+            interactiveMsgs.push(msg);
+          } else {
+            mainMsgs.push(msg);
+          }
+        });
+
+        set({
+          sessionId: data.session_id as string,
+          messages: mainMsgs,
+          deadloopMessages: deadloopMsgs,
+          interactiveMessages: interactiveMsgs,
+          hasMoreMessages: hasMore,
+          isDualPane: true,
+        });
       } else {
-        // Initial load - replace all messages
+        // Single pane mode - replace all messages
         set({
           sessionId: data.session_id as string,
           messages: parsedMessages,

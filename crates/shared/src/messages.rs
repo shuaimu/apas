@@ -222,6 +222,8 @@ pub struct MessageInfo {
     pub content: String,
     pub message_type: String,
     pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_type: Option<String>,
 }
 
 // ============================================================================

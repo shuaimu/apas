@@ -235,6 +235,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     content: m.content,
                                     message_type: m.message_type,
                                     created_at: Some(m.created_at),
+                                    pane_type: m.pane_type,
                                 })
                                 .collect();
                             state
@@ -306,6 +307,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     content: m.content,
                                     message_type: m.message_type,
                                     created_at: Some(m.created_at),
+                                    pane_type: m.pane_type,
                                 })
                                 .collect();
                             state
