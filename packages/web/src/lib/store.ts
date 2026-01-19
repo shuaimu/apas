@@ -370,8 +370,12 @@ function addMessageWithPaneRouting(
 ) {
   let { isDualPane } = get();
 
+  // Debug logging
+  console.log("addMessageWithPaneRouting:", { paneType, isDualPane, role: message.role });
+
   // Auto-detect dual pane mode when we receive a pane_type
   if (paneType && !isDualPane) {
+    console.log("Enabling dual pane mode!");
     set({ isDualPane: true });
     isDualPane = true;
   }
@@ -523,6 +527,7 @@ function handleServerMessage(
       if (!msg) break;
 
       const paneType = data.pane_type as string | undefined;
+      console.log("stream_message received:", { paneType, msgType: (msg as Record<string, unknown>).type });
       const msgType = msg.type as string;
       if (msgType === "assistant") {
         const message = msg.message as Record<string, unknown>;

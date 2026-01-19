@@ -182,8 +182,13 @@ impl SessionManager {
     pub async fn route_to_web(&self, session_id: &Uuid, msg: ServerToWeb) -> bool {
         if let Some(session) = self.sessions.get(session_id) {
             if let Some(web_id) = session.web_connection_id {
+                tracing::debug!("Routing message to web client {} for session {}", web_id, session_id);
                 return self.send_to_web(&web_id, msg).await;
+            } else {
+                tracing::debug!("No web client attached to session {}", session_id);
             }
+        } else {
+            tracing::debug!("Session {} not found for routing", session_id);
         }
         false
     }

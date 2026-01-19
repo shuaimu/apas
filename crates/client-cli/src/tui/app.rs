@@ -159,6 +159,12 @@ impl App {
                 KeyCode::Down => {
                     self.interactive_scroll += 1;
                 }
+                KeyCode::PageUp => {
+                    self.interactive_scroll = self.interactive_scroll.saturating_sub(20);
+                }
+                KeyCode::PageDown => {
+                    self.interactive_scroll += 20;
+                }
                 KeyCode::Esc => {
                     self.input.clear();
                 }
@@ -174,6 +180,12 @@ impl App {
                 }
                 KeyCode::Down => {
                     self.deadloop_scroll += 1;
+                }
+                KeyCode::PageUp => {
+                    self.deadloop_scroll = self.deadloop_scroll.saturating_sub(20);
+                }
+                KeyCode::PageDown => {
+                    self.deadloop_scroll += 20;
                 }
                 _ => {}
             }
@@ -285,7 +297,7 @@ impl App {
         };
 
         let status = format!(
-            " Focus: {} | Ctrl+L: Deadloop | Ctrl+R: Interactive | Ctrl+C: Quit ",
+            " Focus: {} | Ctrl+L/R: Switch | PgUp/PgDn: Scroll | Ctrl+C: Quit ",
             focus_text
         );
 

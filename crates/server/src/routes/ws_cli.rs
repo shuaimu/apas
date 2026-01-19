@@ -200,6 +200,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                     Ok(CliToServer::StreamMessage { session_id, message, pane_type }) => {
+                        tracing::info!("Received StreamMessage for session {} with pane_type {:?}", session_id, pane_type);
+
                         // Save message to file storage
                         if let Some(stored_message) = stream_message_to_stored(&session_id, &message) {
                             if let Err(e) = state.storage.append_message(&session_id, &stored_message).await {
@@ -208,13 +210,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         }
 
                         // Route structured stream message to web client
-                        state
+                        let routed = state
                             .sessions
                             .route_to_web(
                                 &session_id,
                                 ServerToWeb::StreamMessage { session_id, message, pane_type },
                             )
                             .await;
+                        tracing::info!("StreamMessage routed to web: {}", routed);
                     }
                     Ok(CliToServer::UserInput { session_id, text, pane_type }) => {
                         tracing::info!("Received UserInput for session {}: {}", session_id, text);
