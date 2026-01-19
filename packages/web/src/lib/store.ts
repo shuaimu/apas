@@ -580,6 +580,13 @@ function handleServerMessage(
 
     case "user_input": {
       // User input from CLI (displayed as user message)
+      // Only show if it's for the currently viewed session
+      const msgSessionId = data.session_id as string | undefined;
+      const { sessionId: currentSessionId } = get();
+      if (msgSessionId && currentSessionId && msgSessionId !== currentSessionId) {
+        break; // Ignore messages from other sessions
+      }
+
       const userMessage: Message = {
         id: generateId(),
         role: "user",
@@ -594,6 +601,13 @@ function handleServerMessage(
 
     case "stream_message": {
       // Real-time Claude output from attached session
+      // Only show if it's for the currently viewed session
+      const msgSessionId = data.session_id as string | undefined;
+      const { sessionId: currentSessionId } = get();
+      if (msgSessionId && currentSessionId && msgSessionId !== currentSessionId) {
+        break; // Ignore messages from other sessions
+      }
+
       const msg = data.message as Record<string, unknown>;
       if (!msg) break;
 
