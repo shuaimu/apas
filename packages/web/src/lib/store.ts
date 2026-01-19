@@ -167,20 +167,26 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   attachSession: (sessionId: string) => {
-    const { ws } = get();
+    const { ws, sessionId: currentSessionId, isDualPane } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       console.error("WebSocket not connected");
       return;
     }
 
-    // Clear previous messages and reset dual pane state
-    set({
-      messages: [],
-      deadloopMessages: [],
-      interactiveMessages: [],
-      isDualPane: false,
-      isAttached: true
-    });
+    // Only reset state when switching to a different session
+    const isSameSession = currentSessionId === sessionId;
+    if (!isSameSession) {
+      set({
+        messages: [],
+        deadloopMessages: [],
+        interactiveMessages: [],
+        isDualPane: false,
+        isAttached: true
+      });
+    } else {
+      // Re-attaching to same session - preserve dual pane state
+      set({ isAttached: true });
+    }
 
     // Attach to existing session
     ws.send(JSON.stringify({
@@ -370,12 +376,8 @@ function addMessageWithPaneRouting(
 ) {
   let { isDualPane } = get();
 
-  // Debug logging
-  console.log("addMessageWithPaneRouting:", { paneType, isDualPane, role: message.role });
-
   // Auto-detect dual pane mode when we receive a pane_type
   if (paneType && !isDualPane) {
-    console.log("Enabling dual pane mode!");
     set({ isDualPane: true });
     isDualPane = true;
   }
@@ -527,7 +529,6 @@ function handleServerMessage(
       if (!msg) break;
 
       const paneType = data.pane_type as string | undefined;
-      console.log("stream_message received:", { paneType, msgType: (msg as Record<string, unknown>).type });
       const msgType = msg.type as string;
       if (msgType === "assistant") {
         const message = msg.message as Record<string, unknown>;
