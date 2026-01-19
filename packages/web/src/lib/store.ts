@@ -269,19 +269,29 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   loadMoreMessages: () => {
-    const { ws, sessionId, messages, isLoadingMore, hasMoreMessages } = get();
+    const { ws, sessionId, messages, deadloopMessages, interactiveMessages, isDualPane, isLoadingMore, hasMoreMessages } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return;
     }
     if (!sessionId || isLoadingMore || !hasMoreMessages) {
       return;
     }
-    if (messages.length === 0) {
+
+    // Find the oldest message across all arrays
+    let oldestMessage: Message | undefined;
+    const allMessages = isDualPane
+      ? [...messages, ...deadloopMessages, ...interactiveMessages]
+      : messages;
+
+    if (allMessages.length === 0) {
       return;
     }
 
-    // Get the ID of the oldest message we have
-    const oldestMessage = messages[0];
+    // Sort by timestamp to find the oldest
+    oldestMessage = allMessages.reduce((oldest, msg) =>
+      msg.timestamp < oldest.timestamp ? msg : oldest
+    );
+
     set({ isLoadingMore: true });
 
     ws.send(JSON.stringify({
@@ -503,8 +513,34 @@ function handleServerMessage(
       // Check if this is a "load more" request (prepend) or initial load (replace)
       const { isLoadingMore, isDualPane } = get();
       if (isLoadingMore) {
-        // Prepend older messages
-        get().prependMessages(parsedMessages, hasMore);
+        // Prepend older messages - route to correct panes in dual-pane mode
+        if (isDualPane || hasPaneType) {
+          const deadloopMsgs: Message[] = [];
+          const interactiveMsgs: Message[] = [];
+          const mainMsgs: Message[] = [];
+
+          messages.forEach((m, i) => {
+            const paneType = m.pane_type as string | undefined;
+            const msg = parsedMessages[i];
+            if (paneType === "deadloop") {
+              deadloopMsgs.push(msg);
+            } else if (paneType === "interactive") {
+              interactiveMsgs.push(msg);
+            } else {
+              mainMsgs.push(msg);
+            }
+          });
+
+          set((state) => ({
+            messages: [...mainMsgs, ...state.messages],
+            deadloopMessages: [...deadloopMsgs, ...state.deadloopMessages],
+            interactiveMessages: [...interactiveMsgs, ...state.interactiveMessages],
+            hasMoreMessages: hasMore,
+            isLoadingMore: false,
+          }));
+        } else {
+          get().prependMessages(parsedMessages, hasMore);
+        }
       } else if (isDualPane || hasPaneType) {
         // Dual pane mode - route messages to correct arrays
         const deadloopMsgs: Message[] = [];
