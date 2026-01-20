@@ -14,6 +14,7 @@ use lettre::{
     message::header::ContentType,
     transport::smtp::authentication::Credentials,
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
+    AsyncSendmailTransport,
 };
 
 #[derive(Debug, Deserialize)]
@@ -373,7 +374,7 @@ pub async fn reset_password(
     })))
 }
 
-/// Send password reset email via SMTP
+/// Send password reset email via sendmail or SMTP
 async fn send_password_reset_email(
     smtp_config: &crate::config::SmtpConfig,
     to_email: &str,
@@ -407,16 +408,24 @@ async fn send_password_reset_email(
             reset_url, reset_url
         ))?;
 
-    let creds = Credentials::new(
-        smtp_config.username.clone(),
-        smtp_config.password.clone(),
-    );
+    if smtp_config.use_sendmail {
+        // Use local sendmail binary
+        let mailer = AsyncSendmailTransport::<Tokio1Executor>::new();
+        mailer.send(email).await?;
+    } else {
+        // Use SMTP server
+        let creds = Credentials::new(
+            smtp_config.username.clone(),
+            smtp_config.password.clone(),
+        );
 
-    let mailer: AsyncSmtpTransport<Tokio1Executor> = AsyncSmtpTransport::<Tokio1Executor>::relay(&smtp_config.host)?
-        .credentials(creds)
-        .port(smtp_config.port)
-        .build();
+        let mailer: AsyncSmtpTransport<Tokio1Executor> = AsyncSmtpTransport::<Tokio1Executor>::relay(&smtp_config.host)?
+            .credentials(creds)
+            .port(smtp_config.port)
+            .build();
 
-    mailer.send(email).await?;
+        mailer.send(email).await?;
+    }
+
     Ok(())
 }

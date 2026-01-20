@@ -31,23 +31,38 @@ pub struct AuthConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SmtpConfig {
     pub enabled: bool,
+    /// Use local sendmail binary instead of SMTP server
+    #[serde(default = "default_true")]
+    pub use_sendmail: bool,
+    /// SMTP server host (only used if use_sendmail is false)
+    #[serde(default)]
     pub host: String,
+    /// SMTP server port (only used if use_sendmail is false)
+    #[serde(default = "default_smtp_port")]
     pub port: u16,
+    /// SMTP username (only used if use_sendmail is false)
+    #[serde(default)]
     pub username: String,
+    /// SMTP password (only used if use_sendmail is false)
+    #[serde(default)]
     pub password: String,
     pub from_email: String,
     pub from_name: String,
 }
 
+fn default_true() -> bool { true }
+fn default_smtp_port() -> u16 { 587 }
+
 impl Default for SmtpConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            host: "smtp.example.com".to_string(),
+            enabled: true,  // Enable by default, using sendmail
+            use_sendmail: true,
+            host: "".to_string(),
             port: 587,
             username: "".to_string(),
             password: "".to_string(),
-            from_email: "noreply@example.com".to_string(),
+            from_email: "noreply@apas.mpaxos.com".to_string(),
             from_name: "APAS".to_string(),
         }
     }
