@@ -13,6 +13,8 @@ pub struct SessionManager {
     web_senders: DashMap<Uuid, mpsc::Sender<ServerToWeb>>,
     /// Map of CLI client ID -> list of session IDs
     cli_sessions: DashMap<Uuid, Vec<Uuid>>,
+    /// Map of CLI client ID -> user ID (owner)
+    cli_users: DashMap<Uuid, Uuid>,
 }
 
 #[derive(Debug)]
@@ -30,20 +32,23 @@ impl SessionManager {
             cli_senders: DashMap::new(),
             web_senders: DashMap::new(),
             cli_sessions: DashMap::new(),
+            cli_users: DashMap::new(),
         }
     }
 
     // CLI client management
-    pub fn register_cli(&self, cli_id: Uuid, sender: mpsc::Sender<ServerToCli>) {
+    pub fn register_cli(&self, cli_id: Uuid, user_id: Uuid, sender: mpsc::Sender<ServerToCli>) {
         self.cli_senders.insert(cli_id, sender);
         self.cli_sessions.insert(cli_id, Vec::new());
-        tracing::info!("CLI client registered: {}", cli_id);
+        self.cli_users.insert(cli_id, user_id);
+        tracing::info!("CLI client registered: {} (user: {})", cli_id, user_id);
         // Broadcast updated client list to all web clients
         self.broadcast_cli_clients_update();
     }
 
     pub fn unregister_cli(&self, cli_id: &Uuid) {
         self.cli_senders.remove(cli_id);
+        self.cli_users.remove(cli_id);
         if let Some((_, session_ids)) = self.cli_sessions.remove(cli_id) {
             for session_id in session_ids {
                 if let Some(mut session) = self.sessions.get_mut(&session_id) {
@@ -198,10 +203,39 @@ impl SessionManager {
         self.cli_senders.iter().map(|r| *r.key()).collect()
     }
 
-    /// Get CLI clients info for the web UI
+    /// Get CLI clients info for the web UI (all clients)
     pub fn get_cli_clients_info(&self) -> Vec<CliClientInfo> {
         self.cli_senders
             .iter()
+            .map(|entry| {
+                let cli_id = *entry.key();
+                // Get active session for this CLI
+                let active_session = self.get_cli_active_session(&cli_id);
+                let is_busy = active_session.is_some();
+
+                CliClientInfo {
+                    id: cli_id,
+                    name: None, // CLI name not tracked yet
+                    status: if is_busy {
+                        CliClientStatus::Busy
+                    } else {
+                        CliClientStatus::Online
+                    },
+                    last_seen: Some(chrono::Utc::now()),
+                    active_session,
+                }
+            })
+            .collect()
+    }
+
+    /// Get CLI clients info for a specific user
+    pub fn get_cli_clients_info_for_user(&self, user_id: &Uuid) -> Vec<CliClientInfo> {
+        self.cli_senders
+            .iter()
+            .filter(|entry| {
+                // Only include CLIs owned by this user
+                self.cli_users.get(entry.key()).map(|u| *u == *user_id).unwrap_or(false)
+            })
             .map(|entry| {
                 let cli_id = *entry.key();
                 // Get active session for this CLI

@@ -92,7 +92,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                 }
                 Ok(WebToServer::ListCliClients) => {
-                    let clients = state.sessions.get_cli_clients_info();
+                    // Require authentication
+                    let Some(uid) = user_id else {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Not authenticated".to_string(),
+                                },
+                            )
+                            .await;
+                        continue;
+                    };
+
+                    // Only return CLI clients owned by this user
+                    let clients = state.sessions.get_cli_clients_info_for_user(&uid);
                     state
                         .sessions
                         .send_to_web(
@@ -303,8 +318,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                 }
                 Ok(WebToServer::ListSessions) => {
-                    // Get all persisted sessions from database
-                    match state.db.get_all_sessions().await {
+                    // Require authentication
+                    let Some(uid) = user_id else {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Not authenticated".to_string(),
+                                },
+                            )
+                            .await;
+                        continue;
+                    };
+
+                    // Get sessions for this user from database
+                    match state.db.get_sessions_for_user(&uid.to_string()).await {
                         Ok(db_sessions) => {
                             let sessions: Vec<SessionInfo> = db_sessions
                                 .into_iter()

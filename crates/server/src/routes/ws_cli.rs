@@ -135,8 +135,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // Channel for sending messages to this CLI client
     let (tx, mut rx) = mpsc::channel::<ServerToCli>(32);
 
-    // Register this CLI connection
-    state.sessions.register_cli(cli_id, tx);
+    // Register this CLI connection with user association
+    state.sessions.register_cli(cli_id, user_id, tx);
 
     // Update database - first ensure user exists (dev mode creates random users)
     let dev_user = crate::db::User {

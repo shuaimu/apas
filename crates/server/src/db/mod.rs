@@ -220,6 +220,16 @@ impl Database {
         Ok(sessions)
     }
 
+    pub async fn get_sessions_for_user(&self, user_id: &str) -> Result<Vec<Session>> {
+        let sessions = sqlx::query_as::<_, Session>(
+            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at FROM sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(sessions)
+    }
+
     // Message operations
     pub async fn save_message(&self, message: &Message) -> Result<()> {
         sqlx::query(
