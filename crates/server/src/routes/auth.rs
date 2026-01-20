@@ -202,13 +202,17 @@ pub async fn device_poll(
     State(state): State<AppState>,
     Json(req): Json<DevicePollRequest>,
 ) -> Result<Json<DevicePollResponse>, AppError> {
+    tracing::info!("Device poll request for code: {}", req.code);
+
     // Clean up expired codes first
     state.device_codes.retain(|_, v| v.expires_at > Utc::now());
 
     match state.device_codes.get(&req.code) {
         Some(code_state) => {
+            tracing::info!("Found device code {}, user_id: {:?}", req.code, code_state.user_id);
             if code_state.expires_at <= Utc::now() {
                 state.device_codes.remove(&req.code);
+                tracing::info!("Device code {} expired", req.code);
                 Ok(Json(DevicePollResponse::Expired))
             } else if let Some(user_id) = code_state.user_id {
                 // User has completed login - generate token
@@ -221,10 +225,14 @@ pub async fn device_poll(
                 }))
             } else {
                 // Still waiting for user to complete login
+                tracing::info!("Device code {} still pending", req.code);
                 Ok(Json(DevicePollResponse::Pending))
             }
         }
-        None => Ok(Json(DevicePollResponse::Expired)),
+        None => {
+            tracing::info!("Device code {} not found (may have been cleaned up)", req.code);
+            Ok(Json(DevicePollResponse::Expired))
+        }
     }
 }
 

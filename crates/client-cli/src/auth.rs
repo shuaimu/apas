@@ -60,23 +60,44 @@ pub async fn login(server_url: &str) -> Result<String> {
     // 3. Poll for completion
     let poll_interval = Duration::from_secs(2);
     let max_attempts = device_code.expires_in / 2;
+    let poll_url = format!("{}/auth/device-poll", http_url);
 
-    for _ in 0..max_attempts {
+    for attempt in 0..max_attempts {
         tokio::time::sleep(poll_interval).await;
 
-        let poll_resp = client
-            .post(format!("{}/auth/device-poll", http_url))
+        let poll_result = client
+            .post(&poll_url)
             .json(&DevicePollRequest {
                 code: device_code.code.clone(),
             })
             .send()
-            .await?;
+            .await;
+
+        let poll_resp = match poll_result {
+            Ok(resp) => resp,
+            Err(e) => {
+                // Log network errors but continue polling
+                if attempt % 5 == 0 {
+                    eprintln!("\x1b[33mNetwork error (retrying...): {}\x1b[0m", e);
+                }
+                continue;
+            }
+        };
 
         if !poll_resp.status().is_success() {
+            if attempt % 5 == 0 {
+                eprintln!("\x1b[33mPoll returned {}, retrying...\x1b[0m", poll_resp.status());
+            }
             continue;
         }
 
-        let poll_result: DevicePollResponse = poll_resp.json().await?;
+        let poll_result: DevicePollResponse = match poll_resp.json().await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("\x1b[33mFailed to parse poll response: {}\x1b[0m", e);
+                continue;
+            }
+        };
 
         match poll_result {
             DevicePollResponse::Success { token, user_id } => {
