@@ -10,6 +10,7 @@ use shared::{MessageInfo, ServerToCli, ServerToWeb, SessionInfo, SessionStatus, 
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::routes::auth::verify_token;
 use crate::state::AppState;
 
 pub async fn ws_handler(
@@ -39,29 +40,56 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     });
 
-    // Dev mode: auto-authenticate with a random user ID
-    let user_id = Uuid::new_v4();
+    // User must authenticate before accessing other features
+    let mut user_id: Option<Uuid> = None;
     let mut session_id: Option<Uuid> = None;
 
-    tracing::info!("Web client connected: {} (dev mode)", connection_id);
-
-    // Send authenticated message immediately
-    state
-        .sessions
-        .send_to_web(&connection_id, ServerToWeb::Authenticated { user_id })
-        .await;
+    tracing::info!("Web client connected: {}", connection_id);
 
     // Handle incoming messages
     while let Some(Ok(msg)) = receiver.next().await {
         if let Message::Text(text) = msg {
             let parsed: Result<WebToServer, _> = serde_json::from_str(&text);
             match parsed {
-                Ok(WebToServer::Authenticate { token: _ }) => {
-                    // Already authenticated in dev mode, just confirm
-                    state
-                        .sessions
-                        .send_to_web(&connection_id, ServerToWeb::Authenticated { user_id })
-                        .await;
+                Ok(WebToServer::Authenticate { token }) => {
+                    // Validate JWT token
+                    match verify_token(&token, &state.config.auth.jwt_secret) {
+                        Ok(claims) => {
+                            match Uuid::parse_str(&claims.sub) {
+                                Ok(uid) => {
+                                    user_id = Some(uid);
+                                    tracing::info!("Web client {} authenticated as user {}", connection_id, uid);
+                                    state
+                                        .sessions
+                                        .send_to_web(&connection_id, ServerToWeb::Authenticated { user_id: uid })
+                                        .await;
+                                }
+                                Err(_) => {
+                                    state
+                                        .sessions
+                                        .send_to_web(
+                                            &connection_id,
+                                            ServerToWeb::AuthenticationFailed {
+                                                reason: "Invalid user ID in token".to_string(),
+                                            },
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Web client {} auth failed: {}", connection_id, e);
+                            state
+                                .sessions
+                                .send_to_web(
+                                    &connection_id,
+                                    ServerToWeb::AuthenticationFailed {
+                                        reason: e.to_string(),
+                                    },
+                                )
+                                .await;
+                        }
+                    }
                 }
                 Ok(WebToServer::ListCliClients) => {
                     let clients = state.sessions.get_cli_clients_info();
@@ -74,13 +102,27 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         .await;
                 }
                 Ok(WebToServer::StartSession { cli_client_id }) => {
+                    // Require authentication
+                    let Some(uid) = user_id else {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Not authenticated".to_string(),
+                                },
+                            )
+                            .await;
+                        continue;
+                    };
+
                     let new_session_id = Uuid::new_v4();
                     session_id = Some(new_session_id);
 
                     // Create session in manager
                     state
                         .sessions
-                        .create_session(new_session_id, user_id, connection_id);
+                        .create_session(new_session_id, uid, connection_id);
 
                     // Try to assign a CLI client
                     let cli_id = cli_client_id.or_else(|| {

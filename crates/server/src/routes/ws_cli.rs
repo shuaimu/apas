@@ -10,6 +10,7 @@ use shared::{CliToServer, ServerToCli, ServerToWeb};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::routes::auth::verify_token;
 use crate::state::AppState;
 
 /// Minimum supported client version (YY.MM.COMMIT format)
@@ -57,7 +58,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             Some(Ok(Message::Text(text))) => {
                 let parsed: Result<CliToServer, _> = serde_json::from_str(&text);
                 match parsed {
-                    Ok(CliToServer::Register { token: _, version }) => {
+                    Ok(CliToServer::Register { token, version }) => {
                         // Check client version
                         let client_version = version.as_deref().unwrap_or("unknown");
                         if !is_version_supported(client_version) {
@@ -75,18 +76,43 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             return;
                         }
 
-                        // Dev mode: skip authentication, accept all connections
-                        user_id = Uuid::new_v4();
-                        cli_id = Uuid::new_v4();
+                        // Validate JWT token
+                        match verify_token(&token, &state.config.auth.jwt_secret) {
+                            Ok(claims) => {
+                                match Uuid::parse_str(&claims.sub) {
+                                    Ok(uid) => {
+                                        user_id = uid;
+                                        cli_id = Uuid::new_v4();
 
-                        // Send registration success
-                        let response = ServerToCli::Registered { cli_id };
-                        let text = serde_json::to_string(&response).unwrap();
-                        if sender.send(Message::Text(text.into())).await.is_err() {
-                            return;
+                                        // Send registration success
+                                        let response = ServerToCli::Registered { cli_id };
+                                        let text = serde_json::to_string(&response).unwrap();
+                                        if sender.send(Message::Text(text.into())).await.is_err() {
+                                            return;
+                                        }
+                                        tracing::info!("CLI client registered: {} (version: {}, user: {})", cli_id, client_version, user_id);
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        let response = ServerToCli::RegistrationFailed {
+                                            reason: "Invalid user ID in token".to_string(),
+                                        };
+                                        let text = serde_json::to_string(&response).unwrap();
+                                        let _ = sender.send(Message::Text(text.into())).await;
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("CLI registration failed: {}", e);
+                                let response = ServerToCli::RegistrationFailed {
+                                    reason: format!("Authentication failed: {}", e),
+                                };
+                                let text = serde_json::to_string(&response).unwrap();
+                                let _ = sender.send(Message::Text(text.into())).await;
+                                return;
+                            }
                         }
-                        tracing::info!("CLI client registered: {} (version: {}, dev mode)", cli_id, client_version);
-                        break;
                     }
                     _ => {
                         tracing::warn!("Expected Register message, got something else");

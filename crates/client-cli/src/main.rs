@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+mod auth;
 mod config;
 mod claude;
 mod mode;
@@ -56,6 +57,12 @@ enum Commands {
     },
     /// Check for updates and install if available
     Update,
+    /// Login to the APAS server
+    Login,
+    /// Logout from the APAS server
+    Logout,
+    /// Show current login status
+    Whoami,
 }
 
 #[derive(Subcommand)]
@@ -103,6 +110,34 @@ async fn main() -> Result<()> {
                 update::check_and_update().await?;
                 return Ok(());
             }
+            Commands::Login => {
+                let config = config::Config::load().unwrap_or_default();
+                let server = cli.server
+                    .or(config.remote.server)
+                    .unwrap_or_else(|| DEFAULT_SERVER.to_string());
+
+                let token = auth::login(&server).await?;
+
+                // Save the token
+                let mut config = config::Config::load().unwrap_or_default();
+                config.remote.token = Some(token);
+                config.save()?;
+
+                return Ok(());
+            }
+            Commands::Logout => {
+                let mut config = config::Config::load().unwrap_or_default();
+                auth::logout(&mut config)?;
+                return Ok(());
+            }
+            Commands::Whoami => {
+                let config = config::Config::load().unwrap_or_default();
+                let server = cli.server
+                    .or(config.remote.server.clone())
+                    .unwrap_or_else(|| DEFAULT_SERVER.to_string());
+                auth::whoami(&config, &server).await?;
+                return Ok(());
+            }
         }
     }
 
@@ -122,9 +157,14 @@ async fn main() -> Result<()> {
         let server = cli.server
             .or(config.remote.server)
             .unwrap_or_else(|| DEFAULT_SERVER.to_string());
-        let token = cli.token
-            .or(config.remote.token)
-            .unwrap_or_else(|| "dev".to_string());
+        let token = match cli.token.or(config.remote.token) {
+            Some(t) => t,
+            None => {
+                eprintln!("\x1b[33m🔐 Not logged in.\x1b[0m");
+                eprintln!("   Run '\x1b[1mapas login\x1b[0m' to authenticate.");
+                return Ok(());
+            }
+        };
 
         // Show web UI hint
         eprintln!("\x1b[36m📺 View this session in browser: {}\x1b[0m", WEB_UI_URL);
@@ -137,9 +177,14 @@ async fn main() -> Result<()> {
         let server = cli.server
             .or(config.remote.server)
             .unwrap_or_else(|| DEFAULT_SERVER.to_string());
-        let token = cli.token
-            .or(config.remote.token)
-            .unwrap_or_else(|| "dev".to_string());
+        let token = match cli.token.or(config.remote.token) {
+            Some(t) => t,
+            None => {
+                eprintln!("\x1b[33m🔐 Not logged in.\x1b[0m");
+                eprintln!("   Run '\x1b[1mapas login\x1b[0m' to authenticate.");
+                return Ok(());
+            }
+        };
 
         // Show web UI hint
         eprintln!("\x1b[36m📺 View this session in browser: {}\x1b[0m", WEB_UI_URL);
@@ -152,9 +197,14 @@ async fn main() -> Result<()> {
         let server = cli.server
             .or(config.remote.server)
             .unwrap_or_else(|| DEFAULT_SERVER.to_string());
-        let token = cli.token
-            .or(config.remote.token)
-            .unwrap_or_else(|| "dev".to_string());
+        let token = match cli.token.or(config.remote.token) {
+            Some(t) => t,
+            None => {
+                eprintln!("\x1b[33m🔐 Not logged in.\x1b[0m");
+                eprintln!("   Run '\x1b[1mapas login\x1b[0m' to authenticate.");
+                return Ok(());
+            }
+        };
 
         // Show web UI hint
         eprintln!("\x1b[36m📺 View this session in browser: {}\x1b[0m", WEB_UI_URL);

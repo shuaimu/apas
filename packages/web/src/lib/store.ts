@@ -50,6 +50,11 @@ export type OutputType =
 export type PaneType = "deadloop" | "interactive";
 
 interface AppState {
+  // Auth state
+  token: string | null;
+  userId: string | null;
+  isAuthenticated: boolean;
+
   // Connection state
   connected: boolean;
   sessionId: string | null;
@@ -72,6 +77,10 @@ interface AppState {
   isDualPane: boolean;
   deadloopMessages: Message[];
   interactiveMessages: Message[];
+
+  // Auth actions
+  login: (token: string, userId: string) => void;
+  logout: () => void;
 
   // Actions
   connect: () => void;
@@ -97,6 +106,11 @@ interface AppState {
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://apas.mpaxos.com:8080";
 
 export const useStore = create<AppState>((set, get) => ({
+  // Auth state - initialize from localStorage if available
+  token: typeof window !== 'undefined' ? localStorage.getItem("apas_token") : null,
+  userId: typeof window !== 'undefined' ? localStorage.getItem("apas_user_id") : null,
+  isAuthenticated: false,
+
   connected: false,
   sessionId: null,
   ws: null,
@@ -111,12 +125,44 @@ export const useStore = create<AppState>((set, get) => ({
   deadloopMessages: [],
   interactiveMessages: [],
 
+  login: (token: string, userId: string) => {
+    localStorage.setItem("apas_token", token);
+    localStorage.setItem("apas_user_id", userId);
+    set({ token, userId, isAuthenticated: true });
+  },
+
+  logout: () => {
+    localStorage.removeItem("apas_token");
+    localStorage.removeItem("apas_user_id");
+    const { ws } = get();
+    if (ws) {
+      ws.close();
+    }
+    set({
+      token: null,
+      userId: null,
+      isAuthenticated: false,
+      connected: false,
+      ws: null,
+      sessionId: null,
+      cliClients: [],
+      sessions: [],
+    });
+  },
+
   connect: () => {
+    const token = typeof window !== 'undefined' ? localStorage.getItem("apas_token") : null;
+    if (!token) {
+      console.log("No token found, cannot connect");
+      return;
+    }
+
     const ws = new WebSocket(`${WS_URL}/ws/web`);
 
     ws.onopen = () => {
-      console.log("WebSocket connected");
-      // Dev mode: no authentication needed, server auto-authenticates
+      console.log("WebSocket connected, sending authentication...");
+      // Send token for authentication
+      ws.send(JSON.stringify({ type: "authenticate", token }));
     };
 
     ws.onmessage = (event) => {
@@ -415,7 +461,11 @@ function handleServerMessage(
 ) {
   switch (data.type) {
     case "authenticated":
-      set({ connected: true });
+      set({
+        connected: true,
+        isAuthenticated: true,
+        userId: data.user_id as string,
+      });
       console.log("Authenticated as user:", data.user_id);
       // Request CLI clients and sessions list after authentication
       get().refreshCliClients();
@@ -426,7 +476,15 @@ function handleServerMessage(
 
     case "authentication_failed":
       console.error("Authentication failed:", data.reason);
-      set({ connected: false });
+      // Clear invalid token
+      localStorage.removeItem("apas_token");
+      localStorage.removeItem("apas_user_id");
+      set({
+        connected: false,
+        isAuthenticated: false,
+        token: null,
+        userId: null,
+      });
       break;
 
     case "cli_clients": {

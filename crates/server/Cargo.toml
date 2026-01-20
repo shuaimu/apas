@@ -44,3 +44,4 @@ toml = { workspace = true }
 
 # Concurrent state
 dashmap = "5"
+rand = "0.8"

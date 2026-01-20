@@ -1,19 +1,54 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { MessageList } from "@/components/chat/MessageList";
 import { DualPaneView } from "@/components/chat/DualPaneView";
 import { Sidebar } from "@/components/Sidebar";
 import { useStore } from "@/lib/store";
-import { Settings, Wifi, WifiOff } from "lucide-react";
+import { Settings, Wifi, WifiOff, LogOut } from "lucide-react";
 
 export default function Home() {
-  const { connected, connect, sessionId, isDualPane } = useStore();
+  const router = useRouter();
+  const { connected, connect, sessionId, isDualPane, isAuthenticated, logout, token } = useStore();
+  const [isCheckingAuth, setIsCheckingAuth] = useState(true);
 
   useEffect(() => {
-    // Auto-connect on mount (dev mode - no auth needed)
+    // Check for token in localStorage
+    const storedToken = localStorage.getItem("apas_token");
+    if (!storedToken) {
+      router.push("/login");
+      return;
+    }
+    setIsCheckingAuth(false);
+    // Connect with token
     connect();
-  }, [connect]);
+  }, [connect, router]);
+
+  // Handle auth failure - redirect to login
+  useEffect(() => {
+    if (!isCheckingAuth && !isAuthenticated && !connected && !token) {
+      // Token was invalid or expired
+      const storedToken = localStorage.getItem("apas_token");
+      if (!storedToken) {
+        router.push("/login");
+      }
+    }
+  }, [isAuthenticated, connected, token, isCheckingAuth, router]);
+
+  const handleLogout = () => {
+    logout();
+    router.push("/login");
+  };
+
+  // Show loading while checking auth
+  if (isCheckingAuth) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-gray-900">
+        <div className="text-gray-500">Loading...</div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-screen bg-background">
@@ -48,6 +83,13 @@ export default function Home() {
               title="Settings"
             >
               <Settings className="w-5 h-5" />
+            </button>
+            <button
+              onClick={handleLogout}
+              className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg text-gray-500 hover:text-red-500"
+              title="Logout"
+            >
+              <LogOut className="w-5 h-5" />
             </button>
           </div>
         </header>
