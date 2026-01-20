@@ -166,7 +166,7 @@ The APAS server and web UI are deployed on an LXC container:
 - **Host**: `apas.mpaxos.com` (130.245.173.82)
 - **SSH**: `ssh root@apas.mpaxos.com`
 - **Server port**: 8080 (WebSocket: `ws://apas.mpaxos.com:8080`)
-- **Web UI port**: 3000 (http://apas.mpaxos.com:3000)
+- **Web UI port**: 80 (http://apas.mpaxos.com)
 
 #### Directory Structure on Server
 ```
