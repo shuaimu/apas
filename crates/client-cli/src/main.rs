@@ -10,7 +10,7 @@ mod tui;
 mod update;
 
 // Default server URL
-const DEFAULT_SERVER: &str = "ws://130.245.173.105:8081";
+const DEFAULT_SERVER: &str = "ws://apas.mpaxos.com:8080";
 
 #[derive(Parser)]
 #[command(name = "apas")]

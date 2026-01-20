@@ -94,7 +94,7 @@ interface AppState {
   stopAutoRefresh: () => void;
 }
 
-const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://130.245.173.105:8081";
+const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://apas.mpaxos.com:8080";
 
 export const useStore = create<AppState>((set, get) => ({
   connected: false,

@@ -7,7 +7,7 @@ APAS is a web interface for Claude Code that allows you to observe and interact 
 ```
 ┌─────────────────┐     WebSocket      ┌─────────────────┐     WebSocket     ┌─────────────────┐
 │   CLI Client    │ ◄──────────────────►│     Server      │ ◄────────────────►│   Web Frontend  │
-│  (apas binary)  │   ws://host:8081    │  (apas-server)  │   ws://host:8081  │   (Next.js)     │
+│  (apas binary)  │   ws://host:8080    │  (apas-server)  │   ws://host:8080  │   (Next.js)     │
 └─────────────────┘                     └─────────────────┘                    └─────────────────┘
         │                                       │
         ▼                                       ▼
@@ -108,7 +108,7 @@ npm run dev
 Located at `~/.config/apas/config.toml`:
 ```toml
 [remote]
-server = "ws://localhost:8081"
+server = "ws://apas.mpaxos.com:8080"
 token = "your-token"
 
 [local]
@@ -155,11 +155,65 @@ cargo run -p apas
 
 ### Environment Variables
 - `RUST_LOG`: Logging level (e.g., `info`, `debug`)
-- `NEXT_PUBLIC_WS_URL`: WebSocket URL for web frontend (default: `ws://localhost:8081`)
+- `NEXT_PUBLIC_WS_URL`: WebSocket URL for web frontend (default: `ws://apas.mpaxos.com:8080`)
+
+## Deployment
+
+### Production Server
+
+The APAS server and web UI are deployed on an LXC container:
+
+- **Host**: `apas.mpaxos.com` (130.245.173.82)
+- **SSH**: `ssh root@apas.mpaxos.com`
+- **Server port**: 8080 (WebSocket: `ws://apas.mpaxos.com:8080`)
+- **Web UI port**: 3000 (http://apas.mpaxos.com:3000)
+
+#### Directory Structure on Server
+```
+/opt/apas/
+├── apas-server         # Server binary
+├── data/
+│   ├── apas.db         # SQLite database
+│   └── sessions/       # Message storage
+└── web/                # Next.js web frontend
+```
+
+#### Systemd Services
+```bash
+# Check status
+systemctl status apas-server
+systemctl status apas-web
+
+# Restart services
+systemctl restart apas-server
+systemctl restart apas-web
+
+# View logs
+journalctl -u apas-server -f
+journalctl -u apas-web -f
+```
+
+#### Deploying Updates
+
+```bash
+# Build locally
+cargo build -p apas-server --release
+
+# Copy binary to server
+scp target/release/apas-server root@apas.mpaxos.com:/opt/apas/
+
+# Restart server
+ssh root@apas.mpaxos.com "systemctl restart apas-server"
+
+# For web updates
+rsync -av --exclude 'node_modules' --exclude '.next' packages/web/ root@apas.mpaxos.com:/opt/apas/web/
+ssh root@apas.mpaxos.com "cd /opt/apas/web && npm install && npm run build && systemctl restart apas-web"
+```
 
 ## Key Concepts
 
-1. **Hybrid Mode** (default): CLI runs locally, streams output to server for web observation
-2. **Project-based Sessions**: Sessions identified by project directory (`.apas` file)
-3. **Stream-JSON**: Uses Claude CLI's `--output-format stream-json` for structured output
-4. **Real-time Updates**: WebSocket connections for live message streaming
+1. **Dual-Pane Mode** (default): Split TUI with deadloop (left) and interactive (right) panes
+2. **Hybrid Mode** (legacy): Single pane with local terminal + streaming
+3. **Project-based Sessions**: Sessions identified by project directory (`.apas` file)
+4. **Stream-JSON**: Uses Claude CLI's `--output-format stream-json` for structured output
+5. **Real-time Updates**: WebSocket connections for live message streaming
