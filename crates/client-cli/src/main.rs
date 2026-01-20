@@ -11,6 +11,8 @@ mod update;
 
 // Default server URL
 const DEFAULT_SERVER: &str = "ws://apas.mpaxos.com:8080";
+// Web UI URL for users to view sessions
+const WEB_UI_URL: &str = "http://apas.mpaxos.com";
 
 #[derive(Parser)]
 #[command(name = "apas")]
@@ -124,6 +126,9 @@ async fn main() -> Result<()> {
             .or(config.remote.token)
             .unwrap_or_else(|| "dev".to_string());
 
+        // Show web UI hint
+        eprintln!("\x1b[36m📺 View this session in browser: {}\x1b[0m", WEB_UI_URL);
+
         tracing::info!("Starting in remote-only mode, connecting to {}", server);
         mode::remote::run(&server, &token, &working_dir).await?;
     } else if cli.hybrid {
@@ -136,6 +141,9 @@ async fn main() -> Result<()> {
             .or(config.remote.token)
             .unwrap_or_else(|| "dev".to_string());
 
+        // Show web UI hint
+        eprintln!("\x1b[36m📺 View this session in browser: {}\x1b[0m", WEB_UI_URL);
+
         tracing::info!("Starting in hybrid mode (local + streaming to {})", server);
         mode::hybrid::run(&server, &token, &working_dir).await?;
     } else {
@@ -147,6 +155,9 @@ async fn main() -> Result<()> {
         let token = cli.token
             .or(config.remote.token)
             .unwrap_or_else(|| "dev".to_string());
+
+        // Show web UI hint
+        eprintln!("\x1b[36m📺 View this session in browser: {}\x1b[0m", WEB_UI_URL);
 
         tracing::info!("Starting in dual-pane mode (streaming to {})", server);
         mode::dual_pane::run(&server, &token, &working_dir).await?;
