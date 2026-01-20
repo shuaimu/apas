@@ -45,3 +45,6 @@ toml = { workspace = true }
 # Concurrent state
 dashmap = "5"
 rand = "0.8"
+
+# Email
+lettre = { version = "0.11", features = ["tokio1-native-tls", "builder"] }

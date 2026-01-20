@@ -7,6 +7,8 @@ pub struct Config {
     pub server: ServerConfig,
     pub database: DatabaseConfig,
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub smtp: SmtpConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +28,31 @@ pub struct AuthConfig {
     pub token_expiry_hours: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmtpConfig {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub password: String,
+    pub from_email: String,
+    pub from_name: String,
+}
+
+impl Default for SmtpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: "smtp.example.com".to_string(),
+            port: 587,
+            username: "".to_string(),
+            password: "".to_string(),
+            from_email: "noreply@example.com".to_string(),
+            from_name: "APAS".to_string(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -40,6 +67,7 @@ impl Default for Config {
                 jwt_secret: "change-me-in-production".to_string(),
                 token_expiry_hours: 24,
             },
+            smtp: SmtpConfig::default(),
         }
     }
 }

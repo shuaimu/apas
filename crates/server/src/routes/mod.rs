@@ -28,6 +28,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/auth/device-code", post(auth::device_code))
         .route("/auth/device-poll", post(auth::device_poll))
         .route("/auth/device-complete", post(auth::device_complete))
+        // Password reset
+        .route("/auth/forgot-password", post(auth::forgot_password))
+        .route("/auth/reset-password", post(auth::reset_password))
         // WebSocket routes
         .route("/ws/web", get(ws_web::ws_handler))
         .route("/ws/cli", get(ws_cli::ws_handler))

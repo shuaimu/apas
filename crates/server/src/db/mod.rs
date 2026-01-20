@@ -134,6 +134,15 @@ impl Database {
         Ok(user)
     }
 
+    pub async fn update_user_password(&self, email: &str, password_hash: &str) -> Result<bool> {
+        let result = sqlx::query("UPDATE users SET password_hash = ? WHERE email = ?")
+            .bind(password_hash)
+            .bind(email)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     // CLI client operations
     pub async fn upsert_cli_client(&self, client: &CliClient) -> Result<()> {
         sqlx::query(

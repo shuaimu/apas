@@ -12,6 +12,13 @@ pub struct DeviceCodeState {
     pub user_id: Option<Uuid>,
 }
 
+/// State for password reset tokens
+#[derive(Debug, Clone)]
+pub struct PasswordResetState {
+    pub email: String,
+    pub expires_at: DateTime<Utc>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: Database,
@@ -19,6 +26,7 @@ pub struct AppState {
     pub sessions: Arc<SessionManager>,
     pub storage: FileStorage,
     pub device_codes: Arc<DashMap<String, DeviceCodeState>>,
+    pub password_reset_tokens: Arc<DashMap<String, PasswordResetState>>,
 }
 
 impl AppState {
@@ -36,6 +44,7 @@ impl AppState {
             sessions: Arc::new(SessionManager::new()),
             storage: FileStorage::new(storage_path),
             device_codes: Arc::new(DashMap::new()),
+            password_reset_tokens: Arc::new(DashMap::new()),
         }
     }
 }
