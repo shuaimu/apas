@@ -72,8 +72,10 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
         }
     })?;
 
+    // Channel for web input -> interactive session
+    let (web_input_tx, web_input_rx) = mpsc::channel::<String>();
+
     // Spawn server connection task
-    let server_tx_clone = server_tx.clone();
     let shutdown_clone = shutdown.clone();
     let server_url_clone = server_url.clone();
     let token_clone = token.clone();
@@ -86,6 +88,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
             &working_dir_clone,
             server_rx,
             shutdown_clone,
+            web_input_tx,
         )
         .await
     });
@@ -123,6 +126,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
             &interactive_working_dir,
             session_id,
             input_rx,
+            web_input_rx,
             interactive_output_tx,
             interactive_server_tx,
             interactive_shutdown,
@@ -291,17 +295,31 @@ fn run_interactive_session(
     claude_path: &str,
     working_dir: &str,
     session_id: Uuid,
-    input_rx: mpsc::Receiver<String>,
+    tui_input_rx: mpsc::Receiver<String>,
+    web_input_rx: mpsc::Receiver<String>,
     output_tx: mpsc::Sender<PaneOutput>,
     server_tx: tokio_mpsc::Sender<CliToServer>,
     shutdown: Arc<AtomicBool>,
 ) {
     while !shutdown.load(Ordering::SeqCst) {
-        // Wait for user input
-        let prompt = match input_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(p) => p,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        // Wait for user input from either TUI or web
+        let prompt = {
+            // Try TUI input first
+            match tui_input_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(p) => p,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Try web input
+                    match web_input_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                        Ok(p) => p,
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            // Web channel closed, continue with just TUI
+                            continue;
+                        }
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
         };
 
         let _ = output_tx.send(PaneOutput {
@@ -460,6 +478,7 @@ async fn run_server_connection(
     working_dir: &str,
     mut output_rx: tokio_mpsc::Receiver<CliToServer>,
     shutdown: Arc<AtomicBool>,
+    web_input_tx: mpsc::Sender<String>,
 ) -> Result<()> {
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -537,11 +556,24 @@ async fn run_server_connection(
                             }
                         }
                         Some(Ok(msg)) = ws_receiver.next() => {
-                            // Handle server messages (heartbeat, etc.)
+                            // Handle server messages (input, heartbeat, etc.)
                             if let Message::Text(text) = msg {
-                                if let Ok(ServerToCli::Input { session_id: _, data }) = serde_json::from_str(&text) {
-                                    tracing::debug!("Received input from server: {}", data);
-                                    // TODO: Route to appropriate session
+                                if let Ok(server_msg) = serde_json::from_str::<ServerToCli>(&text) {
+                                    match server_msg {
+                                        ServerToCli::Input { session_id: _, data } => {
+                                            tracing::info!("Received input from web UI: {}", data);
+                                            // Forward to interactive session
+                                            if let Err(e) = web_input_tx.send(data) {
+                                                tracing::error!("Failed to forward web input: {}", e);
+                                            }
+                                        }
+                                        ServerToCli::Heartbeat => {
+                                            // Heartbeat response, nothing to do
+                                        }
+                                        _ => {
+                                            tracing::debug!("Received server message: {:?}", server_msg);
+                                        }
+                                    }
                                 }
                             }
                         }

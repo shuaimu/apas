@@ -42,6 +42,10 @@ pub struct App {
     deadloop_scroll: u16,
     /// Scroll offset for interactive pane
     interactive_scroll: u16,
+    /// Auto-scroll enabled for deadloop pane
+    deadloop_auto_scroll: bool,
+    /// Auto-scroll enabled for interactive pane
+    interactive_auto_scroll: bool,
     /// Channel to send user input
     input_tx: Sender<String>,
     /// Channel to receive output
@@ -60,6 +64,8 @@ impl App {
             focus: Focus::Interactive,
             deadloop_scroll: 0,
             interactive_scroll: 0,
+            deadloop_auto_scroll: true,
+            interactive_auto_scroll: true,
             input_tx,
             output_rx,
             should_quit: false,
@@ -102,15 +108,16 @@ impl App {
         while let Ok(output) = self.output_rx.try_recv() {
             if output.is_deadloop {
                 self.deadloop_output.push(output.text);
-                // Auto-scroll to bottom
-                if self.deadloop_output.len() > 100 {
-                    self.deadloop_scroll = (self.deadloop_output.len() - 100) as u16;
+                // Auto-scroll to bottom when enabled
+                if self.deadloop_auto_scroll {
+                    // Set to max value - rendering will clamp to actual content
+                    self.deadloop_scroll = u16::MAX;
                 }
             } else {
                 self.interactive_output.push(output.text);
-                // Auto-scroll to bottom
-                if self.interactive_output.len() > 100 {
-                    self.interactive_scroll = (self.interactive_output.len() - 100) as u16;
+                // Auto-scroll to bottom when enabled
+                if self.interactive_auto_scroll {
+                    self.interactive_scroll = u16::MAX;
                 }
             }
         }
@@ -152,18 +159,24 @@ impl App {
                     self.input.pop();
                 }
                 KeyCode::Up => {
-                    if self.interactive_scroll > 0 {
-                        self.interactive_scroll -= 1;
-                    }
+                    // Scrolling up disables auto-scroll
+                    self.interactive_auto_scroll = false;
+                    self.interactive_scroll = self.interactive_scroll.saturating_sub(1);
                 }
                 KeyCode::Down => {
-                    self.interactive_scroll += 1;
+                    self.interactive_scroll = self.interactive_scroll.saturating_add(1);
                 }
                 KeyCode::PageUp => {
+                    self.interactive_auto_scroll = false;
                     self.interactive_scroll = self.interactive_scroll.saturating_sub(20);
                 }
                 KeyCode::PageDown => {
-                    self.interactive_scroll += 20;
+                    self.interactive_scroll = self.interactive_scroll.saturating_add(20);
+                }
+                KeyCode::End => {
+                    // End key re-enables auto-scroll and jumps to bottom
+                    self.interactive_auto_scroll = true;
+                    self.interactive_scroll = u16::MAX;
                 }
                 KeyCode::Esc => {
                     self.input.clear();
@@ -174,18 +187,24 @@ impl App {
             // Scroll controls for deadloop pane
             match code {
                 KeyCode::Up => {
-                    if self.deadloop_scroll > 0 {
-                        self.deadloop_scroll -= 1;
-                    }
+                    // Scrolling up disables auto-scroll
+                    self.deadloop_auto_scroll = false;
+                    self.deadloop_scroll = self.deadloop_scroll.saturating_sub(1);
                 }
                 KeyCode::Down => {
-                    self.deadloop_scroll += 1;
+                    self.deadloop_scroll = self.deadloop_scroll.saturating_add(1);
                 }
                 KeyCode::PageUp => {
+                    self.deadloop_auto_scroll = false;
                     self.deadloop_scroll = self.deadloop_scroll.saturating_sub(20);
                 }
                 KeyCode::PageDown => {
-                    self.deadloop_scroll += 20;
+                    self.deadloop_scroll = self.deadloop_scroll.saturating_add(20);
+                }
+                KeyCode::End => {
+                    // End key re-enables auto-scroll and jumps to bottom
+                    self.deadloop_auto_scroll = true;
+                    self.deadloop_scroll = u16::MAX;
                 }
                 _ => {}
             }
@@ -297,7 +316,7 @@ impl App {
         };
 
         let status = format!(
-            " Focus: {} | Ctrl+L/R: Switch | PgUp/PgDn: Scroll | Ctrl+C: Quit ",
+            " Focus: {} | Ctrl+L/R: Switch | PgUp/PgDn: Scroll | End: Auto-scroll | Ctrl+C: Quit ",
             focus_text
         );
 

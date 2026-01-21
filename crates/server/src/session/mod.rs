@@ -103,33 +103,71 @@ impl SessionManager {
         false
     }
 
-    /// Create a CLI-initiated session (hybrid mode - no web client initially)
+    /// Create or update a CLI-initiated session (hybrid mode)
+    /// Preserves web_connection_id if session already exists (for reconnection)
     pub fn create_cli_session(&self, session_id: Uuid, cli_id: Uuid) {
-        let state = SessionState {
-            session_id,
-            user_id: Uuid::nil(), // No user for CLI-initiated sessions
-            cli_client_id: Some(cli_id),
-            web_connection_id: None,
-        };
-        self.sessions.insert(session_id, state);
+        // Check if session already exists (preserve web connection)
+        if let Some(mut existing) = self.sessions.get_mut(&session_id) {
+            let old_cli_id = existing.cli_client_id;
+            existing.cli_client_id = Some(cli_id);
+            tracing::info!(
+                "CLI session {} updated: cli {:?} -> {} (web: {:?})",
+                session_id, old_cli_id, cli_id, existing.web_connection_id
+            );
+        } else {
+            let state = SessionState {
+                session_id,
+                user_id: Uuid::nil(), // No user for CLI-initiated sessions
+                cli_client_id: Some(cli_id),
+                web_connection_id: None,
+            };
+            self.sessions.insert(session_id, state);
+            tracing::info!("CLI session created: {} (cli: {})", session_id, cli_id);
+        }
 
         // Track this session for the CLI
         if let Some(mut sessions) = self.cli_sessions.get_mut(&cli_id) {
-            sessions.push(session_id);
+            if !sessions.contains(&session_id) {
+                sessions.push(session_id);
+            }
         }
-        tracing::info!("CLI session created: {} (cli: {})", session_id, cli_id);
         // Broadcast updated client list to all web clients (shows active session)
         self.broadcast_cli_clients_update();
     }
 
     /// Attach a web client to an existing session (to observe CLI output)
-    pub fn attach_web_to_session(&self, session_id: &Uuid, web_connection_id: Uuid) -> bool {
+    /// If the session doesn't exist in memory, creates it (for reconnection scenarios)
+    pub fn attach_web_to_session(&self, session_id: &Uuid, web_connection_id: Uuid, cli_client_id: Option<Uuid>) -> bool {
         if let Some(mut session) = self.sessions.get_mut(session_id) {
             session.web_connection_id = Some(web_connection_id);
+            // Update CLI client ID if provided (for reconnection)
+            if let Some(cli_id) = cli_client_id {
+                session.cli_client_id = Some(cli_id);
+            }
             tracing::info!("Web client {} attached to session {}", web_connection_id, session_id);
             return true;
         }
-        false
+
+        // Session not in memory - create it (happens after server restart or reconnection)
+        tracing::info!("Creating session {} in memory for web attach (cli: {:?})", session_id, cli_client_id);
+        let state = SessionState {
+            session_id: *session_id,
+            user_id: Uuid::nil(), // Will be updated when needed
+            cli_client_id,
+            web_connection_id: Some(web_connection_id),
+        };
+        self.sessions.insert(*session_id, state);
+
+        // If we have a CLI ID, track this session for the CLI
+        if let Some(cli_id) = cli_client_id {
+            if let Some(mut sessions) = self.cli_sessions.get_mut(&cli_id) {
+                if !sessions.contains(session_id) {
+                    sessions.push(*session_id);
+                }
+            }
+        }
+
+        true
     }
 
     /// Get the active session for a CLI client
@@ -178,8 +216,17 @@ impl SessionManager {
     pub async fn route_to_cli(&self, session_id: &Uuid, msg: ServerToCli) -> bool {
         if let Some(session) = self.sessions.get(session_id) {
             if let Some(cli_id) = session.cli_client_id {
+                let cli_exists = self.cli_senders.contains_key(&cli_id);
+                tracing::debug!(
+                    "route_to_cli: session {} -> cli {} (cli exists in senders: {})",
+                    session_id, cli_id, cli_exists
+                );
                 return self.send_to_cli(&cli_id, msg).await;
+            } else {
+                tracing::warn!("route_to_cli: session {} has no cli_client_id", session_id);
             }
+        } else {
+            tracing::warn!("route_to_cli: session {} not found in memory", session_id);
         }
         false
     }

@@ -188,6 +188,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 }
                 Ok(WebToServer::Input { text, pane_type }) => {
                     if let Some(sid) = session_id {
+                        tracing::info!("Routing input to session {}: {:?}", sid, text.chars().take(50).collect::<String>());
                         // Route input to CLI (pane_type will be used for dual-pane routing)
                         let _ = pane_type; // TODO: Use pane_type for routing to correct session
                         let sent = state
@@ -201,6 +202,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             )
                             .await;
                         if !sent {
+                            tracing::warn!("Failed to route input to CLI for session {}", sid);
                             state
                                 .sessions
                                 .send_to_web(
@@ -211,6 +213,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 )
                                 .await;
                         }
+                    } else {
+                        tracing::warn!("Input received but no session_id set for web connection {}", connection_id);
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "No session attached".to_string(),
+                                },
+                            )
+                            .await;
                     }
                 }
                 Ok(WebToServer::Signal { signal }) => {
@@ -295,8 +308,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         continue;
                     }
 
+                    // Look up CLI client ID from database for this session
+                    let cli_client_id = match state.db.get_session(&sid.to_string()).await {
+                        Ok(Some(db_session)) => db_session.cli_client_id.and_then(|id| Uuid::parse_str(&id).ok()),
+                        _ => None,
+                    };
+
                     // Attach to an existing CLI session to observe output
-                    if state.sessions.attach_web_to_session(&sid, connection_id) {
+                    if state.sessions.attach_web_to_session(&sid, connection_id, cli_client_id) {
                         session_id = Some(sid);
                         state
                             .sessions
