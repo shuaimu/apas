@@ -290,7 +290,7 @@ fn run_deadloop_session(
     }
 }
 
-/// Run the interactive session
+/// Run the interactive session with a continuous Claude process
 fn run_interactive_session(
     claude_path: &str,
     working_dir: &str,
@@ -301,115 +301,153 @@ fn run_interactive_session(
     server_tx: tokio_mpsc::Sender<CliToServer>,
     shutdown: Arc<AtomicBool>,
 ) {
-    while !shutdown.load(Ordering::SeqCst) {
-        // Wait for user input from either TUI or web
-        let prompt = {
-            // Try TUI input first
-            match tui_input_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(p) => p,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // Try web input
-                    match web_input_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                        Ok(p) => p,
-                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            // Web channel closed, continue with just TUI
-                            continue;
-                        }
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        };
+    use std::io::Write;
 
+    while !shutdown.load(Ordering::SeqCst) {
         let _ = output_tx.send(PaneOutput {
-            text: format!("[Processing: {}]", &prompt[..std::cmp::min(50, prompt.len())]),
+            text: "[Starting interactive Claude session...]".to_string(),
             is_deadloop: false,
         });
 
-        // Send user input to server
-        let _ = server_tx.blocking_send(CliToServer::UserInput {
-            session_id,
-            text: prompt.clone(),
-            pane_type: Some(PaneType::Interactive),
-        });
-
-        // Run Claude for this query
+        // Start Claude in continuous mode (no --print flag)
         let args = vec![
-            "--print".to_string(),
             "--output-format".to_string(),
             "stream-json".to_string(),
             "--verbose".to_string(),
             "--dangerously-skip-permissions".to_string(),
-            prompt,
         ];
 
         match Command::new(claude_path)
             .args(&args)
             .current_dir(working_dir)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
         {
             Ok(mut child) => {
+                let mut stdin = child.stdin.take().unwrap();
                 let stdout = child.stdout.take().unwrap();
-                let reader = BufReader::new(stdout);
 
-                for line in reader.lines() {
-                    if shutdown.load(Ordering::SeqCst) {
-                        break;
+                // Spawn thread to read stdout
+                let output_tx_clone = output_tx.clone();
+                let server_tx_clone = server_tx.clone();
+                let shutdown_clone = shutdown.clone();
+                let reader_thread = thread::spawn(move || {
+                    let reader = BufReader::new(stdout);
+                    for line in reader.lines() {
+                        if shutdown_clone.load(Ordering::SeqCst) {
+                            break;
+                        }
+
+                        let line = match line {
+                            Ok(l) => l,
+                            Err(_) => break,
+                        };
+
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+
+                        // Parse and process
+                        match serde_json::from_str::<ClaudeStreamMessage>(&line) {
+                            Ok(message) => {
+                                // Display locally
+                                let display_text = format_stream_message(&message);
+                                let _ = output_tx_clone.send(PaneOutput {
+                                    text: display_text,
+                                    is_deadloop: false,
+                                });
+
+                                // Send to server
+                                let _ = server_tx_clone.blocking_send(CliToServer::StreamMessage {
+                                    session_id,
+                                    message,
+                                    pane_type: Some(PaneType::Interactive),
+                                });
+                            }
+                            Err(_) => {
+                                let _ = output_tx_clone.send(PaneOutput {
+                                    text: line,
+                                    is_deadloop: false,
+                                });
+                            }
+                        }
                     }
+                });
 
-                    let line = match line {
-                        Ok(l) => l,
-                        Err(_) => break,
+                // Main loop: read input and send to Claude
+                while !shutdown.load(Ordering::SeqCst) {
+                    // Wait for user input from either TUI or web
+                    let prompt = {
+                        // Try TUI input first
+                        match tui_input_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                            Ok(p) => p,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                // Try web input
+                                match web_input_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                                    Ok(p) => p,
+                                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                                        // Check if Claude process is still running
+                                        match child.try_wait() {
+                                            Ok(Some(_)) => break, // Process exited
+                                            Ok(None) => continue, // Still running
+                                            Err(_) => break,
+                                        }
+                                    }
+                                    Err(mpsc::RecvTimeoutError::Disconnected) => continue,
+                                }
+                            }
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
                     };
 
-                    if line.trim().is_empty() {
-                        continue;
-                    }
+                    let _ = output_tx.send(PaneOutput {
+                        text: format!("> {}", &prompt[..std::cmp::min(100, prompt.len())]),
+                        is_deadloop: false,
+                    });
 
-                    // Parse and process
-                    match serde_json::from_str::<ClaudeStreamMessage>(&line) {
-                        Ok(message) => {
-                            // Display locally
-                            let display_text = format_stream_message(&message);
-                            let _ = output_tx.send(PaneOutput {
-                                text: display_text,
-                                is_deadloop: false,
-                            });
+                    // Send user input to server
+                    let _ = server_tx.blocking_send(CliToServer::UserInput {
+                        session_id,
+                        text: prompt.clone(),
+                        pane_type: Some(PaneType::Interactive),
+                    });
 
-                            // Send to server
-                            let _ = server_tx.blocking_send(CliToServer::StreamMessage {
-                                session_id,
-                                message,
-                                pane_type: Some(PaneType::Interactive),
-                            });
-                        }
-                        Err(_) => {
-                            let _ = output_tx.send(PaneOutput {
-                                text: line,
-                                is_deadloop: false,
-                            });
-                        }
+                    // Send to Claude via stdin (with newline to submit)
+                    if writeln!(stdin, "{}", prompt).is_err() {
+                        let _ = output_tx.send(PaneOutput {
+                            text: "[Claude session ended]".to_string(),
+                            is_deadloop: false,
+                        });
+                        break;
                     }
+                    let _ = stdin.flush();
                 }
 
-                let _ = child.wait();
-
-                let _ = output_tx.send(PaneOutput {
-                    text: "[Query complete]".to_string(),
-                    is_deadloop: false,
-                });
+                // Cleanup
+                let _ = child.kill();
+                let _ = reader_thread.join();
             }
             Err(e) => {
                 let _ = output_tx.send(PaneOutput {
-                    text: format!("[Error: {}]", e),
+                    text: format!("[Error starting Claude: {}]", e),
                     is_deadloop: false,
                 });
+                thread::sleep(std::time::Duration::from_secs(5));
             }
         }
+
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // Small delay before restarting session
+        let _ = output_tx.send(PaneOutput {
+            text: "[Restarting interactive session...]".to_string(),
+            is_deadloop: false,
+        });
+        thread::sleep(std::time::Duration::from_secs(2));
     }
 }
 
