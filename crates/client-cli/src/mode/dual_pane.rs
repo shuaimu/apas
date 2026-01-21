@@ -311,7 +311,7 @@ fn run_deadloop_session(
     }
 }
 
-/// Run the interactive session using --session-id to maintain conversation context
+/// Run the interactive session using --continue to maintain conversation context
 fn run_interactive_session(
     claude_path: &str,
     working_dir: &str,
@@ -322,52 +322,12 @@ fn run_interactive_session(
     server_tx: tokio_mpsc::Sender<CliToServer>,
     shutdown: Arc<AtomicBool>,
 ) {
-    // Generate a dedicated session ID for the interactive pane's Claude conversation
-    // This is different from the APAS session_id - it's for Claude's internal session tracking
-    let claude_session_id = Uuid::new_v4();
-
     let _ = output_tx.send(PaneOutput {
-        text: format!("[Initializing Claude session: {}]", &claude_session_id.to_string()[..8]),
+        text: "[Interactive session ready - type a message]".to_string(),
         is_deadloop: false,
     });
 
-    // Send initialization message to create the session
-    // This ensures all user messages can use --resume
-    let init_args = vec![
-        "--print".to_string(),
-        "--output-format".to_string(),
-        "stream-json".to_string(),
-        "--verbose".to_string(),
-        "--dangerously-skip-permissions".to_string(),
-        "--session-id".to_string(),
-        claude_session_id.to_string(),
-        "You are an interactive assistant. Respond with just 'Ready.' to confirm.".to_string(),
-    ];
-
-    match Command::new(claude_path)
-        .args(&init_args)
-        .current_dir(working_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(mut child) => {
-            // Wait for init to complete, discard output
-            let _ = child.wait();
-            let _ = output_tx.send(PaneOutput {
-                text: "[Session ready - type a message]".to_string(),
-                is_deadloop: false,
-            });
-        }
-        Err(e) => {
-            let _ = output_tx.send(PaneOutput {
-                text: format!("[Error initializing session: {}]", e),
-                is_deadloop: false,
-            });
-            return;
-        }
-    }
+    let mut first_message = true;
 
     while !shutdown.load(Ordering::SeqCst) {
         // Wait for user input from either TUI or web
@@ -399,17 +359,22 @@ fn run_interactive_session(
             pane_type: Some(PaneType::Interactive),
         });
 
-        // Build args - always use --resume since session was created during init
-        let args = vec![
+        // Build args - use --continue after first message to maintain conversation
+        let mut args = vec![
             "--print".to_string(),
             "--output-format".to_string(),
             "stream-json".to_string(),
             "--verbose".to_string(),
             "--dangerously-skip-permissions".to_string(),
-            "--resume".to_string(),
-            claude_session_id.to_string(),
-            prompt,
         ];
+
+        // After first message, use --continue to continue the conversation
+        if !first_message {
+            args.push("--continue".to_string());
+        }
+        first_message = false;
+
+        args.push(prompt);
 
         match Command::new(claude_path)
             .args(&args)
