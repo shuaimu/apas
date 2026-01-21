@@ -148,7 +148,7 @@ impl App {
                 KeyCode::Enter => {
                     if !self.input.is_empty() {
                         let input = std::mem::take(&mut self.input);
-                        self.interactive_output.push(format!("> {}", input));
+                        // Don't display here - run_interactive_session will display it
                         let _ = self.input_tx.send(input);
                     }
                 }
@@ -212,7 +212,7 @@ impl App {
     }
 
     /// Draw the UI
-    fn draw(&self, frame: &mut Frame) {
+    fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
 
         // Split into status bar and main content
@@ -238,7 +238,7 @@ impl App {
     }
 
     /// Draw the deadloop (left) pane
-    fn draw_deadloop_pane(&self, frame: &mut Frame, area: Rect) {
+    fn draw_deadloop_pane(&mut self, frame: &mut Frame, area: Rect) {
         let border_style = if self.focus == Focus::Deadloop {
             Style::default().fg(Color::Yellow)
         } else {
@@ -253,16 +253,32 @@ impl App {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        // Calculate content height and max scroll
+        let content_lines = self.deadloop_output.len() as u16;
+        let viewport_height = inner.height;
+        let max_scroll = content_lines.saturating_sub(viewport_height);
+
+        // Calculate scroll position
+        let scroll = if self.deadloop_auto_scroll {
+            // Auto-scroll: always show bottom
+            self.deadloop_scroll = max_scroll;
+            max_scroll
+        } else {
+            // Manual scroll: clamp to valid range
+            self.deadloop_scroll = self.deadloop_scroll.min(max_scroll);
+            self.deadloop_scroll
+        };
+
         // Render output
         let output_text = self.deadloop_output.join("\n");
         let paragraph = Paragraph::new(output_text)
             .wrap(Wrap { trim: false })
-            .scroll((self.deadloop_scroll, 0));
+            .scroll((scroll, 0));
         frame.render_widget(paragraph, inner);
     }
 
     /// Draw the interactive (right) pane
-    fn draw_interactive_pane(&self, frame: &mut Frame, area: Rect) {
+    fn draw_interactive_pane(&mut self, frame: &mut Frame, area: Rect) {
         let border_style = if self.focus == Focus::Interactive {
             Style::default().fg(Color::Cyan)
         } else {
@@ -283,11 +299,27 @@ impl App {
             .constraints([Constraint::Min(0), Constraint::Length(3)])
             .split(inner);
 
+        // Calculate content height and max scroll
+        let content_lines = self.interactive_output.len() as u16;
+        let viewport_height = layout[0].height;
+        let max_scroll = content_lines.saturating_sub(viewport_height);
+
+        // Calculate scroll position
+        let scroll = if self.interactive_auto_scroll {
+            // Auto-scroll: always show bottom
+            self.interactive_scroll = max_scroll;
+            max_scroll
+        } else {
+            // Manual scroll: clamp to valid range
+            self.interactive_scroll = self.interactive_scroll.min(max_scroll);
+            self.interactive_scroll
+        };
+
         // Render output
         let output_text = self.interactive_output.join("\n");
         let paragraph = Paragraph::new(output_text)
             .wrap(Wrap { trim: false })
-            .scroll((self.interactive_scroll, 0));
+            .scroll((scroll, 0));
         frame.render_widget(paragraph, layout[0]);
 
         // Render input area

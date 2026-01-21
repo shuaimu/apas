@@ -365,15 +365,8 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
 
-    // Add user message to appropriate pane
-    const userMessage: Message = {
-      id: generateId(),
-      role: "user",
-      content: text,
-      timestamp: new Date(),
-      outputType: { type: "text" },
-    };
-    get().addMessageToPane(userMessage, pane);
+    // Don't add message locally - the server will broadcast it back via user_input
+    // This prevents duplicate display
 
     // Send to server with pane type
     ws.send(JSON.stringify({
