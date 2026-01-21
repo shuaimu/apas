@@ -12,6 +12,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc as tokio_mpsc;
 use uuid::Uuid;
 
@@ -185,6 +186,8 @@ fn run_deadloop_session(
     let mut iteration = 0;
     let mut backoff_seconds = 2u64;
     const MAX_BACKOFF: u64 = 3600;
+    const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60); // 1 hour
+    let mut last_update_check = Instant::now();
 
     while !shutdown.load(Ordering::SeqCst) {
         iteration += 1;
@@ -307,6 +310,19 @@ fn run_deadloop_session(
                 });
                 thread::sleep(std::time::Duration::from_secs(5));
             }
+        }
+
+        // Check for updates every hour
+        if last_update_check.elapsed() >= UPDATE_CHECK_INTERVAL {
+            last_update_check = Instant::now();
+            let _ = output_tx.send(PaneOutput {
+                text: "[Checking for updates...]".to_string(),
+                is_deadloop: true,
+            });
+            // Run update check in background - if update is installed, process will restart
+            thread::spawn(|| {
+                crate::update::auto_update_and_restart();
+            });
         }
     }
 }

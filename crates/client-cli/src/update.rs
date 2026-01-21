@@ -191,3 +191,79 @@ pub fn check_for_updates_background() {
         }
     });
 }
+
+/// Check for updates and automatically install + restart if available
+/// This function will not return if an update is installed (it exec's the new binary)
+pub fn auto_update_and_restart() {
+    eprintln!("[Auto-update] Checking for updates...");
+
+    // Check if update is available
+    let current = match parse_version(CURRENT_VERSION) {
+        Some(v) => v,
+        None => {
+            eprintln!("[Auto-update] Failed to parse current version");
+            return;
+        }
+    };
+
+    let remote_version_str = match get_remote_version() {
+        Some(v) => v,
+        None => {
+            eprintln!("[Auto-update] Failed to get remote version");
+            return;
+        }
+    };
+
+    let remote = match parse_version(&remote_version_str) {
+        Some(v) => v,
+        None => {
+            eprintln!("[Auto-update] Failed to parse remote version");
+            return;
+        }
+    };
+
+    if remote <= current {
+        eprintln!("[Auto-update] Already up to date ({})", CURRENT_VERSION);
+        return;
+    }
+
+    eprintln!("[Auto-update] Update available: {} -> {}", CURRENT_VERSION, remote_version_str);
+    eprintln!("[Auto-update] Installing update...");
+
+    // Run the update synchronously
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    if let Err(e) = rt.block_on(check_and_update()) {
+        eprintln!("[Auto-update] Update failed: {}", e);
+        return;
+    }
+
+    // Restart the process with the same arguments
+    eprintln!("[Auto-update] Restarting...");
+    restart_self();
+}
+
+/// Restart the current process with the same arguments
+#[cfg(unix)]
+fn restart_self() {
+    use std::os::unix::process::CommandExt;
+
+    let exe = match get_current_exe() {
+        Some(e) => e,
+        None => {
+            eprintln!("[Auto-update] Failed to get executable path for restart");
+            return;
+        }
+    };
+
+    let args: Vec<String> = env::args().collect();
+
+    // exec() replaces the current process - this function won't return on success
+    let err = Command::new(&exe).args(&args[1..]).exec();
+    eprintln!("[Auto-update] Failed to restart: {}", err);
+}
+
+#[cfg(not(unix))]
+fn restart_self() {
+    eprintln!("[Auto-update] Auto-restart not supported on this platform");
+    eprintln!("[Auto-update] Please restart manually to use the new version");
+}
