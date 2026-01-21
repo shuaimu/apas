@@ -311,7 +311,7 @@ fn run_deadloop_session(
     }
 }
 
-/// Run the interactive session using --continue to maintain conversation context
+/// Run the interactive session using --session-id and --resume to maintain conversation context
 fn run_interactive_session(
     claude_path: &str,
     working_dir: &str,
@@ -322,12 +322,15 @@ fn run_interactive_session(
     server_tx: tokio_mpsc::Sender<CliToServer>,
     shutdown: Arc<AtomicBool>,
 ) {
+    // Generate a unique Claude session ID for this interactive pane
+    // This allows multiple APAS instances to have separate conversations
+    let claude_session_id = Uuid::new_v4();
+    let mut first_message = true;
+
     let _ = output_tx.send(PaneOutput {
-        text: "[Interactive session ready - type a message]".to_string(),
+        text: format!("[Interactive session: {}]", &claude_session_id.to_string()[..8]),
         is_deadloop: false,
     });
-
-    let mut first_message = true;
 
     while !shutdown.load(Ordering::SeqCst) {
         // Wait for user input from either TUI or web
@@ -359,22 +362,33 @@ fn run_interactive_session(
             pane_type: Some(PaneType::Interactive),
         });
 
-        // Build args - use --continue after first message to maintain conversation
-        let mut args = vec![
-            "--print".to_string(),
-            "--output-format".to_string(),
-            "stream-json".to_string(),
-            "--verbose".to_string(),
-            "--dangerously-skip-permissions".to_string(),
-        ];
-
-        // After first message, use --continue to continue the conversation
-        if !first_message {
-            args.push("--continue".to_string());
-        }
-        first_message = false;
-
-        args.push(prompt);
+        // Build args:
+        // - First message: use --session-id to create session with specific ID
+        // - Subsequent: use --resume with the session ID to continue
+        let args = if first_message {
+            first_message = false;
+            vec![
+                "--print".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--verbose".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                "--session-id".to_string(),
+                claude_session_id.to_string(),
+                prompt,
+            ]
+        } else {
+            vec![
+                "--print".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--verbose".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                "--resume".to_string(),
+                claude_session_id.to_string(),
+                prompt,
+            ]
+        };
 
         match Command::new(claude_path)
             .args(&args)
@@ -386,7 +400,24 @@ fn run_interactive_session(
         {
             Ok(mut child) => {
                 let stdout = child.stdout.take().unwrap();
+                let stderr = child.stderr.take().unwrap();
                 let reader = BufReader::new(stdout);
+
+                // Spawn thread to capture stderr
+                let output_tx_stderr = output_tx.clone();
+                let stderr_thread = thread::spawn(move || {
+                    let reader = BufReader::new(stderr);
+                    for line in reader.lines() {
+                        if let Ok(line) = line {
+                            if !line.trim().is_empty() {
+                                let _ = output_tx_stderr.send(PaneOutput {
+                                    text: format!("[stderr] {}", line),
+                                    is_deadloop: false,
+                                });
+                            }
+                        }
+                    }
+                });
 
                 for line in reader.lines() {
                     if shutdown.load(Ordering::SeqCst) {
@@ -429,6 +460,7 @@ fn run_interactive_session(
                 }
 
                 let _ = child.wait();
+                let _ = stderr_thread.join();
             }
             Err(e) => {
                 let _ = output_tx.send(PaneOutput {
