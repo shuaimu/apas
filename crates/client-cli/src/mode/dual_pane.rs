@@ -311,7 +311,7 @@ fn run_deadloop_session(
     }
 }
 
-/// Run the interactive session using --resume to maintain conversation context
+/// Run the interactive session using --session-id to maintain conversation context
 fn run_interactive_session(
     claude_path: &str,
     working_dir: &str,
@@ -322,12 +322,15 @@ fn run_interactive_session(
     server_tx: tokio_mpsc::Sender<CliToServer>,
     shutdown: Arc<AtomicBool>,
 ) {
+    // Generate a dedicated session ID for the interactive pane's Claude conversation
+    // This is different from the APAS session_id - it's for Claude's internal session tracking
+    let claude_session_id = Uuid::new_v4();
+    let mut first_message = true;
+
     let _ = output_tx.send(PaneOutput {
-        text: "[Interactive session ready - type a message to start]".to_string(),
+        text: format!("[Interactive session ready - Claude session: {}]", &claude_session_id.to_string()[..8]),
         is_deadloop: false,
     });
-
-    let mut first_message = true;
 
     while !shutdown.load(Ordering::SeqCst) {
         // Wait for user input from either TUI or web
@@ -359,21 +362,33 @@ fn run_interactive_session(
             pane_type: Some(PaneType::Interactive),
         });
 
-        // Build args - use --resume after first message to continue conversation
-        let mut args = vec![
-            "--print".to_string(),
-            "--output-format".to_string(),
-            "stream-json".to_string(),
-            "--verbose".to_string(),
-            "--dangerously-skip-permissions".to_string(),
-        ];
-
-        if !first_message {
-            args.push("--resume".to_string());
-        }
-        first_message = false;
-
-        args.push(prompt);
+        // Build args - use --session-id to keep all messages in the same Claude conversation
+        // First message: create session with --session-id
+        // Subsequent: use --resume with the session ID to continue
+        let args = if first_message {
+            first_message = false;
+            vec![
+                "--print".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--verbose".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                "--session-id".to_string(),
+                claude_session_id.to_string(),
+                prompt,
+            ]
+        } else {
+            vec![
+                "--print".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--verbose".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                "--resume".to_string(),
+                claude_session_id.to_string(),
+                prompt,
+            ]
+        };
 
         match Command::new(claude_path)
             .args(&args)
