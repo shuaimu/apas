@@ -37,6 +37,8 @@ pub async fn login(server_url: &str) -> Result<String> {
         .replace("ws://", "http://")
         .replace("wss://", "https://");
 
+    eprintln!("\x1b[90mConnecting to {}...\x1b[0m", http_url);
+
     // 1. Request device code
     let resp = client
         .post(format!("{}/auth/device-code", http_url))

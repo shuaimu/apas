@@ -207,30 +207,36 @@ pub async fn device_poll(
     // Clean up expired codes first
     state.device_codes.retain(|_, v| v.expires_at > Utc::now());
 
-    match state.device_codes.get(&req.code) {
-        Some(code_state) => {
-            tracing::info!("Found device code {}, user_id: {:?}", req.code, code_state.user_id);
+    // Remove and check in one operation to avoid any lock issues
+    // We'll re-insert if the user hasn't completed login yet
+    let removed = state.device_codes.remove(&req.code);
+
+    match removed {
+        Some((code, code_state)) => {
+            tracing::info!("Found device code {}, user_id: {:?}, expires_at: {:?}",
+                code, code_state.user_id, code_state.expires_at);
+
             if code_state.expires_at <= Utc::now() {
-                state.device_codes.remove(&req.code);
-                tracing::info!("Device code {} expired", req.code);
+                tracing::info!("Device code {} expired", code);
                 Ok(Json(DevicePollResponse::Expired))
             } else if let Some(user_id) = code_state.user_id {
                 // User has completed login - generate token
+                tracing::info!("Device code {} - user_id is Some, generating token", code);
                 let token = generate_token(&user_id.to_string(), &state.config.auth)?;
-                state.device_codes.remove(&req.code);
-                tracing::info!("Device code {} completed for user {}", req.code, user_id);
+                tracing::info!("Device code {} completed for user {}", code, user_id);
                 Ok(Json(DevicePollResponse::Success {
                     token,
                     user_id: user_id.to_string(),
                 }))
             } else {
-                // Still waiting for user to complete login
-                tracing::info!("Device code {} still pending", req.code);
+                // Still waiting - put it back
+                tracing::info!("Device code {} still pending, re-inserting", code);
+                state.device_codes.insert(code, code_state);
                 Ok(Json(DevicePollResponse::Pending))
             }
         }
         None => {
-            tracing::info!("Device code {} not found (may have been cleaned up)", req.code);
+            tracing::info!("Device code {} not found", req.code);
             Ok(Json(DevicePollResponse::Expired))
         }
     }
@@ -436,4 +442,67 @@ async fn send_password_reset_email(
     }
 
     Ok(())
+}
+
+// Admin impersonate endpoint for debugging
+#[derive(Debug, Deserialize)]
+pub struct ImpersonateRequest {
+    pub email: String,
+    pub admin_secret: String,
+}
+
+pub async fn admin_impersonate(
+    State(state): State<AppState>,
+    Json(req): Json<ImpersonateRequest>,
+) -> Result<Json<AuthResponse>, AppError> {
+    // Check admin secret (use JWT secret as admin secret for simplicity)
+    if req.admin_secret != state.config.auth.jwt_secret {
+        return Err(AppError::AuthError("Invalid admin secret".to_string()));
+    }
+
+    // Find user by email
+    let user = state
+        .db
+        .get_user_by_email(&req.email)
+        .await?
+        .ok_or_else(|| AppError::BadRequest(format!("User not found: {}", req.email)))?;
+
+    // Generate token for the user
+    let token = generate_token(&user.id, &state.config.auth)?;
+
+    tracing::warn!("Admin impersonating user: {} ({})", user.email, user.id);
+
+    Ok(Json(AuthResponse {
+        token,
+        user_id: user.id,
+    }))
+}
+
+// List all users (admin only)
+#[derive(Debug, Deserialize)]
+pub struct AdminRequest {
+    pub admin_secret: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UserInfo {
+    pub id: String,
+    pub email: String,
+}
+
+pub async fn admin_list_users(
+    State(state): State<AppState>,
+    Json(req): Json<AdminRequest>,
+) -> Result<Json<Vec<UserInfo>>, AppError> {
+    // Check admin secret
+    if req.admin_secret != state.config.auth.jwt_secret {
+        return Err(AppError::AuthError("Invalid admin secret".to_string()));
+    }
+
+    let users = state.db.get_all_users().await?;
+
+    Ok(Json(users.into_iter().map(|u| UserInfo {
+        id: u.id,
+        email: u.email,
+    }).collect()))
 }

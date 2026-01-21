@@ -259,6 +259,42 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     session_id = Some(sid);
                 }
                 Ok(WebToServer::AttachSession { session_id: sid }) => {
+                    // Check if user is authenticated and has access to this session
+                    let Some(uid) = user_id else {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Not authenticated".to_string(),
+                                },
+                            )
+                            .await;
+                        continue;
+                    };
+
+                    // Check access (owner or shared)
+                    let has_access = match state.db.check_session_access(&sid.to_string(), &uid.to_string()).await {
+                        Ok(access) => access,
+                        Err(e) => {
+                            tracing::error!("Failed to check session access: {}", e);
+                            false
+                        }
+                    };
+
+                    if !has_access {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Access denied".to_string(),
+                                },
+                            )
+                            .await;
+                        continue;
+                    }
+
                     // Attach to an existing CLI session to observe output
                     if state.sessions.attach_web_to_session(&sid, connection_id) {
                         session_id = Some(sid);
@@ -332,27 +368,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         continue;
                     };
 
-                    // Get sessions for this user from database
-                    match state.db.get_sessions_for_user(&uid.to_string()).await {
-                        Ok(db_sessions) => {
-                            let sessions: Vec<SessionInfo> = db_sessions
-                                .into_iter()
-                                .map(|s| SessionInfo {
-                                    id: Uuid::parse_str(&s.id).unwrap_or_default(),
-                                    cli_client_id: s.cli_client_id.and_then(|id| Uuid::parse_str(&id).ok()),
-                                    working_dir: s.working_dir,
-                                    hostname: s.hostname,
-                                    status: s.status,
-                                    created_at: s.created_at,
-                                })
-                                .collect();
-                            state
-                                .sessions
-                                .send_to_web(&connection_id, ServerToWeb::Sessions { sessions })
-                                .await;
-                        }
+                    // Get owned sessions for this user from database
+                    let owned_sessions = match state.db.get_sessions_for_user(&uid.to_string()).await {
+                        Ok(sessions) => sessions,
                         Err(e) => {
-                            tracing::error!("Failed to get sessions: {}", e);
+                            tracing::error!("Failed to get owned sessions: {}", e);
                             state
                                 .sessions
                                 .send_to_web(
@@ -362,8 +382,52 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     },
                                 )
                                 .await;
+                            continue;
                         }
+                    };
+
+                    // Get shared sessions for this user
+                    let shared_sessions = match state.db.get_shared_sessions_for_user(&uid.to_string()).await {
+                        Ok(sessions) => sessions,
+                        Err(e) => {
+                            tracing::error!("Failed to get shared sessions: {}", e);
+                            vec![] // Continue without shared sessions
+                        }
+                    };
+
+                    // Combine owned and shared sessions
+                    let mut sessions: Vec<SessionInfo> = owned_sessions
+                        .into_iter()
+                        .map(|s| SessionInfo {
+                            id: Uuid::parse_str(&s.id).unwrap_or_default(),
+                            cli_client_id: s.cli_client_id.and_then(|id| Uuid::parse_str(&id).ok()),
+                            working_dir: s.working_dir,
+                            hostname: s.hostname,
+                            status: s.status,
+                            created_at: s.created_at,
+                            is_shared: false,
+                            owner_email: None,
+                        })
+                        .collect();
+
+                    // Add shared sessions with owner email
+                    for (s, owner_email) in shared_sessions {
+                        sessions.push(SessionInfo {
+                            id: Uuid::parse_str(&s.id).unwrap_or_default(),
+                            cli_client_id: s.cli_client_id.and_then(|id| Uuid::parse_str(&id).ok()),
+                            working_dir: s.working_dir,
+                            hostname: s.hostname,
+                            status: s.status,
+                            created_at: s.created_at,
+                            is_shared: true,
+                            owner_email: Some(owner_email),
+                        });
                     }
+
+                    state
+                        .sessions
+                        .send_to_web(&connection_id, ServerToWeb::Sessions { sessions })
+                        .await;
                 }
                 Ok(WebToServer::GetSessionMessages { session_id: sid, limit, before_id }) => {
                     // Get messages for a specific session from file storage with pagination

@@ -21,6 +21,7 @@ export function DualPaneView() {
         <PaneHeader title="Deadloop (Autonomous)" type="deadloop" />
         <MessagePane
           messages={deadloopMessages}
+          paneType="deadloop"
           onLoadMore={loadMoreMessages}
           isLoading={isLoadingMore}
           hasMore={hasMoreMessages}
@@ -32,6 +33,7 @@ export function DualPaneView() {
         <PaneHeader title="Interactive" type="interactive" />
         <MessagePane
           messages={interactiveMessages}
+          paneType="interactive"
           onLoadMore={loadMoreMessages}
           isLoading={isLoadingMore}
           hasMore={hasMoreMessages}
@@ -71,12 +73,13 @@ function PaneHeader({ title, type }: PaneHeaderProps) {
 
 interface MessagePaneProps {
   messages: Message[];
+  paneType: PaneType;
   onLoadMore?: () => void;
   isLoading?: boolean;
   hasMore?: boolean;
 }
 
-function MessagePane({ messages, onLoadMore, isLoading, hasMore }: MessagePaneProps) {
+function MessagePane({ messages, paneType, onLoadMore, isLoading, hasMore }: MessagePaneProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const shouldAutoScroll = useRef(true);
@@ -126,8 +129,15 @@ function MessagePane({ messages, onLoadMore, isLoading, hasMore }: MessagePanePr
 
   if (messages.length === 0) {
     return (
-      <div className="flex-1 flex items-center justify-center text-gray-400">
-        <p className="text-sm">No messages yet</p>
+      <div className="flex-1 flex items-center justify-center text-gray-400 px-4">
+        {paneType === "interactive" ? (
+          <div className="text-center">
+            <p className="text-sm">No messages yet</p>
+            <p className="text-xs mt-1 opacity-75">Ask Claude to create TODO items here</p>
+          </div>
+        ) : (
+          <p className="text-sm">Waiting for autonomous activity...</p>
+        )}
       </div>
     );
   }

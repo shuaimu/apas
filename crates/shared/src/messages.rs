@@ -212,6 +212,12 @@ pub struct SessionInfo {
     pub hostname: Option<String>,
     pub status: String,
     pub created_at: Option<String>,
+    /// True if this session is shared with the user (not owned)
+    #[serde(default)]
+    pub is_shared: bool,
+    /// Email of the session owner (only set if is_shared is true)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_email: Option<String>,
 }
 
 /// Information about a persisted message

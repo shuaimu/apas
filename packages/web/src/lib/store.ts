@@ -36,6 +36,8 @@ export interface SessionInfo {
   hostname?: string;
   status: string;
   createdAt?: string;
+  isShared?: boolean;
+  ownerEmail?: string;
 }
 
 export type OutputType =
@@ -545,6 +547,8 @@ function handleServerMessage(
           hostname: s.hostname as string | undefined,
           status: s.status as string,
           createdAt: s.created_at as string | undefined,
+          isShared: s.is_shared as boolean | undefined,
+          ownerEmail: s.owner_email as string | undefined,
         })),
       });
       break;

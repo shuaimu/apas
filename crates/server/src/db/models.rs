@@ -40,3 +40,23 @@ pub struct Message {
     pub metadata: Option<String>,
     pub created_at: Option<String>,
 }
+
+#[derive(Debug, Clone, FromRow)]
+pub struct SessionShare {
+    pub id: i64,
+    pub session_id: String,
+    pub user_id: String,
+    pub invited_by: String,
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct InvitationCode {
+    pub code: String,
+    pub session_id: String,
+    pub created_by: String,
+    pub expires_at: String,
+    pub redeemed_by: Option<String>,
+    pub redeemed_at: Option<String>,
+    pub created_at: Option<String>,
+}
