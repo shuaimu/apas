@@ -13,35 +13,67 @@ export function DualPaneView() {
   const loadMoreMessages = useStore((state) => state.loadMoreMessages);
   const isLoadingMore = useStore((state) => state.isLoadingMore);
   const hasMoreMessages = useStore((state) => state.hasMoreMessages);
+  const [activePane, setActivePane] = useState<PaneType>("deadloop");
 
   return (
-    <div className="flex h-full">
-      {/* Left Pane - Deadloop */}
-      <div className="w-1/2 border-r border-gray-200 dark:border-gray-700 flex flex-col">
-        <PaneHeader title="Deadloop (Autonomous)" type="deadloop" />
-        <MessagePane
-          messages={deadloopMessages}
-          paneType="deadloop"
-          onLoadMore={loadMoreMessages}
-          isLoading={isLoadingMore}
-          hasMore={hasMoreMessages}
-        />
+    <div className="flex flex-col h-full overflow-hidden">
+      {/* Mobile tab switcher - only visible on small screens */}
+      <div className="flex md:hidden border-b border-gray-200 dark:border-gray-700 flex-shrink-0">
+        <button
+          onClick={() => setActivePane("deadloop")}
+          className={`flex-1 px-4 py-2 text-sm font-medium transition-colors ${
+            activePane === "deadloop"
+              ? "bg-amber-50 dark:bg-amber-900/20 text-amber-700 dark:text-amber-300 border-b-2 border-amber-500"
+              : "text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-800"
+          }`}
+        >
+          Deadloop
+        </button>
+        <button
+          onClick={() => setActivePane("interactive")}
+          className={`flex-1 px-4 py-2 text-sm font-medium transition-colors ${
+            activePane === "interactive"
+              ? "bg-cyan-50 dark:bg-cyan-900/20 text-cyan-700 dark:text-cyan-300 border-b-2 border-cyan-500"
+              : "text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-800"
+          }`}
+        >
+          Interactive
+        </button>
       </div>
 
-      {/* Right Pane - Interactive */}
-      <div className="w-1/2 flex flex-col">
-        <PaneHeader title="Interactive" type="interactive" />
-        <MessagePane
-          messages={interactiveMessages}
-          paneType="interactive"
-          onLoadMore={loadMoreMessages}
-          isLoading={isLoadingMore}
-          hasMore={hasMoreMessages}
-        />
-        <div className="p-4 border-t border-gray-200 dark:border-gray-700">
-          <InteractiveInput
-            onSend={(text) => sendMessageToPane(text, "interactive")}
+      {/* Desktop: side-by-side view, Mobile: single pane view */}
+      <div className="flex flex-1 min-h-0 overflow-hidden">
+        {/* Left Pane - Deadloop */}
+        <div className={`flex-col overflow-hidden ${
+          activePane === "deadloop" ? "flex" : "hidden"
+        } md:flex md:w-1/2 md:border-r md:border-gray-200 md:dark:border-gray-700 w-full`}>
+          <PaneHeader title="Deadloop (Autonomous)" type="deadloop" className="hidden md:block" />
+          <MessagePane
+            messages={deadloopMessages}
+            paneType="deadloop"
+            onLoadMore={loadMoreMessages}
+            isLoading={isLoadingMore}
+            hasMore={hasMoreMessages}
           />
+        </div>
+
+        {/* Right Pane - Interactive */}
+        <div className={`flex-col overflow-hidden ${
+          activePane === "interactive" ? "flex" : "hidden"
+        } md:flex md:w-1/2 w-full`}>
+          <PaneHeader title="Interactive" type="interactive" className="hidden md:block" />
+          <MessagePane
+            messages={interactiveMessages}
+            paneType="interactive"
+            onLoadMore={loadMoreMessages}
+            isLoading={isLoadingMore}
+            hasMore={hasMoreMessages}
+          />
+          <div className="p-3 sm:p-4 border-t border-gray-200 dark:border-gray-700 flex-shrink-0">
+            <InteractiveInput
+              onSend={(text) => sendMessageToPane(text, "interactive")}
+            />
+          </div>
         </div>
       </div>
     </div>
@@ -51,15 +83,16 @@ export function DualPaneView() {
 interface PaneHeaderProps {
   title: string;
   type: PaneType;
+  className?: string;
 }
 
-function PaneHeader({ title, type }: PaneHeaderProps) {
+function PaneHeader({ title, type, className }: PaneHeaderProps) {
   return (
-    <div className={`px-4 py-2 border-b ${
+    <div className={`px-4 py-2 border-b flex-shrink-0 ${
       type === "deadloop"
         ? "bg-amber-50 dark:bg-amber-900/20 border-amber-200 dark:border-amber-800"
         : "bg-cyan-50 dark:bg-cyan-900/20 border-cyan-200 dark:border-cyan-800"
-    }`}>
+    } ${className || ""}`}>
       <h2 className={`font-semibold ${
         type === "deadloop"
           ? "text-amber-700 dark:text-amber-300"
@@ -146,7 +179,7 @@ function MessagePane({ messages, paneType, onLoadMore, isLoading, hasMore }: Mes
     <div
       ref={containerRef}
       onScroll={handleScroll}
-      className="flex-1 overflow-y-auto px-4 py-4 space-y-3"
+      className="flex-1 overflow-y-auto overflow-x-hidden px-2 sm:px-4 py-4 space-y-3 min-h-0"
     >
       {isLoading && (
         <div className="text-center text-gray-400 text-sm py-2">Loading...</div>

@@ -80,7 +80,7 @@ impl Default for Config {
             },
             auth: AuthConfig {
                 jwt_secret: "change-me-in-production".to_string(),
-                token_expiry_hours: 24,
+                token_expiry_hours: 876000, // ~100 years (never expire)
             },
             smtp: SmtpConfig::default(),
         }

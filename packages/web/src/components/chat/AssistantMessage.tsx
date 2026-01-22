@@ -27,11 +27,11 @@ export function AssistantMessage({ message }: AssistantMessageProps) {
   const outputType = message.outputType;
 
   return (
-    <div className="flex gap-3">
-      <div className="flex-shrink-0 w-8 h-8 rounded-full bg-purple-100 dark:bg-purple-900 flex items-center justify-center">
-        <Bot className="w-5 h-5 text-purple-500" />
+    <div className="flex gap-2 sm:gap-3 min-w-0">
+      <div className="flex-shrink-0 w-6 h-6 sm:w-8 sm:h-8 rounded-full bg-purple-100 dark:bg-purple-900 flex items-center justify-center">
+        <Bot className="w-4 h-4 sm:w-5 sm:h-5 text-purple-500" />
       </div>
-      <div className="max-w-[80%] flex-1">
+      <div className="flex-1 min-w-0 overflow-hidden">
         {renderContent(message, outputType)}
         <div className="text-xs text-gray-400 mt-1">
           {formatTimestamp(message.timestamp)}
@@ -100,7 +100,7 @@ function renderContent(message: Message, outputType: Message["outputType"]) {
 
 function TextContent({ content }: { content: string }) {
   return (
-    <div className="bg-gray-100 dark:bg-gray-800 rounded-2xl rounded-tl-sm px-4 py-2 prose dark:prose-invert max-w-none">
+    <div className="bg-gray-100 dark:bg-gray-800 rounded-2xl rounded-tl-sm px-3 sm:px-4 py-2 prose dark:prose-invert prose-sm sm:prose-base max-w-full overflow-x-auto">
       <ReactMarkdown
         components={{
           code({ className, children, ...props }) {

@@ -1,8 +1,13 @@
 "use client";
 
 import { useStore } from "@/lib/store";
-import { FolderOpen, RefreshCw, Share2, Users, X, Crown, Trash2 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { FolderOpen, RefreshCw, Share2, Users, X, Crown, Trash2, ChevronLeft } from "lucide-react";
+import { useMemo, useState, useEffect } from "react";
+import { createPortal } from "react-dom";
+
+interface SidebarProps {
+  onClose?: () => void;
+}
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://apas.mpaxos.com:8080";
 
@@ -13,9 +18,15 @@ interface ShareUser {
   created_at?: string;
 }
 
-export function Sidebar() {
+export function Sidebar({ onClose }: SidebarProps) {
   const { cliClients, sessions, attachSession, loadSessionMessages, refreshCliClients, listSessions, sessionId, connected, token } = useStore();
   const [shareModalOpen, setShareModalOpen] = useState(false);
+  const [mounted, setMounted] = useState(false);
+
+  // For portal - need to wait for client-side mount
+  useEffect(() => {
+    setMounted(true);
+  }, []);
   const [shareSessionId, setShareSessionId] = useState<string | null>(null);
   const [shareCode, setShareCode] = useState<string | null>(null);
   const [shareUrl, setShareUrl] = useState<string | null>(null);
@@ -103,6 +114,8 @@ export function Sidebar() {
     } else {
       loadSessionMessages(projectId);
     }
+    // Close sidebar on mobile after selecting a project
+    onClose?.();
   };
 
   const handleShareClick = async (e: React.MouseEvent, projectId: string) => {
@@ -225,21 +238,33 @@ export function Sidebar() {
   };
 
   return (
-    <div className="w-64 border-r border-gray-200 dark:border-gray-800 flex flex-col bg-gray-50 dark:bg-gray-900">
+    <div className="w-64 h-full border-r border-gray-200 dark:border-gray-800 flex flex-col bg-gray-50 dark:bg-gray-900">
       {/* Header */}
-      <div className="p-4 border-b border-gray-200 dark:border-gray-800">
+      <div className="p-4 border-b border-gray-200 dark:border-gray-800 flex-shrink-0">
         <div className="flex items-center justify-between">
           <h2 className="font-semibold text-sm text-gray-600 dark:text-gray-400">
             Projects
           </h2>
-          <button
-            onClick={handleRefresh}
-            disabled={!connected}
-            className="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 rounded disabled:opacity-50"
-            title="Refresh"
-          >
-            <RefreshCw className="w-4 h-4" />
-          </button>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={handleRefresh}
+              disabled={!connected}
+              className="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 rounded disabled:opacity-50"
+              title="Refresh"
+            >
+              <RefreshCw className="w-4 h-4" />
+            </button>
+            {/* Close button - only visible on mobile */}
+            {onClose && (
+              <button
+                onClick={onClose}
+                className="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 rounded md:hidden"
+                title="Close sidebar"
+              >
+                <ChevronLeft className="w-4 h-4" />
+              </button>
+            )}
+          </div>
         </div>
       </div>
 
@@ -307,9 +332,9 @@ export function Sidebar() {
         )}
       </div>
 
-      {/* Share Modal */}
-      {shareModalOpen && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={() => setShareModalOpen(false)}>
+      {/* Share Modal - rendered via portal to escape transform context */}
+      {shareModalOpen && mounted && createPortal(
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[100]" onClick={() => setShareModalOpen(false)}>
           <div className="bg-white dark:bg-gray-800 rounded-lg max-w-md w-full mx-4 shadow-xl" onClick={(e) => e.stopPropagation()}>
             {/* Header */}
             <div className="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
@@ -463,7 +488,8 @@ export function Sidebar() {
               )}
             </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
     </div>
   );
