@@ -381,13 +381,14 @@ fn run_interactive_session(
         // Build args:
         // - First message: use --session-id to create session with specific ID
         // - Subsequent: use --resume with the session ID to continue
-        // Note: Don't use --verbose as it outputs extra non-JSON lines
+        // Note: --verbose is required when using --print with --output-format stream-json
         let args = if first_message {
             first_message = false;
             vec![
                 "--print".to_string(),
                 "--output-format".to_string(),
                 "stream-json".to_string(),
+                "--verbose".to_string(),
                 "--dangerously-skip-permissions".to_string(),
                 "--session-id".to_string(),
                 claude_session_id.to_string(),
@@ -398,6 +399,7 @@ fn run_interactive_session(
                 "--print".to_string(),
                 "--output-format".to_string(),
                 "stream-json".to_string(),
+                "--verbose".to_string(),
                 "--dangerously-skip-permissions".to_string(),
                 "--resume".to_string(),
                 claude_session_id.to_string(),

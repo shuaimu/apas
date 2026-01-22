@@ -224,8 +224,19 @@ impl Database {
 
     // Session operations
     pub async fn create_session(&self, session: &Session) -> Result<()> {
+        // Use UPSERT (ON CONFLICT DO UPDATE) instead of INSERT OR REPLACE
+        // INSERT OR REPLACE triggers ON DELETE CASCADE, which deletes session_shares
         sqlx::query(
-            "INSERT OR REPLACE INTO sessions (id, user_id, cli_client_id, working_dir, hostname, status) VALUES (?, ?, ?, ?, ?, ?)",
+            r#"
+            INSERT INTO sessions (id, user_id, cli_client_id, working_dir, hostname, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                cli_client_id = excluded.cli_client_id,
+                working_dir = excluded.working_dir,
+                hostname = excluded.hostname,
+                status = excluded.status,
+                updated_at = CURRENT_TIMESTAMP
+            "#,
         )
         .bind(&session.id)
         .bind(&session.user_id)
