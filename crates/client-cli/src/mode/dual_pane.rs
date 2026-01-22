@@ -178,6 +178,45 @@ fn run_deadloop_session(
     shutdown: Arc<AtomicBool>,
     child_process: Arc<Mutex<Option<std::process::Child>>>,
 ) {
+    // Wrap in panic catcher to prevent silent thread crashes
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_deadloop_session_inner(
+            claude_path,
+            working_dir,
+            session_id,
+            prompt,
+            output_tx.clone(),
+            server_tx,
+            shutdown,
+            child_process,
+        )
+    }));
+
+    if let Err(e) = result {
+        let msg = if let Some(s) = e.downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = e.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Unknown panic".to_string()
+        };
+        let _ = output_tx.send(PaneOutput {
+            text: format!("[DEADLOOP CRASHED: {}]", msg),
+            is_deadloop: true,
+        });
+    }
+}
+
+fn run_deadloop_session_inner(
+    claude_path: &str,
+    working_dir: &str,
+    session_id: Uuid,
+    prompt: &str,
+    output_tx: mpsc::Sender<PaneOutput>,
+    server_tx: tokio_mpsc::Sender<CliToServer>,
+    shutdown: Arc<AtomicBool>,
+    child_process: Arc<Mutex<Option<std::process::Child>>>,
+) {
     let _ = output_tx.send(PaneOutput {
         text: "[Deadloop thread started]".to_string(),
         is_deadloop: true,
@@ -221,15 +260,25 @@ fn run_deadloop_session(
             .stderr(Stdio::piped())
             .spawn()
         {
-            Ok(child) => {
+            Ok(mut child) => {
+                // Take stdout for reading
+                let stdout = match child.stdout.take() {
+                    Some(s) => s,
+                    None => {
+                        let _ = output_tx.send(PaneOutput {
+                            text: "[Error: Failed to capture stdout]".to_string(),
+                            is_deadloop: true,
+                        });
+                        thread::sleep(std::time::Duration::from_secs(5));
+                        continue;
+                    }
+                };
+
                 // Store child for cleanup
                 if let Ok(mut guard) = child_process.lock() {
                     *guard = Some(child);
                 }
 
-                // Take the child back for reading
-                let mut child = child_process.lock().unwrap().take().unwrap();
-                let stdout = child.stdout.take().unwrap();
                 let reader = BufReader::new(stdout);
 
                 let mut had_error = false;
@@ -282,7 +331,12 @@ fn run_deadloop_session(
                     }
                 }
 
-                let _ = child.wait();
+                // Wait for child to finish
+                if let Ok(mut guard) = child_process.lock() {
+                    if let Some(mut child) = guard.take() {
+                        let _ = child.wait();
+                    }
+                }
 
                 // Backoff on error
                 if had_error {
