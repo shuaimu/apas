@@ -192,6 +192,19 @@ pub fn check_for_updates_background() {
     });
 }
 
+/// Check if an update is available, returns the new version string if available
+pub fn check_for_update_available() -> Option<String> {
+    let current = parse_version(CURRENT_VERSION)?;
+    let remote_version_str = get_remote_version()?;
+    let remote = parse_version(&remote_version_str)?;
+
+    if remote > current {
+        Some(remote_version_str)
+    } else {
+        None
+    }
+}
+
 /// Check for updates and automatically install + restart if available
 /// This function will not return if an update is installed (it exec's the new binary)
 pub fn auto_update_and_restart() {

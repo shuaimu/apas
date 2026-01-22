@@ -312,16 +312,17 @@ fn run_deadloop_session(
             }
         }
 
-        // Check for updates every hour
+        // Check for updates every hour (notify only, don't auto-restart in TUI mode)
         if last_update_check.elapsed() >= UPDATE_CHECK_INTERVAL {
             last_update_check = Instant::now();
-            let _ = output_tx.send(PaneOutput {
-                text: "[Checking for updates...]".to_string(),
-                is_deadloop: true,
-            });
-            // Run update check in background - if update is installed, process will restart
-            thread::spawn(|| {
-                crate::update::auto_update_and_restart();
+            let output_tx_update = output_tx.clone();
+            thread::spawn(move || {
+                if let Some(new_version) = crate::update::check_for_update_available() {
+                    let _ = output_tx_update.send(PaneOutput {
+                        text: format!("[Update available: {} - restart to apply]", new_version),
+                        is_deadloop: true,
+                    });
+                }
             });
         }
     }
