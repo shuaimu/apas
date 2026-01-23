@@ -690,52 +690,76 @@ async fn run_server_connection(
                     continue;
                 }
 
-                // Wait for registration response
-                let mut registered = false;
-                while let Some(Ok(msg)) = ws_receiver.next().await {
-                    if let Message::Text(text) = msg {
-                        let response: ServerToCli = match serde_json::from_str(&text) {
-                            Ok(r) => r,
-                            Err(_) => continue,
-                        };
-                        match response {
-                            ServerToCli::Registered { cli_id } => {
-                                let _ = status_tx.send(PaneOutput {
-                                    text: format!("[Server: Connected ({})]", &cli_id.to_string()[..8]),
-                                    is_deadloop: true,
-                                });
-                                registered = true;
-                                break;
+                // Wait for registration response with timeout
+                let registration_timeout = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    async {
+                        while let Some(Ok(msg)) = ws_receiver.next().await {
+                            match msg {
+                                Message::Text(text) => {
+                                    let response: ServerToCli = match serde_json::from_str(&text) {
+                                        Ok(r) => r,
+                                        Err(_) => continue,
+                                    };
+                                    match response {
+                                        ServerToCli::Registered { cli_id } => {
+                                            return Some(Ok(cli_id));
+                                        }
+                                        ServerToCli::RegistrationFailed { reason } => {
+                                            return Some(Err(reason));
+                                        }
+                                        ServerToCli::VersionUnsupported {
+                                            client_version,
+                                            min_version,
+                                        } => {
+                                            return Some(Err(format!("Version {} not supported, need {}", client_version, min_version)));
+                                        }
+                                        _ => continue,
+                                    }
+                                }
+                                Message::Ping(data) => {
+                                    // Respond to ping during registration
+                                    return Some(Err(format!("ping:{}", data.len())));
+                                }
+                                _ => continue,
                             }
-                            ServerToCli::RegistrationFailed { reason } => {
-                                let _ = status_tx.send(PaneOutput {
-                                    text: format!("[Server: Registration failed - {}]", reason),
-                                    is_deadloop: true,
-                                });
-                                return Err(anyhow::anyhow!("Registration failed: {}", reason));
-                            }
-                            ServerToCli::VersionUnsupported {
-                                client_version,
-                                min_version,
-                            } => {
-                                let _ = status_tx.send(PaneOutput {
-                                    text: format!("[Server: Version {} not supported, need {}]", client_version, min_version),
-                                    is_deadloop: true,
-                                });
-                                return Err(anyhow::anyhow!("Version not supported"));
-                            }
-                            _ => continue,
                         }
+                        None
                     }
-                }
+                ).await;
 
-                if !registered {
-                    let _ = status_tx.send(PaneOutput {
-                        text: "[Server: Connection lost before registration]".to_string(),
-                        is_deadloop: true,
-                    });
-                    tokio::time::sleep(reconnect_delay).await;
-                    continue;
+                match registration_timeout {
+                    Ok(Some(Ok(cli_id))) => {
+                        let _ = status_tx.send(PaneOutput {
+                            text: format!("[Server: Connected ({})]", &cli_id.to_string()[..8]),
+                            is_deadloop: true,
+                        });
+                        // Successfully registered, continue to session start
+                    }
+                    Ok(Some(Err(reason))) if reason.starts_with("ping:") => {
+                        // Got a ping, need to handle it - restart the connection
+                        let _ = status_tx.send(PaneOutput {
+                            text: "[Server: Received ping during registration, reconnecting...]".to_string(),
+                            is_deadloop: true,
+                        });
+                        tokio::time::sleep(reconnect_delay).await;
+                        continue;
+                    }
+                    Ok(Some(Err(reason))) => {
+                        let _ = status_tx.send(PaneOutput {
+                            text: format!("[Server: Registration failed - {}]", reason),
+                            is_deadloop: true,
+                        });
+                        return Err(anyhow::anyhow!("Registration failed: {}", reason));
+                    }
+                    Ok(None) | Err(_) => {
+                        let _ = status_tx.send(PaneOutput {
+                            text: "[Server: Registration timeout or connection lost]".to_string(),
+                            is_deadloop: true,
+                        });
+                        tokio::time::sleep(reconnect_delay).await;
+                        continue;
+                    }
                 }
 
                 // Register session (pane_type in messages will differentiate deadloop vs interactive)
@@ -758,6 +782,12 @@ async fn run_server_connection(
                     tokio::time::sleep(reconnect_delay).await;
                     continue;
                 }
+
+                // Use a persistent heartbeat interval instead of creating new sleep each time
+                let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(25));
+                heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // Skip the first immediate tick
+                heartbeat_interval.tick().await;
 
                 // Main loop
                 loop {
@@ -788,6 +818,19 @@ async fn run_server_connection(
                                         }
                                     }
                                 }
+                                Some(Ok(Message::Ping(data))) => {
+                                    // Respond to server ping with pong
+                                    if ws_sender.send(Message::Pong(data)).await.is_err() {
+                                        let _ = status_tx.send(PaneOutput {
+                                            text: "[Server: Failed to send pong, reconnecting...]".to_string(),
+                                            is_deadloop: true,
+                                        });
+                                        break;
+                                    }
+                                }
+                                Some(Ok(Message::Pong(_))) => {
+                                    // Server responded to our ping, connection is alive
+                                }
                                 Some(Ok(Message::Close(_))) | None => {
                                     let _ = status_tx.send(PaneOutput {
                                         text: "[Server: Connection closed, reconnecting...]".to_string(),
@@ -795,9 +838,9 @@ async fn run_server_connection(
                                     });
                                     break;
                                 }
-                                Some(Err(_)) => {
+                                Some(Err(e)) => {
                                     let _ = status_tx.send(PaneOutput {
-                                        text: "[Server: Connection error, reconnecting...]".to_string(),
+                                        text: format!("[Server: Connection error ({}), reconnecting...]", e),
                                         is_deadloop: true,
                                     });
                                     break;
@@ -805,11 +848,9 @@ async fn run_server_connection(
                                 _ => {}
                             }
                         }
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                            // Heartbeat
-                            if ws_sender.send(Message::Text(
-                                serde_json::to_string(&CliToServer::Heartbeat)?.into()
-                            )).await.is_err() {
+                        _ = heartbeat_interval.tick() => {
+                            // Send ping to server to keep connection alive
+                            if ws_sender.send(Message::Ping(vec![].into())).await.is_err() {
                                 let _ = status_tx.send(PaneOutput {
                                     text: "[Server: Heartbeat failed, reconnecting...]".to_string(),
                                     is_deadloop: true,

@@ -3,6 +3,7 @@
 import { Message } from "@/lib/store";
 import { Bot } from "lucide-react";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { CodeBlock } from "@/components/code/CodeBlock";
 import { ToolCard } from "@/components/tools/ToolCard";
 import { ApprovalPrompt } from "@/components/tools/ApprovalPrompt";
@@ -102,6 +103,7 @@ function TextContent({ content }: { content: string }) {
   return (
     <div className="bg-gray-100 dark:bg-gray-800 rounded-2xl rounded-tl-sm px-3 sm:px-4 py-2 prose dark:prose-invert prose-sm sm:prose-base max-w-full overflow-x-auto">
       <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
         components={{
           code({ className, children, ...props }) {
             const match = /language-(\w+)/.exec(className || "");
@@ -123,6 +125,43 @@ function TextContent({ content }: { content: string }) {
                 code={String(children).replace(/\n$/, "")}
                 language={match[1]}
               />
+            );
+          },
+          table({ children }) {
+            return (
+              <div className="overflow-x-auto my-2">
+                <table className="min-w-full border-collapse text-sm">
+                  {children}
+                </table>
+              </div>
+            );
+          },
+          thead({ children }) {
+            return (
+              <thead className="bg-gray-200 dark:bg-gray-700">
+                {children}
+              </thead>
+            );
+          },
+          th({ children }) {
+            return (
+              <th className="border border-gray-300 dark:border-gray-600 px-3 py-2 text-left font-semibold">
+                {children}
+              </th>
+            );
+          },
+          td({ children }) {
+            return (
+              <td className="border border-gray-300 dark:border-gray-600 px-3 py-2">
+                {children}
+              </td>
+            );
+          },
+          tr({ children }) {
+            return (
+              <tr className="even:bg-gray-50 dark:even:bg-gray-750">
+                {children}
+              </tr>
             );
           },
         }}

@@ -7,6 +7,7 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use shared::{CliToServer, ServerToCli, ServerToWeb};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -16,6 +17,12 @@ use crate::state::AppState;
 /// Minimum supported client version (YY.MM.COMMIT format)
 /// Update this when making breaking API changes
 const MIN_CLIENT_VERSION: &str = "26.01.0";
+
+/// How often to send ping frames to CLI clients
+const PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long to wait for any activity before considering connection dead
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Parse version string (YY.MM.COMMIT) into comparable number
 fn parse_version(v: &str) -> Option<u64> {
@@ -164,145 +171,190 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         tracing::error!("Failed to upsert cli_client: {}", e);
     }
 
-    // Task to forward messages from channel to WebSocket
-    let mut send_sender = sender;
-    let send_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            let text = serde_json::to_string(&msg).unwrap();
-            if send_sender.send(Message::Text(text.into())).await.is_err() {
-                break;
+    // Track last activity for timeout detection
+    let mut last_activity = Instant::now();
+    let mut ping_interval = tokio::time::interval(PING_INTERVAL);
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Main message handling loop with ping/timeout
+    loop {
+        tokio::select! {
+            // Handle outgoing messages from channel
+            Some(msg) = rx.recv() => {
+                let text = serde_json::to_string(&msg).unwrap();
+                if sender.send(Message::Text(text.into())).await.is_err() {
+                    tracing::warn!("CLI {} send failed, closing connection", cli_id);
+                    break;
+                }
             }
-        }
-    });
 
-    // Handle incoming messages
-    while let Some(Ok(msg)) = receiver.next().await {
-        match msg {
-            Message::Text(text) => {
-                let parsed: Result<CliToServer, _> = serde_json::from_str(&text);
-                match parsed {
-                    Ok(CliToServer::SessionStart {
-                        session_id,
-                        working_dir,
-                        hostname,
-                        pane_type: _,
-                    }) => {
-                        // CLI is starting a local session (hybrid mode)
-                        state.sessions.create_cli_session(session_id, cli_id);
+            // Periodic ping to detect dead connections
+            _ = ping_interval.tick() => {
+                // Check if connection has timed out
+                if last_activity.elapsed() > CONNECTION_TIMEOUT {
+                    tracing::warn!("CLI {} connection timed out (no activity for {:?})", cli_id, last_activity.elapsed());
+                    break;
+                }
 
-                        // Persist session to database
-                        let session = crate::db::Session {
-                            id: session_id.to_string(),
-                            user_id: user_id.to_string(),
-                            cli_client_id: Some(cli_id.to_string()),
-                            working_dir,
-                            hostname,
-                            status: "active".to_string(),
-                            created_at: None,
-                            updated_at: None,
-                        };
-                        if let Err(e) = state.db.create_session(&session).await {
-                            tracing::error!("Failed to persist session to database: {}", e);
-                        }
+                // Send ping frame
+                if sender.send(Message::Ping(vec![].into())).await.is_err() {
+                    tracing::warn!("CLI {} ping failed, closing connection", cli_id);
+                    break;
+                }
+            }
 
-                        tracing::info!("CLI {} started local session {}", cli_id, session_id);
-                    }
-                    Ok(CliToServer::Output {
-                        session_id,
-                        data,
-                        output_type,
-                    }) => {
-                        // Route output to web client (if attached)
-                        state
-                            .sessions
-                            .route_to_web(
-                                &session_id,
-                                ServerToWeb::Output {
-                                    content: data,
-                                    output_type,
-                                    pane_type: None,
-                                },
-                            )
-                            .await;
-                    }
-                    Ok(CliToServer::StreamMessage { session_id, message, pane_type }) => {
-                        tracing::info!("Received StreamMessage for session {} with pane_type {:?}", session_id, pane_type);
+            // Handle incoming messages
+            msg = receiver.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        last_activity = Instant::now();
+                        let parsed: Result<CliToServer, _> = serde_json::from_str(&text);
+                        match parsed {
+                            Ok(CliToServer::SessionStart {
+                                session_id,
+                                working_dir,
+                                hostname,
+                                pane_type: _,
+                            }) => {
+                                // CLI is starting a local session (hybrid mode)
+                                state.sessions.create_cli_session(session_id, cli_id);
 
-                        // Save message(s) to file storage
-                        for stored_message in stream_message_to_stored(&session_id, &message, pane_type) {
-                            if let Err(e) = state.storage.append_message(&session_id, &stored_message).await {
-                                tracing::error!("Failed to save message to file: {}", e);
+                                // Persist session to database
+                                let session = crate::db::Session {
+                                    id: session_id.to_string(),
+                                    user_id: user_id.to_string(),
+                                    cli_client_id: Some(cli_id.to_string()),
+                                    working_dir,
+                                    hostname,
+                                    status: "active".to_string(),
+                                    created_at: None,
+                                    updated_at: None,
+                                };
+                                if let Err(e) = state.db.create_session(&session).await {
+                                    tracing::error!("Failed to persist session to database: {}", e);
+                                }
+
+                                tracing::info!("CLI {} started local session {}", cli_id, session_id);
+                            }
+                            Ok(CliToServer::Output {
+                                session_id,
+                                data,
+                                output_type,
+                            }) => {
+                                // Route output to web client (if attached)
+                                state
+                                    .sessions
+                                    .route_to_web(
+                                        &session_id,
+                                        ServerToWeb::Output {
+                                            content: data,
+                                            output_type,
+                                            pane_type: None,
+                                        },
+                                    )
+                                    .await;
+                            }
+                            Ok(CliToServer::StreamMessage { session_id, message, pane_type }) => {
+                                tracing::info!("Received StreamMessage for session {} with pane_type {:?}", session_id, pane_type);
+
+                                // Save message(s) to file storage
+                                for stored_message in stream_message_to_stored(&session_id, &message, pane_type) {
+                                    if let Err(e) = state.storage.append_message(&session_id, &stored_message).await {
+                                        tracing::error!("Failed to save message to file: {}", e);
+                                    }
+                                }
+
+                                // Route structured stream message to web client
+                                let routed = state
+                                    .sessions
+                                    .route_to_web(
+                                        &session_id,
+                                        ServerToWeb::StreamMessage { session_id, message, pane_type },
+                                    )
+                                    .await;
+                                tracing::info!("StreamMessage routed to web: {}", routed);
+                            }
+                            Ok(CliToServer::UserInput { session_id, text, pane_type }) => {
+                                tracing::info!("Received UserInput for session {}: {}", session_id, text);
+                                // Save user input to file storage
+                                let stored_message = crate::storage::StoredMessage {
+                                    id: Uuid::new_v4().to_string(),
+                                    role: "user".to_string(),
+                                    content: text.clone(),
+                                    message_type: "text".to_string(),
+                                    created_at: chrono::Utc::now().to_rfc3339(),
+                                    pane_type: pane_type.map(|p| format!("{:?}", p).to_lowercase()),
+                                };
+                                if let Err(e) = state.storage.append_message(&session_id, &stored_message).await {
+                                    tracing::error!("Failed to save user input to file: {}", e);
+                                }
+
+                                // Forward user input to web client
+                                state
+                                    .sessions
+                                    .route_to_web(
+                                        &session_id,
+                                        ServerToWeb::UserInput { session_id, text, pane_type },
+                                    )
+                                    .await;
+                            }
+                            Ok(CliToServer::SessionEnd { session_id, reason }) => {
+                                // Update session status in database
+                                let _ = state.db.update_session_status(&session_id.to_string(), "ended").await;
+
+                                state
+                                    .sessions
+                                    .route_to_web(
+                                        &session_id,
+                                        ServerToWeb::SessionStatus {
+                                            status: shared::SessionStatus::Ended,
+                                        },
+                                    )
+                                    .await;
+                                tracing::info!("Session {} ended: {}", session_id, reason);
+                            }
+                            Ok(CliToServer::Heartbeat) => {
+                                state
+                                    .sessions
+                                    .send_to_cli(&cli_id, ServerToCli::Heartbeat)
+                                    .await;
+                            }
+                            Ok(CliToServer::Register { .. }) => {
+                                // Already registered, ignore
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to parse CLI message: {}", e);
                             }
                         }
-
-                        // Route structured stream message to web client
-                        let routed = state
-                            .sessions
-                            .route_to_web(
-                                &session_id,
-                                ServerToWeb::StreamMessage { session_id, message, pane_type },
-                            )
-                            .await;
-                        tracing::info!("StreamMessage routed to web: {}", routed);
                     }
-                    Ok(CliToServer::UserInput { session_id, text, pane_type }) => {
-                        tracing::info!("Received UserInput for session {}: {}", session_id, text);
-                        // Save user input to file storage
-                        let stored_message = crate::storage::StoredMessage {
-                            id: Uuid::new_v4().to_string(),
-                            role: "user".to_string(),
-                            content: text.clone(),
-                            message_type: "text".to_string(),
-                            created_at: chrono::Utc::now().to_rfc3339(),
-                            pane_type: pane_type.map(|p| format!("{:?}", p).to_lowercase()),
-                        };
-                        if let Err(e) = state.storage.append_message(&session_id, &stored_message).await {
-                            tracing::error!("Failed to save user input to file: {}", e);
-                        }
-
-                        // Forward user input to web client
-                        state
-                            .sessions
-                            .route_to_web(
-                                &session_id,
-                                ServerToWeb::UserInput { session_id, text, pane_type },
-                            )
-                            .await;
+                    Some(Ok(Message::Pong(_))) => {
+                        // Pong received - connection is alive
+                        last_activity = Instant::now();
                     }
-                    Ok(CliToServer::SessionEnd { session_id, reason }) => {
-                        // Update session status in database
-                        let _ = state.db.update_session_status(&session_id.to_string(), "ended").await;
-
-                        state
-                            .sessions
-                            .route_to_web(
-                                &session_id,
-                                ServerToWeb::SessionStatus {
-                                    status: shared::SessionStatus::Ended,
-                                },
-                            )
-                            .await;
-                        tracing::info!("Session {} ended: {}", session_id, reason);
+                    Some(Ok(Message::Ping(data))) => {
+                        // Respond to ping from client
+                        last_activity = Instant::now();
+                        let _ = sender.send(Message::Pong(data)).await;
                     }
-                    Ok(CliToServer::Heartbeat) => {
-                        state
-                            .sessions
-                            .send_to_cli(&cli_id, ServerToCli::Heartbeat)
-                            .await;
+                    Some(Ok(Message::Close(_))) => {
+                        tracing::info!("CLI {} sent close frame", cli_id);
+                        break;
                     }
-                    Ok(CliToServer::Register { .. }) => {
-                        // Already registered, ignore
+                    Some(Ok(_)) => {
+                        // Binary or other message types - still counts as activity
+                        last_activity = Instant::now();
                     }
-                    Err(e) => {
-                        tracing::warn!("Failed to parse CLI message: {}", e);
+                    Some(Err(e)) => {
+                        tracing::warn!("CLI {} WebSocket error: {}", cli_id, e);
+                        break;
+                    }
+                    None => {
+                        // Connection closed
+                        tracing::info!("CLI {} connection closed", cli_id);
+                        break;
                     }
                 }
             }
-            Message::Ping(_) => {
-                // Pong is handled automatically
-            }
-            Message::Close(_) => break,
-            _ => {}
         }
     }
 
@@ -316,7 +368,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     state.sessions.unregister_cli(&cli_id);
     let _ = state.db.update_cli_client_status(&cli_id.to_string(), "offline").await;
-    send_task.abort();
     tracing::info!("CLI client disconnected: {} (marked {} sessions as inactive)", cli_id, session_ids.len());
 }
 
