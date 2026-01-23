@@ -66,6 +66,7 @@ export function Sidebar({ onClose }: SidebarProps) {
   const [shareUrl, setShareUrl] = useState<string | null>(null);
   const [shareLoading, setShareLoading] = useState(false);
   const [shareError, setShareError] = useState<string | null>(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [shareTab, setShareTab] = useState<"invite" | "manage">("invite");
   const [shareUsers, setShareUsers] = useState<{ owner?: ShareUser; shares: ShareUser[] }>({ shares: [] });
   const [manageLoading, setManageLoading] = useState(false);
@@ -138,8 +139,14 @@ export function Sidebar({ onClose }: SidebarProps) {
   }, [cliClients, sessions]);
 
   const handleRefresh = () => {
+    if (isRefreshing) return;
+    setIsRefreshing(true);
     refreshCliClients();
     listSessions();
+    // Clear refreshing state after a short delay
+    setTimeout(() => {
+      setIsRefreshing(false);
+    }, 1000);
   };
 
   const handleProjectClick = (projectId: string, isActive: boolean) => {
@@ -282,11 +289,15 @@ export function Sidebar({ onClose }: SidebarProps) {
           <div className="flex items-center gap-1">
             <button
               onClick={handleRefresh}
-              disabled={!connected}
-              className="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 rounded disabled:opacity-50"
-              title="Refresh"
+              disabled={!connected || isRefreshing}
+              className={`p-1 rounded disabled:opacity-50 ${
+                isRefreshing
+                  ? "bg-blue-100 dark:bg-blue-900/30"
+                  : "hover:bg-gray-200 dark:hover:bg-gray-700"
+              }`}
+              title={isRefreshing ? "Refreshing..." : "Refresh"}
             >
-              <RefreshCw className="w-4 h-4" />
+              <RefreshCw className={`w-4 h-4 ${isRefreshing ? "animate-spin text-blue-500" : ""}`} />
             </button>
             {/* Close button - only visible on mobile */}
             {onClose && (

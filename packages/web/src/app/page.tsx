@@ -45,14 +45,36 @@ export default function Home() {
     router.push("/login");
   };
 
-  const handleReconnect = async () => {
+  const handleReconnect = () => {
+    if (isReconnecting) return; // Prevent double-clicks
     setIsReconnecting(true);
-    disconnect();
-    // Small delay before reconnecting
-    await new Promise(resolve => setTimeout(resolve, 500));
-    connect();
-    setIsReconnecting(false);
+    // Use setTimeout(0) to let React update the UI first (show spinner)
+    // before we disconnect (which also triggers a re-render)
+    setTimeout(() => {
+      disconnect();
+      // Then reconnect after a delay to let the old connection close
+      setTimeout(() => {
+        connect();
+      }, 500);
+    }, 50);
   };
+
+  // Clear reconnecting state when connection is established
+  useEffect(() => {
+    if (isReconnecting && connected) {
+      setIsReconnecting(false);
+    }
+  }, [connected, isReconnecting]);
+
+  // Also clear reconnecting after a timeout in case connection fails
+  useEffect(() => {
+    if (isReconnecting) {
+      const timeout = setTimeout(() => {
+        setIsReconnecting(false);
+      }, 5000); // 5 second timeout
+      return () => clearTimeout(timeout);
+    }
+  }, [isReconnecting]);
 
   // Show loading while checking auth
   if (isCheckingAuth) {
@@ -102,13 +124,17 @@ export default function Home() {
             <button
               onClick={handleReconnect}
               disabled={isReconnecting}
-              className="flex items-center gap-1 text-sm hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg px-2 py-1"
+              className={`flex items-center gap-1 text-sm rounded-lg px-2 py-1 transition-all duration-200 ${
+                isReconnecting
+                  ? "bg-blue-100 dark:bg-blue-900/30 cursor-wait"
+                  : "hover:bg-gray-100 dark:hover:bg-gray-800"
+              }`}
               title={connected ? "Click to reconnect" : "Click to connect"}
             >
               {isReconnecting ? (
                 <>
                   <RefreshCw className="w-4 h-4 text-blue-500 animate-spin" />
-                  <span className="text-blue-500 hidden sm:inline">Reconnecting...</span>
+                  <span className="text-blue-500 sm:inline">Reconnecting...</span>
                 </>
               ) : connected ? (
                 <>
