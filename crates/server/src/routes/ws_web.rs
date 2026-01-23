@@ -360,8 +360,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             )
                             .await;
 
-                        // Also load existing messages from file storage (limit to recent 100)
-                        let (messages, has_more) = match state.storage.get_messages_paginated(&sid, Some(100), None).await {
+                        // Load existing messages from file storage (100 per pane type to ensure both are shown)
+                        let (messages, has_more) = match state.storage.get_messages_per_pane(&sid, 100).await {
                             Ok((stored_messages, has_more)) => {
                                 let messages: Vec<MessageInfo> = stored_messages
                                     .into_iter()

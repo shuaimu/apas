@@ -131,6 +131,82 @@ impl FileStorage {
         Ok((result, has_more))
     }
 
+    /// Read messages for a session, loading recent messages per pane type
+    /// This ensures both deadloop and interactive messages are included
+    /// Returns (messages, has_more) where messages are sorted by created_at
+    pub async fn get_messages_per_pane(
+        &self,
+        session_id: &Uuid,
+        limit_per_pane: usize,
+    ) -> Result<(Vec<StoredMessage>, bool)> {
+        let file_path = self.messages_file(session_id);
+
+        if !file_path.exists() {
+            return Ok((Vec::new(), false));
+        }
+
+        let file = fs::File::open(&file_path).await?;
+        let reader = BufReader::new(file);
+        let mut lines = reader.lines();
+
+        let mut deadloop_messages = Vec::new();
+        let mut interactive_messages = Vec::new();
+        let mut other_messages = Vec::new();
+
+        while let Some(line) = lines.next_line().await? {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<StoredMessage>(&line) {
+                Ok(msg) => {
+                    match msg.pane_type.as_deref() {
+                        Some("deadloop") => deadloop_messages.push(msg),
+                        Some("interactive") => interactive_messages.push(msg),
+                        _ => other_messages.push(msg),
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to parse message line: {}", e);
+                }
+            }
+        }
+
+        // Check if there are more messages than we're returning
+        let has_more = deadloop_messages.len() > limit_per_pane
+            || interactive_messages.len() > limit_per_pane
+            || other_messages.len() > limit_per_pane;
+
+        // Take the most recent N messages from each category
+        let deadloop_recent: Vec<_> = if deadloop_messages.len() > limit_per_pane {
+            deadloop_messages[deadloop_messages.len() - limit_per_pane..].to_vec()
+        } else {
+            deadloop_messages
+        };
+
+        let interactive_recent: Vec<_> = if interactive_messages.len() > limit_per_pane {
+            interactive_messages[interactive_messages.len() - limit_per_pane..].to_vec()
+        } else {
+            interactive_messages
+        };
+
+        let other_recent: Vec<_> = if other_messages.len() > limit_per_pane {
+            other_messages[other_messages.len() - limit_per_pane..].to_vec()
+        } else {
+            other_messages
+        };
+
+        // Combine and sort by created_at
+        let mut combined = Vec::new();
+        combined.extend(deadloop_recent);
+        combined.extend(interactive_recent);
+        combined.extend(other_recent);
+
+        // Sort by created_at timestamp
+        combined.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+
+        Ok((combined, has_more))
+    }
+
     /// List all session IDs that have message files
     pub async fn list_sessions_with_messages(&self) -> Result<Vec<Uuid>> {
         let sessions_dir = self.base_path.join("sessions");
