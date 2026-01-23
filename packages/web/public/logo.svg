@@ -1,41 +1,73 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
-  <!-- Circuit Brain Logo - Simplified -->
-  <g stroke="#06b6d4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-    <!-- Left hemisphere -->
-    <path d="M28 12 C16 14, 10 24, 12 36 C14 46, 22 52, 30 52"/>
-    <path d="M24 18 C18 20, 14 28, 16 36 C17 42, 22 46, 28 48"/>
-    <path d="M20 26 L16 30"/>
-    <path d="M22 36 L18 40"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 48" fill="none">
+  <!-- Circuit Brain Logo - Horizontal brain shape like the reference -->
+  <g stroke="#06b6d4" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Left hemisphere outline -->
+    <path d="M38 24 C38 14, 30 6, 20 6 C10 6, 4 14, 4 24 C4 34, 10 42, 20 42 C30 42, 38 34, 38 24"/>
 
-    <!-- Right hemisphere -->
-    <path d="M36 12 C48 14, 54 24, 52 36 C50 46, 42 52, 34 52"/>
-    <path d="M40 18 C46 20, 50 28, 48 36 C47 42, 42 46, 36 48"/>
-    <path d="M44 26 L48 30"/>
-    <path d="M42 36 L46 40"/>
+    <!-- Left inner circuits -->
+    <path d="M34 18 C28 12, 18 10, 12 16"/>
+    <path d="M12 16 L8 14"/>
+    <path d="M30 14 C24 10, 16 10, 12 14"/>
+    <path d="M12 14 L8 12"/>
+    <path d="M34 24 C28 20, 18 18, 10 22"/>
+    <path d="M10 22 L6 20"/>
+    <path d="M34 30 C28 36, 18 38, 12 32"/>
+    <path d="M12 32 L8 34"/>
+    <path d="M30 34 C24 38, 16 38, 12 34"/>
+    <path d="M12 34 L8 36"/>
+    <path d="M26 20 L22 18"/>
+    <path d="M26 28 L22 30"/>
+    <path d="M18 24 L14 24"/>
 
-    <!-- Center stem -->
-    <path d="M32 12 L32 52"/>
-    <path d="M32 20 L28 24"/>
-    <path d="M32 20 L36 24"/>
-    <path d="M32 32 L26 36"/>
-    <path d="M32 32 L38 36"/>
-    <path d="M32 44 L28 48"/>
-    <path d="M32 44 L36 48"/>
+    <!-- Right hemisphere outline -->
+    <path d="M42 24 C42 14, 50 6, 60 6 C70 6, 76 14, 76 24 C76 34, 70 42, 60 42 C50 42, 42 34, 42 24"/>
+
+    <!-- Right inner circuits -->
+    <path d="M46 18 C52 12, 62 10, 68 16"/>
+    <path d="M68 16 L72 14"/>
+    <path d="M50 14 C56 10, 64 10, 68 14"/>
+    <path d="M68 14 L72 12"/>
+    <path d="M46 24 C52 20, 62 18, 70 22"/>
+    <path d="M70 22 L74 20"/>
+    <path d="M46 30 C52 36, 62 38, 68 32"/>
+    <path d="M68 32 L72 34"/>
+    <path d="M50 34 C56 38, 64 38, 68 34"/>
+    <path d="M68 34 L72 36"/>
+    <path d="M54 20 L58 18"/>
+    <path d="M54 28 L58 30"/>
+    <path d="M62 24 L66 24"/>
+
+    <!-- Center connection (corpus callosum) -->
+    <path d="M38 24 L42 24"/>
+    <path d="M38 20 L42 20"/>
+    <path d="M38 28 L42 28"/>
   </g>
 
   <!-- Circuit nodes -->
   <g fill="#06b6d4">
-    <circle cx="32" cy="12" r="2.5"/>
-    <circle cx="28" cy="12" r="2"/>
-    <circle cx="36" cy="12" r="2"/>
-    <circle cx="16" cy="30" r="2"/>
-    <circle cx="48" cy="30" r="2"/>
-    <circle cx="18" cy="40" r="2"/>
-    <circle cx="46" cy="40" r="2"/>
-    <circle cx="32" cy="52" r="2.5"/>
-    <circle cx="28" cy="24" r="1.5"/>
-    <circle cx="36" cy="24" r="1.5"/>
-    <circle cx="26" cy="36" r="1.5"/>
-    <circle cx="38" cy="36" r="1.5"/>
+    <!-- Left side nodes -->
+    <circle cx="8" cy="14" r="1.5"/>
+    <circle cx="8" cy="12" r="1.5"/>
+    <circle cx="6" cy="20" r="1.5"/>
+    <circle cx="8" cy="34" r="1.5"/>
+    <circle cx="8" cy="36" r="1.5"/>
+    <circle cx="22" cy="18" r="1.2"/>
+    <circle cx="22" cy="30" r="1.2"/>
+    <circle cx="14" cy="24" r="1.2"/>
+
+    <!-- Right side nodes -->
+    <circle cx="72" cy="14" r="1.5"/>
+    <circle cx="72" cy="12" r="1.5"/>
+    <circle cx="74" cy="20" r="1.5"/>
+    <circle cx="72" cy="34" r="1.5"/>
+    <circle cx="72" cy="36" r="1.5"/>
+    <circle cx="58" cy="18" r="1.2"/>
+    <circle cx="58" cy="30" r="1.2"/>
+    <circle cx="66" cy="24" r="1.2"/>
+
+    <!-- Center nodes -->
+    <circle cx="40" cy="20" r="1.2"/>
+    <circle cx="40" cy="24" r="1.5"/>
+    <circle cx="40" cy="28" r="1.2"/>
   </g>
 </svg>
