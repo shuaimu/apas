@@ -10,33 +10,34 @@ import { createPortal } from "react-dom";
 function truncatePath(path: string, maxLength: number = 22): string {
   if (path.length <= maxLength) return path;
 
-  const parts = path.split('/');
-  if (parts.length <= 2) return path;
+  // Handle absolute paths (starting with /)
+  const isAbsolute = path.startsWith('/');
+  const parts = path.split('/').filter(p => p.length > 0);
+  if (parts.length <= 1) return path;
 
   // Always keep the last part (folder name)
   const lastPart = parts[parts.length - 1];
-  const firstPart = parts[0] || '/';
+  const suffix = `.../${lastPart}`;
 
   // If even with truncation it's too long, just show .../folder
-  if (lastPart.length + 5 > maxLength) {
-    return `.../${lastPart}`;
+  if (suffix.length + 1 >= maxLength) {
+    return (isAbsolute ? '/' : '') + suffix;
   }
 
   // Try to fit as much of the beginning as possible
-  let result = firstPart;
-  const suffix = `/.../${lastPart}`;
-  const availableLength = maxLength - suffix.length;
+  const prefix = isAbsolute ? '/' : '';
+  let result = prefix + parts[0];
+  const fullSuffix = `/.../${lastPart}`;
+  const availableLength = maxLength - fullSuffix.length;
 
-  if (availableLength > firstPart.length) {
-    // We can include more path segments from the start
-    for (let i = 1; i < parts.length - 1; i++) {
-      const next = result + '/' + parts[i];
-      if (next.length > availableLength) break;
-      result = next;
-    }
+  // Add more path segments from the start if they fit
+  for (let i = 1; i < parts.length - 1; i++) {
+    const next = result + '/' + parts[i];
+    if (next.length > availableLength) break;
+    result = next;
   }
 
-  return result + suffix;
+  return result + fullSuffix;
 }
 
 interface SidebarProps {
