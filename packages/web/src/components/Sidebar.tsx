@@ -5,6 +5,40 @@ import { FolderOpen, RefreshCw, Share2, Users, X, Crown, Trash2, ChevronLeft } f
 import { useMemo, useState, useEffect } from "react";
 import { createPortal } from "react-dom";
 
+// Truncate path in the middle to preserve the folder name at the end
+// e.g., "/home/shuai/workspace/long-project" -> "/home/.../long-project"
+function truncatePath(path: string, maxLength: number = 30): string {
+  if (path.length <= maxLength) return path;
+
+  const parts = path.split('/');
+  if (parts.length <= 2) return path;
+
+  // Always keep the last part (folder name)
+  const lastPart = parts[parts.length - 1];
+  const firstPart = parts[0] || '/';
+
+  // If even with truncation it's too long, just show .../folder
+  if (lastPart.length + 5 > maxLength) {
+    return `.../${lastPart}`;
+  }
+
+  // Try to fit as much of the beginning as possible
+  let result = firstPart;
+  const suffix = `/.../${lastPart}`;
+  const availableLength = maxLength - suffix.length;
+
+  if (availableLength > firstPart.length) {
+    // We can include more path segments from the start
+    for (let i = 1; i < parts.length - 1; i++) {
+      const next = result + '/' + parts[i];
+      if (next.length > availableLength) break;
+      result = next;
+    }
+  }
+
+  return result + suffix;
+}
+
 interface SidebarProps {
   onClose?: () => void;
 }
@@ -299,8 +333,8 @@ export function Sidebar({ onClose }: SidebarProps) {
                       {project.hostname}
                     </div>
                   )}
-                  <div className="font-medium truncate">
-                    {project.workingDir}
+                  <div className="font-medium truncate" title={project.workingDir}>
+                    {truncatePath(project.workingDir)}
                   </div>
                   <div className="text-xs text-gray-500 truncate">
                     {project.isShared ? (
