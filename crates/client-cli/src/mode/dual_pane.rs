@@ -439,14 +439,15 @@ fn run_interactive_session(
 
     while !shutdown.load(Ordering::SeqCst) {
         // Wait for user input from either TUI or web
-        let prompt = {
+        // Track the source to avoid duplicate UserInput messages
+        let (prompt, from_tui) = {
             // Try TUI input first
             match tui_input_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(p) => p,
+                Ok(p) => (p, true),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     // Try web input
                     match web_input_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                        Ok(p) => p,
+                        Ok(p) => (p, false), // Web input - server already saved/broadcast it
                         Err(mpsc::RecvTimeoutError::Timeout) => continue,
                         Err(mpsc::RecvTimeoutError::Disconnected) => continue,
                     }
@@ -460,12 +461,15 @@ fn run_interactive_session(
             is_deadloop: false,
         });
 
-        // Send user input to server
-        let _ = server_tx.blocking_send(CliToServer::UserInput {
-            session_id,
-            text: prompt.clone(),
-            pane_type: Some(PaneType::Interactive),
-        });
+        // Only send UserInput to server for TUI inputs
+        // Web inputs are already saved/broadcast by the server when it receives them
+        if from_tui {
+            let _ = server_tx.blocking_send(CliToServer::UserInput {
+                session_id,
+                text: prompt.clone(),
+                pane_type: Some(PaneType::Interactive),
+            });
+        }
 
         // Build args:
         // - First message: use --session-id to create session with specific ID
