@@ -2,17 +2,20 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import { createPortal } from "react-dom";
 import { MessageList } from "@/components/chat/MessageList";
 import { DualPaneView } from "@/components/chat/DualPaneView";
 import { Sidebar } from "@/components/Sidebar";
 import { useStore } from "@/lib/store";
-import { Settings, Wifi, WifiOff, LogOut, Menu, X } from "lucide-react";
+import { Settings, Wifi, WifiOff, LogOut, Menu, X, RefreshCw } from "lucide-react";
 
 export default function Home() {
   const router = useRouter();
-  const { connected, connect, sessionId, isDualPane, isAuthenticated, logout, token } = useStore();
+  const { connected, connect, disconnect, sessionId, isDualPane, isAuthenticated, logout, token, userId } = useStore();
   const [isCheckingAuth, setIsCheckingAuth] = useState(true);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [isReconnecting, setIsReconnecting] = useState(false);
 
   useEffect(() => {
     // Check for token in localStorage
@@ -40,6 +43,15 @@ export default function Home() {
   const handleLogout = () => {
     logout();
     router.push("/login");
+  };
+
+  const handleReconnect = async () => {
+    setIsReconnecting(true);
+    disconnect();
+    // Small delay before reconnecting
+    await new Promise(resolve => setTimeout(resolve, 500));
+    connect();
+    setIsReconnecting(false);
   };
 
   // Show loading while checking auth
@@ -86,9 +98,19 @@ export default function Home() {
             <span className="text-sm text-gray-500 hidden sm:inline">Claude Code Remote</span>
           </div>
           <div className="flex items-center gap-1 sm:gap-2">
-            {/* Connection status */}
-            <div className="flex items-center gap-1 text-sm">
-              {connected ? (
+            {/* Connection status with reconnect */}
+            <button
+              onClick={handleReconnect}
+              disabled={isReconnecting}
+              className="flex items-center gap-1 text-sm hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg px-2 py-1"
+              title={connected ? "Click to reconnect" : "Click to connect"}
+            >
+              {isReconnecting ? (
+                <>
+                  <RefreshCw className="w-4 h-4 text-blue-500 animate-spin" />
+                  <span className="text-blue-500 hidden sm:inline">Reconnecting...</span>
+                </>
+              ) : connected ? (
                 <>
                   <Wifi className="w-4 h-4 text-green-500" />
                   <span className="text-green-500 hidden sm:inline">Connected</span>
@@ -99,8 +121,9 @@ export default function Home() {
                   <span className="text-gray-400 hidden sm:inline">Disconnected</span>
                 </>
               )}
-            </div>
+            </button>
             <button
+              onClick={() => setSettingsOpen(true)}
               className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg"
               title="Settings"
             >
@@ -130,6 +153,91 @@ export default function Home() {
           </div>
         )}
       </div>
+
+      {/* Settings Modal */}
+      {settingsOpen && typeof document !== 'undefined' && createPortal(
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[100]" onClick={() => setSettingsOpen(false)}>
+          <div className="bg-white dark:bg-gray-800 rounded-lg max-w-md w-full mx-4 shadow-xl" onClick={(e) => e.stopPropagation()}>
+            {/* Header */}
+            <div className="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
+              <h3 className="text-lg font-semibold">Settings</h3>
+              <button
+                onClick={() => setSettingsOpen(false)}
+                className="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 rounded"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Content */}
+            <div className="p-4 space-y-4">
+              {/* User Info */}
+              <div>
+                <h4 className="text-sm font-medium text-gray-500 dark:text-gray-400 mb-2">Account</h4>
+                <div className="bg-gray-50 dark:bg-gray-700 rounded-lg p-3">
+                  <p className="text-sm">
+                    <span className="text-gray-500 dark:text-gray-400">User ID: </span>
+                    <span className="font-mono text-xs">{userId || 'Not logged in'}</span>
+                  </p>
+                </div>
+              </div>
+
+              {/* Connection Info */}
+              <div>
+                <h4 className="text-sm font-medium text-gray-500 dark:text-gray-400 mb-2">Connection</h4>
+                <div className="bg-gray-50 dark:bg-gray-700 rounded-lg p-3 space-y-2">
+                  <p className="text-sm flex items-center gap-2">
+                    <span className="text-gray-500 dark:text-gray-400">Status:</span>
+                    {connected ? (
+                      <span className="text-green-500 flex items-center gap-1">
+                        <Wifi className="w-4 h-4" /> Connected
+                      </span>
+                    ) : (
+                      <span className="text-gray-400 flex items-center gap-1">
+                        <WifiOff className="w-4 h-4" /> Disconnected
+                      </span>
+                    )}
+                  </p>
+                  <p className="text-sm">
+                    <span className="text-gray-500 dark:text-gray-400">Server: </span>
+                    <span className="font-mono text-xs">{process.env.NEXT_PUBLIC_WS_URL || 'ws://apas.mpaxos.com:8080'}</span>
+                  </p>
+                </div>
+              </div>
+
+              {/* Actions */}
+              <div className="flex gap-2 pt-2">
+                <button
+                  onClick={() => {
+                    handleReconnect();
+                    setSettingsOpen(false);
+                  }}
+                  className="flex-1 px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-lg text-sm font-medium transition-colors"
+                >
+                  Reconnect
+                </button>
+                <button
+                  onClick={() => {
+                    handleLogout();
+                    setSettingsOpen(false);
+                  }}
+                  className="flex-1 px-4 py-2 bg-red-500 hover:bg-red-600 text-white rounded-lg text-sm font-medium transition-colors"
+                >
+                  Logout
+                </button>
+              </div>
+
+              {/* About */}
+              <div className="pt-2 border-t border-gray-200 dark:border-gray-700">
+                <p className="text-xs text-gray-400 text-center">
+                  APAS - Claude Code Remote Interface
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
     </div>
   );
 }
