@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <!-- Circuit Brain Logo - Simplified -->
+  <g stroke="#06b6d4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Left hemisphere -->
+    <path d="M28 12 C16 14, 10 24, 12 36 C14 46, 22 52, 30 52"/>
+    <path d="M24 18 C18 20, 14 28, 16 36 C17 42, 22 46, 28 48"/>
+    <path d="M20 26 L16 30"/>
+    <path d="M22 36 L18 40"/>
+
+    <!-- Right hemisphere -->
+    <path d="M36 12 C48 14, 54 24, 52 36 C50 46, 42 52, 34 52"/>
+    <path d="M40 18 C46 20, 50 28, 48 36 C47 42, 42 46, 36 48"/>
+    <path d="M44 26 L48 30"/>
+    <path d="M42 36 L46 40"/>
+
+    <!-- Center stem -->
+    <path d="M32 12 L32 52"/>
+    <path d="M32 20 L28 24"/>
+    <path d="M32 20 L36 24"/>
+    <path d="M32 32 L26 36"/>
+    <path d="M32 32 L38 36"/>
+    <path d="M32 44 L28 48"/>
+    <path d="M32 44 L36 48"/>
+  </g>
+
+  <!-- Circuit nodes -->
+  <g fill="#06b6d4">
+    <circle cx="32" cy="12" r="2.5"/>
+    <circle cx="28" cy="12" r="2"/>
+    <circle cx="36" cy="12" r="2"/>
+    <circle cx="16" cy="30" r="2"/>
+    <circle cx="48" cy="30" r="2"/>
+    <circle cx="18" cy="40" r="2"/>
+    <circle cx="46" cy="40" r="2"/>
+    <circle cx="32" cy="52" r="2.5"/>
+    <circle cx="28" cy="24" r="1.5"/>
+    <circle cx="36" cy="24" r="1.5"/>
+    <circle cx="26" cy="36" r="1.5"/>
+    <circle cx="38" cy="36" r="1.5"/>
+  </g>
+</svg>

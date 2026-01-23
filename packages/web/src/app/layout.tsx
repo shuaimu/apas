@@ -5,6 +5,10 @@ export const metadata: Metadata = {
   title: "APAS - Claude Code Remote",
   description: "Web interface for Claude Code",
   manifest: "/manifest.json",
+  icons: {
+    icon: "/logo.svg",
+    apple: "/logo.svg",
+  },
   appleWebApp: {
     capable: true,
     statusBarStyle: "default",
@@ -30,9 +34,6 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <head>
-        <link rel="apple-touch-icon" href="/icon-192.png" />
-      </head>
       <body className="antialiased">{children}</body>
     </html>
   );

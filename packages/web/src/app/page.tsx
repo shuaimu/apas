@@ -8,6 +8,7 @@ import { DualPaneView } from "@/components/chat/DualPaneView";
 import { Sidebar } from "@/components/Sidebar";
 import { useStore } from "@/lib/store";
 import { Settings, Wifi, WifiOff, LogOut, Menu, X, RefreshCw } from "lucide-react";
+import Image from "next/image";
 
 export default function Home() {
   const router = useRouter();
@@ -116,6 +117,7 @@ export default function Home() {
             >
               <Menu className="w-5 h-5" />
             </button>
+            <Image src="/logo.svg" alt="APAS" width={28} height={28} className="dark:invert-0" />
             <h1 className="text-xl font-semibold">APAS</h1>
             <span className="text-sm text-gray-500 hidden sm:inline">Claude Code Remote</span>
           </div>
