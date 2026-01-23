@@ -100,7 +100,7 @@ interface AppState {
   loadSessionMessages: (sessionId: string) => void;
   loadMoreMessages: () => void; // Load older messages
   prependMessages: (messages: Message[], hasMore: boolean) => void; // Prepend older messages
-  sendMessageToPane: (text: string, pane: PaneType) => void; // Send to specific pane
+  sendMessageToPane: (text: string, pane: PaneType) => { success: boolean; error?: string }; // Send to specific pane
   addMessageToPane: (message: Message, pane: PaneType) => void; // Add message to specific pane
   startAutoRefresh: () => void;
   stopAutoRefresh: () => void;
@@ -359,11 +359,16 @@ export const useStore = create<AppState>((set, get) => ({
     }));
   },
 
-  sendMessageToPane: (text: string, pane: PaneType) => {
-    const { ws, sessionId } = get();
+  sendMessageToPane: (text: string, pane: PaneType): { success: boolean; error?: string } => {
+    const { ws, sessionId, isAttached } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       console.error("WebSocket not connected");
-      return;
+      return { success: false, error: "Not connected to server" };
+    }
+
+    if (!isAttached) {
+      console.error("Session is not active");
+      return { success: false, error: "Session is not active. Start the CLI to send messages." };
     }
 
     // Don't add message locally - the server will broadcast it back via user_input
@@ -375,6 +380,7 @@ export const useStore = create<AppState>((set, get) => ({
       text,
       pane_type: pane
     }));
+    return { success: true };
   },
 
   addMessageToPane: (message: Message, pane: PaneType) => {

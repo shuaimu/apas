@@ -210,19 +210,29 @@ function MessageComponent({ message }: { message: Message }) {
 }
 
 interface InteractiveInputProps {
-  onSend: (text: string) => void;
+  onSend: (text: string) => { success: boolean; error?: string };
 }
 
 function InteractiveInput({ onSend }: InteractiveInputProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [error, setError] = useState<string | null>(null);
 
   const handleSubmit = () => {
     const text = textareaRef.current?.value.trim();
     if (text) {
-      onSend(text);
-      if (textareaRef.current) {
-        textareaRef.current.value = "";
-        textareaRef.current.style.height = "auto";
+      const result = onSend(text);
+      if (result.success) {
+        // Only clear on success
+        if (textareaRef.current) {
+          textareaRef.current.value = "";
+          textareaRef.current.style.height = "auto";
+        }
+        setError(null);
+      } else {
+        // Show error and keep the message
+        setError(result.error || "Failed to send message");
+        // Auto-clear error after 5 seconds
+        setTimeout(() => setError(null), 5000);
       }
     }
   };
@@ -240,24 +250,33 @@ function InteractiveInput({ onSend }: InteractiveInputProps) {
       textarea.style.height = "auto";
       textarea.style.height = Math.min(textarea.scrollHeight, 150) + "px";
     }
+    // Clear error when user starts typing again
+    if (error) setError(null);
   };
 
   return (
-    <div className="flex gap-2">
-      <textarea
-        ref={textareaRef}
-        rows={1}
-        placeholder="Type a message..."
-        className="flex-1 resize-none rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-cyan-500"
-        onKeyDown={handleKeyDown}
-        onInput={handleInput}
-      />
-      <button
-        onClick={handleSubmit}
-        className="px-4 py-2 bg-cyan-500 hover:bg-cyan-600 text-white rounded-lg text-sm font-medium transition-colors"
-      >
-        Send
-      </button>
+    <div className="space-y-2">
+      {error && (
+        <div className="text-sm text-red-500 bg-red-50 dark:bg-red-900/20 px-3 py-2 rounded-lg">
+          {error}
+        </div>
+      )}
+      <div className="flex gap-2">
+        <textarea
+          ref={textareaRef}
+          rows={1}
+          placeholder="Type a message..."
+          className="flex-1 resize-none rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-cyan-500"
+          onKeyDown={handleKeyDown}
+          onInput={handleInput}
+        />
+        <button
+          onClick={handleSubmit}
+          className="px-4 py-2 bg-cyan-500 hover:bg-cyan-600 text-white rounded-lg text-sm font-medium transition-colors"
+        >
+          Send
+        </button>
+      </div>
     </div>
   );
 }
