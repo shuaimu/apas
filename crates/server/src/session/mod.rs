@@ -200,8 +200,9 @@ impl SessionManager {
         for entry in self.cli_sessions.iter() {
             let cli_id = entry.key();
             let sessions = entry.value();
+            let is_connected = self.cli_senders.contains_key(cli_id);
             // Check if this CLI has the session and is still connected
-            if sessions.last() == Some(session_id) && self.cli_senders.contains_key(cli_id) {
+            if sessions.last() == Some(session_id) && is_connected {
                 return true;
             }
         }
