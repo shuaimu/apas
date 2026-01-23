@@ -265,7 +265,15 @@ export const useStore = create<AppState>((set, get) => ({
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return;
     }
-    set({ sessionId, messages: [], isAttached: false });
+    // Reset all message state including dual-pane arrays
+    set({
+      sessionId,
+      messages: [],
+      deadloopMessages: [],
+      interactiveMessages: [],
+      isDualPane: false,
+      isAttached: false
+    });
     ws.send(JSON.stringify({ type: "get_session_messages", session_id: sessionId }));
   },
 

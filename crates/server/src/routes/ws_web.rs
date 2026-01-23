@@ -338,26 +338,33 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
 
                         // Also load existing messages from file storage (limit to recent 100)
-                        if let Ok((stored_messages, has_more)) = state.storage.get_messages_paginated(&sid, Some(100), None).await {
-                            let messages: Vec<MessageInfo> = stored_messages
-                                .into_iter()
-                                .map(|m| MessageInfo {
-                                    id: m.id,
-                                    role: m.role,
-                                    content: m.content,
-                                    message_type: m.message_type,
-                                    created_at: Some(m.created_at),
-                                    pane_type: m.pane_type,
-                                })
-                                .collect();
-                            state
-                                .sessions
-                                .send_to_web(
-                                    &connection_id,
-                                    ServerToWeb::SessionMessages { session_id: sid, messages, has_more },
-                                )
-                                .await;
-                        }
+                        let (messages, has_more) = match state.storage.get_messages_paginated(&sid, Some(100), None).await {
+                            Ok((stored_messages, has_more)) => {
+                                let messages: Vec<MessageInfo> = stored_messages
+                                    .into_iter()
+                                    .map(|m| MessageInfo {
+                                        id: m.id,
+                                        role: m.role,
+                                        content: m.content,
+                                        message_type: m.message_type,
+                                        created_at: Some(m.created_at),
+                                        pane_type: m.pane_type,
+                                    })
+                                    .collect();
+                                (messages, has_more)
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to load messages for session {}: {}", sid, e);
+                                (Vec::new(), false)
+                            }
+                        };
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::SessionMessages { session_id: sid, messages, has_more },
+                            )
+                            .await;
 
                         tracing::info!("Web client attached to CLI session {}", sid);
                     } else {
