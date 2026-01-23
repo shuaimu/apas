@@ -194,6 +194,20 @@ impl SessionManager {
         })
     }
 
+    /// Check if a session has an active CLI client connected
+    pub fn is_session_active(&self, session_id: &Uuid) -> bool {
+        // Check if any connected CLI client has this session as their active session
+        for entry in self.cli_sessions.iter() {
+            let cli_id = entry.key();
+            let sessions = entry.value();
+            // Check if this CLI has the session and is still connected
+            if sessions.last() == Some(session_id) && self.cli_senders.contains_key(cli_id) {
+                return true;
+            }
+        }
+        false
+    }
+
     // Message routing
     pub async fn send_to_cli(&self, cli_id: &Uuid, msg: ServerToCli) -> bool {
         if let Some(sender) = self.cli_senders.get(cli_id) {

@@ -38,6 +38,7 @@ export interface SessionInfo {
   createdAt?: string;
   isShared?: boolean;
   ownerEmail?: string;
+  isActive?: boolean;
 }
 
 export type OutputType =
@@ -542,6 +543,7 @@ function handleServerMessage(
           createdAt: s.created_at as string | undefined,
           isShared: s.is_shared as boolean | undefined,
           ownerEmail: s.owner_email as string | undefined,
+          isActive: s.is_active as boolean | undefined,
         })),
       });
       break;

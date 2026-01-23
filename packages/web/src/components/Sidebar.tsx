@@ -71,8 +71,8 @@ export function Sidebar({ onClose }: SidebarProps) {
           name,
           workingDir,
           hostname: session.hostname,
-          // Don't trust database status - only trust actual CLI connections
-          isActive: false,
+          // Use server-provided isActive status (works for shared sessions too)
+          isActive: session.isActive || false,
           createdAt: session.createdAt,
           isShared: session.isShared,
           ownerEmail: session.ownerEmail,
@@ -80,10 +80,10 @@ export function Sidebar({ onClose }: SidebarProps) {
       }
     }
 
-    // Mark projects as active if they have a connected CLI client
+    // Also mark projects as active if current user has a connected CLI client
+    // (this handles the case where server hasn't refreshed yet)
     for (const client of cliClients) {
       if (client.activeSession) {
-        // Find project by session ID and mark as active
         for (const project of projectMap.values()) {
           if (project.id === client.activeSession) {
             project.isActive = true;

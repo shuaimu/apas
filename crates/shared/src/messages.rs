@@ -218,6 +218,9 @@ pub struct SessionInfo {
     /// Email of the session owner (only set if is_shared is true)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_email: Option<String>,
+    /// True if this session has an active CLI client connected
+    #[serde(default)]
+    pub is_active: bool,
 }
 
 /// Information about a persisted message

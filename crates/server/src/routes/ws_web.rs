@@ -417,22 +417,29 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     // Combine owned and shared sessions
                     let mut sessions: Vec<SessionInfo> = owned_sessions
                         .into_iter()
-                        .map(|s| SessionInfo {
-                            id: Uuid::parse_str(&s.id).unwrap_or_default(),
-                            cli_client_id: s.cli_client_id.and_then(|id| Uuid::parse_str(&id).ok()),
-                            working_dir: s.working_dir,
-                            hostname: s.hostname,
-                            status: s.status,
-                            created_at: s.created_at,
-                            is_shared: false,
-                            owner_email: None,
+                        .map(|s| {
+                            let session_id = Uuid::parse_str(&s.id).unwrap_or_default();
+                            let is_active = state.sessions.is_session_active(&session_id);
+                            SessionInfo {
+                                id: session_id,
+                                cli_client_id: s.cli_client_id.and_then(|id| Uuid::parse_str(&id).ok()),
+                                working_dir: s.working_dir,
+                                hostname: s.hostname,
+                                status: s.status,
+                                created_at: s.created_at,
+                                is_shared: false,
+                                owner_email: None,
+                                is_active,
+                            }
                         })
                         .collect();
 
                     // Add shared sessions with owner email
                     for (s, owner_email) in shared_sessions {
+                        let session_id = Uuid::parse_str(&s.id).unwrap_or_default();
+                        let is_active = state.sessions.is_session_active(&session_id);
                         sessions.push(SessionInfo {
-                            id: Uuid::parse_str(&s.id).unwrap_or_default(),
+                            id: session_id,
                             cli_client_id: s.cli_client_id.and_then(|id| Uuid::parse_str(&id).ok()),
                             working_dir: s.working_dir,
                             hostname: s.hostname,
@@ -440,6 +447,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             created_at: s.created_at,
                             is_shared: true,
                             owner_email: Some(owner_email),
+                            is_active,
                         });
                     }
 
