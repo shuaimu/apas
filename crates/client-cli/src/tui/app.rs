@@ -253,8 +253,19 @@ impl App {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        // Calculate content height and max scroll
-        let content_lines = self.deadloop_output.len() as u16;
+        // Calculate wrapped line count (accounts for text wrapping)
+        let viewport_width = inner.width as usize;
+        let content_lines: u16 = self.deadloop_output.iter()
+            .map(|line| {
+                if line.is_empty() || viewport_width == 0 {
+                    1
+                } else {
+                    // Calculate how many visual lines this logical line takes
+                    ((line.chars().count() + viewport_width - 1) / viewport_width).max(1) as u16
+                }
+            })
+            .sum();
+
         let viewport_height = inner.height;
         let max_scroll = content_lines.saturating_sub(viewport_height);
 
@@ -299,8 +310,19 @@ impl App {
             .constraints([Constraint::Min(0), Constraint::Length(3)])
             .split(inner);
 
-        // Calculate content height and max scroll
-        let content_lines = self.interactive_output.len() as u16;
+        // Calculate wrapped line count (accounts for text wrapping)
+        let viewport_width = layout[0].width as usize;
+        let content_lines: u16 = self.interactive_output.iter()
+            .map(|line| {
+                if line.is_empty() || viewport_width == 0 {
+                    1
+                } else {
+                    // Calculate how many visual lines this logical line takes
+                    ((line.chars().count() + viewport_width - 1) / viewport_width).max(1) as u16
+                }
+            })
+            .sum();
+
         let viewport_height = layout[0].height;
         let max_scroll = content_lines.saturating_sub(viewport_height);
 
