@@ -226,6 +226,9 @@ impl Database {
     pub async fn create_session(&self, session: &Session) -> Result<()> {
         // Use UPSERT (ON CONFLICT DO UPDATE) instead of INSERT OR REPLACE
         // INSERT OR REPLACE triggers ON DELETE CASCADE, which deletes session_shares
+        //
+        // Also update user_id if the existing session owner is a dev/placeholder user
+        // (email like 'dev-*@local'). This migrates sessions from temp users to real users.
         sqlx::query(
             r#"
             INSERT INTO sessions (id, user_id, cli_client_id, working_dir, hostname, status)
@@ -235,7 +238,12 @@ impl Database {
                 working_dir = excluded.working_dir,
                 hostname = excluded.hostname,
                 status = excluded.status,
-                updated_at = CURRENT_TIMESTAMP
+                updated_at = CURRENT_TIMESTAMP,
+                user_id = CASE
+                    WHEN (SELECT email FROM users WHERE id = sessions.user_id) LIKE 'dev-%@local'
+                    THEN excluded.user_id
+                    ELSE sessions.user_id
+                END
             "#,
         )
         .bind(&session.id)
