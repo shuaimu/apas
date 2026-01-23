@@ -559,13 +559,51 @@ function handleServerMessage(
         set({ isDualPane: true });
       }
 
-      const parsedMessages: Message[] = messages.map((m) => ({
-        id: m.id as string,
-        role: m.role as "user" | "assistant" | "system",
-        content: m.content as string,
-        timestamp: new Date(m.created_at as string || Date.now()),
-        outputType: { type: m.message_type as "text" | "system" || "text" } as OutputType,
-      }));
+      const parsedMessages: Message[] = messages.map((m) => {
+        const messageType = m.message_type as string || "text";
+        const content = m.content as string;
+        let outputType: OutputType;
+        let displayContent = content;
+
+        // Reconstruct outputType based on message_type
+        if (messageType === "tool_use") {
+          try {
+            const toolData = JSON.parse(content);
+            outputType = {
+              type: "tool_use",
+              tool: toolData.name as string,
+              input: toolData.input,
+            };
+            displayContent = `Using ${toolData.name}: ${JSON.stringify(toolData.input)}`;
+          } catch {
+            outputType = { type: "text" };
+          }
+        } else if (messageType === "tool_result") {
+          try {
+            const resultData = JSON.parse(content);
+            outputType = {
+              type: "tool_result",
+              tool: resultData.tool_use_id as string,
+              success: !resultData.is_error,
+            };
+            displayContent = resultData.content as string || content;
+          } catch {
+            outputType = { type: "text" };
+          }
+        } else if (messageType === "result" || messageType === "system") {
+          outputType = { type: "system" };
+        } else {
+          outputType = { type: "text" };
+        }
+
+        return {
+          id: m.id as string,
+          role: m.role as "user" | "assistant" | "system",
+          content: displayContent,
+          timestamp: new Date(m.created_at as string || Date.now()),
+          outputType,
+        };
+      });
 
       // Check if this is a "load more" request (prepend) or initial load (replace)
       const { isLoadingMore, isDualPane } = get();

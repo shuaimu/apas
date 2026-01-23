@@ -228,8 +228,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     Ok(CliToServer::StreamMessage { session_id, message, pane_type }) => {
                         tracing::info!("Received StreamMessage for session {} with pane_type {:?}", session_id, pane_type);
 
-                        // Save message to file storage
-                        if let Some(stored_message) = stream_message_to_stored(&session_id, &message, pane_type) {
+                        // Save message(s) to file storage
+                        for stored_message in stream_message_to_stored(&session_id, &message, pane_type) {
                             if let Err(e) = state.storage.append_message(&session_id, &stored_message).await {
                                 tracing::error!("Failed to save message to file: {}", e);
                             }
@@ -320,54 +320,80 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     tracing::info!("CLI client disconnected: {} (marked {} sessions as inactive)", cli_id, session_ids.len());
 }
 
-/// Convert a ClaudeStreamMessage to a StoredMessage for file storage
+/// Convert a ClaudeStreamMessage to StoredMessages for file storage
+/// Returns a Vec because assistant messages may have multiple content blocks
 fn stream_message_to_stored(
     _session_id: &Uuid,
     message: &shared::ClaudeStreamMessage,
     pane_type: Option<shared::PaneType>,
-) -> Option<crate::storage::StoredMessage> {
+) -> Vec<crate::storage::StoredMessage> {
     use shared::{ClaudeStreamMessage, ClaudeContentBlock};
 
     let pane_type_str = pane_type.map(|p| format!("{:?}", p).to_lowercase());
+    let mut messages = Vec::new();
 
     match message {
         ClaudeStreamMessage::Assistant { message: msg, .. } => {
-            // Extract text content from assistant message
-            let text_content: Vec<String> = msg.content.iter()
-                .filter_map(|block| {
-                    match block {
-                        ClaudeContentBlock::Text { text } => Some(text.clone()),
-                        ClaudeContentBlock::ToolUse { name, input, .. } => {
-                            Some(format!("[Tool: {}] {}", name, serde_json::to_string(input).unwrap_or_default()))
-                        }
-                        _ => None,
+            // Store each content block separately to preserve structure
+            for block in &msg.content {
+                match block {
+                    ClaudeContentBlock::Text { text } => {
+                        messages.push(crate::storage::StoredMessage {
+                            id: Uuid::new_v4().to_string(),
+                            role: "assistant".to_string(),
+                            content: text.clone(),
+                            message_type: "text".to_string(),
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                            pane_type: pane_type_str.clone(),
+                        });
                     }
-                })
-                .collect();
-
-            if text_content.is_empty() {
-                return None;
+                    ClaudeContentBlock::ToolUse { id, name, input } => {
+                        // Store tool_use with structured JSON content
+                        let tool_data = serde_json::json!({
+                            "id": id,
+                            "name": name,
+                            "input": input
+                        });
+                        messages.push(crate::storage::StoredMessage {
+                            id: Uuid::new_v4().to_string(),
+                            role: "assistant".to_string(),
+                            content: tool_data.to_string(),
+                            message_type: "tool_use".to_string(),
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                            pane_type: pane_type_str.clone(),
+                        });
+                    }
+                    ClaudeContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                        // Store tool_result with structured JSON content
+                        let result_data = serde_json::json!({
+                            "tool_use_id": tool_use_id,
+                            "content": content,
+                            "is_error": is_error
+                        });
+                        messages.push(crate::storage::StoredMessage {
+                            id: Uuid::new_v4().to_string(),
+                            role: "assistant".to_string(),
+                            content: result_data.to_string(),
+                            message_type: "tool_result".to_string(),
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                            pane_type: pane_type_str.clone(),
+                        });
+                    }
+                }
             }
-
-            Some(crate::storage::StoredMessage {
-                id: Uuid::new_v4().to_string(),
-                role: "assistant".to_string(),
-                content: text_content.join("\n"),
-                message_type: "text".to_string(),
-                created_at: chrono::Utc::now().to_rfc3339(),
-                pane_type: pane_type_str,
-            })
         }
         ClaudeStreamMessage::Result { subtype, total_cost_usd, duration_ms, .. } => {
-            Some(crate::storage::StoredMessage {
+            messages.push(crate::storage::StoredMessage {
                 id: Uuid::new_v4().to_string(),
                 role: "system".to_string(),
                 content: format!("{} - Cost: ${:.4}, Duration: {}ms", subtype, total_cost_usd, duration_ms),
                 message_type: "result".to_string(),
                 created_at: chrono::Utc::now().to_rfc3339(),
                 pane_type: pane_type_str,
-            })
+            });
         }
-        _ => None, // Skip system and user messages for now
+        _ => {} // Skip system and user messages for now
     }
+
+    messages
 }
