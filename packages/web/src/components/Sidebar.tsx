@@ -7,7 +7,7 @@ import { createPortal } from "react-dom";
 
 // Truncate path in the middle to preserve the folder name at the end
 // e.g., "/home/shuai/workspace/long-project" -> "/home/.../long-project"
-function truncatePath(path: string, maxLength: number = 30): string {
+function truncatePath(path: string, maxLength: number = 22): string {
   if (path.length <= maxLength) return path;
 
   const parts = path.split('/');
