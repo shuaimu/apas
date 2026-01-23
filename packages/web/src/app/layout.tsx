@@ -5,10 +5,6 @@ export const metadata: Metadata = {
   title: "APAS - Claude Code Remote",
   description: "Web interface for Claude Code",
   manifest: "/manifest.json",
-  icons: {
-    icon: "/logo.png",
-    apple: "/logo.png",
-  },
   appleWebApp: {
     capable: true,
     statusBarStyle: "default",

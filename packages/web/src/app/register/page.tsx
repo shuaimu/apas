@@ -3,7 +3,6 @@
 import { useState, useEffect, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
-import Image from "next/image";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://apas.mpaxos.com:8080";
 
@@ -114,9 +113,6 @@ function RegisterForm() {
     <div className="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-gray-900">
       <div className="max-w-md w-full p-8 bg-white dark:bg-gray-800 rounded-lg shadow-lg">
         <div className="text-center mb-8">
-          <div className="flex justify-center mb-4">
-            <Image src="/logo.png" alt="APAS" width={80} height={56} />
-          </div>
           <h1 className="text-3xl font-bold text-gray-900 dark:text-white">
             APAS
           </h1>
