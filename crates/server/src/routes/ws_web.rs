@@ -189,19 +189,42 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 Ok(WebToServer::Input { text, pane_type }) => {
                     if let Some(sid) = session_id {
                         tracing::info!("Routing input to session {}: {:?}", sid, text.chars().take(50).collect::<String>());
-                        // Route input to CLI (pane_type will be used for dual-pane routing)
-                        let _ = pane_type; // TODO: Use pane_type for routing to correct session
+
+                        // Route input to CLI
                         let sent = state
                             .sessions
                             .route_to_cli(
                                 &sid,
                                 ServerToCli::Input {
                                     session_id: sid,
-                                    data: text,
+                                    data: text.clone(),
                                 },
                             )
                             .await;
-                        if !sent {
+
+                        if sent {
+                            // Save user input to file storage (same as CLI does)
+                            let stored_message = crate::storage::StoredMessage {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                role: "user".to_string(),
+                                content: text.clone(),
+                                message_type: "text".to_string(),
+                                created_at: chrono::Utc::now().to_rfc3339(),
+                                pane_type: pane_type.map(|p| format!("{:?}", p).to_lowercase()),
+                            };
+                            if let Err(e) = state.storage.append_message(&sid, &stored_message).await {
+                                tracing::error!("Failed to save user input to file: {}", e);
+                            }
+
+                            // Echo user input back to web client for immediate display
+                            state
+                                .sessions
+                                .route_to_web(
+                                    &sid,
+                                    ServerToWeb::UserInput { session_id: sid, text, pane_type },
+                                )
+                                .await;
+                        } else {
                             tracing::warn!("Failed to route input to CLI for session {}", sid);
                             state
                                 .sessions
