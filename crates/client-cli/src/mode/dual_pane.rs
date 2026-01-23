@@ -288,6 +288,8 @@ fn run_deadloop_session_inner(
             .spawn()
         {
             Ok(mut child) => {
+                let child_pid = child.id();
+
                 // Take stdout for reading
                 let stdout = match child.stdout.take() {
                     Some(s) => s,
@@ -308,6 +310,26 @@ fn run_deadloop_session_inner(
                 if let Ok(mut guard) = child_process.lock() {
                     *guard = Some(child);
                 }
+
+                // Channel for stdout lines (allows timeout-based reading)
+                let (stdout_tx, stdout_rx) = mpsc::channel::<Option<String>>();
+
+                // Spawn thread to read stdout and send via channel
+                let stdout_thread = thread::spawn(move || {
+                    let reader = BufReader::new(stdout);
+                    for line in reader.lines() {
+                        match line {
+                            Ok(l) => {
+                                if stdout_tx.send(Some(l)).is_err() {
+                                    break; // Receiver dropped
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    // Signal end of stream
+                    let _ = stdout_tx.send(None);
+                });
 
                 // Spawn thread to read stderr
                 let output_tx_stderr = output_tx.clone();
@@ -334,76 +356,151 @@ fn run_deadloop_session_inner(
                     })
                 });
 
-                let reader = BufReader::new(stdout);
                 let mut had_error = false;
+                let mut process_crashed = false;
+                let check_interval = std::time::Duration::from_millis(500);
 
-                for line in reader.lines() {
+                // Main loop: read stdout with timeout and check for process crash
+                loop {
                     if shutdown.load(Ordering::SeqCst) {
                         break;
                     }
 
-                    let line = match line {
-                        Ok(l) => l,
-                        Err(_) => break,
-                    };
-
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-
-                    // Parse and process
-                    match serde_json::from_str::<ClaudeStreamMessage>(&line) {
-                        Ok(message) => {
-                            if let ClaudeStreamMessage::Result { is_error, .. } = &message {
-                                if *is_error {
-                                    had_error = true;
+                    // Check if process has exited (crash detection)
+                    if let Ok(mut guard) = child_process.lock() {
+                        if let Some(ref mut child) = *guard {
+                            match child.try_wait() {
+                                Ok(Some(status)) => {
+                                    // Process has exited
+                                    if !status.success() {
+                                        let _ = output_tx.send(PaneOutput {
+                                            text: format!("[Claude process exited with {}]", status),
+                                            is_deadloop: true,
+                                        });
+                                        process_crashed = true;
+                                        had_error = true;
+                                    }
+                                }
+                                Ok(None) => {
+                                    // Still running
+                                }
+                                Err(e) => {
+                                    let _ = output_tx.send(PaneOutput {
+                                        text: format!("[Error checking process status: {}]", e),
+                                        is_deadloop: true,
+                                    });
                                 }
                             }
-
-                            let display_text = format_stream_message(&message);
-                            let _ = output_tx.send(PaneOutput {
-                                text: display_text,
-                                is_deadloop: true,
-                            });
-
-                            let _ = server_tx.blocking_send(CliToServer::StreamMessage {
-                                session_id,
-                                message,
-                                pane_type: Some(PaneType::Deadloop),
-                            });
                         }
-                        Err(_) => {
-                            // Non-JSON output - display and forward to server
-                            let _ = output_tx.send(PaneOutput {
-                                text: line.clone(),
-                                is_deadloop: true,
-                            });
-                            let _ = server_tx.blocking_send(CliToServer::Output {
-                                session_id,
-                                data: line,
-                                output_type: shared::OutputType::Text,
-                            });
+                    }
+
+                    // Try to receive stdout line with timeout
+                    match stdout_rx.recv_timeout(check_interval) {
+                        Ok(Some(line)) => {
+                            if line.trim().is_empty() {
+                                continue;
+                            }
+
+                            // Parse and process
+                            match serde_json::from_str::<ClaudeStreamMessage>(&line) {
+                                Ok(message) => {
+                                    if let ClaudeStreamMessage::Result { is_error, .. } = &message {
+                                        if *is_error {
+                                            had_error = true;
+                                        }
+                                    }
+
+                                    let display_text = format_stream_message(&message);
+                                    let _ = output_tx.send(PaneOutput {
+                                        text: display_text,
+                                        is_deadloop: true,
+                                    });
+
+                                    let _ = server_tx.blocking_send(CliToServer::StreamMessage {
+                                        session_id,
+                                        message,
+                                        pane_type: Some(PaneType::Deadloop),
+                                    });
+                                }
+                                Err(_) => {
+                                    // Non-JSON output - display and forward to server
+                                    let _ = output_tx.send(PaneOutput {
+                                        text: line.clone(),
+                                        is_deadloop: true,
+                                    });
+                                    let _ = server_tx.blocking_send(CliToServer::Output {
+                                        session_id,
+                                        data: line,
+                                        output_type: shared::OutputType::Text,
+                                    });
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            // End of stream - stdout closed normally
+                            break;
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            // No data yet, but check if process crashed
+                            if process_crashed {
+                                let _ = output_tx.send(PaneOutput {
+                                    text: "[Detected crash, restarting...]".to_string(),
+                                    is_deadloop: true,
+                                });
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            // Stdout thread exited
+                            break;
                         }
                     }
                 }
 
-                // Wait for stderr thread
+                // Cleanup: wait for threads with timeout
+                let _ = stdout_thread.join();
+
                 if let Some(handle) = stderr_thread {
-                    let _ = handle.join();
+                    // Give stderr thread a moment to finish, but don't block forever
+                    let stderr_timeout = thread::spawn(move || {
+                        let _ = handle.join();
+                    });
+                    thread::sleep(std::time::Duration::from_millis(500));
+                    drop(stderr_timeout); // Don't wait for it if it's stuck
                 }
 
-                // Wait for child to finish
+                // Cleanup child process (kill if still running, reap zombie)
                 if let Ok(mut guard) = child_process.lock() {
                     if let Some(mut child) = guard.take() {
-                        let _ = child.wait();
+                        // Try to get exit status, kill if still running
+                        match child.try_wait() {
+                            Ok(Some(_)) => {
+                                // Already exited, just reap
+                            }
+                            Ok(None) => {
+                                // Still running, kill it
+                                let _ = output_tx.send(PaneOutput {
+                                    text: format!("[Killing stuck process {}]", child_pid),
+                                    is_deadloop: true,
+                                });
+                                let _ = child.kill();
+                                let _ = child.wait();
+                            }
+                            Err(_) => {
+                                // Error checking, try to kill anyway
+                                let _ = child.kill();
+                                let _ = child.wait();
+                            }
+                        }
                     }
                 }
 
-                // Backoff on error
-                if had_error {
+                // Backoff on error or crash
+                if had_error || process_crashed {
                     backoff_seconds = std::cmp::min(backoff_seconds * 2, MAX_BACKOFF);
                     let _ = output_tx.send(PaneOutput {
-                        text: format!("[Backing off for {}s due to error]", backoff_seconds),
+                        text: format!("[Backing off for {}s before retry]", backoff_seconds),
                         is_deadloop: true,
                     });
 
