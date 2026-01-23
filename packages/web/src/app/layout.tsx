@@ -6,8 +6,8 @@ export const metadata: Metadata = {
   description: "Web interface for Claude Code",
   manifest: "/manifest.json",
   icons: {
-    icon: "/logo.svg",
-    apple: "/logo.svg",
+    icon: "/logo.png",
+    apple: "/logo.png",
   },
   appleWebApp: {
     capable: true,

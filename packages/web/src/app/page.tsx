@@ -117,7 +117,7 @@ export default function Home() {
             >
               <Menu className="w-5 h-5" />
             </button>
-            <Image src="/logo.svg" alt="APAS" width={28} height={28} className="dark:invert-0" />
+            <Image src="/logo.png" alt="APAS" width={28} height={28} />
             <h1 className="text-xl font-semibold">APAS</h1>
             <span className="text-sm text-gray-500 hidden sm:inline">Claude Code Remote</span>
           </div>
