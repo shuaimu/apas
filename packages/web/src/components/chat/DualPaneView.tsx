@@ -6,6 +6,17 @@ import { UserMessage } from "./UserMessage";
 import { AssistantMessage } from "./AssistantMessage";
 import { InputBox } from "./InputBox";
 
+// Store scroll positions per session+pane combination
+interface ScrollState {
+  scrollTop: number;
+  wasAtBottom: boolean;
+}
+const scrollPositions = new Map<string, ScrollState>();
+
+function getScrollKey(sessionId: string | null, paneType: PaneType): string {
+  return `${sessionId || 'none'}-${paneType}`;
+}
+
 export function DualPaneView() {
   const deadloopMessages = useStore((state) => state.deadloopMessages);
   const interactiveMessages = useStore((state) => state.interactiveMessages);
@@ -113,10 +124,15 @@ interface MessagePaneProps {
 }
 
 function MessagePane({ messages, paneType, onLoadMore, isLoading, hasMore }: MessagePaneProps) {
+  const sessionId = useStore((state) => state.sessionId);
   const containerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const shouldAutoScroll = useRef(true);
   const prevScrollHeight = useRef<number>(0);
+  const previousSessionId = useRef<string | null>(null);
+  const isRestoringScroll = useRef(false);
+
+  const scrollKey = getScrollKey(sessionId, paneType);
 
   const checkIfAtBottom = useCallback(() => {
     const container = containerRef.current;
@@ -133,14 +149,68 @@ function MessagePane({ messages, paneType, onLoadMore, isLoading, hasMore }: Mes
   }, []);
 
   const handleScroll = useCallback(() => {
+    // Don't update state while we're restoring scroll position
+    if (isRestoringScroll.current) return;
+
     shouldAutoScroll.current = checkIfAtBottom();
+
+    // Save scroll position for current session+pane
+    if (containerRef.current) {
+      scrollPositions.set(scrollKey, {
+        scrollTop: containerRef.current.scrollTop,
+        wasAtBottom: shouldAutoScroll.current,
+      });
+    }
 
     // Check if near top and should load more
     if (checkIfNearTop() && onLoadMore && !isLoading && hasMore) {
       prevScrollHeight.current = containerRef.current?.scrollHeight || 0;
       onLoadMore();
     }
-  }, [checkIfAtBottom, checkIfNearTop, onLoadMore, isLoading, hasMore]);
+  }, [checkIfAtBottom, checkIfNearTop, onLoadMore, isLoading, hasMore, scrollKey]);
+
+  // Save scroll position when switching away from a session
+  useEffect(() => {
+    const prevKey = getScrollKey(previousSessionId.current, paneType);
+    if (previousSessionId.current && previousSessionId.current !== sessionId && containerRef.current) {
+      scrollPositions.set(prevKey, {
+        scrollTop: containerRef.current.scrollTop,
+        wasAtBottom: shouldAutoScroll.current,
+      });
+    }
+    previousSessionId.current = sessionId;
+  }, [sessionId, paneType]);
+
+  // Restore scroll position when switching to a session
+  useEffect(() => {
+    if (!sessionId || !containerRef.current) return;
+
+    const savedState = scrollPositions.get(scrollKey);
+    if (savedState) {
+      isRestoringScroll.current = true;
+      shouldAutoScroll.current = savedState.wasAtBottom;
+
+      // Use requestAnimationFrame to ensure DOM is updated
+      requestAnimationFrame(() => {
+        if (containerRef.current) {
+          if (savedState.wasAtBottom) {
+            // Scroll to bottom
+            containerRef.current.scrollTop = containerRef.current.scrollHeight;
+          } else {
+            // Restore exact position
+            containerRef.current.scrollTop = savedState.scrollTop;
+          }
+        }
+        isRestoringScroll.current = false;
+      });
+    } else {
+      // New session - scroll to bottom
+      shouldAutoScroll.current = true;
+      requestAnimationFrame(() => {
+        messagesEndRef.current?.scrollIntoView();
+      });
+    }
+  }, [sessionId, scrollKey, messages.length]); // Re-run when messages load
 
   // Maintain scroll position when prepending messages
   useEffect(() => {
@@ -155,7 +225,7 @@ function MessagePane({ messages, paneType, onLoadMore, isLoading, hasMore }: Mes
   }, [messages.length]);
 
   useEffect(() => {
-    if (shouldAutoScroll.current) {
+    if (shouldAutoScroll.current && !isRestoringScroll.current) {
       messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }
   }, [messages]);

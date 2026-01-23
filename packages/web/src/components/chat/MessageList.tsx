@@ -5,8 +5,16 @@ import { useStore, Message } from "@/lib/store";
 import { UserMessage } from "./UserMessage";
 import { AssistantMessage } from "./AssistantMessage";
 
+// Store scroll positions per session
+interface ScrollState {
+  scrollTop: number;
+  wasAtBottom: boolean;
+}
+const scrollPositions = new Map<string, ScrollState>();
+
 export function MessageList() {
   const messages = useStore((state) => state.messages);
+  const sessionId = useStore((state) => state.sessionId);
   const hasMoreMessages = useStore((state) => state.hasMoreMessages);
   const isLoadingMore = useStore((state) => state.isLoadingMore);
   const loadMoreMessages = useStore((state) => state.loadMoreMessages);
@@ -15,6 +23,8 @@ export function MessageList() {
   const shouldAutoScroll = useRef(true);
   const previousScrollHeight = useRef<number>(0);
   const previousMessageCount = useRef<number>(0);
+  const previousSessionId = useRef<string | null>(null);
+  const isRestoringScroll = useRef(false);
 
   // Check if user is near the bottom (within 100px)
   const checkIfAtBottom = useCallback(() => {
@@ -34,13 +44,66 @@ export function MessageList() {
 
   // Update auto-scroll flag on scroll and check for loading more
   const handleScroll = useCallback(() => {
+    // Don't update state while we're restoring scroll position
+    if (isRestoringScroll.current) return;
+
     shouldAutoScroll.current = checkIfAtBottom();
+
+    // Save scroll position for current session
+    if (sessionId && containerRef.current) {
+      scrollPositions.set(sessionId, {
+        scrollTop: containerRef.current.scrollTop,
+        wasAtBottom: shouldAutoScroll.current,
+      });
+    }
 
     // Load more when scrolled to top
     if (checkIfAtTop() && hasMoreMessages && !isLoadingMore) {
       loadMoreMessages();
     }
-  }, [checkIfAtBottom, checkIfAtTop, hasMoreMessages, isLoadingMore, loadMoreMessages]);
+  }, [checkIfAtBottom, checkIfAtTop, hasMoreMessages, isLoadingMore, loadMoreMessages, sessionId]);
+
+  // Save scroll position when switching away from a session
+  useEffect(() => {
+    if (previousSessionId.current && previousSessionId.current !== sessionId && containerRef.current) {
+      scrollPositions.set(previousSessionId.current, {
+        scrollTop: containerRef.current.scrollTop,
+        wasAtBottom: shouldAutoScroll.current,
+      });
+    }
+    previousSessionId.current = sessionId;
+  }, [sessionId]);
+
+  // Restore scroll position when switching to a session
+  useEffect(() => {
+    if (!sessionId || !containerRef.current) return;
+
+    const savedState = scrollPositions.get(sessionId);
+    if (savedState) {
+      isRestoringScroll.current = true;
+      shouldAutoScroll.current = savedState.wasAtBottom;
+
+      // Use requestAnimationFrame to ensure DOM is updated
+      requestAnimationFrame(() => {
+        if (containerRef.current) {
+          if (savedState.wasAtBottom) {
+            // Scroll to bottom
+            containerRef.current.scrollTop = containerRef.current.scrollHeight;
+          } else {
+            // Restore exact position
+            containerRef.current.scrollTop = savedState.scrollTop;
+          }
+        }
+        isRestoringScroll.current = false;
+      });
+    } else {
+      // New session - scroll to bottom
+      shouldAutoScroll.current = true;
+      requestAnimationFrame(() => {
+        messagesEndRef.current?.scrollIntoView();
+      });
+    }
+  }, [sessionId, messages.length]); // Re-run when messages load
 
   // Preserve scroll position when prepending messages
   useEffect(() => {
@@ -62,7 +125,7 @@ export function MessageList() {
 
   // Auto-scroll to bottom only if user was already at bottom (for new messages at bottom)
   useEffect(() => {
-    if (shouldAutoScroll.current) {
+    if (shouldAutoScroll.current && !isRestoringScroll.current) {
       messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }
   }, [messages]);
