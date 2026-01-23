@@ -344,7 +344,7 @@ export function Sidebar({ onClose }: SidebarProps) {
                       {project.hostname}
                     </div>
                   )}
-                  <div className="font-medium truncate" title={project.workingDir}>
+                  <div className="font-medium overflow-hidden whitespace-nowrap" title={project.workingDir}>
                     {truncatePath(project.workingDir)}
                   </div>
                   <div className="text-xs text-gray-500 truncate">
