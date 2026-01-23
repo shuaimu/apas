@@ -31,19 +31,17 @@ const DEFAULT_PROMPT: &str = r#"Work on tasks defined in TODO.md. Repeat the fol
 
 /// Run in dual-pane mode
 pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()> {
-    eprintln!("[DEBUG] dual_pane::run starting...");
     let config = crate::config::Config::load().unwrap_or_default();
     let claude_path = config.local.claude_path.clone();
-    eprintln!("[DEBUG] claude_path: {}", claude_path);
 
     // Load or create project metadata
     let metadata = get_or_create_project(working_dir)?;
     // Use same session_id for both panes - pane_type differentiates them
     let session_id = metadata.id;
 
-    let prompt = metadata.prompt.clone().unwrap_or_else(|| {
-        DEFAULT_PROMPT.to_string()
-    });
+    let prompt = metadata.prompt.clone()
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_PROMPT.to_string());
 
     let working_dir_str = working_dir.to_string_lossy().to_string();
     let server_url = server_url.to_string();
@@ -147,14 +145,10 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     });
 
     // Run TUI in main thread
-    eprintln!("[DEBUG] Creating TUI app...");
     let mut app = App::new(input_tx, output_rx);
-    eprintln!("[DEBUG] Starting TUI...");
     if let Err(e) = app.run() {
-        eprintln!("[DEBUG] TUI error: {}", e);
         tracing::error!("TUI error: {}", e);
     }
-    eprintln!("[DEBUG] TUI exited");
 
     // Signal shutdown
     shutdown.store(true, Ordering::SeqCst);
@@ -242,25 +236,31 @@ fn run_deadloop_session_inner(
             pane_type: Some(PaneType::Deadloop),
         });
 
-        // Run Claude
+        // Run Claude - pass prompt via stdin for reliability with long prompts
         let args = vec![
             "--print".to_string(),
             "--output-format".to_string(),
             "stream-json".to_string(),
             "--verbose".to_string(),
             "--dangerously-skip-permissions".to_string(),
-            prompt.to_string(),
         ];
 
         match Command::new(claude_path)
             .args(&args)
             .current_dir(working_dir)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
         {
             Ok(mut child) => {
+                // Write prompt to stdin
+                if let Some(mut stdin) = child.stdin.take() {
+                    use std::io::Write;
+                    let _ = stdin.write_all(prompt.as_bytes());
+                    drop(stdin);
+                }
+
                 // Take stdout for reading
                 let stdout = match child.stdout.take() {
                     Some(s) => s,
@@ -274,13 +274,40 @@ fn run_deadloop_session_inner(
                     }
                 };
 
+                // Take stderr for reading
+                let stderr = child.stderr.take();
+
                 // Store child for cleanup
                 if let Ok(mut guard) = child_process.lock() {
                     *guard = Some(child);
                 }
 
-                let reader = BufReader::new(stdout);
+                // Spawn thread to read stderr
+                let output_tx_stderr = output_tx.clone();
+                let server_tx_stderr = server_tx.clone();
+                let session_id_stderr = session_id;
+                let stderr_thread = stderr.map(|stderr| {
+                    thread::spawn(move || {
+                        let reader = BufReader::new(stderr);
+                        for line in reader.lines() {
+                            if let Ok(line) = line {
+                                if !line.trim().is_empty() {
+                                    let _ = output_tx_stderr.send(PaneOutput {
+                                        text: format!("[stderr] {}", line),
+                                        is_deadloop: true,
+                                    });
+                                    let _ = server_tx_stderr.blocking_send(CliToServer::Output {
+                                        session_id: session_id_stderr,
+                                        data: format!("[stderr] {}", line),
+                                        output_type: shared::OutputType::Error,
+                                    });
+                                }
+                            }
+                        }
+                    })
+                });
 
+                let reader = BufReader::new(stdout);
                 let mut had_error = false;
 
                 for line in reader.lines() {
@@ -300,21 +327,18 @@ fn run_deadloop_session_inner(
                     // Parse and process
                     match serde_json::from_str::<ClaudeStreamMessage>(&line) {
                         Ok(message) => {
-                            // Check for errors
                             if let ClaudeStreamMessage::Result { is_error, .. } = &message {
                                 if *is_error {
                                     had_error = true;
                                 }
                             }
 
-                            // Display locally
                             let display_text = format_stream_message(&message);
                             let _ = output_tx.send(PaneOutput {
                                 text: display_text,
                                 is_deadloop: true,
                             });
 
-                            // Send to server
                             let _ = server_tx.blocking_send(CliToServer::StreamMessage {
                                 session_id,
                                 message,
@@ -322,13 +346,23 @@ fn run_deadloop_session_inner(
                             });
                         }
                         Err(_) => {
-                            // Non-JSON output
+                            // Non-JSON output - display and forward to server
                             let _ = output_tx.send(PaneOutput {
-                                text: line,
+                                text: line.clone(),
                                 is_deadloop: true,
+                            });
+                            let _ = server_tx.blocking_send(CliToServer::Output {
+                                session_id,
+                                data: line,
+                                output_type: shared::OutputType::Text,
                             });
                         }
                     }
+                }
+
+                // Wait for stderr thread
+                if let Some(handle) = stderr_thread {
+                    let _ = handle.join();
                 }
 
                 // Wait for child to finish

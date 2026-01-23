@@ -87,8 +87,6 @@ enum ConfigAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    eprintln!("[DEBUG] apas starting...");
-
     // Initialize tracing
     tracing_subscriber::registry()
         .with(
@@ -113,14 +111,10 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             Commands::Login => {
-                eprintln!("[DEBUG] Loading config...");
                 let config = config::Config::load().unwrap_or_default();
-                eprintln!("[DEBUG] Config loaded");
                 let server = cli.server
                     .or(config.remote.server)
                     .unwrap_or_else(|| DEFAULT_SERVER.to_string());
-                eprintln!("[DEBUG] Calling auth::login with server: {}", server);
-
                 let token = auth::login(&server).await?;
 
                 // Save the token
