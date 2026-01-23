@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc as tokio_mpsc;
 use uuid::Uuid;
 
-use crate::project::get_or_create_project;
+use crate::project::{get_or_create_project, save_project};
 use crate::tui::{App, PaneOutput};
 
 const DEFAULT_PROMPT: &str = r#"Work on tasks defined in TODO.md. Repeat the following steps, don't stop until interrupted. Don't ask me for advice, just pick the best option you think that is honest, complete, and not corner-cutting:
@@ -35,9 +35,16 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     let claude_path = config.local.claude_path.clone();
 
     // Load or create project metadata
-    let metadata = get_or_create_project(working_dir)?;
+    let mut metadata = get_or_create_project(working_dir)?;
     // Use same session_id for both panes - pane_type differentiates them
     let session_id = metadata.id;
+
+    // Get or create Claude session IDs for persistence across restarts
+    let deadloop_claude_session_id = metadata.get_or_create_deadloop_session_id();
+    let interactive_claude_session_id = metadata.get_or_create_interactive_session_id();
+
+    // Save the metadata with new session IDs if they were created
+    save_project(working_dir, &metadata)?;
 
     let prompt = metadata.prompt.clone()
         .filter(|p| !p.trim().is_empty())
@@ -119,6 +126,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
             &deadloop_claude_path,
             &deadloop_working_dir,
             session_id,
+            deadloop_claude_session_id,
             &deadloop_prompt,
             deadloop_output_tx,
             deadloop_server_tx,
@@ -138,6 +146,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
             &interactive_claude_path,
             &interactive_working_dir,
             session_id,
+            interactive_claude_session_id,
             input_rx,
             web_input_rx,
             interactive_output_tx,
@@ -168,6 +177,7 @@ fn run_deadloop_session(
     claude_path: &str,
     working_dir: &str,
     session_id: Uuid,
+    claude_session_id: Uuid,
     prompt: &str,
     output_tx: mpsc::Sender<PaneOutput>,
     server_tx: tokio_mpsc::Sender<CliToServer>,
@@ -180,6 +190,7 @@ fn run_deadloop_session(
             claude_path,
             working_dir,
             session_id,
+            claude_session_id,
             prompt,
             output_tx.clone(),
             server_tx,
@@ -207,6 +218,7 @@ fn run_deadloop_session_inner(
     claude_path: &str,
     working_dir: &str,
     session_id: Uuid,
+    claude_session_id: Uuid,
     prompt: &str,
     output_tx: mpsc::Sender<PaneOutput>,
     server_tx: tokio_mpsc::Sender<CliToServer>,
@@ -214,7 +226,7 @@ fn run_deadloop_session_inner(
     child_process: Arc<Mutex<Option<std::process::Child>>>,
 ) {
     let _ = output_tx.send(PaneOutput {
-        text: "[Deadloop thread started]".to_string(),
+        text: format!("[Deadloop session: {}]", &claude_session_id.to_string()[..8]),
         is_deadloop: true,
     });
 
@@ -223,6 +235,7 @@ fn run_deadloop_session_inner(
     const MAX_BACKOFF: u64 = 3600;
     const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60); // 1 hour
     let mut last_update_check = Instant::now();
+    let mut first_message = true; // Track if this is first message (use --session-id) or resume (use --resume)
 
     while !shutdown.load(Ordering::SeqCst) {
         iteration += 1;
@@ -238,31 +251,43 @@ fn run_deadloop_session_inner(
             pane_type: Some(PaneType::Deadloop),
         });
 
-        // Run Claude - pass prompt via stdin for reliability with long prompts
-        let args = vec![
-            "--print".to_string(),
-            "--output-format".to_string(),
-            "stream-json".to_string(),
-            "--verbose".to_string(),
-            "--dangerously-skip-permissions".to_string(),
-        ];
+        // Build args:
+        // - First iteration: use --session-id to create session with specific ID
+        // - Subsequent: use --resume with the session ID to continue
+        let args = if first_message {
+            first_message = false;
+            vec![
+                "--print".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--verbose".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                "--session-id".to_string(),
+                claude_session_id.to_string(),
+                prompt.to_string(),
+            ]
+        } else {
+            vec![
+                "--print".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--verbose".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                "--resume".to_string(),
+                claude_session_id.to_string(),
+                prompt.to_string(),
+            ]
+        };
 
         match Command::new(claude_path)
             .args(&args)
             .current_dir(working_dir)
-            .stdin(Stdio::piped())
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
         {
             Ok(mut child) => {
-                // Write prompt to stdin
-                if let Some(mut stdin) = child.stdin.take() {
-                    use std::io::Write;
-                    let _ = stdin.write_all(prompt.as_bytes());
-                    drop(stdin);
-                }
-
                 // Take stdout for reading
                 let stdout = match child.stdout.take() {
                     Some(s) => s,
@@ -423,15 +448,14 @@ fn run_interactive_session(
     claude_path: &str,
     working_dir: &str,
     session_id: Uuid,
+    claude_session_id: Uuid,
     tui_input_rx: mpsc::Receiver<String>,
     web_input_rx: mpsc::Receiver<String>,
     output_tx: mpsc::Sender<PaneOutput>,
     server_tx: tokio_mpsc::Sender<CliToServer>,
     shutdown: Arc<AtomicBool>,
 ) {
-    // Generate a unique Claude session ID for this interactive pane
-    // This allows multiple APAS instances to have separate conversations
-    let claude_session_id = Uuid::new_v4();
+    // Use the persisted Claude session ID for conversation continuity across restarts
     let mut first_message = true;
 
     let _ = output_tx.send(PaneOutput {
