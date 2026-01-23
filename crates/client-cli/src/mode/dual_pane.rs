@@ -81,6 +81,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     let server_url_clone = server_url.clone();
     let token_clone = token.clone();
     let working_dir_clone = working_dir_str.clone();
+    let status_output_tx = output_tx.clone();
     let server_task = tokio::spawn(async move {
         run_server_connection(
             &server_url_clone,
@@ -90,6 +91,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
             server_rx,
             shutdown_clone,
             web_input_tx,
+            status_output_tx,
         )
         .await
     });
@@ -639,7 +641,7 @@ fn format_stream_message(message: &ClaudeStreamMessage) -> String {
     }
 }
 
-/// Run server connection (similar to hybrid mode)
+/// Run server connection with automatic reconnection
 async fn run_server_connection(
     server_url: &str,
     token: &str,
@@ -648,19 +650,28 @@ async fn run_server_connection(
     mut output_rx: tokio_mpsc::Receiver<CliToServer>,
     shutdown: Arc<AtomicBool>,
     web_input_tx: mpsc::Sender<String>,
+    status_tx: mpsc::Sender<PaneOutput>,
 ) -> Result<()> {
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::{connect_async, tungstenite::Message};
 
     let mut reconnect_delay = std::time::Duration::from_secs(1);
     let max_reconnect_delay = std::time::Duration::from_secs(60);
+    let mut connection_count = 0u32;
 
     while !shutdown.load(Ordering::SeqCst) {
         let ws_url = format!("{}/ws/cli", server_url);
-        tracing::info!("Connecting to server: {}", ws_url);
+
+        if connection_count > 0 {
+            let _ = status_tx.send(PaneOutput {
+                text: format!("[Server: Reconnecting... (attempt {})]", connection_count),
+                is_deadloop: true,
+            });
+        }
 
         match connect_async(&ws_url).await {
             Ok((ws_stream, _)) => {
+                connection_count += 1;
                 reconnect_delay = std::time::Duration::from_secs(1);
                 let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
@@ -670,35 +681,61 @@ async fn run_server_connection(
                     version: Some(env!("APAS_VERSION").to_string()),
                 };
                 let msg_text = serde_json::to_string(&register_msg)?;
-                ws_sender.send(Message::Text(msg_text.into())).await?;
+                if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
+                    let _ = status_tx.send(PaneOutput {
+                        text: "[Server: Connection lost during registration]".to_string(),
+                        is_deadloop: true,
+                    });
+                    tokio::time::sleep(reconnect_delay).await;
+                    continue;
+                }
 
                 // Wait for registration response
+                let mut registered = false;
                 while let Some(Ok(msg)) = ws_receiver.next().await {
                     if let Message::Text(text) = msg {
-                        let response: ServerToCli = serde_json::from_str(&text)?;
+                        let response: ServerToCli = match serde_json::from_str(&text) {
+                            Ok(r) => r,
+                            Err(_) => continue,
+                        };
                         match response {
                             ServerToCli::Registered { cli_id } => {
-                                tracing::info!("Registered as CLI {}", cli_id);
+                                let _ = status_tx.send(PaneOutput {
+                                    text: format!("[Server: Connected ({})]", &cli_id.to_string()[..8]),
+                                    is_deadloop: true,
+                                });
+                                registered = true;
                                 break;
                             }
                             ServerToCli::RegistrationFailed { reason } => {
-                                tracing::error!("Registration failed: {}", reason);
+                                let _ = status_tx.send(PaneOutput {
+                                    text: format!("[Server: Registration failed - {}]", reason),
+                                    is_deadloop: true,
+                                });
                                 return Err(anyhow::anyhow!("Registration failed: {}", reason));
                             }
                             ServerToCli::VersionUnsupported {
                                 client_version,
                                 min_version,
                             } => {
-                                tracing::error!(
-                                    "Version {} not supported, minimum: {}",
-                                    client_version,
-                                    min_version
-                                );
+                                let _ = status_tx.send(PaneOutput {
+                                    text: format!("[Server: Version {} not supported, need {}]", client_version, min_version),
+                                    is_deadloop: true,
+                                });
                                 return Err(anyhow::anyhow!("Version not supported"));
                             }
                             _ => continue,
                         }
                     }
+                }
+
+                if !registered {
+                    let _ = status_tx.send(PaneOutput {
+                        text: "[Server: Connection lost before registration]".to_string(),
+                        is_deadloop: true,
+                    });
+                    tokio::time::sleep(reconnect_delay).await;
+                    continue;
                 }
 
                 // Register session (pane_type in messages will differentiate deadloop vs interactive)
@@ -713,7 +750,14 @@ async fn run_server_connection(
                     pane_type: None, // Single session, pane_type on individual messages
                 };
                 let msg_text = serde_json::to_string(&session_start)?;
-                ws_sender.send(Message::Text(msg_text.into())).await?;
+                if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
+                    let _ = status_tx.send(PaneOutput {
+                        text: "[Server: Connection lost during session start]".to_string(),
+                        is_deadloop: true,
+                    });
+                    tokio::time::sleep(reconnect_delay).await;
+                    continue;
+                }
 
                 // Main loop
                 loop {
@@ -721,36 +765,57 @@ async fn run_server_connection(
                         Some(msg) = output_rx.recv() => {
                             let msg_text = serde_json::to_string(&msg)?;
                             if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
+                                let _ = status_tx.send(PaneOutput {
+                                    text: "[Server: Connection lost, reconnecting...]".to_string(),
+                                    is_deadloop: true,
+                                });
                                 break;
                             }
                         }
-                        Some(Ok(msg)) = ws_receiver.next() => {
-                            // Handle server messages (input, heartbeat, etc.)
-                            if let Message::Text(text) = msg {
-                                if let Ok(server_msg) = serde_json::from_str::<ServerToCli>(&text) {
-                                    match server_msg {
-                                        ServerToCli::Input { session_id: _, data } => {
-                                            tracing::info!("Received input from web UI: {}", data);
-                                            // Forward to interactive session
-                                            if let Err(e) = web_input_tx.send(data) {
-                                                tracing::error!("Failed to forward web input: {}", e);
+                        msg = ws_receiver.next() => {
+                            match msg {
+                                Some(Ok(Message::Text(text))) => {
+                                    if let Ok(server_msg) = serde_json::from_str::<ServerToCli>(&text) {
+                                        match server_msg {
+                                            ServerToCli::Input { session_id: _, data } => {
+                                                // Forward to interactive session
+                                                let _ = web_input_tx.send(data);
                                             }
-                                        }
-                                        ServerToCli::Heartbeat => {
-                                            // Heartbeat response, nothing to do
-                                        }
-                                        _ => {
-                                            tracing::debug!("Received server message: {:?}", server_msg);
+                                            ServerToCli::Heartbeat => {
+                                                // Heartbeat response, nothing to do
+                                            }
+                                            _ => {}
                                         }
                                     }
                                 }
+                                Some(Ok(Message::Close(_))) | None => {
+                                    let _ = status_tx.send(PaneOutput {
+                                        text: "[Server: Connection closed, reconnecting...]".to_string(),
+                                        is_deadloop: true,
+                                    });
+                                    break;
+                                }
+                                Some(Err(_)) => {
+                                    let _ = status_tx.send(PaneOutput {
+                                        text: "[Server: Connection error, reconnecting...]".to_string(),
+                                        is_deadloop: true,
+                                    });
+                                    break;
+                                }
+                                _ => {}
                             }
                         }
                         _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
                             // Heartbeat
-                            let _ = ws_sender.send(Message::Text(
+                            if ws_sender.send(Message::Text(
                                 serde_json::to_string(&CliToServer::Heartbeat)?.into()
-                            )).await;
+                            )).await.is_err() {
+                                let _ = status_tx.send(PaneOutput {
+                                    text: "[Server: Heartbeat failed, reconnecting...]".to_string(),
+                                    is_deadloop: true,
+                                });
+                                break;
+                            }
                         }
                     }
 
@@ -758,11 +823,20 @@ async fn run_server_connection(
                         break;
                     }
                 }
+
+                // Small delay before reconnecting
+                if !shutdown.load(Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
             }
             Err(e) => {
-                tracing::warn!("Connection failed: {}. Retrying in {:?}", e, reconnect_delay);
+                let _ = status_tx.send(PaneOutput {
+                    text: format!("[Server: Connection failed - {}. Retry in {}s]", e, reconnect_delay.as_secs()),
+                    is_deadloop: true,
+                });
                 tokio::time::sleep(reconnect_delay).await;
                 reconnect_delay = std::cmp::min(reconnect_delay * 2, max_reconnect_delay);
+                connection_count += 1;
             }
         }
     }
