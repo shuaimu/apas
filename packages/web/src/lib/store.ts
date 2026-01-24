@@ -64,6 +64,9 @@ interface AppState {
   ws: WebSocket | null;
   refreshInterval: NodeJS.Timeout | null;
   isAttached: boolean; // Whether we're attached to an active session
+  reconnectAttempts: number;
+  reconnectTimeout: NodeJS.Timeout | null;
+  visibilityHandler: (() => void) | null;
 
   // CLI clients
   cliClients: CliClient[];
@@ -119,6 +122,9 @@ export const useStore = create<AppState>((set, get) => ({
   ws: null,
   refreshInterval: null,
   isAttached: false,
+  reconnectAttempts: 0,
+  reconnectTimeout: null,
+  visibilityHandler: null,
   cliClients: [],
   sessions: [],
   messages: [],
@@ -137,9 +143,20 @@ export const useStore = create<AppState>((set, get) => ({
   logout: () => {
     localStorage.removeItem("apas_token");
     localStorage.removeItem("apas_user_id");
-    const { ws } = get();
+    const { ws, reconnectTimeout, visibilityHandler } = get();
+
+    // Clear reconnect timeout
+    if (reconnectTimeout) {
+      clearTimeout(reconnectTimeout);
+    }
+
+    // Remove visibility handler
+    if (visibilityHandler && typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', visibilityHandler);
+    }
+
     if (ws) {
-      ws.close();
+      ws.close(1000, "User logged out");
     }
     set({
       token: null,
@@ -150,6 +167,9 @@ export const useStore = create<AppState>((set, get) => ({
       sessionId: null,
       cliClients: [],
       sessions: [],
+      reconnectAttempts: 0,
+      reconnectTimeout: null,
+      visibilityHandler: null,
     });
   },
 
@@ -160,10 +180,19 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
 
+    // Clear any existing reconnect timeout
+    const { reconnectTimeout, visibilityHandler } = get();
+    if (reconnectTimeout) {
+      clearTimeout(reconnectTimeout);
+      set({ reconnectTimeout: null });
+    }
+
     const ws = new WebSocket(`${WS_URL}/ws/web`);
 
     ws.onopen = () => {
       console.log("WebSocket connected, sending authentication...");
+      // Reset reconnect attempts on successful connection
+      set({ reconnectAttempts: 0 });
       // Send token for authentication
       ws.send(JSON.stringify({ type: "authenticate", token }));
     };
@@ -177,25 +206,94 @@ export const useStore = create<AppState>((set, get) => ({
       }
     };
 
-    ws.onclose = () => {
-      console.log("WebSocket disconnected");
+    ws.onclose = (event) => {
+      console.log("WebSocket disconnected", event.code, event.reason);
       set({ connected: false, ws: null, cliClients: [] });
+
+      // Auto-reconnect with exponential backoff (unless intentionally disconnected)
+      // Code 1000 = normal close (intentional), 1001 = going away
+      if (event.code !== 1000) {
+        const { reconnectAttempts } = get();
+        const maxAttempts = 10;
+        if (reconnectAttempts < maxAttempts) {
+          // Exponential backoff: 1s, 2s, 4s, 8s, 16s, max 30s
+          const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+          console.log(`Scheduling reconnect attempt ${reconnectAttempts + 1} in ${delay}ms`);
+          const timeout = setTimeout(() => {
+            console.log(`Reconnect attempt ${reconnectAttempts + 1}`);
+            set({ reconnectAttempts: reconnectAttempts + 1 });
+            get().connect();
+          }, delay);
+          set({ reconnectTimeout: timeout });
+        } else {
+          console.log("Max reconnect attempts reached");
+        }
+      }
     };
 
     ws.onerror = (error) => {
       console.error("WebSocket error:", error);
     };
 
+    // Add visibility change listener for mobile (only once)
+    if (!visibilityHandler && typeof document !== 'undefined') {
+      const handler = () => {
+        if (document.visibilityState === 'visible') {
+          const { ws, connected } = get();
+          console.log("App became visible, checking connection...");
+          // If not connected or WebSocket is not open, reconnect
+          if (!connected || !ws || ws.readyState !== WebSocket.OPEN) {
+            console.log("Connection lost while in background, reconnecting...");
+            // Reset reconnect attempts for immediate reconnect
+            set({ reconnectAttempts: 0 });
+            get().connect();
+          } else {
+            // Connection is healthy, just refresh data
+            console.log("Connection healthy, refreshing data...");
+            get().refreshCliClients();
+            get().listSessions();
+            // If we have an active session, reload messages to catch up
+            const { sessionId, isAttached } = get();
+            if (sessionId && isAttached) {
+              get().attachSession(sessionId);
+            }
+          }
+        }
+      };
+      document.addEventListener('visibilitychange', handler);
+      set({ visibilityHandler: handler });
+    }
+
     set({ ws });
   },
 
   disconnect: () => {
-    const { ws } = get();
+    const { ws, reconnectTimeout, visibilityHandler } = get();
     get().stopAutoRefresh();
-    if (ws) {
-      ws.close();
+
+    // Clear reconnect timeout
+    if (reconnectTimeout) {
+      clearTimeout(reconnectTimeout);
     }
-    set({ connected: false, ws: null, sessionId: null, cliClients: [], isAttached: false });
+
+    // Remove visibility handler
+    if (visibilityHandler && typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', visibilityHandler);
+    }
+
+    if (ws) {
+      ws.close(1000, "User disconnected"); // 1000 = normal close, prevents auto-reconnect
+    }
+    set({
+      connected: false,
+      ws: null,
+      sessionId: null,
+      cliClients: [],
+      isAttached: false,
+      reconnectAttempts: 0,
+      reconnectTimeout: null,
+      visibilityHandler: null,
+    });
   },
 
   startSession: (cliClientId?: string) => {
