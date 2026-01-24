@@ -361,6 +361,8 @@ fn run_deadloop_session_inner(
                 let mut had_error = false;
                 let mut process_exited = false;
                 let mut exit_was_error = false;
+                let mut timeouts_after_exit = 0;
+                const MAX_TIMEOUTS_AFTER_EXIT: u32 = 10; // 5 seconds max wait after exit
                 let check_interval = std::time::Duration::from_millis(500);
 
                 // Main loop: read stdout with timeout and check for process exit
@@ -370,8 +372,9 @@ fn run_deadloop_session_inner(
                     }
 
                     // Check if process has exited (crash/exit detection)
+                    // Use try_lock to avoid blocking if another thread holds the lock
                     if !process_exited {
-                        if let Ok(mut guard) = child_process.lock() {
+                        if let Ok(mut guard) = child_process.try_lock() {
                             if let Some(ref mut child) = *guard {
                                 match child.try_wait() {
                                     Ok(Some(status)) => {
@@ -403,11 +406,15 @@ fn run_deadloop_session_inner(
                                 }
                             }
                         }
+                        // If lock not available, we'll try again next iteration
                     }
 
                     // Try to receive stdout line with timeout
                     match stdout_rx.recv_timeout(check_interval) {
                         Ok(Some(line)) => {
+                            // Reset timeout counter since we're receiving data
+                            timeouts_after_exit = 0;
+
                             if line.trim().is_empty() {
                                 continue;
                             }
@@ -456,15 +463,20 @@ fn run_deadloop_session_inner(
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             // No data yet, check if process has exited
                             if process_exited {
-                                let _ = output_tx.send(PaneOutput {
-                                    text: if exit_was_error {
-                                        "[Process exited with error, restarting...]".to_string()
-                                    } else {
-                                        "[Process exited, restarting...]".to_string()
-                                    },
-                                    is_deadloop: true,
-                                });
-                                break;
+                                timeouts_after_exit += 1;
+                                if timeouts_after_exit >= MAX_TIMEOUTS_AFTER_EXIT {
+                                    let _ = output_tx.send(PaneOutput {
+                                        text: if exit_was_error {
+                                            "[Process exited with error, restarting...]".to_string()
+                                        } else {
+                                            "[Process exited, restarting...]".to_string()
+                                        },
+                                        is_deadloop: true,
+                                    });
+                                    break;
+                                }
+                                // Give stdout thread a bit more time to flush
+                                continue;
                             }
                             continue;
                         }
