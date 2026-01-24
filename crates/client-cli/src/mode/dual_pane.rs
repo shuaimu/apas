@@ -245,7 +245,8 @@ fn run_deadloop_session_inner(
         });
 
         // Send user input to server
-        let _ = server_tx.blocking_send(CliToServer::UserInput {
+        // Use try_send to avoid blocking if channel is full
+        let _ = server_tx.try_send(CliToServer::UserInput {
             session_id,
             text: format!("[Iteration {}]\n{}", iteration, prompt),
             pane_type: Some(PaneType::Deadloop),
@@ -345,7 +346,8 @@ fn run_deadloop_session_inner(
                                         text: format!("[stderr] {}", line),
                                         is_deadloop: true,
                                     });
-                                    let _ = server_tx_stderr.blocking_send(CliToServer::Output {
+                                    // Use try_send to avoid blocking
+                                    let _ = server_tx_stderr.try_send(CliToServer::Output {
                                         session_id: session_id_stderr,
                                         data: format!("[stderr] {}", line),
                                         output_type: shared::OutputType::Error,
@@ -357,38 +359,47 @@ fn run_deadloop_session_inner(
                 });
 
                 let mut had_error = false;
-                let mut process_crashed = false;
+                let mut process_exited = false;
+                let mut exit_was_error = false;
                 let check_interval = std::time::Duration::from_millis(500);
 
-                // Main loop: read stdout with timeout and check for process crash
+                // Main loop: read stdout with timeout and check for process exit
                 loop {
                     if shutdown.load(Ordering::SeqCst) {
                         break;
                     }
 
-                    // Check if process has exited (crash detection)
-                    if let Ok(mut guard) = child_process.lock() {
-                        if let Some(ref mut child) = *guard {
-                            match child.try_wait() {
-                                Ok(Some(status)) => {
-                                    // Process has exited
-                                    if !status.success() {
+                    // Check if process has exited (crash/exit detection)
+                    if !process_exited {
+                        if let Ok(mut guard) = child_process.lock() {
+                            if let Some(ref mut child) = *guard {
+                                match child.try_wait() {
+                                    Ok(Some(status)) => {
+                                        // Process has exited
+                                        process_exited = true;
+                                        if !status.success() {
+                                            let _ = output_tx.send(PaneOutput {
+                                                text: format!("[Claude process exited with {}]", status),
+                                                is_deadloop: true,
+                                            });
+                                            exit_was_error = true;
+                                            had_error = true;
+                                        } else {
+                                            let _ = output_tx.send(PaneOutput {
+                                                text: "[Claude process exited normally]".to_string(),
+                                                is_deadloop: true,
+                                            });
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        // Still running
+                                    }
+                                    Err(e) => {
                                         let _ = output_tx.send(PaneOutput {
-                                            text: format!("[Claude process exited with {}]", status),
+                                            text: format!("[Error checking process status: {}]", e),
                                             is_deadloop: true,
                                         });
-                                        process_crashed = true;
-                                        had_error = true;
                                     }
-                                }
-                                Ok(None) => {
-                                    // Still running
-                                }
-                                Err(e) => {
-                                    let _ = output_tx.send(PaneOutput {
-                                        text: format!("[Error checking process status: {}]", e),
-                                        is_deadloop: true,
-                                    });
                                 }
                             }
                         }
@@ -416,7 +427,8 @@ fn run_deadloop_session_inner(
                                         is_deadloop: true,
                                     });
 
-                                    let _ = server_tx.blocking_send(CliToServer::StreamMessage {
+                                    // Use try_send to avoid blocking (drop message if channel full)
+                                    let _ = server_tx.try_send(CliToServer::StreamMessage {
                                         session_id,
                                         message,
                                         pane_type: Some(PaneType::Deadloop),
@@ -428,7 +440,8 @@ fn run_deadloop_session_inner(
                                         text: line.clone(),
                                         is_deadloop: true,
                                     });
-                                    let _ = server_tx.blocking_send(CliToServer::Output {
+                                    // Use try_send to avoid blocking
+                                    let _ = server_tx.try_send(CliToServer::Output {
                                         session_id,
                                         data: line,
                                         output_type: shared::OutputType::Text,
@@ -441,10 +454,14 @@ fn run_deadloop_session_inner(
                             break;
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            // No data yet, but check if process crashed
-                            if process_crashed {
+                            // No data yet, check if process has exited
+                            if process_exited {
                                 let _ = output_tx.send(PaneOutput {
-                                    text: "[Detected crash, restarting...]".to_string(),
+                                    text: if exit_was_error {
+                                        "[Process exited with error, restarting...]".to_string()
+                                    } else {
+                                        "[Process exited, restarting...]".to_string()
+                                    },
                                     is_deadloop: true,
                                 });
                                 break;
@@ -496,8 +513,8 @@ fn run_deadloop_session_inner(
                     }
                 }
 
-                // Backoff on error or crash
-                if had_error || process_crashed {
+                // Backoff on error
+                if had_error || exit_was_error {
                     backoff_seconds = std::cmp::min(backoff_seconds * 2, MAX_BACKOFF);
                     let _ = output_tx.send(PaneOutput {
                         text: format!("[Backing off for {}s before retry]", backoff_seconds),
