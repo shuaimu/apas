@@ -734,6 +734,17 @@ fn run_interactive_session(
     }
 }
 
+/// Truncate a string to max_chars characters, respecting UTF-8 boundaries
+fn truncate_string(s: &str, max_chars: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{}...", truncated)
+    }
+}
+
 /// Format a stream message for display
 fn format_stream_message(message: &ClaudeStreamMessage) -> String {
     match message {
@@ -752,11 +763,8 @@ fn format_stream_message(message: &ClaudeStreamMessage) -> String {
                     }
                     shared::ClaudeContentBlock::ToolResult { content, is_error, .. } => {
                         let status = if *is_error { "Error" } else { "Result" };
-                        let preview = if content.len() > 100 {
-                            format!("{}...", &content[..100])
-                        } else {
-                            content.clone()
-                        };
+                        // Use char-safe truncation to avoid panics on multi-byte UTF-8
+                        let preview = truncate_string(content, 100);
                         output.push_str(&format!("[{}: {}]", status, preview));
                     }
                 }
@@ -767,11 +775,8 @@ fn format_stream_message(message: &ClaudeStreamMessage) -> String {
             let mut output = String::new();
             for block in &message.content {
                 if let shared::ClaudeContentBlock::ToolResult { tool_use_id, content, .. } = block {
-                    let preview = if content.len() > 50 {
-                        format!("{}...", &content[..50])
-                    } else {
-                        content.clone()
-                    };
+                    // Use char-safe truncation to avoid panics on multi-byte UTF-8
+                    let preview = truncate_string(content, 50);
                     output.push_str(&format!("[Tool result {}: {}]", tool_use_id, preview));
                 }
             }
