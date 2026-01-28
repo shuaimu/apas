@@ -5,11 +5,18 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{Duration, SystemTime};
 
 const REPO_URL: &str = "https://github.com/shuaimu/apas.git";
-const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 const CURRENT_VERSION: &str = env!("APAS_VERSION");
+
+/// Get the path to the source directory (~/.apas/source/)
+fn source_dir() -> PathBuf {
+    let dir = directories::ProjectDirs::from("", "", "apas")
+        .map(|d| d.data_dir().join("source"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/apas/source"));
+    fs::create_dir_all(&dir).ok();
+    dir
+}
 
 /// Parse version string (YY.MM.COMMIT) into comparable number
 fn parse_version(v: &str) -> Option<u64> {
@@ -25,62 +32,70 @@ fn parse_version(v: &str) -> Option<u64> {
     Some(yy * 1_000_000 + mm * 10_000 + commit)
 }
 
-/// Get the path to the update check timestamp file
-fn update_check_file() -> PathBuf {
-    let config_dir = directories::ProjectDirs::from("", "", "apas")
-        .map(|d| d.cache_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("/tmp/apas"));
-
-    fs::create_dir_all(&config_dir).ok();
-    config_dir.join("last_update_check")
-}
-
-/// Check if we should check for updates (based on time since last check)
-fn should_check_for_updates() -> bool {
-    let check_file = update_check_file();
-
-    if let Ok(metadata) = fs::metadata(&check_file) {
-        if let Ok(modified) = metadata.modified() {
-            if let Ok(elapsed) = SystemTime::now().duration_since(modified) {
-                return elapsed > UPDATE_CHECK_INTERVAL;
-            }
-        }
-    }
-
-    true // Check if file doesn't exist or can't read it
-}
-
-/// Mark that we checked for updates
-fn mark_update_checked() {
-    let check_file = update_check_file();
-    fs::write(&check_file, "").ok();
-}
-
 /// Get the path to the current executable
 fn get_current_exe() -> Option<PathBuf> {
     env::current_exe().ok()
 }
 
-/// Get latest version from remote repo by checking commit count
-fn get_remote_version() -> Option<String> {
-    let build_dir = env::temp_dir().join(format!("apas-version-check-{}", std::process::id()));
+/// Ensure the source repo exists (clone if not, fetch if exists)
+/// Returns true if there are new commits available
+fn sync_source_repo() -> Option<bool> {
+    let src_dir = source_dir();
+    let git_dir = src_dir.join(".git");
 
-    // Full clone needed for accurate commit count
-    let status = Command::new("git")
-        .args(["clone", REPO_URL, build_dir.to_str()?])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()?;
+    if git_dir.exists() {
+        // Repo exists, fetch updates
+        let status = Command::new("git")
+            .args(["fetch", "origin"])
+            .current_dir(&src_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?;
 
-    if !status.success() {
-        return None;
+        if !status.success() {
+            return None;
+        }
+
+        // Check if there are new commits
+        let output = Command::new("git")
+            .args(["rev-list", "HEAD..origin/master", "--count"])
+            .current_dir(&src_dir)
+            .output()
+            .ok()?;
+
+        let count: u64 = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0);
+
+        Some(count > 0)
+    } else {
+        // Clone the repo
+        eprintln!("[Auto-update] First run, cloning source repository...");
+        let status = Command::new("git")
+            .args(["clone", REPO_URL, src_dir.to_str()?])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?;
+
+        if status.success() {
+            Some(false) // Just cloned, no updates needed
+        } else {
+            None
+        }
     }
+}
+
+/// Get the version string from the source repo
+fn get_source_version() -> Option<String> {
+    let src_dir = source_dir();
 
     // Get commit count
     let output = Command::new("git")
-        .args(["rev-list", "--count", "HEAD"])
-        .current_dir(&build_dir)
+        .args(["rev-list", "--count", "origin/master"])
+        .current_dir(&src_dir)
         .output()
         .ok()?;
 
@@ -94,65 +109,100 @@ fn get_remote_version() -> Option<String> {
 
     let date = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-    // Cleanup
-    fs::remove_dir_all(&build_dir).ok();
-
     Some(format!("{}.{}", date, commit_count))
 }
 
-/// Check for updates and install if available
-pub async fn check_and_update() -> Result<()> {
-    println!("Current version: {}", CURRENT_VERSION);
-    println!("Checking for updates...\n");
+/// Pull updates and build the new binary
+fn pull_and_build() -> Result<PathBuf> {
+    let src_dir = source_dir();
 
-    // Clone and build from source
-    let build_dir = env::temp_dir().join(format!("apas-update-{}", std::process::id()));
-
-    // Clone repo (full clone needed for accurate commit count in version)
-    println!("Cloning repository...");
+    // Pull the latest changes
+    eprintln!("[Auto-update] Pulling latest changes...");
     let status = Command::new("git")
-        .args(["clone", REPO_URL, build_dir.to_str().unwrap()])
+        .args(["pull", "origin", "master"])
+        .current_dir(&src_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()?;
 
     if !status.success() {
-        anyhow::bail!("Failed to clone repository");
+        // Try to reset and pull again in case of conflicts
+        Command::new("git")
+            .args(["reset", "--hard", "origin/master"])
+            .current_dir(&src_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
     }
 
     // Build
-    println!("Building...");
+    eprintln!("[Auto-update] Building...");
     let status = Command::new("cargo")
         .args(["build", "--release", "-p", "apas"])
-        .current_dir(&build_dir)
+        .current_dir(&src_dir)
         .status()?;
 
     if !status.success() {
-        fs::remove_dir_all(&build_dir).ok();
         anyhow::bail!("Failed to build");
     }
 
-    // Get current executable path
+    Ok(src_dir.join("target/release/apas"))
+}
+
+/// Install a new binary by replacing the current one
+fn install_binary(new_binary: &PathBuf) -> Result<()> {
     let current_exe = get_current_exe()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine executable path"))?;
-
-    // Copy new binary
-    let new_binary = build_dir.join("target/release/apas");
 
     // Backup and replace
     let backup_path = current_exe.with_extension("old");
     fs::rename(&current_exe, &backup_path).ok();
 
-    if let Err(e) = fs::copy(&new_binary, &current_exe) {
+    if let Err(e) = fs::copy(new_binary, &current_exe) {
         // Restore backup
         fs::rename(&backup_path, &current_exe).ok();
-        fs::remove_dir_all(&build_dir).ok();
         anyhow::bail!("Failed to install: {}", e);
     }
 
-    // Cleanup
+    // Cleanup backup
     fs::remove_file(&backup_path).ok();
-    fs::remove_dir_all(&build_dir).ok();
 
-    // Get new version (--version outputs "apas X.Y.Z", extract just version)
+    Ok(())
+}
+
+/// Check for updates and install if available (manual command)
+pub async fn check_and_update() -> Result<()> {
+    println!("Current version: {}", CURRENT_VERSION);
+    println!("Checking for updates...\n");
+
+    // Sync source repo
+    match sync_source_repo() {
+        Some(has_updates) => {
+            if !has_updates {
+                // Check version anyway in case we're behind
+                let remote_version = get_source_version().unwrap_or_default();
+                let current = parse_version(CURRENT_VERSION);
+                let remote = parse_version(&remote_version);
+
+                if let (Some(c), Some(r)) = (current, remote) {
+                    if r <= c {
+                        println!("Already up to date ({})", CURRENT_VERSION);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        None => {
+            anyhow::bail!("Failed to sync source repository");
+        }
+    }
+
+    // Build and install
+    let new_binary = pull_and_build()?;
+    install_binary(&new_binary)?;
+
+    // Get new version
+    let current_exe = get_current_exe().unwrap();
     let output = Command::new(&current_exe)
         .args(["--version"])
         .output();
@@ -160,7 +210,6 @@ pub async fn check_and_update() -> Result<()> {
     let new_version = output
         .map(|o| {
             let full = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            // Extract version number after "apas "
             full.strip_prefix("apas ").unwrap_or(&full).to_string()
         })
         .unwrap_or_else(|_| "unknown".to_string());
@@ -171,31 +220,13 @@ pub async fn check_and_update() -> Result<()> {
     Ok(())
 }
 
-/// Check for updates in the background (non-blocking)
-pub fn check_for_updates_background() {
-    // Skip if we checked recently
-    if !should_check_for_updates() {
-        return;
-    }
-
-    mark_update_checked();
-
-    std::thread::spawn(|| {
-        let current = parse_version(CURRENT_VERSION);
-        let remote = get_remote_version().and_then(|v| parse_version(&v));
-
-        if let (Some(curr), Some(rem)) = (current, remote) {
-            if rem > curr {
-                println!("Update available! Run 'apas update' to install.");
-            }
-        }
-    });
-}
-
 /// Check if an update is available, returns the new version string if available
 pub fn check_for_update_available() -> Option<String> {
+    // Sync source repo first
+    sync_source_repo()?;
+
     let current = parse_version(CURRENT_VERSION)?;
-    let remote_version_str = get_remote_version()?;
+    let remote_version_str = get_source_version()?;
     let remote = parse_version(&remote_version_str)?;
 
     if remote > current {
@@ -208,51 +239,65 @@ pub fn check_for_update_available() -> Option<String> {
 /// Check for updates on boot and automatically install + restart if available
 /// This function will not return if an update is installed (it exec's the new binary)
 pub fn check_and_upgrade_on_boot() {
-    auto_update_and_restart();
-}
-
-/// Check for updates and automatically install + restart if available
-/// This function will not return if an update is installed (it exec's the new binary)
-pub fn auto_update_and_restart() {
     eprintln!("[Auto-update] Checking for updates...");
 
-    // Check if update is available
-    let current = match parse_version(CURRENT_VERSION) {
+    // Sync source repo (fetch or clone)
+    let has_updates = match sync_source_repo() {
         Some(v) => v,
         None => {
-            eprintln!("[Auto-update] Failed to parse current version");
+            eprintln!("[Auto-update] Failed to sync source repository");
             return;
         }
     };
 
-    let remote_version_str = match get_remote_version() {
-        Some(v) => v,
-        None => {
-            eprintln!("[Auto-update] Failed to get remote version");
+    if !has_updates {
+        // Double-check by comparing versions
+        let current = match parse_version(CURRENT_VERSION) {
+            Some(v) => v,
+            None => {
+                eprintln!("[Auto-update] Failed to parse current version");
+                return;
+            }
+        };
+
+        let remote_version_str = match get_source_version() {
+            Some(v) => v,
+            None => {
+                eprintln!("[Auto-update] Failed to get remote version");
+                return;
+            }
+        };
+
+        let remote = match parse_version(&remote_version_str) {
+            Some(v) => v,
+            None => {
+                eprintln!("[Auto-update] Failed to parse remote version");
+                return;
+            }
+        };
+
+        if remote <= current {
+            eprintln!("[Auto-update] Already up to date ({})", CURRENT_VERSION);
             return;
         }
-    };
 
-    let remote = match parse_version(&remote_version_str) {
-        Some(v) => v,
-        None => {
-            eprintln!("[Auto-update] Failed to parse remote version");
-            return;
-        }
-    };
-
-    if remote <= current {
-        eprintln!("[Auto-update] Already up to date ({})", CURRENT_VERSION);
-        return;
+        eprintln!("[Auto-update] Update available: {} -> {}", CURRENT_VERSION, remote_version_str);
+    } else {
+        eprintln!("[Auto-update] New commits available, updating...");
     }
 
-    eprintln!("[Auto-update] Update available: {} -> {}", CURRENT_VERSION, remote_version_str);
+    // Build and install
     eprintln!("[Auto-update] Installing update...");
+    let new_binary = match pull_and_build() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[Auto-update] Build failed: {}", e);
+            return;
+        }
+    };
 
-    // Run the update synchronously
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    if let Err(e) = rt.block_on(check_and_update()) {
-        eprintln!("[Auto-update] Update failed: {}", e);
+    if let Err(e) = install_binary(&new_binary) {
+        eprintln!("[Auto-update] Install failed: {}", e);
         return;
     }
 
