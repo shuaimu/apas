@@ -291,6 +291,34 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
+                Ok(WebToServer::PauseDeadloop) => {
+                    if let Some(sid) = session_id {
+                        tracing::info!("Pausing deadloop for session {}", sid);
+                        state
+                            .sessions
+                            .route_to_cli(
+                                &sid,
+                                ServerToCli::PauseDeadloop {
+                                    session_id: sid,
+                                },
+                            )
+                            .await;
+                    }
+                }
+                Ok(WebToServer::ResumeDeadloop) => {
+                    if let Some(sid) = session_id {
+                        tracing::info!("Resuming deadloop for session {}", sid);
+                        state
+                            .sessions
+                            .route_to_cli(
+                                &sid,
+                                ServerToCli::ResumeDeadloop {
+                                    session_id: sid,
+                                },
+                            )
+                            .await;
+                    }
+                }
                 Ok(WebToServer::ResumeSession { session_id: sid }) => {
                     session_id = Some(sid);
                 }

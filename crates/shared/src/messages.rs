@@ -54,6 +54,12 @@ pub enum CliToServer {
         #[serde(default)]
         pane_type: Option<PaneType>,
     },
+
+    /// Report deadloop pause status to server
+    DeadloopStatus {
+        session_id: Uuid,
+        is_paused: bool,
+    },
 }
 
 /// Messages sent from server to CLI client
@@ -86,6 +92,12 @@ pub enum ServerToCli {
 
     /// Heartbeat response
     Heartbeat,
+
+    /// Pause the deadloop
+    PauseDeadloop { session_id: Uuid },
+
+    /// Resume the deadloop
+    ResumeDeadloop { session_id: Uuid },
 }
 
 // ============================================================================
@@ -138,6 +150,12 @@ pub enum WebToServer {
         #[serde(default)]
         before_id: Option<String>, // Load messages before this message ID
     },
+
+    /// Pause the deadloop session
+    PauseDeadloop,
+
+    /// Resume the deadloop session
+    ResumeDeadloop,
 }
 
 /// Messages sent from server to web client
@@ -200,6 +218,12 @@ pub enum ServerToWeb {
         text: String,
         #[serde(default)]
         pane_type: Option<PaneType>,
+    },
+
+    /// Deadloop pause status update
+    DeadloopStatus {
+        session_id: Uuid,
+        is_paused: bool,
     },
 }
 

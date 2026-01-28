@@ -64,6 +64,9 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     // Shutdown flag
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    // Pause deadloop flag (controlled from web UI)
+    let pause_deadloop = Arc::new(AtomicBool::new(false));
+
     // Shared reference to child process for cleanup
     let child_process: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
     let child_for_handler = child_process.clone();
@@ -85,6 +88,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
 
     // Spawn server connection task
     let shutdown_clone = shutdown.clone();
+    let pause_clone = pause_deadloop.clone();
     let server_url_clone = server_url.clone();
     let token_clone = token.clone();
     let working_dir_clone = working_dir_str.clone();
@@ -97,6 +101,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
             &working_dir_clone,
             server_rx,
             shutdown_clone,
+            pause_clone,
             web_input_tx,
             status_output_tx,
         )
@@ -117,6 +122,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     let deadloop_output_tx = output_tx.clone();
     let deadloop_server_tx = server_tx.clone();
     let deadloop_shutdown = shutdown.clone();
+    let deadloop_pause = pause_deadloop.clone();
     let deadloop_working_dir = working_dir_str.clone();
     let deadloop_claude_path = claude_path.clone();
     let deadloop_child = child_process.clone();
@@ -131,6 +137,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
             deadloop_output_tx,
             deadloop_server_tx,
             deadloop_shutdown,
+            deadloop_pause,
             deadloop_child,
         )
     });
@@ -182,6 +189,7 @@ fn run_deadloop_session(
     output_tx: mpsc::Sender<PaneOutput>,
     server_tx: tokio_mpsc::Sender<CliToServer>,
     shutdown: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
     child_process: Arc<Mutex<Option<std::process::Child>>>,
 ) {
     // Wrap in panic catcher to prevent silent thread crashes
@@ -195,6 +203,7 @@ fn run_deadloop_session(
             output_tx.clone(),
             server_tx,
             shutdown,
+            pause,
             child_process,
         )
     }));
@@ -223,6 +232,7 @@ fn run_deadloop_session_inner(
     output_tx: mpsc::Sender<PaneOutput>,
     server_tx: tokio_mpsc::Sender<CliToServer>,
     shutdown: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
     child_process: Arc<Mutex<Option<std::process::Child>>>,
 ) {
     let _ = output_tx.send(PaneOutput {
@@ -236,8 +246,30 @@ fn run_deadloop_session_inner(
     const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60); // 1 hour
     let mut last_update_check = Instant::now();
     let mut first_message = true; // Track if this is first message (use --session-id) or resume (use --resume)
+    let mut was_paused = false;
 
     while !shutdown.load(Ordering::SeqCst) {
+        // Check for pause before each iteration
+        if pause.load(Ordering::SeqCst) {
+            if !was_paused {
+                was_paused = true;
+                let _ = output_tx.send(PaneOutput {
+                    text: "[Deadloop paused - waiting for resume...]".to_string(),
+                    is_deadloop: true,
+                });
+            }
+            // Sleep and continue checking
+            thread::sleep(Duration::from_millis(500));
+            continue;
+        } else if was_paused {
+            // Just resumed
+            was_paused = false;
+            let _ = output_tx.send(PaneOutput {
+                text: "[Deadloop resumed]".to_string(),
+                is_deadloop: true,
+            });
+        }
+
         iteration += 1;
         let _ = output_tx.send(PaneOutput {
             text: format!("=== Iteration {} ===", iteration),
@@ -804,6 +836,7 @@ async fn run_server_connection(
     working_dir: &str,
     mut output_rx: tokio_mpsc::Receiver<CliToServer>,
     shutdown: Arc<AtomicBool>,
+    pause_deadloop: Arc<AtomicBool>,
     web_input_tx: mpsc::Sender<String>,
     status_tx: mpsc::Sender<PaneOutput>,
 ) -> Result<()> {
@@ -968,6 +1001,34 @@ async fn run_server_connection(
                                             }
                                             ServerToCli::Heartbeat => {
                                                 // Heartbeat response, nothing to do
+                                            }
+                                            ServerToCli::PauseDeadloop { .. } => {
+                                                pause_deadloop.store(true, Ordering::SeqCst);
+                                                let _ = status_tx.send(PaneOutput {
+                                                    text: "[Pause command received from web]".to_string(),
+                                                    is_deadloop: true,
+                                                });
+                                                // Send status update to server
+                                                let status_msg = CliToServer::DeadloopStatus {
+                                                    session_id,
+                                                    is_paused: true,
+                                                };
+                                                let msg_text = serde_json::to_string(&status_msg).unwrap_or_default();
+                                                let _ = ws_sender.send(Message::Text(msg_text.into())).await;
+                                            }
+                                            ServerToCli::ResumeDeadloop { .. } => {
+                                                pause_deadloop.store(false, Ordering::SeqCst);
+                                                let _ = status_tx.send(PaneOutput {
+                                                    text: "[Resume command received from web]".to_string(),
+                                                    is_deadloop: true,
+                                                });
+                                                // Send status update to server
+                                                let status_msg = CliToServer::DeadloopStatus {
+                                                    session_id,
+                                                    is_paused: false,
+                                                };
+                                                let msg_text = serde_json::to_string(&status_msg).unwrap_or_default();
+                                                let _ = ws_sender.send(Message::Text(msg_text.into())).await;
                                             }
                                             _ => {}
                                         }

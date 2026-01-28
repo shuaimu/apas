@@ -84,6 +84,9 @@ interface AppState {
   deadloopMessages: Message[];
   interactiveMessages: Message[];
 
+  // Deadloop control
+  isDeadloopPaused: boolean;
+
   // Auth actions
   login: (token: string, userId: string) => void;
   logout: () => void;
@@ -107,6 +110,8 @@ interface AppState {
   addMessageToPane: (message: Message, pane: PaneType) => void; // Add message to specific pane
   startAutoRefresh: () => void;
   stopAutoRefresh: () => void;
+  pauseDeadloop: () => void;
+  resumeDeadloop: () => void;
 }
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://apas.mpaxos.com:8080";
@@ -133,6 +138,7 @@ export const useStore = create<AppState>((set, get) => ({
   isDualPane: false,
   deadloopMessages: [],
   interactiveMessages: [],
+  isDeadloopPaused: false,
 
   login: (token: string, userId: string) => {
     localStorage.setItem("apas_token", token);
@@ -529,6 +535,20 @@ export const useStore = create<AppState>((set, get) => ({
       set({ refreshInterval: null });
     }
   },
+
+  pauseDeadloop: () => {
+    const { ws } = get();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "pause_deadloop" }));
+    }
+  },
+
+  resumeDeadloop: () => {
+    const { ws } = get();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "resume_deadloop" }));
+    }
+  },
 }));
 
 // Helper function to route messages to correct array based on pane type
@@ -856,6 +876,13 @@ function handleServerMessage(
         };
         addMessageWithPaneRouting(set, get, resultMessage, paneType);
       }
+      break;
+    }
+
+    case "deadloop_status": {
+      const isPaused = data.is_paused as boolean;
+      console.log("Deadloop status update:", isPaused ? "paused" : "running");
+      set({ isDeadloopPaused: isPaused });
       break;
     }
 

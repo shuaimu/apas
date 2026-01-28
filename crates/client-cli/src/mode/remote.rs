@@ -221,6 +221,10 @@ async fn run_connection(
                     | Ok(ServerToCli::VersionUnsupported { .. }) => {
                         // Already handled during registration
                     }
+                    Ok(ServerToCli::PauseDeadloop { .. })
+                    | Ok(ServerToCli::ResumeDeadloop { .. }) => {
+                        // Pause/resume not supported in remote mode
+                    }
                     Err(e) => {
                         tracing::warn!("Failed to parse server message: {}", e);
                     }

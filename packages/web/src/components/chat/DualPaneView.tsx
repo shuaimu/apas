@@ -24,6 +24,10 @@ export function DualPaneView() {
   const loadMoreMessages = useStore((state) => state.loadMoreMessages);
   const isLoadingMore = useStore((state) => state.isLoadingMore);
   const hasMoreMessages = useStore((state) => state.hasMoreMessages);
+  const isDeadloopPaused = useStore((state) => state.isDeadloopPaused);
+  const pauseDeadloop = useStore((state) => state.pauseDeadloop);
+  const resumeDeadloop = useStore((state) => state.resumeDeadloop);
+  const isAttached = useStore((state) => state.isAttached);
   const [activePane, setActivePane] = useState<PaneType>("deadloop");
 
   return (
@@ -38,8 +42,20 @@ export function DualPaneView() {
               : "text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-800"
           }`}
         >
-          Deadloop
+          Deadloop {isDeadloopPaused && "(Paused)"}
         </button>
+        {activePane === "deadloop" && isAttached && (
+          <button
+            onClick={isDeadloopPaused ? resumeDeadloop : pauseDeadloop}
+            className={`px-3 py-1 m-1 text-xs font-medium rounded transition-colors ${
+              isDeadloopPaused
+                ? "bg-green-500 hover:bg-green-600 text-white"
+                : "bg-amber-500 hover:bg-amber-600 text-white"
+            }`}
+          >
+            {isDeadloopPaused ? "Resume" : "Pause"}
+          </button>
+        )}
         <button
           onClick={() => setActivePane("interactive")}
           className={`flex-1 px-4 py-2 text-sm font-medium transition-colors ${
@@ -98,8 +114,13 @@ interface PaneHeaderProps {
 }
 
 function PaneHeader({ title, type, className }: PaneHeaderProps) {
+  const isDeadloopPaused = useStore((state) => state.isDeadloopPaused);
+  const pauseDeadloop = useStore((state) => state.pauseDeadloop);
+  const resumeDeadloop = useStore((state) => state.resumeDeadloop);
+  const isAttached = useStore((state) => state.isAttached);
+
   return (
-    <div className={`px-4 py-2 border-b flex-shrink-0 ${
+    <div className={`px-4 py-2 border-b flex-shrink-0 flex items-center justify-between ${
       type === "deadloop"
         ? "bg-amber-50 dark:bg-amber-900/20 border-amber-200 dark:border-amber-800"
         : "bg-cyan-50 dark:bg-cyan-900/20 border-cyan-200 dark:border-cyan-800"
@@ -110,7 +131,22 @@ function PaneHeader({ title, type, className }: PaneHeaderProps) {
           : "text-cyan-700 dark:text-cyan-300"
       }`}>
         {title}
+        {type === "deadloop" && isDeadloopPaused && (
+          <span className="ml-2 text-xs font-normal text-amber-600 dark:text-amber-400">(Paused)</span>
+        )}
       </h2>
+      {type === "deadloop" && isAttached && (
+        <button
+          onClick={isDeadloopPaused ? resumeDeadloop : pauseDeadloop}
+          className={`px-3 py-1 text-xs font-medium rounded transition-colors ${
+            isDeadloopPaused
+              ? "bg-green-500 hover:bg-green-600 text-white"
+              : "bg-amber-500 hover:bg-amber-600 text-white"
+          }`}
+        >
+          {isDeadloopPaused ? "Resume" : "Pause"}
+        </button>
+      )}
     </div>
   );
 }

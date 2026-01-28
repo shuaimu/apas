@@ -319,6 +319,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     .send_to_cli(&cli_id, ServerToCli::Heartbeat)
                                     .await;
                             }
+                            Ok(CliToServer::DeadloopStatus { session_id, is_paused }) => {
+                                // Forward deadloop status to web clients
+                                tracing::info!("Deadloop status for session {}: paused={}", session_id, is_paused);
+                                state
+                                    .sessions
+                                    .route_to_web(
+                                        &session_id,
+                                        ServerToWeb::DeadloopStatus {
+                                            session_id,
+                                            is_paused,
+                                        },
+                                    )
+                                    .await;
+                            }
                             Ok(CliToServer::Register { .. }) => {
                                 // Already registered, ignore
                             }
