@@ -98,8 +98,11 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Check for updates in the background (non-blocking)
-    update::check_for_updates_background();
+    // Auto-upgrade on boot if a new version is available (checks once per 24h)
+    // Skip for subcommands like update, login, etc.
+    if cli.command.is_none() {
+        update::check_and_upgrade_on_boot();
+    }
 
     // Handle subcommands
     if let Some(command) = cli.command {

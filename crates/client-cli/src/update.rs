@@ -205,6 +205,19 @@ pub fn check_for_update_available() -> Option<String> {
     }
 }
 
+/// Check for updates on boot and automatically install + restart if available
+/// Respects the update check interval to avoid checking too frequently
+/// This function will not return if an update is installed (it exec's the new binary)
+pub fn check_and_upgrade_on_boot() {
+    // Skip if we checked recently
+    if !should_check_for_updates() {
+        return;
+    }
+
+    mark_update_checked();
+    auto_update_and_restart();
+}
+
 /// Check for updates and automatically install + restart if available
 /// This function will not return if an update is installed (it exec's the new binary)
 pub fn auto_update_and_restart() {
