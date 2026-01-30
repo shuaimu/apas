@@ -27,6 +27,7 @@ export function DualPaneView() {
   const isDeadloopPaused = useStore((state) => state.isDeadloopPaused);
   const pauseDeadloop = useStore((state) => state.pauseDeadloop);
   const resumeDeadloop = useStore((state) => state.resumeDeadloop);
+  const rebootCli = useStore((state) => state.rebootCli);
   const isAttached = useStore((state) => state.isAttached);
   const [activePane, setActivePane] = useState<PaneType>("deadloop");
 
@@ -45,16 +46,28 @@ export function DualPaneView() {
           Deadloop {isDeadloopPaused && "(Paused)"}
         </button>
         {activePane === "deadloop" && isAttached && (
-          <button
-            onClick={isDeadloopPaused ? resumeDeadloop : pauseDeadloop}
-            className={`px-3 py-1 m-1 text-xs font-medium rounded transition-colors ${
-              isDeadloopPaused
-                ? "bg-green-500 hover:bg-green-600 text-white"
-                : "bg-amber-500 hover:bg-amber-600 text-white"
-            }`}
-          >
-            {isDeadloopPaused ? "Resume" : "Pause"}
-          </button>
+          <>
+            <button
+              onClick={isDeadloopPaused ? resumeDeadloop : pauseDeadloop}
+              className={`px-3 py-1 m-1 text-xs font-medium rounded transition-colors ${
+                isDeadloopPaused
+                  ? "bg-green-500 hover:bg-green-600 text-white"
+                  : "bg-amber-500 hover:bg-amber-600 text-white"
+              }`}
+            >
+              {isDeadloopPaused ? "Resume" : "Pause"}
+            </button>
+            <button
+              onClick={() => {
+                if (confirm("Are you sure you want to reboot the CLI?")) {
+                  rebootCli();
+                }
+              }}
+              className="px-3 py-1 m-1 text-xs font-medium rounded transition-colors bg-red-500 hover:bg-red-600 text-white"
+            >
+              Reboot
+            </button>
+          </>
         )}
         <button
           onClick={() => setActivePane("interactive")}
@@ -117,6 +130,7 @@ function PaneHeader({ title, type, className }: PaneHeaderProps) {
   const isDeadloopPaused = useStore((state) => state.isDeadloopPaused);
   const pauseDeadloop = useStore((state) => state.pauseDeadloop);
   const resumeDeadloop = useStore((state) => state.resumeDeadloop);
+  const rebootCli = useStore((state) => state.rebootCli);
   const isAttached = useStore((state) => state.isAttached);
 
   return (
@@ -136,16 +150,28 @@ function PaneHeader({ title, type, className }: PaneHeaderProps) {
         )}
       </h2>
       {type === "deadloop" && isAttached && (
-        <button
-          onClick={isDeadloopPaused ? resumeDeadloop : pauseDeadloop}
-          className={`px-3 py-1 text-xs font-medium rounded transition-colors ${
-            isDeadloopPaused
-              ? "bg-green-500 hover:bg-green-600 text-white"
-              : "bg-amber-500 hover:bg-amber-600 text-white"
-          }`}
-        >
-          {isDeadloopPaused ? "Resume" : "Pause"}
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={isDeadloopPaused ? resumeDeadloop : pauseDeadloop}
+            className={`px-3 py-1 text-xs font-medium rounded transition-colors ${
+              isDeadloopPaused
+                ? "bg-green-500 hover:bg-green-600 text-white"
+                : "bg-amber-500 hover:bg-amber-600 text-white"
+            }`}
+          >
+            {isDeadloopPaused ? "Resume" : "Pause"}
+          </button>
+          <button
+            onClick={() => {
+              if (confirm("Are you sure you want to reboot the CLI?")) {
+                rebootCli();
+              }
+            }}
+            className="px-3 py-1 text-xs font-medium rounded transition-colors bg-red-500 hover:bg-red-600 text-white"
+          >
+            Reboot
+          </button>
+        </div>
       )}
     </div>
   );

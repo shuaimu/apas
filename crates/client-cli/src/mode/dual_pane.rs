@@ -1029,6 +1029,16 @@ async fn run_server_connection(
                                                 let msg_text = serde_json::to_string(&status_msg).unwrap_or_default();
                                                 let _ = ws_sender.send(Message::Text(msg_text.into())).await;
                                             }
+                                            ServerToCli::RebootCli { .. } => {
+                                                let _ = status_tx.send(PaneOutput {
+                                                    text: "[Reboot command received from web, restarting...]".to_string(),
+                                                    is_deadloop: true,
+                                                });
+                                                // Give time for the message to display
+                                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                                // Restart the CLI process
+                                                crate::update::restart_cli();
+                                            }
                                             _ => {}
                                         }
                                     }

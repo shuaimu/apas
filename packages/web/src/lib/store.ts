@@ -112,6 +112,7 @@ interface AppState {
   stopAutoRefresh: () => void;
   pauseDeadloop: () => void;
   resumeDeadloop: () => void;
+  rebootCli: () => void;
 }
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://apas.mpaxos.com:8080";
@@ -547,6 +548,13 @@ export const useStore = create<AppState>((set, get) => ({
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "resume_deadloop" }));
+    }
+  },
+
+  rebootCli: () => {
+    const { ws } = get();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "reboot_cli" }));
     }
   },
 }));

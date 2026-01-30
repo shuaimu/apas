@@ -319,6 +319,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
+                Ok(WebToServer::RebootCli) => {
+                    if let Some(sid) = session_id {
+                        tracing::info!("Rebooting CLI for session {}", sid);
+                        state
+                            .sessions
+                            .route_to_cli(
+                                &sid,
+                                ServerToCli::RebootCli {
+                                    session_id: sid,
+                                },
+                            )
+                            .await;
+                    }
+                }
                 Ok(WebToServer::ResumeSession { session_id: sid }) => {
                     session_id = Some(sid);
                 }

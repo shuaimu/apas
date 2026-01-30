@@ -225,6 +225,10 @@ async fn run_connection(
                     | Ok(ServerToCli::ResumeDeadloop { .. }) => {
                         // Pause/resume not supported in remote mode
                     }
+                    Ok(ServerToCli::RebootCli { .. }) => {
+                        tracing::info!("Reboot command received, restarting...");
+                        crate::update::restart_cli();
+                    }
                     Err(e) => {
                         tracing::warn!("Failed to parse server message: {}", e);
                     }

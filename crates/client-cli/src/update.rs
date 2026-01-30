@@ -309,12 +309,25 @@ pub fn check_and_upgrade_on_boot() {
 /// Restart the current process with the same arguments
 #[cfg(unix)]
 fn restart_self() {
+    restart_cli();
+}
+
+#[cfg(not(unix))]
+fn restart_self() {
+    eprintln!("[Auto-update] Auto-restart not supported on this platform");
+    eprintln!("[Auto-update] Please restart manually to use the new version");
+}
+
+/// Restart the CLI process (public, can be called from other modules)
+/// This function will not return on success (it exec's the new binary)
+#[cfg(unix)]
+pub fn restart_cli() {
     use std::os::unix::process::CommandExt;
 
     let exe = match get_current_exe() {
         Some(e) => e,
         None => {
-            eprintln!("[Auto-update] Failed to get executable path for restart");
+            eprintln!("[Restart] Failed to get executable path for restart");
             return;
         }
     };
@@ -323,11 +336,11 @@ fn restart_self() {
 
     // exec() replaces the current process - this function won't return on success
     let err = Command::new(&exe).args(&args[1..]).exec();
-    eprintln!("[Auto-update] Failed to restart: {}", err);
+    eprintln!("[Restart] Failed to restart: {}", err);
 }
 
 #[cfg(not(unix))]
-fn restart_self() {
-    eprintln!("[Auto-update] Auto-restart not supported on this platform");
-    eprintln!("[Auto-update] Please restart manually to use the new version");
+pub fn restart_cli() {
+    eprintln!("[Restart] Auto-restart not supported on this platform");
+    eprintln!("[Restart] Please restart manually");
 }

@@ -98,6 +98,9 @@ pub enum ServerToCli {
 
     /// Resume the deadloop
     ResumeDeadloop { session_id: Uuid },
+
+    /// Reboot the CLI process
+    RebootCli { session_id: Uuid },
 }
 
 // ============================================================================
@@ -156,6 +159,9 @@ pub enum WebToServer {
 
     /// Resume the deadloop session
     ResumeDeadloop,
+
+    /// Reboot the CLI process
+    RebootCli,
 }
 
 /// Messages sent from server to web client
