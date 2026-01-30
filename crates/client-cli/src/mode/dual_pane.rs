@@ -584,16 +584,22 @@ fn run_deadloop_session_inner(
             }
         }
 
-        // Check for updates every hour (notify only, don't auto-restart in TUI mode)
+        // Check for updates every hour - auto-update and restart if available
         if last_update_check.elapsed() >= UPDATE_CHECK_INTERVAL {
             last_update_check = Instant::now();
             let output_tx_update = output_tx.clone();
+            let shutdown_update = shutdown.clone();
             thread::spawn(move || {
                 if let Some(new_version) = crate::update::check_for_update_available() {
                     let _ = output_tx_update.send(PaneOutput {
-                        text: format!("[Update available: {} - restart to apply]", new_version),
+                        text: format!("[Update available: {} -> {} - updating and restarting...]", env!("APAS_VERSION"), new_version),
                         is_deadloop: true,
                     });
+                    // Give time for the message to display
+                    thread::sleep(Duration::from_secs(2));
+                    // Signal shutdown and trigger update
+                    shutdown_update.store(true, Ordering::SeqCst);
+                    crate::update::check_and_upgrade_on_boot();
                 }
             });
         }
