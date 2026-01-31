@@ -334,6 +334,10 @@ pub fn restart_cli() {
 
     let args: Vec<String> = env::args().collect();
 
+    // Clear terminal screen before restart so old and new output don't mix
+    print!("\x1B[2J\x1B[H");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
     // exec() replaces the current process - this function won't return on success
     let err = Command::new(&exe).args(&args[1..]).exec();
     eprintln!("[Restart] Failed to restart: {}", err);
