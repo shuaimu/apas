@@ -177,25 +177,33 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     }
 
     // Signal shutdown
+    eprintln!("[Debug] TUI exited, setting shutdown flag");
     shutdown.store(true, Ordering::SeqCst);
 
     // Kill any running child process
     if let Ok(mut guard) = child_process.lock() {
         if let Some(ref mut child) = *guard {
+            eprintln!("[Debug] Killing child process");
             let _ = child.kill();
         }
     }
 
     // If reboot was requested, restart immediately without waiting for threads
     if reboot_requested.load(Ordering::SeqCst) {
+        eprintln!("[Debug] Reboot requested, calling restart_cli()");
         server_task.abort();
         crate::update::restart_cli();
+        // If we get here, restart_cli() failed
+        eprintln!("[Debug] restart_cli() returned (exec failed), exiting process");
+        std::process::exit(1);
     }
 
     // Wait for threads to finish (normal shutdown)
+    eprintln!("[Debug] Waiting for threads to finish");
     let _ = deadloop_thread.join();
     let _ = interactive_thread.join();
     server_task.abort();
+    eprintln!("[Debug] All threads finished, returning from run()");
 
     Ok(())
 }
