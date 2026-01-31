@@ -1170,8 +1170,8 @@ async fn run_server_connection(
                                     }
                                 }
                                 Err(e) => {
-                                    // Non-fatal, just log it
-                                    tracing::debug!("Failed to fetch usage limits: {}", e);
+                                    // Non-fatal, but log at warn so we can see failures
+                                    tracing::warn!("Failed to fetch usage limits: {}", e);
                                 }
                             }
                         }

@@ -104,12 +104,13 @@ pub async fn fetch_usage_limits() -> Result<UsageLimits> {
     let now = chrono::Utc::now().to_rfc3339();
 
     Ok(UsageLimits {
+        // API returns utilization as percentage (0-100), convert to fraction (0-1)
         five_hour: api_response.five_hour.map(|w| UsageLimitWindow {
-            utilization: w.utilization,
+            utilization: w.utilization / 100.0,
             resets_at: w.resets_at,
         }),
         seven_day: api_response.seven_day.map(|w| UsageLimitWindow {
-            utilization: w.utilization,
+            utilization: w.utilization / 100.0,
             resets_at: w.resets_at,
         }),
         fetched_at: Some(now),
