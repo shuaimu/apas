@@ -30,14 +30,30 @@ export function DualPaneView() {
   const rebootCli = useStore((state) => state.rebootCli);
   const isAttached = useStore((state) => state.isAttached);
   const interactiveStatus = useStore((state) => state.interactiveStatus);
-  const [activePane, setActivePane] = useState<PaneType>("deadloop");
+
+  // Initialize activePane from localStorage to persist across page refreshes
+  const [activePane, setActivePane] = useState<PaneType>(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem("apas_active_pane");
+      if (saved === "interactive" || saved === "deadloop") {
+        return saved;
+      }
+    }
+    return "deadloop";
+  });
+
+  // Save activePane to localStorage when it changes
+  const handleSetActivePane = (pane: PaneType) => {
+    setActivePane(pane);
+    localStorage.setItem("apas_active_pane", pane);
+  };
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
       {/* Mobile tab switcher - only visible on small screens */}
       <div className="flex md:hidden border-b border-gray-200 dark:border-gray-700 flex-shrink-0">
         <button
-          onClick={() => setActivePane("deadloop")}
+          onClick={() => handleSetActivePane("deadloop")}
           className={`flex-1 px-4 py-2 text-sm font-medium transition-colors ${
             activePane === "deadloop"
               ? "bg-amber-50 dark:bg-amber-900/20 text-amber-700 dark:text-amber-300 border-b-2 border-amber-500"
@@ -71,7 +87,7 @@ export function DualPaneView() {
           </>
         )}
         <button
-          onClick={() => setActivePane("interactive")}
+          onClick={() => handleSetActivePane("interactive")}
           className={`flex-1 px-4 py-2 text-sm font-medium transition-colors ${
             activePane === "interactive"
               ? "bg-cyan-50 dark:bg-cyan-900/20 text-cyan-700 dark:text-cyan-300 border-b-2 border-cyan-500"
