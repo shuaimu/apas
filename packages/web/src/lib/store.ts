@@ -243,7 +243,7 @@ export const useStore = create<AppState>((set, get) => ({
 
     ws.onclose = (event) => {
       console.log("WebSocket disconnected", event.code, event.reason);
-      set({ connected: false, ws: null, cliClients: [] });
+      set({ connected: false, ws: null, cliClients: [], isAttached: false });
 
       // Auto-reconnect with exponential backoff (unless intentionally disconnected)
       // Code 1000 = normal close (intentional), 1001 = going away
@@ -274,8 +274,8 @@ export const useStore = create<AppState>((set, get) => ({
     if (!visibilityHandler && typeof document !== 'undefined') {
       const handler = () => {
         if (document.visibilityState === 'visible') {
-          const { ws, connected } = get();
-          console.log("App became visible, checking connection...");
+          const { ws, connected, sessionId, isAttached } = get();
+          console.log("App became visible, checking connection...", { connected, isAttached, sessionId });
           // If not connected or WebSocket is not open, reconnect
           if (!connected || !ws || ws.readyState !== WebSocket.OPEN) {
             console.log("Connection lost while in background, reconnecting...");
@@ -283,12 +283,17 @@ export const useStore = create<AppState>((set, get) => ({
             set({ reconnectAttempts: 0 });
             get().connect();
           } else {
-            // Connection is healthy, just refresh data
-            console.log("Connection healthy, refreshing data...");
+            // Connection appears healthy, refresh data
+            console.log("Connection appears healthy, refreshing data...");
             get().refreshCliClients();
             get().listSessions();
-            // Don't re-attach - this would reset scroll position
-            // Real-time updates will continue through the existing WebSocket connection
+
+            // If we have a session but lost attachment, re-attach
+            // This handles the case where connection stayed open but server-side state was lost
+            if (sessionId && !isAttached) {
+              console.log("Session exists but not attached, re-attaching...");
+              get().attachSession(sessionId);
+            }
           }
         }
       };
@@ -543,7 +548,16 @@ export const useStore = create<AppState>((set, get) => ({
     if (refreshInterval) return; // Already running
 
     const interval = setInterval(() => {
-      const { connected, sessionId, isAttached, cliClients } = get();
+      const { ws, connected, sessionId, isAttached, cliClients } = get();
+
+      // Check for zombie connection - WebSocket might think it's open but actually dead
+      if (ws && ws.readyState !== WebSocket.OPEN) {
+        console.log("WebSocket not in OPEN state, triggering reconnect...");
+        set({ connected: false, ws: null, isAttached: false, reconnectAttempts: 0 });
+        get().connect();
+        return;
+      }
+
       if (!connected) return;
 
       // Refresh CLI clients and sessions list
