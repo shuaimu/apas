@@ -324,15 +324,18 @@ fn restart_self() {
 pub fn restart_cli() {
     use std::os::unix::process::CommandExt;
 
-    let exe = match get_current_exe() {
-        Some(e) => e,
-        None => {
-            eprintln!("[Restart] Failed to get executable path for restart");
-            return;
-        }
-    };
-
     let args: Vec<String> = env::args().collect();
+
+    // Try to get executable path, with fallbacks
+    let exe = get_current_exe()
+        .filter(|p| p.exists()) // Make sure it still exists
+        .or_else(|| {
+            // Fallback: try the first argument (argv[0])
+            args.first().map(PathBuf::from).filter(|p| p.exists())
+        })
+        .unwrap_or_else(|| PathBuf::from("apas")); // Last resort: hope it's in PATH
+
+    eprintln!("[Restart] Restarting from: {:?}", exe);
 
     // Clear terminal screen before restart so old and new output don't mix
     print!("\x1B[2J\x1B[H");
