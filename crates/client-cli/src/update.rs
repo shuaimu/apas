@@ -326,16 +326,28 @@ pub fn restart_cli() {
 
     let args: Vec<String> = env::args().collect();
 
+    // Debug: show all paths we're considering
+    let current_exe = get_current_exe();
+    let argv0 = args.first().map(PathBuf::from);
+
+    eprintln!("[Restart] current_exe: {:?} (exists: {})",
+        current_exe,
+        current_exe.as_ref().map(|p| p.exists()).unwrap_or(false));
+    eprintln!("[Restart] argv[0]: {:?} (exists: {})",
+        argv0,
+        argv0.as_ref().map(|p| p.exists()).unwrap_or(false));
+    eprintln!("[Restart] args: {:?}", args);
+
     // Try to get executable path, with fallbacks
-    let exe = get_current_exe()
+    let exe = current_exe
         .filter(|p| p.exists()) // Make sure it still exists
         .or_else(|| {
             // Fallback: try the first argument (argv[0])
-            args.first().map(PathBuf::from).filter(|p| p.exists())
+            argv0.filter(|p| p.exists())
         })
         .unwrap_or_else(|| PathBuf::from("apas")); // Last resort: hope it's in PATH
 
-    eprintln!("[Restart] Restarting from: {:?}", exe);
+    eprintln!("[Restart] Using executable: {:?}", exe);
 
     // Clear terminal screen before restart so old and new output don't mix
     print!("\x1B[2J\x1B[H");
