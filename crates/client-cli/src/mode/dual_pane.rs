@@ -928,6 +928,9 @@ async fn run_server_connection(
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+    // Usage fetch interval: every 5 minutes
+    const USAGE_FETCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
     let mut reconnect_delay = std::time::Duration::from_secs(1);
     let max_reconnect_delay = std::time::Duration::from_secs(60);
     let mut connection_count = 0u32;
@@ -1062,6 +1065,12 @@ async fn run_server_connection(
                 // Skip the first immediate tick
                 heartbeat_interval.tick().await;
 
+                // Usage fetch interval
+                let mut usage_interval = tokio::time::interval(USAGE_FETCH_INTERVAL);
+                usage_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // Fetch usage immediately on connect, then periodically
+                // (first tick is immediate)
+
                 // Main loop
                 loop {
                     tokio::select! {
@@ -1164,6 +1173,23 @@ async fn run_server_connection(
                                     is_deadloop: true,
                                 });
                                 break;
+                            }
+                        }
+                        _ = usage_interval.tick() => {
+                            // Fetch and send usage limits
+                            match crate::usage::fetch_usage_limits().await {
+                                Ok(limits) => {
+                                    let usage_msg = CliToServer::UsageLimits { limits };
+                                    let msg_text = serde_json::to_string(&usage_msg).unwrap_or_default();
+                                    if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
+                                        // Non-fatal, will retry next interval
+                                        tracing::warn!("Failed to send usage limits to server");
+                                    }
+                                }
+                                Err(e) => {
+                                    // Non-fatal, just log it
+                                    tracing::debug!("Failed to fetch usage limits: {}", e);
+                                }
                             }
                         }
                     }

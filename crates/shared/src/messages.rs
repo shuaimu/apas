@@ -69,6 +69,9 @@ pub enum CliToServer {
         pane_type: PaneType,
         status: Option<String>,
     },
+
+    /// Report usage limits from the Anthropic API
+    UsageLimits { limits: UsageLimits },
 }
 
 /// Messages sent from server to CLI client
@@ -246,6 +249,12 @@ pub enum ServerToWeb {
         pane_type: PaneType,
         status: Option<String>,
     },
+
+    /// Usage limits update from a CLI client
+    UsageLimits {
+        cli_client_id: Uuid,
+        limits: UsageLimits,
+    },
 }
 
 /// Information about a persisted session
@@ -353,6 +362,30 @@ pub enum CliClientStatus {
     Online,
     Offline,
     Busy,
+}
+
+/// Usage limit information for a time window (5-hour or 7-day)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UsageLimitWindow {
+    /// Utilization as a fraction (0.0 to 1.0+)
+    pub utilization: f64,
+    /// When the limit resets (ISO 8601 timestamp)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<String>,
+}
+
+/// Usage limits from the Anthropic API
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UsageLimits {
+    /// 5-hour rolling window usage
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub five_hour: Option<UsageLimitWindow>,
+    /// 7-day (weekly) rolling window usage
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seven_day: Option<UsageLimitWindow>,
+    /// When the usage was last fetched (ISO 8601 timestamp)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<String>,
 }
 
 // ============================================================================

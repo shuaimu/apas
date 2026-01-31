@@ -352,6 +352,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     )
                                     .await;
                             }
+                            Ok(CliToServer::UsageLimits { limits }) => {
+                                // Update and broadcast usage limits
+                                tracing::info!(
+                                    "Usage limits from CLI {}: 5h={:.1}%, 7d={:.1}%",
+                                    cli_id,
+                                    limits.five_hour.as_ref().map(|w| w.utilization * 100.0).unwrap_or(0.0),
+                                    limits.seven_day.as_ref().map(|w| w.utilization * 100.0).unwrap_or(0.0)
+                                );
+                                state.sessions.update_usage_limits(cli_id, limits);
+                            }
                             Ok(CliToServer::Register { .. }) => {
                                 // Already registered, ignore
                             }

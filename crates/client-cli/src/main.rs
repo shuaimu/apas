@@ -9,6 +9,7 @@ mod mode;
 mod project;
 mod tui;
 mod update;
+mod usage;
 
 // Default server URL
 const DEFAULT_SERVER: &str = "ws://apas.mpaxos.com:8080";

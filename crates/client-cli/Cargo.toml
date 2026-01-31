@@ -45,3 +45,6 @@ crossterm = "0.28"
 
 # HTTP client for auth
 reqwest = { version = "0.12", features = ["json"] }
+
+# Home directory detection
+dirs = "5.0"

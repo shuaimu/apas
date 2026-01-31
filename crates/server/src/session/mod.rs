@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use shared::{CliClientInfo, CliClientStatus, ServerToCli, ServerToWeb};
+use shared::{CliClientInfo, CliClientStatus, ServerToCli, ServerToWeb, UsageLimits};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -15,6 +15,8 @@ pub struct SessionManager {
     cli_sessions: DashMap<Uuid, Vec<Uuid>>,
     /// Map of CLI client ID -> user ID (owner)
     cli_users: DashMap<Uuid, Uuid>,
+    /// Map of CLI client ID -> latest usage limits
+    cli_usage_limits: DashMap<Uuid, UsageLimits>,
 }
 
 #[derive(Debug)]
@@ -34,6 +36,7 @@ impl SessionManager {
             web_senders: DashMap::new(),
             cli_sessions: DashMap::new(),
             cli_users: DashMap::new(),
+            cli_usage_limits: DashMap::new(),
         }
     }
 
@@ -50,6 +53,7 @@ impl SessionManager {
     pub fn unregister_cli(&self, cli_id: &Uuid) {
         self.cli_senders.remove(cli_id);
         self.cli_users.remove(cli_id);
+        self.cli_usage_limits.remove(cli_id);
         if let Some((_, session_ids)) = self.cli_sessions.remove(cli_id) {
             for session_id in session_ids {
                 if let Some(mut session) = self.sessions.get_mut(&session_id) {
@@ -348,6 +352,38 @@ impl SessionManager {
                 let _ = sender.send(msg_clone).await;
             });
         }
+    }
+
+    /// Update usage limits for a CLI client and broadcast to web clients
+    pub fn update_usage_limits(&self, cli_id: Uuid, limits: UsageLimits) {
+        self.cli_usage_limits.insert(cli_id, limits.clone());
+
+        // Broadcast to all web clients
+        let msg = ServerToWeb::UsageLimits {
+            cli_client_id: cli_id,
+            limits,
+        };
+
+        for entry in self.web_senders.iter() {
+            let sender = entry.value().clone();
+            let msg_clone = msg.clone();
+            tokio::spawn(async move {
+                let _ = sender.send(msg_clone).await;
+            });
+        }
+    }
+
+    /// Get usage limits for a CLI client
+    pub fn get_usage_limits(&self, cli_id: &Uuid) -> Option<UsageLimits> {
+        self.cli_usage_limits.get(cli_id).map(|r| r.clone())
+    }
+
+    /// Get all usage limits for all CLI clients
+    pub fn get_all_usage_limits(&self) -> Vec<(Uuid, UsageLimits)> {
+        self.cli_usage_limits
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().clone()))
+            .collect()
     }
 }
 

@@ -41,6 +41,22 @@ export interface SessionInfo {
   isActive?: boolean;
 }
 
+export interface UsageLimitWindow {
+  utilization: number; // 0.0 to 1.0+
+  resetsAt?: string; // ISO 8601 timestamp
+}
+
+export interface UsageLimits {
+  fiveHour?: UsageLimitWindow;
+  sevenDay?: UsageLimitWindow;
+  fetchedAt?: string;
+}
+
+export interface CliUsageLimits {
+  cliClientId: string;
+  limits: UsageLimits;
+}
+
 export type OutputType =
   | { type: "text" }
   | { type: "code"; language?: string }
@@ -89,6 +105,9 @@ interface AppState {
 
   // Pane status (for status bar)
   interactiveStatus: string | null;
+
+  // Usage limits per CLI client
+  usageLimits: Map<string, UsageLimits>;
 
   // Auth actions
   login: (token: string, userId: string) => void;
@@ -144,6 +163,7 @@ export const useStore = create<AppState>((set, get) => ({
   interactiveMessages: [],
   isDeadloopPaused: false,
   interactiveStatus: null,
+  usageLimits: new Map(),
 
   login: (token: string, userId: string) => {
     localStorage.setItem("apas_token", token);
@@ -907,6 +927,31 @@ function handleServerMessage(
       const isPaused = data.is_paused as boolean;
       console.log("Deadloop status update:", isPaused ? "paused" : "running");
       set({ isDeadloopPaused: isPaused });
+      break;
+    }
+
+    case "usage_limits": {
+      const cliClientId = data.cli_client_id as string;
+      const limits = data.limits as Record<string, unknown>;
+      if (cliClientId && limits) {
+        const parsedLimits: UsageLimits = {
+          fiveHour: limits.five_hour ? {
+            utilization: (limits.five_hour as Record<string, unknown>).utilization as number,
+            resetsAt: (limits.five_hour as Record<string, unknown>).resets_at as string | undefined,
+          } : undefined,
+          sevenDay: limits.seven_day ? {
+            utilization: (limits.seven_day as Record<string, unknown>).utilization as number,
+            resetsAt: (limits.seven_day as Record<string, unknown>).resets_at as string | undefined,
+          } : undefined,
+          fetchedAt: limits.fetched_at as string | undefined,
+        };
+        set((state) => {
+          const newMap = new Map(state.usageLimits);
+          newMap.set(cliClientId, parsedLimits);
+          return { usageLimits: newMap };
+        });
+        console.log("Usage limits updated for CLI:", cliClientId, parsedLimits);
+      }
       break;
     }
 

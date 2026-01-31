@@ -4,6 +4,7 @@ import { useStore } from "@/lib/store";
 import { FolderOpen, RefreshCw, Share2, Users, X, Crown, Trash2, ChevronLeft } from "lucide-react";
 import { useMemo, useState, useEffect } from "react";
 import { createPortal } from "react-dom";
+import { UsageLimitsPanel } from "./UsageLimits";
 
 // Truncate path in the middle to preserve the folder name at the end
 // e.g., "/home/shuai/workspace/long-project" -> "/home/.../long-project"
@@ -313,6 +314,9 @@ export function Sidebar({ onClose }: SidebarProps) {
           </div>
         </div>
       </div>
+
+      {/* Usage Limits */}
+      <UsageLimitsPanel />
 
       {/* Project list */}
       <div className="flex-1 overflow-y-auto p-2">
