@@ -283,11 +283,8 @@ export const useStore = create<AppState>((set, get) => ({
             console.log("Connection healthy, refreshing data...");
             get().refreshCliClients();
             get().listSessions();
-            // If we have an active session, reload messages to catch up
-            const { sessionId, isAttached } = get();
-            if (sessionId && isAttached) {
-              get().attachSession(sessionId);
-            }
+            // Don't re-attach - this would reset scroll position
+            // Real-time updates will continue through the existing WebSocket connection
           }
         }
       };
@@ -726,8 +723,20 @@ function handleServerMessage(
     }
 
     case "session_messages": {
+      const incomingSessionId = data.session_id as string;
       const messages = (data.messages as Array<Record<string, unknown>>) || [];
       const hasMore = data.has_more as boolean || false;
+
+      // Check if this is for the currently viewed session and we already have messages
+      // If so, skip replacing to preserve scroll position (this happens on re-attach)
+      const { sessionId: currentSessionId, messages: currentMessages, deadloopMessages, interactiveMessages, isLoadingMore } = get();
+      const hasExistingMessages = currentMessages.length > 0 || deadloopMessages.length > 0 || interactiveMessages.length > 0;
+
+      if (currentSessionId === incomingSessionId && hasExistingMessages && !isLoadingMore) {
+        // Already viewing this session with messages - skip to preserve scroll
+        console.log("Skipping session_messages for same session to preserve scroll position");
+        break;
+      }
 
       // Check if any messages have pane_type - if so, enable dual pane
       const hasPaneType = messages.some((m) => m.pane_type);
@@ -782,7 +791,7 @@ function handleServerMessage(
       });
 
       // Check if this is a "load more" request (prepend) or initial load (replace)
-      const { isLoadingMore, isDualPane } = get();
+      const { isDualPane } = get();
       if (isLoadingMore) {
         // Prepend older messages - route to correct panes in dual-pane mode
         if (isDualPane || hasPaneType) {
