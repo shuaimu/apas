@@ -1,7 +1,9 @@
 //! Main TUI application for dual-pane mode
 
 use std::io::{self, Stdout};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::{
@@ -52,6 +54,8 @@ pub struct App {
     output_rx: Receiver<PaneOutput>,
     /// Whether to quit
     should_quit: bool,
+    /// Shared shutdown flag (from main)
+    shutdown: Option<Arc<AtomicBool>>,
 }
 
 impl App {
@@ -69,7 +73,22 @@ impl App {
             input_tx,
             output_rx,
             should_quit: false,
+            shutdown: None,
         }
+    }
+
+    /// Set the shared shutdown flag
+    pub fn with_shutdown(mut self, shutdown: Arc<AtomicBool>) -> Self {
+        self.shutdown = Some(shutdown);
+        self
+    }
+
+    /// Check if shutdown has been requested
+    fn is_shutdown(&self) -> bool {
+        self.shutdown
+            .as_ref()
+            .map(|s| s.load(Ordering::SeqCst))
+            .unwrap_or(false)
     }
 
     /// Run the TUI main loop
@@ -81,8 +100,8 @@ impl App {
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
-        // Main loop
-        while !self.should_quit {
+        // Main loop - check both local should_quit and shared shutdown flag
+        while !self.should_quit && !self.is_shutdown() {
             // Process any pending output
             self.process_output();
 

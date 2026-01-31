@@ -171,7 +171,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     });
 
     // Run TUI in main thread
-    let mut app = App::new(input_tx, output_rx);
+    let mut app = App::new(input_tx, output_rx).with_shutdown(shutdown.clone());
     if let Err(e) = app.run() {
         tracing::error!("TUI error: {}", e);
     }
