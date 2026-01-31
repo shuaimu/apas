@@ -63,6 +63,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         .sessions
                                         .send_to_web(&connection_id, ServerToWeb::Authenticated { user_id: uid })
                                         .await;
+
+                                    // Send cached usage limits for all CLI clients
+                                    for (cli_id, limits) in state.sessions.get_all_usage_limits() {
+                                        state
+                                            .sessions
+                                            .send_to_web(
+                                                &connection_id,
+                                                ServerToWeb::UsageLimits {
+                                                    cli_client_id: cli_id,
+                                                    limits,
+                                                },
+                                            )
+                                            .await;
+                                    }
                                 }
                                 Err(_) => {
                                     state
