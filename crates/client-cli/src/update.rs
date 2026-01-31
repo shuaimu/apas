@@ -369,12 +369,15 @@ pub fn restart_cli() {
         PathBuf::from("apas")
     };
 
-    eprintln!("[Restart] Restarting with: {:?}", exe);
-    eprintln!("[Restart] Args: {:?}", &args[1..]);
-
-    // Clear terminal screen before restart
+    // Clear terminal screen and show countdown
     print!("\x1B[2J\x1B[H");
     let _ = std::io::Write::flush(&mut std::io::stdout());
+
+    for i in (1..=3).rev() {
+        println!("[Restart] Restarting in {}...", i);
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    println!("[Restart] Restarting now...");
 
     // exec() replaces the current process - this function won't return on success
     let err = Command::new(&exe).args(&args[1..]).exec();

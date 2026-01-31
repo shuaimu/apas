@@ -85,14 +85,10 @@ impl App {
 
     /// Check if shutdown has been requested
     fn is_shutdown(&self) -> bool {
-        let result = self.shutdown
+        self.shutdown
             .as_ref()
             .map(|s| s.load(Ordering::SeqCst))
-            .unwrap_or(false);
-        if result {
-            eprintln!("[Debug] TUI detected shutdown flag");
-        }
-        result
+            .unwrap_or(false)
     }
 
     /// Run the TUI main loop
