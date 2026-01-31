@@ -763,16 +763,11 @@ function handleServerMessage(
       const messages = (data.messages as Array<Record<string, unknown>>) || [];
       const hasMore = data.has_more as boolean || false;
 
-      // Check if this is for the currently viewed session and we already have messages
-      // If so, skip replacing to preserve scroll position (this happens on re-attach)
       const { sessionId: currentSessionId, messages: currentMessages, deadloopMessages, interactiveMessages, isLoadingMore } = get();
       const hasExistingMessages = currentMessages.length > 0 || deadloopMessages.length > 0 || interactiveMessages.length > 0;
 
-      if (currentSessionId === incomingSessionId && hasExistingMessages && !isLoadingMore) {
-        // Already viewing this session with messages - skip to preserve scroll
-        console.log("Skipping session_messages for same session to preserve scroll position");
-        break;
-      }
+      // Flag to track if we should merge vs replace
+      const shouldMerge = currentSessionId === incomingSessionId && hasExistingMessages && !isLoadingMore;
 
       // Check if any messages have pane_type - if so, enable dual pane
       const hasPaneType = messages.some((m) => m.pane_type);
@@ -826,27 +821,27 @@ function handleServerMessage(
         };
       });
 
-      // Check if this is a "load more" request (prepend) or initial load (replace)
+      // Route messages to correct panes
       const { isDualPane } = get();
+      const deadloopMsgs: Message[] = [];
+      const interactiveMsgs: Message[] = [];
+      const mainMsgs: Message[] = [];
+
+      messages.forEach((m, i) => {
+        const paneType = m.pane_type as string | undefined;
+        const msg = parsedMessages[i];
+        if (paneType === "deadloop") {
+          deadloopMsgs.push(msg);
+        } else if (paneType === "interactive") {
+          interactiveMsgs.push(msg);
+        } else {
+          mainMsgs.push(msg);
+        }
+      });
+
       if (isLoadingMore) {
-        // Prepend older messages - route to correct panes in dual-pane mode
+        // Prepend older messages
         if (isDualPane || hasPaneType) {
-          const deadloopMsgs: Message[] = [];
-          const interactiveMsgs: Message[] = [];
-          const mainMsgs: Message[] = [];
-
-          messages.forEach((m, i) => {
-            const paneType = m.pane_type as string | undefined;
-            const msg = parsedMessages[i];
-            if (paneType === "deadloop") {
-              deadloopMsgs.push(msg);
-            } else if (paneType === "interactive") {
-              interactiveMsgs.push(msg);
-            } else {
-              mainMsgs.push(msg);
-            }
-          });
-
           set((state) => ({
             messages: [...mainMsgs, ...state.messages],
             deadloopMessages: [...deadloopMsgs, ...state.deadloopMessages],
@@ -857,24 +852,50 @@ function handleServerMessage(
         } else {
           get().prependMessages(parsedMessages, hasMore);
         }
+      } else if (shouldMerge) {
+        // Re-attaching to same session - merge new messages with existing ones
+        // This preserves scroll position while showing any messages we missed
+        console.log("Merging session_messages for re-attached session");
+
+        if (isDualPane || hasPaneType) {
+          set((state) => {
+            // Create sets of existing message IDs for fast lookup
+            const existingDeadloopIds = new Set(state.deadloopMessages.map(m => m.id));
+            const existingInteractiveIds = new Set(state.interactiveMessages.map(m => m.id));
+            const existingMainIds = new Set(state.messages.map(m => m.id));
+
+            // Filter to only new messages
+            const newDeadloop = deadloopMsgs.filter(m => !existingDeadloopIds.has(m.id));
+            const newInteractive = interactiveMsgs.filter(m => !existingInteractiveIds.has(m.id));
+            const newMain = mainMsgs.filter(m => !existingMainIds.has(m.id));
+
+            if (newDeadloop.length > 0 || newInteractive.length > 0 || newMain.length > 0) {
+              console.log(`Adding ${newDeadloop.length} deadloop, ${newInteractive.length} interactive, ${newMain.length} main messages`);
+            }
+
+            return {
+              messages: [...state.messages, ...newMain],
+              deadloopMessages: [...state.deadloopMessages, ...newDeadloop],
+              interactiveMessages: [...state.interactiveMessages, ...newInteractive],
+              hasMoreMessages: hasMore,
+              isDualPane: true,
+            };
+          });
+        } else {
+          set((state) => {
+            const existingIds = new Set(state.messages.map(m => m.id));
+            const newMessages = parsedMessages.filter(m => !existingIds.has(m.id));
+            if (newMessages.length > 0) {
+              console.log(`Adding ${newMessages.length} new messages`);
+            }
+            return {
+              messages: [...state.messages, ...newMessages],
+              hasMoreMessages: hasMore,
+            };
+          });
+        }
       } else if (isDualPane || hasPaneType) {
-        // Dual pane mode - route messages to correct arrays
-        const deadloopMsgs: Message[] = [];
-        const interactiveMsgs: Message[] = [];
-        const mainMsgs: Message[] = [];
-
-        messages.forEach((m, i) => {
-          const paneType = m.pane_type as string | undefined;
-          const msg = parsedMessages[i];
-          if (paneType === "deadloop") {
-            deadloopMsgs.push(msg);
-          } else if (paneType === "interactive") {
-            interactiveMsgs.push(msg);
-          } else {
-            mainMsgs.push(msg);
-          }
-        });
-
+        // Initial load - dual pane mode
         set({
           sessionId: data.session_id as string,
           messages: mainMsgs,
@@ -884,7 +905,7 @@ function handleServerMessage(
           isDualPane: true,
         });
       } else {
-        // Single pane mode - replace all messages
+        // Initial load - single pane mode
         set({
           sessionId: data.session_id as string,
           messages: parsedMessages,
