@@ -832,17 +832,6 @@ fn run_interactive_session(
                 let _ = child.wait();
                 let _ = stdout_thread.join();
                 let _ = stderr_thread.join();
-
-                // Show ready indicator (locally and to server/web)
-                let _ = output_tx.send(PaneOutput {
-                    text: "[Ready]".to_string(),
-                    is_deadloop: false,
-                });
-                let _ = server_tx.blocking_send(CliToServer::output_with_pane(
-                    session_id,
-                    "[Ready]",
-                    shared::PaneType::Interactive,
-                ));
             }
             Err(e) => {
                 let _ = output_tx.send(PaneOutput {
