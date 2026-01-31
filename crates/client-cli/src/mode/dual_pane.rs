@@ -30,6 +30,10 @@ const DEFAULT_PROMPT: &str = r#"Work on tasks defined in TODO.md. Do the followi
 
 /// Run in dual-pane mode
 pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()> {
+    // Clear terminal screen for a clean start
+    print!("\x1B[2J\x1B[H");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
     let config = crate::config::Config::load().unwrap_or_default();
     let claude_path = config.local.claude_path.clone();
 
