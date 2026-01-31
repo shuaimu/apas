@@ -62,6 +62,13 @@ pub enum CliToServer {
         session_id: Uuid,
         is_paused: bool,
     },
+
+    /// Report pane status (e.g., "thinking") for status bar display
+    PaneStatus {
+        session_id: Uuid,
+        pane_type: PaneType,
+        status: Option<String>,
+    },
 }
 
 /// Messages sent from server to CLI client
@@ -232,6 +239,12 @@ pub enum ServerToWeb {
     DeadloopStatus {
         session_id: Uuid,
         is_paused: bool,
+    },
+
+    /// Pane status update (e.g., "thinking") for status bar display
+    PaneStatus {
+        pane_type: PaneType,
+        status: Option<String>,
     },
 }
 

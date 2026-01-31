@@ -87,6 +87,9 @@ interface AppState {
   // Deadloop control
   isDeadloopPaused: boolean;
 
+  // Pane status (for status bar)
+  interactiveStatus: string | null;
+
   // Auth actions
   login: (token: string, userId: string) => void;
   logout: () => void;
@@ -140,6 +143,7 @@ export const useStore = create<AppState>((set, get) => ({
   deadloopMessages: [],
   interactiveMessages: [],
   isDeadloopPaused: false,
+  interactiveStatus: null,
 
   login: (token: string, userId: string) => {
     localStorage.setItem("apas_token", token);
@@ -645,6 +649,15 @@ function handleServerMessage(
     case "session_status":
       console.log("Session status:", data.status);
       break;
+
+    case "pane_status": {
+      const paneType = data.pane_type as string | undefined;
+      const status = data.status as string | null;
+      if (paneType === "interactive") {
+        set({ interactiveStatus: status });
+      }
+      break;
+    }
 
     case "output": {
       const outputType = parseOutputType(data.output_type as Record<string, unknown> | undefined);

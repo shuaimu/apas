@@ -676,16 +676,16 @@ fn run_interactive_session(
             is_deadloop: false,
         });
 
-        // Show thinking indicator (locally and to server/web)
+        // Show thinking status (locally and to server/web as status bar)
         let _ = output_tx.send(PaneOutput {
             text: "[Thinking...]".to_string(),
             is_deadloop: false,
         });
-        let _ = server_tx.blocking_send(CliToServer::output_with_pane(
+        let _ = server_tx.blocking_send(CliToServer::PaneStatus {
             session_id,
-            "[Thinking...]",
-            shared::PaneType::Interactive,
-        ));
+            pane_type: shared::PaneType::Interactive,
+            status: Some("Thinking...".to_string()),
+        });
 
         // Only send UserInput to server for TUI inputs
         // Web inputs are already saved/broadcast by the server when it receives them
@@ -832,6 +832,13 @@ fn run_interactive_session(
                 let _ = child.wait();
                 let _ = stdout_thread.join();
                 let _ = stderr_thread.join();
+
+                // Clear thinking status
+                let _ = server_tx.blocking_send(CliToServer::PaneStatus {
+                    session_id,
+                    pane_type: shared::PaneType::Interactive,
+                    status: None,
+                });
             }
             Err(e) => {
                 let _ = output_tx.send(PaneOutput {

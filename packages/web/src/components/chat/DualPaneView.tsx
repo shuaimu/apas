@@ -29,6 +29,7 @@ export function DualPaneView() {
   const resumeDeadloop = useStore((state) => state.resumeDeadloop);
   const rebootCli = useStore((state) => state.rebootCli);
   const isAttached = useStore((state) => state.isAttached);
+  const interactiveStatus = useStore((state) => state.interactiveStatus);
   const [activePane, setActivePane] = useState<PaneType>("deadloop");
 
   return (
@@ -109,6 +110,14 @@ export function DualPaneView() {
             isLoading={isLoadingMore}
             hasMore={hasMoreMessages}
           />
+          {interactiveStatus && (
+            <div className="px-3 sm:px-4 py-2 border-t border-gray-200 dark:border-gray-700 bg-cyan-50 dark:bg-cyan-900/20 flex-shrink-0">
+              <div className="flex items-center gap-2 text-sm text-cyan-700 dark:text-cyan-300">
+                <div className="animate-pulse">●</div>
+                <span>{interactiveStatus}</span>
+              </div>
+            </div>
+          )}
           <div className="p-3 sm:p-4 border-t border-gray-200 dark:border-gray-700 flex-shrink-0">
             <InteractiveInput
               onSend={(text) => sendMessageToPane(text, "interactive")}

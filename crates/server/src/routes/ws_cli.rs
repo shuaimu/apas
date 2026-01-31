@@ -336,6 +336,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     )
                                     .await;
                             }
+                            Ok(CliToServer::PaneStatus { session_id, pane_type, status }) => {
+                                // Forward pane status to web clients
+                                tracing::info!("Pane status for session {}: {:?} = {:?}", session_id, pane_type, status);
+                                state
+                                    .sessions
+                                    .route_to_web(
+                                        &session_id,
+                                        ServerToWeb::PaneStatus {
+                                            pane_type,
+                                            status,
+                                        },
+                                    )
+                                    .await;
+                            }
                             Ok(CliToServer::Register { .. }) => {
                                 // Already registered, ignore
                             }
