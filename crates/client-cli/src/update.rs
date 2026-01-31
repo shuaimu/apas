@@ -326,36 +326,46 @@ pub fn restart_cli() {
 
     let args: Vec<String> = env::args().collect();
 
-    // Debug: show all paths we're considering
+    // On Linux, /proc/self/exe always points to the current executable
+    // even if the file was deleted/replaced
+    let proc_self_exe = PathBuf::from("/proc/self/exe");
     let current_exe = get_current_exe();
     let argv0 = args.first().map(PathBuf::from);
 
-    eprintln!("[Restart] current_exe: {:?} (exists: {})",
-        current_exe,
-        current_exe.as_ref().map(|p| p.exists()).unwrap_or(false));
-    eprintln!("[Restart] argv[0]: {:?} (exists: {})",
-        argv0,
-        argv0.as_ref().map(|p| p.exists()).unwrap_or(false));
-    eprintln!("[Restart] args: {:?}", args);
+    // Try paths in order of preference
+    let exe = if proc_self_exe.exists() {
+        // /proc/self/exe is most reliable on Linux
+        proc_self_exe
+    } else if let Some(ref path) = current_exe {
+        if path.exists() {
+            path.clone()
+        } else if let Some(ref a0) = argv0 {
+            if a0.exists() {
+                a0.clone()
+            } else {
+                PathBuf::from("apas")
+            }
+        } else {
+            PathBuf::from("apas")
+        }
+    } else {
+        PathBuf::from("apas")
+    };
 
-    // Try to get executable path, with fallbacks
-    let exe = current_exe
-        .filter(|p| p.exists()) // Make sure it still exists
-        .or_else(|| {
-            // Fallback: try the first argument (argv[0])
-            argv0.filter(|p| p.exists())
-        })
-        .unwrap_or_else(|| PathBuf::from("apas")); // Last resort: hope it's in PATH
+    eprintln!("[Restart] Restarting with: {:?}", exe);
+    eprintln!("[Restart] Args: {:?}", &args[1..]);
 
-    eprintln!("[Restart] Using executable: {:?}", exe);
-
-    // Clear terminal screen before restart so old and new output don't mix
+    // Clear terminal screen before restart
     print!("\x1B[2J\x1B[H");
     let _ = std::io::Write::flush(&mut std::io::stdout());
 
     // exec() replaces the current process - this function won't return on success
     let err = Command::new(&exe).args(&args[1..]).exec();
+
+    // If we get here, exec failed
     eprintln!("[Restart] Failed to restart: {}", err);
+    eprintln!("[Restart] Executable: {:?}", exe);
+    eprintln!("[Restart] Please restart manually.");
 }
 
 #[cfg(not(unix))]
