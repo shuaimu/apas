@@ -70,6 +70,9 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     // Pause deadloop flag (controlled from web UI)
     let pause_deadloop = Arc::new(AtomicBool::new(false));
 
+    // Reboot flag - when set, restart CLI after clean shutdown
+    let reboot_requested = Arc::new(AtomicBool::new(false));
+
     // Shared reference to child process for cleanup
     let child_process: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
     let child_for_handler = child_process.clone();
@@ -92,6 +95,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     // Spawn server connection task
     let shutdown_clone = shutdown.clone();
     let pause_clone = pause_deadloop.clone();
+    let reboot_clone = reboot_requested.clone();
     let server_url_clone = server_url.clone();
     let token_clone = token.clone();
     let working_dir_clone = working_dir_str.clone();
@@ -105,6 +109,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
             server_rx,
             shutdown_clone,
             pause_clone,
+            reboot_clone,
             web_input_tx,
             status_output_tx,
         )
@@ -178,6 +183,11 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     let _ = deadloop_thread.join();
     let _ = interactive_thread.join();
     server_task.abort();
+
+    // If reboot was requested, restart the CLI after clean shutdown
+    if reboot_requested.load(Ordering::SeqCst) {
+        crate::update::restart_cli();
+    }
 
     Ok(())
 }
@@ -846,6 +856,7 @@ async fn run_server_connection(
     mut output_rx: tokio_mpsc::Receiver<CliToServer>,
     shutdown: Arc<AtomicBool>,
     pause_deadloop: Arc<AtomicBool>,
+    reboot_requested: Arc<AtomicBool>,
     web_input_tx: mpsc::Sender<String>,
     status_tx: mpsc::Sender<PaneOutput>,
 ) -> Result<()> {
@@ -1040,14 +1051,11 @@ async fn run_server_connection(
                                                 let _ = ws_sender.send(Message::Text(msg_text.into())).await;
                                             }
                                             ServerToCli::RebootCli { .. } => {
-                                                let _ = status_tx.send(PaneOutput {
-                                                    text: "[Reboot command received from web, restarting...]".to_string(),
-                                                    is_deadloop: true,
-                                                });
-                                                // Give time for the message to display
-                                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                                // Restart the CLI process
-                                                crate::update::restart_cli();
+                                                // Set reboot flag and signal shutdown for clean exit
+                                                reboot_requested.store(true, Ordering::SeqCst);
+                                                shutdown.store(true, Ordering::SeqCst);
+                                                // Exit the connection loop - TUI will exit and restart will happen after cleanup
+                                                return Ok(());
                                             }
                                             _ => {}
                                         }
