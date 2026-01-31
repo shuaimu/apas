@@ -179,15 +179,23 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     // Signal shutdown
     shutdown.store(true, Ordering::SeqCst);
 
-    // Wait for threads to finish
+    // Kill any running child process
+    if let Ok(mut guard) = child_process.lock() {
+        if let Some(ref mut child) = *guard {
+            let _ = child.kill();
+        }
+    }
+
+    // If reboot was requested, restart immediately without waiting for threads
+    if reboot_requested.load(Ordering::SeqCst) {
+        server_task.abort();
+        crate::update::restart_cli();
+    }
+
+    // Wait for threads to finish (normal shutdown)
     let _ = deadloop_thread.join();
     let _ = interactive_thread.join();
     server_task.abort();
-
-    // If reboot was requested, restart the CLI after clean shutdown
-    if reboot_requested.load(Ordering::SeqCst) {
-        crate::update::restart_cli();
-    }
 
     Ok(())
 }
