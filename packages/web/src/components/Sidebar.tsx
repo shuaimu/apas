@@ -4,7 +4,7 @@ import { useStore } from "@/lib/store";
 import { FolderOpen, RefreshCw, Share2, Users, X, Crown, Trash2, ChevronLeft } from "lucide-react";
 import { useMemo, useState, useEffect } from "react";
 import { createPortal } from "react-dom";
-import { UsageLimitsPanel } from "./UsageLimits";
+import { UsageLimitsDisplay } from "./UsageLimits";
 
 // Truncate path in the middle to preserve the folder name at the end
 // e.g., "/home/shuai/workspace/long-project" -> "/home/.../long-project"
@@ -55,7 +55,7 @@ interface ShareUser {
 }
 
 export function Sidebar({ onClose }: SidebarProps) {
-  const { cliClients, sessions, attachSession, loadSessionMessages, refreshCliClients, listSessions, sessionId, connected, token } = useStore();
+  const { cliClients, sessions, attachSession, loadSessionMessages, refreshCliClients, listSessions, sessionId, connected, token, usageLimits } = useStore();
   const [shareModalOpen, setShareModalOpen] = useState(false);
   const [mounted, setMounted] = useState(false);
 
@@ -86,6 +86,7 @@ export function Sidebar({ onClose }: SidebarProps) {
       createdAt?: string;
       isShared?: boolean;
       ownerEmail?: string;
+      cliClientId?: string;
     }>();
 
     // Sort sessions by date (newest first) so we keep the most recent per directory
@@ -113,6 +114,7 @@ export function Sidebar({ onClose }: SidebarProps) {
           createdAt: session.createdAt,
           isShared: session.isShared,
           ownerEmail: session.ownerEmail,
+          cliClientId: session.cliClientId,
         });
       }
     }
@@ -124,6 +126,7 @@ export function Sidebar({ onClose }: SidebarProps) {
         for (const project of projectMap.values()) {
           if (project.id === client.activeSession) {
             project.isActive = true;
+            project.cliClientId = client.id;
             break;
           }
         }
@@ -315,9 +318,6 @@ export function Sidebar({ onClose }: SidebarProps) {
         </div>
       </div>
 
-      {/* Usage Limits */}
-      <UsageLimitsPanel />
-
       {/* Project list */}
       <div className="flex-1 overflow-y-auto p-2">
         {projects.length === 0 ? (
@@ -329,52 +329,59 @@ export function Sidebar({ onClose }: SidebarProps) {
         ) : (
           <div className="space-y-1">
             {projects.map((project) => (
-              <div
-                key={project.id}
-                onClick={() => handleProjectClick(project.id, project.isActive)}
-                className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-left text-sm transition-colors cursor-pointer ${
-                  sessionId === project.id
-                    ? "bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-300"
-                    : "hover:bg-gray-200 dark:hover:bg-gray-800"
-                }`}
-              >
+              <div key={project.id}>
                 <div
-                  className={`w-2 h-2 rounded-full flex-shrink-0 ${
-                    project.isActive ? "bg-green-500" : "bg-gray-400"
+                  onClick={() => handleProjectClick(project.id, project.isActive)}
+                  className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-left text-sm transition-colors cursor-pointer ${
+                    sessionId === project.id
+                      ? "bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-300"
+                      : "hover:bg-gray-200 dark:hover:bg-gray-800"
                   }`}
-                />
-                <div className="flex-1 min-w-0">
-                  {project.hostname && (
-                    <div className="text-xs text-gray-500 truncate">
-                      {project.hostname}
-                    </div>
-                  )}
-                  <div className="font-medium overflow-hidden whitespace-nowrap" title={project.workingDir}>
-                    {truncatePath(project.workingDir)}
-                  </div>
-                  <div className="text-xs text-gray-500 truncate">
-                    {project.isShared ? (
-                      <span className="flex items-center gap-1 text-blue-500">
-                        <Users className="w-3 h-3" />
-                        Shared by {project.ownerEmail}
-                      </span>
-                    ) : project.isActive ? (
-                      "Active"
-                    ) : project.createdAt ? (
-                      new Date(project.createdAt).toLocaleDateString()
-                    ) : (
-                      ""
+                >
+                  <div
+                    className={`w-2 h-2 rounded-full flex-shrink-0 ${
+                      project.isActive ? "bg-green-500" : "bg-gray-400"
+                    }`}
+                  />
+                  <div className="flex-1 min-w-0">
+                    {project.hostname && (
+                      <div className="text-xs text-gray-500 truncate">
+                        {project.hostname}
+                      </div>
                     )}
+                    <div className="font-medium overflow-hidden whitespace-nowrap" title={project.workingDir}>
+                      {truncatePath(project.workingDir)}
+                    </div>
+                    <div className="text-xs text-gray-500 truncate">
+                      {project.isShared ? (
+                        <span className="flex items-center gap-1 text-blue-500">
+                          <Users className="w-3 h-3" />
+                          Shared by {project.ownerEmail}
+                        </span>
+                      ) : project.isActive ? (
+                        "Active"
+                      ) : project.createdAt ? (
+                        new Date(project.createdAt).toLocaleDateString()
+                      ) : (
+                        ""
+                      )}
+                    </div>
                   </div>
+                  {!project.isShared && (
+                    <button
+                      onClick={(e) => handleShareClick(e, project.id)}
+                      className="p-1 hover:bg-gray-300 dark:hover:bg-gray-600 rounded opacity-50 hover:opacity-100 flex-shrink-0"
+                      title="Share this session"
+                    >
+                      <Share2 className="w-4 h-4" />
+                    </button>
+                  )}
                 </div>
-                {!project.isShared && (
-                  <button
-                    onClick={(e) => handleShareClick(e, project.id)}
-                    className="p-1 hover:bg-gray-300 dark:hover:bg-gray-600 rounded opacity-50 hover:opacity-100 flex-shrink-0"
-                    title="Share this session"
-                  >
-                    <Share2 className="w-4 h-4" />
-                  </button>
+                {/* Usage limits for selected session */}
+                {sessionId === project.id && project.cliClientId && usageLimits.get(project.cliClientId) && (
+                  <div className="ml-4 mt-1 mb-2">
+                    <UsageLimitsDisplay limits={usageLimits.get(project.cliClientId)!} compact={false} />
+                  </div>
                 )}
               </div>
             ))}
