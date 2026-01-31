@@ -146,7 +146,8 @@ export const useStore = create<AppState>((set, get) => ({
   isAuthenticated: false,
 
   connected: false,
-  sessionId: null,
+  // Restore sessionId from localStorage to persist across page refreshes
+  sessionId: typeof window !== 'undefined' ? localStorage.getItem("apas_session_id") : null,
   ws: null,
   refreshInterval: null,
   isAttached: false,
@@ -174,6 +175,7 @@ export const useStore = create<AppState>((set, get) => ({
   logout: () => {
     localStorage.removeItem("apas_token");
     localStorage.removeItem("apas_user_id");
+    localStorage.removeItem("apas_session_id");
     const { ws, reconnectTimeout, visibilityHandler } = get();
 
     // Clear reconnect timeout
@@ -348,10 +350,14 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
 
+    // Save to localStorage to persist across page refreshes
+    localStorage.setItem("apas_session_id", sessionId);
+
     // Only reset state when switching to a different session
     const isSameSession = currentSessionId === sessionId;
     if (!isSameSession) {
       set({
+        sessionId,
         messages: [],
         deadloopMessages: [],
         interactiveMessages: [],
@@ -393,6 +399,8 @@ export const useStore = create<AppState>((set, get) => ({
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return;
     }
+    // Save to localStorage to persist across page refreshes
+    localStorage.setItem("apas_session_id", sessionId);
     // Reset all message state including dual-pane arrays
     set({
       sessionId,
@@ -631,6 +639,15 @@ function handleServerMessage(
       get().listSessions();
       // Start auto-refresh for real-time updates
       get().startAutoRefresh();
+      // Restore previously viewed session if available
+      const savedSessionId = localStorage.getItem("apas_session_id");
+      if (savedSessionId) {
+        console.log("Restoring session:", savedSessionId);
+        // Use setTimeout to ensure sessions list is loaded first
+        setTimeout(() => {
+          get().attachSession(savedSessionId);
+        }, 500);
+      }
       break;
 
     case "authentication_failed":
