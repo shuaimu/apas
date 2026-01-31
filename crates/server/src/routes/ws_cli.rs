@@ -240,19 +240,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 session_id,
                                 data,
                                 output_type,
+                                pane_type,
                             }) => {
+                                tracing::info!("Received Output for session {} with pane_type {:?}: {}", session_id, pane_type, &data[..data.len().min(50)]);
                                 // Route output to web client (if attached)
-                                state
+                                let routed = state
                                     .sessions
                                     .route_to_web(
                                         &session_id,
                                         ServerToWeb::Output {
                                             content: data,
                                             output_type,
-                                            pane_type: None,
+                                            pane_type,
                                         },
                                     )
                                     .await;
+                                tracing::info!("Output routed to web: {}", routed);
                             }
                             Ok(CliToServer::StreamMessage { session_id, message, pane_type }) => {
                                 tracing::info!("Received StreamMessage for session {} with pane_type {:?}", session_id, pane_type);

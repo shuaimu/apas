@@ -406,6 +406,7 @@ fn run_deadloop_session_inner(
                                         session_id: session_id_stderr,
                                         data: format!("[stderr] {}", line),
                                         output_type: shared::OutputType::Error,
+                                        pane_type: Some(shared::PaneType::Deadloop),
                                     });
                                 }
                             }
@@ -507,6 +508,7 @@ fn run_deadloop_session_inner(
                                         session_id,
                                         data: line,
                                         output_type: shared::OutputType::Text,
+                                        pane_type: Some(shared::PaneType::Deadloop),
                                     });
                                 }
                             }
@@ -674,11 +676,16 @@ fn run_interactive_session(
             is_deadloop: false,
         });
 
-        // Show thinking indicator
+        // Show thinking indicator (locally and to server/web)
         let _ = output_tx.send(PaneOutput {
             text: "[Thinking...]".to_string(),
             is_deadloop: false,
         });
+        let _ = server_tx.blocking_send(CliToServer::output_with_pane(
+            session_id,
+            "[Thinking...]",
+            shared::PaneType::Interactive,
+        ));
 
         // Only send UserInput to server for TUI inputs
         // Web inputs are already saved/broadcast by the server when it receives them
@@ -826,11 +833,16 @@ fn run_interactive_session(
                 let _ = stdout_thread.join();
                 let _ = stderr_thread.join();
 
-                // Show ready indicator
+                // Show ready indicator (locally and to server/web)
                 let _ = output_tx.send(PaneOutput {
                     text: "[Ready]".to_string(),
                     is_deadloop: false,
                 });
+                let _ = server_tx.blocking_send(CliToServer::output_with_pane(
+                    session_id,
+                    "[Ready]",
+                    shared::PaneType::Interactive,
+                ));
             }
             Err(e) => {
                 let _ = output_tx.send(PaneOutput {

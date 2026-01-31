@@ -289,6 +289,7 @@ async fn handle_session(
                 session_id,
                 data: line,
                 output_type: OutputType::Text,
+                pane_type: None,
             };
             if ws_tx_stdout.send(msg).await.is_err() {
                 break;
@@ -304,6 +305,7 @@ async fn handle_session(
                 session_id,
                 data: line,
                 output_type: OutputType::Error,
+                pane_type: None,
             };
             if ws_tx_stderr.send(msg).await.is_err() {
                 break;

@@ -655,7 +655,8 @@ function handleServerMessage(
         timestamp: new Date(),
         outputType,
       };
-      set((state) => ({ messages: [...state.messages, message] }));
+      const paneType = data.pane_type as string | undefined;
+      addMessageWithPaneRouting(set, get, message, paneType);
       break;
     }
 

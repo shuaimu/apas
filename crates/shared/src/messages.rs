@@ -31,6 +31,8 @@ pub enum CliToServer {
         data: String,
         #[serde(default)]
         output_type: OutputType,
+        #[serde(default)]
+        pane_type: Option<PaneType>,
     },
 
     /// Session has ended
@@ -446,6 +448,7 @@ impl CliToServer {
             session_id,
             data: data.into(),
             output_type: OutputType::Text,
+            pane_type: None,
         }
     }
 
@@ -454,6 +457,16 @@ impl CliToServer {
             session_id,
             data: data.into(),
             output_type,
+            pane_type: None,
+        }
+    }
+
+    pub fn output_with_pane(session_id: Uuid, data: impl Into<String>, pane_type: PaneType) -> Self {
+        Self::Output {
+            session_id,
+            data: data.into(),
+            output_type: OutputType::Text,
+            pane_type: Some(pane_type),
         }
     }
 }
@@ -486,6 +499,7 @@ mod tests {
     fn test_cli_to_server_register_serialization() {
         let msg = CliToServer::Register {
             token: "test-token".to_string(),
+            version: Some("1.0.0".to_string()),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"register\""));
@@ -493,7 +507,7 @@ mod tests {
 
         let deserialized: CliToServer = serde_json::from_str(&json).unwrap();
         match deserialized {
-            CliToServer::Register { token } => assert_eq!(token, "test-token"),
+            CliToServer::Register { token, .. } => assert_eq!(token, "test-token"),
             _ => panic!("Expected Register variant"),
         }
     }
@@ -504,6 +518,8 @@ mod tests {
         let msg = CliToServer::SessionStart {
             session_id,
             working_dir: Some("/home/user/project".to_string()),
+            hostname: None,
+            pane_type: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"session_start\""));
@@ -511,7 +527,7 @@ mod tests {
 
         let deserialized: CliToServer = serde_json::from_str(&json).unwrap();
         match deserialized {
-            CliToServer::SessionStart { session_id: sid, working_dir } => {
+            CliToServer::SessionStart { session_id: sid, working_dir, .. } => {
                 assert_eq!(sid, session_id);
                 assert_eq!(working_dir, Some("/home/user/project".to_string()));
             }
@@ -524,10 +540,11 @@ mod tests {
         let session_id = Uuid::new_v4();
         let msg = CliToServer::output(session_id, "Hello, world!");
         match msg {
-            CliToServer::Output { session_id: sid, data, output_type } => {
+            CliToServer::Output { session_id: sid, data, output_type, pane_type } => {
                 assert_eq!(sid, session_id);
                 assert_eq!(data, "Hello, world!");
                 assert_eq!(output_type, OutputType::Text);
+                assert_eq!(pane_type, None);
             }
             _ => panic!("Expected Output variant"),
         }
@@ -564,9 +581,10 @@ mod tests {
     fn test_server_to_web_helpers() {
         let msg = ServerToWeb::output("Test output");
         match msg {
-            ServerToWeb::Output { content, output_type } => {
+            ServerToWeb::Output { content, output_type, pane_type } => {
                 assert_eq!(content, "Test output");
                 assert_eq!(output_type, OutputType::Text);
+                assert_eq!(pane_type, None);
             }
             _ => panic!("Expected Output variant"),
         }
@@ -733,6 +751,7 @@ mod tests {
         let msg = CliToServer::StreamMessage {
             session_id,
             message: stream_msg,
+            pane_type: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"stream_message\""));
