@@ -674,6 +674,12 @@ fn run_interactive_session(
             is_deadloop: false,
         });
 
+        // Show thinking indicator
+        let _ = output_tx.send(PaneOutput {
+            text: "[Thinking...]".to_string(),
+            is_deadloop: false,
+        });
+
         // Only send UserInput to server for TUI inputs
         // Web inputs are already saved/broadcast by the server when it receives them
         if from_tui {
@@ -819,6 +825,12 @@ fn run_interactive_session(
                 let _ = child.wait();
                 let _ = stdout_thread.join();
                 let _ = stderr_thread.join();
+
+                // Show ready indicator
+                let _ = output_tx.send(PaneOutput {
+                    text: "[Ready]".to_string(),
+                    is_deadloop: false,
+                });
             }
             Err(e) => {
                 let _ = output_tx.send(PaneOutput {
