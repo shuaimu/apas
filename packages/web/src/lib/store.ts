@@ -105,6 +105,7 @@ interface AppState {
 
   // Pane status (for status bar)
   interactiveStatus: string | null;
+  deadloopStatus: string | null;
 
   // Usage limits per CLI client
   usageLimits: Map<string, UsageLimits>;
@@ -164,6 +165,7 @@ export const useStore = create<AppState>((set, get) => ({
   interactiveMessages: [],
   isDeadloopPaused: false,
   interactiveStatus: null,
+  deadloopStatus: null,
   usageLimits: new Map(),
 
   login: (token: string, userId: string) => {
@@ -365,6 +367,7 @@ export const useStore = create<AppState>((set, get) => ({
         isAttached: true,
         isDeadloopPaused: false, // Reset pause state - server will send correct state
         interactiveStatus: null, // Reset status bar
+        deadloopStatus: null, // Reset status bar
       });
     } else {
       // Re-attaching to same session - preserve dual pane state
@@ -691,6 +694,8 @@ function handleServerMessage(
       const status = data.status as string | null;
       if (paneType === "interactive") {
         set({ interactiveStatus: status });
+      } else if (paneType === "deadloop") {
+        set({ deadloopStatus: status });
       }
       break;
     }

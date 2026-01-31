@@ -305,6 +305,13 @@ fn run_deadloop_session_inner(
             pane_type: Some(PaneType::Deadloop),
         });
 
+        // Show thinking status for deadloop pane
+        let _ = server_tx.try_send(CliToServer::PaneStatus {
+            session_id,
+            pane_type: PaneType::Deadloop,
+            status: Some("Thinking...".to_string()),
+        });
+
         // Build args:
         // - First iteration: use --session-id to create session with specific ID
         // - Subsequent: use --resume with the session ID to continue
@@ -580,6 +587,13 @@ fn run_deadloop_session_inner(
                     }
                 }
 
+                // Clear thinking status for deadloop pane
+                let _ = server_tx.try_send(CliToServer::PaneStatus {
+                    session_id,
+                    pane_type: PaneType::Deadloop,
+                    status: None,
+                });
+
                 // Backoff on error
                 if had_error || exit_was_error {
                     backoff_seconds = std::cmp::min(backoff_seconds * 2, MAX_BACKOFF);
@@ -603,6 +617,12 @@ fn run_deadloop_session_inner(
                 let _ = output_tx.send(PaneOutput {
                     text: format!("[Error starting Claude: {}]", e),
                     is_deadloop: true,
+                });
+                // Clear thinking status on error
+                let _ = server_tx.try_send(CliToServer::PaneStatus {
+                    session_id,
+                    pane_type: PaneType::Deadloop,
+                    status: None,
                 });
                 thread::sleep(std::time::Duration::from_secs(5));
             }

@@ -30,6 +30,7 @@ export function DualPaneView() {
   const rebootCli = useStore((state) => state.rebootCli);
   const isAttached = useStore((state) => state.isAttached);
   const interactiveStatus = useStore((state) => state.interactiveStatus);
+  const deadloopStatus = useStore((state) => state.deadloopStatus);
 
   // Initialize activePane from localStorage to persist across page refreshes
   const [activePane, setActivePane] = useState<PaneType>(() => {
@@ -112,6 +113,14 @@ export function DualPaneView() {
             isLoading={isLoadingMore}
             hasMore={hasMoreMessages}
           />
+          {deadloopStatus && (
+            <div className="px-3 sm:px-4 py-2 border-t border-gray-200 dark:border-gray-700 bg-amber-50 dark:bg-amber-900/20 flex-shrink-0">
+              <div className="flex items-center gap-2 text-sm text-amber-700 dark:text-amber-300">
+                <div className="animate-pulse">●</div>
+                <span>{deadloopStatus}</span>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Right Pane - Interactive */}
