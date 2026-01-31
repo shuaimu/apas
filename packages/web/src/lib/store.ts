@@ -763,11 +763,7 @@ function handleServerMessage(
       const messages = (data.messages as Array<Record<string, unknown>>) || [];
       const hasMore = data.has_more as boolean || false;
 
-      const { sessionId: currentSessionId, messages: currentMessages, deadloopMessages, interactiveMessages, isLoadingMore } = get();
-      const hasExistingMessages = currentMessages.length > 0 || deadloopMessages.length > 0 || interactiveMessages.length > 0;
-
-      // Flag to track if we should merge vs replace
-      const shouldMerge = currentSessionId === incomingSessionId && hasExistingMessages && !isLoadingMore;
+      const { sessionId: currentSessionId, isLoadingMore } = get();
 
       // Check if any messages have pane_type - if so, enable dual pane
       const hasPaneType = messages.some((m) => m.pane_type);
@@ -851,48 +847,6 @@ function handleServerMessage(
           }));
         } else {
           get().prependMessages(parsedMessages, hasMore);
-        }
-      } else if (shouldMerge) {
-        // Re-attaching to same session - merge new messages with existing ones
-        // This preserves scroll position while showing any messages we missed
-        console.log("Merging session_messages for re-attached session");
-
-        if (isDualPane || hasPaneType) {
-          set((state) => {
-            // Create sets of existing message IDs for fast lookup
-            const existingDeadloopIds = new Set(state.deadloopMessages.map(m => m.id));
-            const existingInteractiveIds = new Set(state.interactiveMessages.map(m => m.id));
-            const existingMainIds = new Set(state.messages.map(m => m.id));
-
-            // Filter to only new messages
-            const newDeadloop = deadloopMsgs.filter(m => !existingDeadloopIds.has(m.id));
-            const newInteractive = interactiveMsgs.filter(m => !existingInteractiveIds.has(m.id));
-            const newMain = mainMsgs.filter(m => !existingMainIds.has(m.id));
-
-            if (newDeadloop.length > 0 || newInteractive.length > 0 || newMain.length > 0) {
-              console.log(`Adding ${newDeadloop.length} deadloop, ${newInteractive.length} interactive, ${newMain.length} main messages`);
-            }
-
-            return {
-              messages: [...state.messages, ...newMain],
-              deadloopMessages: [...state.deadloopMessages, ...newDeadloop],
-              interactiveMessages: [...state.interactiveMessages, ...newInteractive],
-              hasMoreMessages: hasMore,
-              isDualPane: true,
-            };
-          });
-        } else {
-          set((state) => {
-            const existingIds = new Set(state.messages.map(m => m.id));
-            const newMessages = parsedMessages.filter(m => !existingIds.has(m.id));
-            if (newMessages.length > 0) {
-              console.log(`Adding ${newMessages.length} new messages`);
-            }
-            return {
-              messages: [...state.messages, ...newMessages],
-              hasMoreMessages: hasMore,
-            };
-          });
         }
       } else if (isDualPane || hasPaneType) {
         // Initial load - dual pane mode
