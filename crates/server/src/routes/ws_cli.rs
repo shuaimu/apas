@@ -323,6 +323,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     .await;
                             }
                             Ok(CliToServer::DeadloopStatus { session_id, is_paused }) => {
+                                // Save pause state for the session
+                                state.sessions.set_session_paused(&session_id, is_paused);
                                 // Forward deadloop status to web clients
                                 tracing::info!("Deadloop status for session {}: paused={}", session_id, is_paused);
                                 state

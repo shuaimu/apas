@@ -23,6 +23,7 @@ pub struct SessionState {
     pub user_id: Uuid,
     pub cli_client_id: Option<Uuid>,
     pub web_connection_id: Option<Uuid>,
+    pub is_paused: bool,
 }
 
 impl SessionManager {
@@ -85,6 +86,7 @@ impl SessionManager {
             user_id,
             cli_client_id: None,
             web_connection_id: Some(web_connection_id),
+            is_paused: false,
         };
         self.sessions.insert(session_id, state);
         tracing::info!("Session created: {}", session_id);
@@ -120,6 +122,7 @@ impl SessionManager {
                 user_id: Uuid::nil(), // No user for CLI-initiated sessions
                 cli_client_id: Some(cli_id),
                 web_connection_id: None,
+                is_paused: false,
             };
             self.sessions.insert(session_id, state);
             tracing::info!("CLI session created: {} (cli: {})", session_id, cli_id);
@@ -155,6 +158,7 @@ impl SessionManager {
             user_id: Uuid::nil(), // Will be updated when needed
             cli_client_id,
             web_connection_id: Some(web_connection_id),
+            is_paused: false,
         };
         self.sessions.insert(*session_id, state);
 
@@ -191,6 +195,7 @@ impl SessionManager {
             user_id: s.user_id,
             cli_client_id: s.cli_client_id,
             web_connection_id: s.web_connection_id,
+            is_paused: s.is_paused,
         })
     }
 
@@ -207,6 +212,18 @@ impl SessionManager {
             }
         }
         false
+    }
+
+    /// Update the pause state for a session
+    pub fn set_session_paused(&self, session_id: &Uuid, is_paused: bool) {
+        if let Some(mut session) = self.sessions.get_mut(session_id) {
+            session.is_paused = is_paused;
+        }
+    }
+
+    /// Get the pause state for a session
+    pub fn is_session_paused(&self, session_id: &Uuid) -> bool {
+        self.sessions.get(session_id).map(|s| s.is_paused).unwrap_or(false)
     }
 
     // Message routing

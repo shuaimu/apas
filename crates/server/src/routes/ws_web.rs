@@ -402,6 +402,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             )
                             .await;
 
+                        // Send current pause state for this session
+                        let is_paused = state.sessions.is_session_paused(&sid);
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::DeadloopStatus {
+                                    session_id: sid,
+                                    is_paused,
+                                },
+                            )
+                            .await;
+
                         // Load existing messages from file storage (100 per pane type to ensure both are shown)
                         let (messages, has_more) = match state.storage.get_messages_per_pane(&sid, 100).await {
                             Ok((stored_messages, has_more)) => {

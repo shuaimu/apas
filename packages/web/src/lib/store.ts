@@ -339,7 +339,9 @@ export const useStore = create<AppState>((set, get) => ({
         deadloopMessages: [],
         interactiveMessages: [],
         isDualPane: false,
-        isAttached: true
+        isAttached: true,
+        isDeadloopPaused: false, // Reset pause state - server will send correct state
+        interactiveStatus: null, // Reset status bar
       });
     } else {
       // Re-attaching to same session - preserve dual pane state
