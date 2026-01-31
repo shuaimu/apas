@@ -714,7 +714,26 @@ fn run_interactive_session(
             Ok(mut child) => {
                 let stdout = child.stdout.take().unwrap();
                 let stderr = child.stderr.take().unwrap();
-                let reader = BufReader::new(stdout);
+
+                // Channel for stdout lines (allows timeout-based reading)
+                let (stdout_tx, stdout_rx) = mpsc::channel::<Option<String>>();
+
+                // Spawn thread to read stdout and send via channel
+                let stdout_thread = thread::spawn(move || {
+                    let reader = BufReader::new(stdout);
+                    for line in reader.lines() {
+                        match line {
+                            Ok(l) => {
+                                if stdout_tx.send(Some(l)).is_err() {
+                                    break; // Receiver dropped
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    // Signal end of stream
+                    let _ = stdout_tx.send(None);
+                });
 
                 // Spawn thread to capture stderr
                 let output_tx_stderr = output_tx.clone();
@@ -732,47 +751,63 @@ fn run_interactive_session(
                     }
                 });
 
-                for line in reader.lines() {
+                let check_interval = std::time::Duration::from_millis(100);
+
+                // Main loop: read stdout with timeout and check for shutdown
+                loop {
                     if shutdown.load(Ordering::SeqCst) {
+                        // Kill child process on shutdown
+                        let _ = child.kill();
                         break;
                     }
 
-                    let line = match line {
-                        Ok(l) => l,
-                        Err(_) => break,
-                    };
+                    match stdout_rx.recv_timeout(check_interval) {
+                        Ok(Some(line)) => {
+                            if line.trim().is_empty() {
+                                continue;
+                            }
 
-                    if line.trim().is_empty() {
-                        continue;
-                    }
+                            // Parse and process
+                            match serde_json::from_str::<ClaudeStreamMessage>(&line) {
+                                Ok(message) => {
+                                    // Display locally
+                                    let display_text = format_stream_message(&message);
+                                    let _ = output_tx.send(PaneOutput {
+                                        text: display_text,
+                                        is_deadloop: false,
+                                    });
 
-                    // Parse and process
-                    match serde_json::from_str::<ClaudeStreamMessage>(&line) {
-                        Ok(message) => {
-                            // Display locally
-                            let display_text = format_stream_message(&message);
-                            let _ = output_tx.send(PaneOutput {
-                                text: display_text,
-                                is_deadloop: false,
-                            });
-
-                            // Send to server
-                            let _ = server_tx.blocking_send(CliToServer::StreamMessage {
-                                session_id,
-                                message,
-                                pane_type: Some(PaneType::Interactive),
-                            });
+                                    // Send to server
+                                    let _ = server_tx.blocking_send(CliToServer::StreamMessage {
+                                        session_id,
+                                        message,
+                                        pane_type: Some(PaneType::Interactive),
+                                    });
+                                }
+                                Err(_) => {
+                                    let _ = output_tx.send(PaneOutput {
+                                        text: line,
+                                        is_deadloop: false,
+                                    });
+                                }
+                            }
                         }
-                        Err(_) => {
-                            let _ = output_tx.send(PaneOutput {
-                                text: line,
-                                is_deadloop: false,
-                            });
+                        Ok(None) => {
+                            // End of stream
+                            break;
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            // Check shutdown flag and continue
+                            continue;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            break;
                         }
                     }
                 }
 
                 let _ = child.wait();
+                let _ = stdout_thread.join();
                 let _ = stderr_thread.join();
             }
             Err(e) => {
