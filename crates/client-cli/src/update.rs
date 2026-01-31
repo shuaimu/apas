@@ -306,10 +306,27 @@ pub fn check_and_upgrade_on_boot() {
     restart_self();
 }
 
-/// Restart the current process with the same arguments
+/// Restart using the newly installed binary (for auto-update)
+/// This uses get_current_exe() to find the actual installed binary path,
+/// NOT /proc/self/exe which would run the old binary still in memory.
 #[cfg(unix)]
 fn restart_self() {
-    restart_cli();
+    use std::os::unix::process::CommandExt;
+
+    let args: Vec<String> = env::args().collect();
+
+    // Use the actual installed binary path, not /proc/self/exe
+    // because /proc/self/exe points to the OLD binary in memory
+    let exe = get_current_exe().unwrap_or_else(|| PathBuf::from("apas"));
+
+    eprintln!("[Auto-update] Restarting with new binary: {:?}", exe);
+
+    // Clear terminal screen before restart
+    print!("\x1B[2J\x1B[H");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
+    let err = Command::new(&exe).args(&args[1..]).exec();
+    eprintln!("[Auto-update] Failed to restart: {}", err);
 }
 
 #[cfg(not(unix))]
