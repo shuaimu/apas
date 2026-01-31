@@ -266,8 +266,6 @@ fn run_deadloop_session_inner(
     let mut iteration = 0;
     let mut backoff_seconds = 2u64;
     const MAX_BACKOFF: u64 = 3600;
-    const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60); // 1 hour
-    let mut last_update_check = Instant::now();
     let mut first_message = true; // Track if this is first message (use --session-id) or resume (use --resume)
     let mut was_paused = false;
 
@@ -610,25 +608,10 @@ fn run_deadloop_session_inner(
             }
         }
 
-        // Check for updates every hour - auto-update and restart if available
-        if last_update_check.elapsed() >= UPDATE_CHECK_INTERVAL {
-            last_update_check = Instant::now();
-            let output_tx_update = output_tx.clone();
-            let shutdown_update = shutdown.clone();
-            thread::spawn(move || {
-                if let Some(new_version) = crate::update::check_for_update_available() {
-                    let _ = output_tx_update.send(PaneOutput {
-                        text: format!("[Update available: {} -> {} - updating and restarting...]", env!("APAS_VERSION"), new_version),
-                        is_deadloop: true,
-                    });
-                    // Give time for the message to display
-                    thread::sleep(Duration::from_secs(2));
-                    // Signal shutdown and trigger update
-                    shutdown_update.store(true, Ordering::SeqCst);
-                    crate::update::check_and_upgrade_on_boot();
-                }
-            });
-        }
+        // Periodic update check disabled - updates only happen on manual restart
+        // if last_update_check.elapsed() >= UPDATE_CHECK_INTERVAL {
+        //     ...
+        // }
     }
 }
 
