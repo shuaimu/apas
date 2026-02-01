@@ -850,11 +850,17 @@ function handleServerMessage(
         }
       } else if (isDualPane || hasPaneType) {
         // Initial load - dual pane mode
+        // Preserve any real-time messages that arrived before this response (race condition fix)
+        const {
+          interactiveMessages: existingInteractive,
+          deadloopMessages: existingDeadloop,
+          messages: existingMain
+        } = get();
         set({
           sessionId: data.session_id as string,
-          messages: mainMsgs,
-          deadloopMessages: deadloopMsgs,
-          interactiveMessages: interactiveMsgs,
+          messages: [...mainMsgs, ...existingMain],
+          deadloopMessages: [...deadloopMsgs, ...existingDeadloop],
+          interactiveMessages: [...interactiveMsgs, ...existingInteractive],
           hasMoreMessages: hasMore,
           isDualPane: true,
         });
