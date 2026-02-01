@@ -266,7 +266,10 @@ fn run_deadloop_session_inner(
     let mut iteration = 0;
     let mut backoff_seconds = 2u64;
     const MAX_BACKOFF: u64 = 3600;
-    let mut first_message = true; // Track if this is first message (use --session-id) or resume (use --resume)
+    let mut first_message = true; // Track if this is first message
+    // On first message, try --resume first (session may exist from previous run).
+    // If --resume fails, fall back to --session-id to create new session.
+    let mut try_resume_first = true;
     let mut was_paused = false;
 
     while !shutdown.load(Ordering::SeqCst) {
@@ -313,22 +316,12 @@ fn run_deadloop_session_inner(
         });
 
         // Build args:
-        // - First iteration: use --session-id to create session with specific ID
+        // - First message with try_resume_first: try --resume (session may exist from previous run)
+        // - First message without try_resume_first: use --session-id (fallback if --resume failed)
         // - Subsequent: use --resume with the session ID to continue
-        let args = if first_message {
-            first_message = false;
-            vec![
-                "--print".to_string(),
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--verbose".to_string(),
-                "--dangerously-skip-permissions".to_string(),
-                "--session-id".to_string(),
-                claude_session_id.to_string(),
-                prompt.to_string(),
-            ]
-        } else {
-            vec![
+        let (args, using_resume) = if first_message && try_resume_first {
+            // Try --resume first on first message (handles apas restart case)
+            (vec![
                 "--print".to_string(),
                 "--output-format".to_string(),
                 "stream-json".to_string(),
@@ -337,7 +330,31 @@ fn run_deadloop_session_inner(
                 "--resume".to_string(),
                 claude_session_id.to_string(),
                 prompt.to_string(),
-            ]
+            ], true)
+        } else if first_message {
+            // Fallback to --session-id if --resume failed (new session)
+            first_message = false;
+            (vec![
+                "--print".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--verbose".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                "--session-id".to_string(),
+                claude_session_id.to_string(),
+                prompt.to_string(),
+            ], false)
+        } else {
+            (vec![
+                "--print".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--verbose".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                "--resume".to_string(),
+                claude_session_id.to_string(),
+                prompt.to_string(),
+            ], true)
         };
 
         match Command::new(claude_path)
@@ -594,21 +611,34 @@ fn run_deadloop_session_inner(
                     status: None,
                 });
 
-                // Backoff on error
+                // Handle session creation fallback and backoff
                 if had_error || exit_was_error {
-                    backoff_seconds = std::cmp::min(backoff_seconds * 2, MAX_BACKOFF);
-                    let _ = output_tx.send(PaneOutput {
-                        text: format!("[Backing off for {}s before retry]", backoff_seconds),
-                        is_deadloop: true,
-                    });
-
-                    for _ in 0..backoff_seconds {
-                        if shutdown.load(Ordering::SeqCst) {
-                            break;
-                        }
+                    // If --resume failed on first message, try --session-id next
+                    if first_message && using_resume {
+                        try_resume_first = false;
+                        let _ = output_tx.send(PaneOutput {
+                            text: "[Session not found, will create new session...]".to_string(),
+                            is_deadloop: true,
+                        });
+                        // Short delay before retry with --session-id
                         thread::sleep(std::time::Duration::from_secs(1));
+                    } else {
+                        backoff_seconds = std::cmp::min(backoff_seconds * 2, MAX_BACKOFF);
+                        let _ = output_tx.send(PaneOutput {
+                            text: format!("[Backing off for {}s before retry]", backoff_seconds),
+                            is_deadloop: true,
+                        });
+
+                        for _ in 0..backoff_seconds {
+                            if shutdown.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            thread::sleep(std::time::Duration::from_secs(1));
+                        }
                     }
                 } else {
+                    // Success - session confirmed working
+                    first_message = false;
                     backoff_seconds = 2;
                     thread::sleep(std::time::Duration::from_secs(2));
                 }
@@ -649,6 +679,9 @@ fn run_interactive_session(
 ) {
     // Use the persisted Claude session ID for conversation continuity across restarts
     let mut first_message = true;
+    // On first message, try --resume first (session may exist from previous run).
+    // If --resume fails, fall back to --session-id to create new session.
+    let mut try_resume_first = true;
 
     let _ = output_tx.send(PaneOutput {
         text: format!("[Interactive session: {}]", &claude_session_id.to_string()[..8]),
@@ -701,23 +734,13 @@ fn run_interactive_session(
         }
 
         // Build args:
-        // - First message: use --session-id to create session with specific ID
+        // - First message with try_resume_first: try --resume (session may exist from previous run)
+        // - First message without try_resume_first: use --session-id (fallback if --resume failed)
         // - Subsequent: use --resume with the session ID to continue
         // Note: --verbose is required when using --print with --output-format stream-json
-        let args = if first_message {
-            first_message = false;
-            vec![
-                "--print".to_string(),
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--verbose".to_string(),
-                "--dangerously-skip-permissions".to_string(),
-                "--session-id".to_string(),
-                claude_session_id.to_string(),
-                prompt,
-            ]
-        } else {
-            vec![
+        let (args, using_resume) = if first_message && try_resume_first {
+            // Try --resume first on first message (handles apas restart case)
+            (vec![
                 "--print".to_string(),
                 "--output-format".to_string(),
                 "stream-json".to_string(),
@@ -726,7 +749,31 @@ fn run_interactive_session(
                 "--resume".to_string(),
                 claude_session_id.to_string(),
                 prompt,
-            ]
+            ], true)
+        } else if first_message {
+            // Fallback to --session-id if --resume failed (new session)
+            first_message = false;
+            (vec![
+                "--print".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--verbose".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                "--session-id".to_string(),
+                claude_session_id.to_string(),
+                prompt,
+            ], false)
+        } else {
+            (vec![
+                "--print".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--verbose".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                "--resume".to_string(),
+                claude_session_id.to_string(),
+                prompt,
+            ], true)
         };
 
         match Command::new(claude_path)
@@ -832,7 +879,7 @@ fn run_interactive_session(
                     }
                 }
 
-                let _ = child.wait();
+                let exit_status = child.wait();
                 let _ = stdout_thread.join();
                 let _ = stderr_thread.join();
 
@@ -842,12 +889,32 @@ fn run_interactive_session(
                     pane_type: shared::PaneType::Interactive,
                     status: None,
                 });
+
+                // Handle session creation fallback
+                let had_error = exit_status.map(|s| !s.success()).unwrap_or(true);
+                if had_error {
+                    // If --resume failed on first message, try --session-id next
+                    if first_message && using_resume {
+                        try_resume_first = false;
+                        let _ = output_tx.send(PaneOutput {
+                            text: "[Session not found, will create new session on next message...]".to_string(),
+                            is_deadloop: false,
+                        });
+                    }
+                } else {
+                    // Success - session confirmed working
+                    first_message = false;
+                }
             }
             Err(e) => {
                 let _ = output_tx.send(PaneOutput {
                     text: format!("[Error: {}]", e),
                     is_deadloop: false,
                 });
+                // If --resume failed on first message, try --session-id next
+                if first_message && using_resume {
+                    try_resume_first = false;
+                }
             }
         }
     }
