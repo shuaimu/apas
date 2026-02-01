@@ -43,6 +43,10 @@ This rebuilds from the latest source. The CLI also checks for updates every 24 h
 Navigate to your project directory and run:
 
 ```bash
+# setup ws service or your service
+apas config set server ws://apas.mpaxos.com:8080
+
+# start apas
 apas
 ```
 
