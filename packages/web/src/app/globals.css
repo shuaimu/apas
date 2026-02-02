@@ -12,8 +12,66 @@
   }
 }
 
+/* iOS viewport height fix - use dvh with fallback */
+html {
+  height: 100%;
+}
+
 body {
   color: var(--foreground);
   background: var(--background);
   font-family: Arial, Helvetica, sans-serif;
+  min-height: 100%;
+  min-height: 100dvh; /* Dynamic viewport height for iOS */
+  margin: 0;
+  padding: 0;
+}
+
+/* Fix for iOS Chrome - ensure Next.js root stretches properly */
+#__next {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+  min-height: 100dvh;
+  height: auto !important;
+}
+
+/* Main app container - iOS compatible height */
+.app-container {
+  height: 100vh;
+  height: 100dvh; /* Override with dvh for iOS */
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+/* Force header to always be visible */
+header {
+  flex-shrink: 0 !important;
+  min-height: 48px;
+}
+
+/* Fix for iOS Chrome not properly showing mobile tabs with Tailwind md:hidden */
+/* Force mobile tab bar to display on screens smaller than 768px */
+@media screen and (max-width: 767px) {
+  .mobile-tabs {
+    display: flex !important;
+    flex-shrink: 0 !important;
+    min-height: 40px;
+  }
+
+  /* Ensure main content area is visible */
+  main {
+    flex: 1 1 auto !important;
+    min-height: 0;
+  }
+}
+
+/* iOS safe area handling */
+@supports (padding: env(safe-area-inset-top)) {
+  body {
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+  }
 }

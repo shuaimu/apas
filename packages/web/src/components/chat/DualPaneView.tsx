@@ -52,7 +52,7 @@ export function DualPaneView() {
   return (
     <div className="flex flex-col h-full overflow-hidden">
       {/* Mobile tab switcher - only visible on small screens */}
-      <div className="flex md:hidden border-b border-gray-200 dark:border-gray-700 flex-shrink-0">
+      <div className="mobile-tabs flex md:hidden border-b border-gray-200 dark:border-gray-700 flex-shrink-0">
         <button
           onClick={() => handleSetActivePane("deadloop")}
           className={`flex-1 px-4 py-2 text-sm font-medium transition-colors ${
