@@ -47,6 +47,22 @@ export default function Home() {
     localStorage.setItem("apas_sidebar_width", sidebarWidth.toString());
   }, [sidebarWidth]);
 
+  // Sidebar collapsed state
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem("apas_sidebar_collapsed") === "true";
+    }
+    return false;
+  });
+
+  const toggleSidebarCollapsed = useCallback(() => {
+    setSidebarCollapsed(prev => {
+      const newValue = !prev;
+      localStorage.setItem("apas_sidebar_collapsed", newValue.toString());
+      return newValue;
+    });
+  }, []);
+
   useEffect(() => {
     // Check for token in localStorage
     const storedToken = localStorage.getItem("apas_token");
@@ -126,24 +142,43 @@ export default function Home() {
       )}
 
       {/* Sidebar - hidden on mobile, shown on md+ */}
-      <div className={`
-        fixed inset-y-0 left-0 z-50 transform transition-transform duration-200 ease-in-out md:relative md:translate-x-0 md:flex md:flex-shrink-0
-        ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}
-      `}
-        style={{ width: typeof window !== 'undefined' && window.innerWidth >= 768 ? sidebarWidth : 256 }}
-      >
-        <Sidebar onClose={() => setSidebarOpen(false)} />
-      </div>
+      {!sidebarCollapsed && (
+        <>
+          <div className={`
+            fixed inset-y-0 left-0 z-50 transform transition-transform duration-200 ease-in-out md:relative md:translate-x-0 md:flex md:flex-shrink-0
+            ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}
+          `}
+            style={{ width: typeof window !== 'undefined' && window.innerWidth >= 768 ? sidebarWidth : 256 }}
+          >
+            <Sidebar onClose={() => setSidebarOpen(false)} onCollapse={toggleSidebarCollapsed} />
+          </div>
 
-      {/* Sidebar resize handle - only on desktop */}
-      <div className="hidden md:flex h-full">
-        <ResizeHandle
-          direction="horizontal"
-          onResize={handleSidebarResize}
-          onResizeEnd={handleSidebarResizeEnd}
-          className="h-full"
-        />
-      </div>
+          {/* Sidebar resize handle - only on desktop */}
+          <div className="hidden md:flex h-full">
+            <ResizeHandle
+              direction="horizontal"
+              onResize={handleSidebarResize}
+              onResizeEnd={handleSidebarResizeEnd}
+              className="h-full"
+            />
+          </div>
+        </>
+      )}
+
+      {/* Collapsed sidebar expand button - only on desktop */}
+      {sidebarCollapsed && (
+        <div className="hidden md:flex flex-col items-center py-2 px-1 border-r border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800">
+          <button
+            onClick={toggleSidebarCollapsed}
+            className="p-2 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-lg"
+            title="Expand sidebar"
+          >
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 5l7 7-7 7M5 5l7 7-7 7" />
+            </svg>
+          </button>
+        </div>
+      )}
 
       {/* Main content */}
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">

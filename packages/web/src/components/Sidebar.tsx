@@ -43,6 +43,7 @@ function truncatePath(path: string, maxLength: number = 22): string {
 
 interface SidebarProps {
   onClose?: () => void;
+  onCollapse?: () => void;
 }
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://apas.mpaxos.com:8080";
@@ -54,7 +55,7 @@ interface ShareUser {
   created_at?: string;
 }
 
-export function Sidebar({ onClose }: SidebarProps) {
+export function Sidebar({ onClose, onCollapse }: SidebarProps) {
   const { cliClients, sessions, attachSession, loadSessionMessages, refreshCliClients, listSessions, sessionId, connected, token, usageLimits } = useStore();
   const [shareModalOpen, setShareModalOpen] = useState(false);
   const [mounted, setMounted] = useState(false);
@@ -304,6 +305,16 @@ export function Sidebar({ onClose }: SidebarProps) {
             >
               <RefreshCw className={`w-4 h-4 ${isRefreshing ? "animate-spin text-blue-500" : ""}`} />
             </button>
+            {/* Collapse button - only visible on desktop */}
+            {onCollapse && (
+              <button
+                onClick={onCollapse}
+                className="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 rounded hidden md:block"
+                title="Collapse sidebar"
+              >
+                <ChevronLeft className="w-4 h-4" />
+              </button>
+            )}
             {/* Close button - only visible on mobile */}
             {onClose && (
               <button
@@ -311,7 +322,7 @@ export function Sidebar({ onClose }: SidebarProps) {
                 className="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 rounded md:hidden"
                 title="Close sidebar"
               >
-                <ChevronLeft className="w-4 h-4" />
+                <X className="w-4 h-4" />
               </button>
             )}
           </div>

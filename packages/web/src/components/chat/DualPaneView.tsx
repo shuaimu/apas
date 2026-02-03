@@ -85,6 +85,37 @@ export function DualPaneView() {
     localStorage.setItem("apas_deadloop_percent", deadloopPercent.toString());
   }, [deadloopPercent]);
 
+  // Collapsed states for each pane
+  const [deadloopCollapsed, setDeadloopCollapsed] = useState(() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem("apas_deadloop_collapsed") === "true";
+    }
+    return false;
+  });
+
+  const [interactiveCollapsed, setInteractiveCollapsed] = useState(() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem("apas_interactive_collapsed") === "true";
+    }
+    return false;
+  });
+
+  const toggleDeadloopCollapsed = useCallback(() => {
+    setDeadloopCollapsed(prev => {
+      const newValue = !prev;
+      localStorage.setItem("apas_deadloop_collapsed", newValue.toString());
+      return newValue;
+    });
+  }, []);
+
+  const toggleInteractiveCollapsed = useCallback(() => {
+    setInteractiveCollapsed(prev => {
+      const newValue = !prev;
+      localStorage.setItem("apas_interactive_collapsed", newValue.toString());
+      return newValue;
+    });
+  }, []);
+
   return (
     <div className="flex flex-col h-full overflow-hidden">
       {/* Mobile tab switcher - only visible on small screens */}
@@ -144,14 +175,31 @@ export function DualPaneView() {
 
       {/* Desktop: side-by-side view, Mobile: single pane view */}
       <div ref={containerRef} className="flex flex-1 min-h-0 overflow-hidden">
+        {/* Collapsed deadloop expand button - desktop only */}
+        {deadloopCollapsed && (
+          <div className="hidden md:flex flex-col items-center py-2 px-1 border-r border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/20">
+            <button
+              onClick={toggleDeadloopCollapsed}
+              className="p-2 hover:bg-amber-100 dark:hover:bg-amber-800/30 rounded-lg text-amber-700 dark:text-amber-300"
+              title="Expand Deadloop pane"
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 5l7 7-7 7M5 5l7 7-7 7" />
+              </svg>
+            </button>
+            <span className="text-xs text-amber-600 dark:text-amber-400 mt-2 [writing-mode:vertical-rl] rotate-180">Deadloop</span>
+          </div>
+        )}
+
         {/* Left Pane - Deadloop */}
-        <div
-          className={`flex-col overflow-hidden ${
-            activePane === "deadloop" ? "flex" : "hidden"
-          } md:flex w-full`}
-          style={{ width: typeof window !== 'undefined' && window.innerWidth >= 768 ? `${deadloopPercent}%` : undefined }}
-        >
-          <PaneHeader title="Deadloop (Autonomous)" type="deadloop" className="hidden md:block" />
+        {!deadloopCollapsed && (
+          <div
+            className={`flex-col overflow-hidden ${
+              activePane === "deadloop" ? "flex" : "hidden"
+            } md:flex w-full`}
+            style={{ width: typeof window !== 'undefined' && window.innerWidth >= 768 ? (interactiveCollapsed ? '100%' : `${deadloopPercent}%`) : undefined }}
+          >
+            <PaneHeader title="Deadloop (Autonomous)" type="deadloop" className="hidden md:block" onCollapse={toggleDeadloopCollapsed} />
           <MessagePane
             messages={deadloopMessages}
             paneType="deadloop"
@@ -167,23 +215,43 @@ export function DualPaneView() {
               </div>
             </div>
           )}
-        </div>
+          </div>
+        )}
 
-        {/* Resize handle between panes - desktop only */}
-        <div className="hidden md:flex">
-          <ResizeHandle
-            direction="horizontal"
-            onResize={handlePaneResize}
-            onResizeEnd={handlePaneResizeEnd}
-            className="h-full"
-          />
-        </div>
+        {/* Resize handle between panes - desktop only, hidden if either pane is collapsed */}
+        {!deadloopCollapsed && !interactiveCollapsed && (
+          <div className="hidden md:flex">
+            <ResizeHandle
+              direction="horizontal"
+              onResize={handlePaneResize}
+              onResizeEnd={handlePaneResizeEnd}
+              className="h-full"
+            />
+          </div>
+        )}
+
+        {/* Collapsed interactive expand button - desktop only */}
+        {interactiveCollapsed && (
+          <div className="hidden md:flex flex-col items-center py-2 px-1 border-l border-cyan-200 dark:border-cyan-800 bg-cyan-50 dark:bg-cyan-900/20">
+            <button
+              onClick={toggleInteractiveCollapsed}
+              className="p-2 hover:bg-cyan-100 dark:hover:bg-cyan-800/30 rounded-lg text-cyan-700 dark:text-cyan-300"
+              title="Expand Interactive pane"
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 19l-7-7 7-7m8 14l-7-7 7-7" />
+              </svg>
+            </button>
+            <span className="text-xs text-cyan-600 dark:text-cyan-400 mt-2 [writing-mode:vertical-rl]">Interactive</span>
+          </div>
+        )}
 
         {/* Right Pane - Interactive */}
-        <div className={`flex-col overflow-hidden ${
-          activePane === "interactive" ? "flex" : "hidden"
-        } md:flex md:flex-1 w-full`}>
-          <PaneHeader title="Interactive" type="interactive" className="hidden md:block" />
+        {!interactiveCollapsed && (
+          <div className={`flex-col overflow-hidden ${
+            activePane === "interactive" ? "flex" : "hidden"
+          } md:flex md:flex-1 w-full`}>
+            <PaneHeader title="Interactive" type="interactive" className="hidden md:block" onCollapse={toggleInteractiveCollapsed} />
           <MessagePane
             messages={interactiveMessages}
             paneType="interactive"
@@ -204,7 +272,8 @@ export function DualPaneView() {
               onSend={(text) => sendMessageToPane(text, "interactive")}
             />
           </div>
-        </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -214,9 +283,10 @@ interface PaneHeaderProps {
   title: string;
   type: PaneType;
   className?: string;
+  onCollapse?: () => void;
 }
 
-function PaneHeader({ title, type, className }: PaneHeaderProps) {
+function PaneHeader({ title, type, className, onCollapse }: PaneHeaderProps) {
   const isDeadloopPaused = useStore((state) => state.isDeadloopPaused);
   const pauseDeadloop = useStore((state) => state.pauseDeadloop);
   const resumeDeadloop = useStore((state) => state.resumeDeadloop);
@@ -240,41 +310,62 @@ function PaneHeader({ title, type, className }: PaneHeaderProps) {
           <span className="ml-2 text-xs font-normal text-amber-600 dark:text-amber-400">(Paused)</span>
         )}
       </h2>
-      {type === "deadloop" && (
-        <div className="flex gap-2">
-          {isAttached && (
-            <>
-              <button
-                onClick={isDeadloopPaused ? resumeDeadloop : pauseDeadloop}
-                className={`px-3 py-1 text-xs font-medium rounded transition-colors ${
-                  isDeadloopPaused
-                    ? "bg-green-500 hover:bg-green-600 text-white"
-                    : "bg-amber-500 hover:bg-amber-600 text-white"
-                }`}
-              >
-                {isDeadloopPaused ? "Resume" : "Pause"}
-              </button>
-              <button
-                onClick={() => {
-                  if (confirm("Are you sure you want to reboot the CLI?")) {
-                    rebootCli();
-                  }
-                }}
-                className="px-3 py-1 text-xs font-medium rounded transition-colors bg-red-500 hover:bg-red-600 text-white"
-              >
-                Reboot
-              </button>
-            </>
-          )}
+      <div className="flex gap-2 items-center">
+        {type === "deadloop" && (
+          <>
+            {isAttached && (
+              <>
+                <button
+                  onClick={isDeadloopPaused ? resumeDeadloop : pauseDeadloop}
+                  className={`px-3 py-1 text-xs font-medium rounded transition-colors ${
+                    isDeadloopPaused
+                      ? "bg-green-500 hover:bg-green-600 text-white"
+                      : "bg-amber-500 hover:bg-amber-600 text-white"
+                  }`}
+                >
+                  {isDeadloopPaused ? "Resume" : "Pause"}
+                </button>
+                <button
+                  onClick={() => {
+                    if (confirm("Are you sure you want to reboot the CLI?")) {
+                      rebootCli();
+                    }
+                  }}
+                  className="px-3 py-1 text-xs font-medium rounded transition-colors bg-red-500 hover:bg-red-600 text-white"
+                >
+                  Reboot
+                </button>
+              </>
+            )}
+            <button
+              onClick={downloadSession}
+              className="px-3 py-1 text-xs font-medium rounded transition-colors bg-blue-500 hover:bg-blue-600 text-white"
+              title="Download session data"
+            >
+              Download
+            </button>
+          </>
+        )}
+        {onCollapse && (
           <button
-            onClick={downloadSession}
-            className="px-3 py-1 text-xs font-medium rounded transition-colors bg-blue-500 hover:bg-blue-600 text-white"
-            title="Download session data"
+            onClick={onCollapse}
+            className={`p-1 rounded transition-colors ${
+              type === "deadloop"
+                ? "hover:bg-amber-100 dark:hover:bg-amber-800/30 text-amber-600 dark:text-amber-400"
+                : "hover:bg-cyan-100 dark:hover:bg-cyan-800/30 text-cyan-600 dark:text-cyan-400"
+            }`}
+            title={`Collapse ${title}`}
           >
-            Download
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              {type === "deadloop" ? (
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 19l-7-7 7-7m8 14l-7-7 7-7" />
+              ) : (
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 5l7 7-7 7M5 5l7 7-7 7" />
+              )}
+            </svg>
           </button>
-        </div>
-      )}
+        )}
+      </div>
     </div>
   );
 }
