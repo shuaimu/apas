@@ -174,6 +174,9 @@ pub enum WebToServer {
 
     /// Reboot the CLI process
     RebootCli,
+
+    /// Download all session data
+    DownloadSession { session_id: Uuid },
 }
 
 /// Messages sent from server to web client
@@ -254,6 +257,15 @@ pub enum ServerToWeb {
     UsageLimits {
         cli_client_id: Uuid,
         limits: UsageLimits,
+    },
+
+    /// Full session data for download
+    SessionDownload {
+        session_id: Uuid,
+        messages: Vec<MessageInfo>,
+        working_dir: Option<String>,
+        hostname: Option<String>,
+        created_at: Option<String>,
     },
 }
 

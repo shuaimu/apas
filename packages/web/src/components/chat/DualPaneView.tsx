@@ -28,6 +28,7 @@ export function DualPaneView() {
   const pauseDeadloop = useStore((state) => state.pauseDeadloop);
   const resumeDeadloop = useStore((state) => state.resumeDeadloop);
   const rebootCli = useStore((state) => state.rebootCli);
+  const downloadSession = useStore((state) => state.downloadSession);
   const isAttached = useStore((state) => state.isAttached);
   const interactiveStatus = useStore((state) => state.interactiveStatus);
   const deadloopStatus = useStore((state) => state.deadloopStatus);
@@ -97,6 +98,13 @@ export function DualPaneView() {
         >
           Interactive
         </button>
+        <button
+          onClick={downloadSession}
+          className="px-3 py-1 m-1 text-xs font-medium rounded transition-colors bg-blue-500 hover:bg-blue-600 text-white"
+          title="Download session data"
+        >
+          ↓
+        </button>
       </div>
 
       {/* Desktop: side-by-side view, Mobile: single pane view */}
@@ -165,6 +173,7 @@ function PaneHeader({ title, type, className }: PaneHeaderProps) {
   const pauseDeadloop = useStore((state) => state.pauseDeadloop);
   const resumeDeadloop = useStore((state) => state.resumeDeadloop);
   const rebootCli = useStore((state) => state.rebootCli);
+  const downloadSession = useStore((state) => state.downloadSession);
   const isAttached = useStore((state) => state.isAttached);
 
   return (
@@ -183,27 +192,38 @@ function PaneHeader({ title, type, className }: PaneHeaderProps) {
           <span className="ml-2 text-xs font-normal text-amber-600 dark:text-amber-400">(Paused)</span>
         )}
       </h2>
-      {type === "deadloop" && isAttached && (
+      {type === "deadloop" && (
         <div className="flex gap-2">
+          {isAttached && (
+            <>
+              <button
+                onClick={isDeadloopPaused ? resumeDeadloop : pauseDeadloop}
+                className={`px-3 py-1 text-xs font-medium rounded transition-colors ${
+                  isDeadloopPaused
+                    ? "bg-green-500 hover:bg-green-600 text-white"
+                    : "bg-amber-500 hover:bg-amber-600 text-white"
+                }`}
+              >
+                {isDeadloopPaused ? "Resume" : "Pause"}
+              </button>
+              <button
+                onClick={() => {
+                  if (confirm("Are you sure you want to reboot the CLI?")) {
+                    rebootCli();
+                  }
+                }}
+                className="px-3 py-1 text-xs font-medium rounded transition-colors bg-red-500 hover:bg-red-600 text-white"
+              >
+                Reboot
+              </button>
+            </>
+          )}
           <button
-            onClick={isDeadloopPaused ? resumeDeadloop : pauseDeadloop}
-            className={`px-3 py-1 text-xs font-medium rounded transition-colors ${
-              isDeadloopPaused
-                ? "bg-green-500 hover:bg-green-600 text-white"
-                : "bg-amber-500 hover:bg-amber-600 text-white"
-            }`}
+            onClick={downloadSession}
+            className="px-3 py-1 text-xs font-medium rounded transition-colors bg-blue-500 hover:bg-blue-600 text-white"
+            title="Download session data"
           >
-            {isDeadloopPaused ? "Resume" : "Pause"}
-          </button>
-          <button
-            onClick={() => {
-              if (confirm("Are you sure you want to reboot the CLI?")) {
-                rebootCli();
-              }
-            }}
-            className="px-3 py-1 text-xs font-medium rounded transition-colors bg-red-500 hover:bg-red-600 text-white"
-          >
-            Reboot
+            Download
           </button>
         </div>
       )}

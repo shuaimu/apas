@@ -136,6 +136,7 @@ interface AppState {
   pauseDeadloop: () => void;
   resumeDeadloop: () => void;
   rebootCli: () => void;
+  downloadSession: () => void;
 }
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://apas.mpaxos.com:8080";
@@ -362,6 +363,11 @@ export const useStore = create<AppState>((set, get) => ({
 
     // Only reset state when switching to a different session
     const isSameSession = currentSessionId === sessionId;
+
+    // Check if session has an active CLI client
+    const { cliClients } = get();
+    const hasActiveClient = cliClients.some(c => c.activeSession === sessionId);
+
     if (!isSameSession) {
       set({
         sessionId,
@@ -369,14 +375,14 @@ export const useStore = create<AppState>((set, get) => ({
         deadloopMessages: [],
         interactiveMessages: [],
         isDualPane: false,
-        isAttached: true,
+        isAttached: hasActiveClient, // Only attached if session has active CLI
         isDeadloopPaused: false, // Reset pause state - server will send correct state
         interactiveStatus: null, // Reset status bar
         deadloopStatus: null, // Reset status bar
       });
     } else {
-      // Re-attaching to same session - preserve dual pane state
-      set({ isAttached: true });
+      // Re-attaching to same session - update attached state based on active client
+      set({ isAttached: hasActiveClient });
     }
 
     // Attach to existing session
@@ -605,6 +611,13 @@ export const useStore = create<AppState>((set, get) => ({
       ws.send(JSON.stringify({ type: "reboot_cli" }));
     }
   },
+
+  downloadSession: () => {
+    const { ws, sessionId } = get();
+    if (ws && ws.readyState === WebSocket.OPEN && sessionId) {
+      ws.send(JSON.stringify({ type: "download_session", session_id: sessionId }));
+    }
+  },
 }));
 
 // Helper function to route messages to correct array based on pane type
@@ -682,14 +695,23 @@ function handleServerMessage(
 
     case "cli_clients": {
       const clients = (data.clients as Array<Record<string, unknown>>) || [];
+      const parsedClients = clients.map((c) => ({
+        id: c.id as string,
+        name: c.name as string | undefined,
+        status: (c.status as "online" | "offline" | "busy") || "offline",
+        lastSeen: c.last_seen as string | undefined,
+        activeSession: c.active_session as string | undefined,
+      }));
+
+      // Update isAttached based on whether current session has an active client
+      const { sessionId } = get();
+      const hasActiveClient = sessionId
+        ? parsedClients.some(c => c.activeSession === sessionId)
+        : false;
+
       set({
-        cliClients: clients.map((c) => ({
-          id: c.id as string,
-          name: c.name as string | undefined,
-          status: (c.status as "online" | "offline" | "busy") || "offline",
-          lastSeen: c.last_seen as string | undefined,
-          activeSession: c.active_session as string | undefined,
-        })),
+        cliClients: parsedClients,
+        isAttached: hasActiveClient,
       });
       break;
     }
@@ -953,6 +975,39 @@ function handleServerMessage(
       const isPaused = data.is_paused as boolean;
       console.log("Deadloop status update:", isPaused ? "paused" : "running");
       set({ isDeadloopPaused: isPaused });
+      break;
+    }
+
+    case "session_download": {
+      // Handle session download - create a downloadable file
+      const sessionId = data.session_id as string;
+      const messages = data.messages as Array<Record<string, unknown>> || [];
+      const workingDir = data.working_dir as string | undefined;
+      const hostname = data.hostname as string | undefined;
+      const createdAt = data.created_at as string | undefined;
+
+      const downloadData = {
+        session_id: sessionId,
+        working_dir: workingDir,
+        hostname: hostname,
+        created_at: createdAt,
+        exported_at: new Date().toISOString(),
+        message_count: messages.length,
+        messages: messages,
+      };
+
+      // Create and trigger download
+      const blob = new Blob([JSON.stringify(downloadData, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `apas-session-${sessionId.slice(0, 8)}-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      console.log(`Downloaded session ${sessionId} with ${messages.length} messages`);
       break;
     }
 

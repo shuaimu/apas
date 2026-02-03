@@ -63,9 +63,32 @@ impl FileStorage {
         Ok(())
     }
 
-    /// Read all messages for a session (with optional limit for recent messages)
+    /// Read ALL messages for a session (no limit)
     pub async fn get_messages(&self, session_id: &Uuid) -> Result<Vec<StoredMessage>> {
-        self.get_messages_with_limit(session_id, None).await
+        let file_path = self.messages_file(session_id);
+
+        if !file_path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let file = fs::File::open(&file_path).await?;
+        let reader = BufReader::new(file);
+        let mut lines = reader.lines();
+        let mut all_messages = Vec::new();
+
+        while let Some(line) = lines.next_line().await? {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<StoredMessage>(&line) {
+                Ok(msg) => all_messages.push(msg),
+                Err(e) => {
+                    tracing::warn!("Failed to parse message line: {}", e);
+                }
+            }
+        }
+
+        Ok(all_messages)
     }
 
     /// Read messages for a session, optionally limited to the most recent N

@@ -593,6 +593,58 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         }
                     }
                 }
+                Ok(WebToServer::DownloadSession { session_id: sid }) => {
+                    // Get all messages for download (no pagination limit)
+                    tracing::info!("Downloading session data for {}", sid);
+
+                    // Get session metadata from database
+                    let (working_dir, hostname, created_at) = match state.db.get_session(&sid.to_string()).await {
+                        Ok(Some(session)) => (session.working_dir, session.hostname, session.created_at),
+                        _ => (None, None, None),
+                    };
+
+                    // Get all messages without limit
+                    match state.storage.get_messages(&sid).await {
+                        Ok(stored_messages) => {
+                            let messages: Vec<MessageInfo> = stored_messages
+                                .into_iter()
+                                .map(|m| MessageInfo {
+                                    id: m.id,
+                                    role: m.role,
+                                    content: m.content,
+                                    message_type: m.message_type,
+                                    created_at: Some(m.created_at),
+                                    pane_type: m.pane_type,
+                                })
+                                .collect();
+                            state
+                                .sessions
+                                .send_to_web(
+                                    &connection_id,
+                                    ServerToWeb::SessionDownload {
+                                        session_id: sid,
+                                        messages,
+                                        working_dir,
+                                        hostname,
+                                        created_at,
+                                    },
+                                )
+                                .await;
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to get messages for download: {}", e);
+                            state
+                                .sessions
+                                .send_to_web(
+                                    &connection_id,
+                                    ServerToWeb::Error {
+                                        message: "Failed to download session data".to_string(),
+                                    },
+                                )
+                                .await;
+                        }
+                    }
+                }
                 Err(e) => {
                     tracing::warn!("Failed to parse message: {}", e);
                 }
