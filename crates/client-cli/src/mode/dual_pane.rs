@@ -1026,7 +1026,17 @@ async fn run_server_connection(
                     token: token.to_string(),
                     version: Some(env!("APAS_VERSION").to_string()),
                 };
-                let msg_text = serde_json::to_string(&register_msg)?;
+                let msg_text = match serde_json::to_string(&register_msg) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let _ = status_tx.send(PaneOutput {
+                            text: format!("[Server: Failed to serialize register message - {}]", e),
+                            is_deadloop: true,
+                        });
+                        tokio::time::sleep(reconnect_delay).await;
+                        continue;
+                    }
+                };
                 if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
                     let _ = status_tx.send(PaneOutput {
                         text: "[Server: Connection lost during registration]".to_string(),
@@ -1119,7 +1129,17 @@ async fn run_server_connection(
                     hostname,
                     pane_type: None, // Single session, pane_type on individual messages
                 };
-                let msg_text = serde_json::to_string(&session_start)?;
+                let msg_text = match serde_json::to_string(&session_start) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let _ = status_tx.send(PaneOutput {
+                            text: format!("[Server: Failed to serialize session start - {}]", e),
+                            is_deadloop: true,
+                        });
+                        tokio::time::sleep(reconnect_delay).await;
+                        continue;
+                    }
+                };
                 if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
                     let _ = status_tx.send(PaneOutput {
                         text: "[Server: Connection lost during session start]".to_string(),
@@ -1145,7 +1165,13 @@ async fn run_server_connection(
                 loop {
                     tokio::select! {
                         Some(msg) = output_rx.recv() => {
-                            let msg_text = serde_json::to_string(&msg)?;
+                            let msg_text = match serde_json::to_string(&msg) {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    tracing::warn!("Failed to serialize message: {}", e);
+                                    continue; // Skip this message but don't break connection
+                                }
+                            };
                             if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
                                 let _ = status_tx.send(PaneOutput {
                                     text: "[Server: Connection lost, reconnecting...]".to_string(),
@@ -1271,7 +1297,11 @@ async fn run_server_connection(
 
                 // Small delay before reconnecting
                 if !shutdown.load(Ordering::SeqCst) {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let _ = status_tx.send(PaneOutput {
+                        text: format!("[Server: Will reconnect in 1s (attempt {})]", connection_count + 1),
+                        is_deadloop: true,
+                    });
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             }
             Err(e) => {
