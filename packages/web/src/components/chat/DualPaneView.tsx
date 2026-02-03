@@ -22,6 +22,28 @@ function getScrollKey(sessionId: string | null, paneType: PaneType): string {
   return `${sessionId || 'none'}-${paneType}`;
 }
 
+// Helper to get/set per-project layout preferences
+function getProjectLayoutKey(cliClientId: string | null, key: string): string {
+  return cliClientId ? `apas_layout_${cliClientId}_${key}` : `apas_layout_global_${key}`;
+}
+
+function getProjectLayout(cliClientId: string | null, key: string, defaultValue: string): string {
+  if (typeof window === 'undefined') return defaultValue;
+  // Try project-specific first
+  if (cliClientId) {
+    const projectValue = localStorage.getItem(getProjectLayoutKey(cliClientId, key));
+    if (projectValue !== null) return projectValue;
+  }
+  // Fall back to global default
+  const globalValue = localStorage.getItem(`apas_layout_global_${key}`);
+  return globalValue !== null ? globalValue : defaultValue;
+}
+
+function setProjectLayout(cliClientId: string | null, key: string, value: string): void {
+  if (typeof window === 'undefined') return;
+  localStorage.setItem(getProjectLayoutKey(cliClientId, key), value);
+}
+
 export function DualPaneView() {
   const deadloopMessages = useStore((state) => state.deadloopMessages);
   const interactiveMessages = useStore((state) => state.interactiveMessages);
@@ -37,37 +59,42 @@ export function DualPaneView() {
   const isAttached = useStore((state) => state.isAttached);
   const interactiveStatus = useStore((state) => state.interactiveStatus);
   const deadloopStatus = useStore((state) => state.deadloopStatus);
+  const cliClientId = useStore((state) => state.cliClientId);
 
-  // Initialize activePane from localStorage to persist across page refreshes
-  const [activePane, setActivePane] = useState<PaneType>(() => {
-    if (typeof window !== 'undefined') {
-      const saved = localStorage.getItem("apas_active_pane");
-      if (saved === "interactive" || saved === "deadloop") {
-        return saved;
-      }
+  // Initialize states with defaults - will be loaded from per-project storage
+  const [activePane, setActivePane] = useState<PaneType>("deadloop");
+  const [deadloopPercent, setDeadloopPercent] = useState(DEFAULT_DEADLOOP_PERCENT);
+  const [deadloopCollapsed, setDeadloopCollapsed] = useState(false);
+  const [interactiveCollapsed, setInteractiveCollapsed] = useState(false);
+
+  // Load layout when cliClientId changes
+  useEffect(() => {
+    // Active pane
+    const savedActivePane = getProjectLayout(cliClientId, "active_pane", "deadloop");
+    if (savedActivePane === "interactive" || savedActivePane === "deadloop") {
+      setActivePane(savedActivePane);
     }
-    return "deadloop";
-  });
 
-  // Save activePane to localStorage when it changes
+    // Deadloop percent
+    const savedPercent = getProjectLayout(cliClientId, "deadloop_percent", DEFAULT_DEADLOOP_PERCENT.toString());
+    const percent = parseFloat(savedPercent);
+    if (!isNaN(percent) && percent >= MIN_PANE_PERCENT && percent <= MAX_PANE_PERCENT) {
+      setDeadloopPercent(percent);
+    }
+
+    // Collapsed states
+    const savedDeadloopCollapsed = getProjectLayout(cliClientId, "deadloop_collapsed", "false");
+    setDeadloopCollapsed(savedDeadloopCollapsed === "true");
+
+    const savedInteractiveCollapsed = getProjectLayout(cliClientId, "interactive_collapsed", "false");
+    setInteractiveCollapsed(savedInteractiveCollapsed === "true");
+  }, [cliClientId]);
+
+  // Save activePane to per-project storage when it changes
   const handleSetActivePane = (pane: PaneType) => {
     setActivePane(pane);
-    localStorage.setItem("apas_active_pane", pane);
+    setProjectLayout(cliClientId, "active_pane", pane);
   };
-
-  // Deadloop pane width percentage (desktop only)
-  const [deadloopPercent, setDeadloopPercent] = useState(() => {
-    if (typeof window !== 'undefined') {
-      const saved = localStorage.getItem("apas_deadloop_percent");
-      if (saved) {
-        const percent = parseFloat(saved);
-        if (!isNaN(percent) && percent >= MIN_PANE_PERCENT && percent <= MAX_PANE_PERCENT) {
-          return percent;
-        }
-      }
-    }
-    return DEFAULT_DEADLOOP_PERCENT;
-  });
 
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -82,39 +109,24 @@ export function DualPaneView() {
   }, []);
 
   const handlePaneResizeEnd = useCallback(() => {
-    localStorage.setItem("apas_deadloop_percent", deadloopPercent.toString());
-  }, [deadloopPercent]);
-
-  // Collapsed states for each pane
-  const [deadloopCollapsed, setDeadloopCollapsed] = useState(() => {
-    if (typeof window !== 'undefined') {
-      return localStorage.getItem("apas_deadloop_collapsed") === "true";
-    }
-    return false;
-  });
-
-  const [interactiveCollapsed, setInteractiveCollapsed] = useState(() => {
-    if (typeof window !== 'undefined') {
-      return localStorage.getItem("apas_interactive_collapsed") === "true";
-    }
-    return false;
-  });
+    setProjectLayout(cliClientId, "deadloop_percent", deadloopPercent.toString());
+  }, [deadloopPercent, cliClientId]);
 
   const toggleDeadloopCollapsed = useCallback(() => {
     setDeadloopCollapsed(prev => {
       const newValue = !prev;
-      localStorage.setItem("apas_deadloop_collapsed", newValue.toString());
+      setProjectLayout(cliClientId, "deadloop_collapsed", newValue.toString());
       return newValue;
     });
-  }, []);
+  }, [cliClientId]);
 
   const toggleInteractiveCollapsed = useCallback(() => {
     setInteractiveCollapsed(prev => {
       const newValue = !prev;
-      localStorage.setItem("apas_interactive_collapsed", newValue.toString());
+      setProjectLayout(cliClientId, "interactive_collapsed", newValue.toString());
       return newValue;
     });
-  }, []);
+  }, [cliClientId]);
 
   return (
     <div className="flex flex-col h-full overflow-hidden">

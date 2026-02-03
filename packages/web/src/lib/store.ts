@@ -77,6 +77,7 @@ interface AppState {
   // Connection state
   connected: boolean;
   sessionId: string | null;
+  cliClientId: string | null; // Current CLI client ID for per-project settings
   ws: WebSocket | null;
   refreshInterval: NodeJS.Timeout | null;
   isAttached: boolean; // Whether we're attached to an active session
@@ -150,6 +151,8 @@ export const useStore = create<AppState>((set, get) => ({
   connected: false,
   // Restore sessionId from localStorage to persist across page refreshes
   sessionId: typeof window !== 'undefined' ? localStorage.getItem("apas_session_id") : null,
+  // Restore cliClientId from localStorage for per-project settings
+  cliClientId: typeof window !== 'undefined' ? localStorage.getItem("apas_cli_client_id") : null,
   ws: null,
   refreshInterval: null,
   isAttached: false,
@@ -365,12 +368,31 @@ export const useStore = create<AppState>((set, get) => ({
     const isSameSession = currentSessionId === sessionId;
 
     // Check if session has an active CLI client
-    const { cliClients } = get();
+    const { cliClients, sessions } = get();
     const hasActiveClient = cliClients.some(c => c.activeSession === sessionId);
+
+    // Get cliClientId from session info or active client
+    let newCliClientId: string | null = null;
+    const sessionInfo = sessions.find(s => s.id === sessionId);
+    if (sessionInfo?.cliClientId) {
+      newCliClientId = sessionInfo.cliClientId;
+    } else {
+      // Try to get from active CLI client
+      const activeClient = cliClients.find(c => c.activeSession === sessionId);
+      if (activeClient) {
+        newCliClientId = activeClient.id;
+      }
+    }
+
+    // Save cliClientId to localStorage for per-project settings
+    if (newCliClientId) {
+      localStorage.setItem("apas_cli_client_id", newCliClientId);
+    }
 
     if (!isSameSession) {
       set({
         sessionId,
+        cliClientId: newCliClientId,
         messages: [],
         deadloopMessages: [],
         interactiveMessages: [],
@@ -382,7 +404,7 @@ export const useStore = create<AppState>((set, get) => ({
       });
     } else {
       // Re-attaching to same session - update attached state based on active client
-      set({ isAttached: hasActiveClient });
+      set({ isAttached: hasActiveClient, cliClientId: newCliClientId });
     }
 
     // Attach to existing session

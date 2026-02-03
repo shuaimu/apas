@@ -14,27 +14,52 @@ const MIN_SIDEBAR_WIDTH = 180;
 const MAX_SIDEBAR_WIDTH = 400;
 const DEFAULT_SIDEBAR_WIDTH = 256;
 
+// Helper to get/set per-project layout preferences
+function getProjectLayoutKey(cliClientId: string | null | undefined, key: string): string {
+  return cliClientId ? `apas_layout_${cliClientId}_${key}` : `apas_layout_global_${key}`;
+}
+
+function getProjectLayout(cliClientId: string | null | undefined, key: string, defaultValue: string): string {
+  if (typeof window === 'undefined') return defaultValue;
+  // Try project-specific first
+  if (cliClientId) {
+    const projectValue = localStorage.getItem(getProjectLayoutKey(cliClientId, key));
+    if (projectValue !== null) return projectValue;
+  }
+  // Fall back to global default
+  const globalValue = localStorage.getItem(`apas_layout_global_${key}`);
+  return globalValue !== null ? globalValue : defaultValue;
+}
+
+function setProjectLayout(cliClientId: string | null | undefined, key: string, value: string): void {
+  if (typeof window === 'undefined') return;
+  localStorage.setItem(getProjectLayoutKey(cliClientId, key), value);
+}
+
 export default function Home() {
   const router = useRouter();
-  const { connected, connect, disconnect, sessionId, isDualPane, isAuthenticated, logout, token, userId } = useStore();
+  const { connected, connect, disconnect, sessionId, isDualPane, isAuthenticated, logout, token, userId, cliClientId } = useStore();
   const [isCheckingAuth, setIsCheckingAuth] = useState(true);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [isReconnecting, setIsReconnecting] = useState(false);
 
-  // Sidebar width state - initialize from localStorage
-  const [sidebarWidth, setSidebarWidth] = useState(() => {
-    if (typeof window !== 'undefined') {
-      const saved = localStorage.getItem("apas_sidebar_width");
-      if (saved) {
-        const width = parseInt(saved, 10);
-        if (!isNaN(width) && width >= MIN_SIDEBAR_WIDTH && width <= MAX_SIDEBAR_WIDTH) {
-          return width;
-        }
-      }
+  // Sidebar width state - per-project
+  const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
+
+  // Sidebar collapsed state - per-project
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+
+  // Load layout when cliClientId changes
+  useEffect(() => {
+    const savedWidth = getProjectLayout(cliClientId, "sidebar_width", DEFAULT_SIDEBAR_WIDTH.toString());
+    const width = parseInt(savedWidth, 10);
+    if (!isNaN(width) && width >= MIN_SIDEBAR_WIDTH && width <= MAX_SIDEBAR_WIDTH) {
+      setSidebarWidth(width);
     }
-    return DEFAULT_SIDEBAR_WIDTH;
-  });
+    const savedCollapsed = getProjectLayout(cliClientId, "sidebar_collapsed", "false");
+    setSidebarCollapsed(savedCollapsed === "true");
+  }, [cliClientId]);
 
   const handleSidebarResize = useCallback((delta: number) => {
     setSidebarWidth(prev => {
@@ -44,24 +69,16 @@ export default function Home() {
   }, []);
 
   const handleSidebarResizeEnd = useCallback(() => {
-    localStorage.setItem("apas_sidebar_width", sidebarWidth.toString());
-  }, [sidebarWidth]);
-
-  // Sidebar collapsed state
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
-    if (typeof window !== 'undefined') {
-      return localStorage.getItem("apas_sidebar_collapsed") === "true";
-    }
-    return false;
-  });
+    setProjectLayout(cliClientId, "sidebar_width", sidebarWidth.toString());
+  }, [sidebarWidth, cliClientId]);
 
   const toggleSidebarCollapsed = useCallback(() => {
     setSidebarCollapsed(prev => {
       const newValue = !prev;
-      localStorage.setItem("apas_sidebar_collapsed", newValue.toString());
+      setProjectLayout(cliClientId, "sidebar_collapsed", newValue.toString());
       return newValue;
     });
-  }, []);
+  }, [cliClientId]);
 
   useEffect(() => {
     // Check for token in localStorage
