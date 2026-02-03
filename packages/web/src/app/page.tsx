@@ -1,13 +1,18 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { createPortal } from "react-dom";
 import { MessageList } from "@/components/chat/MessageList";
 import { DualPaneView } from "@/components/chat/DualPaneView";
 import { Sidebar } from "@/components/Sidebar";
+import { ResizeHandle } from "@/components/ResizeHandle";
 import { useStore } from "@/lib/store";
 import { Settings, Wifi, WifiOff, LogOut, Menu, X, RefreshCw } from "lucide-react";
+
+const MIN_SIDEBAR_WIDTH = 180;
+const MAX_SIDEBAR_WIDTH = 400;
+const DEFAULT_SIDEBAR_WIDTH = 256;
 
 export default function Home() {
   const router = useRouter();
@@ -16,6 +21,31 @@ export default function Home() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [isReconnecting, setIsReconnecting] = useState(false);
+
+  // Sidebar width state - initialize from localStorage
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem("apas_sidebar_width");
+      if (saved) {
+        const width = parseInt(saved, 10);
+        if (!isNaN(width) && width >= MIN_SIDEBAR_WIDTH && width <= MAX_SIDEBAR_WIDTH) {
+          return width;
+        }
+      }
+    }
+    return DEFAULT_SIDEBAR_WIDTH;
+  });
+
+  const handleSidebarResize = useCallback((delta: number) => {
+    setSidebarWidth(prev => {
+      const newWidth = Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, prev + delta));
+      return newWidth;
+    });
+  }, []);
+
+  const handleSidebarResizeEnd = useCallback(() => {
+    localStorage.setItem("apas_sidebar_width", sidebarWidth.toString());
+  }, [sidebarWidth]);
 
   useEffect(() => {
     // Check for token in localStorage
@@ -97,10 +127,21 @@ export default function Home() {
 
       {/* Sidebar - hidden on mobile, shown on md+ */}
       <div className={`
-        fixed inset-y-0 left-0 z-50 w-64 transform transition-transform duration-200 ease-in-out md:relative md:translate-x-0
+        fixed inset-y-0 left-0 z-50 transform transition-transform duration-200 ease-in-out md:relative md:translate-x-0 md:flex md:flex-shrink-0
         ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}
-      `}>
+      `}
+        style={{ width: typeof window !== 'undefined' && window.innerWidth >= 768 ? sidebarWidth : 256 }}
+      >
         <Sidebar onClose={() => setSidebarOpen(false)} />
+      </div>
+
+      {/* Sidebar resize handle - only on desktop */}
+      <div className="hidden md:block">
+        <ResizeHandle
+          direction="horizontal"
+          onResize={handleSidebarResize}
+          onResizeEnd={handleSidebarResizeEnd}
+        />
       </div>
 
       {/* Main content */}

@@ -5,6 +5,11 @@ import { useStore, Message, PaneType } from "@/lib/store";
 import { UserMessage } from "./UserMessage";
 import { AssistantMessage } from "./AssistantMessage";
 import { InputBox } from "./InputBox";
+import { ResizeHandle } from "../ResizeHandle";
+
+const MIN_PANE_PERCENT = 20;
+const MAX_PANE_PERCENT = 80;
+const DEFAULT_DEADLOOP_PERCENT = 50;
 
 // Store scroll positions per session+pane combination
 interface ScrollState {
@@ -49,6 +54,36 @@ export function DualPaneView() {
     setActivePane(pane);
     localStorage.setItem("apas_active_pane", pane);
   };
+
+  // Deadloop pane width percentage (desktop only)
+  const [deadloopPercent, setDeadloopPercent] = useState(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem("apas_deadloop_percent");
+      if (saved) {
+        const percent = parseFloat(saved);
+        if (!isNaN(percent) && percent >= MIN_PANE_PERCENT && percent <= MAX_PANE_PERCENT) {
+          return percent;
+        }
+      }
+    }
+    return DEFAULT_DEADLOOP_PERCENT;
+  });
+
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  const handlePaneResize = useCallback((delta: number) => {
+    if (!containerRef.current) return;
+    const containerWidth = containerRef.current.offsetWidth;
+    const deltaPercent = (delta / containerWidth) * 100;
+    setDeadloopPercent(prev => {
+      const newPercent = Math.min(MAX_PANE_PERCENT, Math.max(MIN_PANE_PERCENT, prev + deltaPercent));
+      return newPercent;
+    });
+  }, []);
+
+  const handlePaneResizeEnd = useCallback(() => {
+    localStorage.setItem("apas_deadloop_percent", deadloopPercent.toString());
+  }, [deadloopPercent]);
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
@@ -108,11 +143,14 @@ export function DualPaneView() {
       </div>
 
       {/* Desktop: side-by-side view, Mobile: single pane view */}
-      <div className="flex flex-1 min-h-0 overflow-hidden">
+      <div ref={containerRef} className="flex flex-1 min-h-0 overflow-hidden">
         {/* Left Pane - Deadloop */}
-        <div className={`flex-col overflow-hidden ${
-          activePane === "deadloop" ? "flex" : "hidden"
-        } md:flex md:w-1/2 md:border-r md:border-gray-200 md:dark:border-gray-700 w-full`}>
+        <div
+          className={`flex-col overflow-hidden ${
+            activePane === "deadloop" ? "flex" : "hidden"
+          } md:flex w-full`}
+          style={{ width: typeof window !== 'undefined' && window.innerWidth >= 768 ? `${deadloopPercent}%` : undefined }}
+        >
           <PaneHeader title="Deadloop (Autonomous)" type="deadloop" className="hidden md:block" />
           <MessagePane
             messages={deadloopMessages}
@@ -131,10 +169,19 @@ export function DualPaneView() {
           )}
         </div>
 
+        {/* Resize handle between panes - desktop only */}
+        <div className="hidden md:block">
+          <ResizeHandle
+            direction="horizontal"
+            onResize={handlePaneResize}
+            onResizeEnd={handlePaneResizeEnd}
+          />
+        </div>
+
         {/* Right Pane - Interactive */}
         <div className={`flex-col overflow-hidden ${
           activePane === "interactive" ? "flex" : "hidden"
-        } md:flex md:w-1/2 w-full`}>
+        } md:flex md:flex-1 w-full`}>
           <PaneHeader title="Interactive" type="interactive" className="hidden md:block" />
           <MessagePane
             messages={interactiveMessages}
