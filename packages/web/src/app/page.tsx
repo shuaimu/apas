@@ -136,11 +136,12 @@ export default function Home() {
       </div>
 
       {/* Sidebar resize handle - only on desktop */}
-      <div className="hidden md:block">
+      <div className="hidden md:flex h-full">
         <ResizeHandle
           direction="horizontal"
           onResize={handleSidebarResize}
           onResizeEnd={handleSidebarResizeEnd}
+          className="h-full"
         />
       </div>
 

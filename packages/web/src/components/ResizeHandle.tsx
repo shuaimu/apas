@@ -74,11 +74,12 @@ export function ResizeHandle({ direction, onResize, onResizeEnd, className = "" 
       onMouseDown={handleMouseDown}
       onTouchStart={handleTouchStart}
       className={`
-        ${isHorizontal ? "w-1 cursor-col-resize hover:w-1.5" : "h-1 cursor-row-resize hover:h-1.5"}
-        ${isDragging ? "bg-blue-500" : "bg-gray-200 dark:bg-gray-700 hover:bg-blue-400 dark:hover:bg-blue-500"}
-        transition-all duration-150 flex-shrink-0
+        ${isHorizontal ? "w-2 cursor-col-resize hover:w-2" : "h-2 cursor-row-resize hover:h-2"}
+        ${isDragging ? "bg-blue-500" : "bg-gray-300 dark:bg-gray-600 hover:bg-blue-400 dark:hover:bg-blue-500"}
+        transition-colors duration-150 flex-shrink-0
         ${className}
       `}
+      style={{ minWidth: isHorizontal ? '8px' : undefined, minHeight: !isHorizontal ? '8px' : undefined }}
       title="Drag to resize"
     />
   );

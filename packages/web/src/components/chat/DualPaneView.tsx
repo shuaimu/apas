@@ -170,11 +170,12 @@ export function DualPaneView() {
         </div>
 
         {/* Resize handle between panes - desktop only */}
-        <div className="hidden md:block">
+        <div className="hidden md:flex">
           <ResizeHandle
             direction="horizontal"
             onResize={handlePaneResize}
             onResizeEnd={handlePaneResizeEnd}
+            className="h-full"
           />
         </div>
 
