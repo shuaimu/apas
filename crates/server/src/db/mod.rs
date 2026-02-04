@@ -1,6 +1,7 @@
 use anyhow::Result;
 use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
 use std::path::Path;
+use std::time::Duration;
 
 mod models;
 
@@ -20,7 +21,8 @@ impl Database {
 
         let database_url = format!("sqlite:{}?mode=rwc", path);
         let pool = SqlitePoolOptions::new()
-            .max_connections(5)
+            .max_connections(10)
+            .acquire_timeout(Duration::from_secs(5))
             .connect(&database_url)
             .await?;
 
@@ -78,6 +80,9 @@ impl Database {
             .execute(&self.pool)
             .await;
         let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN hostname TEXT")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN is_paused INTEGER DEFAULT 0")
             .execute(&self.pool)
             .await;
 
@@ -268,9 +273,20 @@ impl Database {
         Ok(())
     }
 
+    pub async fn update_session_paused(&self, id: &str, is_paused: bool) -> Result<()> {
+        sqlx::query(
+            "UPDATE sessions SET is_paused = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(is_paused)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let session = sqlx::query_as::<_, Session>(
-            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at FROM sessions WHERE id = ?",
+            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at, COALESCE(is_paused, 0) as is_paused FROM sessions WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -280,7 +296,7 @@ impl Database {
 
     pub async fn get_all_sessions(&self) -> Result<Vec<Session>> {
         let sessions = sqlx::query_as::<_, Session>(
-            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at FROM sessions ORDER BY created_at DESC LIMIT 50",
+            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at, COALESCE(is_paused, 0) as is_paused FROM sessions ORDER BY created_at DESC LIMIT 50",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -289,7 +305,7 @@ impl Database {
 
     pub async fn get_sessions_for_user(&self, user_id: &str) -> Result<Vec<Session>> {
         let sessions = sqlx::query_as::<_, Session>(
-            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at FROM sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
+            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at, COALESCE(is_paused, 0) as is_paused FROM sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
         )
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -383,7 +399,7 @@ impl Database {
         // Returns sessions shared with this user along with the owner's email
         let rows = sqlx::query(
             r#"
-            SELECT s.id, s.user_id, s.cli_client_id, s.working_dir, s.hostname, s.status, s.created_at, s.updated_at, u.email
+            SELECT s.id, s.user_id, s.cli_client_id, s.working_dir, s.hostname, s.status, s.created_at, s.updated_at, COALESCE(s.is_paused, 0) as is_paused, u.email
             FROM sessions s
             INNER JOIN session_shares ss ON s.id = ss.session_id
             INNER JOIN users u ON s.user_id = u.id
@@ -408,6 +424,7 @@ impl Database {
                 status: row.get("status"),
                 created_at: row.get("created_at"),
                 updated_at: row.get("updated_at"),
+                is_paused: row.get::<i32, _>("is_paused") != 0,
             };
             let email: String = row.get("email");
             results.push((session, email));
