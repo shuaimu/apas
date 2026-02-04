@@ -569,10 +569,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         .send_to_web(&connection_id, ServerToWeb::Sessions { sessions })
                         .await;
                 }
-                Ok(WebToServer::GetSessionMessages { session_id: sid, limit, before_id }) => {
+                Ok(WebToServer::GetSessionMessages { session_id: sid, limit, before_id, pane_type }) => {
                     // Get messages for a specific session from file storage with pagination
                     let limit = limit.unwrap_or(100);
-                    match state.storage.get_messages_paginated(&sid, Some(limit), before_id.as_deref()).await {
+                    match state.storage.get_messages_paginated_by_pane(&sid, Some(limit), before_id.as_deref(), pane_type).await {
                         Ok((stored_messages, has_more)) => {
                             let messages: Vec<MessageInfo> = stored_messages
                                 .into_iter()

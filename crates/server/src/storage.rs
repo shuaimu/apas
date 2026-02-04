@@ -154,6 +154,80 @@ impl FileStorage {
         Ok((result, has_more))
     }
 
+    /// Read messages for a session with pagination support, optionally filtered by pane type
+    /// Returns (messages, has_more)
+    pub async fn get_messages_paginated_by_pane(
+        &self,
+        session_id: &Uuid,
+        limit: Option<usize>,
+        before_id: Option<&str>,
+        pane_type: Option<shared::PaneType>,
+    ) -> Result<(Vec<StoredMessage>, bool)> {
+        let file_path = self.messages_file(session_id);
+
+        if !file_path.exists() {
+            return Ok((Vec::new(), false));
+        }
+
+        let file = fs::File::open(&file_path).await?;
+        let reader = BufReader::new(file);
+        let mut lines = reader.lines();
+        let mut all_messages = Vec::new();
+
+        // Convert pane_type to string for comparison
+        let pane_filter = pane_type.map(|p| match p {
+            shared::PaneType::Deadloop => "deadloop",
+            shared::PaneType::Interactive => "interactive",
+        });
+
+        while let Some(line) = lines.next_line().await? {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<StoredMessage>(&line) {
+                Ok(msg) => {
+                    // Filter by pane type if specified
+                    if let Some(filter) = pane_filter {
+                        if msg.pane_type.as_deref() == Some(filter) {
+                            all_messages.push(msg);
+                        }
+                    } else {
+                        all_messages.push(msg);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to parse message line: {}", e);
+                }
+            }
+        }
+
+        // If before_id is specified, find messages before that ID
+        let messages = if let Some(before_id) = before_id {
+            // Find the index of the message with before_id
+            if let Some(idx) = all_messages.iter().position(|m| m.id == before_id) {
+                // Take messages before this index
+                all_messages[..idx].to_vec()
+            } else {
+                // ID not found - might be in a different pane, return all messages before the timestamp
+                // For now, return empty to avoid confusion
+                Vec::new()
+            }
+        } else {
+            all_messages
+        };
+
+        // Apply limit (take from the end to get most recent)
+        let limit = limit.unwrap_or(100);
+        let has_more = messages.len() > limit;
+        let result = if messages.len() > limit {
+            messages[messages.len() - limit..].to_vec()
+        } else {
+            messages
+        };
+
+        Ok((result, has_more))
+    }
+
     /// Read messages for a session, loading recent messages per pane type
     /// This ensures both deadloop and interactive messages are included
     /// Returns (messages, has_more) where messages are sorted by created_at

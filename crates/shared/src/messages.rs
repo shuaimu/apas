@@ -164,6 +164,8 @@ pub enum WebToServer {
         limit: Option<usize>,
         #[serde(default)]
         before_id: Option<String>, // Load messages before this message ID
+        #[serde(default)]
+        pane_type: Option<PaneType>, // Filter by pane type for per-pane pagination
     },
 
     /// Pause the deadloop session

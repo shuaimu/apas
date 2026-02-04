@@ -49,8 +49,9 @@ export function DualPaneView() {
   const interactiveMessages = useStore((state) => state.interactiveMessages);
   const sendMessageToPane = useStore((state) => state.sendMessageToPane);
   const loadMoreMessages = useStore((state) => state.loadMoreMessages);
-  const isLoadingMore = useStore((state) => state.isLoadingMore);
-  const hasMoreMessages = useStore((state) => state.hasMoreMessages);
+  const loadingMorePane = useStore((state) => state.loadingMorePane);
+  const hasMoreDeadloop = useStore((state) => state.hasMoreDeadloop);
+  const hasMoreInteractive = useStore((state) => state.hasMoreInteractive);
   const isDeadloopPaused = useStore((state) => state.isDeadloopPaused);
   const pauseDeadloop = useStore((state) => state.pauseDeadloop);
   const resumeDeadloop = useStore((state) => state.resumeDeadloop);
@@ -215,9 +216,9 @@ export function DualPaneView() {
           <MessagePane
             messages={deadloopMessages}
             paneType="deadloop"
-            onLoadMore={loadMoreMessages}
-            isLoading={isLoadingMore}
-            hasMore={hasMoreMessages}
+            onLoadMore={() => loadMoreMessages("deadloop")}
+            isLoading={loadingMorePane === "deadloop"}
+            hasMore={hasMoreDeadloop}
           />
           {deadloopStatus && (
             <div className="px-3 sm:px-4 py-2 border-t border-gray-200 dark:border-gray-700 bg-amber-50 dark:bg-amber-900/20 flex-shrink-0">
@@ -267,9 +268,9 @@ export function DualPaneView() {
           <MessagePane
             messages={interactiveMessages}
             paneType="interactive"
-            onLoadMore={loadMoreMessages}
-            isLoading={isLoadingMore}
-            hasMore={hasMoreMessages}
+            onLoadMore={() => loadMoreMessages("interactive")}
+            isLoading={loadingMorePane === "interactive"}
+            hasMore={hasMoreInteractive}
           />
           {interactiveStatus && (
             <div className="px-3 sm:px-4 py-2 border-t border-gray-200 dark:border-gray-700 bg-cyan-50 dark:bg-cyan-900/20 flex-shrink-0">

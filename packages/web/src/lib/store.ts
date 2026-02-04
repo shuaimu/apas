@@ -100,6 +100,9 @@ interface AppState {
   isDualPane: boolean;
   deadloopMessages: Message[];
   interactiveMessages: Message[];
+  hasMoreDeadloop: boolean; // Per-pane hasMore for deadloop
+  hasMoreInteractive: boolean; // Per-pane hasMore for interactive
+  loadingMorePane: PaneType | null; // Which pane is loading more
 
   // Deadloop control
   isDeadloopPaused: boolean;
@@ -128,7 +131,7 @@ interface AppState {
   refreshCliClients: () => void;
   listSessions: () => void;
   loadSessionMessages: (sessionId: string) => void;
-  loadMoreMessages: () => void; // Load older messages
+  loadMoreMessages: (paneType?: PaneType) => void; // Load older messages for a specific pane
   prependMessages: (messages: Message[], hasMore: boolean) => void; // Prepend older messages
   sendMessageToPane: (text: string, pane: PaneType) => { success: boolean; error?: string }; // Send to specific pane
   addMessageToPane: (message: Message, pane: PaneType) => void; // Add message to specific pane
@@ -167,6 +170,9 @@ export const useStore = create<AppState>((set, get) => ({
   isDualPane: false,
   deadloopMessages: [],
   interactiveMessages: [],
+  hasMoreDeadloop: false,
+  hasMoreInteractive: false,
+  loadingMorePane: null,
   isDeadloopPaused: false,
   interactiveStatus: null,
   deadloopStatus: null,
@@ -497,37 +503,53 @@ export const useStore = create<AppState>((set, get) => ({
     set({ messages: [] });
   },
 
-  loadMoreMessages: () => {
-    const { ws, sessionId, messages, deadloopMessages, interactiveMessages, isDualPane, isLoadingMore, hasMoreMessages } = get();
+  loadMoreMessages: (paneType?: PaneType) => {
+    const { ws, sessionId, messages, deadloopMessages, interactiveMessages, isDualPane, loadingMorePane, hasMoreMessages, hasMoreDeadloop, hasMoreInteractive } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return;
     }
-    if (!sessionId || isLoadingMore || !hasMoreMessages) {
+    if (!sessionId || loadingMorePane) {
+      return; // Already loading
+    }
+
+    // Determine which pane and check if it has more messages
+    let targetMessages: Message[];
+    let hasMore: boolean;
+    let paneTypeToLoad: PaneType | undefined = paneType;
+
+    if (isDualPane && paneType) {
+      // Dual pane mode with specific pane
+      if (paneType === "deadloop") {
+        targetMessages = deadloopMessages;
+        hasMore = hasMoreDeadloop;
+      } else {
+        targetMessages = interactiveMessages;
+        hasMore = hasMoreInteractive;
+      }
+    } else {
+      // Single pane mode or no pane specified
+      targetMessages = messages;
+      hasMore = hasMoreMessages;
+      paneTypeToLoad = undefined;
+    }
+
+    if (!hasMore || targetMessages.length === 0) {
       return;
     }
 
-    // Find the oldest message across all arrays
-    let oldestMessage: Message | undefined;
-    const allMessages = isDualPane
-      ? [...messages, ...deadloopMessages, ...interactiveMessages]
-      : messages;
-
-    if (allMessages.length === 0) {
-      return;
-    }
-
-    // Sort by timestamp to find the oldest
-    oldestMessage = allMessages.reduce((oldest, msg) =>
+    // Find the oldest message in the target pane
+    const oldestMessage = targetMessages.reduce((oldest, msg) =>
       msg.timestamp < oldest.timestamp ? msg : oldest
     );
 
-    set({ isLoadingMore: true });
+    set({ loadingMorePane: paneType || null, isLoadingMore: true });
 
     ws.send(JSON.stringify({
       type: "get_session_messages",
       session_id: sessionId,
       limit: 50,
-      before_id: oldestMessage.id
+      before_id: oldestMessage.id,
+      pane_type: paneTypeToLoad // Tell server which pane to filter by
     }));
   },
 
@@ -821,7 +843,7 @@ function handleServerMessage(
       const messages = (data.messages as Array<Record<string, unknown>>) || [];
       const hasMore = data.has_more as boolean || false;
 
-      const { sessionId: currentSessionId, isLoadingMore } = get();
+      const { sessionId: currentSessionId, isLoadingMore, loadingMorePane } = get();
 
       // Check if any messages have pane_type - if so, enable dual pane
       const hasPaneType = messages.some((m) => m.pane_type);
@@ -896,13 +918,25 @@ function handleServerMessage(
       if (isLoadingMore) {
         // Prepend older messages
         if (isDualPane || hasPaneType) {
-          set((state) => ({
-            messages: [...mainMsgs, ...state.messages],
-            deadloopMessages: [...deadloopMsgs, ...state.deadloopMessages],
-            interactiveMessages: [...interactiveMsgs, ...state.interactiveMessages],
-            hasMoreMessages: hasMore,
+          // Determine which pane's hasMore to update based on loadingMorePane
+          const updates: Record<string, unknown> = {
+            messages: [...mainMsgs, ...get().messages],
+            deadloopMessages: [...deadloopMsgs, ...get().deadloopMessages],
+            interactiveMessages: [...interactiveMsgs, ...get().interactiveMessages],
             isLoadingMore: false,
-          }));
+            loadingMorePane: null,
+          };
+
+          // Update the appropriate hasMore flag based on which pane was loading
+          if (loadingMorePane === "deadloop") {
+            updates.hasMoreDeadloop = hasMore;
+          } else if (loadingMorePane === "interactive") {
+            updates.hasMoreInteractive = hasMore;
+          } else {
+            updates.hasMoreMessages = hasMore;
+          }
+
+          set(updates);
         } else {
           get().prependMessages(parsedMessages, hasMore);
         }
@@ -920,6 +954,9 @@ function handleServerMessage(
           deadloopMessages: [...deadloopMsgs, ...existingDeadloop],
           interactiveMessages: [...interactiveMsgs, ...existingInteractive],
           hasMoreMessages: hasMore,
+          // Set per-pane hasMore - on initial load, if server says hasMore, both panes might have more
+          hasMoreDeadloop: hasMore,
+          hasMoreInteractive: hasMore,
           isDualPane: true,
         });
       } else {
