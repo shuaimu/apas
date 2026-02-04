@@ -19,10 +19,26 @@ impl Database {
             std::fs::create_dir_all(parent)?;
         }
 
+        // Enable WAL mode for better concurrency (concurrent reads + writes)
+        // Set busy_timeout to wait up to 5s when database is locked
         let database_url = format!("sqlite:{}?mode=rwc", path);
         let pool = SqlitePoolOptions::new()
-            .max_connections(10)
+            .max_connections(32)
             .acquire_timeout(Duration::from_secs(5))
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    sqlx::query("PRAGMA journal_mode=WAL")
+                        .execute(&mut *conn)
+                        .await?;
+                    sqlx::query("PRAGMA busy_timeout=5000")
+                        .execute(&mut *conn)
+                        .await?;
+                    sqlx::query("PRAGMA synchronous=NORMAL")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(())
+                })
+            })
             .connect(&database_url)
             .await?;
 
