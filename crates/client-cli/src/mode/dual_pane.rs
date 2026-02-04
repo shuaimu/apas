@@ -68,7 +68,14 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // Pause deadloop flag (controlled from web UI)
-    let pause_deadloop = Arc::new(AtomicBool::new(false));
+    // Initialize from saved state in project metadata
+    let pause_deadloop = Arc::new(AtomicBool::new(metadata.is_paused));
+    if metadata.is_paused {
+        let _ = output_tx.send(PaneOutput {
+            text: "[Deadloop starting in paused state (from previous session)]".to_string(),
+            is_deadloop: true,
+        });
+    }
 
     // Reboot flag - when set, restart CLI after clean shutdown
     let reboot_requested = Arc::new(AtomicBool::new(false));
@@ -1198,6 +1205,11 @@ async fn run_server_connection(
                                                     text: "[Pause command received from web]".to_string(),
                                                     is_deadloop: true,
                                                 });
+                                                // Save pause status to project file
+                                                if let Ok(mut metadata) = get_or_create_project(std::path::Path::new(working_dir)) {
+                                                    metadata.is_paused = true;
+                                                    let _ = save_project(std::path::Path::new(working_dir), &metadata);
+                                                }
                                                 // Send status update to server
                                                 let status_msg = CliToServer::DeadloopStatus {
                                                     session_id,
@@ -1212,6 +1224,11 @@ async fn run_server_connection(
                                                     text: "[Resume command received from web]".to_string(),
                                                     is_deadloop: true,
                                                 });
+                                                // Save pause status to project file
+                                                if let Ok(mut metadata) = get_or_create_project(std::path::Path::new(working_dir)) {
+                                                    metadata.is_paused = false;
+                                                    let _ = save_project(std::path::Path::new(working_dir), &metadata);
+                                                }
                                                 // Send status update to server
                                                 let status_msg = CliToServer::DeadloopStatus {
                                                     session_id,

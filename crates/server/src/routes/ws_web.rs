@@ -431,7 +431,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
 
                         // Send current pause state for this session
-                        let is_paused = state.sessions.is_session_paused(&sid);
+                        // First check in-memory state, then fall back to database (for server restart recovery)
+                        let is_paused = if state.sessions.has_session_state(&sid) {
+                            state.sessions.is_session_paused(&sid)
+                        } else {
+                            // Load from database (server may have restarted)
+                            match state.db.get_session(&sid.to_string()).await {
+                                Ok(Some(db_session)) => {
+                                    // Cache it in memory for future lookups
+                                    state.sessions.set_session_paused(&sid, db_session.is_paused);
+                                    db_session.is_paused
+                                }
+                                _ => false
+                            }
+                        };
                         state
                             .sessions
                             .send_to_web(

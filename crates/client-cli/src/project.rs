@@ -22,6 +22,9 @@ pub struct ProjectMetadata {
     /// Claude session ID for the interactive pane (persisted for --resume)
     #[serde(default)]
     pub interactive_claude_session_id: Option<Uuid>,
+    /// Whether the deadloop is paused (persisted across restarts)
+    #[serde(default)]
+    pub is_paused: bool,
 }
 
 impl ProjectMetadata {
@@ -33,6 +36,7 @@ impl ProjectMetadata {
             prompt: None,
             deadloop_claude_session_id: None,
             interactive_claude_session_id: None,
+            is_paused: false,
         }
     }
 
@@ -44,6 +48,7 @@ impl ProjectMetadata {
             prompt: None,
             deadloop_claude_session_id: None,
             interactive_claude_session_id: None,
+            is_paused: false,
         }
     }
 
@@ -93,6 +98,7 @@ pub fn get_or_create_project(dir: &Path) -> Result<ProjectMetadata> {
             prompt: None,
             deadloop_claude_session_id: None,
             interactive_claude_session_id: None,
+            is_paused: false,
         };
 
         // Save to file

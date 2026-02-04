@@ -529,4 +529,96 @@ impl Database {
             (r.get("id"), r.get("email"), r.get("created_at"))
         }).collect())
     }
+
+    // ========================================================================
+    // Admin Statistics
+    // ========================================================================
+
+    /// Get total user count
+    pub async fn get_user_count(&self) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0)
+    }
+
+    /// Get total session count
+    pub async fn get_session_count(&self) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sessions")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0)
+    }
+
+    /// Get active session count (sessions with activity in last 24 hours)
+    pub async fn get_active_session_count(&self) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sessions WHERE updated_at > datetime('now', '-1 day')"
+        )
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0)
+    }
+
+    /// Get users created in last 7 days
+    pub async fn get_recent_user_count(&self) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM users WHERE created_at > datetime('now', '-7 days')"
+        )
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0)
+    }
+
+    /// Get CLI client count
+    pub async fn get_cli_client_count(&self) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM cli_clients")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0)
+    }
+
+    /// Get session share count
+    pub async fn get_share_count(&self) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM session_shares")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0)
+    }
+
+    /// Get recent users (last 10 registered)
+    pub async fn get_recent_users(&self, limit: i32) -> Result<Vec<(String, String, Option<String>)>> {
+        let rows = sqlx::query(
+            "SELECT id, email, created_at FROM users ORDER BY created_at DESC LIMIT ?"
+        )
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows.iter().map(|r| {
+            use sqlx::Row;
+            (r.get("id"), r.get("email"), r.get("created_at"))
+        }).collect())
+    }
+
+    /// Get sessions per day for last N days
+    pub async fn get_sessions_per_day(&self, days: i32) -> Result<Vec<(String, i64)>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT date(created_at) as day, COUNT(*) as count
+            FROM sessions
+            WHERE created_at > datetime('now', '-' || ? || ' days')
+            GROUP BY date(created_at)
+            ORDER BY day DESC
+            "#
+        )
+            .bind(days)
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows.iter().map(|r| {
+            use sqlx::Row;
+            (r.get("day"), r.get("count"))
+        }).collect())
+    }
 }

@@ -28,6 +28,8 @@ pub struct Session {
     pub status: String,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+    #[sqlx(default)]
+    pub is_paused: bool,
 }
 
 #[derive(Debug, Clone, FromRow)]

@@ -229,6 +229,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     status: "active".to_string(),
                                     created_at: None,
                                     updated_at: None,
+                                    is_paused: false,
                                 };
                                 if let Err(e) = state.db.create_session(&session).await {
                                     tracing::error!("Failed to persist session to database: {}", e);
@@ -323,8 +324,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     .await;
                             }
                             Ok(CliToServer::DeadloopStatus { session_id, is_paused }) => {
-                                // Save pause state for the session
+                                // Save pause state for the session (in-memory)
                                 state.sessions.set_session_paused(&session_id, is_paused);
+                                // Persist to database for server restart recovery
+                                if let Err(e) = state.db.update_session_paused(&session_id.to_string(), is_paused).await {
+                                    tracing::error!("Failed to persist pause status to database: {}", e);
+                                }
                                 // Forward deadloop status to web clients
                                 tracing::info!("Deadloop status for session {}: paused={}", session_id, is_paused);
                                 state

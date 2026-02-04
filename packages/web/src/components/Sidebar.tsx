@@ -1,7 +1,8 @@
 "use client";
 
 import { useStore } from "@/lib/store";
-import { FolderOpen, RefreshCw, Share2, Users, X, Crown, Trash2, ChevronLeft } from "lucide-react";
+import { FolderOpen, RefreshCw, Share2, Users, X, Crown, Trash2, ChevronLeft, BarChart3 } from "lucide-react";
+import Link from "next/link";
 import { useMemo, useState, useEffect } from "react";
 import { createPortal } from "react-dom";
 import { UsageLimitsDisplay } from "./UsageLimits";
@@ -55,8 +56,10 @@ interface ShareUser {
   created_at?: string;
 }
 
+const ADMIN_USER_ID = "88b6016d-a8b4-400c-bdc9-f0120504a4fc";
+
 export function Sidebar({ onClose, onCollapse }: SidebarProps) {
-  const { cliClients, sessions, attachSession, loadSessionMessages, refreshCliClients, listSessions, sessionId, connected, token, usageLimits } = useStore();
+  const { cliClients, sessions, attachSession, loadSessionMessages, refreshCliClients, listSessions, sessionId, connected, token, usageLimits, userId } = useStore();
   const [shareModalOpen, setShareModalOpen] = useState(false);
   const [mounted, setMounted] = useState(false);
 
@@ -399,6 +402,19 @@ export function Sidebar({ onClose, onCollapse }: SidebarProps) {
           </div>
         )}
       </div>
+
+      {/* Admin link - only visible to admin user */}
+      {userId === ADMIN_USER_ID && (
+        <div className="border-t border-gray-200 dark:border-gray-800 p-2 flex-shrink-0">
+          <Link
+            href="/admin"
+            className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors"
+          >
+            <BarChart3 className="w-4 h-4" />
+            System Dashboard
+          </Link>
+        </div>
+      )}
 
       {/* Share Modal - rendered via portal to escape transform context */}
       {shareModalOpen && mounted && createPortal(

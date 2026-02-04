@@ -7,6 +7,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::state::AppState;
 
+mod admin;
 pub mod auth;
 mod health;
 mod share;
@@ -35,6 +36,7 @@ pub fn create_router(state: AppState) -> Router {
         // Admin routes (for debugging)
         .route("/admin/impersonate", post(auth::admin_impersonate))
         .route("/admin/users", post(auth::admin_list_users))
+        .route("/admin/stats", get(admin::get_stats))
         // Session sharing routes
         .route("/share/generate", post(share::generate_code))
         .route("/share/redeem", post(share::redeem_code))

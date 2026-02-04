@@ -230,6 +230,11 @@ impl SessionManager {
         self.sessions.get(session_id).map(|s| s.is_paused).unwrap_or(false)
     }
 
+    /// Check if a session exists in memory (for determining if DB fallback is needed)
+    pub fn has_session_state(&self, session_id: &Uuid) -> bool {
+        self.sessions.contains_key(session_id)
+    }
+
     // Message routing
     pub async fn send_to_cli(&self, cli_id: &Uuid, msg: ServerToCli) -> bool {
         if let Some(sender) = self.cli_senders.get(cli_id) {
