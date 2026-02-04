@@ -747,6 +747,15 @@ function handleServerMessage(
       console.log("Session status:", data.status);
       break;
 
+    case "session_attached": {
+      // Server tells us if the session has an active CLI
+      // This allows shared users to see pause/reboot buttons
+      const hasActiveCli = data.has_active_cli as boolean;
+      console.log("Session attached, has active CLI:", hasActiveCli);
+      set({ isAttached: hasActiveCli });
+      break;
+    }
+
     case "pane_status": {
       const paneType = data.pane_type as string | undefined;
       const status = data.status as string | null;

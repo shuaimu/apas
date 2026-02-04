@@ -199,6 +199,12 @@ pub enum ServerToWeb {
     /// Session status update
     SessionStatus { status: SessionStatus },
 
+    /// Session attached confirmation (includes whether CLI is active)
+    SessionAttached {
+        session_id: Uuid,
+        has_active_cli: bool,
+    },
+
     /// Output from Claude
     Output {
         content: String,

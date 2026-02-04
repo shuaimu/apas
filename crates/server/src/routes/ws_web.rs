@@ -416,6 +416,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             )
                             .await;
 
+                        // Send attached confirmation with CLI active status
+                        // This allows shared users to see pause/reboot buttons
+                        let has_active_cli = state.sessions.is_session_active(&sid);
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::SessionAttached {
+                                    session_id: sid,
+                                    has_active_cli,
+                                },
+                            )
+                            .await;
+
                         // Send current pause state for this session
                         let is_paused = state.sessions.is_session_paused(&sid);
                         state
