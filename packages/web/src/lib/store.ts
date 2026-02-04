@@ -726,14 +726,19 @@ function handleServerMessage(
       }));
 
       // Update isAttached based on whether current session has an active client
+      // Only upgrade isAttached to true here - don't downgrade it
+      // For shared sessions, the CLI belongs to another user and won't be in our list
+      // The server sends session_attached message with the correct value for those
       const { sessionId } = get();
-      const hasActiveClient = sessionId
+      const hasActiveClientInOurList = sessionId
         ? parsedClients.some(c => c.activeSession === sessionId)
         : false;
 
       set({
         cliClients: parsedClients,
-        isAttached: hasActiveClient,
+        // Only set isAttached to true if we found an active client
+        // Don't set it to false - that would break shared sessions
+        ...(hasActiveClientInOurList ? { isAttached: true } : {}),
       });
       break;
     }
