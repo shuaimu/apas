@@ -84,6 +84,20 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     // Per-pane input channels
     let input_channels: InputChannels = Arc::new(Mutex::new(HashMap::new()));
 
+    // Track pane_id -> claude_session_id for persistence
+    let pane_sessions: Arc<Mutex<HashMap<u32, Uuid>>> = Arc::new(Mutex::new(HashMap::new()));
+    {
+        let mut ps = pane_sessions.lock().unwrap();
+        ps.insert(shared::PANE_ID_DEADLOOP, deadloop_claude_session_id);
+        ps.insert(shared::PANE_ID_INTERACTIVE, interactive_claude_session_id);
+    }
+
+    // Collect dynamic tabs to restore from .apas metadata
+    let dynamic_tabs_to_restore: Vec<(u32, Uuid, String)> = metadata.panes.iter()
+        .filter(|p| p.pane_id != shared::PANE_ID_DEADLOOP && p.pane_id != shared::PANE_ID_INTERACTIVE)
+        .map(|p| (p.pane_id, p.session_id, p.label.clone().unwrap_or_else(|| format!("Tab {}", p.pane_id))))
+        .collect();
+
     // TUI channels
     let (tui_input_tx, tui_input_rx) = mpsc::channel::<(u32, String)>();
     let (output_tx, output_rx) = mpsc::channel::<PaneOutput>();
@@ -187,6 +201,38 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
         })
     };
 
+    // Restore dynamic tabs from .apas metadata
+    for (pane_id, claude_session_id, label) in &dynamic_tabs_to_restore {
+        let (input_tx, input_rx) = mpsc::channel::<PaneInput>();
+        {
+            let mut channels = input_channels.lock().unwrap();
+            channels.insert(*pane_id, input_tx);
+        }
+        {
+            let mut ps = pane_sessions.lock().unwrap();
+            ps.insert(*pane_id, *claude_session_id);
+        }
+        let _ = output_tx.send(PaneOutput {
+            text: format!("[Restored tab: {}]", label),
+            pane_id: *pane_id,
+        });
+        let output_tx = output_tx.clone();
+        let server_tx = server_tx.clone();
+        let shutdown = shutdown.clone();
+        let claude_path = claude_path.clone();
+        let working_dir = working_dir_str.clone();
+        let sid = session_id;
+        let csid = *claude_session_id;
+        let pid = *pane_id;
+        thread::spawn(move || {
+            run_pane_session(
+                &claude_path, &working_dir, sid, csid,
+                pid, input_rx,
+                output_tx, server_tx, shutdown,
+            )
+        });
+    }
+
     // TUI event handler thread — processes AddTab/CloseTab events
     // (runs in background, feeds events into the App via channels)
     let tui_event_thread = {
@@ -196,21 +242,26 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
         let input_channels_event = input_channels.clone();
         let working_dir_event = working_dir_str.clone();
         let claude_path_event = claude_path.clone();
+        let pane_sessions_event = pane_sessions.clone();
         thread::spawn(move || {
             handle_tui_events(
                 event_rx, shutdown, output_tx_event, server_tx_event,
                 input_channels_event, session_id,
                 &claude_path_event, &working_dir_event,
-                command_tx,
+                command_tx, pane_sessions_event,
             )
         })
     };
 
     // Run TUI in main thread
-    let initial_tabs = vec![
+    let mut initial_tabs = vec![
         (shared::PANE_ID_DEADLOOP, "Deadloop".to_string()),
         (shared::PANE_ID_INTERACTIVE, "Interactive".to_string()),
     ];
+    // Add restored dynamic tabs
+    for (pane_id, _, label) in &dynamic_tabs_to_restore {
+        initial_tabs.push((*pane_id, label.clone()));
+    }
     let mut app = App::new(tui_input_tx, output_rx, event_tx, command_rx, initial_tabs)
         .with_shutdown(shutdown.clone());
     if let Err(e) = app.run() {
@@ -266,6 +317,34 @@ fn spawn_centralized_input_router(
     });
 }
 
+/// Persist current pane configs (including dynamic tabs) to the .apas file
+fn save_pane_configs(working_dir: &str, pane_sessions: &HashMap<u32, Uuid>) {
+    if let Ok(mut metadata) = get_or_create_project(Path::new(working_dir)) {
+        // Rebuild panes list from pane_sessions map
+        let mut panes: Vec<shared::PaneConfig> = pane_sessions.iter().map(|(&pane_id, &claude_sid)| {
+            let (mode, label) = if pane_id == shared::PANE_ID_DEADLOOP {
+                (shared::PaneMode::Deadloop, "Deadloop".to_string())
+            } else if pane_id == shared::PANE_ID_INTERACTIVE {
+                (shared::PaneMode::Interactive, "Interactive".to_string())
+            } else {
+                (shared::PaneMode::Interactive, format!("Tab {}", pane_id))
+            };
+            shared::PaneConfig {
+                pane_id,
+                provider: shared::Provider::Claude,
+                mode,
+                session_id: claude_sid,
+                is_paused: false,
+                prompt: None,
+                label: Some(label),
+            }
+        }).collect();
+        panes.sort_by_key(|p| p.pane_id);
+        metadata.panes = panes;
+        let _ = save_project(Path::new(working_dir), &metadata);
+    }
+}
+
 /// Handle TUI events (AddTab, CloseTab) in a background thread
 fn handle_tui_events(
     event_rx: mpsc::Receiver<TuiEvent>,
@@ -277,6 +356,7 @@ fn handle_tui_events(
     claude_path: &str,
     working_dir: &str,
     command_tx: mpsc::Sender<TuiCommand>,
+    pane_sessions: Arc<Mutex<HashMap<u32, Uuid>>>,
 ) {
     while !shutdown.load(Ordering::SeqCst) {
         match event_rx.recv_timeout(Duration::from_millis(100)) {
@@ -291,6 +371,12 @@ fn handle_tui_events(
                 {
                     let mut channels = input_channels.lock().unwrap();
                     channels.insert(pane_id, input_tx);
+                }
+
+                // Track claude session for this pane
+                {
+                    let mut ps = pane_sessions.lock().unwrap();
+                    ps.insert(pane_id, claude_session_id);
                 }
 
                 // Notify TUI to add the tab visually
@@ -325,6 +411,9 @@ fn handle_tui_events(
                     session_id,
                     panes: build_pane_list(&input_channels, session_id),
                 });
+
+                // Persist to .apas
+                save_pane_configs(working_dir, &pane_sessions.lock().unwrap());
             }
             Ok(TuiEvent::AddTabWithConfig { pane_id, label, claude_session_id }) => {
                 // Web/server-initiated tab with a specific pane_id
@@ -333,6 +422,12 @@ fn handle_tui_events(
                 {
                     let mut channels = input_channels.lock().unwrap();
                     channels.insert(pane_id, input_tx);
+                }
+
+                // Track claude session for this pane
+                {
+                    let mut ps = pane_sessions.lock().unwrap();
+                    ps.insert(pane_id, claude_session_id);
                 }
 
                 // Notify TUI to add the tab visually
@@ -367,12 +462,21 @@ fn handle_tui_events(
                     session_id,
                     panes: build_pane_list(&input_channels, session_id),
                 });
+
+                // Persist to .apas
+                save_pane_configs(working_dir, &pane_sessions.lock().unwrap());
             }
             Ok(TuiEvent::CloseTab(pane_id)) => {
                 // Remove input channel (causes session thread to exit)
                 {
                     let mut channels = input_channels.lock().unwrap();
                     channels.remove(&pane_id);
+                }
+
+                // Remove from pane sessions
+                {
+                    let mut ps = pane_sessions.lock().unwrap();
+                    ps.remove(&pane_id);
                 }
 
                 // Notify TUI to remove the tab visually
@@ -388,6 +492,9 @@ fn handle_tui_events(
                     session_id,
                     panes: build_pane_list(&input_channels, session_id),
                 });
+
+                // Persist to .apas
+                save_pane_configs(working_dir, &pane_sessions.lock().unwrap());
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,

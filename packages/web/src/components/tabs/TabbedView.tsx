@@ -114,23 +114,31 @@ export function TabbedView() {
   // Active tab state, persisted per project
   const [activeTabId, setActiveTabId] = useState<number | null>(null);
 
-  // Load saved active tab when project changes
+  // Stable list of tab IDs (avoids re-running effects on every message)
+  const tabIds = useMemo(
+    () => effectiveTabs.map((t) => t.pane_id).join(","),
+    [effectiveTabs],
+  );
+
+  // Load saved active tab when project or available tabs change
   useEffect(() => {
+    const ids = tabIds.split(",").filter(Boolean).map(Number);
     const saved = getProjectLayout(cliClientId, "active_tab", "");
     const savedNum = saved ? parseInt(saved, 10) : NaN;
-    if (!isNaN(savedNum) && effectiveTabs.some((t) => t.pane_id === savedNum)) {
+    if (!isNaN(savedNum) && ids.includes(savedNum)) {
       setActiveTabId(savedNum);
-    } else if (effectiveTabs.length > 0) {
-      setActiveTabId(effectiveTabs[0].pane_id);
+    } else if (ids.length > 0) {
+      setActiveTabId(ids[0]);
     }
-  }, [cliClientId, effectiveTabs]);
+  }, [cliClientId, tabIds]);
 
   // If active tab no longer exists, reset to first
   useEffect(() => {
-    if (activeTabId != null && effectiveTabs.length > 0 && !effectiveTabs.some((t) => t.pane_id === activeTabId)) {
-      setActiveTabId(effectiveTabs[0].pane_id);
+    const ids = tabIds.split(",").filter(Boolean).map(Number);
+    if (activeTabId != null && ids.length > 0 && !ids.includes(activeTabId)) {
+      setActiveTabId(ids[0]);
     }
-  }, [activeTabId, effectiveTabs]);
+  }, [activeTabId, tabIds]);
 
   const handleSelectTab = useCallback(
     (paneId: number) => {
@@ -283,8 +291,9 @@ export function TabbedView() {
         </button>
       </div>
 
-      {/* Message pane for active tab */}
+      {/* Message pane for active tab — keyed so each tab gets its own DOM/scroll state */}
       <MessagePane
+        key={`${sessionId}-${activeTabId ?? PANE_ID_MAIN}`}
         paneId={activeTabId ?? PANE_ID_MAIN}
         messages={activeMessages}
         onLoadMore={handleLoadMore}
@@ -326,7 +335,6 @@ function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore }: Messa
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const shouldAutoScroll = useRef(true);
   const prevScrollHeight = useRef<number>(0);
-  const previousPaneId = useRef<number | null>(null);
   const isRestoringScroll = useRef(false);
 
   const scrollKey = getScrollKey(sessionId, paneId);
@@ -360,19 +368,19 @@ function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore }: Messa
     }
   }, [checkIfAtBottom, checkIfNearTop, onLoadMore, isLoading, hasMore, scrollKey]);
 
-  // Save scroll position when switching panes
+  // Save scroll position on unmount (component is keyed by paneId, so unmount = tab switch)
   useEffect(() => {
-    if (previousPaneId.current != null && previousPaneId.current !== paneId && containerRef.current) {
-      const prevKey = getScrollKey(sessionId, previousPaneId.current);
-      scrollPositions.set(prevKey, {
-        scrollTop: containerRef.current.scrollTop,
-        wasAtBottom: shouldAutoScroll.current,
-      });
-    }
-    previousPaneId.current = paneId;
-  }, [paneId, sessionId]);
+    return () => {
+      if (containerRef.current) {
+        scrollPositions.set(scrollKey, {
+          scrollTop: containerRef.current.scrollTop,
+          wasAtBottom: shouldAutoScroll.current,
+        });
+      }
+    };
+  }, [scrollKey]);
 
-  // Restore scroll position when switching to a pane
+  // Restore scroll position on mount
   useEffect(() => {
     if (!containerRef.current) return;
 
@@ -396,7 +404,8 @@ function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore }: Messa
         messagesEndRef.current?.scrollIntoView();
       });
     }
-  }, [paneId, scrollKey, messages.length]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Maintain scroll position when prepending messages
   useEffect(() => {

@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use shared::{CliClientInfo, CliClientStatus, ServerToCli, ServerToWeb, UsageLimits};
+use shared::{CliClientInfo, CliClientStatus, PaneConfig, ServerToCli, ServerToWeb, UsageLimits};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -27,6 +27,8 @@ pub struct SessionState {
     /// All web clients currently viewing this session
     pub web_connection_ids: Vec<Uuid>,
     pub is_paused: bool,
+    /// Cached pane configurations (last PaneList from CLI)
+    pub panes: Vec<PaneConfig>,
 }
 
 impl SessionManager {
@@ -90,6 +92,7 @@ impl SessionManager {
             cli_client_id: None,
             web_connection_ids: vec![web_connection_id],
             is_paused: false,
+            panes: Vec::new(),
         };
         self.sessions.insert(session_id, state);
         tracing::info!("Session created: {}", session_id);
@@ -126,6 +129,7 @@ impl SessionManager {
                 cli_client_id: Some(cli_id),
                 web_connection_ids: Vec::new(),
                 is_paused: false,
+                panes: Vec::new(),
             };
             self.sessions.insert(session_id, state);
             tracing::info!("CLI session created: {} (cli: {})", session_id, cli_id);
@@ -165,6 +169,7 @@ impl SessionManager {
             cli_client_id,
             web_connection_ids: vec![web_connection_id],
             is_paused: false,
+            panes: Vec::new(),
         };
         self.sessions.insert(*session_id, state);
 
@@ -202,6 +207,7 @@ impl SessionManager {
             cli_client_id: s.cli_client_id,
             web_connection_ids: s.web_connection_ids.clone(),
             is_paused: s.is_paused,
+            panes: s.panes.clone(),
         })
     }
 
@@ -235,6 +241,18 @@ impl SessionManager {
     /// Check if a session exists in memory (for determining if DB fallback is needed)
     pub fn has_session_state(&self, session_id: &Uuid) -> bool {
         self.sessions.contains_key(session_id)
+    }
+
+    /// Cache pane configurations for a session (from CLI PaneList)
+    pub fn set_session_panes(&self, session_id: &Uuid, panes: Vec<PaneConfig>) {
+        if let Some(mut session) = self.sessions.get_mut(session_id) {
+            session.panes = panes;
+        }
+    }
+
+    /// Get cached pane configurations for a session
+    pub fn get_session_panes(&self, session_id: &Uuid) -> Vec<PaneConfig> {
+        self.sessions.get(session_id).map(|s| s.panes.clone()).unwrap_or_default()
     }
 
     // Message routing

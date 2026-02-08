@@ -396,8 +396,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 state.sessions.update_usage_limits(cli_id, limits);
                             }
                             Ok(CliToServer::PaneList { session_id, panes }) => {
-                                // Forward pane list to attached web clients
+                                // Cache pane list and forward to attached web clients
                                 tracing::info!("CLI {} sent pane list for session {}: {} panes", cli_id, session_id, panes.len());
+                                state.sessions.set_session_panes(&session_id, panes.clone());
                                 let web_msg = ServerToWeb::PaneList {
                                     session_id,
                                     panes,

@@ -234,7 +234,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 tracing::error!("Failed to save user input to file: {}", e);
                             }
 
-                            // Echo user input back to web client for immediate display
+                            // Echo user input to all web clients for immediate display.
+                            // The CLI skips CliToServer::UserInput for web-originated
+                            // input (from_tui=false), so this is the only display path.
                             state
                                 .sessions
                                 .route_to_web(
@@ -569,6 +571,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 ServerToWeb::SessionMessages { session_id: sid, messages, has_more },
                             )
                             .await;
+
+                        // Send cached pane list if available
+                        let cached_panes = state.sessions.get_session_panes(&sid);
+                        if !cached_panes.is_empty() {
+                            state
+                                .sessions
+                                .send_to_web(
+                                    &connection_id,
+                                    ServerToWeb::PaneList { session_id: sid, panes: cached_panes },
+                                )
+                                .await;
+                        }
 
                         tracing::info!("Web client attached to CLI session {}", sid);
                     } else {
