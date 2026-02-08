@@ -100,12 +100,11 @@ export function TabBar({
         })}
       </div>
 
-      {/* Add tab button — disabled until CLI supports dynamic pane creation */}
+      {/* Add tab button */}
       <button
         onClick={onAddTab}
-        disabled
-        className="flex items-center justify-center w-8 h-8 m-1 rounded text-gray-300 dark:text-gray-600 cursor-not-allowed flex-shrink-0"
-        title="New tab (coming soon — requires CLI support)"
+        className="flex items-center justify-center w-8 h-8 m-1 rounded text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors flex-shrink-0"
+        title="New tab"
       >
         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />

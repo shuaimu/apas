@@ -54,6 +54,8 @@ impl TabState {
 #[derive(Debug, Clone)]
 pub enum TuiEvent {
     AddTab,
+    /// Add a tab with a specific pane_id and label (from web/server)
+    AddTabWithConfig { pane_id: u32, label: String, claude_session_id: uuid::Uuid },
     CloseTab(u32),
 }
 

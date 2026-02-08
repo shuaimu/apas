@@ -322,6 +322,48 @@ fn handle_tui_events(
                     panes: build_pane_list(&input_channels, session_id),
                 });
             }
+            Ok(TuiEvent::AddTabWithConfig { pane_id, label, claude_session_id }) => {
+                // Web/server-initiated tab with a specific pane_id
+                // Create input channel — TUI and web input both flow through this
+                let (input_tx, input_rx) = mpsc::channel::<String>();
+                {
+                    let mut channels = input_channels.lock().unwrap();
+                    channels.insert(pane_id, input_tx);
+                }
+
+                // Notify TUI to add the tab visually
+                let _ = command_tx.send(TuiCommand::AddTab {
+                    pane_id,
+                    label: label.clone(),
+                });
+
+                let _ = output_tx.send(PaneOutput {
+                    text: format!("[New tab from web: {}]", label),
+                    pane_id,
+                });
+
+                // Spawn session thread
+                {
+                    let output_tx = output_tx.clone();
+                    let server_tx = server_tx.clone();
+                    let shutdown = shutdown.clone();
+                    let claude_path = claude_path.to_string();
+                    let working_dir = working_dir.to_string();
+                    thread::spawn(move || {
+                        run_pane_session(
+                            &claude_path, &working_dir, session_id, claude_session_id,
+                            pane_id, input_rx,
+                            output_tx, server_tx, shutdown,
+                        )
+                    });
+                }
+
+                // Send pane list update
+                let _ = server_tx.blocking_send(CliToServer::PaneList {
+                    session_id,
+                    panes: build_pane_list(&input_channels, session_id),
+                });
+            }
             Ok(TuiEvent::CloseTab(pane_id)) => {
                 // Remove input channel (causes session thread to exit)
                 {
@@ -1226,71 +1268,17 @@ async fn run_server_connection(
                                                 let _ = ws_sender.send(Message::Text(msg_text.into())).await;
                                             }
                                             ServerToCli::AddPane { session_id: _, pane_config } => {
-                                                let new_pane_id = pane_config.pane_id;
-                                                let label = pane_config.label.clone().unwrap_or_else(|| format!("Tab {}", new_pane_id));
-                                                let claude_session_id = pane_config.session_id;
-
-                                                // Create input channel
-                                                let (web_input_tx, web_input_rx) = mpsc::channel::<String>();
-                                                {
-                                                    let mut channels = input_channels.lock().unwrap();
-                                                    channels.insert(new_pane_id, web_input_tx);
-                                                }
-
-                                                let _ = status_tx.send(PaneOutput {
-                                                    text: format!("[New tab from web: {}]", label),
-                                                    pane_id: new_pane_id,
+                                                let label = pane_config.label.clone().unwrap_or_else(|| format!("Tab {}", pane_config.pane_id));
+                                                // Delegate to TUI event handler which has server_tx and can spawn the session thread
+                                                let _ = tui_event_tx.send(TuiEvent::AddTabWithConfig {
+                                                    pane_id: pane_config.pane_id,
+                                                    label,
+                                                    claude_session_id: pane_config.session_id,
                                                 });
-
-                                                // Notify TUI to add a tab
-                                                let _ = tui_event_tx.send(TuiEvent::AddTab);
-
-                                                // Spawn session thread
-                                                let (_, no_tui_rx) = mpsc::channel::<String>();
-                                                let output_tx = status_tx.clone();
-                                                let server_tx_clone = CliToServer::PaneList {
-                                                    session_id,
-                                                    panes: build_pane_list(&input_channels, session_id),
-                                                };
-                                                // Send pane list update
-                                                let pane_list_text = serde_json::to_string(&server_tx_clone).unwrap_or_default();
-                                                let _ = ws_sender.send(Message::Text(pane_list_text.into())).await;
-
-                                                // We can't easily spawn threads from here in async context,
-                                                // but we can send the event to the TUI event handler
-                                                // Actually, let's just spawn directly
-                                                let claude_path_clone = config_claude_path(working_dir);
-                                                let working_dir_clone = working_dir.to_string();
-                                                let shutdown_clone = shutdown.clone();
-                                                // We need to get server_tx but we only have output_rx...
-                                                // The server_tx is in the outer scope. We need a different approach.
-                                                // For now, dynamic panes spawned from web will just respond locally.
-                                                // Actually, we should spawn in the TUI event handler thread instead.
-                                                // Let's send a TuiEvent to handle this.
-                                                // The TuiEvent handler already handles AddTab but it creates its own pane_id.
-                                                // Let's not duplicate - the web-initiated AddPane is handled here.
-
-                                                // We'll need to handle this differently - skip spawning here
-                                                // and rely on the fact that the input channel is registered.
-                                                // The actual session thread spawn happens via a simpler mechanism.
                                             }
                                             ServerToCli::RemovePane { session_id: _, pane_id: remove_id } => {
-                                                {
-                                                    let mut channels = input_channels.lock().unwrap();
-                                                    channels.remove(&remove_id);
-                                                }
-                                                let _ = status_tx.send(PaneOutput {
-                                                    text: format!("[Tab {} removed from web]", remove_id),
-                                                    pane_id: remove_id,
-                                                });
-
-                                                // Send updated pane list
-                                                let pane_list = CliToServer::PaneList {
-                                                    session_id,
-                                                    panes: build_pane_list(&input_channels, session_id),
-                                                };
-                                                let msg_text = serde_json::to_string(&pane_list).unwrap_or_default();
-                                                let _ = ws_sender.send(Message::Text(msg_text.into())).await;
+                                                // Delegate to TUI event handler
+                                                let _ = tui_event_tx.send(TuiEvent::CloseTab(remove_id));
                                             }
                                             ServerToCli::RebootCli { .. } => {
                                                 reboot_requested.store(true, Ordering::SeqCst);
