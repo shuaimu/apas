@@ -31,9 +31,13 @@ const DEFAULT_PROMPT: &str = r#"Work on tasks defined in TODO.md. Do the followi
 5. Prepare for git commit, remove all temporary files, especially not to commit any binary files. For plan files, remove the implementation plan and keep the design rational and user manual and put it in the docs folder.
 6. Git commit the changes. First do git pull --rebase, and fix conflicts if any. Then do git push."#;
 
+/// Pane input: (text, from_tui). from_tui=true means input came from TUI keyboard,
+/// from_tui=false means it came from web (server already echoed it to web clients).
+type PaneInput = (String, bool);
+
 /// Per-pane input channel registry.
-/// Maps pane_id -> Sender<String> for routing input to the correct session thread.
-type InputChannels = Arc<Mutex<HashMap<u32, mpsc::Sender<String>>>>;
+/// Maps pane_id -> Sender<PaneInput> for routing input to the correct session thread.
+type InputChannels = Arc<Mutex<HashMap<u32, mpsc::Sender<PaneInput>>>>;
 
 /// Run in tab-based mode
 pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()> {
@@ -88,7 +92,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
 
     // Create per-pane input channel for the interactive pane
     // Both TUI and web input are routed through this single channel via input_channels
-    let (interactive_input_tx, interactive_input_rx) = mpsc::channel::<String>();
+    let (interactive_input_tx, interactive_input_rx) = mpsc::channel::<PaneInput>();
     {
         let mut channels = input_channels.lock().unwrap();
         channels.insert(shared::PANE_ID_INTERACTIVE, interactive_input_tx);
@@ -252,7 +256,7 @@ fn spawn_centralized_input_router(
                 Ok((pane_id, text)) => {
                     let channels = input_channels.lock().unwrap();
                     if let Some(tx) = channels.get(&pane_id) {
-                        let _ = tx.send(text);
+                        let _ = tx.send((text, true)); // from_tui=true
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -283,7 +287,7 @@ fn handle_tui_events(
                 let label = format!("Tab {}", pane_id);
 
                 // Create input channel — TUI and web input both flow through this
-                let (input_tx, input_rx) = mpsc::channel::<String>();
+                let (input_tx, input_rx) = mpsc::channel::<PaneInput>();
                 {
                     let mut channels = input_channels.lock().unwrap();
                     channels.insert(pane_id, input_tx);
@@ -325,7 +329,7 @@ fn handle_tui_events(
             Ok(TuiEvent::AddTabWithConfig { pane_id, label, claude_session_id }) => {
                 // Web/server-initiated tab with a specific pane_id
                 // Create input channel — TUI and web input both flow through this
-                let (input_tx, input_rx) = mpsc::channel::<String>();
+                let (input_tx, input_rx) = mpsc::channel::<PaneInput>();
                 {
                     let mut channels = input_channels.lock().unwrap();
                     channels.insert(pane_id, input_tx);
@@ -795,7 +799,7 @@ fn run_pane_session(
     session_id: Uuid,
     claude_session_id: Uuid,
     pane_id: u32,
-    input_rx: mpsc::Receiver<String>,
+    input_rx: mpsc::Receiver<PaneInput>,
     output_tx: mpsc::Sender<PaneOutput>,
     server_tx: tokio_mpsc::Sender<CliToServer>,
     shutdown: Arc<AtomicBool>,
@@ -810,7 +814,7 @@ fn run_pane_session(
 
     while !shutdown.load(Ordering::SeqCst) {
         // Wait for user input (from TUI or web, both routed through same channel)
-        let prompt = {
+        let (prompt, from_tui) = {
             match input_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(p) => p,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -841,13 +845,16 @@ fn run_pane_session(
             status: Some("Thinking...".to_string()),
         });
 
-        // Forward input to server (for web UI display)
-        let _ = server_tx.blocking_send(CliToServer::UserInput {
-            session_id,
-            text: prompt.clone(),
-            pane_type: Some(PaneType::Interactive),
-            pane_id: Some(pane_id),
-        });
+        // Forward TUI input to server (for web UI display).
+        // Web-originated input is already echoed by the server, so skip to avoid duplicates.
+        if from_tui {
+            let _ = server_tx.blocking_send(CliToServer::UserInput {
+                session_id,
+                text: prompt.clone(),
+                pane_type: Some(PaneType::Interactive),
+                pane_id: Some(pane_id),
+            });
+        }
 
         let (args, using_resume) = if first_message && try_resume_first {
             (vec![
@@ -1226,15 +1233,15 @@ async fn run_server_connection(
                                     if let Ok(server_msg) = serde_json::from_str::<ServerToCli>(&text) {
                                         match server_msg {
                                             ServerToCli::Input { session_id: _, data, pane_id } => {
-                                                // Route to the correct pane
+                                                // Route to the correct pane (from_tui=false: web-originated)
                                                 let target_pane = pane_id.unwrap_or(shared::PANE_ID_INTERACTIVE);
                                                 let channels = input_channels.lock().unwrap();
                                                 if let Some(tx) = channels.get(&target_pane) {
-                                                    let _ = tx.send(data);
+                                                    let _ = tx.send((data, false));
                                                 } else {
                                                     // Fallback to interactive
                                                     if let Some(tx) = channels.get(&shared::PANE_ID_INTERACTIVE) {
-                                                        let _ = tx.send(data);
+                                                        let _ = tx.send((data, false));
                                                     }
                                                 }
                                             }
