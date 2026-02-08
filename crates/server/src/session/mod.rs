@@ -24,7 +24,8 @@ pub struct SessionState {
     pub session_id: Uuid,
     pub user_id: Uuid,
     pub cli_client_id: Option<Uuid>,
-    pub web_connection_id: Option<Uuid>,
+    /// All web clients currently viewing this session
+    pub web_connection_ids: Vec<Uuid>,
     pub is_paused: bool,
 }
 
@@ -74,11 +75,9 @@ impl SessionManager {
 
     pub fn unregister_web(&self, connection_id: &Uuid) {
         self.web_senders.remove(connection_id);
-        // Find and update any sessions using this web connection
+        // Remove this connection from any sessions it was viewing
         for mut session in self.sessions.iter_mut() {
-            if session.web_connection_id == Some(*connection_id) {
-                session.web_connection_id = None;
-            }
+            session.web_connection_ids.retain(|id| id != connection_id);
         }
         tracing::info!("Web client unregistered: {}", connection_id);
     }
@@ -89,7 +88,7 @@ impl SessionManager {
             session_id,
             user_id,
             cli_client_id: None,
-            web_connection_id: Some(web_connection_id),
+            web_connection_ids: vec![web_connection_id],
             is_paused: false,
         };
         self.sessions.insert(session_id, state);
@@ -110,22 +109,22 @@ impl SessionManager {
     }
 
     /// Create or update a CLI-initiated session (hybrid mode)
-    /// Preserves web_connection_id if session already exists (for reconnection)
+    /// Preserves web connections if session already exists (for reconnection)
     pub fn create_cli_session(&self, session_id: Uuid, cli_id: Uuid) {
-        // Check if session already exists (preserve web connection)
+        // Check if session already exists (preserve web connections)
         if let Some(mut existing) = self.sessions.get_mut(&session_id) {
             let old_cli_id = existing.cli_client_id;
             existing.cli_client_id = Some(cli_id);
             tracing::info!(
-                "CLI session {} updated: cli {:?} -> {} (web: {:?})",
-                session_id, old_cli_id, cli_id, existing.web_connection_id
+                "CLI session {} updated: cli {:?} -> {} (web viewers: {})",
+                session_id, old_cli_id, cli_id, existing.web_connection_ids.len()
             );
         } else {
             let state = SessionState {
                 session_id,
                 user_id: Uuid::nil(), // No user for CLI-initiated sessions
                 cli_client_id: Some(cli_id),
-                web_connection_id: None,
+                web_connection_ids: Vec::new(),
                 is_paused: false,
             };
             self.sessions.insert(session_id, state);
@@ -146,12 +145,15 @@ impl SessionManager {
     /// If the session doesn't exist in memory, creates it (for reconnection scenarios)
     pub fn attach_web_to_session(&self, session_id: &Uuid, web_connection_id: Uuid, cli_client_id: Option<Uuid>) -> bool {
         if let Some(mut session) = self.sessions.get_mut(session_id) {
-            session.web_connection_id = Some(web_connection_id);
+            // Add this web client if not already attached
+            if !session.web_connection_ids.contains(&web_connection_id) {
+                session.web_connection_ids.push(web_connection_id);
+            }
             // Update CLI client ID if provided (for reconnection)
             if let Some(cli_id) = cli_client_id {
                 session.cli_client_id = Some(cli_id);
             }
-            tracing::info!("Web client {} attached to session {}", web_connection_id, session_id);
+            tracing::info!("Web client {} attached to session {} (total viewers: {})", web_connection_id, session_id, session.web_connection_ids.len());
             return true;
         }
 
@@ -161,7 +163,7 @@ impl SessionManager {
             session_id: *session_id,
             user_id: Uuid::nil(), // Will be updated when needed
             cli_client_id,
-            web_connection_id: Some(web_connection_id),
+            web_connection_ids: vec![web_connection_id],
             is_paused: false,
         };
         self.sessions.insert(*session_id, state);
@@ -198,7 +200,7 @@ impl SessionManager {
             session_id: s.session_id,
             user_id: s.user_id,
             cli_client_id: s.cli_client_id,
-            web_connection_id: s.web_connection_id,
+            web_connection_ids: s.web_connection_ids.clone(),
             is_paused: s.is_paused,
         })
     }
@@ -274,12 +276,20 @@ impl SessionManager {
 
     pub async fn route_to_web(&self, session_id: &Uuid, msg: ServerToWeb) -> bool {
         if let Some(session) = self.sessions.get(session_id) {
-            if let Some(web_id) = session.web_connection_id {
-                tracing::debug!("Routing message to web client {} for session {}", web_id, session_id);
-                return self.send_to_web(&web_id, msg).await;
-            } else {
-                tracing::debug!("No web client attached to session {}", session_id);
+            if session.web_connection_ids.is_empty() {
+                tracing::debug!("No web clients attached to session {}", session_id);
+                return false;
             }
+            let web_ids = session.web_connection_ids.clone();
+            drop(session); // Release lock before sending
+            let mut any_sent = false;
+            for web_id in &web_ids {
+                tracing::debug!("Routing message to web client {} for session {}", web_id, session_id);
+                if self.send_to_web(web_id, msg.clone()).await {
+                    any_sent = true;
+                }
+            }
+            return any_sent;
         } else {
             tracing::debug!("Session {} not found for routing", session_id);
         }

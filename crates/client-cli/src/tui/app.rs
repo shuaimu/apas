@@ -1,6 +1,9 @@
-//! Main TUI application for dual-pane mode
+//! Tab-based TUI application
+//!
+//! Supports N tabs, each with its own output buffer, scroll state, and input.
+//! Only the active tab is rendered. Tab bar at top, status bar at bottom.
 
-use std::io::{self, Stdout};
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -16,42 +19,65 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-/// Output message for a pane
+/// Output message routed by pane_id
 #[derive(Debug, Clone)]
 pub struct PaneOutput {
     pub text: String,
-    pub is_deadloop: bool,
+    pub pane_id: u32,
 }
 
-/// Focus state for input
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Focus {
-    Deadloop,
-    Interactive,
+/// Per-tab state
+struct TabState {
+    pane_id: u32,
+    label: String,
+    output: Vec<String>,
+    input: String,
+    scroll: u16,
+    auto_scroll: bool,
+}
+
+impl TabState {
+    fn new(pane_id: u32, label: String) -> Self {
+        let init_msg = format!("[{} initialized]", label);
+        Self {
+            pane_id,
+            label,
+            output: vec![init_msg],
+            input: String::new(),
+            scroll: 0,
+            auto_scroll: true,
+        }
+    }
+}
+
+/// Callback for tab management events from the TUI
+#[derive(Debug, Clone)]
+pub enum TuiEvent {
+    AddTab,
+    CloseTab(u32),
+}
+
+/// Commands sent back to the TUI from event handlers
+#[derive(Debug)]
+pub enum TuiCommand {
+    AddTab { pane_id: u32, label: String },
+    RemoveTab { pane_id: u32 },
 }
 
 /// Main TUI application state
 pub struct App {
-    /// Left pane output lines
-    deadloop_output: Vec<String>,
-    /// Right pane output lines
-    interactive_output: Vec<String>,
-    /// Current input text (for interactive pane)
-    input: String,
-    /// Which pane is focused
-    focus: Focus,
-    /// Scroll offset for deadloop pane
-    deadloop_scroll: u16,
-    /// Scroll offset for interactive pane
-    interactive_scroll: u16,
-    /// Auto-scroll enabled for deadloop pane
-    deadloop_auto_scroll: bool,
-    /// Auto-scroll enabled for interactive pane
-    interactive_auto_scroll: bool,
-    /// Channel to send user input
-    input_tx: Sender<String>,
+    /// All tabs, keyed by pane_id
+    tabs: Vec<TabState>,
+    /// Index of active tab in `tabs` vec
+    active_tab: usize,
+    /// Channel to send user input (with pane_id)
+    input_tx: Sender<(u32, String)>,
     /// Channel to receive output
     output_rx: Receiver<PaneOutput>,
+    /// Channel to send tab management events
+    event_tx: Sender<TuiEvent>,
+    /// Channel to receive commands (add/remove tabs from event handler)
+    command_rx: Receiver<TuiCommand>,
     /// Whether to quit
     should_quit: bool,
     /// Shared shutdown flag (from main)
@@ -60,18 +86,25 @@ pub struct App {
 
 impl App {
     /// Create a new App with channels for I/O
-    pub fn new(input_tx: Sender<String>, output_rx: Receiver<PaneOutput>) -> Self {
+    pub fn new(
+        input_tx: Sender<(u32, String)>,
+        output_rx: Receiver<PaneOutput>,
+        event_tx: Sender<TuiEvent>,
+        command_rx: Receiver<TuiCommand>,
+        initial_tabs: Vec<(u32, String)>,
+    ) -> Self {
+        let tabs: Vec<TabState> = initial_tabs
+            .into_iter()
+            .map(|(id, label)| TabState::new(id, label))
+            .collect();
+
         Self {
-            deadloop_output: vec!["[Deadloop - Autonomous Worker]".to_string()],
-            interactive_output: vec!["[Interactive - Press Enter to send]".to_string()],
-            input: String::new(),
-            focus: Focus::Interactive,
-            deadloop_scroll: 0,
-            interactive_scroll: 0,
-            deadloop_auto_scroll: true,
-            interactive_auto_scroll: true,
+            tabs,
+            active_tab: 0,
             input_tx,
             output_rx,
+            event_tx,
+            command_rx,
             should_quit: false,
             shutdown: None,
         }
@@ -81,6 +114,28 @@ impl App {
     pub fn with_shutdown(mut self, shutdown: Arc<AtomicBool>) -> Self {
         self.shutdown = Some(shutdown);
         self
+    }
+
+    /// Add a new tab dynamically (called from outside the TUI loop)
+    pub fn add_tab(&mut self, pane_id: u32, label: String) {
+        // Don't add duplicate
+        if self.tabs.iter().any(|t| t.pane_id == pane_id) {
+            return;
+        }
+        self.tabs.push(TabState::new(pane_id, label));
+    }
+
+    /// Remove a tab dynamically
+    pub fn remove_tab(&mut self, pane_id: u32) {
+        if let Some(idx) = self.tabs.iter().position(|t| t.pane_id == pane_id) {
+            self.tabs.remove(idx);
+            // Adjust active_tab if needed
+            if self.tabs.is_empty() {
+                self.active_tab = 0;
+            } else if self.active_tab >= self.tabs.len() {
+                self.active_tab = self.tabs.len() - 1;
+            }
+        }
     }
 
     /// Check if shutdown has been requested
@@ -93,22 +148,17 @@ impl App {
 
     /// Run the TUI main loop
     pub fn run(&mut self) -> io::Result<()> {
-        // Setup terminal
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
-        // Main loop - check both local should_quit and shared shutdown flag
         while !self.should_quit && !self.is_shutdown() {
-            // Process any pending output
+            self.process_commands();
             self.process_output();
-
-            // Draw UI
             terminal.draw(|f| self.draw(f))?;
 
-            // Handle input with timeout
             if event::poll(Duration::from_millis(50))? {
                 if let Event::Key(key) = event::read()? {
                     self.handle_key(key.code, key.modifiers);
@@ -116,114 +166,137 @@ impl App {
             }
         }
 
-        // Restore terminal
         disable_raw_mode()?;
         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
         Ok(())
     }
 
-    /// Process pending output from channel
-    fn process_output(&mut self) {
-        while let Ok(output) = self.output_rx.try_recv() {
-            if output.is_deadloop {
-                self.deadloop_output.push(output.text);
-                // Auto-scroll to bottom when enabled
-                if self.deadloop_auto_scroll {
-                    // Set to max value - rendering will clamp to actual content
-                    self.deadloop_scroll = u16::MAX;
+    /// Process pending commands (add/remove tabs from event handler)
+    fn process_commands(&mut self) {
+        while let Ok(cmd) = self.command_rx.try_recv() {
+            match cmd {
+                TuiCommand::AddTab { pane_id, label } => {
+                    self.add_tab(pane_id, label);
+                    // Switch to newly created tab
+                    self.active_tab = self.tabs.len() - 1;
                 }
-            } else {
-                self.interactive_output.push(output.text);
-                // Auto-scroll to bottom when enabled
-                if self.interactive_auto_scroll {
-                    self.interactive_scroll = u16::MAX;
+                TuiCommand::RemoveTab { pane_id } => {
+                    self.remove_tab(pane_id);
                 }
             }
         }
     }
 
+    /// Process pending output from channel
+    fn process_output(&mut self) {
+        while let Ok(output) = self.output_rx.try_recv() {
+            // Find the tab for this pane_id
+            if let Some(tab) = self.tabs.iter_mut().find(|t| t.pane_id == output.pane_id) {
+                tab.output.push(output.text);
+                if tab.auto_scroll {
+                    tab.scroll = u16::MAX;
+                }
+            }
+            // If no tab found, output is silently dropped (pane may have been closed)
+        }
+    }
+
     /// Handle keyboard input
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
-        // Global shortcuts
+        // Global shortcuts (Ctrl+*)
         if modifiers.contains(KeyModifiers::CONTROL) {
             match code {
                 KeyCode::Char('c') => {
                     self.should_quit = true;
                 }
-                KeyCode::Char('l') => {
-                    self.focus = Focus::Deadloop;
+                KeyCode::Char('t') => {
+                    // Create new tab
+                    let _ = self.event_tx.send(TuiEvent::AddTab);
                 }
-                KeyCode::Char('r') => {
-                    self.focus = Focus::Interactive;
+                KeyCode::Char('w') => {
+                    // Close current tab (only if more than 1 tab)
+                    if self.tabs.len() > 1 {
+                        if let Some(tab) = self.tabs.get(self.active_tab) {
+                            let pane_id = tab.pane_id;
+                            let _ = self.event_tx.send(TuiEvent::CloseTab(pane_id));
+                        }
+                    }
                 }
                 _ => {}
             }
             return;
         }
 
-        // Input handling (only in interactive focus)
-        if self.focus == Focus::Interactive {
+        // Tab switching with Alt+number or Tab/Shift+Tab
+        if modifiers.contains(KeyModifiers::ALT) {
+            if let KeyCode::Char(c) = code {
+                if let Some(digit) = c.to_digit(10) {
+                    let idx = if digit == 0 { 9 } else { (digit - 1) as usize };
+                    if idx < self.tabs.len() {
+                        self.active_tab = idx;
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Tab/Shift+Tab to cycle tabs
+        match code {
+            KeyCode::BackTab => {
+                // Shift+Tab: previous tab
+                if !self.tabs.is_empty() {
+                    if self.active_tab == 0 {
+                        self.active_tab = self.tabs.len() - 1;
+                    } else {
+                        self.active_tab -= 1;
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        // Active tab input
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             match code {
+                KeyCode::Tab => {
+                    // Next tab
+                    if !self.tabs.is_empty() {
+                        self.active_tab = (self.active_tab + 1) % self.tabs.len();
+                    }
+                }
                 KeyCode::Enter => {
-                    if !self.input.is_empty() {
-                        let input = std::mem::take(&mut self.input);
-                        // Don't display here - run_interactive_session will display it
-                        let _ = self.input_tx.send(input);
+                    if !tab.input.is_empty() {
+                        let input = std::mem::take(&mut tab.input);
+                        let _ = self.input_tx.send((tab.pane_id, input));
                     }
                 }
                 KeyCode::Char(c) => {
-                    self.input.push(c);
+                    tab.input.push(c);
                 }
                 KeyCode::Backspace => {
-                    self.input.pop();
+                    tab.input.pop();
                 }
                 KeyCode::Up => {
-                    // Scrolling up disables auto-scroll
-                    self.interactive_auto_scroll = false;
-                    self.interactive_scroll = self.interactive_scroll.saturating_sub(1);
+                    tab.auto_scroll = false;
+                    tab.scroll = tab.scroll.saturating_sub(1);
                 }
                 KeyCode::Down => {
-                    self.interactive_scroll = self.interactive_scroll.saturating_add(1);
+                    tab.scroll = tab.scroll.saturating_add(1);
                 }
                 KeyCode::PageUp => {
-                    self.interactive_auto_scroll = false;
-                    self.interactive_scroll = self.interactive_scroll.saturating_sub(20);
+                    tab.auto_scroll = false;
+                    tab.scroll = tab.scroll.saturating_sub(20);
                 }
                 KeyCode::PageDown => {
-                    self.interactive_scroll = self.interactive_scroll.saturating_add(20);
+                    tab.scroll = tab.scroll.saturating_add(20);
                 }
                 KeyCode::End => {
-                    // End key re-enables auto-scroll and jumps to bottom
-                    self.interactive_auto_scroll = true;
-                    self.interactive_scroll = u16::MAX;
+                    tab.auto_scroll = true;
+                    tab.scroll = u16::MAX;
                 }
                 KeyCode::Esc => {
-                    self.input.clear();
-                }
-                _ => {}
-            }
-        } else {
-            // Scroll controls for deadloop pane
-            match code {
-                KeyCode::Up => {
-                    // Scrolling up disables auto-scroll
-                    self.deadloop_auto_scroll = false;
-                    self.deadloop_scroll = self.deadloop_scroll.saturating_sub(1);
-                }
-                KeyCode::Down => {
-                    self.deadloop_scroll = self.deadloop_scroll.saturating_add(1);
-                }
-                KeyCode::PageUp => {
-                    self.deadloop_auto_scroll = false;
-                    self.deadloop_scroll = self.deadloop_scroll.saturating_sub(20);
-                }
-                KeyCode::PageDown => {
-                    self.deadloop_scroll = self.deadloop_scroll.saturating_add(20);
-                }
-                KeyCode::End => {
-                    // End key re-enables auto-scroll and jumps to bottom
-                    self.deadloop_auto_scroll = true;
-                    self.deadloop_scroll = u16::MAX;
+                    tab.input.clear();
                 }
                 _ => {}
             }
@@ -234,184 +307,166 @@ impl App {
     fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
 
-        // Split into status bar and main content
-        let main_layout = Layout::default()
+        // Layout: tab bar (1 line) + content + status bar (1 line)
+        let layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(1), // Tab bar
+                Constraint::Min(0),    // Content
+                Constraint::Length(1), // Status bar
+            ])
             .split(area);
 
-        // Split main content into two panes
-        let panes = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(main_layout[0]);
-
-        // Draw left pane (deadloop)
-        self.draw_deadloop_pane(frame, panes[0]);
-
-        // Draw right pane (interactive)
-        self.draw_interactive_pane(frame, panes[1]);
-
-        // Draw status bar
-        self.draw_status_bar(frame, main_layout[1]);
+        self.draw_tab_bar(frame, layout[0]);
+        self.draw_active_tab(frame, layout[1]);
+        self.draw_status_bar(frame, layout[2]);
     }
 
-    /// Draw the deadloop (left) pane
-    fn draw_deadloop_pane(&mut self, frame: &mut Frame, area: Rect) {
-        let border_style = if self.focus == Focus::Deadloop {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
+    /// Draw the tab bar
+    fn draw_tab_bar(&self, frame: &mut Frame, area: Rect) {
+        let mut spans = Vec::new();
 
+        for (i, tab) in self.tabs.iter().enumerate() {
+            let is_active = i == self.active_tab;
+
+            // Tab number prefix
+            let num = format!(" {}:", i + 1);
+
+            if is_active {
+                spans.push(Span::styled(
+                    num,
+                    Style::default().fg(Color::Black).bg(Color::White).bold(),
+                ));
+                spans.push(Span::styled(
+                    format!("{} ", tab.label),
+                    Style::default().fg(Color::Black).bg(Color::White).bold(),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    num,
+                    Style::default().fg(Color::Gray),
+                ));
+                spans.push(Span::styled(
+                    format!("{} ", tab.label),
+                    Style::default().fg(Color::Gray),
+                ));
+            }
+
+            // Separator
+            spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+        }
+
+        // Add "+" hint
+        spans.push(Span::styled(" + ", Style::default().fg(Color::DarkGray)));
+
+        let line = Line::from(spans);
+        let paragraph = Paragraph::new(line)
+            .style(Style::default().bg(Color::DarkGray));
+        frame.render_widget(paragraph, area);
+    }
+
+    /// Draw the active tab's content
+    fn draw_active_tab(&mut self, frame: &mut Frame, area: Rect) {
+        if self.tabs.is_empty() {
+            let paragraph = Paragraph::new("No tabs open. Press Ctrl+T to create one.")
+                .style(Style::default().fg(Color::Gray));
+            frame.render_widget(paragraph, area);
+            return;
+        }
+
+        let tab = &mut self.tabs[self.active_tab];
+
+        let border_style = Style::default().fg(Color::Cyan);
         let block = Block::default()
-            .title(" Deadloop (Ctrl+L) ")
+            .title(format!(" {} ", tab.label))
             .borders(Borders::ALL)
             .border_style(border_style);
 
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        // Calculate wrapped line count (accounts for text wrapping)
-        let viewport_width = inner.width as usize;
-        let content_lines: u16 = self.deadloop_output.iter()
-            .map(|line| {
-                if line.is_empty() || viewport_width == 0 {
-                    1
-                } else {
-                    // Calculate how many visual lines this logical line takes
-                    ((line.chars().count() + viewport_width - 1) / viewport_width).max(1) as u16
-                }
-            })
-            .sum();
-
-        let viewport_height = inner.height;
-        let max_scroll = content_lines.saturating_sub(viewport_height);
-
-        // Calculate scroll position
-        let scroll = if self.deadloop_auto_scroll {
-            // Auto-scroll: always show bottom
-            self.deadloop_scroll = max_scroll;
-            max_scroll
-        } else {
-            // Manual scroll: clamp to valid range
-            self.deadloop_scroll = self.deadloop_scroll.min(max_scroll);
-            self.deadloop_scroll
-        };
-
-        // Render output
-        let output_text = self.deadloop_output.join("\n");
-        let paragraph = Paragraph::new(output_text)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0));
-        frame.render_widget(paragraph, inner);
-    }
-
-    /// Draw the interactive (right) pane
-    fn draw_interactive_pane(&mut self, frame: &mut Frame, area: Rect) {
-        let border_style = if self.focus == Focus::Interactive {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-
-        let block = Block::default()
-            .title(" Interactive (Ctrl+R) ")
-            .borders(Borders::ALL)
-            .border_style(border_style);
-
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-
-        // Split inner area for output and input
-        let layout = Layout::default()
+        // Split inner area: output + input box
+        let content_layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(0), Constraint::Length(3)])
             .split(inner);
 
-        // Calculate wrapped line count (accounts for text wrapping)
-        let viewport_width = layout[0].width as usize;
-        let content_lines: u16 = self.interactive_output.iter()
+        // --- Output area ---
+        let viewport_width = content_layout[0].width as usize;
+        let content_lines: u16 = tab.output.iter()
             .map(|line| {
                 if line.is_empty() || viewport_width == 0 {
                     1
                 } else {
-                    // Calculate how many visual lines this logical line takes
                     ((line.chars().count() + viewport_width - 1) / viewport_width).max(1) as u16
                 }
             })
             .sum();
 
-        let viewport_height = layout[0].height;
+        let viewport_height = content_layout[0].height;
         let max_scroll = content_lines.saturating_sub(viewport_height);
 
-        // Calculate scroll position
-        let scroll = if self.interactive_auto_scroll {
-            // Auto-scroll: always show bottom
-            self.interactive_scroll = max_scroll;
+        let scroll = if tab.auto_scroll {
+            tab.scroll = max_scroll;
             max_scroll
         } else {
-            // Manual scroll: clamp to valid range
-            self.interactive_scroll = self.interactive_scroll.min(max_scroll);
-            self.interactive_scroll
+            tab.scroll = tab.scroll.min(max_scroll);
+            tab.scroll
         };
 
-        // Render output
-        let output_text = self.interactive_output.join("\n");
+        let output_text = tab.output.join("\n");
         let paragraph = Paragraph::new(output_text)
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0));
-        frame.render_widget(paragraph, layout[0]);
+        frame.render_widget(paragraph, content_layout[0]);
 
-        // Render input area
+        // --- Input area ---
         let input_block = Block::default()
             .title(" Input ")
             .borders(Borders::ALL)
-            .border_style(if self.focus == Focus::Interactive {
-                Style::default().fg(Color::Green)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            });
+            .border_style(Style::default().fg(Color::Green));
 
-        let input_inner = input_block.inner(layout[1]);
-        frame.render_widget(input_block, layout[1]);
+        let input_inner = input_block.inner(content_layout[1]);
+        frame.render_widget(input_block, content_layout[1]);
 
-        let input_text = format!("{}_", self.input);
+        let input_text = format!("{}_", tab.input);
         let input_paragraph = Paragraph::new(input_text);
         frame.render_widget(input_paragraph, input_inner);
     }
 
     /// Draw the status bar
     fn draw_status_bar(&self, frame: &mut Frame, area: Rect) {
-        let focus_text = match self.focus {
-            Focus::Deadloop => "DEADLOOP",
-            Focus::Interactive => "INTERACTIVE",
+        let tab_info = if let Some(tab) = self.tabs.get(self.active_tab) {
+            format!("{} ({})", tab.label, tab.pane_id)
+        } else {
+            "No tabs".to_string()
         };
 
         let status = format!(
-            " Focus: {} | Ctrl+L/R: Switch | PgUp/PgDn: Scroll | End: Auto-scroll | Ctrl+C: Quit ",
-            focus_text
+            " Tab: {} | Tab/Shift+Tab: Switch | Alt+N: Go to tab | Ctrl+T: New | Ctrl+W: Close | Ctrl+C: Quit ",
+            tab_info
         );
 
         let paragraph = Paragraph::new(status)
             .style(Style::default().bg(Color::DarkGray).fg(Color::White));
         frame.render_widget(paragraph, area);
     }
-
-    /// Add output to deadloop pane
-    pub fn add_deadloop_output(&mut self, text: String) {
-        self.deadloop_output.push(text);
-    }
-
-    /// Add output to interactive pane
-    pub fn add_interactive_output(&mut self, text: String) {
-        self.interactive_output.push(text);
-    }
 }
 
 /// Create channels for TUI communication
-pub fn create_channels() -> (Sender<String>, Receiver<String>, Sender<PaneOutput>, Receiver<PaneOutput>) {
+pub fn create_channels() -> (
+    Sender<(u32, String)>,    // input_tx: (pane_id, text)
+    Receiver<(u32, String)>,  // input_rx
+    Sender<PaneOutput>,       // output_tx
+    Receiver<PaneOutput>,     // output_rx
+    Sender<TuiEvent>,         // event_tx
+    Receiver<TuiEvent>,       // event_rx
+    Sender<TuiCommand>,       // command_tx
+    Receiver<TuiCommand>,     // command_rx
+) {
     let (input_tx, input_rx) = mpsc::channel();
     let (output_tx, output_rx) = mpsc::channel();
-    (input_tx, input_rx, output_tx, output_rx)
+    let (event_tx, event_rx) = mpsc::channel();
+    let (command_tx, command_rx) = mpsc::channel();
+    (input_tx, input_rx, output_tx, output_rx, event_tx, event_rx, command_tx, command_rx)
 }

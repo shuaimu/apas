@@ -68,6 +68,45 @@ export type OutputType =
 
 export type PaneType = "deadloop" | "interactive";
 
+export interface PaneConfig {
+  pane_id: number;
+  provider: "claude" | "codex";
+  mode: "deadloop" | "interactive";
+  session_id: string;
+  is_paused: boolean;
+  prompt?: string;
+  label?: string;
+}
+
+// Legacy pane_id constants (must match shared::PANE_ID_DEADLOOP / PANE_ID_INTERACTIVE)
+export const PANE_ID_DEADLOOP = 1;
+export const PANE_ID_INTERACTIVE = 2;
+
+// Map legacy pane_type string to numeric pane_id
+function normalizePaneId(paneType: string | undefined, paneId: number | undefined): number | undefined {
+  if (paneId != null) return paneId;
+  if (!paneType) return undefined;
+  if (paneType === "deadloop") return PANE_ID_DEADLOOP;
+  if (paneType === "interactive") return PANE_ID_INTERACTIVE;
+  // Try parsing as number (for stored messages with numeric string pane_type)
+  const parsed = parseInt(paneType, 10);
+  if (!isNaN(parsed)) return parsed;
+  return undefined;
+}
+
+// Reverse map: numeric pane_id to legacy pane_type for wire compat
+function legacyPaneType(paneId: number | undefined): string | undefined {
+  if (paneId == null) return undefined;
+  if (paneId === PANE_ID_DEADLOOP) return "deadloop";
+  if (paneId === PANE_ID_INTERACTIVE) return "interactive";
+  return undefined;
+}
+
+// Convert pane_id to string key for use in Record<string, ...>
+export function paneKey(paneId: number): string {
+  return String(paneId);
+}
+
 interface AppState {
   // Auth state
   token: string | null;
@@ -91,23 +130,26 @@ interface AppState {
   // Persisted sessions
   sessions: SessionInfo[];
 
-  // Messages (single pane mode)
+  // Messages (single pane mode / fallback)
   messages: Message[];
-  hasMoreMessages: boolean; // Whether there are older messages to load
-  isLoadingMore: boolean; // Prevent multiple simultaneous loads
+  hasMoreMessages: boolean;
+  isLoadingMore: boolean;
 
-  // Dual pane mode
+  // Dynamic pane state
   isDualPane: boolean;
+  paneConfigs: PaneConfig[];
+  paneMessages: Record<string, Message[]>;
+  paneHasMore: Record<string, boolean>;
+  paneStatuses: Record<string, string | null>;
+  pausedPanes: number[]; // pane_ids that are paused
+  loadingMorePane: number | null;
+
+  // Legacy compat (derived from dynamic state)
   deadloopMessages: Message[];
   interactiveMessages: Message[];
-  hasMoreDeadloop: boolean; // Per-pane hasMore for deadloop
-  hasMoreInteractive: boolean; // Per-pane hasMore for interactive
-  loadingMorePane: PaneType | null; // Which pane is loading more
-
-  // Deadloop control
+  hasMoreDeadloop: boolean;
+  hasMoreInteractive: boolean;
   isDeadloopPaused: boolean;
-
-  // Pane status (for status bar)
   interactiveStatus: string | null;
   deadloopStatus: string | null;
 
@@ -131,14 +173,18 @@ interface AppState {
   refreshCliClients: () => void;
   listSessions: () => void;
   loadSessionMessages: (sessionId: string) => void;
-  loadMoreMessages: (paneType?: PaneType) => void; // Load older messages for a specific pane
-  prependMessages: (messages: Message[], hasMore: boolean) => void; // Prepend older messages
-  sendMessageToPane: (text: string, pane: PaneType) => { success: boolean; error?: string }; // Send to specific pane
-  addMessageToPane: (message: Message, pane: PaneType) => void; // Add message to specific pane
+  loadMoreMessages: (paneType?: PaneType) => void;
+  prependMessages: (messages: Message[], hasMore: boolean) => void;
+  sendMessageToPane: (text: string, pane: PaneType | number) => { success: boolean; error?: string };
+  addMessageToPane: (message: Message, pane: PaneType | number) => void;
   startAutoRefresh: () => void;
   stopAutoRefresh: () => void;
   pauseDeadloop: () => void;
   resumeDeadloop: () => void;
+  pausePane: (paneId: number) => void;
+  resumePane: (paneId: number) => void;
+  addPane: (provider: string, mode: string, label?: string, prompt?: string) => void;
+  removePane: (paneId: number) => void;
   rebootCli: () => void;
   downloadSession: () => void;
 }
@@ -168,11 +214,17 @@ export const useStore = create<AppState>((set, get) => ({
   hasMoreMessages: false,
   isLoadingMore: false,
   isDualPane: false,
+  paneConfigs: [],
+  paneMessages: {},
+  paneHasMore: {},
+  paneStatuses: {},
+  pausedPanes: [],
+  loadingMorePane: null,
+  // Legacy compat getters (populated from dynamic state)
   deadloopMessages: [],
   interactiveMessages: [],
   hasMoreDeadloop: false,
   hasMoreInteractive: false,
-  loadingMorePane: null,
   isDeadloopPaused: false,
   interactiveStatus: null,
   deadloopStatus: null,
@@ -256,12 +308,10 @@ export const useStore = create<AppState>((set, get) => ({
       set({ connected: false, ws: null, cliClients: [], isAttached: false });
 
       // Auto-reconnect with exponential backoff (unless intentionally disconnected)
-      // Code 1000 = normal close (intentional), 1001 = going away
       if (event.code !== 1000) {
         const { reconnectAttempts } = get();
         const maxAttempts = 10;
         if (reconnectAttempts < maxAttempts) {
-          // Exponential backoff: 1s, 2s, 4s, 8s, 16s, max 30s
           const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
           console.log(`Scheduling reconnect attempt ${reconnectAttempts + 1} in ${delay}ms`);
           const timeout = setTimeout(() => {
@@ -286,20 +336,14 @@ export const useStore = create<AppState>((set, get) => ({
         if (document.visibilityState === 'visible') {
           const { ws, connected, sessionId, isAttached } = get();
           console.log("App became visible, checking connection...", { connected, isAttached, sessionId });
-          // If not connected or WebSocket is not open, reconnect
           if (!connected || !ws || ws.readyState !== WebSocket.OPEN) {
             console.log("Connection lost while in background, reconnecting...");
-            // Reset reconnect attempts for immediate reconnect
             set({ reconnectAttempts: 0 });
             get().connect();
           } else {
-            // Connection appears healthy, refresh data
             console.log("Connection appears healthy, refreshing data...");
             get().refreshCliClients();
             get().listSessions();
-
-            // If we have a session but lost attachment, re-attach
-            // This handles the case where connection stayed open but server-side state was lost
             if (sessionId && !isAttached) {
               console.log("Session exists but not attached, re-attaching...");
               get().attachSession(sessionId);
@@ -318,18 +362,16 @@ export const useStore = create<AppState>((set, get) => ({
     const { ws, reconnectTimeout, visibilityHandler } = get();
     get().stopAutoRefresh();
 
-    // Clear reconnect timeout
     if (reconnectTimeout) {
       clearTimeout(reconnectTimeout);
     }
 
-    // Remove visibility handler
     if (visibilityHandler && typeof document !== 'undefined') {
       document.removeEventListener('visibilitychange', visibilityHandler);
     }
 
     if (ws) {
-      ws.close(1000, "User disconnected"); // 1000 = normal close, prevents auto-reconnect
+      ws.close(1000, "User disconnected");
     }
     set({
       connected: false,
@@ -350,10 +392,8 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
 
-    // Clear previous messages
     set({ messages: [], sessionId: null });
 
-    // Request new session
     ws.send(JSON.stringify({
       type: "start_session",
       cli_client_id: cliClientId || null
@@ -361,36 +401,30 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   attachSession: (sessionId: string) => {
-    const { ws, sessionId: currentSessionId, isDualPane } = get();
+    const { ws, sessionId: currentSessionId } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       console.error("WebSocket not connected");
       return;
     }
 
-    // Save to localStorage to persist across page refreshes
     localStorage.setItem("apas_session_id", sessionId);
 
-    // Only reset state when switching to a different session
     const isSameSession = currentSessionId === sessionId;
 
-    // Check if session has an active CLI client
     const { cliClients, sessions } = get();
     const hasActiveClient = cliClients.some(c => c.activeSession === sessionId);
 
-    // Get cliClientId from session info or active client
     let newCliClientId: string | null = null;
     const sessionInfo = sessions.find(s => s.id === sessionId);
     if (sessionInfo?.cliClientId) {
       newCliClientId = sessionInfo.cliClientId;
     } else {
-      // Try to get from active CLI client
       const activeClient = cliClients.find(c => c.activeSession === sessionId);
       if (activeClient) {
         newCliClientId = activeClient.id;
       }
     }
 
-    // Save cliClientId to localStorage for per-project settings
     if (newCliClientId) {
       localStorage.setItem("apas_cli_client_id", newCliClientId);
     }
@@ -400,20 +434,23 @@ export const useStore = create<AppState>((set, get) => ({
         sessionId,
         cliClientId: newCliClientId,
         messages: [],
+        paneMessages: {},
+        paneHasMore: {},
+        paneStatuses: {},
+        pausedPanes: [],
+        paneConfigs: [],
         deadloopMessages: [],
         interactiveMessages: [],
         isDualPane: false,
-        isAttached: hasActiveClient, // Only attached if session has active CLI
-        isDeadloopPaused: false, // Reset pause state - server will send correct state
-        interactiveStatus: null, // Reset status bar
-        deadloopStatus: null, // Reset status bar
+        isAttached: hasActiveClient,
+        isDeadloopPaused: false,
+        interactiveStatus: null,
+        deadloopStatus: null,
       });
     } else {
-      // Re-attaching to same session - update attached state based on active client
       set({ isAttached: hasActiveClient, cliClientId: newCliClientId });
     }
 
-    // Attach to existing session
     ws.send(JSON.stringify({
       type: "attach_session",
       session_id: sessionId
@@ -441,12 +478,12 @@ export const useStore = create<AppState>((set, get) => ({
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return;
     }
-    // Save to localStorage to persist across page refreshes
     localStorage.setItem("apas_session_id", sessionId);
-    // Reset all message state including dual-pane arrays
     set({
       sessionId,
       messages: [],
+      paneMessages: {},
+      paneHasMore: {},
       deadloopMessages: [],
       interactiveMessages: [],
       isDualPane: false,
@@ -462,7 +499,6 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
 
-    // Add user message to UI
     const userMessage: Message = {
       id: generateId(),
       role: "user",
@@ -472,12 +508,10 @@ export const useStore = create<AppState>((set, get) => ({
     };
     set((state) => ({ messages: [...state.messages, userMessage] }));
 
-    // Start session if not started
     if (!sessionId) {
       ws.send(JSON.stringify({ type: "start_session" }));
     }
 
-    // Send input
     ws.send(JSON.stringify({ type: "input", text }));
   },
 
@@ -504,52 +538,45 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   loadMoreMessages: (paneType?: PaneType) => {
-    const { ws, sessionId, messages, deadloopMessages, interactiveMessages, isDualPane, loadingMorePane, hasMoreMessages, hasMoreDeadloop, hasMoreInteractive } = get();
+    const { ws, sessionId, messages, paneMessages, isDualPane, loadingMorePane, hasMoreMessages, paneHasMore } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return;
     }
     if (!sessionId || loadingMorePane) {
-      return; // Already loading
+      return;
     }
 
-    // Determine which pane and check if it has more messages
+    // Determine pane_id from paneType
+    const paneId = paneType ? normalizePaneId(paneType, undefined) : undefined;
+
     let targetMessages: Message[];
     let hasMore: boolean;
-    let paneTypeToLoad: PaneType | undefined = paneType;
 
-    if (isDualPane && paneType) {
-      // Dual pane mode with specific pane
-      if (paneType === "deadloop") {
-        targetMessages = deadloopMessages;
-        hasMore = hasMoreDeadloop;
-      } else {
-        targetMessages = interactiveMessages;
-        hasMore = hasMoreInteractive;
-      }
+    if (isDualPane && paneId) {
+      targetMessages = paneMessages[paneId] || [];
+      hasMore = paneHasMore[paneId] || false;
     } else {
-      // Single pane mode or no pane specified
       targetMessages = messages;
       hasMore = hasMoreMessages;
-      paneTypeToLoad = undefined;
     }
 
     if (!hasMore || targetMessages.length === 0) {
       return;
     }
 
-    // Find the oldest message in the target pane
     const oldestMessage = targetMessages.reduce((oldest, msg) =>
       msg.timestamp < oldest.timestamp ? msg : oldest
     );
 
-    set({ loadingMorePane: paneType || null, isLoadingMore: true });
+    set({ loadingMorePane: paneId || null, isLoadingMore: true });
 
     ws.send(JSON.stringify({
       type: "get_session_messages",
       session_id: sessionId,
       limit: 50,
       before_id: oldestMessage.id,
-      pane_type: paneTypeToLoad // Tell server which pane to filter by
+      pane_type: paneType, // Legacy compat
+      pane_id: paneId // New field
     }));
   },
 
@@ -561,7 +588,7 @@ export const useStore = create<AppState>((set, get) => ({
     }));
   },
 
-  sendMessageToPane: (text: string, pane: PaneType): { success: boolean; error?: string } => {
+  sendMessageToPane: (text: string, pane: PaneType | number): { success: boolean; error?: string } => {
     const { ws, sessionId, isAttached } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       console.error("WebSocket not connected");
@@ -573,34 +600,40 @@ export const useStore = create<AppState>((set, get) => ({
       return { success: false, error: "Session is not active. Start the CLI to send messages." };
     }
 
-    // Don't add message locally - the server will broadcast it back via user_input
-    // This prevents duplicate display
+    const paneId = typeof pane === "number" ? pane : normalizePaneId(pane, undefined);
+    const paneType = legacyPaneType(paneId) || (typeof pane === "string" ? pane : undefined);
 
-    // Send to server with pane type
     ws.send(JSON.stringify({
       type: "input",
       text,
-      pane_type: pane
+      pane_type: paneType, // Legacy compat: must be "deadloop" or "interactive"
+      pane_id: paneId
     }));
     return { success: true };
   },
 
-  addMessageToPane: (message: Message, pane: PaneType) => {
-    if (pane === "deadloop") {
-      set((state) => ({ deadloopMessages: [...state.deadloopMessages, message] }));
-    } else {
-      set((state) => ({ interactiveMessages: [...state.interactiveMessages, message] }));
-    }
+  addMessageToPane: (message: Message, pane: PaneType | number) => {
+    const paneId = typeof pane === "number" ? pane : (normalizePaneId(pane, undefined) ?? 0);
+    const key = paneKey(paneId);
+    set((state) => {
+      const current = state.paneMessages[key] || [];
+      const newPaneMessages = { ...state.paneMessages, [key]: [...current, message] };
+      return {
+        paneMessages: newPaneMessages,
+        // Legacy compat
+        deadloopMessages: newPaneMessages[paneKey(PANE_ID_DEADLOOP)] || [],
+        interactiveMessages: newPaneMessages[paneKey(PANE_ID_INTERACTIVE)] || [],
+      };
+    });
   },
 
   startAutoRefresh: () => {
     const { refreshInterval } = get();
-    if (refreshInterval) return; // Already running
+    if (refreshInterval) return;
 
     const interval = setInterval(() => {
       const { ws, connected, sessionId, isAttached, cliClients } = get();
 
-      // Check for zombie connection - WebSocket might think it's open but actually dead
       if (ws && ws.readyState !== WebSocket.OPEN) {
         console.log("WebSocket not in OPEN state, triggering reconnect...");
         set({ connected: false, ws: null, isAttached: false, reconnectAttempts: 0 });
@@ -610,19 +643,16 @@ export const useStore = create<AppState>((set, get) => ({
 
       if (!connected) return;
 
-      // Refresh CLI clients and sessions list
       get().refreshCliClients();
       get().listSessions();
 
-      // If we're viewing a session but not attached, check if it became active
       if (sessionId && !isAttached) {
         const activeClient = cliClients.find(c => c.activeSession === sessionId);
         if (activeClient) {
-          // Session is now active, attach to it for real-time updates
           get().attachSession(sessionId);
         }
       }
-    }, 3000); // Refresh every 3 seconds
+    }, 3000);
 
     set({ refreshInterval: interval });
   },
@@ -639,6 +669,8 @@ export const useStore = create<AppState>((set, get) => ({
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "pause_deadloop" }));
+      // Also send new pane-specific pause
+      ws.send(JSON.stringify({ type: "pause_pane", pane_id: PANE_ID_DEADLOOP }));
     }
   },
 
@@ -646,6 +678,49 @@ export const useStore = create<AppState>((set, get) => ({
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "resume_deadloop" }));
+      // Also send new pane-specific resume
+      ws.send(JSON.stringify({ type: "resume_pane", pane_id: PANE_ID_DEADLOOP }));
+    }
+  },
+
+  pausePane: (paneId: number) => {
+    const { ws } = get();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "pause_pane", pane_id: paneId }));
+      // Also send legacy message for backward compat
+      if (paneId === PANE_ID_DEADLOOP) {
+        ws.send(JSON.stringify({ type: "pause_deadloop" }));
+      }
+    }
+  },
+
+  resumePane: (paneId: number) => {
+    const { ws } = get();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "resume_pane", pane_id: paneId }));
+      if (paneId === PANE_ID_DEADLOOP) {
+        ws.send(JSON.stringify({ type: "resume_deadloop" }));
+      }
+    }
+  },
+
+  addPane: (provider: string, mode: string, label?: string, prompt?: string) => {
+    const { ws } = get();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: "add_pane",
+        provider,
+        mode,
+        label: label || undefined,
+        prompt: prompt || undefined,
+      }));
+    }
+  },
+
+  removePane: (paneId: number) => {
+    const { ws } = get();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "remove_pane", pane_id: paneId }));
     }
   },
 
@@ -664,33 +739,37 @@ export const useStore = create<AppState>((set, get) => ({
   },
 }));
 
-// Helper function to route messages to correct array based on pane type
+// Helper function to route messages to correct array based on pane_id
 function addMessageWithPaneRouting(
   set: (partial: Partial<AppState> | ((state: AppState) => Partial<AppState>)) => void,
   get: () => AppState,
   message: Message,
-  paneType: string | undefined
+  rawPaneType: string | undefined,
+  rawPaneId: number | string | undefined
 ) {
+  const numericPaneId = typeof rawPaneId === "string" ? parseInt(rawPaneId, 10) : rawPaneId;
+  const paneId = normalizePaneId(rawPaneType, isNaN(numericPaneId as number) ? undefined : numericPaneId as number | undefined);
   let { isDualPane } = get();
 
-  // Auto-detect dual pane mode when we receive a pane_type
-  if (paneType && !isDualPane) {
+  // Auto-detect dual pane mode when we receive a pane identifier
+  if (paneId && !isDualPane) {
     set({ isDualPane: true });
     isDualPane = true;
   }
 
-  if (isDualPane && paneType) {
-    // Dual pane mode - route to specific array
-    if (paneType === "deadloop") {
-      set((state) => ({ deadloopMessages: [...state.deadloopMessages, message] }));
-    } else if (paneType === "interactive") {
-      set((state) => ({ interactiveMessages: [...state.interactiveMessages, message] }));
-    } else {
-      // Unknown pane type, add to main messages
-      set((state) => ({ messages: [...state.messages, message] }));
-    }
+  if (isDualPane && paneId) {
+    const key = paneKey(paneId);
+    set((state) => {
+      const current = state.paneMessages[key] || [];
+      const newPaneMessages = { ...state.paneMessages, [key]: [...current, message] };
+      return {
+        paneMessages: newPaneMessages,
+        // Legacy compat
+        deadloopMessages: newPaneMessages[paneKey(PANE_ID_DEADLOOP)] || state.deadloopMessages,
+        interactiveMessages: newPaneMessages[paneKey(PANE_ID_INTERACTIVE)] || state.interactiveMessages,
+      };
+    });
   } else {
-    // Single pane mode - add to main messages
     set((state) => ({ messages: [...state.messages, message] }));
   }
 }
@@ -708,16 +787,12 @@ function handleServerMessage(
         userId: data.user_id as string,
       });
       console.log("Authenticated as user:", data.user_id);
-      // Request CLI clients and sessions list after authentication
       get().refreshCliClients();
       get().listSessions();
-      // Start auto-refresh for real-time updates
       get().startAutoRefresh();
-      // Restore previously viewed session if available
       const savedSessionId = localStorage.getItem("apas_session_id");
       if (savedSessionId) {
         console.log("Restoring session:", savedSessionId);
-        // Use setTimeout to ensure sessions list is loaded first
         setTimeout(() => {
           get().attachSession(savedSessionId);
         }, 500);
@@ -726,7 +801,6 @@ function handleServerMessage(
 
     case "authentication_failed":
       console.error("Authentication failed:", data.reason);
-      // Clear invalid token
       localStorage.removeItem("apas_token");
       localStorage.removeItem("apas_user_id");
       set({
@@ -747,10 +821,6 @@ function handleServerMessage(
         activeSession: c.active_session as string | undefined,
       }));
 
-      // Update isAttached based on whether current session has an active client
-      // Only upgrade isAttached to true here - don't downgrade it
-      // For shared sessions, the CLI belongs to another user and won't be in our list
-      // The server sends session_attached message with the correct value for those
       const { sessionId } = get();
       const hasActiveClientInOurList = sessionId
         ? parsedClients.some(c => c.activeSession === sessionId)
@@ -758,8 +828,6 @@ function handleServerMessage(
 
       set({
         cliClients: parsedClients,
-        // Only set isAttached to true if we found an active client
-        // Don't set it to false - that would break shared sessions
         ...(hasActiveClientInOurList ? { isAttached: true } : {}),
       });
       break;
@@ -775,8 +843,6 @@ function handleServerMessage(
       break;
 
     case "session_attached": {
-      // Server tells us if the session has an active CLI
-      // This allows shared users to see pause/reboot buttons
       const hasActiveCli = data.has_active_cli as boolean;
       console.log("Session attached, has active CLI:", hasActiveCli);
       set({ isAttached: hasActiveCli });
@@ -785,12 +851,23 @@ function handleServerMessage(
 
     case "pane_status": {
       const paneType = data.pane_type as string | undefined;
+      const paneId = normalizePaneId(paneType, data.pane_id as number | undefined);
       const status = data.status as string | null;
-      if (paneType === "interactive") {
-        set({ interactiveStatus: status });
-      } else if (paneType === "deadloop") {
-        set({ deadloopStatus: status });
+
+      if (paneId) {
+        set((state) => ({
+          paneStatuses: { ...state.paneStatuses, [paneId]: status },
+          // Legacy compat
+          interactiveStatus: paneId === PANE_ID_INTERACTIVE ? status : state.interactiveStatus,
+          deadloopStatus: paneId === PANE_ID_DEADLOOP ? status : state.deadloopStatus,
+        }));
       }
+      break;
+    }
+
+    case "pane_list": {
+      const panes = (data.panes as PaneConfig[]) || [];
+      set({ paneConfigs: panes });
       break;
     }
 
@@ -804,7 +881,8 @@ function handleServerMessage(
         outputType,
       };
       const paneType = data.pane_type as string | undefined;
-      addMessageWithPaneRouting(set, get, message, paneType);
+      const paneId = data.pane_id as string | undefined;
+      addMessageWithPaneRouting(set, get, message, paneType, paneId);
       break;
     }
 
@@ -839,14 +917,13 @@ function handleServerMessage(
     }
 
     case "session_messages": {
-      const incomingSessionId = data.session_id as string;
       const messages = (data.messages as Array<Record<string, unknown>>) || [];
       const hasMore = data.has_more as boolean || false;
 
-      const { sessionId: currentSessionId, isLoadingMore, loadingMorePane } = get();
+      const { isLoadingMore, loadingMorePane } = get();
 
-      // Check if any messages have pane_type - if so, enable dual pane
-      const hasPaneType = messages.some((m) => m.pane_type);
+      // Check if any messages have pane_type or pane_id - if so, enable dual pane
+      const hasPaneType = messages.some((m) => m.pane_type || m.pane_id);
       if (hasPaneType) {
         set({ isDualPane: true });
       }
@@ -857,7 +934,6 @@ function handleServerMessage(
         let outputType: OutputType;
         let displayContent = content;
 
-        // Reconstruct outputType based on message_type
         if (messageType === "tool_use") {
           try {
             const toolData = JSON.parse(content);
@@ -888,28 +964,29 @@ function handleServerMessage(
           outputType = { type: "text" };
         }
 
+        const rawRole = m.role as string;
+        const role: "user" | "assistant" | "system" = rawRole === "tool" ? "assistant" : rawRole as "user" | "assistant" | "system";
+
         return {
           id: m.id as string,
-          role: m.role as "user" | "assistant" | "system",
+          role,
           content: displayContent,
           timestamp: new Date(m.created_at as string || Date.now()),
           outputType,
         };
       });
 
-      // Route messages to correct panes
+      // Route messages to correct panes using pane_id
       const { isDualPane } = get();
-      const deadloopMsgs: Message[] = [];
-      const interactiveMsgs: Message[] = [];
+      const paneMsgBuckets: Record<string, Message[]> = {};
       const mainMsgs: Message[] = [];
 
       messages.forEach((m, i) => {
-        const paneType = m.pane_type as string | undefined;
+        const paneId = normalizePaneId(m.pane_type as string | undefined, m.pane_id as number | undefined);
         const msg = parsedMessages[i];
-        if (paneType === "deadloop") {
-          deadloopMsgs.push(msg);
-        } else if (paneType === "interactive") {
-          interactiveMsgs.push(msg);
+        if (paneId) {
+          if (!paneMsgBuckets[paneId]) paneMsgBuckets[paneId] = [];
+          paneMsgBuckets[paneId].push(msg);
         } else {
           mainMsgs.push(msg);
         }
@@ -918,45 +995,54 @@ function handleServerMessage(
       if (isLoadingMore) {
         // Prepend older messages
         if (isDualPane || hasPaneType) {
-          // Determine which pane's hasMore to update based on loadingMorePane
-          const updates: Record<string, unknown> = {
-            messages: [...mainMsgs, ...get().messages],
-            deadloopMessages: [...deadloopMsgs, ...get().deadloopMessages],
-            interactiveMessages: [...interactiveMsgs, ...get().interactiveMessages],
-            isLoadingMore: false,
-            loadingMorePane: null,
-          };
+          set((state) => {
+            const newPaneMessages = { ...state.paneMessages };
+            for (const [paneId, msgs] of Object.entries(paneMsgBuckets)) {
+              newPaneMessages[paneId] = [...msgs, ...(newPaneMessages[paneId] || [])];
+            }
 
-          // Update the appropriate hasMore flag based on which pane was loading
-          if (loadingMorePane === "deadloop") {
-            updates.hasMoreDeadloop = hasMore;
-          } else if (loadingMorePane === "interactive") {
-            updates.hasMoreInteractive = hasMore;
-          } else {
-            updates.hasMoreMessages = hasMore;
-          }
+            const updates: Partial<AppState> = {
+              messages: [...mainMsgs, ...state.messages],
+              paneMessages: newPaneMessages,
+              deadloopMessages: newPaneMessages[paneKey(PANE_ID_DEADLOOP)] || state.deadloopMessages,
+              interactiveMessages: newPaneMessages[paneKey(PANE_ID_INTERACTIVE)] || state.interactiveMessages,
+              isLoadingMore: false,
+              loadingMorePane: null,
+            };
 
-          set(updates);
+            // Update the appropriate hasMore flag
+            if (loadingMorePane) {
+              updates.paneHasMore = { ...state.paneHasMore, [loadingMorePane]: hasMore };
+              if (loadingMorePane === PANE_ID_DEADLOOP) updates.hasMoreDeadloop = hasMore;
+              if (loadingMorePane === PANE_ID_INTERACTIVE) updates.hasMoreInteractive = hasMore;
+            } else {
+              updates.hasMoreMessages = hasMore;
+            }
+
+            return updates;
+          });
         } else {
           get().prependMessages(parsedMessages, hasMore);
         }
       } else if (isDualPane || hasPaneType) {
         // Initial load - dual pane mode
-        // Preserve any real-time messages that arrived before this response (race condition fix)
-        const {
-          interactiveMessages: existingInteractive,
-          deadloopMessages: existingDeadloop,
-          messages: existingMain
-        } = get();
+        const { paneMessages: existingPaneMessages, messages: existingMain } = get();
+        const newPaneMessages = { ...existingPaneMessages };
+        const newPaneHasMore: Record<string, boolean> = {};
+        for (const [paneId, msgs] of Object.entries(paneMsgBuckets)) {
+          newPaneMessages[paneId] = [...msgs, ...(newPaneMessages[paneId] || [])];
+          newPaneHasMore[paneId] = hasMore;
+        }
         set({
           sessionId: data.session_id as string,
           messages: [...mainMsgs, ...existingMain],
-          deadloopMessages: [...deadloopMsgs, ...existingDeadloop],
-          interactiveMessages: [...interactiveMsgs, ...existingInteractive],
+          paneMessages: newPaneMessages,
+          paneHasMore: newPaneHasMore,
+          deadloopMessages: newPaneMessages[paneKey(PANE_ID_DEADLOOP)] || [],
+          interactiveMessages: newPaneMessages[paneKey(PANE_ID_INTERACTIVE)] || [],
           hasMoreMessages: hasMore,
-          // Set per-pane hasMore - on initial load, if server says hasMore, both panes might have more
-          hasMoreDeadloop: hasMore,
-          hasMoreInteractive: hasMore,
+          hasMoreDeadloop: newPaneHasMore[paneKey(PANE_ID_DEADLOOP)] || false,
+          hasMoreInteractive: newPaneHasMore[paneKey(PANE_ID_INTERACTIVE)] || false,
           isDualPane: true,
         });
       } else {
@@ -971,12 +1057,10 @@ function handleServerMessage(
     }
 
     case "user_input": {
-      // User input from CLI (displayed as user message)
-      // Only show if it's for the currently viewed session
       const msgSessionId = data.session_id as string | undefined;
       const { sessionId: currentSessionId } = get();
       if (msgSessionId && currentSessionId && msgSessionId !== currentSessionId) {
-        break; // Ignore messages from other sessions
+        break;
       }
 
       const userMessage: Message = {
@@ -987,23 +1071,23 @@ function handleServerMessage(
         outputType: { type: "text" },
       };
       const paneType = data.pane_type as string | undefined;
-      addMessageWithPaneRouting(set, get, userMessage, paneType);
+      const paneId = data.pane_id as string | undefined;
+      addMessageWithPaneRouting(set, get, userMessage, paneType, paneId);
       break;
     }
 
     case "stream_message": {
-      // Real-time Claude output from attached session
-      // Only show if it's for the currently viewed session
       const msgSessionId = data.session_id as string | undefined;
       const { sessionId: currentSessionId } = get();
       if (msgSessionId && currentSessionId && msgSessionId !== currentSessionId) {
-        break; // Ignore messages from other sessions
+        break;
       }
 
       const msg = data.message as Record<string, unknown>;
       if (!msg) break;
 
       const paneType = data.pane_type as string | undefined;
+      const paneId = data.pane_id as string | undefined;
       const msgType = msg.type as string;
       if (msgType === "assistant") {
         const message = msg.message as Record<string, unknown>;
@@ -1018,7 +1102,7 @@ function handleServerMessage(
                 timestamp: new Date(),
                 outputType: { type: "text" },
               };
-              addMessageWithPaneRouting(set, get, assistantMessage, paneType);
+              addMessageWithPaneRouting(set, get, assistantMessage, paneType, paneId);
             } else if (block.type === "tool_use") {
               const toolMessage: Message = {
                 id: generateId(),
@@ -1027,7 +1111,28 @@ function handleServerMessage(
                 timestamp: new Date(),
                 outputType: { type: "tool_use", tool: block.name as string, input: block.input },
               };
-              addMessageWithPaneRouting(set, get, toolMessage, paneType);
+              addMessageWithPaneRouting(set, get, toolMessage, paneType, paneId);
+            }
+          }
+        }
+      } else if (msgType === "user") {
+        const message = msg.message as Record<string, unknown>;
+        const content = message?.content as Array<Record<string, unknown>>;
+        if (content) {
+          for (const block of content) {
+            if (block.type === "tool_result") {
+              const toolResultMessage: Message = {
+                id: generateId(),
+                role: "assistant",
+                content: block.content as string || "",
+                timestamp: new Date(),
+                outputType: {
+                  type: "tool_result",
+                  tool: block.tool_use_id as string,
+                  success: !(block.is_error as boolean),
+                },
+              };
+              addMessageWithPaneRouting(set, get, toolResultMessage, paneType, paneId);
             }
           }
         }
@@ -1039,7 +1144,7 @@ function handleServerMessage(
           timestamp: new Date(),
           outputType: { type: "system" },
         };
-        addMessageWithPaneRouting(set, get, resultMessage, paneType);
+        addMessageWithPaneRouting(set, get, resultMessage, paneType, paneId);
       }
       break;
     }
@@ -1047,12 +1152,30 @@ function handleServerMessage(
     case "deadloop_status": {
       const isPaused = data.is_paused as boolean;
       console.log("Deadloop status update:", isPaused ? "paused" : "running");
-      set({ isDeadloopPaused: isPaused });
+      set((state) => ({
+        isDeadloopPaused: isPaused,
+        pausedPanes: isPaused
+          ? [...state.pausedPanes.filter(p => p !== PANE_ID_DEADLOOP), PANE_ID_DEADLOOP]
+          : state.pausedPanes.filter(p => p !== PANE_ID_DEADLOOP),
+      }));
+      break;
+    }
+
+    case "pane_paused": {
+      const paneId = data.pane_id as number;
+      const isPaused = data.is_paused as boolean;
+      console.log(`Pane ${paneId} ${isPaused ? "paused" : "resumed"}`);
+      set((state) => ({
+        pausedPanes: isPaused
+          ? [...state.pausedPanes.filter(p => p !== paneId), paneId]
+          : state.pausedPanes.filter(p => p !== paneId),
+        // Legacy compat
+        isDeadloopPaused: paneId === PANE_ID_DEADLOOP ? isPaused : state.isDeadloopPaused,
+      }));
       break;
     }
 
     case "session_download": {
-      // Handle session download - create a downloadable file
       const sessionId = data.session_id as string;
       const messages = data.messages as Array<Record<string, unknown>> || [];
       const workingDir = data.working_dir as string | undefined;
@@ -1069,7 +1192,6 @@ function handleServerMessage(
         messages: messages,
       };
 
-      // Create and trigger download
       const blob = new Blob([JSON.stringify(downloadData, null, 2)], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");

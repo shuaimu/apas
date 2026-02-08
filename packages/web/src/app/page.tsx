@@ -3,8 +3,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { createPortal } from "react-dom";
-import { MessageList } from "@/components/chat/MessageList";
-import { DualPaneView } from "@/components/chat/DualPaneView";
+import { TabbedView } from "@/components/tabs/TabbedView";
 import { Sidebar } from "@/components/Sidebar";
 import { ResizeHandle } from "@/components/ResizeHandle";
 import { useStore } from "@/lib/store";
@@ -38,7 +37,7 @@ function setProjectLayout(cliClientId: string | null | undefined, key: string, v
 
 export default function Home() {
   const router = useRouter();
-  const { connected, connect, disconnect, sessionId, isDualPane, isAuthenticated, logout, token, userId, cliClientId } = useStore();
+  const { connected, connect, disconnect, sessionId, isAuthenticated, logout, token, userId, cliClientId } = useStore();
   const [isCheckingAuth, setIsCheckingAuth] = useState(true);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -259,19 +258,10 @@ export default function Home() {
           </div>
         </header>
 
-        {/* Chat area or placeholder */}
-        {sessionId ? (
-          <main className="flex-1 overflow-hidden flex flex-col">
-            {isDualPane ? <DualPaneView /> : <MessageList />}
-          </main>
-        ) : (
-          <div className="flex-1 flex items-center justify-center text-gray-400">
-            <div className="text-center">
-              <p className="text-lg">No session selected</p>
-              <p className="text-sm mt-1">Select a CLI client from the sidebar to start a session</p>
-            </div>
-          </div>
-        )}
+        {/* Chat area */}
+        <main className="flex-1 overflow-hidden flex flex-col">
+          <TabbedView />
+        </main>
       </div>
 
       {/* Settings Modal */}

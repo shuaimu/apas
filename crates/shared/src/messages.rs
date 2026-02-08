@@ -23,6 +23,9 @@ pub enum CliToServer {
         hostname: Option<String>,
         #[serde(default)]
         pane_type: Option<PaneType>,
+        /// Pane configurations for this session
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        panes: Option<Vec<PaneConfig>>,
     },
 
     /// Claude output to be forwarded to web client
@@ -33,6 +36,8 @@ pub enum CliToServer {
         output_type: OutputType,
         #[serde(default)]
         pane_type: Option<PaneType>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u32>,
     },
 
     /// Session has ended
@@ -47,6 +52,8 @@ pub enum CliToServer {
         message: ClaudeStreamMessage,
         #[serde(default)]
         pane_type: Option<PaneType>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u32>,
     },
 
     /// User input/prompt from CLI (to be displayed in web UI)
@@ -55,19 +62,37 @@ pub enum CliToServer {
         text: String,
         #[serde(default)]
         pane_type: Option<PaneType>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u32>,
     },
 
-    /// Report deadloop pause status to server
+    /// Report deadloop pause status to server (legacy - use PanePaused for new code)
     DeadloopStatus {
         session_id: Uuid,
+        is_paused: bool,
+    },
+
+    /// Report pane pause status to server
+    PanePaused {
+        session_id: Uuid,
+        pane_id: u32,
         is_paused: bool,
     },
 
     /// Report pane status (e.g., "thinking") for status bar display
     PaneStatus {
         session_id: Uuid,
+        #[serde(default)]
         pane_type: PaneType,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u32>,
         status: Option<String>,
+    },
+
+    /// Report current pane configurations to server
+    PaneList {
+        session_id: Uuid,
+        panes: Vec<PaneConfig>,
     },
 
     /// Report usage limits from the Anthropic API
@@ -94,7 +119,12 @@ pub enum ServerToCli {
     SessionAssigned { session_id: Uuid, working_dir: Option<String> },
 
     /// User input from web client
-    Input { session_id: Uuid, data: String },
+    Input {
+        session_id: Uuid,
+        data: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u32>,
+    },
 
     /// Signal to send to Claude process (e.g., SIGINT)
     Signal { session_id: Uuid, signal: String },
@@ -105,11 +135,23 @@ pub enum ServerToCli {
     /// Heartbeat response
     Heartbeat,
 
-    /// Pause the deadloop
+    /// Pause the deadloop (legacy - use PausePane for new code)
     PauseDeadloop { session_id: Uuid },
 
-    /// Resume the deadloop
+    /// Resume the deadloop (legacy - use ResumePane for new code)
     ResumeDeadloop { session_id: Uuid },
+
+    /// Pause a specific pane
+    PausePane { session_id: Uuid, pane_id: u32 },
+
+    /// Resume a specific pane
+    ResumePane { session_id: Uuid, pane_id: u32 },
+
+    /// Add a new pane to the session
+    AddPane { session_id: Uuid, pane_config: PaneConfig },
+
+    /// Remove a pane from the session
+    RemovePane { session_id: Uuid, pane_id: u32 },
 
     /// Reboot the CLI process
     RebootCli { session_id: Uuid },
@@ -143,6 +185,8 @@ pub enum WebToServer {
         text: String,
         #[serde(default)]
         pane_type: Option<PaneType>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u32>,
     },
 
     /// Approve a tool call
@@ -166,13 +210,34 @@ pub enum WebToServer {
         before_id: Option<String>, // Load messages before this message ID
         #[serde(default)]
         pane_type: Option<PaneType>, // Filter by pane type for per-pane pagination
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u32>, // Filter by pane ID for per-pane pagination
     },
 
-    /// Pause the deadloop session
+    /// Pause the deadloop session (legacy - use PausePane for new code)
     PauseDeadloop,
 
-    /// Resume the deadloop session
+    /// Resume the deadloop session (legacy - use ResumePane for new code)
     ResumeDeadloop,
+
+    /// Pause a specific pane
+    PausePane { pane_id: u32 },
+
+    /// Resume a specific pane
+    ResumePane { pane_id: u32 },
+
+    /// Add a new pane
+    AddPane {
+        provider: Provider,
+        mode: PaneMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+    },
+
+    /// Remove a pane
+    RemovePane { pane_id: u32 },
 
     /// Reboot the CLI process
     RebootCli,
@@ -196,6 +261,8 @@ pub enum ServerToWeb {
         session_id: Uuid,
         #[serde(default)]
         pane_type: Option<PaneType>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u32>,
     },
 
     /// Session status update
@@ -214,6 +281,8 @@ pub enum ServerToWeb {
         output_type: OutputType,
         #[serde(default)]
         pane_type: Option<PaneType>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u32>,
     },
 
     /// Error message
@@ -228,6 +297,8 @@ pub enum ServerToWeb {
         message: ClaudeStreamMessage,
         #[serde(default)]
         pane_type: Option<PaneType>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u32>,
     },
 
     /// List of persisted sessions
@@ -247,18 +318,36 @@ pub enum ServerToWeb {
         text: String,
         #[serde(default)]
         pane_type: Option<PaneType>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u32>,
     },
 
-    /// Deadloop pause status update
+    /// Deadloop pause status update (legacy - use PanePaused for new code)
     DeadloopStatus {
         session_id: Uuid,
         is_paused: bool,
     },
 
+    /// Pane pause status update
+    PanePaused {
+        session_id: Uuid,
+        pane_id: u32,
+        is_paused: bool,
+    },
+
     /// Pane status update (e.g., "thinking") for status bar display
     PaneStatus {
+        #[serde(default)]
         pane_type: PaneType,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u32>,
         status: Option<String>,
+    },
+
+    /// List of pane configurations for a session
+    PaneList {
+        session_id: Uuid,
+        panes: Vec<PaneConfig>,
     },
 
     /// Usage limits update from a CLI client
@@ -307,13 +396,15 @@ pub struct MessageInfo {
     pub created_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<u32>,
 }
 
 // ============================================================================
 // Shared Types
 // ============================================================================
 
-/// Pane type for dual-pane mode
+/// Pane type for dual-pane mode (legacy - kept for backward compatibility)
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PaneType {
@@ -322,6 +413,84 @@ pub enum PaneType {
     Deadloop,
     /// Interactive user session (right pane)
     Interactive,
+}
+
+/// Provider for a pane
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Provider {
+    Claude,
+    Codex,
+}
+
+/// Mode for a pane
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneMode {
+    Deadloop,
+    Interactive,
+}
+
+/// Configuration for a single pane
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneConfig {
+    pub pane_id: u32,
+    pub provider: Provider,
+    pub mode: PaneMode,
+    pub session_id: Uuid, // Provider-specific session for --resume
+    #[serde(default)]
+    pub is_paused: bool, // Only meaningful for deadloop
+    #[serde(default)]
+    pub prompt: Option<String>, // Custom prompt for deadloop
+    #[serde(default)]
+    pub label: Option<String>, // User-facing label like "Deadloop" or "Interactive"
+}
+
+/// Legacy pane_id constants
+pub const PANE_ID_DEADLOOP: u32 = 1;
+pub const PANE_ID_INTERACTIVE: u32 = 2;
+
+impl PaneConfig {
+    /// Create default pane configs (Claude deadloop + Claude interactive)
+    pub fn defaults() -> Vec<PaneConfig> {
+        vec![
+            PaneConfig {
+                pane_id: PANE_ID_DEADLOOP,
+                provider: Provider::Claude,
+                mode: PaneMode::Deadloop,
+                session_id: Uuid::new_v4(),
+                is_paused: false,
+                prompt: None,
+                label: Some("Deadloop".to_string()),
+            },
+            PaneConfig {
+                pane_id: PANE_ID_INTERACTIVE,
+                provider: Provider::Claude,
+                mode: PaneMode::Interactive,
+                session_id: Uuid::new_v4(),
+                is_paused: false,
+                prompt: None,
+                label: Some("Interactive".to_string()),
+            },
+        ]
+    }
+
+    /// Map legacy PaneType to numeric pane_id
+    pub fn pane_id_from_legacy(pane_type: &PaneType) -> u32 {
+        match pane_type {
+            PaneType::Deadloop => PANE_ID_DEADLOOP,
+            PaneType::Interactive => PANE_ID_INTERACTIVE,
+        }
+    }
+
+    /// Map numeric pane_id back to legacy PaneType (if applicable)
+    pub fn legacy_from_pane_id(pane_id: u32) -> Option<PaneType> {
+        match pane_id {
+            PANE_ID_DEADLOOP => Some(PaneType::Deadloop),
+            PANE_ID_INTERACTIVE => Some(PaneType::Interactive),
+            _ => None,
+        }
+    }
 }
 
 /// Type of output content
@@ -515,6 +684,7 @@ impl CliToServer {
             data: data.into(),
             output_type: OutputType::Text,
             pane_type: None,
+            pane_id: None,
         }
     }
 
@@ -524,6 +694,7 @@ impl CliToServer {
             data: data.into(),
             output_type,
             pane_type: None,
+            pane_id: None,
         }
     }
 
@@ -533,6 +704,7 @@ impl CliToServer {
             data: data.into(),
             output_type: OutputType::Text,
             pane_type: Some(pane_type),
+            pane_id: Some(PaneConfig::pane_id_from_legacy(&pane_type)),
         }
     }
 }
@@ -543,6 +715,7 @@ impl ServerToWeb {
             content: content.into(),
             output_type: OutputType::Text,
             pane_type: None,
+            pane_id: None,
         }
     }
 
@@ -586,6 +759,7 @@ mod tests {
             working_dir: Some("/home/user/project".to_string()),
             hostname: None,
             pane_type: None,
+            panes: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"session_start\""));
@@ -606,7 +780,7 @@ mod tests {
         let session_id = Uuid::new_v4();
         let msg = CliToServer::output(session_id, "Hello, world!");
         match msg {
-            CliToServer::Output { session_id: sid, data, output_type, pane_type } => {
+            CliToServer::Output { session_id: sid, data, output_type, pane_type, .. } => {
                 assert_eq!(sid, session_id);
                 assert_eq!(data, "Hello, world!");
                 assert_eq!(output_type, OutputType::Text);
@@ -647,7 +821,7 @@ mod tests {
     fn test_server_to_web_helpers() {
         let msg = ServerToWeb::output("Test output");
         match msg {
-            ServerToWeb::Output { content, output_type, pane_type } => {
+            ServerToWeb::Output { content, output_type, pane_type, .. } => {
                 assert_eq!(content, "Test output");
                 assert_eq!(output_type, OutputType::Text);
                 assert_eq!(pane_type, None);
@@ -818,6 +992,7 @@ mod tests {
             session_id,
             message: stream_msg,
             pane_type: None,
+            pane_id: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"stream_message\""));

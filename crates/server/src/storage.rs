@@ -154,7 +154,7 @@ impl FileStorage {
         Ok((result, has_more))
     }
 
-    /// Read messages for a session with pagination support, optionally filtered by pane type
+    /// Read messages for a session with pagination support, optionally filtered by pane type (legacy)
     /// Returns (messages, has_more)
     pub async fn get_messages_paginated_by_pane(
         &self,
@@ -162,6 +162,19 @@ impl FileStorage {
         limit: Option<usize>,
         before_id: Option<&str>,
         pane_type: Option<shared::PaneType>,
+    ) -> Result<(Vec<StoredMessage>, bool)> {
+        let pane_filter = pane_type.map(|p| shared::PaneConfig::pane_id_from_legacy(&p));
+        self.get_messages_paginated_by_pane_id(session_id, limit, before_id, pane_filter).await
+    }
+
+    /// Read messages for a session with pagination support, optionally filtered by pane_id
+    /// Returns (messages, has_more)
+    pub async fn get_messages_paginated_by_pane_id(
+        &self,
+        session_id: &Uuid,
+        limit: Option<usize>,
+        before_id: Option<&str>,
+        pane_id: Option<u32>,
     ) -> Result<(Vec<StoredMessage>, bool)> {
         let file_path = self.messages_file(session_id);
 
@@ -174,21 +187,20 @@ impl FileStorage {
         let mut lines = reader.lines();
         let mut all_messages = Vec::new();
 
-        // Convert pane_type to string for comparison
-        let pane_filter = pane_type.map(|p| match p {
-            shared::PaneType::Deadloop => "deadloop",
-            shared::PaneType::Interactive => "interactive",
-        });
-
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
                 continue;
             }
             match serde_json::from_str::<StoredMessage>(&line) {
                 Ok(msg) => {
-                    // Filter by pane type if specified
-                    if let Some(filter) = pane_filter {
-                        if msg.pane_type.as_deref() == Some(filter) {
+                    // Filter by pane_id if specified
+                    if let Some(filter) = pane_id {
+                        let filter_str = filter.to_string();
+                        // Match exact numeric pane_id, or legacy "deadloop"/"interactive" values
+                        let matches = msg.pane_type.as_deref() == Some(&filter_str)
+                            || (filter == shared::PANE_ID_DEADLOOP && msg.pane_type.as_deref() == Some("deadloop"))
+                            || (filter == shared::PANE_ID_INTERACTIVE && msg.pane_type.as_deref() == Some("interactive"));
+                        if matches {
                             all_messages.push(msg);
                         }
                     } else {
@@ -203,13 +215,9 @@ impl FileStorage {
 
         // If before_id is specified, find messages before that ID
         let messages = if let Some(before_id) = before_id {
-            // Find the index of the message with before_id
             if let Some(idx) = all_messages.iter().position(|m| m.id == before_id) {
-                // Take messages before this index
                 all_messages[..idx].to_vec()
             } else {
-                // ID not found - might be in a different pane, return all messages before the timestamp
-                // For now, return empty to avoid confusion
                 Vec::new()
             }
         } else {
@@ -228,8 +236,8 @@ impl FileStorage {
         Ok((result, has_more))
     }
 
-    /// Read messages for a session, loading recent messages per pane type
-    /// This ensures both deadloop and interactive messages are included
+    /// Read messages for a session, loading recent messages per pane
+    /// This ensures all panes have messages included
     /// Returns (messages, has_more) where messages are sorted by created_at
     pub async fn get_messages_per_pane(
         &self,
@@ -246,9 +254,8 @@ impl FileStorage {
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
 
-        let mut deadloop_messages = Vec::new();
-        let mut interactive_messages = Vec::new();
-        let mut other_messages = Vec::new();
+        // Dynamic pane bucketing using HashMap instead of hardcoded categories
+        let mut pane_buckets: std::collections::HashMap<Option<String>, Vec<StoredMessage>> = std::collections::HashMap::new();
 
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
@@ -256,11 +263,13 @@ impl FileStorage {
             }
             match serde_json::from_str::<StoredMessage>(&line) {
                 Ok(msg) => {
-                    match msg.pane_type.as_deref() {
-                        Some("deadloop") => deadloop_messages.push(msg),
-                        Some("interactive") => interactive_messages.push(msg),
-                        _ => other_messages.push(msg),
-                    }
+                    // Normalize legacy pane_type values to new pane_id format
+                    let bucket_key = match msg.pane_type.as_deref() {
+                        Some("deadloop") => Some("claude-deadloop-1".to_string()),
+                        Some("interactive") => Some("claude-interactive-1".to_string()),
+                        other => other.map(|s| s.to_string()),
+                    };
+                    pane_buckets.entry(bucket_key).or_default().push(msg);
                 }
                 Err(e) => {
                     tracing::warn!("Failed to parse message line: {}", e);
@@ -269,34 +278,18 @@ impl FileStorage {
         }
 
         // Check if there are more messages than we're returning
-        let has_more = deadloop_messages.len() > limit_per_pane
-            || interactive_messages.len() > limit_per_pane
-            || other_messages.len() > limit_per_pane;
+        let has_more = pane_buckets.values().any(|msgs| msgs.len() > limit_per_pane);
 
-        // Take the most recent N messages from each category
-        let deadloop_recent: Vec<_> = if deadloop_messages.len() > limit_per_pane {
-            deadloop_messages[deadloop_messages.len() - limit_per_pane..].to_vec()
-        } else {
-            deadloop_messages
-        };
-
-        let interactive_recent: Vec<_> = if interactive_messages.len() > limit_per_pane {
-            interactive_messages[interactive_messages.len() - limit_per_pane..].to_vec()
-        } else {
-            interactive_messages
-        };
-
-        let other_recent: Vec<_> = if other_messages.len() > limit_per_pane {
-            other_messages[other_messages.len() - limit_per_pane..].to_vec()
-        } else {
-            other_messages
-        };
-
-        // Combine and sort by created_at
+        // Take the most recent N messages from each bucket
         let mut combined = Vec::new();
-        combined.extend(deadloop_recent);
-        combined.extend(interactive_recent);
-        combined.extend(other_recent);
+        for msgs in pane_buckets.values() {
+            let recent: Vec<_> = if msgs.len() > limit_per_pane {
+                msgs[msgs.len() - limit_per_pane..].to_vec()
+            } else {
+                msgs.clone()
+            };
+            combined.extend(recent);
+        }
 
         // Sort by created_at timestamp
         combined.sort_by(|a, b| a.created_at.cmp(&b.created_at));

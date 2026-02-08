@@ -194,7 +194,7 @@ async fn run_connection(
                             }
                         });
                     }
-                    Ok(ServerToCli::Input { session_id, data }) => {
+                    Ok(ServerToCli::Input { session_id, data, .. }) => {
                         // Forward input to the appropriate Claude process
                         let processes = processes.lock().await;
                         if let Some(sender) = processes.get(&session_id) {
@@ -222,8 +222,12 @@ async fn run_connection(
                         // Already handled during registration
                     }
                     Ok(ServerToCli::PauseDeadloop { .. })
-                    | Ok(ServerToCli::ResumeDeadloop { .. }) => {
-                        // Pause/resume not supported in remote mode
+                    | Ok(ServerToCli::ResumeDeadloop { .. })
+                    | Ok(ServerToCli::PausePane { .. })
+                    | Ok(ServerToCli::ResumePane { .. })
+                    | Ok(ServerToCli::AddPane { .. })
+                    | Ok(ServerToCli::RemovePane { .. }) => {
+                        // Pause/resume/pane management not supported in remote mode
                     }
                     Ok(ServerToCli::RebootCli { .. }) => {
                         tracing::info!("Reboot command received, restarting...");
@@ -290,6 +294,7 @@ async fn handle_session(
                 data: line,
                 output_type: OutputType::Text,
                 pane_type: None,
+                pane_id: None,
             };
             if ws_tx_stdout.send(msg).await.is_err() {
                 break;
@@ -306,6 +311,7 @@ async fn handle_session(
                 data: line,
                 output_type: OutputType::Error,
                 pane_type: None,
+                pane_id: None,
             };
             if ws_tx_stderr.send(msg).await.is_err() {
                 break;

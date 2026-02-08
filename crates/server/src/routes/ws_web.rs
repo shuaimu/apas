@@ -181,6 +181,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             ServerToWeb::SessionStarted {
                                 session_id: new_session_id,
                                 pane_type: None,
+                                pane_id: None,
                             },
                         )
                         .await;
@@ -200,7 +201,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                     tracing::info!("Session started: {} (CLI: {:?})", new_session_id, cli_id);
                 }
-                Ok(WebToServer::Input { text, pane_type }) => {
+                Ok(WebToServer::Input { text, pane_type, pane_id }) => {
                     if let Some(sid) = session_id {
                         tracing::info!("Routing input to session {}: {:?}", sid, text.chars().take(50).collect::<String>());
 
@@ -212,11 +213,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 ServerToCli::Input {
                                     session_id: sid,
                                     data: text.clone(),
+                                    pane_id: pane_id.clone(),
                                 },
                             )
                             .await;
 
                         if sent {
+                            // Use pane_id for storage, falling back to pane_type
+                            let effective_pane_id = pane_id.or_else(|| pane_type.map(|p| shared::PaneConfig::pane_id_from_legacy(&p)));
                             // Save user input to file storage (same as CLI does)
                             let stored_message = crate::storage::StoredMessage {
                                 id: uuid::Uuid::new_v4().to_string(),
@@ -224,7 +228,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 content: text.clone(),
                                 message_type: "text".to_string(),
                                 created_at: chrono::Utc::now().to_rfc3339(),
-                                pane_type: pane_type.map(|p| format!("{:?}", p).to_lowercase()),
+                                pane_type: effective_pane_id.map(|id| id.to_string()),
                             };
                             if let Err(e) = state.storage.append_message(&sid, &stored_message).await {
                                 tracing::error!("Failed to save user input to file: {}", e);
@@ -235,7 +239,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 .sessions
                                 .route_to_web(
                                     &sid,
-                                    ServerToWeb::UserInput { session_id: sid, text, pane_type },
+                                    ServerToWeb::UserInput { session_id: sid, text, pane_type, pane_id },
                                 )
                                 .await;
                         } else {
@@ -286,6 +290,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 ServerToCli::Input {
                                     session_id: sid,
                                     data: "y".to_string(),
+                                    pane_id: None,
                                 },
                             )
                             .await;
@@ -300,6 +305,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 ServerToCli::Input {
                                     session_id: sid,
                                     data: "n".to_string(),
+                                    pane_id: None,
                                 },
                             )
                             .await;
@@ -342,6 +348,79 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 &sid,
                                 ServerToCli::RebootCli {
                                     session_id: sid,
+                                },
+                            )
+                            .await;
+                    }
+                }
+                Ok(WebToServer::PausePane { pane_id }) => {
+                    if let Some(sid) = session_id {
+                        tracing::info!("Pausing pane {} for session {}", pane_id, sid);
+                        state
+                            .sessions
+                            .route_to_cli(
+                                &sid,
+                                ServerToCli::PausePane {
+                                    session_id: sid,
+                                    pane_id,
+                                },
+                            )
+                            .await;
+                    }
+                }
+                Ok(WebToServer::ResumePane { pane_id }) => {
+                    if let Some(sid) = session_id {
+                        tracing::info!("Resuming pane {} for session {}", pane_id, sid);
+                        state
+                            .sessions
+                            .route_to_cli(
+                                &sid,
+                                ServerToCli::ResumePane {
+                                    session_id: sid,
+                                    pane_id,
+                                },
+                            )
+                            .await;
+                    }
+                }
+                Ok(WebToServer::AddPane { provider, mode, label, prompt }) => {
+                    if let Some(sid) = session_id {
+                        // Generate a unique pane_id starting from 3 (1 and 2 are reserved for legacy deadloop/interactive)
+                        let pane_id = 3 + (uuid::Uuid::new_v4().as_u128() % 1000) as u32;
+                        let pane_config = shared::PaneConfig {
+                            pane_id,
+                            provider,
+                            mode,
+                            session_id: uuid::Uuid::new_v4(),
+                            is_paused: false,
+                            prompt,
+                            label,
+                        };
+                        tracing::info!("Adding pane {} to session {}", pane_id, sid);
+                        state
+                            .sessions
+                            .route_to_cli(
+                                &sid,
+                                ServerToCli::AddPane {
+                                    session_id: sid,
+                                    pane_config: pane_config.clone(),
+                                },
+                            )
+                            .await;
+                        // Also broadcast PaneList to web clients
+                        // (CLI will send back updated pane config)
+                    }
+                }
+                Ok(WebToServer::RemovePane { pane_id }) => {
+                    if let Some(sid) = session_id {
+                        tracing::info!("Removing pane {} from session {}", pane_id, sid);
+                        state
+                            .sessions
+                            .route_to_cli(
+                                &sid,
+                                ServerToCli::RemovePane {
+                                    session_id: sid,
+                                    pane_id,
                                 },
                             )
                             .await;
@@ -403,6 +482,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 ServerToWeb::SessionStarted {
                                     session_id: sid,
                                     pane_type: None,
+                                    pane_id: None,
                                 },
                             )
                             .await;
@@ -461,13 +541,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             Ok((stored_messages, has_more)) => {
                                 let messages: Vec<MessageInfo> = stored_messages
                                     .into_iter()
-                                    .map(|m| MessageInfo {
-                                        id: m.id,
-                                        role: m.role,
-                                        content: m.content,
-                                        message_type: m.message_type,
-                                        created_at: Some(m.created_at),
-                                        pane_type: m.pane_type,
+                                    .map(|m| {
+                                        let pane_id = m.pane_type.as_deref().and_then(|s| s.parse::<u32>().ok()
+                                            .or_else(|| match s { "deadloop" => Some(shared::PANE_ID_DEADLOOP), "interactive" => Some(shared::PANE_ID_INTERACTIVE), _ => None }));
+                                        MessageInfo {
+                                            id: m.id,
+                                            role: m.role,
+                                            content: m.content,
+                                            message_type: m.message_type,
+                                            created_at: Some(m.created_at),
+                                            pane_type: m.pane_type,
+                                            pane_id,
+                                        }
                                     })
                                     .collect();
                                 (messages, has_more)
@@ -582,20 +667,28 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         .send_to_web(&connection_id, ServerToWeb::Sessions { sessions })
                         .await;
                 }
-                Ok(WebToServer::GetSessionMessages { session_id: sid, limit, before_id, pane_type }) => {
+                Ok(WebToServer::GetSessionMessages { session_id: sid, limit, before_id, pane_type, pane_id }) => {
                     // Get messages for a specific session from file storage with pagination
                     let limit = limit.unwrap_or(100);
-                    match state.storage.get_messages_paginated_by_pane(&sid, Some(limit), before_id.as_deref(), pane_type).await {
+                    // Use pane_id for filtering if provided, otherwise fall back to pane_type
+                    let effective_pane_filter = pane_id
+                        .or_else(|| pane_type.as_ref().map(|p| shared::PaneConfig::pane_id_from_legacy(p)));
+                    match state.storage.get_messages_paginated_by_pane_id(&sid, Some(limit), before_id.as_deref(), effective_pane_filter).await {
                         Ok((stored_messages, has_more)) => {
                             let messages: Vec<MessageInfo> = stored_messages
                                 .into_iter()
-                                .map(|m| MessageInfo {
-                                    id: m.id,
-                                    role: m.role,
-                                    content: m.content,
-                                    message_type: m.message_type,
-                                    created_at: Some(m.created_at),
-                                    pane_type: m.pane_type,
+                                .map(|m| {
+                                    let pane_id = m.pane_type.as_deref().and_then(|s| s.parse::<u32>().ok()
+                                        .or_else(|| match s { "deadloop" => Some(shared::PANE_ID_DEADLOOP), "interactive" => Some(shared::PANE_ID_INTERACTIVE), _ => None }));
+                                    MessageInfo {
+                                        id: m.id,
+                                        role: m.role,
+                                        content: m.content,
+                                        message_type: m.message_type,
+                                        created_at: Some(m.created_at),
+                                        pane_type: m.pane_type,
+                                        pane_id,
+                                    }
                                 })
                                 .collect();
                             state
@@ -635,13 +728,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         Ok(stored_messages) => {
                             let messages: Vec<MessageInfo> = stored_messages
                                 .into_iter()
-                                .map(|m| MessageInfo {
-                                    id: m.id,
-                                    role: m.role,
-                                    content: m.content,
-                                    message_type: m.message_type,
-                                    created_at: Some(m.created_at),
-                                    pane_type: m.pane_type,
+                                .map(|m| {
+                                    let pane_id = m.pane_type.as_deref().and_then(|s| s.parse::<u32>().ok()
+                                        .or_else(|| match s { "deadloop" => Some(shared::PANE_ID_DEADLOOP), "interactive" => Some(shared::PANE_ID_INTERACTIVE), _ => None }));
+                                    MessageInfo {
+                                        id: m.id,
+                                        role: m.role,
+                                        content: m.content,
+                                        message_type: m.message_type,
+                                        created_at: Some(m.created_at),
+                                        pane_type: m.pane_type,
+                                        pane_id,
+                                    }
                                 })
                                 .collect();
                             state

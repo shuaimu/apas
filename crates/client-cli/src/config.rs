@@ -20,12 +20,19 @@ pub struct RemoteConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalConfig {
     pub claude_path: String,
+    #[serde(default = "default_codex_path")]
+    pub codex_path: String,
+}
+
+fn default_codex_path() -> String {
+    "codex".to_string()
 }
 
 impl Default for LocalConfig {
     fn default() -> Self {
         Self {
             claude_path: "claude".to_string(),
+            codex_path: default_codex_path(),
         }
     }
 }

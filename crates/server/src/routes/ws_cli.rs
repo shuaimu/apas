@@ -215,6 +215,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 working_dir,
                                 hostname,
                                 pane_type: _,
+                                panes: _,
                             }) => {
                                 // CLI is starting a local session (hybrid mode)
                                 state.sessions.create_cli_session(session_id, cli_id);
@@ -242,8 +243,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 data,
                                 output_type,
                                 pane_type,
+                                pane_id,
                             }) => {
-                                tracing::info!("Received Output for session {} with pane_type {:?}: {}", session_id, pane_type, &data[..data.len().min(50)]);
+                                tracing::info!("Received Output for session {} with pane_id {:?}: {}", session_id, pane_id, &data[..data.len().min(50)]);
                                 // Route output to web client (if attached)
                                 let routed = state
                                     .sessions
@@ -253,16 +255,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                             content: data,
                                             output_type,
                                             pane_type,
+                                            pane_id,
                                         },
                                     )
                                     .await;
                                 tracing::info!("Output routed to web: {}", routed);
                             }
-                            Ok(CliToServer::StreamMessage { session_id, message, pane_type }) => {
-                                tracing::info!("Received StreamMessage for session {} with pane_type {:?}", session_id, pane_type);
+                            Ok(CliToServer::StreamMessage { session_id, message, pane_type, pane_id }) => {
+                                tracing::info!("Received StreamMessage for session {} with pane_id {:?}", session_id, pane_id);
+
+                                // Use pane_id for storage, falling back to pane_type for backward compat
+                                let effective_pane_id = pane_id.or_else(|| pane_type.map(|p| shared::PaneConfig::pane_id_from_legacy(&p)));
 
                                 // Save message(s) to file storage
-                                for stored_message in stream_message_to_stored(&session_id, &message, pane_type) {
+                                for stored_message in stream_message_to_stored(&session_id, &message, effective_pane_id) {
                                     if let Err(e) = state.storage.append_message(&session_id, &stored_message).await {
                                         tracing::error!("Failed to save message to file: {}", e);
                                     }
@@ -273,13 +279,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     .sessions
                                     .route_to_web(
                                         &session_id,
-                                        ServerToWeb::StreamMessage { session_id, message, pane_type },
+                                        ServerToWeb::StreamMessage { session_id, message, pane_type, pane_id },
                                     )
                                     .await;
                                 tracing::info!("StreamMessage routed to web: {}", routed);
                             }
-                            Ok(CliToServer::UserInput { session_id, text, pane_type }) => {
+                            Ok(CliToServer::UserInput { session_id, text, pane_type, pane_id }) => {
                                 tracing::info!("Received UserInput for session {}: {}", session_id, text);
+                                // Use pane_id for storage, falling back to pane_type
+                                let effective_pane_id = pane_id.or_else(|| pane_type.map(|p| shared::PaneConfig::pane_id_from_legacy(&p)));
                                 // Save user input to file storage
                                 let stored_message = crate::storage::StoredMessage {
                                     id: Uuid::new_v4().to_string(),
@@ -287,7 +295,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     content: text.clone(),
                                     message_type: "text".to_string(),
                                     created_at: chrono::Utc::now().to_rfc3339(),
-                                    pane_type: pane_type.map(|p| format!("{:?}", p).to_lowercase()),
+                                    pane_type: effective_pane_id.map(|id| id.to_string()),
                                 };
                                 if let Err(e) = state.storage.append_message(&session_id, &stored_message).await {
                                     tracing::error!("Failed to save user input to file: {}", e);
@@ -298,7 +306,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     .sessions
                                     .route_to_web(
                                         &session_id,
-                                        ServerToWeb::UserInput { session_id, text, pane_type },
+                                        ServerToWeb::UserInput { session_id, text, pane_type, pane_id },
                                     )
                                     .await;
                             }
@@ -343,16 +351,36 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     )
                                     .await;
                             }
-                            Ok(CliToServer::PaneStatus { session_id, pane_type, status }) => {
+                            Ok(CliToServer::PaneStatus { session_id, pane_type, pane_id, status }) => {
                                 // Forward pane status to web clients
-                                tracing::info!("Pane status for session {}: {:?} = {:?}", session_id, pane_type, status);
+                                tracing::info!("Pane status for session {}: pane_id={:?} = {:?}", session_id, pane_id, status);
                                 state
                                     .sessions
                                     .route_to_web(
                                         &session_id,
                                         ServerToWeb::PaneStatus {
                                             pane_type,
+                                            pane_id,
                                             status,
+                                        },
+                                    )
+                                    .await;
+                            }
+                            Ok(CliToServer::PanePaused { session_id, pane_id, is_paused }) => {
+                                // Save pause state
+                                state.sessions.set_session_paused(&session_id, is_paused);
+                                if let Err(e) = state.db.update_session_paused(&session_id.to_string(), is_paused).await {
+                                    tracing::error!("Failed to persist pause status to database: {}", e);
+                                }
+                                tracing::info!("Pane {} paused={} for session {}", pane_id, is_paused, session_id);
+                                state
+                                    .sessions
+                                    .route_to_web(
+                                        &session_id,
+                                        ServerToWeb::PanePaused {
+                                            session_id,
+                                            pane_id,
+                                            is_paused,
                                         },
                                     )
                                     .await;
@@ -366,6 +394,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     limits.seven_day.as_ref().map(|w| w.utilization * 100.0).unwrap_or(0.0)
                                 );
                                 state.sessions.update_usage_limits(cli_id, limits);
+                            }
+                            Ok(CliToServer::PaneList { session_id, panes }) => {
+                                // Forward pane list to attached web clients
+                                tracing::info!("CLI {} sent pane list for session {}: {} panes", cli_id, session_id, panes.len());
+                                let web_msg = ServerToWeb::PaneList {
+                                    session_id,
+                                    panes,
+                                };
+                                state.sessions.route_to_web(&session_id, web_msg).await;
                             }
                             Ok(CliToServer::Register { .. }) => {
                                 // Already registered, ignore
@@ -424,11 +461,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 fn stream_message_to_stored(
     _session_id: &Uuid,
     message: &shared::ClaudeStreamMessage,
-    pane_type: Option<shared::PaneType>,
+    pane_id: Option<u32>,
 ) -> Vec<crate::storage::StoredMessage> {
     use shared::{ClaudeStreamMessage, ClaudeContentBlock};
 
-    let pane_type_str = pane_type.map(|p| format!("{:?}", p).to_lowercase());
+    let pane_type_str = pane_id.map(|id| id.to_string());
     let mut messages = Vec::new();
 
     match message {
@@ -491,7 +528,27 @@ fn stream_message_to_stored(
                 pane_type: pane_type_str,
             });
         }
-        _ => {} // Skip system and user messages for now
+        ClaudeStreamMessage::User { message: msg, .. } => {
+            // Store tool results from user messages
+            for block in &msg.content {
+                if let ClaudeContentBlock::ToolResult { tool_use_id, content, is_error } = block {
+                    let result_data = serde_json::json!({
+                        "tool_use_id": tool_use_id,
+                        "content": content,
+                        "is_error": is_error
+                    });
+                    messages.push(crate::storage::StoredMessage {
+                        id: Uuid::new_v4().to_string(),
+                        role: "tool".to_string(),
+                        content: result_data.to_string(),
+                        message_type: "tool_result".to_string(),
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                        pane_type: pane_type_str.clone(),
+                    });
+                }
+            }
+        }
+        _ => {} // Skip system init messages
     }
 
     messages

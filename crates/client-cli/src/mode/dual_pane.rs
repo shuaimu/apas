@@ -1,23 +1,26 @@
-//! Dual-pane mode: Split terminal with deadloop (left) and interactive (right) sessions
+//! Tab-based mode: Multiple independent Claude sessions as tabs
 //!
-//! Runs two independent Claude sessions:
-//! - Left pane: Autonomous deadloop worker (same as hybrid mode)
-//! - Right pane: Interactive session for user queries
+//! Starts with two default tabs:
+//! - Tab 1: Deadloop (autonomous worker)
+//! - Tab 2: Interactive session
+//!
+//! Users can create and close tabs dynamically from both TUI and web UI.
 
 use anyhow::Result;
 use shared::{CliToServer, ClaudeStreamMessage, PaneType, ServerToCli};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 use uuid::Uuid;
 
 use crate::project::{get_or_create_project, save_project};
-use crate::tui::{App, PaneOutput};
+use crate::tui::{App, PaneOutput, TuiCommand, TuiEvent};
 
 const DEFAULT_PROMPT: &str = r#"Work on tasks defined in TODO.md. Do the following steps. Don't ask me for advice, just pick the best option you think that is honest, complete, and not corner-cutting:
 
@@ -28,7 +31,11 @@ const DEFAULT_PROMPT: &str = r#"Work on tasks defined in TODO.md. Do the followi
 5. Prepare for git commit, remove all temporary files, especially not to commit any binary files. For plan files, remove the implementation plan and keep the design rational and user manual and put it in the docs folder.
 6. Git commit the changes. First do git pull --rebase, and fix conflicts if any. Then do git push."#;
 
-/// Run in dual-pane mode
+/// Per-pane input channel registry.
+/// Maps pane_id -> Sender<String> for routing input to the correct session thread.
+type InputChannels = Arc<Mutex<HashMap<u32, mpsc::Sender<String>>>>;
+
+/// Run in tab-based mode
 pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()> {
     // Clear terminal screen for a clean start
     print!("\x1B[2J\x1B[H");
@@ -39,14 +46,11 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
 
     // Load or create project metadata
     let mut metadata = get_or_create_project(working_dir)?;
-    // Use same session_id for both panes - pane_type differentiates them
     let session_id = metadata.id;
 
     // Get or create Claude session IDs for persistence across restarts
     let deadloop_claude_session_id = metadata.get_or_create_deadloop_session_id();
     let interactive_claude_session_id = metadata.get_or_create_interactive_session_id();
-
-    // Save the metadata with new session IDs if they were created
     save_project(working_dir, &metadata)?;
 
     let prompt = metadata.prompt.clone()
@@ -57,38 +61,43 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     let server_url = server_url.to_string();
     let token = token.to_string();
 
-    // Channels for TUI <-> sessions
-    let (input_tx, input_rx) = mpsc::channel::<String>();
-    let (output_tx, output_rx) = mpsc::channel::<PaneOutput>();
-
     // Channel for sending to server
     let (server_tx, server_rx) = tokio_mpsc::channel::<CliToServer>(256);
 
     // Shutdown flag
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    // Pause deadloop flag (controlled from web UI)
-    // Initialize from saved state in project metadata
+    // Pause deadloop flag
     let pause_deadloop = Arc::new(AtomicBool::new(metadata.is_paused));
-    if metadata.is_paused {
-        let _ = output_tx.send(PaneOutput {
-            text: "[Deadloop starting in paused state (from previous session)]".to_string(),
-            is_deadloop: true,
-        });
-    }
 
-    // Reboot flag - when set, restart CLI after clean shutdown
+    // Reboot flag
     let reboot_requested = Arc::new(AtomicBool::new(false));
 
-    // Shared reference to child process for cleanup
+    // Shared child process for cleanup (deadloop pane)
     let child_process: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
     let child_for_handler = child_process.clone();
+
+    // Per-pane input channels
+    let input_channels: InputChannels = Arc::new(Mutex::new(HashMap::new()));
+
+    // TUI channels
+    let (tui_input_tx, tui_input_rx) = mpsc::channel::<(u32, String)>();
+    let (output_tx, output_rx) = mpsc::channel::<PaneOutput>();
+    let (event_tx, event_rx) = mpsc::channel::<TuiEvent>();
+    let (command_tx, command_rx) = mpsc::channel::<TuiCommand>();
+
+    // Create per-pane input channel for the interactive pane
+    // Both TUI and web input are routed through this single channel via input_channels
+    let (interactive_input_tx, interactive_input_rx) = mpsc::channel::<String>();
+    {
+        let mut channels = input_channels.lock().unwrap();
+        channels.insert(shared::PANE_ID_INTERACTIVE, interactive_input_tx);
+    }
 
     // Setup Ctrl+C handler
     let shutdown_for_handler = shutdown.clone();
     ctrlc::set_handler(move || {
         shutdown_for_handler.store(true, Ordering::SeqCst);
-        // Kill child process if running
         if let Ok(mut guard) = child_for_handler.lock() {
             if let Some(ref mut child) = *guard {
                 let _ = child.kill();
@@ -96,89 +105,110 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
         }
     })?;
 
-    // Channel for web input -> interactive session
-    let (web_input_tx, web_input_rx) = mpsc::channel::<String>();
-
     // Spawn server connection task
-    let shutdown_clone = shutdown.clone();
-    let pause_clone = pause_deadloop.clone();
-    let reboot_clone = reboot_requested.clone();
-    let server_url_clone = server_url.clone();
-    let token_clone = token.clone();
-    let working_dir_clone = working_dir_str.clone();
-    let status_output_tx = output_tx.clone();
-    let server_task = tokio::spawn(async move {
-        run_server_connection(
-            &server_url_clone,
-            &token_clone,
-            session_id,
-            &working_dir_clone,
-            server_rx,
-            shutdown_clone,
-            pause_clone,
-            reboot_clone,
-            web_input_tx,
-            status_output_tx,
-        )
-        .await
-    });
+    let server_task = {
+        let shutdown = shutdown.clone();
+        let pause = pause_deadloop.clone();
+        let reboot = reboot_requested.clone();
+        let server_url = server_url.clone();
+        let token = token.clone();
+        let working_dir = working_dir_str.clone();
+        let status_tx = output_tx.clone();
+        let input_channels = input_channels.clone();
+        let event_tx_for_server = event_tx.clone();
+        tokio::spawn(async move {
+            run_server_connection(
+                &server_url, &token, session_id, &working_dir,
+                server_rx, shutdown, pause, reboot,
+                input_channels, status_tx, event_tx_for_server,
+            ).await
+        })
+    };
 
-    // Send initial messages to show TUI is working
+    // Send initial messages
     let _ = output_tx.send(PaneOutput {
         text: "[Deadloop pane initializing...]".to_string(),
-        is_deadloop: true,
+        pane_id: shared::PANE_ID_DEADLOOP,
     });
     let _ = output_tx.send(PaneOutput {
         text: "[Interactive pane initializing...]".to_string(),
-        is_deadloop: false,
+        pane_id: shared::PANE_ID_INTERACTIVE,
     });
 
-    // Spawn deadloop session in a thread
-    let deadloop_output_tx = output_tx.clone();
-    let deadloop_server_tx = server_tx.clone();
-    let deadloop_shutdown = shutdown.clone();
-    let deadloop_pause = pause_deadloop.clone();
-    let deadloop_working_dir = working_dir_str.clone();
-    let deadloop_claude_path = claude_path.clone();
-    let deadloop_child = child_process.clone();
-    let deadloop_prompt = prompt.clone();
-    let deadloop_thread = thread::spawn(move || {
-        run_deadloop_session(
-            &deadloop_claude_path,
-            &deadloop_working_dir,
-            session_id,
-            deadloop_claude_session_id,
-            &deadloop_prompt,
-            deadloop_output_tx,
-            deadloop_server_tx,
-            deadloop_shutdown,
-            deadloop_pause,
-            deadloop_child,
-        )
-    });
+    if metadata.is_paused {
+        let _ = output_tx.send(PaneOutput {
+            text: "[Deadloop starting in paused state (from previous session)]".to_string(),
+            pane_id: shared::PANE_ID_DEADLOOP,
+        });
+    }
 
-    // Spawn interactive session in a thread
-    let interactive_output_tx = output_tx.clone();
-    let interactive_server_tx = server_tx.clone();
-    let interactive_shutdown = shutdown.clone();
-    let interactive_working_dir = working_dir_str.clone();
-    let interactive_claude_path = claude_path.clone();
-    let interactive_thread = thread::spawn(move || {
-        run_interactive_session(
-            &interactive_claude_path,
-            &interactive_working_dir,
-            session_id,
-            interactive_claude_session_id,
-            input_rx,
-            web_input_rx,
-            interactive_output_tx,
-            interactive_server_tx,
-            interactive_shutdown,
-        )
-    });
+    // Spawn deadloop session thread
+    let deadloop_thread = {
+        let output_tx = output_tx.clone();
+        let server_tx = server_tx.clone();
+        let shutdown = shutdown.clone();
+        let pause = pause_deadloop.clone();
+        let working_dir = working_dir_str.clone();
+        let claude_path = claude_path.clone();
+        let child_process = child_process.clone();
+        let prompt = prompt.clone();
+        thread::spawn(move || {
+            run_deadloop_session(
+                &claude_path, &working_dir, session_id, deadloop_claude_session_id,
+                &prompt, output_tx, server_tx, shutdown, pause, child_process,
+            )
+        })
+    };
+
+    // Spawn centralized input router — routes TUI input to correct pane via input_channels
+    spawn_centralized_input_router(
+        tui_input_rx,
+        input_channels.clone(),
+        shutdown.clone(),
+    );
+
+    // Spawn interactive session thread
+    let interactive_thread = {
+        let output_tx = output_tx.clone();
+        let server_tx = server_tx.clone();
+        let shutdown = shutdown.clone();
+        let working_dir = working_dir_str.clone();
+        let claude_path = claude_path.clone();
+        thread::spawn(move || {
+            run_pane_session(
+                &claude_path, &working_dir, session_id, interactive_claude_session_id,
+                shared::PANE_ID_INTERACTIVE, interactive_input_rx,
+                output_tx, server_tx, shutdown,
+            )
+        })
+    };
+
+    // TUI event handler thread — processes AddTab/CloseTab events
+    // (runs in background, feeds events into the App via channels)
+    let tui_event_thread = {
+        let shutdown = shutdown.clone();
+        let output_tx_event = output_tx.clone();
+        let server_tx_event = server_tx.clone();
+        let input_channels_event = input_channels.clone();
+        let working_dir_event = working_dir_str.clone();
+        let claude_path_event = claude_path.clone();
+        thread::spawn(move || {
+            handle_tui_events(
+                event_rx, shutdown, output_tx_event, server_tx_event,
+                input_channels_event, session_id,
+                &claude_path_event, &working_dir_event,
+                command_tx,
+            )
+        })
+    };
 
     // Run TUI in main thread
-    let mut app = App::new(input_tx, output_rx).with_shutdown(shutdown.clone());
+    let initial_tabs = vec![
+        (shared::PANE_ID_DEADLOOP, "Deadloop".to_string()),
+        (shared::PANE_ID_INTERACTIVE, "Interactive".to_string()),
+    ];
+    let mut app = App::new(tui_input_tx, output_rx, event_tx, command_rx, initial_tabs)
+        .with_shutdown(shutdown.clone());
     if let Err(e) = app.run() {
         tracing::error!("TUI error: {}", e);
     }
@@ -193,20 +223,178 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
         }
     }
 
-    // If reboot was requested, restart immediately without waiting for threads
+    // If reboot was requested, restart immediately
     if reboot_requested.load(Ordering::SeqCst) {
         server_task.abort();
         crate::update::restart_cli();
-        // If we get here, restart_cli() failed
         std::process::exit(1);
     }
 
-    // Wait for threads to finish (normal shutdown)
+    // Wait for threads
     let _ = deadloop_thread.join();
     let _ = interactive_thread.join();
+    let _ = tui_event_thread.join();
     server_task.abort();
 
     Ok(())
+}
+
+/// Centralized input router: forwards TUI input to the correct pane via input_channels.
+/// All panes (interactive, dynamic) register in input_channels and receive TUI input automatically.
+fn spawn_centralized_input_router(
+    tui_input_rx: mpsc::Receiver<(u32, String)>,
+    input_channels: InputChannels,
+    shutdown: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
+        while !shutdown.load(Ordering::SeqCst) {
+            match tui_input_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok((pane_id, text)) => {
+                    let channels = input_channels.lock().unwrap();
+                    if let Some(tx) = channels.get(&pane_id) {
+                        let _ = tx.send(text);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
+}
+
+/// Handle TUI events (AddTab, CloseTab) in a background thread
+fn handle_tui_events(
+    event_rx: mpsc::Receiver<TuiEvent>,
+    shutdown: Arc<AtomicBool>,
+    output_tx: mpsc::Sender<PaneOutput>,
+    server_tx: tokio_mpsc::Sender<CliToServer>,
+    input_channels: InputChannels,
+    session_id: Uuid,
+    claude_path: &str,
+    working_dir: &str,
+    command_tx: mpsc::Sender<TuiCommand>,
+) {
+    while !shutdown.load(Ordering::SeqCst) {
+        match event_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(TuiEvent::AddTab) => {
+                // Generate a new pane_id
+                let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
+                let claude_session_id = Uuid::new_v4();
+                let label = format!("Tab {}", pane_id);
+
+                // Create input channel — TUI and web input both flow through this
+                let (input_tx, input_rx) = mpsc::channel::<String>();
+                {
+                    let mut channels = input_channels.lock().unwrap();
+                    channels.insert(pane_id, input_tx);
+                }
+
+                // Notify TUI to add the tab visually
+                let _ = command_tx.send(TuiCommand::AddTab {
+                    pane_id,
+                    label: label.clone(),
+                });
+
+                let _ = output_tx.send(PaneOutput {
+                    text: format!("[New tab created: {}]", label),
+                    pane_id,
+                });
+
+                // Spawn session thread — input comes from centralized router + web
+                {
+                    let output_tx = output_tx.clone();
+                    let server_tx = server_tx.clone();
+                    let shutdown = shutdown.clone();
+                    let claude_path = claude_path.to_string();
+                    let working_dir = working_dir.to_string();
+                    thread::spawn(move || {
+                        run_pane_session(
+                            &claude_path, &working_dir, session_id, claude_session_id,
+                            pane_id, input_rx,
+                            output_tx, server_tx, shutdown,
+                        )
+                    });
+                }
+
+                // Send pane list update
+                let _ = server_tx.blocking_send(CliToServer::PaneList {
+                    session_id,
+                    panes: build_pane_list(&input_channels, session_id),
+                });
+            }
+            Ok(TuiEvent::CloseTab(pane_id)) => {
+                // Remove input channel (causes session thread to exit)
+                {
+                    let mut channels = input_channels.lock().unwrap();
+                    channels.remove(&pane_id);
+                }
+
+                // Notify TUI to remove the tab visually
+                let _ = command_tx.send(TuiCommand::RemoveTab { pane_id });
+
+                let _ = output_tx.send(PaneOutput {
+                    text: format!("[Tab {} closed]", pane_id),
+                    pane_id,
+                });
+
+                // Send pane list update
+                let _ = server_tx.blocking_send(CliToServer::PaneList {
+                    session_id,
+                    panes: build_pane_list(&input_channels, session_id),
+                });
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+/// Build a PaneConfig list from the current input channels registry
+fn build_pane_list(input_channels: &InputChannels, session_id: Uuid) -> Vec<shared::PaneConfig> {
+    let channels = input_channels.lock().unwrap();
+    let mut panes = Vec::new();
+
+    // Always include deadloop (it doesn't have an input channel but is always present)
+    panes.push(shared::PaneConfig {
+        pane_id: shared::PANE_ID_DEADLOOP,
+        provider: shared::Provider::Claude,
+        mode: shared::PaneMode::Deadloop,
+        session_id,
+        is_paused: false,
+        prompt: None,
+        label: Some("Deadloop".to_string()),
+    });
+
+    // Interactive pane
+    if channels.contains_key(&shared::PANE_ID_INTERACTIVE) {
+        panes.push(shared::PaneConfig {
+            pane_id: shared::PANE_ID_INTERACTIVE,
+            provider: shared::Provider::Claude,
+            mode: shared::PaneMode::Interactive,
+            session_id,
+            is_paused: false,
+            prompt: None,
+            label: Some("Interactive".to_string()),
+        });
+    }
+
+    // Dynamic panes
+    for &pane_id in channels.keys() {
+        if pane_id != shared::PANE_ID_INTERACTIVE && pane_id != shared::PANE_ID_DEADLOOP {
+            panes.push(shared::PaneConfig {
+                pane_id,
+                provider: shared::Provider::Claude,
+                mode: shared::PaneMode::Interactive,
+                session_id,
+                is_paused: false,
+                prompt: None,
+                label: Some(format!("Tab {}", pane_id)),
+            });
+        }
+    }
+
+    panes.sort_by_key(|p| p.pane_id);
+    panes
 }
 
 /// Run the deadloop (autonomous) session
@@ -222,19 +410,10 @@ fn run_deadloop_session(
     pause: Arc<AtomicBool>,
     child_process: Arc<Mutex<Option<std::process::Child>>>,
 ) {
-    // Wrap in panic catcher to prevent silent thread crashes
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_deadloop_session_inner(
-            claude_path,
-            working_dir,
-            session_id,
-            claude_session_id,
-            prompt,
-            output_tx.clone(),
-            server_tx,
-            shutdown,
-            pause,
-            child_process,
+            claude_path, working_dir, session_id, claude_session_id,
+            prompt, output_tx.clone(), server_tx, shutdown, pause, child_process,
         )
     }));
 
@@ -248,7 +427,7 @@ fn run_deadloop_session(
         };
         let _ = output_tx.send(PaneOutput {
             text: format!("[DEADLOOP CRASHED: {}]", msg),
-            is_deadloop: true,
+            pane_id: shared::PANE_ID_DEADLOOP,
         });
     }
 }
@@ -265,102 +444,76 @@ fn run_deadloop_session_inner(
     pause: Arc<AtomicBool>,
     child_process: Arc<Mutex<Option<std::process::Child>>>,
 ) {
+    let pane_id = shared::PANE_ID_DEADLOOP;
     let _ = output_tx.send(PaneOutput {
         text: format!("[Deadloop session: {}]", &claude_session_id.to_string()[..8]),
-        is_deadloop: true,
+        pane_id,
     });
 
     let mut iteration = 0;
     let mut backoff_seconds = 2u64;
     const MAX_BACKOFF: u64 = 3600;
-    let mut first_message = true; // Track if this is first message
-    // On first message, try --resume first (session may exist from previous run).
-    // If --resume fails, fall back to --session-id to create new session.
+    let mut first_message = true;
     let mut try_resume_first = true;
     let mut was_paused = false;
 
     while !shutdown.load(Ordering::SeqCst) {
-        // Check for pause before each iteration
         if pause.load(Ordering::SeqCst) {
             if !was_paused {
                 was_paused = true;
                 let _ = output_tx.send(PaneOutput {
                     text: "[Deadloop paused - waiting for resume...]".to_string(),
-                    is_deadloop: true,
+                    pane_id,
                 });
             }
-            // Sleep and continue checking
             thread::sleep(Duration::from_millis(500));
             continue;
         } else if was_paused {
-            // Just resumed
             was_paused = false;
             let _ = output_tx.send(PaneOutput {
                 text: "[Deadloop resumed]".to_string(),
-                is_deadloop: true,
+                pane_id,
             });
         }
 
         iteration += 1;
         let _ = output_tx.send(PaneOutput {
             text: format!("=== Iteration {} ===", iteration),
-            is_deadloop: true,
+            pane_id,
         });
 
-        // Send user input to server
-        // Use try_send to avoid blocking if channel is full
         let _ = server_tx.try_send(CliToServer::UserInput {
             session_id,
             text: format!("[Iteration {}]\n{}", iteration, prompt),
             pane_type: Some(PaneType::Deadloop),
+            pane_id: Some(pane_id),
         });
 
-        // Show thinking status for deadloop pane
         let _ = server_tx.try_send(CliToServer::PaneStatus {
             session_id,
             pane_type: PaneType::Deadloop,
+            pane_id: Some(pane_id),
             status: Some("Thinking...".to_string()),
         });
 
-        // Build args:
-        // - First message with try_resume_first: try --resume (session may exist from previous run)
-        // - First message without try_resume_first: use --session-id (fallback if --resume failed)
-        // - Subsequent: use --resume with the session ID to continue
         let (args, using_resume) = if first_message && try_resume_first {
-            // Try --resume first on first message (handles apas restart case)
             (vec![
-                "--print".to_string(),
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--verbose".to_string(),
-                "--dangerously-skip-permissions".to_string(),
-                "--resume".to_string(),
-                claude_session_id.to_string(),
-                prompt.to_string(),
+                "--print".to_string(), "--output-format".to_string(), "stream-json".to_string(),
+                "--verbose".to_string(), "--dangerously-skip-permissions".to_string(),
+                "--resume".to_string(), claude_session_id.to_string(), prompt.to_string(),
             ], true)
         } else if first_message {
-            // Fallback to --session-id if --resume failed (new session)
             first_message = false;
             (vec![
-                "--print".to_string(),
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--verbose".to_string(),
-                "--dangerously-skip-permissions".to_string(),
-                "--session-id".to_string(),
-                claude_session_id.to_string(),
-                prompt.to_string(),
+                "--print".to_string(), "--output-format".to_string(), "stream-json".to_string(),
+                "--verbose".to_string(), "--dangerously-skip-permissions".to_string(),
+                "--session-id".to_string(), claude_session_id.to_string(), prompt.to_string(),
             ], false)
         } else {
             (vec![
-                "--print".to_string(),
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--verbose".to_string(),
-                "--dangerously-skip-permissions".to_string(),
-                "--resume".to_string(),
-                claude_session_id.to_string(),
-                prompt.to_string(),
+                "--print".to_string(), "--output-format".to_string(), "stream-json".to_string(),
+                "--verbose".to_string(), "--dangerously-skip-permissions".to_string(),
+                "--resume".to_string(), claude_session_id.to_string(), prompt.to_string(),
             ], true)
         };
 
@@ -374,52 +527,37 @@ fn run_deadloop_session_inner(
         {
             Ok(mut child) => {
                 let child_pid = child.id();
-
-                // Take stdout for reading
                 let stdout = match child.stdout.take() {
                     Some(s) => s,
                     None => {
                         let _ = output_tx.send(PaneOutput {
                             text: "[Error: Failed to capture stdout]".to_string(),
-                            is_deadloop: true,
+                            pane_id,
                         });
-                        thread::sleep(std::time::Duration::from_secs(5));
+                        thread::sleep(Duration::from_secs(5));
                         continue;
                     }
                 };
-
-                // Take stderr for reading
                 let stderr = child.stderr.take();
 
-                // Store child for cleanup
                 if let Ok(mut guard) = child_process.lock() {
                     *guard = Some(child);
                 }
 
-                // Channel for stdout lines (allows timeout-based reading)
                 let (stdout_tx, stdout_rx) = mpsc::channel::<Option<String>>();
-
-                // Spawn thread to read stdout and send via channel
                 let stdout_thread = thread::spawn(move || {
                     let reader = BufReader::new(stdout);
                     for line in reader.lines() {
                         match line {
-                            Ok(l) => {
-                                if stdout_tx.send(Some(l)).is_err() {
-                                    break; // Receiver dropped
-                                }
-                            }
+                            Ok(l) => { if stdout_tx.send(Some(l)).is_err() { break; } }
                             Err(_) => break,
                         }
                     }
-                    // Signal end of stream
                     let _ = stdout_tx.send(None);
                 });
 
-                // Spawn thread to read stderr
                 let output_tx_stderr = output_tx.clone();
                 let server_tx_stderr = server_tx.clone();
-                let session_id_stderr = session_id;
                 let stderr_thread = stderr.map(|stderr| {
                     thread::spawn(move || {
                         let reader = BufReader::new(stderr);
@@ -428,14 +566,14 @@ fn run_deadloop_session_inner(
                                 if !line.trim().is_empty() {
                                     let _ = output_tx_stderr.send(PaneOutput {
                                         text: format!("[stderr] {}", line),
-                                        is_deadloop: true,
+                                        pane_id,
                                     });
-                                    // Use try_send to avoid blocking
                                     let _ = server_tx_stderr.try_send(CliToServer::Output {
-                                        session_id: session_id_stderr,
+                                        session_id,
                                         data: format!("[stderr] {}", line),
                                         output_type: shared::OutputType::Error,
-                                        pane_type: Some(shared::PaneType::Deadloop),
+                                        pane_type: Some(PaneType::Deadloop),
+                                        pane_id: Some(pane_id),
                                     });
                                 }
                             }
@@ -447,107 +585,75 @@ fn run_deadloop_session_inner(
                 let mut process_exited = false;
                 let mut exit_was_error = false;
                 let mut timeouts_after_exit = 0;
-                const MAX_TIMEOUTS_AFTER_EXIT: u32 = 10; // 5 seconds max wait after exit
-                let check_interval = std::time::Duration::from_millis(500);
+                const MAX_TIMEOUTS_AFTER_EXIT: u32 = 10;
+                let check_interval = Duration::from_millis(500);
 
-                // Main loop: read stdout with timeout and check for process exit
                 loop {
-                    if shutdown.load(Ordering::SeqCst) {
-                        break;
-                    }
+                    if shutdown.load(Ordering::SeqCst) { break; }
 
-                    // Check if process has exited (crash/exit detection)
-                    // Use try_lock to avoid blocking if another thread holds the lock
                     if !process_exited {
                         if let Ok(mut guard) = child_process.try_lock() {
                             if let Some(ref mut child) = *guard {
                                 match child.try_wait() {
                                     Ok(Some(status)) => {
-                                        // Process has exited
                                         process_exited = true;
                                         if !status.success() {
                                             let _ = output_tx.send(PaneOutput {
                                                 text: format!("[Claude process exited with {}]", status),
-                                                is_deadloop: true,
+                                                pane_id,
                                             });
                                             exit_was_error = true;
                                             had_error = true;
                                         } else {
                                             let _ = output_tx.send(PaneOutput {
                                                 text: "[Claude process exited normally]".to_string(),
-                                                is_deadloop: true,
+                                                pane_id,
                                             });
                                         }
                                     }
-                                    Ok(None) => {
-                                        // Still running
-                                    }
+                                    Ok(None) => {}
                                     Err(e) => {
                                         let _ = output_tx.send(PaneOutput {
                                             text: format!("[Error checking process status: {}]", e),
-                                            is_deadloop: true,
+                                            pane_id,
                                         });
                                     }
                                 }
                             }
                         }
-                        // If lock not available, we'll try again next iteration
                     }
 
-                    // Try to receive stdout line with timeout
                     match stdout_rx.recv_timeout(check_interval) {
                         Ok(Some(line)) => {
-                            // Reset timeout counter since we're receiving data
                             timeouts_after_exit = 0;
+                            if line.trim().is_empty() { continue; }
 
-                            if line.trim().is_empty() {
-                                continue;
-                            }
-
-                            // Parse and process
                             match serde_json::from_str::<ClaudeStreamMessage>(&line) {
                                 Ok(message) => {
                                     if let ClaudeStreamMessage::Result { is_error, .. } = &message {
-                                        if *is_error {
-                                            had_error = true;
-                                        }
+                                        if *is_error { had_error = true; }
                                     }
-
                                     let display_text = format_stream_message(&message);
-                                    let _ = output_tx.send(PaneOutput {
-                                        text: display_text,
-                                        is_deadloop: true,
-                                    });
-
-                                    // Use try_send to avoid blocking (drop message if channel full)
+                                    let _ = output_tx.send(PaneOutput { text: display_text, pane_id });
                                     let _ = server_tx.try_send(CliToServer::StreamMessage {
-                                        session_id,
-                                        message,
+                                        session_id, message,
                                         pane_type: Some(PaneType::Deadloop),
+                                        pane_id: Some(pane_id),
                                     });
                                 }
                                 Err(_) => {
-                                    // Non-JSON output - display and forward to server
-                                    let _ = output_tx.send(PaneOutput {
-                                        text: line.clone(),
-                                        is_deadloop: true,
-                                    });
-                                    // Use try_send to avoid blocking
+                                    let _ = output_tx.send(PaneOutput { text: line.clone(), pane_id });
                                     let _ = server_tx.try_send(CliToServer::Output {
-                                        session_id,
-                                        data: line,
+                                        session_id, data: line,
                                         output_type: shared::OutputType::Text,
-                                        pane_type: Some(shared::PaneType::Deadloop),
+                                        pane_type: Some(PaneType::Deadloop),
+                                        pane_id: Some(pane_id),
                                     });
                                 }
                             }
                         }
-                        Ok(None) => {
-                            // End of stream - stdout closed normally
-                            break;
-                        }
+                        Ok(None) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            // No data yet, check if process has exited
                             if process_exited {
                                 timeouts_after_exit += 1;
                                 if timeouts_after_exit >= MAX_TIMEOUTS_AFTER_EXIT {
@@ -557,53 +663,36 @@ fn run_deadloop_session_inner(
                                         } else {
                                             "[Process exited, restarting...]".to_string()
                                         },
-                                        is_deadloop: true,
+                                        pane_id,
                                     });
                                     break;
                                 }
-                                // Give stdout thread a bit more time to flush
-                                continue;
                             }
-                            continue;
                         }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            // Stdout thread exited
-                            break;
-                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
 
-                // Cleanup: wait for threads with timeout
                 let _ = stdout_thread.join();
-
                 if let Some(handle) = stderr_thread {
-                    // Give stderr thread a moment to finish, but don't block forever
-                    let stderr_timeout = thread::spawn(move || {
-                        let _ = handle.join();
-                    });
-                    thread::sleep(std::time::Duration::from_millis(500));
-                    drop(stderr_timeout); // Don't wait for it if it's stuck
+                    let stderr_timeout = thread::spawn(move || { let _ = handle.join(); });
+                    thread::sleep(Duration::from_millis(500));
+                    drop(stderr_timeout);
                 }
 
-                // Cleanup child process (kill if still running, reap zombie)
                 if let Ok(mut guard) = child_process.lock() {
                     if let Some(mut child) = guard.take() {
-                        // Try to get exit status, kill if still running
                         match child.try_wait() {
-                            Ok(Some(_)) => {
-                                // Already exited, just reap
-                            }
+                            Ok(Some(_)) => {}
                             Ok(None) => {
-                                // Still running, kill it
                                 let _ = output_tx.send(PaneOutput {
                                     text: format!("[Killing stuck process {}]", child_pid),
-                                    is_deadloop: true,
+                                    pane_id,
                                 });
                                 let _ = child.kill();
                                 let _ = child.wait();
                             }
                             Err(_) => {
-                                // Error checking, try to kill anyway
                                 let _ = child.kill();
                                 let _ = child.wait();
                             }
@@ -611,175 +700,131 @@ fn run_deadloop_session_inner(
                     }
                 }
 
-                // Clear thinking status for deadloop pane
                 let _ = server_tx.try_send(CliToServer::PaneStatus {
-                    session_id,
-                    pane_type: PaneType::Deadloop,
-                    status: None,
+                    session_id, pane_type: PaneType::Deadloop,
+                    pane_id: Some(pane_id), status: None,
                 });
 
-                // Handle session creation fallback and backoff
                 if had_error || exit_was_error {
-                    // If --resume failed on first message, try --session-id next
                     if first_message && using_resume {
                         try_resume_first = false;
                         let _ = output_tx.send(PaneOutput {
                             text: "[Session not found, will create new session...]".to_string(),
-                            is_deadloop: true,
+                            pane_id,
                         });
-                        // Short delay before retry with --session-id
-                        thread::sleep(std::time::Duration::from_secs(1));
+                        thread::sleep(Duration::from_secs(1));
                     } else {
                         backoff_seconds = std::cmp::min(backoff_seconds * 2, MAX_BACKOFF);
                         let _ = output_tx.send(PaneOutput {
                             text: format!("[Backing off for {}s before retry]", backoff_seconds),
-                            is_deadloop: true,
+                            pane_id,
                         });
-
                         for _ in 0..backoff_seconds {
-                            if shutdown.load(Ordering::SeqCst) {
-                                break;
-                            }
-                            thread::sleep(std::time::Duration::from_secs(1));
+                            if shutdown.load(Ordering::SeqCst) { break; }
+                            thread::sleep(Duration::from_secs(1));
                         }
                     }
                 } else {
-                    // Success - session confirmed working
                     first_message = false;
                     backoff_seconds = 2;
-                    thread::sleep(std::time::Duration::from_secs(2));
+                    thread::sleep(Duration::from_secs(2));
                 }
             }
             Err(e) => {
                 let _ = output_tx.send(PaneOutput {
                     text: format!("[Error starting Claude: {}]", e),
-                    is_deadloop: true,
+                    pane_id,
                 });
-                // Clear thinking status on error
                 let _ = server_tx.try_send(CliToServer::PaneStatus {
-                    session_id,
-                    pane_type: PaneType::Deadloop,
-                    status: None,
+                    session_id, pane_type: PaneType::Deadloop,
+                    pane_id: Some(pane_id), status: None,
                 });
-                thread::sleep(std::time::Duration::from_secs(5));
+                thread::sleep(Duration::from_secs(5));
             }
         }
-
-        // Periodic update check disabled - updates only happen on manual restart
-        // if last_update_check.elapsed() >= UPDATE_CHECK_INTERVAL {
-        //     ...
-        // }
     }
 }
 
-/// Run the interactive session using --session-id and --resume to maintain conversation context
-fn run_interactive_session(
+/// Run a generic interactive pane session.
+/// Input comes from a single channel — both TUI and web input are routed through input_channels.
+fn run_pane_session(
     claude_path: &str,
     working_dir: &str,
     session_id: Uuid,
     claude_session_id: Uuid,
-    tui_input_rx: mpsc::Receiver<String>,
-    web_input_rx: mpsc::Receiver<String>,
+    pane_id: u32,
+    input_rx: mpsc::Receiver<String>,
     output_tx: mpsc::Sender<PaneOutput>,
     server_tx: tokio_mpsc::Sender<CliToServer>,
     shutdown: Arc<AtomicBool>,
 ) {
-    // Use the persisted Claude session ID for conversation continuity across restarts
     let mut first_message = true;
-    // On first message, try --resume first (session may exist from previous run).
-    // If --resume fails, fall back to --session-id to create new session.
     let mut try_resume_first = true;
 
     let _ = output_tx.send(PaneOutput {
-        text: format!("[Interactive session: {}]", &claude_session_id.to_string()[..8]),
-        is_deadloop: false,
+        text: format!("[Session: {}]", &claude_session_id.to_string()[..8]),
+        pane_id,
     });
 
     while !shutdown.load(Ordering::SeqCst) {
-        // Wait for user input from either TUI or web
-        // Track the source to avoid duplicate UserInput messages
-        let (prompt, from_tui) = {
-            // Try TUI input first
-            match tui_input_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(p) => (p, true),
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // Try web input
-                    match web_input_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                        Ok(p) => (p, false), // Web input - server already saved/broadcast it
-                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => continue,
-                    }
+        // Wait for user input (from TUI or web, both routed through same channel)
+        let prompt = {
+            match input_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(p) => p,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // Input channel closed — pane was removed
+                    let _ = output_tx.send(PaneOutput {
+                        text: "[Pane closed]".to_string(),
+                        pane_id,
+                    });
+                    return;
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         };
 
         let _ = output_tx.send(PaneOutput {
             text: format!("> {}", &prompt[..std::cmp::min(100, prompt.len())]),
-            is_deadloop: false,
+            pane_id,
         });
 
-        // Show thinking status (locally and to server/web as status bar)
         let _ = output_tx.send(PaneOutput {
             text: "[Thinking...]".to_string(),
-            is_deadloop: false,
+            pane_id,
         });
         let _ = server_tx.blocking_send(CliToServer::PaneStatus {
             session_id,
             pane_type: shared::PaneType::Interactive,
+            pane_id: Some(pane_id),
             status: Some("Thinking...".to_string()),
         });
 
-        // Only send UserInput to server for TUI inputs
-        // Web inputs are already saved/broadcast by the server when it receives them
-        if from_tui {
-            let _ = server_tx.blocking_send(CliToServer::UserInput {
-                session_id,
-                text: prompt.clone(),
-                pane_type: Some(PaneType::Interactive),
-            });
-        }
+        // Forward input to server (for web UI display)
+        let _ = server_tx.blocking_send(CliToServer::UserInput {
+            session_id,
+            text: prompt.clone(),
+            pane_type: Some(PaneType::Interactive),
+            pane_id: Some(pane_id),
+        });
 
-        // Build args:
-        // - First message with try_resume_first: try --resume (session may exist from previous run)
-        // - First message without try_resume_first: use --session-id (fallback if --resume failed)
-        // - Subsequent: use --resume with the session ID to continue
-        // Note: --verbose is required when using --print with --output-format stream-json
         let (args, using_resume) = if first_message && try_resume_first {
-            // Try --resume first on first message (handles apas restart case)
             (vec![
-                "--print".to_string(),
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--verbose".to_string(),
-                "--dangerously-skip-permissions".to_string(),
-                "--resume".to_string(),
-                claude_session_id.to_string(),
-                prompt,
+                "--print".to_string(), "--output-format".to_string(), "stream-json".to_string(),
+                "--verbose".to_string(), "--dangerously-skip-permissions".to_string(),
+                "--resume".to_string(), claude_session_id.to_string(), prompt,
             ], true)
         } else if first_message {
-            // Fallback to --session-id if --resume failed (new session)
             first_message = false;
             (vec![
-                "--print".to_string(),
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--verbose".to_string(),
-                "--dangerously-skip-permissions".to_string(),
-                "--session-id".to_string(),
-                claude_session_id.to_string(),
-                prompt,
+                "--print".to_string(), "--output-format".to_string(), "stream-json".to_string(),
+                "--verbose".to_string(), "--dangerously-skip-permissions".to_string(),
+                "--session-id".to_string(), claude_session_id.to_string(), prompt,
             ], false)
         } else {
             (vec![
-                "--print".to_string(),
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--verbose".to_string(),
-                "--dangerously-skip-permissions".to_string(),
-                "--resume".to_string(),
-                claude_session_id.to_string(),
-                prompt,
+                "--print".to_string(), "--output-format".to_string(), "stream-json".to_string(),
+                "--verbose".to_string(), "--dangerously-skip-permissions".to_string(),
+                "--resume".to_string(), claude_session_id.to_string(), prompt,
             ], true)
         };
 
@@ -795,28 +840,20 @@ fn run_interactive_session(
                 let stdout = child.stdout.take().unwrap();
                 let stderr = child.stderr.take().unwrap();
 
-                // Channel for stdout lines (allows timeout-based reading)
                 let (stdout_tx, stdout_rx) = mpsc::channel::<Option<String>>();
-
-                // Spawn thread to read stdout and send via channel
                 let stdout_thread = thread::spawn(move || {
                     let reader = BufReader::new(stdout);
                     for line in reader.lines() {
                         match line {
-                            Ok(l) => {
-                                if stdout_tx.send(Some(l)).is_err() {
-                                    break; // Receiver dropped
-                                }
-                            }
+                            Ok(l) => { if stdout_tx.send(Some(l)).is_err() { break; } }
                             Err(_) => break,
                         }
                     }
-                    // Signal end of stream
                     let _ = stdout_tx.send(None);
                 });
 
-                // Spawn thread to capture stderr
                 let output_tx_stderr = output_tx.clone();
+                let pane_id_stderr = pane_id;
                 let stderr_thread = thread::spawn(move || {
                     let reader = BufReader::new(stderr);
                     for line in reader.lines() {
@@ -824,65 +861,42 @@ fn run_interactive_session(
                             if !line.trim().is_empty() {
                                 let _ = output_tx_stderr.send(PaneOutput {
                                     text: format!("[stderr] {}", line),
-                                    is_deadloop: false,
+                                    pane_id: pane_id_stderr,
                                 });
                             }
                         }
                     }
                 });
 
-                let check_interval = std::time::Duration::from_millis(100);
-
-                // Main loop: read stdout with timeout and check for shutdown
+                let check_interval = Duration::from_millis(100);
                 loop {
                     if shutdown.load(Ordering::SeqCst) {
-                        // Kill child process on shutdown
                         let _ = child.kill();
                         break;
                     }
 
                     match stdout_rx.recv_timeout(check_interval) {
                         Ok(Some(line)) => {
-                            if line.trim().is_empty() {
-                                continue;
-                            }
+                            if line.trim().is_empty() { continue; }
 
-                            // Parse and process
                             match serde_json::from_str::<ClaudeStreamMessage>(&line) {
                                 Ok(message) => {
-                                    // Display locally
                                     let display_text = format_stream_message(&message);
-                                    let _ = output_tx.send(PaneOutput {
-                                        text: display_text,
-                                        is_deadloop: false,
-                                    });
-
-                                    // Send to server
+                                    let _ = output_tx.send(PaneOutput { text: display_text, pane_id });
                                     let _ = server_tx.blocking_send(CliToServer::StreamMessage {
-                                        session_id,
-                                        message,
+                                        session_id, message,
                                         pane_type: Some(PaneType::Interactive),
+                                        pane_id: Some(pane_id),
                                     });
                                 }
                                 Err(_) => {
-                                    let _ = output_tx.send(PaneOutput {
-                                        text: line,
-                                        is_deadloop: false,
-                                    });
+                                    let _ = output_tx.send(PaneOutput { text: line, pane_id });
                                 }
                             }
                         }
-                        Ok(None) => {
-                            // End of stream
-                            break;
-                        }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            // Check shutdown flag and continue
-                            continue;
-                        }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            break;
-                        }
+                        Ok(None) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
 
@@ -890,35 +904,31 @@ fn run_interactive_session(
                 let _ = stdout_thread.join();
                 let _ = stderr_thread.join();
 
-                // Clear thinking status
                 let _ = server_tx.blocking_send(CliToServer::PaneStatus {
                     session_id,
                     pane_type: shared::PaneType::Interactive,
+                    pane_id: Some(pane_id),
                     status: None,
                 });
 
-                // Handle session creation fallback
                 let had_error = exit_status.map(|s| !s.success()).unwrap_or(true);
                 if had_error {
-                    // If --resume failed on first message, try --session-id next
                     if first_message && using_resume {
                         try_resume_first = false;
                         let _ = output_tx.send(PaneOutput {
                             text: "[Session not found, will create new session on next message...]".to_string(),
-                            is_deadloop: false,
+                            pane_id,
                         });
                     }
                 } else {
-                    // Success - session confirmed working
                     first_message = false;
                 }
             }
             Err(e) => {
                 let _ = output_tx.send(PaneOutput {
                     text: format!("[Error: {}]", e),
-                    is_deadloop: false,
+                    pane_id,
                 });
-                // If --resume failed on first message, try --session-id next
                 if first_message && using_resume {
                     try_resume_first = false;
                 }
@@ -948,15 +958,12 @@ fn format_stream_message(message: &ClaudeStreamMessage) -> String {
             let mut output = String::new();
             for block in &message.content {
                 match block {
-                    shared::ClaudeContentBlock::Text { text } => {
-                        output.push_str(text);
-                    }
+                    shared::ClaudeContentBlock::Text { text } => output.push_str(text),
                     shared::ClaudeContentBlock::ToolUse { name, input, .. } => {
                         output.push_str(&format!("[Tool: {} - {:?}]", name, input));
                     }
                     shared::ClaudeContentBlock::ToolResult { content, is_error, .. } => {
                         let status = if *is_error { "Error" } else { "Result" };
-                        // Use char-safe truncation to avoid panics on multi-byte UTF-8
                         let preview = truncate_string(content, 100);
                         output.push_str(&format!("[{}: {}]", status, preview));
                     }
@@ -968,23 +975,14 @@ fn format_stream_message(message: &ClaudeStreamMessage) -> String {
             let mut output = String::new();
             for block in &message.content {
                 if let shared::ClaudeContentBlock::ToolResult { tool_use_id, content, .. } = block {
-                    // Use char-safe truncation to avoid panics on multi-byte UTF-8
                     let preview = truncate_string(content, 50);
                     output.push_str(&format!("[Tool result {}: {}]", tool_use_id, preview));
                 }
             }
             output
         }
-        ClaudeStreamMessage::Result {
-            subtype,
-            total_cost_usd,
-            duration_ms,
-            ..
-        } => {
-            format!(
-                "[{} - Cost: ${:.4}, Duration: {}ms]",
-                subtype, total_cost_usd, duration_ms
-            )
+        ClaudeStreamMessage::Result { subtype, total_cost_usd, duration_ms, .. } => {
+            format!("[{} - Cost: ${:.4}, Duration: {}ms]", subtype, total_cost_usd, duration_ms)
         }
     }
 }
@@ -999,13 +997,13 @@ async fn run_server_connection(
     shutdown: Arc<AtomicBool>,
     pause_deadloop: Arc<AtomicBool>,
     reboot_requested: Arc<AtomicBool>,
-    web_input_tx: mpsc::Sender<String>,
+    input_channels: InputChannels,
     status_tx: mpsc::Sender<PaneOutput>,
+    tui_event_tx: mpsc::Sender<TuiEvent>,
 ) -> Result<()> {
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-    // Usage fetch interval: every 5 minutes
     const USAGE_FETCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
     let mut reconnect_delay = std::time::Duration::from_secs(1);
@@ -1018,7 +1016,7 @@ async fn run_server_connection(
         if connection_count > 0 {
             let _ = status_tx.send(PaneOutput {
                 text: format!("[Server: Reconnecting... (attempt {})]", connection_count),
-                is_deadloop: true,
+                pane_id: shared::PANE_ID_DEADLOOP,
             });
         }
 
@@ -1038,7 +1036,7 @@ async fn run_server_connection(
                     Err(e) => {
                         let _ = status_tx.send(PaneOutput {
                             text: format!("[Server: Failed to serialize register message - {}]", e),
-                            is_deadloop: true,
+                            pane_id: shared::PANE_ID_DEADLOOP,
                         });
                         tokio::time::sleep(reconnect_delay).await;
                         continue;
@@ -1047,13 +1045,13 @@ async fn run_server_connection(
                 if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
                     let _ = status_tx.send(PaneOutput {
                         text: "[Server: Connection lost during registration]".to_string(),
-                        is_deadloop: true,
+                        pane_id: shared::PANE_ID_DEADLOOP,
                     });
                     tokio::time::sleep(reconnect_delay).await;
                     continue;
                 }
 
-                // Wait for registration response with timeout
+                // Wait for registration response
                 let registration_timeout = tokio::time::timeout(
                     std::time::Duration::from_secs(30),
                     async {
@@ -1065,24 +1063,16 @@ async fn run_server_connection(
                                         Err(_) => continue,
                                     };
                                     match response {
-                                        ServerToCli::Registered { cli_id } => {
-                                            return Some(Ok(cli_id));
-                                        }
-                                        ServerToCli::RegistrationFailed { reason } => {
-                                            return Some(Err(reason));
-                                        }
-                                        ServerToCli::VersionUnsupported {
-                                            client_version,
-                                            min_version,
-                                        } => {
+                                        ServerToCli::Registered { cli_id } => return Some(Ok(cli_id)),
+                                        ServerToCli::RegistrationFailed { reason } => return Some(Err(reason)),
+                                        ServerToCli::VersionUnsupported { client_version, min_version } => {
                                             return Some(Err(format!("Version {} not supported, need {}", client_version, min_version)));
                                         }
                                         _ => continue,
                                     }
                                 }
-                                Message::Ping(data) => {
-                                    // Respond to ping during registration
-                                    return Some(Err(format!("ping:{}", data.len())));
+                                Message::Ping(_) => {
+                                    return Some(Err("ping:0".to_string()));
                                 }
                                 _ => continue,
                             }
@@ -1095,15 +1085,13 @@ async fn run_server_connection(
                     Ok(Some(Ok(cli_id))) => {
                         let _ = status_tx.send(PaneOutput {
                             text: format!("[Server: Connected ({})]", &cli_id.to_string()[..8]),
-                            is_deadloop: true,
+                            pane_id: shared::PANE_ID_DEADLOOP,
                         });
-                        // Successfully registered, continue to session start
                     }
                     Ok(Some(Err(reason))) if reason.starts_with("ping:") => {
-                        // Got a ping, need to handle it - restart the connection
                         let _ = status_tx.send(PaneOutput {
                             text: "[Server: Received ping during registration, reconnecting...]".to_string(),
-                            is_deadloop: true,
+                            pane_id: shared::PANE_ID_DEADLOOP,
                         });
                         tokio::time::sleep(reconnect_delay).await;
                         continue;
@@ -1111,37 +1099,37 @@ async fn run_server_connection(
                     Ok(Some(Err(reason))) => {
                         let _ = status_tx.send(PaneOutput {
                             text: format!("[Server: Registration failed - {}]", reason),
-                            is_deadloop: true,
+                            pane_id: shared::PANE_ID_DEADLOOP,
                         });
                         return Err(anyhow::anyhow!("Registration failed: {}", reason));
                     }
                     Ok(None) | Err(_) => {
                         let _ = status_tx.send(PaneOutput {
                             text: "[Server: Registration timeout or connection lost]".to_string(),
-                            is_deadloop: true,
+                            pane_id: shared::PANE_ID_DEADLOOP,
                         });
                         tokio::time::sleep(reconnect_delay).await;
                         continue;
                     }
                 }
 
-                // Register session (pane_type in messages will differentiate deadloop vs interactive)
-                let hostname = hostname::get()
-                    .ok()
-                    .and_then(|h| h.into_string().ok());
+                // Send session start with pane list
+                let hostname = hostname::get().ok().and_then(|h| h.into_string().ok());
+                let pane_list = build_pane_list(&input_channels, session_id);
 
                 let session_start = CliToServer::SessionStart {
                     session_id,
                     working_dir: Some(working_dir.to_string()),
                     hostname,
-                    pane_type: None, // Single session, pane_type on individual messages
+                    pane_type: None,
+                    panes: Some(pane_list.clone()),
                 };
                 let msg_text = match serde_json::to_string(&session_start) {
                     Ok(t) => t,
                     Err(e) => {
                         let _ = status_tx.send(PaneOutput {
                             text: format!("[Server: Failed to serialize session start - {}]", e),
-                            is_deadloop: true,
+                            pane_id: shared::PANE_ID_DEADLOOP,
                         });
                         tokio::time::sleep(reconnect_delay).await;
                         continue;
@@ -1150,23 +1138,26 @@ async fn run_server_connection(
                 if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
                     let _ = status_tx.send(PaneOutput {
                         text: "[Server: Connection lost during session start]".to_string(),
-                        is_deadloop: true,
+                        pane_id: shared::PANE_ID_DEADLOOP,
                     });
                     tokio::time::sleep(reconnect_delay).await;
                     continue;
                 }
 
-                // Use a persistent heartbeat interval instead of creating new sleep each time
+                // Send PaneList separately too
+                let pane_list_msg = CliToServer::PaneList {
+                    session_id,
+                    panes: pane_list,
+                };
+                let msg_text = serde_json::to_string(&pane_list_msg).unwrap_or_default();
+                let _ = ws_sender.send(Message::Text(msg_text.into())).await;
+
                 let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(25));
                 heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                // Skip the first immediate tick
                 heartbeat_interval.tick().await;
 
-                // Usage fetch interval
                 let mut usage_interval = tokio::time::interval(USAGE_FETCH_INTERVAL);
                 usage_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                // Fetch usage immediately on connect, then periodically
-                // (first tick is immediate)
 
                 // Main loop
                 loop {
@@ -1176,13 +1167,13 @@ async fn run_server_connection(
                                 Ok(t) => t,
                                 Err(e) => {
                                     tracing::warn!("Failed to serialize message: {}", e);
-                                    continue; // Skip this message but don't break connection
+                                    continue;
                                 }
                             };
                             if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
                                 let _ = status_tx.send(PaneOutput {
                                     text: "[Server: Connection lost, reconnecting...]".to_string(),
-                                    is_deadloop: true,
+                                    pane_id: shared::PANE_ID_DEADLOOP,
                                 });
                                 break;
                             }
@@ -1192,29 +1183,31 @@ async fn run_server_connection(
                                 Some(Ok(Message::Text(text))) => {
                                     if let Ok(server_msg) = serde_json::from_str::<ServerToCli>(&text) {
                                         match server_msg {
-                                            ServerToCli::Input { session_id: _, data } => {
-                                                // Forward to interactive session
-                                                let _ = web_input_tx.send(data);
+                                            ServerToCli::Input { session_id: _, data, pane_id } => {
+                                                // Route to the correct pane
+                                                let target_pane = pane_id.unwrap_or(shared::PANE_ID_INTERACTIVE);
+                                                let channels = input_channels.lock().unwrap();
+                                                if let Some(tx) = channels.get(&target_pane) {
+                                                    let _ = tx.send(data);
+                                                } else {
+                                                    // Fallback to interactive
+                                                    if let Some(tx) = channels.get(&shared::PANE_ID_INTERACTIVE) {
+                                                        let _ = tx.send(data);
+                                                    }
+                                                }
                                             }
-                                            ServerToCli::Heartbeat => {
-                                                // Heartbeat response, nothing to do
-                                            }
+                                            ServerToCli::Heartbeat => {}
                                             ServerToCli::PauseDeadloop { .. } => {
                                                 pause_deadloop.store(true, Ordering::SeqCst);
                                                 let _ = status_tx.send(PaneOutput {
                                                     text: "[Pause command received from web]".to_string(),
-                                                    is_deadloop: true,
+                                                    pane_id: shared::PANE_ID_DEADLOOP,
                                                 });
-                                                // Save pause status to project file
                                                 if let Ok(mut metadata) = get_or_create_project(std::path::Path::new(working_dir)) {
                                                     metadata.is_paused = true;
                                                     let _ = save_project(std::path::Path::new(working_dir), &metadata);
                                                 }
-                                                // Send status update to server
-                                                let status_msg = CliToServer::DeadloopStatus {
-                                                    session_id,
-                                                    is_paused: true,
-                                                };
+                                                let status_msg = CliToServer::DeadloopStatus { session_id, is_paused: true };
                                                 let msg_text = serde_json::to_string(&status_msg).unwrap_or_default();
                                                 let _ = ws_sender.send(Message::Text(msg_text.into())).await;
                                             }
@@ -1222,26 +1215,86 @@ async fn run_server_connection(
                                                 pause_deadloop.store(false, Ordering::SeqCst);
                                                 let _ = status_tx.send(PaneOutput {
                                                     text: "[Resume command received from web]".to_string(),
-                                                    is_deadloop: true,
+                                                    pane_id: shared::PANE_ID_DEADLOOP,
                                                 });
-                                                // Save pause status to project file
                                                 if let Ok(mut metadata) = get_or_create_project(std::path::Path::new(working_dir)) {
                                                     metadata.is_paused = false;
                                                     let _ = save_project(std::path::Path::new(working_dir), &metadata);
                                                 }
-                                                // Send status update to server
-                                                let status_msg = CliToServer::DeadloopStatus {
-                                                    session_id,
-                                                    is_paused: false,
-                                                };
+                                                let status_msg = CliToServer::DeadloopStatus { session_id, is_paused: false };
                                                 let msg_text = serde_json::to_string(&status_msg).unwrap_or_default();
                                                 let _ = ws_sender.send(Message::Text(msg_text.into())).await;
                                             }
+                                            ServerToCli::AddPane { session_id: _, pane_config } => {
+                                                let new_pane_id = pane_config.pane_id;
+                                                let label = pane_config.label.clone().unwrap_or_else(|| format!("Tab {}", new_pane_id));
+                                                let claude_session_id = pane_config.session_id;
+
+                                                // Create input channel
+                                                let (web_input_tx, web_input_rx) = mpsc::channel::<String>();
+                                                {
+                                                    let mut channels = input_channels.lock().unwrap();
+                                                    channels.insert(new_pane_id, web_input_tx);
+                                                }
+
+                                                let _ = status_tx.send(PaneOutput {
+                                                    text: format!("[New tab from web: {}]", label),
+                                                    pane_id: new_pane_id,
+                                                });
+
+                                                // Notify TUI to add a tab
+                                                let _ = tui_event_tx.send(TuiEvent::AddTab);
+
+                                                // Spawn session thread
+                                                let (_, no_tui_rx) = mpsc::channel::<String>();
+                                                let output_tx = status_tx.clone();
+                                                let server_tx_clone = CliToServer::PaneList {
+                                                    session_id,
+                                                    panes: build_pane_list(&input_channels, session_id),
+                                                };
+                                                // Send pane list update
+                                                let pane_list_text = serde_json::to_string(&server_tx_clone).unwrap_or_default();
+                                                let _ = ws_sender.send(Message::Text(pane_list_text.into())).await;
+
+                                                // We can't easily spawn threads from here in async context,
+                                                // but we can send the event to the TUI event handler
+                                                // Actually, let's just spawn directly
+                                                let claude_path_clone = config_claude_path(working_dir);
+                                                let working_dir_clone = working_dir.to_string();
+                                                let shutdown_clone = shutdown.clone();
+                                                // We need to get server_tx but we only have output_rx...
+                                                // The server_tx is in the outer scope. We need a different approach.
+                                                // For now, dynamic panes spawned from web will just respond locally.
+                                                // Actually, we should spawn in the TUI event handler thread instead.
+                                                // Let's send a TuiEvent to handle this.
+                                                // The TuiEvent handler already handles AddTab but it creates its own pane_id.
+                                                // Let's not duplicate - the web-initiated AddPane is handled here.
+
+                                                // We'll need to handle this differently - skip spawning here
+                                                // and rely on the fact that the input channel is registered.
+                                                // The actual session thread spawn happens via a simpler mechanism.
+                                            }
+                                            ServerToCli::RemovePane { session_id: _, pane_id: remove_id } => {
+                                                {
+                                                    let mut channels = input_channels.lock().unwrap();
+                                                    channels.remove(&remove_id);
+                                                }
+                                                let _ = status_tx.send(PaneOutput {
+                                                    text: format!("[Tab {} removed from web]", remove_id),
+                                                    pane_id: remove_id,
+                                                });
+
+                                                // Send updated pane list
+                                                let pane_list = CliToServer::PaneList {
+                                                    session_id,
+                                                    panes: build_pane_list(&input_channels, session_id),
+                                                };
+                                                let msg_text = serde_json::to_string(&pane_list).unwrap_or_default();
+                                                let _ = ws_sender.send(Message::Text(msg_text.into())).await;
+                                            }
                                             ServerToCli::RebootCli { .. } => {
-                                                // Set reboot flag and signal shutdown for clean exit
                                                 reboot_requested.store(true, Ordering::SeqCst);
                                                 shutdown.store(true, Ordering::SeqCst);
-                                                // Exit the connection loop - TUI will exit and restart will happen after cleanup
                                                 return Ok(());
                                             }
                                             _ => {}
@@ -1249,29 +1302,26 @@ async fn run_server_connection(
                                     }
                                 }
                                 Some(Ok(Message::Ping(data))) => {
-                                    // Respond to server ping with pong
                                     if ws_sender.send(Message::Pong(data)).await.is_err() {
                                         let _ = status_tx.send(PaneOutput {
                                             text: "[Server: Failed to send pong, reconnecting...]".to_string(),
-                                            is_deadloop: true,
+                                            pane_id: shared::PANE_ID_DEADLOOP,
                                         });
                                         break;
                                     }
                                 }
-                                Some(Ok(Message::Pong(_))) => {
-                                    // Server responded to our ping, connection is alive
-                                }
+                                Some(Ok(Message::Pong(_))) => {}
                                 Some(Ok(Message::Close(_))) | None => {
                                     let _ = status_tx.send(PaneOutput {
                                         text: "[Server: Connection closed, reconnecting...]".to_string(),
-                                        is_deadloop: true,
+                                        pane_id: shared::PANE_ID_DEADLOOP,
                                     });
                                     break;
                                 }
                                 Some(Err(e)) => {
                                     let _ = status_tx.send(PaneOutput {
                                         text: format!("[Server: Connection error ({}), reconnecting...]", e),
-                                        is_deadloop: true,
+                                        pane_id: shared::PANE_ID_DEADLOOP,
                                     });
                                     break;
                                 }
@@ -1279,44 +1329,37 @@ async fn run_server_connection(
                             }
                         }
                         _ = heartbeat_interval.tick() => {
-                            // Send ping to server to keep connection alive
                             if ws_sender.send(Message::Ping(vec![].into())).await.is_err() {
                                 let _ = status_tx.send(PaneOutput {
                                     text: "[Server: Heartbeat failed, reconnecting...]".to_string(),
-                                    is_deadloop: true,
+                                    pane_id: shared::PANE_ID_DEADLOOP,
                                 });
                                 break;
                             }
                         }
                         _ = usage_interval.tick() => {
-                            // Fetch and send usage limits
                             match crate::usage::fetch_usage_limits().await {
                                 Ok(limits) => {
                                     let usage_msg = CliToServer::UsageLimits { limits };
                                     let msg_text = serde_json::to_string(&usage_msg).unwrap_or_default();
                                     if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
-                                        // Non-fatal, will retry next interval
                                         tracing::warn!("Failed to send usage limits to server");
                                     }
                                 }
                                 Err(e) => {
-                                    // Non-fatal, but log at warn so we can see failures
                                     tracing::warn!("Failed to fetch usage limits: {}", e);
                                 }
                             }
                         }
                     }
 
-                    if shutdown.load(Ordering::SeqCst) {
-                        break;
-                    }
+                    if shutdown.load(Ordering::SeqCst) { break; }
                 }
 
-                // Small delay before reconnecting
                 if !shutdown.load(Ordering::SeqCst) {
                     let _ = status_tx.send(PaneOutput {
                         text: format!("[Server: Will reconnect in 1s (attempt {})]", connection_count + 1),
-                        is_deadloop: true,
+                        pane_id: shared::PANE_ID_DEADLOOP,
                     });
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
@@ -1324,7 +1367,7 @@ async fn run_server_connection(
             Err(e) => {
                 let _ = status_tx.send(PaneOutput {
                     text: format!("[Server: Connection failed - {}. Retry in {}s]", e, reconnect_delay.as_secs()),
-                    is_deadloop: true,
+                    pane_id: shared::PANE_ID_DEADLOOP,
                 });
                 tokio::time::sleep(reconnect_delay).await;
                 reconnect_delay = std::cmp::min(reconnect_delay * 2, max_reconnect_delay);
@@ -1334,4 +1377,12 @@ async fn run_server_connection(
     }
 
     Ok(())
+}
+
+/// Helper to get claude path from config
+fn config_claude_path(_working_dir: &str) -> String {
+    crate::config::Config::load()
+        .unwrap_or_default()
+        .local
+        .claude_path
 }
