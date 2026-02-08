@@ -85,6 +85,8 @@ export function TabbedView() {
   const resumePane = useStore((s) => s.resumePane);
   const addPane = useStore((s) => s.addPane);
   const removePane = useStore((s) => s.removePane);
+  const startBot = useStore((s) => s.startBot);
+  const stopBot = useStore((s) => s.stopBot);
   const rebootCli = useStore((s) => s.rebootCli);
   const downloadSession = useStore((s) => s.downloadSession);
   // Legacy pause/resume for backward compat with CLI
@@ -163,9 +165,10 @@ export function TabbedView() {
     [removePane, activeTabId, effectiveTabs, handleSelectTab],
   );
 
-  const handleAddTab = useCallback(() => {
-    const label = `Tab ${effectiveTabs.length + 1}`;
-    addPane("claude", "interactive", label);
+  const handleAddTab = useCallback((provider: string = "claude") => {
+    const prefix = provider === "codex" ? "Codex" : "Claude";
+    const label = `${prefix} ${effectiveTabs.length + 1}`;
+    addPane(provider, "interactive", label);
   }, [addPane, effectiveTabs.length]);
 
   // Get messages for active tab
@@ -218,6 +221,16 @@ export function TabbedView() {
     }
   }, [activeTabId, activeIsPaused, pausePane, resumePane, pauseDeadloop, resumeDeadloop]);
 
+  const handleStartBot = useCallback(() => {
+    if (activeTabId == null) return;
+    startBot(activeTabId);
+  }, [activeTabId, startBot]);
+
+  const handleStopBot = useCallback(() => {
+    if (activeTabId == null) return;
+    stopBot(activeTabId);
+  }, [activeTabId, stopBot]);
+
   // No session or no tabs - empty state
   if (!sessionId || effectiveTabs.length === 0) {
     return (
@@ -245,28 +258,47 @@ export function TabbedView() {
 
       {/* Toolbar */}
       <div className="flex items-center gap-2 px-3 py-1.5 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30 flex-shrink-0">
-        {/* Bot toggle */}
-        {activeIsBot && (
-          <button
-            onClick={handlePauseResume}
-            className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors ${
-              activeIsPaused
-                ? "bg-green-500 hover:bg-green-600 text-white"
-                : "bg-amber-500 hover:bg-amber-600 text-white"
-            }`}
-          >
-            {activeIsPaused ? (
-              <>
-                <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
-                Resume Bot
-              </>
-            ) : (
-              <>
-                <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z" /></svg>
-                Pause Bot
-              </>
-            )}
-          </button>
+        {/* Start/Stop Bot + Pause/Resume */}
+        {isAttached && activeTabId != null && activeTabId !== PANE_ID_MAIN && (
+          activeIsBot ? (
+            <>
+              <button
+                onClick={handlePauseResume}
+                className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors ${
+                  activeIsPaused
+                    ? "bg-green-500 hover:bg-green-600 text-white"
+                    : "bg-amber-500 hover:bg-amber-600 text-white"
+                }`}
+              >
+                {activeIsPaused ? (
+                  <>
+                    <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
+                    Resume Bot
+                  </>
+                ) : (
+                  <>
+                    <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z" /></svg>
+                    Pause Bot
+                  </>
+                )}
+              </button>
+              <button
+                onClick={handleStopBot}
+                className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-red-500 hover:bg-red-600 text-white"
+              >
+                <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h12v12H6z" /></svg>
+                Stop Bot
+              </button>
+            </>
+          ) : (
+            <button
+              onClick={handleStartBot}
+              className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-green-500 hover:bg-green-600 text-white"
+            >
+              <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
+              Start Bot
+            </button>
+          )
         )}
 
         <div className="flex-1" />
@@ -311,9 +343,15 @@ export function TabbedView() {
         </div>
       )}
 
-      {/* Input box - every tab gets one */}
+      {/* Input box - disabled for running deadloop panes */}
       <div className="p-3 border-t border-gray-200 dark:border-gray-700 flex-shrink-0">
-        <InteractiveInput onSend={handleSend} />
+        {activeIsBot && !activeIsPaused ? (
+          <div className="text-center text-sm text-gray-400 dark:text-gray-500 py-2">
+            Bot is running autonomously. Pause to send messages.
+          </div>
+        ) : (
+          <InteractiveInput onSend={handleSend} />
+        )}
       </div>
     </div>
   );

@@ -153,6 +153,17 @@ pub enum ServerToCli {
     /// Remove a pane from the session
     RemovePane { session_id: Uuid, pane_id: u32 },
 
+    /// Start bot (deadloop) on a pane
+    StartBot {
+        session_id: Uuid,
+        pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+    },
+
+    /// Stop bot on a pane (revert to interactive)
+    StopBot { session_id: Uuid, pane_id: u32 },
+
     /// Reboot the CLI process
     RebootCli { session_id: Uuid },
 }
@@ -238,6 +249,16 @@ pub enum WebToServer {
 
     /// Remove a pane
     RemovePane { pane_id: u32 },
+
+    /// Start bot (deadloop) on a pane — converts interactive pane to deadloop
+    StartBot {
+        pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+    },
+
+    /// Stop bot on a pane — converts deadloop pane back to interactive
+    StopBot { pane_id: u32 },
 
     /// Reboot the CLI process
     RebootCli,
@@ -671,6 +692,167 @@ pub enum ClaudeContentBlock {
         #[serde(default)]
         is_error: bool,
     },
+}
+
+// ============================================================================
+// Codex Stream-JSON Message Types
+// These match the output format of `codex exec --json`
+// ============================================================================
+
+/// Top-level message from Codex CLI JSONL output
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum CodexStreamMessage {
+    /// Thread started — contains the session/thread ID
+    #[serde(rename = "thread.started")]
+    ThreadStarted {
+        thread_id: String,
+    },
+    /// Turn started
+    #[serde(rename = "turn.started")]
+    TurnStarted {},
+    /// An item has been completed (message, tool use, tool result, reasoning)
+    #[serde(rename = "item.completed")]
+    ItemCompleted {
+        item: CodexItem,
+    },
+    /// Turn completed with usage info
+    #[serde(rename = "turn.completed")]
+    TurnCompleted {
+        #[serde(default)]
+        usage: Option<CodexUsage>,
+    },
+}
+
+/// A completed item from Codex
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexItem {
+    pub id: String,
+    /// Item type: "reasoning", "agent_message", "tool_use", "tool_result", etc.
+    #[serde(rename = "type")]
+    pub item_type: String,
+    #[serde(default)]
+    pub text: Option<String>,
+    // tool_use fields
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub input: Option<serde_json::Value>,
+    // tool_result fields
+    #[serde(default)]
+    pub output: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Value,
+}
+
+/// Usage information from Codex
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexUsage {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub cached_input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+}
+
+/// Convert a Codex stream message to a Claude stream message for uniform handling.
+/// Returns None for messages that don't map (e.g., thread.started, turn.started).
+pub fn convert_codex_to_claude(msg: &CodexStreamMessage, session_id_str: &str) -> Option<ClaudeStreamMessage> {
+    match msg {
+        CodexStreamMessage::ItemCompleted { item } => {
+            match item.item_type.as_str() {
+                "agent_message" => {
+                    let text = item.text.clone().unwrap_or_default();
+                    Some(ClaudeStreamMessage::Assistant {
+                        message: ClaudeAssistantMessage {
+                            content: vec![ClaudeContentBlock::Text { text }],
+                            model: "codex".to_string(),
+                            extra: serde_json::Value::Null,
+                        },
+                        session_id: session_id_str.to_string(),
+                        extra: serde_json::Value::Null,
+                    })
+                }
+                "reasoning" => {
+                    let text = format!("[Reasoning] {}", item.text.as_deref().unwrap_or(""));
+                    Some(ClaudeStreamMessage::Assistant {
+                        message: ClaudeAssistantMessage {
+                            content: vec![ClaudeContentBlock::Text { text }],
+                            model: "codex".to_string(),
+                            extra: serde_json::Value::Null,
+                        },
+                        session_id: session_id_str.to_string(),
+                        extra: serde_json::Value::Null,
+                    })
+                }
+                "tool_use" | "function_call" => {
+                    let name = item.name.clone().unwrap_or_else(|| "unknown".to_string());
+                    let input = item.input.clone().unwrap_or(serde_json::Value::Null);
+                    Some(ClaudeStreamMessage::Assistant {
+                        message: ClaudeAssistantMessage {
+                            content: vec![ClaudeContentBlock::ToolUse {
+                                id: item.id.clone(),
+                                name,
+                                input,
+                            }],
+                            model: "codex".to_string(),
+                            extra: serde_json::Value::Null,
+                        },
+                        session_id: session_id_str.to_string(),
+                        extra: serde_json::Value::Null,
+                    })
+                }
+                "tool_result" | "function_call_output" => {
+                    let content = item.output.clone().or_else(|| item.text.clone()).unwrap_or_default();
+                    Some(ClaudeStreamMessage::User {
+                        message: ClaudeUserMessage {
+                            content: vec![ClaudeContentBlock::ToolResult {
+                                tool_use_id: item.id.clone(),
+                                content,
+                                is_error: false,
+                            }],
+                            role: "user".to_string(),
+                        },
+                        session_id: session_id_str.to_string(),
+                        tool_use_result: None,
+                        extra: serde_json::Value::Null,
+                    })
+                }
+                _ => {
+                    // Unknown item type — render as text if it has text
+                    if let Some(text) = &item.text {
+                        Some(ClaudeStreamMessage::Assistant {
+                            message: ClaudeAssistantMessage {
+                                content: vec![ClaudeContentBlock::Text { text: text.clone() }],
+                                model: "codex".to_string(),
+                                extra: serde_json::Value::Null,
+                            },
+                            session_id: session_id_str.to_string(),
+                            extra: serde_json::Value::Null,
+                        })
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+        CodexStreamMessage::TurnCompleted { usage } => {
+            let (input_tokens, output_tokens) = usage.as_ref()
+                .map(|u| (u.input_tokens, u.output_tokens))
+                .unwrap_or((0, 0));
+            Some(ClaudeStreamMessage::Result {
+                subtype: "success".to_string(),
+                result: format!("Turn completed ({} in, {} out tokens)", input_tokens, output_tokens),
+                total_cost_usd: 0.0,
+                duration_ms: 0,
+                session_id: session_id_str.to_string(),
+                is_error: false,
+                extra: serde_json::Value::Null,
+            })
+        }
+        _ => None, // ThreadStarted, TurnStarted — no display needed
+    }
 }
 
 // ============================================================================

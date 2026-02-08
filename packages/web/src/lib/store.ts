@@ -185,6 +185,8 @@ interface AppState {
   resumePane: (paneId: number) => void;
   addPane: (provider: string, mode: string, label?: string, prompt?: string) => void;
   removePane: (paneId: number) => void;
+  startBot: (paneId: number, prompt?: string) => void;
+  stopBot: (paneId: number) => void;
   rebootCli: () => void;
   downloadSession: () => void;
 }
@@ -721,6 +723,24 @@ export const useStore = create<AppState>((set, get) => ({
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "remove_pane", pane_id: paneId }));
+    }
+  },
+
+  startBot: (paneId: number, prompt?: string) => {
+    const { ws } = get();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: "start_bot",
+        pane_id: paneId,
+        ...(prompt ? { prompt } : {}),
+      }));
+    }
+  },
+
+  stopBot: (paneId: number) => {
+    const { ws } = get();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "stop_bot", pane_id: paneId }));
     }
   },
 

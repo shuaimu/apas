@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useEffect } from "react";
+import { useRef, useEffect, useState } from "react";
 import { PaneConfig, paneKey } from "@/lib/store";
 
 interface TabBarProps {
@@ -8,7 +8,7 @@ interface TabBarProps {
   activeTabId: number | null;
   onSelectTab: (paneId: number) => void;
   onCloseTab: (paneId: number) => void;
-  onAddTab: () => void;
+  onAddTab: (provider?: string) => void;
   paneStatuses: Record<string, string | null>;
   pausedPanes: number[];
 }
@@ -71,6 +71,11 @@ export function TabBar({
                 <span className="w-2 h-2 rounded-full bg-green-500 flex-shrink-0" />
               )}
 
+              {/* Provider indicator */}
+              {!hasActivity && !isBot && tab.provider === "codex" && (
+                <span className="w-2 h-2 rounded-full bg-green-500 flex-shrink-0" title="Codex" />
+              )}
+
               {/* Label */}
               <span className="truncate">
                 {label}
@@ -100,16 +105,56 @@ export function TabBar({
         })}
       </div>
 
-      {/* Add tab button */}
+      {/* Add tab button with provider dropdown */}
+      <AddTabButton onAddTab={onAddTab} />
+    </div>
+  );
+}
+
+function AddTabButton({ onAddTab }: { onAddTab: (provider?: string) => void }) {
+  const [showMenu, setShowMenu] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!showMenu) return;
+    const handleClick = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setShowMenu(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [showMenu]);
+
+  return (
+    <div className="relative flex-shrink-0" ref={menuRef}>
       <button
-        onClick={onAddTab}
-        className="flex items-center justify-center w-8 h-8 m-1 rounded text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors flex-shrink-0"
+        onClick={() => setShowMenu((v) => !v)}
+        className="flex items-center justify-center w-8 h-8 m-1 rounded text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors"
         title="New tab"
       >
         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
         </svg>
       </button>
+      {showMenu && (
+        <div className="absolute right-0 top-full mt-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-lg py-1 z-50 min-w-[140px]">
+          <button
+            onClick={() => { onAddTab("claude"); setShowMenu(false); }}
+            className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
+          >
+            <span className="w-2 h-2 rounded-full bg-blue-500 flex-shrink-0" />
+            Claude Tab
+          </button>
+          <button
+            onClick={() => { onAddTab("codex"); setShowMenu(false); }}
+            className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
+          >
+            <span className="w-2 h-2 rounded-full bg-green-500 flex-shrink-0" />
+            Codex Tab
+          </button>
+        </div>
+      )}
     </div>
   );
 }

@@ -7,7 +7,7 @@
 //! Users can create and close tabs dynamically from both TUI and web UI.
 
 use anyhow::Result;
-use shared::{CliToServer, ClaudeStreamMessage, PaneType, ServerToCli};
+use shared::{CliToServer, ClaudeStreamMessage, CodexStreamMessage, PaneType, Provider, ServerToCli};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -39,6 +39,21 @@ type PaneInput = (String, bool);
 /// Maps pane_id -> Sender<PaneInput> for routing input to the correct session thread.
 type InputChannels = Arc<Mutex<HashMap<u32, mpsc::Sender<PaneInput>>>>;
 
+/// Per-pane pause flags (for deadloop panes).
+type PanePauses = Arc<Mutex<HashMap<u32, Arc<AtomicBool>>>>;
+
+/// Per-pane metadata: mode, provider, prompt, and child process handle.
+#[derive(Clone)]
+struct PaneMeta {
+    mode: shared::PaneMode,
+    provider: shared::Provider,
+    prompt: Option<String>,
+    child_process: Arc<Mutex<Option<std::process::Child>>>,
+}
+
+/// Per-pane metadata registry.
+type PaneMetas = Arc<Mutex<HashMap<u32, PaneMeta>>>;
+
 /// Run in tab-based mode
 pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()> {
     // Clear terminal screen for a clean start
@@ -47,6 +62,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
 
     let config = crate::config::Config::load().unwrap_or_default();
     let claude_path = config.local.claude_path.clone();
+    let codex_path = config.local.codex_path.clone();
 
     // Load or create project metadata
     let mut metadata = get_or_create_project(working_dir)?;
@@ -71,15 +87,35 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     // Shutdown flag
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    // Pause deadloop flag
-    let pause_deadloop = Arc::new(AtomicBool::new(metadata.is_paused));
+    // Per-pane pause flags (for deadloop panes)
+    let pane_pauses: PanePauses = Arc::new(Mutex::new(HashMap::new()));
+    let deadloop_pause = Arc::new(AtomicBool::new(metadata.is_paused));
+    {
+        let mut pauses = pane_pauses.lock().unwrap();
+        pauses.insert(shared::PANE_ID_DEADLOOP, deadloop_pause.clone());
+    }
 
     // Reboot flag
     let reboot_requested = Arc::new(AtomicBool::new(false));
 
-    // Shared child process for cleanup (deadloop pane)
-    let child_process: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
-    let child_for_handler = child_process.clone();
+    // Per-pane metadata (mode, prompt, child process)
+    let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+    let deadloop_child: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
+    {
+        let mut metas = pane_metas.lock().unwrap();
+        metas.insert(shared::PANE_ID_DEADLOOP, PaneMeta {
+            mode: shared::PaneMode::Deadloop,
+            provider: Provider::Claude,
+            prompt: Some(prompt.clone()),
+            child_process: deadloop_child.clone(),
+        });
+        metas.insert(shared::PANE_ID_INTERACTIVE, PaneMeta {
+            mode: shared::PaneMode::Interactive,
+            provider: Provider::Claude,
+            prompt: None,
+            child_process: Arc::new(Mutex::new(None)),
+        });
+    }
 
     // Per-pane input channels
     let input_channels: InputChannels = Arc::new(Mutex::new(HashMap::new()));
@@ -93,9 +129,9 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     }
 
     // Collect dynamic tabs to restore from .apas metadata
-    let dynamic_tabs_to_restore: Vec<(u32, Uuid, String)> = metadata.panes.iter()
+    let dynamic_tabs_to_restore: Vec<(u32, Uuid, String, shared::PaneMode, Provider, Option<String>)> = metadata.panes.iter()
         .filter(|p| p.pane_id != shared::PANE_ID_DEADLOOP && p.pane_id != shared::PANE_ID_INTERACTIVE)
-        .map(|p| (p.pane_id, p.session_id, p.label.clone().unwrap_or_else(|| format!("Tab {}", p.pane_id))))
+        .map(|p| (p.pane_id, p.session_id, p.label.clone().unwrap_or_else(|| format!("Tab {}", p.pane_id)), p.mode.clone(), p.provider.clone(), p.prompt.clone()))
         .collect();
 
     // TUI channels
@@ -114,11 +150,17 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
 
     // Setup Ctrl+C handler
     let shutdown_for_handler = shutdown.clone();
+    let metas_for_handler = pane_metas.clone();
     ctrlc::set_handler(move || {
         shutdown_for_handler.store(true, Ordering::SeqCst);
-        if let Ok(mut guard) = child_for_handler.lock() {
-            if let Some(ref mut child) = *guard {
-                let _ = child.kill();
+        // Kill all child processes
+        if let Ok(metas) = metas_for_handler.lock() {
+            for meta in metas.values() {
+                if let Ok(mut guard) = meta.child_process.lock() {
+                    if let Some(ref mut child) = *guard {
+                        let _ = child.kill();
+                    }
+                }
             }
         }
     })?;
@@ -126,19 +168,22 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     // Spawn server connection task
     let server_task = {
         let shutdown = shutdown.clone();
-        let pause = pause_deadloop.clone();
+        let pane_pauses = pane_pauses.clone();
         let reboot = reboot_requested.clone();
         let server_url = server_url.clone();
         let token = token.clone();
         let working_dir = working_dir_str.clone();
         let status_tx = output_tx.clone();
         let input_channels = input_channels.clone();
+        let pane_metas = pane_metas.clone();
+        let pane_sessions = pane_sessions.clone();
         let event_tx_for_server = event_tx.clone();
         tokio::spawn(async move {
             run_server_connection(
                 &server_url, &token, session_id, &working_dir,
-                server_rx, shutdown, pause, reboot,
-                input_channels, status_tx, event_tx_for_server,
+                server_rx, shutdown, pane_pauses, reboot,
+                input_channels, pane_metas, pane_sessions,
+                status_tx, event_tx_for_server,
             ).await
         })
     };
@@ -165,15 +210,16 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
         let output_tx = output_tx.clone();
         let server_tx = server_tx.clone();
         let shutdown = shutdown.clone();
-        let pause = pause_deadloop.clone();
+        let pause = deadloop_pause.clone();
         let working_dir = working_dir_str.clone();
         let claude_path = claude_path.clone();
-        let child_process = child_process.clone();
+        let child_process = deadloop_child.clone();
         let prompt = prompt.clone();
         thread::spawn(move || {
             run_deadloop_session(
                 &claude_path, &working_dir, session_id, deadloop_claude_session_id,
-                &prompt, output_tx, server_tx, shutdown, pause, child_process,
+                shared::PANE_ID_DEADLOOP,
+                &prompt, &Provider::Claude, output_tx, server_tx, shutdown, pause, child_process,
             )
         })
     };
@@ -195,18 +241,23 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
         thread::spawn(move || {
             run_pane_session(
                 &claude_path, &working_dir, session_id, interactive_claude_session_id,
-                shared::PANE_ID_INTERACTIVE, interactive_input_rx,
+                shared::PANE_ID_INTERACTIVE, &Provider::Claude, interactive_input_rx,
                 output_tx, server_tx, shutdown,
             )
         })
     };
 
     // Restore dynamic tabs from .apas metadata
-    for (pane_id, claude_session_id, label) in &dynamic_tabs_to_restore {
-        let (input_tx, input_rx) = mpsc::channel::<PaneInput>();
+    for (pane_id, claude_session_id, label, mode, provider, tab_prompt) in &dynamic_tabs_to_restore {
+        let child_proc: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
         {
-            let mut channels = input_channels.lock().unwrap();
-            channels.insert(*pane_id, input_tx);
+            let mut metas = pane_metas.lock().unwrap();
+            metas.insert(*pane_id, PaneMeta {
+                mode: mode.clone(),
+                provider: provider.clone(),
+                prompt: tab_prompt.clone(),
+                child_process: child_proc.clone(),
+            });
         }
         {
             let mut ps = pane_sessions.lock().unwrap();
@@ -216,21 +267,58 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
             text: format!("[Restored tab: {}]", label),
             pane_id: *pane_id,
         });
-        let output_tx = output_tx.clone();
-        let server_tx = server_tx.clone();
-        let shutdown = shutdown.clone();
-        let claude_path = claude_path.clone();
-        let working_dir = working_dir_str.clone();
-        let sid = session_id;
-        let csid = *claude_session_id;
-        let pid = *pane_id;
-        thread::spawn(move || {
-            run_pane_session(
-                &claude_path, &working_dir, sid, csid,
-                pid, input_rx,
-                output_tx, server_tx, shutdown,
-            )
-        });
+
+        let binary_path = match provider {
+            Provider::Claude => claude_path.clone(),
+            Provider::Codex => codex_path.clone(),
+        };
+
+        if *mode == shared::PaneMode::Deadloop {
+            // Deadloop tab: spawn deadloop session with its own pause flag
+            let pause_flag = Arc::new(AtomicBool::new(false));
+            {
+                let mut pauses = pane_pauses.lock().unwrap();
+                pauses.insert(*pane_id, pause_flag.clone());
+            }
+            let output_tx = output_tx.clone();
+            let server_tx = server_tx.clone();
+            let shutdown = shutdown.clone();
+            let working_dir = working_dir_str.clone();
+            let sid = session_id;
+            let csid = *claude_session_id;
+            let pid = *pane_id;
+            let dl_prompt = tab_prompt.clone().unwrap_or_else(|| prompt.clone());
+            let child_proc = child_proc.clone();
+            let prov = provider.clone();
+            thread::spawn(move || {
+                run_deadloop_session(
+                    &binary_path, &working_dir, sid, csid,
+                    pid, &dl_prompt, &prov, output_tx, server_tx, shutdown, pause_flag, child_proc,
+                )
+            });
+        } else {
+            // Interactive tab: spawn interactive session
+            let (input_tx, input_rx) = mpsc::channel::<PaneInput>();
+            {
+                let mut channels = input_channels.lock().unwrap();
+                channels.insert(*pane_id, input_tx);
+            }
+            let output_tx = output_tx.clone();
+            let server_tx = server_tx.clone();
+            let shutdown = shutdown.clone();
+            let working_dir = working_dir_str.clone();
+            let sid = session_id;
+            let csid = *claude_session_id;
+            let pid = *pane_id;
+            let prov = provider.clone();
+            thread::spawn(move || {
+                run_pane_session(
+                    &binary_path, &working_dir, sid, csid,
+                    pid, &prov, input_rx,
+                    output_tx, server_tx, shutdown,
+                )
+            });
+        }
     }
 
     // TUI event handler thread — processes AddTab/CloseTab events
@@ -242,25 +330,31 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
         let input_channels_event = input_channels.clone();
         let working_dir_event = working_dir_str.clone();
         let claude_path_event = claude_path.clone();
+        let codex_path_event = codex_path.clone();
         let pane_sessions_event = pane_sessions.clone();
+        let pane_pauses_event = pane_pauses.clone();
+        let pane_metas_event = pane_metas.clone();
+        let default_prompt = prompt.clone();
         thread::spawn(move || {
             handle_tui_events(
                 event_rx, shutdown, output_tx_event, server_tx_event,
                 input_channels_event, session_id,
-                &claude_path_event, &working_dir_event,
+                &claude_path_event, &codex_path_event, &working_dir_event,
                 command_tx, pane_sessions_event,
+                pane_pauses_event, pane_metas_event,
+                &default_prompt,
             )
         })
     };
 
     // Run TUI in main thread
     let mut initial_tabs = vec![
-        (shared::PANE_ID_DEADLOOP, "Deadloop".to_string()),
-        (shared::PANE_ID_INTERACTIVE, "Interactive".to_string()),
+        (shared::PANE_ID_DEADLOOP, "Deadloop".to_string(), shared::PaneMode::Deadloop),
+        (shared::PANE_ID_INTERACTIVE, "Interactive".to_string(), shared::PaneMode::Interactive),
     ];
     // Add restored dynamic tabs
-    for (pane_id, _, label) in &dynamic_tabs_to_restore {
-        initial_tabs.push((*pane_id, label.clone()));
+    for (pane_id, _, label, mode, _, _) in &dynamic_tabs_to_restore {
+        initial_tabs.push((*pane_id, label.clone(), mode.clone()));
     }
     let mut app = App::new(tui_input_tx, output_rx, event_tx, command_rx, initial_tabs)
         .with_shutdown(shutdown.clone());
@@ -271,10 +365,14 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     // Signal shutdown
     shutdown.store(true, Ordering::SeqCst);
 
-    // Kill any running child process
-    if let Ok(mut guard) = child_process.lock() {
-        if let Some(ref mut child) = *guard {
-            let _ = child.kill();
+    // Kill all running child processes
+    if let Ok(metas) = pane_metas.lock() {
+        for meta in metas.values() {
+            if let Ok(mut guard) = meta.child_process.lock() {
+                if let Some(ref mut child) = *guard {
+                    let _ = child.kill();
+                }
+            }
         }
     }
 
@@ -318,24 +416,29 @@ fn spawn_centralized_input_router(
 }
 
 /// Persist current pane configs (including dynamic tabs) to the .apas file
-fn save_pane_configs(working_dir: &str, pane_sessions: &HashMap<u32, Uuid>) {
+fn save_pane_configs(working_dir: &str, pane_sessions: &HashMap<u32, Uuid>, pane_metas: &HashMap<u32, PaneMeta>) {
     if let Ok(mut metadata) = get_or_create_project(Path::new(working_dir)) {
-        // Rebuild panes list from pane_sessions map
+        // Rebuild panes list from pane_sessions and pane_metas
         let mut panes: Vec<shared::PaneConfig> = pane_sessions.iter().map(|(&pane_id, &claude_sid)| {
-            let (mode, label) = if pane_id == shared::PANE_ID_DEADLOOP {
-                (shared::PaneMode::Deadloop, "Deadloop".to_string())
-            } else if pane_id == shared::PANE_ID_INTERACTIVE {
-                (shared::PaneMode::Interactive, "Interactive".to_string())
+            let (mode, provider, prompt) = if let Some(meta) = pane_metas.get(&pane_id) {
+                (meta.mode.clone(), meta.provider.clone(), meta.prompt.clone())
+            } else if pane_id == shared::PANE_ID_DEADLOOP {
+                (shared::PaneMode::Deadloop, Provider::Claude, None)
             } else {
-                (shared::PaneMode::Interactive, format!("Tab {}", pane_id))
+                (shared::PaneMode::Interactive, Provider::Claude, None)
+            };
+            let label = match pane_id {
+                shared::PANE_ID_DEADLOOP => "Deadloop".to_string(),
+                shared::PANE_ID_INTERACTIVE => "Interactive".to_string(),
+                _ => format!("Tab {}", pane_id),
             };
             shared::PaneConfig {
                 pane_id,
-                provider: shared::Provider::Claude,
+                provider,
                 mode,
                 session_id: claude_sid,
                 is_paused: false,
-                prompt: None,
+                prompt,
                 label: Some(label),
             }
         }).collect();
@@ -354,17 +457,23 @@ fn handle_tui_events(
     input_channels: InputChannels,
     session_id: Uuid,
     claude_path: &str,
+    codex_path: &str,
     working_dir: &str,
     command_tx: mpsc::Sender<TuiCommand>,
     pane_sessions: Arc<Mutex<HashMap<u32, Uuid>>>,
+    pane_pauses: PanePauses,
+    pane_metas: PaneMetas,
+    default_prompt: &str,
 ) {
     while !shutdown.load(Ordering::SeqCst) {
         match event_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(TuiEvent::AddTab) => {
-                // Generate a new pane_id
+                // Generate a new pane_id (TUI always creates Claude interactive tabs)
                 let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
                 let claude_session_id = Uuid::new_v4();
                 let label = format!("Tab {}", pane_id);
+                let mode = shared::PaneMode::Interactive;
+                let provider = Provider::Claude;
 
                 // Create input channel — TUI and web input both flow through this
                 let (input_tx, input_rx) = mpsc::channel::<PaneInput>();
@@ -373,16 +482,26 @@ fn handle_tui_events(
                     channels.insert(pane_id, input_tx);
                 }
 
-                // Track claude session for this pane
+                // Track claude session and metadata for this pane
                 {
                     let mut ps = pane_sessions.lock().unwrap();
                     ps.insert(pane_id, claude_session_id);
+                }
+                {
+                    let mut metas = pane_metas.lock().unwrap();
+                    metas.insert(pane_id, PaneMeta {
+                        mode: mode.clone(),
+                        provider: provider.clone(),
+                        prompt: None,
+                        child_process: Arc::new(Mutex::new(None)),
+                    });
                 }
 
                 // Notify TUI to add the tab visually
                 let _ = command_tx.send(TuiCommand::AddTab {
                     pane_id,
                     label: label.clone(),
+                    mode: mode.clone(),
                 });
 
                 let _ = output_tx.send(PaneOutput {
@@ -390,7 +509,7 @@ fn handle_tui_events(
                     pane_id,
                 });
 
-                // Spawn session thread — input comes from centralized router + web
+                // Spawn interactive session thread
                 {
                     let output_tx = output_tx.clone();
                     let server_tx = server_tx.clone();
@@ -400,7 +519,7 @@ fn handle_tui_events(
                     thread::spawn(move || {
                         run_pane_session(
                             &claude_path, &working_dir, session_id, claude_session_id,
-                            pane_id, input_rx,
+                            pane_id, &Provider::Claude, input_rx,
                             output_tx, server_tx, shutdown,
                         )
                     });
@@ -409,31 +528,39 @@ fn handle_tui_events(
                 // Send pane list update
                 let _ = server_tx.blocking_send(CliToServer::PaneList {
                     session_id,
-                    panes: build_pane_list(&input_channels, session_id),
+                    panes: build_pane_list(&pane_metas, &input_channels, session_id, &pane_sessions),
                 });
 
                 // Persist to .apas
-                save_pane_configs(working_dir, &pane_sessions.lock().unwrap());
+                save_pane_configs(working_dir, &pane_sessions.lock().unwrap(), &pane_metas.lock().unwrap());
             }
-            Ok(TuiEvent::AddTabWithConfig { pane_id, label, claude_session_id }) => {
-                // Web/server-initiated tab with a specific pane_id
-                // Create input channel — TUI and web input both flow through this
-                let (input_tx, input_rx) = mpsc::channel::<PaneInput>();
-                {
-                    let mut channels = input_channels.lock().unwrap();
-                    channels.insert(pane_id, input_tx);
-                }
-
-                // Track claude session for this pane
+            Ok(TuiEvent::AddTabWithConfig { pane_id, label, claude_session_id, mode, provider, prompt }) => {
+                // Track claude session and metadata for this pane
                 {
                     let mut ps = pane_sessions.lock().unwrap();
                     ps.insert(pane_id, claude_session_id);
                 }
 
+                let child_proc: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
+                {
+                    let mut metas = pane_metas.lock().unwrap();
+                    metas.insert(pane_id, PaneMeta {
+                        mode: mode.clone(),
+                        provider: provider.clone(),
+                        prompt: prompt.clone(),
+                        child_process: child_proc.clone(),
+                    });
+                }
+                let binary_path = match &provider {
+                    Provider::Claude => claude_path.to_string(),
+                    Provider::Codex => codex_path.to_string(),
+                };
+
                 // Notify TUI to add the tab visually
                 let _ = command_tx.send(TuiCommand::AddTab {
                     pane_id,
                     label: label.clone(),
+                    mode: mode.clone(),
                 });
 
                 let _ = output_tx.send(PaneOutput {
@@ -441,17 +568,39 @@ fn handle_tui_events(
                     pane_id,
                 });
 
-                // Spawn session thread
-                {
+                if mode == shared::PaneMode::Deadloop {
+                    // Deadloop tab: spawn deadloop session with its own pause flag
+                    let pause_flag = Arc::new(AtomicBool::new(false));
+                    {
+                        let mut pauses = pane_pauses.lock().unwrap();
+                        pauses.insert(pane_id, pause_flag.clone());
+                    }
+                    let dl_prompt = prompt.unwrap_or_else(|| default_prompt.to_string());
                     let output_tx = output_tx.clone();
                     let server_tx = server_tx.clone();
                     let shutdown = shutdown.clone();
-                    let claude_path = claude_path.to_string();
+                    let working_dir = working_dir.to_string();
+                    thread::spawn(move || {
+                        run_deadloop_session(
+                            &binary_path, &working_dir, session_id, claude_session_id,
+                            pane_id, &dl_prompt, &provider, output_tx, server_tx, shutdown, pause_flag, child_proc,
+                        )
+                    });
+                } else {
+                    // Interactive tab: spawn interactive session
+                    let (input_tx, input_rx) = mpsc::channel::<PaneInput>();
+                    {
+                        let mut channels = input_channels.lock().unwrap();
+                        channels.insert(pane_id, input_tx);
+                    }
+                    let output_tx = output_tx.clone();
+                    let server_tx = server_tx.clone();
+                    let shutdown = shutdown.clone();
                     let working_dir = working_dir.to_string();
                     thread::spawn(move || {
                         run_pane_session(
-                            &claude_path, &working_dir, session_id, claude_session_id,
-                            pane_id, input_rx,
+                            &binary_path, &working_dir, session_id, claude_session_id,
+                            pane_id, &provider, input_rx,
                             output_tx, server_tx, shutdown,
                         )
                     });
@@ -460,23 +609,45 @@ fn handle_tui_events(
                 // Send pane list update
                 let _ = server_tx.blocking_send(CliToServer::PaneList {
                     session_id,
-                    panes: build_pane_list(&input_channels, session_id),
+                    panes: build_pane_list(&pane_metas, &input_channels, session_id, &pane_sessions),
                 });
 
                 // Persist to .apas
-                save_pane_configs(working_dir, &pane_sessions.lock().unwrap());
+                save_pane_configs(working_dir, &pane_sessions.lock().unwrap(), &pane_metas.lock().unwrap());
             }
             Ok(TuiEvent::CloseTab(pane_id)) => {
-                // Remove input channel (causes session thread to exit)
+                // Remove input channel (causes interactive session thread to exit)
                 {
                     let mut channels = input_channels.lock().unwrap();
                     channels.remove(&pane_id);
                 }
 
-                // Remove from pane sessions
+                // For deadloop panes, signal shutdown by setting pause and removing pause flag
+                // (the deadloop thread checks shutdown flag which will eventually stop it,
+                // but we also kill the child process for immediate effect)
+                {
+                    let mut pauses = pane_pauses.lock().unwrap();
+                    pauses.remove(&pane_id);
+                }
+                {
+                    let metas = pane_metas.lock().unwrap();
+                    if let Some(meta) = metas.get(&pane_id) {
+                        if let Ok(mut guard) = meta.child_process.lock() {
+                            if let Some(ref mut child) = *guard {
+                                let _ = child.kill();
+                            }
+                        }
+                    }
+                }
+
+                // Remove from pane sessions and metas
                 {
                     let mut ps = pane_sessions.lock().unwrap();
                     ps.remove(&pane_id);
+                }
+                {
+                    let mut metas = pane_metas.lock().unwrap();
+                    metas.remove(&pane_id);
                 }
 
                 // Notify TUI to remove the tab visually
@@ -490,11 +661,174 @@ fn handle_tui_events(
                 // Send pane list update
                 let _ = server_tx.blocking_send(CliToServer::PaneList {
                     session_id,
-                    panes: build_pane_list(&input_channels, session_id),
+                    panes: build_pane_list(&pane_metas, &input_channels, session_id, &pane_sessions),
                 });
 
                 // Persist to .apas
-                save_pane_configs(working_dir, &pane_sessions.lock().unwrap());
+                save_pane_configs(working_dir, &pane_sessions.lock().unwrap(), &pane_metas.lock().unwrap());
+            }
+            Ok(TuiEvent::StartBot { pane_id, prompt }) => {
+                // Get existing provider from pane meta (preserve across mode switch)
+                let provider = {
+                    let metas = pane_metas.lock().unwrap();
+                    metas.get(&pane_id).map(|m| m.provider.clone()).unwrap_or(Provider::Claude)
+                };
+
+                // Convert interactive pane to deadloop:
+                // 1. Remove input channel (kills interactive session thread)
+                {
+                    let mut channels = input_channels.lock().unwrap();
+                    channels.remove(&pane_id);
+                }
+
+                // 2. Create pause flag and child process for the deadloop
+                let pause_flag = Arc::new(AtomicBool::new(false));
+                let child_proc: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
+                {
+                    let mut pauses = pane_pauses.lock().unwrap();
+                    pauses.insert(pane_id, pause_flag.clone());
+                }
+                {
+                    let mut metas = pane_metas.lock().unwrap();
+                    metas.insert(pane_id, PaneMeta {
+                        mode: shared::PaneMode::Deadloop,
+                        provider: provider.clone(),
+                        prompt: prompt.clone(),
+                        child_process: child_proc.clone(),
+                    });
+                }
+
+                // 3. Notify TUI to update tab mode
+                let _ = command_tx.send(TuiCommand::SetMode {
+                    pane_id,
+                    mode: shared::PaneMode::Deadloop,
+                });
+
+                let _ = output_tx.send(PaneOutput {
+                    text: "[Bot started on this pane]".to_string(),
+                    pane_id,
+                });
+
+                // 4. Get claude session id for this pane
+                let claude_session_id = {
+                    let ps = pane_sessions.lock().unwrap();
+                    ps.get(&pane_id).copied().unwrap_or_else(Uuid::new_v4)
+                };
+
+                // 5. Spawn deadloop session
+                let dl_prompt = prompt.unwrap_or_else(|| default_prompt.to_string());
+                let binary_path = match &provider {
+                    Provider::Claude => claude_path.to_string(),
+                    Provider::Codex => codex_path.to_string(),
+                };
+                {
+                    let output_tx = output_tx.clone();
+                    let server_tx = server_tx.clone();
+                    let shutdown = shutdown.clone();
+                    let working_dir = working_dir.to_string();
+                    thread::spawn(move || {
+                        run_deadloop_session(
+                            &binary_path, &working_dir, session_id, claude_session_id,
+                            pane_id, &dl_prompt, &provider, output_tx, server_tx, shutdown, pause_flag, child_proc,
+                        )
+                    });
+                }
+
+                // 6. Send updated pane list
+                let _ = server_tx.blocking_send(CliToServer::PaneList {
+                    session_id,
+                    panes: build_pane_list(&pane_metas, &input_channels, session_id, &pane_sessions),
+                });
+
+                save_pane_configs(working_dir, &pane_sessions.lock().unwrap(), &pane_metas.lock().unwrap());
+            }
+            Ok(TuiEvent::StopBot { pane_id }) => {
+                // Get existing provider from pane meta (preserve across mode switch)
+                let provider = {
+                    let metas = pane_metas.lock().unwrap();
+                    metas.get(&pane_id).map(|m| m.provider.clone()).unwrap_or(Provider::Claude)
+                };
+
+                // Convert deadloop pane back to interactive:
+                // 1. Kill the deadloop child process
+                {
+                    let metas = pane_metas.lock().unwrap();
+                    if let Some(meta) = metas.get(&pane_id) {
+                        if let Ok(mut guard) = meta.child_process.lock() {
+                            if let Some(ref mut child) = *guard {
+                                let _ = child.kill();
+                            }
+                        }
+                    }
+                }
+
+                // 2. Remove pause flag
+                {
+                    let mut pauses = pane_pauses.lock().unwrap();
+                    pauses.remove(&pane_id);
+                }
+
+                // 3. Create input channel for interactive mode
+                let (input_tx, input_rx) = mpsc::channel::<PaneInput>();
+                {
+                    let mut channels = input_channels.lock().unwrap();
+                    channels.insert(pane_id, input_tx);
+                }
+
+                // 4. Update pane meta to interactive
+                {
+                    let mut metas = pane_metas.lock().unwrap();
+                    metas.insert(pane_id, PaneMeta {
+                        mode: shared::PaneMode::Interactive,
+                        provider: provider.clone(),
+                        prompt: None,
+                        child_process: Arc::new(Mutex::new(None)),
+                    });
+                }
+
+                // 5. Notify TUI to update tab mode
+                let _ = command_tx.send(TuiCommand::SetMode {
+                    pane_id,
+                    mode: shared::PaneMode::Interactive,
+                });
+
+                let _ = output_tx.send(PaneOutput {
+                    text: "[Bot stopped — switched to interactive mode]".to_string(),
+                    pane_id,
+                });
+
+                // 6. Get claude session id for this pane
+                let claude_session_id = {
+                    let ps = pane_sessions.lock().unwrap();
+                    ps.get(&pane_id).copied().unwrap_or_else(Uuid::new_v4)
+                };
+
+                // 7. Spawn interactive session
+                let binary_path = match &provider {
+                    Provider::Claude => claude_path.to_string(),
+                    Provider::Codex => codex_path.to_string(),
+                };
+                {
+                    let output_tx = output_tx.clone();
+                    let server_tx = server_tx.clone();
+                    let shutdown = shutdown.clone();
+                    let working_dir = working_dir.to_string();
+                    thread::spawn(move || {
+                        run_pane_session(
+                            &binary_path, &working_dir, session_id, claude_session_id,
+                            pane_id, &provider, input_rx,
+                            output_tx, server_tx, shutdown,
+                        )
+                    });
+                }
+
+                // 8. Send updated pane list
+                let _ = server_tx.blocking_send(CliToServer::PaneList {
+                    session_id,
+                    panes: build_pane_list(&pane_metas, &input_channels, session_id, &pane_sessions),
+                });
+
+                save_pane_configs(working_dir, &pane_sessions.lock().unwrap(), &pane_metas.lock().unwrap());
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -502,43 +836,46 @@ fn handle_tui_events(
     }
 }
 
-/// Build a PaneConfig list from the current input channels registry
-fn build_pane_list(input_channels: &InputChannels, session_id: Uuid) -> Vec<shared::PaneConfig> {
+/// Build a PaneConfig list from pane metadata and input channels
+fn build_pane_list(
+    pane_metas: &PaneMetas,
+    input_channels: &InputChannels,
+    session_id: Uuid,
+    pane_sessions: &Arc<Mutex<HashMap<u32, Uuid>>>,
+) -> Vec<shared::PaneConfig> {
+    let metas = pane_metas.lock().unwrap();
     let channels = input_channels.lock().unwrap();
+    let ps = pane_sessions.lock().unwrap();
     let mut panes = Vec::new();
 
-    // Always include deadloop (it doesn't have an input channel but is always present)
-    panes.push(shared::PaneConfig {
-        pane_id: shared::PANE_ID_DEADLOOP,
-        provider: shared::Provider::Claude,
-        mode: shared::PaneMode::Deadloop,
-        session_id,
-        is_paused: false,
-        prompt: None,
-        label: Some("Deadloop".to_string()),
-    });
-
-    // Interactive pane
-    if channels.contains_key(&shared::PANE_ID_INTERACTIVE) {
+    // Build from metas (covers deadloop panes which don't have input channels)
+    for (&pane_id, meta) in metas.iter() {
+        let claude_sid = ps.get(&pane_id).copied().unwrap_or(session_id);
+        let label = match pane_id {
+            shared::PANE_ID_DEADLOOP => "Deadloop".to_string(),
+            shared::PANE_ID_INTERACTIVE => "Interactive".to_string(),
+            _ => format!("Tab {}", pane_id),
+        };
         panes.push(shared::PaneConfig {
-            pane_id: shared::PANE_ID_INTERACTIVE,
-            provider: shared::Provider::Claude,
-            mode: shared::PaneMode::Interactive,
-            session_id,
+            pane_id,
+            provider: meta.provider.clone(),
+            mode: meta.mode.clone(),
+            session_id: claude_sid,
             is_paused: false,
-            prompt: None,
-            label: Some("Interactive".to_string()),
+            prompt: meta.prompt.clone(),
+            label: Some(label),
         });
     }
 
-    // Dynamic panes
+    // Also include any interactive panes that are in input_channels but not in metas
     for &pane_id in channels.keys() {
-        if pane_id != shared::PANE_ID_INTERACTIVE && pane_id != shared::PANE_ID_DEADLOOP {
+        if !metas.contains_key(&pane_id) {
+            let claude_sid = ps.get(&pane_id).copied().unwrap_or(session_id);
             panes.push(shared::PaneConfig {
                 pane_id,
                 provider: shared::Provider::Claude,
                 mode: shared::PaneMode::Interactive,
-                session_id,
+                session_id: claude_sid,
                 is_paused: false,
                 prompt: None,
                 label: Some(format!("Tab {}", pane_id)),
@@ -550,13 +887,94 @@ fn build_pane_list(input_channels: &InputChannels, session_id: Uuid) -> Vec<shar
     panes
 }
 
-/// Run the deadloop (autonomous) session
+/// Build CLI arguments based on provider, session state, and prompt.
+/// Returns (args, is_using_resume).
+fn build_agent_args(
+    provider: &Provider,
+    session_id: &Uuid,
+    prompt: &str,
+    first_message: bool,
+    try_resume: bool,
+) -> (Vec<String>, bool) {
+    match provider {
+        Provider::Claude => {
+            let base = vec![
+                "--print".to_string(), "--output-format".to_string(), "stream-json".to_string(),
+                "--verbose".to_string(), "--dangerously-skip-permissions".to_string(),
+            ];
+            if first_message && try_resume {
+                let mut args = base;
+                args.extend_from_slice(&["--resume".to_string(), session_id.to_string(), prompt.to_string()]);
+                (args, true)
+            } else if first_message {
+                let mut args = base;
+                args.extend_from_slice(&["--session-id".to_string(), session_id.to_string(), prompt.to_string()]);
+                (args, false)
+            } else {
+                let mut args = base;
+                args.extend_from_slice(&["--resume".to_string(), session_id.to_string(), prompt.to_string()]);
+                (args, true)
+            }
+        }
+        Provider::Codex => {
+            // Codex uses subcommands: `codex exec --json ...` or `codex exec resume --json ... <session_id> <prompt>`
+            if first_message && try_resume {
+                (vec![
+                    "exec".to_string(), "resume".to_string(),
+                    "--json".to_string(),
+                    "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                    "--skip-git-repo-check".to_string(),
+                    session_id.to_string(), prompt.to_string(),
+                ], true)
+            } else if first_message {
+                // New session — just exec with prompt
+                (vec![
+                    "exec".to_string(),
+                    "--json".to_string(),
+                    "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                    "--skip-git-repo-check".to_string(),
+                    prompt.to_string(),
+                ], false)
+            } else {
+                // Subsequent — always resume
+                (vec![
+                    "exec".to_string(), "resume".to_string(),
+                    "--json".to_string(),
+                    "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                    "--skip-git-repo-check".to_string(),
+                    session_id.to_string(), prompt.to_string(),
+                ], true)
+            }
+        }
+    }
+}
+
+/// Parse a line of output and convert to ClaudeStreamMessage based on provider.
+/// For Claude, parses as ClaudeStreamMessage directly.
+/// For Codex, parses as CodexStreamMessage and converts.
+fn parse_agent_output(provider: &Provider, line: &str, session_id_str: &str) -> Option<ClaudeStreamMessage> {
+    match provider {
+        Provider::Claude => {
+            serde_json::from_str::<ClaudeStreamMessage>(line).ok()
+        }
+        Provider::Codex => {
+            match serde_json::from_str::<CodexStreamMessage>(line) {
+                Ok(codex_msg) => shared::convert_codex_to_claude(&codex_msg, session_id_str),
+                Err(_) => None,
+            }
+        }
+    }
+}
+
+/// Run the deadloop (autonomous) session on any pane
 fn run_deadloop_session(
-    claude_path: &str,
+    binary_path: &str,
     working_dir: &str,
     session_id: Uuid,
     claude_session_id: Uuid,
+    pane_id: u32,
     prompt: &str,
+    provider: &Provider,
     output_tx: mpsc::Sender<PaneOutput>,
     server_tx: tokio_mpsc::Sender<CliToServer>,
     shutdown: Arc<AtomicBool>,
@@ -565,8 +983,8 @@ fn run_deadloop_session(
 ) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_deadloop_session_inner(
-            claude_path, working_dir, session_id, claude_session_id,
-            prompt, output_tx.clone(), server_tx, shutdown, pause, child_process,
+            binary_path, working_dir, session_id, claude_session_id,
+            pane_id, prompt, provider, output_tx.clone(), server_tx, shutdown, pause, child_process,
         )
     }));
 
@@ -580,24 +998,25 @@ fn run_deadloop_session(
         };
         let _ = output_tx.send(PaneOutput {
             text: format!("[DEADLOOP CRASHED: {}]", msg),
-            pane_id: shared::PANE_ID_DEADLOOP,
+            pane_id,
         });
     }
 }
 
 fn run_deadloop_session_inner(
-    claude_path: &str,
+    binary_path: &str,
     working_dir: &str,
     session_id: Uuid,
     claude_session_id: Uuid,
+    pane_id: u32,
     prompt: &str,
+    provider: &Provider,
     output_tx: mpsc::Sender<PaneOutput>,
     server_tx: tokio_mpsc::Sender<CliToServer>,
     shutdown: Arc<AtomicBool>,
     pause: Arc<AtomicBool>,
     child_process: Arc<Mutex<Option<std::process::Child>>>,
 ) {
-    let pane_id = shared::PANE_ID_DEADLOOP;
     let _ = output_tx.send(PaneOutput {
         text: format!("[Deadloop session: {}]", &claude_session_id.to_string()[..8]),
         pane_id,
@@ -649,28 +1068,12 @@ fn run_deadloop_session_inner(
             status: Some("Thinking...".to_string()),
         });
 
-        let (args, using_resume) = if first_message && try_resume_first {
-            (vec![
-                "--print".to_string(), "--output-format".to_string(), "stream-json".to_string(),
-                "--verbose".to_string(), "--dangerously-skip-permissions".to_string(),
-                "--resume".to_string(), claude_session_id.to_string(), prompt.to_string(),
-            ], true)
-        } else if first_message {
+        let (args, using_resume) = build_agent_args(provider, &claude_session_id, prompt, first_message, try_resume_first);
+        if first_message && !try_resume_first {
             first_message = false;
-            (vec![
-                "--print".to_string(), "--output-format".to_string(), "stream-json".to_string(),
-                "--verbose".to_string(), "--dangerously-skip-permissions".to_string(),
-                "--session-id".to_string(), claude_session_id.to_string(), prompt.to_string(),
-            ], false)
-        } else {
-            (vec![
-                "--print".to_string(), "--output-format".to_string(), "stream-json".to_string(),
-                "--verbose".to_string(), "--dangerously-skip-permissions".to_string(),
-                "--resume".to_string(), claude_session_id.to_string(), prompt.to_string(),
-            ], true)
-        };
+        }
 
-        match Command::new(claude_path)
+        match Command::new(binary_path)
             .args(&args)
             .current_dir(working_dir)
             .stdin(Stdio::null())
@@ -752,14 +1155,14 @@ fn run_deadloop_session_inner(
                                         process_exited = true;
                                         if !status.success() {
                                             let _ = output_tx.send(PaneOutput {
-                                                text: format!("[Claude process exited with {}]", status),
+                                                text: format!("[Agent process exited with {}]", status),
                                                 pane_id,
                                             });
                                             exit_was_error = true;
                                             had_error = true;
                                         } else {
                                             let _ = output_tx.send(PaneOutput {
-                                                text: "[Claude process exited normally]".to_string(),
+                                                text: "[Agent process exited normally]".to_string(),
                                                 pane_id,
                                             });
                                         }
@@ -776,13 +1179,14 @@ fn run_deadloop_session_inner(
                         }
                     }
 
+                    let session_id_str = claude_session_id.to_string();
                     match stdout_rx.recv_timeout(check_interval) {
                         Ok(Some(line)) => {
                             timeouts_after_exit = 0;
                             if line.trim().is_empty() { continue; }
 
-                            match serde_json::from_str::<ClaudeStreamMessage>(&line) {
-                                Ok(message) => {
+                            match parse_agent_output(provider, &line, &session_id_str) {
+                                Some(message) => {
                                     if let ClaudeStreamMessage::Result { is_error, .. } = &message {
                                         if *is_error { had_error = true; }
                                     }
@@ -794,7 +1198,7 @@ fn run_deadloop_session_inner(
                                         pane_id: Some(pane_id),
                                     });
                                 }
-                                Err(_) => {
+                                None => {
                                     let _ = output_tx.send(PaneOutput { text: line.clone(), pane_id });
                                     let _ = server_tx.try_send(CliToServer::Output {
                                         session_id, data: line,
@@ -885,7 +1289,7 @@ fn run_deadloop_session_inner(
             }
             Err(e) => {
                 let _ = output_tx.send(PaneOutput {
-                    text: format!("[Error starting Claude: {}]", e),
+                    text: format!("[Error starting agent: {}]", e),
                     pane_id,
                 });
                 let _ = server_tx.try_send(CliToServer::PaneStatus {
@@ -901,11 +1305,12 @@ fn run_deadloop_session_inner(
 /// Run a generic interactive pane session.
 /// Input comes from a single channel — both TUI and web input are routed through input_channels.
 fn run_pane_session(
-    claude_path: &str,
+    binary_path: &str,
     working_dir: &str,
     session_id: Uuid,
     claude_session_id: Uuid,
     pane_id: u32,
+    provider: &Provider,
     input_rx: mpsc::Receiver<PaneInput>,
     output_tx: mpsc::Sender<PaneOutput>,
     server_tx: tokio_mpsc::Sender<CliToServer>,
@@ -963,28 +1368,12 @@ fn run_pane_session(
             });
         }
 
-        let (args, using_resume) = if first_message && try_resume_first {
-            (vec![
-                "--print".to_string(), "--output-format".to_string(), "stream-json".to_string(),
-                "--verbose".to_string(), "--dangerously-skip-permissions".to_string(),
-                "--resume".to_string(), claude_session_id.to_string(), prompt,
-            ], true)
-        } else if first_message {
+        let (args, using_resume) = build_agent_args(provider, &claude_session_id, &prompt, first_message, try_resume_first);
+        if first_message && !try_resume_first {
             first_message = false;
-            (vec![
-                "--print".to_string(), "--output-format".to_string(), "stream-json".to_string(),
-                "--verbose".to_string(), "--dangerously-skip-permissions".to_string(),
-                "--session-id".to_string(), claude_session_id.to_string(), prompt,
-            ], false)
-        } else {
-            (vec![
-                "--print".to_string(), "--output-format".to_string(), "stream-json".to_string(),
-                "--verbose".to_string(), "--dangerously-skip-permissions".to_string(),
-                "--resume".to_string(), claude_session_id.to_string(), prompt,
-            ], true)
-        };
+        }
 
-        match Command::new(claude_path)
+        match Command::new(binary_path)
             .args(&args)
             .current_dir(working_dir)
             .stdin(Stdio::null())
@@ -1025,6 +1414,7 @@ fn run_pane_session(
                 });
 
                 let check_interval = Duration::from_millis(100);
+                let session_id_str = claude_session_id.to_string();
                 loop {
                     if shutdown.load(Ordering::SeqCst) {
                         let _ = child.kill();
@@ -1035,8 +1425,8 @@ fn run_pane_session(
                         Ok(Some(line)) => {
                             if line.trim().is_empty() { continue; }
 
-                            match serde_json::from_str::<ClaudeStreamMessage>(&line) {
-                                Ok(message) => {
+                            match parse_agent_output(provider, &line, &session_id_str) {
+                                Some(message) => {
                                     let display_text = format_stream_message(&message);
                                     let _ = output_tx.send(PaneOutput { text: display_text, pane_id });
                                     let _ = server_tx.blocking_send(CliToServer::StreamMessage {
@@ -1045,7 +1435,7 @@ fn run_pane_session(
                                         pane_id: Some(pane_id),
                                     });
                                 }
-                                Err(_) => {
+                                None => {
                                     let _ = output_tx.send(PaneOutput { text: line, pane_id });
                                 }
                             }
@@ -1151,9 +1541,11 @@ async fn run_server_connection(
     working_dir: &str,
     mut output_rx: tokio_mpsc::Receiver<CliToServer>,
     shutdown: Arc<AtomicBool>,
-    pause_deadloop: Arc<AtomicBool>,
+    pane_pauses: PanePauses,
     reboot_requested: Arc<AtomicBool>,
     input_channels: InputChannels,
+    pane_metas: PaneMetas,
+    pane_sessions: Arc<Mutex<HashMap<u32, Uuid>>>,
     status_tx: mpsc::Sender<PaneOutput>,
     tui_event_tx: mpsc::Sender<TuiEvent>,
 ) -> Result<()> {
@@ -1271,7 +1663,7 @@ async fn run_server_connection(
 
                 // Send session start with pane list
                 let hostname = hostname::get().ok().and_then(|h| h.into_string().ok());
-                let pane_list = build_pane_list(&input_channels, session_id);
+                let pane_list = build_pane_list(&pane_metas, &input_channels, session_id, &pane_sessions);
 
                 let session_start = CliToServer::SessionStart {
                     session_id,
@@ -1354,7 +1746,12 @@ async fn run_server_connection(
                                             }
                                             ServerToCli::Heartbeat => {}
                                             ServerToCli::PauseDeadloop { .. } => {
-                                                pause_deadloop.store(true, Ordering::SeqCst);
+                                                // Legacy: pause the default deadloop pane
+                                                if let Ok(pauses) = pane_pauses.lock() {
+                                                    if let Some(flag) = pauses.get(&shared::PANE_ID_DEADLOOP) {
+                                                        flag.store(true, Ordering::SeqCst);
+                                                    }
+                                                }
                                                 let _ = status_tx.send(PaneOutput {
                                                     text: "[Pause command received from web]".to_string(),
                                                     pane_id: shared::PANE_ID_DEADLOOP,
@@ -1366,9 +1763,17 @@ async fn run_server_connection(
                                                 let status_msg = CliToServer::DeadloopStatus { session_id, is_paused: true };
                                                 let msg_text = serde_json::to_string(&status_msg).unwrap_or_default();
                                                 let _ = ws_sender.send(Message::Text(msg_text.into())).await;
+                                                let pane_msg = CliToServer::PanePaused { session_id, pane_id: shared::PANE_ID_DEADLOOP, is_paused: true };
+                                                let msg_text = serde_json::to_string(&pane_msg).unwrap_or_default();
+                                                let _ = ws_sender.send(Message::Text(msg_text.into())).await;
                                             }
                                             ServerToCli::ResumeDeadloop { .. } => {
-                                                pause_deadloop.store(false, Ordering::SeqCst);
+                                                // Legacy: resume the default deadloop pane
+                                                if let Ok(pauses) = pane_pauses.lock() {
+                                                    if let Some(flag) = pauses.get(&shared::PANE_ID_DEADLOOP) {
+                                                        flag.store(false, Ordering::SeqCst);
+                                                    }
+                                                }
                                                 let _ = status_tx.send(PaneOutput {
                                                     text: "[Resume command received from web]".to_string(),
                                                     pane_id: shared::PANE_ID_DEADLOOP,
@@ -1380,6 +1785,57 @@ async fn run_server_connection(
                                                 let status_msg = CliToServer::DeadloopStatus { session_id, is_paused: false };
                                                 let msg_text = serde_json::to_string(&status_msg).unwrap_or_default();
                                                 let _ = ws_sender.send(Message::Text(msg_text.into())).await;
+                                                let pane_msg = CliToServer::PanePaused { session_id, pane_id: shared::PANE_ID_DEADLOOP, is_paused: false };
+                                                let msg_text = serde_json::to_string(&pane_msg).unwrap_or_default();
+                                                let _ = ws_sender.send(Message::Text(msg_text.into())).await;
+                                            }
+                                            ServerToCli::PausePane { session_id: _, pane_id: target_pane } => {
+                                                if let Ok(pauses) = pane_pauses.lock() {
+                                                    if let Some(flag) = pauses.get(&target_pane) {
+                                                        flag.store(true, Ordering::SeqCst);
+                                                    }
+                                                }
+                                                let _ = status_tx.send(PaneOutput {
+                                                    text: format!("[Pane {} paused from web]", target_pane),
+                                                    pane_id: target_pane,
+                                                });
+                                                let pane_msg = CliToServer::PanePaused { session_id, pane_id: target_pane, is_paused: true };
+                                                let msg_text = serde_json::to_string(&pane_msg).unwrap_or_default();
+                                                let _ = ws_sender.send(Message::Text(msg_text.into())).await;
+                                                // Legacy compat: also send DeadloopStatus for pane 1
+                                                if target_pane == shared::PANE_ID_DEADLOOP {
+                                                    if let Ok(mut metadata) = get_or_create_project(std::path::Path::new(working_dir)) {
+                                                        metadata.is_paused = true;
+                                                        let _ = save_project(std::path::Path::new(working_dir), &metadata);
+                                                    }
+                                                    let status_msg = CliToServer::DeadloopStatus { session_id, is_paused: true };
+                                                    let msg_text = serde_json::to_string(&status_msg).unwrap_or_default();
+                                                    let _ = ws_sender.send(Message::Text(msg_text.into())).await;
+                                                }
+                                            }
+                                            ServerToCli::ResumePane { session_id: _, pane_id: target_pane } => {
+                                                if let Ok(pauses) = pane_pauses.lock() {
+                                                    if let Some(flag) = pauses.get(&target_pane) {
+                                                        flag.store(false, Ordering::SeqCst);
+                                                    }
+                                                }
+                                                let _ = status_tx.send(PaneOutput {
+                                                    text: format!("[Pane {} resumed from web]", target_pane),
+                                                    pane_id: target_pane,
+                                                });
+                                                let pane_msg = CliToServer::PanePaused { session_id, pane_id: target_pane, is_paused: false };
+                                                let msg_text = serde_json::to_string(&pane_msg).unwrap_or_default();
+                                                let _ = ws_sender.send(Message::Text(msg_text.into())).await;
+                                                // Legacy compat: also send DeadloopStatus for pane 1
+                                                if target_pane == shared::PANE_ID_DEADLOOP {
+                                                    if let Ok(mut metadata) = get_or_create_project(std::path::Path::new(working_dir)) {
+                                                        metadata.is_paused = false;
+                                                        let _ = save_project(std::path::Path::new(working_dir), &metadata);
+                                                    }
+                                                    let status_msg = CliToServer::DeadloopStatus { session_id, is_paused: false };
+                                                    let msg_text = serde_json::to_string(&status_msg).unwrap_or_default();
+                                                    let _ = ws_sender.send(Message::Text(msg_text.into())).await;
+                                                }
                                             }
                                             ServerToCli::AddPane { session_id: _, pane_config } => {
                                                 let label = pane_config.label.clone().unwrap_or_else(|| format!("Tab {}", pane_config.pane_id));
@@ -1388,11 +1844,25 @@ async fn run_server_connection(
                                                     pane_id: pane_config.pane_id,
                                                     label,
                                                     claude_session_id: pane_config.session_id,
+                                                    mode: pane_config.mode,
+                                                    provider: pane_config.provider,
+                                                    prompt: pane_config.prompt,
                                                 });
                                             }
                                             ServerToCli::RemovePane { session_id: _, pane_id: remove_id } => {
                                                 // Delegate to TUI event handler
                                                 let _ = tui_event_tx.send(TuiEvent::CloseTab(remove_id));
+                                            }
+                                            ServerToCli::StartBot { session_id: _, pane_id: target_pane, prompt: bot_prompt } => {
+                                                let _ = tui_event_tx.send(TuiEvent::StartBot {
+                                                    pane_id: target_pane,
+                                                    prompt: bot_prompt,
+                                                });
+                                            }
+                                            ServerToCli::StopBot { session_id: _, pane_id: target_pane } => {
+                                                let _ = tui_event_tx.send(TuiEvent::StopBot {
+                                                    pane_id: target_pane,
+                                                });
                                             }
                                             ServerToCli::RebootCli { .. } => {
                                                 reboot_requested.store(true, Ordering::SeqCst);

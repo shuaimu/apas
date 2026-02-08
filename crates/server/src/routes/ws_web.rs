@@ -428,6 +428,37 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
+                Ok(WebToServer::StartBot { pane_id, prompt }) => {
+                    if let Some(sid) = session_id {
+                        tracing::info!("Starting bot on pane {} for session {}", pane_id, sid);
+                        state
+                            .sessions
+                            .route_to_cli(
+                                &sid,
+                                ServerToCli::StartBot {
+                                    session_id: sid,
+                                    pane_id,
+                                    prompt,
+                                },
+                            )
+                            .await;
+                    }
+                }
+                Ok(WebToServer::StopBot { pane_id }) => {
+                    if let Some(sid) = session_id {
+                        tracing::info!("Stopping bot on pane {} for session {}", pane_id, sid);
+                        state
+                            .sessions
+                            .route_to_cli(
+                                &sid,
+                                ServerToCli::StopBot {
+                                    session_id: sid,
+                                    pane_id,
+                                },
+                            )
+                            .await;
+                    }
+                }
                 Ok(WebToServer::ResumeSession { session_id: sid }) => {
                     session_id = Some(sid);
                 }

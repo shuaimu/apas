@@ -18,6 +18,7 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Paragraph, Wrap},
 };
+use shared::PaneMode;
 
 /// Output message routed by pane_id
 #[derive(Debug, Clone)]
@@ -30,6 +31,7 @@ pub struct PaneOutput {
 struct TabState {
     pane_id: u32,
     label: String,
+    mode: PaneMode,
     output: Vec<String>,
     input: String,
     scroll: u16,
@@ -37,11 +39,12 @@ struct TabState {
 }
 
 impl TabState {
-    fn new(pane_id: u32, label: String) -> Self {
+    fn new(pane_id: u32, label: String, mode: PaneMode) -> Self {
         let init_msg = format!("[{} initialized]", label);
         Self {
             pane_id,
             label,
+            mode,
             output: vec![init_msg],
             input: String::new(),
             scroll: 0,
@@ -54,16 +57,28 @@ impl TabState {
 #[derive(Debug, Clone)]
 pub enum TuiEvent {
     AddTab,
-    /// Add a tab with a specific pane_id and label (from web/server)
-    AddTabWithConfig { pane_id: u32, label: String, claude_session_id: uuid::Uuid },
+    /// Add a tab with a specific pane_id, label, mode, provider, and prompt (from web/server)
+    AddTabWithConfig {
+        pane_id: u32,
+        label: String,
+        claude_session_id: uuid::Uuid,
+        mode: PaneMode,
+        provider: shared::Provider,
+        prompt: Option<String>,
+    },
     CloseTab(u32),
+    /// Start bot (deadloop) on an existing interactive pane
+    StartBot { pane_id: u32, prompt: Option<String> },
+    /// Stop bot on a deadloop pane (revert to interactive)
+    StopBot { pane_id: u32 },
 }
 
 /// Commands sent back to the TUI from event handlers
 #[derive(Debug)]
 pub enum TuiCommand {
-    AddTab { pane_id: u32, label: String },
+    AddTab { pane_id: u32, label: String, mode: PaneMode },
     RemoveTab { pane_id: u32 },
+    SetMode { pane_id: u32, mode: PaneMode },
 }
 
 /// Main TUI application state
@@ -93,11 +108,11 @@ impl App {
         output_rx: Receiver<PaneOutput>,
         event_tx: Sender<TuiEvent>,
         command_rx: Receiver<TuiCommand>,
-        initial_tabs: Vec<(u32, String)>,
+        initial_tabs: Vec<(u32, String, PaneMode)>,
     ) -> Self {
         let tabs: Vec<TabState> = initial_tabs
             .into_iter()
-            .map(|(id, label)| TabState::new(id, label))
+            .map(|(id, label, mode)| TabState::new(id, label, mode))
             .collect();
 
         Self {
@@ -119,12 +134,12 @@ impl App {
     }
 
     /// Add a new tab dynamically (called from outside the TUI loop)
-    pub fn add_tab(&mut self, pane_id: u32, label: String) {
+    pub fn add_tab(&mut self, pane_id: u32, label: String, mode: PaneMode) {
         // Don't add duplicate
         if self.tabs.iter().any(|t| t.pane_id == pane_id) {
             return;
         }
-        self.tabs.push(TabState::new(pane_id, label));
+        self.tabs.push(TabState::new(pane_id, label, mode));
     }
 
     /// Remove a tab dynamically
@@ -177,13 +192,18 @@ impl App {
     fn process_commands(&mut self) {
         while let Ok(cmd) = self.command_rx.try_recv() {
             match cmd {
-                TuiCommand::AddTab { pane_id, label } => {
-                    self.add_tab(pane_id, label);
+                TuiCommand::AddTab { pane_id, label, mode } => {
+                    self.add_tab(pane_id, label, mode);
                     // Switch to newly created tab
                     self.active_tab = self.tabs.len() - 1;
                 }
                 TuiCommand::RemoveTab { pane_id } => {
                     self.remove_tab(pane_id);
+                }
+                TuiCommand::SetMode { pane_id, mode } => {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.pane_id == pane_id) {
+                        tab.mode = mode;
+                    }
                 }
             }
         }
@@ -268,15 +288,19 @@ impl App {
                     }
                 }
                 KeyCode::Enter => {
+                    // Deadloop tabs don't accept user input
+                    if tab.mode == PaneMode::Deadloop { return; }
                     if !tab.input.is_empty() {
                         let input = std::mem::take(&mut tab.input);
                         let _ = self.input_tx.send((tab.pane_id, input));
                     }
                 }
                 KeyCode::Char(c) => {
+                    if tab.mode == PaneMode::Deadloop { return; }
                     tab.input.push(c);
                 }
                 KeyCode::Backspace => {
+                    if tab.mode == PaneMode::Deadloop { return; }
                     tab.input.pop();
                 }
                 KeyCode::Up => {
@@ -330,9 +354,15 @@ impl App {
 
         for (i, tab) in self.tabs.iter().enumerate() {
             let is_active = i == self.active_tab;
+            let is_bot = tab.mode == PaneMode::Deadloop;
 
             // Tab number prefix
             let num = format!(" {}:", i + 1);
+            let label = if is_bot {
+                format!("{} (Bot) ", tab.label)
+            } else {
+                format!("{} ", tab.label)
+            };
 
             if is_active {
                 spans.push(Span::styled(
@@ -340,7 +370,7 @@ impl App {
                     Style::default().fg(Color::Black).bg(Color::White).bold(),
                 ));
                 spans.push(Span::styled(
-                    format!("{} ", tab.label),
+                    label,
                     Style::default().fg(Color::Black).bg(Color::White).bold(),
                 ));
             } else {
@@ -349,7 +379,7 @@ impl App {
                     Style::default().fg(Color::Gray),
                 ));
                 spans.push(Span::styled(
-                    format!("{} ", tab.label),
+                    label,
                     Style::default().fg(Color::Gray),
                 ));
             }
@@ -423,16 +453,22 @@ impl App {
         frame.render_widget(paragraph, content_layout[0]);
 
         // --- Input area ---
+        let is_deadloop = tab.mode == PaneMode::Deadloop;
         let input_block = Block::default()
-            .title(" Input ")
+            .title(if is_deadloop { " Bot Mode " } else { " Input " })
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Green));
+            .border_style(Style::default().fg(if is_deadloop { Color::DarkGray } else { Color::Green }));
 
         let input_inner = input_block.inner(content_layout[1]);
         frame.render_widget(input_block, content_layout[1]);
 
-        let input_text = format!("{}_", tab.input);
-        let input_paragraph = Paragraph::new(input_text);
+        let input_text = if is_deadloop {
+            "Bot running autonomously...".to_string()
+        } else {
+            format!("{}_", tab.input)
+        };
+        let input_paragraph = Paragraph::new(input_text)
+            .style(if is_deadloop { Style::default().fg(Color::DarkGray) } else { Style::default() });
         frame.render_widget(input_paragraph, input_inner);
     }
 

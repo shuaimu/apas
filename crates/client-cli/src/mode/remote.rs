@@ -226,8 +226,10 @@ async fn run_connection(
                     | Ok(ServerToCli::PausePane { .. })
                     | Ok(ServerToCli::ResumePane { .. })
                     | Ok(ServerToCli::AddPane { .. })
-                    | Ok(ServerToCli::RemovePane { .. }) => {
-                        // Pause/resume/pane management not supported in remote mode
+                    | Ok(ServerToCli::RemovePane { .. })
+                    | Ok(ServerToCli::StartBot { .. })
+                    | Ok(ServerToCli::StopBot { .. }) => {
+                        // Pause/resume/pane/bot management not supported in remote mode
                     }
                     Ok(ServerToCli::RebootCli { .. }) => {
                         tracing::info!("Reboot command received, restarting...");
