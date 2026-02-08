@@ -76,6 +76,7 @@ impl ProjectMetadata {
                     is_paused: self.is_paused,
                     prompt: self.prompt.clone(),
                     label: Some("Claude Deadloop".to_string()),
+                    model: None,
                 },
                 PaneConfig {
                     pane_id: shared::PANE_ID_INTERACTIVE,
@@ -85,6 +86,7 @@ impl ProjectMetadata {
                     is_paused: false,
                     prompt: None,
                     label: Some("Claude Interactive".to_string()),
+                    model: None,
                 },
             ];
         }

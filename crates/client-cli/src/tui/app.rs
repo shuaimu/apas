@@ -57,7 +57,7 @@ impl TabState {
 #[derive(Debug, Clone)]
 pub enum TuiEvent {
     AddTab,
-    /// Add a tab with a specific pane_id, label, mode, provider, and prompt (from web/server)
+    /// Add a tab with a specific pane_id, label, mode, provider, prompt, and model (from web/server)
     AddTabWithConfig {
         pane_id: u32,
         label: String,
@@ -65,6 +65,7 @@ pub enum TuiEvent {
         mode: PaneMode,
         provider: shared::Provider,
         prompt: Option<String>,
+        model: Option<String>,
     },
     CloseTab(u32),
     /// Start bot (deadloop) on an existing interactive pane

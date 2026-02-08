@@ -385,7 +385,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::AddPane { provider, mode, label, prompt }) => {
+                Ok(WebToServer::AddPane { provider, mode, label, prompt, model }) => {
                     if let Some(sid) = session_id {
                         // Generate a unique pane_id starting from 3 (1 and 2 are reserved for legacy deadloop/interactive)
                         let pane_id = 3 + (uuid::Uuid::new_v4().as_u128() % 1000) as u32;
@@ -397,6 +397,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             is_paused: false,
                             prompt,
                             label,
+                            model,
                         };
                         tracing::info!("Adding pane {} to session {}", pane_id, sid);
                         state

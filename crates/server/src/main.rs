@@ -11,8 +11,17 @@ mod storage;
 
 use state::AppState;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Build a runtime without the signal driver to avoid socketpair restrictions in containers.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_io()
+        .enable_time()
+        .build()?;
+
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::registry()
         .with(

@@ -76,6 +76,7 @@ export interface PaneConfig {
   is_paused: boolean;
   prompt?: string;
   label?: string;
+  model?: string;
 }
 
 // Legacy pane_id constants (must match shared::PANE_ID_DEADLOOP / PANE_ID_INTERACTIVE)
@@ -183,7 +184,7 @@ interface AppState {
   resumeDeadloop: () => void;
   pausePane: (paneId: number) => void;
   resumePane: (paneId: number) => void;
-  addPane: (provider: string, mode: string, label?: string, prompt?: string) => void;
+  addPane: (provider: string, mode: string, label?: string, prompt?: string, model?: string) => void;
   removePane: (paneId: number) => void;
   startBot: (paneId: number, prompt?: string) => void;
   stopBot: (paneId: number) => void;
@@ -706,7 +707,7 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  addPane: (provider: string, mode: string, label?: string, prompt?: string) => {
+  addPane: (provider: string, mode: string, label?: string, prompt?: string, model?: string) => {
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
@@ -715,6 +716,7 @@ export const useStore = create<AppState>((set, get) => ({
         mode,
         label: label || undefined,
         prompt: prompt || undefined,
+        model: model || undefined,
       }));
     }
   },

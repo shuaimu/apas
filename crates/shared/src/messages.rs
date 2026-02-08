@@ -245,6 +245,8 @@ pub enum WebToServer {
         label: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
 
     /// Remove a pane
@@ -465,6 +467,8 @@ pub struct PaneConfig {
     pub prompt: Option<String>, // Custom prompt for deadloop
     #[serde(default)]
     pub label: Option<String>, // User-facing label like "Deadloop" or "Interactive"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>, // Model override (e.g., "o3", "o4-mini") — Codex only
 }
 
 /// Legacy pane_id constants
@@ -483,6 +487,7 @@ impl PaneConfig {
                 is_paused: false,
                 prompt: None,
                 label: Some("Deadloop".to_string()),
+                model: None,
             },
             PaneConfig {
                 pane_id: PANE_ID_INTERACTIVE,
@@ -492,6 +497,7 @@ impl PaneConfig {
                 is_paused: false,
                 prompt: None,
                 label: Some("Interactive".to_string()),
+                model: None,
             },
         ]
     }

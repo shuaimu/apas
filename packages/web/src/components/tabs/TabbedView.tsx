@@ -115,6 +115,7 @@ export function TabbedView() {
 
   // Active tab state, persisted per project
   const [activeTabId, setActiveTabId] = useState<number | null>(null);
+  const prevTabIdsRef = useRef<number[]>([]);
 
   // Stable list of tab IDs (avoids re-running effects on every message)
   const tabIds = useMemo(
@@ -132,6 +133,23 @@ export function TabbedView() {
     } else if (ids.length > 0) {
       setActiveTabId(ids[0]);
     }
+  }, [cliClientId, tabIds]);
+
+  // Auto-switch to newly created tabs
+  useEffect(() => {
+    const ids = tabIds.split(",").filter(Boolean).map(Number);
+    const prevIds = prevTabIdsRef.current;
+    if (prevIds.length === 0) {
+      prevTabIdsRef.current = ids;
+      return;
+    }
+    const added = ids.filter((id) => !prevIds.includes(id));
+    if (added.length > 0) {
+      const nextActive = added[added.length - 1];
+      setActiveTabId(nextActive);
+      setProjectLayout(cliClientId, "active_tab", String(nextActive));
+    }
+    prevTabIdsRef.current = ids;
   }, [cliClientId, tabIds]);
 
   // If active tab no longer exists, reset to first
@@ -165,10 +183,11 @@ export function TabbedView() {
     [removePane, activeTabId, effectiveTabs, handleSelectTab],
   );
 
-  const handleAddTab = useCallback((provider: string = "claude") => {
+  const handleAddTab = useCallback((provider: string = "claude", model?: string) => {
     const prefix = provider === "codex" ? "Codex" : "Claude";
-    const label = `${prefix} ${effectiveTabs.length + 1}`;
-    addPane(provider, "interactive", label);
+    const modelSuffix = model ? ` (${model})` : "";
+    const label = `${prefix} ${effectiveTabs.length + 1}${modelSuffix}`;
+    addPane(provider, "interactive", label, undefined, model);
   }, [addPane, effectiveTabs.length]);
 
   // Get messages for active tab

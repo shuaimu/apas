@@ -8,7 +8,7 @@ interface TabBarProps {
   activeTabId: number | null;
   onSelectTab: (paneId: number) => void;
   onCloseTab: (paneId: number) => void;
-  onAddTab: (provider?: string) => void;
+  onAddTab: (provider?: string, model?: string) => void;
   paneStatuses: Record<string, string | null>;
   pausedPanes: number[];
 }
@@ -77,9 +77,12 @@ export function TabBar({
               )}
 
               {/* Label */}
-              <span className="truncate">
+              <span className="truncate" title={tab.model ? `Model: ${tab.model}` : undefined}>
                 {label}
                 {isBot && " (Bot)"}
+                {tab.provider === "codex" && tab.model && (
+                  <span className="text-xs opacity-60 ml-1">({tab.model})</span>
+                )}
               </span>
 
               {/* Close button - visible on hover or when active */}
@@ -111,8 +114,17 @@ export function TabBar({
   );
 }
 
-function AddTabButton({ onAddTab }: { onAddTab: (provider?: string) => void }) {
+const CODEX_MODELS = [
+  { id: "o3", label: "o3" },
+  { id: "o4-mini", label: "o4-mini" },
+  { id: "gpt-4.1", label: "gpt-4.1" },
+  { id: "gpt-5.3-codex-max-xhigh", label: "gpt-5.3-codex-max-xhigh" },
+];
+
+function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: string) => void }) {
   const [showMenu, setShowMenu] = useState(false);
+  const [showCodexModels, setShowCodexModels] = useState(false);
+  const [customModel, setCustomModel] = useState("");
   const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -120,11 +132,20 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string) => void }) {
     const handleClick = (e: MouseEvent) => {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
         setShowMenu(false);
+        setShowCodexModels(false);
+        setCustomModel("");
       }
     };
     document.addEventListener("mousedown", handleClick);
     return () => document.removeEventListener("mousedown", handleClick);
   }, [showMenu]);
+
+  const handleCodexModel = (model: string) => {
+    onAddTab("codex", model);
+    setShowMenu(false);
+    setShowCodexModels(false);
+    setCustomModel("");
+  };
 
   return (
     <div className="relative flex-shrink-0" ref={menuRef}>
@@ -138,7 +159,7 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string) => void }) {
         </svg>
       </button>
       {showMenu && (
-        <div className="absolute right-0 top-full mt-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-lg py-1 z-50 min-w-[140px]">
+        <div className="absolute right-0 top-full mt-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-lg py-1 z-50 min-w-[160px]">
           <button
             onClick={() => { onAddTab("claude"); setShowMenu(false); }}
             className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
@@ -146,13 +167,44 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string) => void }) {
             <span className="w-2 h-2 rounded-full bg-blue-500 flex-shrink-0" />
             Claude Tab
           </button>
+          <div className="border-t border-gray-100 dark:border-gray-700 my-0.5" />
           <button
-            onClick={() => { onAddTab("codex"); setShowMenu(false); }}
+            onClick={() => setShowCodexModels((v) => !v)}
             className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
           >
             <span className="w-2 h-2 rounded-full bg-green-500 flex-shrink-0" />
             Codex Tab
+            <svg className={`w-3 h-3 ml-auto transition-transform ${showCodexModels ? "rotate-90" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+            </svg>
           </button>
+          {showCodexModels && (
+            <div className="border-t border-gray-100 dark:border-gray-700">
+              {CODEX_MODELS.map((m) => (
+                <button
+                  key={m.id}
+                  onClick={() => handleCodexModel(m.id)}
+                  className="w-full text-left px-5 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-300"
+                >
+                  {m.label}
+                </button>
+              ))}
+              <div className="px-3 py-1.5">
+                <input
+                  type="text"
+                  placeholder="Custom model..."
+                  value={customModel}
+                  onChange={(e) => setCustomModel(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && customModel.trim()) {
+                      handleCodexModel(customModel.trim());
+                    }
+                  }}
+                  className="w-full text-sm px-2 py-1 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-1 focus:ring-green-500"
+                />
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>
