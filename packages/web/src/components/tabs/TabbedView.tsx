@@ -207,9 +207,14 @@ export function TabbedView() {
   const activeProvider = activeConfig?.provider;
 
   const currentUsageLimits = useMemo(() => {
-    if (!cliClientId) return null;
-    return usageLimits.get(cliClientId)?.codex ?? null;
-  }, [cliClientId, usageLimits]);
+    if (!cliClientId || !activeProvider) return null;
+    return usageLimits.get(cliClientId)?.[activeProvider] ?? null;
+  }, [activeProvider, cliClientId, usageLimits]);
+
+  const usageLabel = useMemo(() => {
+    if (!activeProvider) return "Usage";
+    return activeProvider === "codex" ? "Codex Usage" : "Claude Usage";
+  }, [activeProvider]);
 
   const handleLoadMore = useCallback(() => {
     if (activeTabId == null) return;
@@ -327,10 +332,10 @@ export function TabbedView() {
           )
         )}
 
-        {activeProvider === "codex" && currentUsageLimits && (
+        {activeProvider && currentUsageLimits && (
           <div className="ml-1">
             <div className="text-[10px] uppercase tracking-wide text-gray-400 dark:text-gray-500 mb-0.5">
-              Codex Usage
+              {usageLabel}
             </div>
             <UsageLimitsDisplay limits={currentUsageLimits} compact />
           </div>

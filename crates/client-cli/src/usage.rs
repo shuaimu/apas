@@ -7,14 +7,91 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
-use serde::Deserialize;
+use directories::ProjectDirs;
+use serde::{Deserialize, Serialize};
 use shared::{UsageLimitWindow, UsageLimits};
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 /// Anthropic OAuth usage API endpoint
 const USAGE_API_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 /// Codex/ChatGPT usage API endpoint
 const CODEX_USAGE_API_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const USAGE_CACHE_FILE: &str = "usage_limits_cache.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct UsageCacheFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claude: Option<UsageLimits>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex: Option<UsageLimits>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum UsageProvider {
+    Claude,
+    Codex,
+}
+
+fn usage_cache_dir() -> PathBuf {
+    ProjectDirs::from("", "", "apas")
+        .map(|d| d.data_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("/tmp/apas"))
+}
+
+fn usage_cache_path() -> PathBuf {
+    usage_cache_dir().join(USAGE_CACHE_FILE)
+}
+
+fn read_usage_cache_file(path: &Path) -> Result<UsageCacheFile> {
+    let content = fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("Failed to read usage cache {}: {}", path.display(), e))?;
+    let cache: UsageCacheFile = serde_json::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("Failed to parse usage cache {}: {}", path.display(), e))?;
+    Ok(cache)
+}
+
+fn read_usage_cache() -> Result<UsageCacheFile> {
+    let path = usage_cache_path();
+    if !path.exists() {
+        return Ok(UsageCacheFile::default());
+    }
+    read_usage_cache_file(&path)
+}
+
+fn write_usage_cache(cache: &UsageCacheFile) -> Result<()> {
+    let path = usage_cache_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create usage cache directory {}: {}",
+                parent.display(),
+                e
+            )
+        })?;
+    }
+    let content = serde_json::to_string_pretty(cache)?;
+    fs::write(&path, content)
+        .map_err(|e| anyhow::anyhow!("Failed to write usage cache {}: {}", path.display(), e))?;
+    Ok(())
+}
+
+fn cache_usage_limits(provider: UsageProvider, limits: &UsageLimits) -> Result<()> {
+    let mut cache = read_usage_cache().unwrap_or_default();
+    match provider {
+        UsageProvider::Claude => cache.claude = Some(limits.clone()),
+        UsageProvider::Codex => cache.codex = Some(limits.clone()),
+    }
+    write_usage_cache(&cache)
+}
+
+fn get_cached_usage_limits(provider: UsageProvider) -> Option<UsageLimits> {
+    let cache = read_usage_cache().ok()?;
+    match provider {
+        UsageProvider::Claude => cache.claude,
+        UsageProvider::Codex => cache.codex,
+    }
+}
 
 /// OAuth credentials from Claude's credentials file
 #[derive(Debug, Deserialize)]
@@ -80,6 +157,29 @@ fn read_oauth_token() -> Result<String> {
 
 /// Fetch usage limits from the Anthropic API
 pub async fn fetch_claude_usage_limits() -> Result<UsageLimits> {
+    let fetch_result = fetch_claude_usage_limits_remote().await;
+    match fetch_result {
+        Ok(limits) => {
+            if let Err(e) = cache_usage_limits(UsageProvider::Claude, &limits) {
+                tracing::debug!("Failed to cache Claude usage limits: {}", e);
+            }
+            Ok(limits)
+        }
+        Err(fetch_error) => {
+            if let Some(cached) = get_cached_usage_limits(UsageProvider::Claude) {
+                tracing::warn!(
+                    "Using cached Claude usage limits after fetch failure: {}",
+                    fetch_error
+                );
+                Ok(cached)
+            } else {
+                Err(fetch_error)
+            }
+        }
+    }
+}
+
+async fn fetch_claude_usage_limits_remote() -> Result<UsageLimits> {
     let token = read_oauth_token()?;
 
     let client = reqwest::Client::new();
@@ -238,6 +338,29 @@ fn map_codex_window(window: CodexRateLimitWindow, now: &DateTime<Utc>) -> UsageL
 
 /// Fetch usage limits from Codex API endpoint
 pub async fn fetch_codex_usage_limits() -> Result<UsageLimits> {
+    let fetch_result = fetch_codex_usage_limits_remote().await;
+    match fetch_result {
+        Ok(limits) => {
+            if let Err(e) = cache_usage_limits(UsageProvider::Codex, &limits) {
+                tracing::debug!("Failed to cache Codex usage limits: {}", e);
+            }
+            Ok(limits)
+        }
+        Err(fetch_error) => {
+            if let Some(cached) = get_cached_usage_limits(UsageProvider::Codex) {
+                tracing::warn!(
+                    "Using cached Codex usage limits after fetch failure: {}",
+                    fetch_error
+                );
+                Ok(cached)
+            } else {
+                Err(fetch_error)
+            }
+        }
+    }
+}
+
+async fn fetch_codex_usage_limits_remote() -> Result<UsageLimits> {
     let (access_token, account_id) = read_codex_auth()?;
     let client = reqwest::Client::new();
 

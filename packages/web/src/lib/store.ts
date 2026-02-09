@@ -86,6 +86,16 @@ export interface PaneConfig {
 // Legacy pane_id constants (must match shared::PANE_ID_DEADLOOP / PANE_ID_INTERACTIVE)
 export const PANE_ID_DEADLOOP = 1;
 export const PANE_ID_INTERACTIVE = 2;
+const usageProviderTieBreaker = new Map<string, Provider>();
+
+function normalizeProvider(raw: unknown): Provider | null {
+  if (typeof raw === "string") {
+    const normalized = raw.trim().toLowerCase();
+    if (normalized === "claude" || normalized === "anthropic") return "claude";
+    if (normalized === "codex" || normalized === "openai" || normalized === "chatgpt") return "codex";
+  }
+  return null;
+}
 
 // Map legacy pane_type string to numeric pane_id
 function normalizePaneId(paneType: string | undefined, paneId: number | undefined): number | undefined {
@@ -110,6 +120,45 @@ function legacyPaneType(paneId: number | undefined): string | undefined {
 // Convert pane_id to string key for use in Record<string, ...>
 export function paneKey(paneId: number): string {
   return String(paneId);
+}
+
+function usageFetchedAtMs(limits: UsageLimits | undefined): number {
+  const value = limits?.fetchedAt;
+  if (!value) return 0;
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+function inferUsageProvider(
+  cliClientId: string,
+  usageLimitsByCli: Map<string, UsageLimitsByProvider>,
+  paneConfigs: PaneConfig[],
+): Provider {
+  const existing = usageLimitsByCli.get(cliClientId);
+
+  if (existing?.claude && !existing?.codex) return "codex";
+  if (existing?.codex && !existing?.claude) return "claude";
+
+  const seenProviders = new Set<Provider>();
+  for (const pane of paneConfigs) {
+    const normalized = normalizeProvider(pane.provider);
+    if (normalized) seenProviders.add(normalized);
+  }
+  if (seenProviders.size === 1) {
+    return Array.from(seenProviders)[0];
+  }
+
+  const claudeTime = usageFetchedAtMs(existing?.claude);
+  const codexTime = usageFetchedAtMs(existing?.codex);
+
+  if (claudeTime !== codexTime) {
+    return claudeTime <= codexTime ? "claude" : "codex";
+  }
+
+  const previous = usageProviderTieBreaker.get(cliClientId) ?? "codex";
+  const next = previous === "claude" ? "codex" : "claude";
+  usageProviderTieBreaker.set(cliClientId, next);
+  return next;
 }
 
 interface AppState {
@@ -891,7 +940,10 @@ function handleServerMessage(
     }
 
     case "pane_list": {
-      const panes = (data.panes as PaneConfig[]) || [];
+      const panes = ((data.panes as PaneConfig[]) || []).map((pane) => ({
+        ...pane,
+        provider: normalizeProvider(pane.provider) ?? "claude",
+      }));
       set({ paneConfigs: panes });
       break;
     }
@@ -1233,9 +1285,17 @@ function handleServerMessage(
 
     case "usage_limits": {
       const cliClientId = data.cli_client_id as string;
-      const provider = (data.provider as Provider | undefined) ?? "claude";
       const limits = data.limits as Record<string, unknown>;
       if (cliClientId && limits) {
+        const directProvider = normalizeProvider((data as Record<string, unknown>).provider);
+        const provider =
+          directProvider ??
+          inferUsageProvider(cliClientId, get().usageLimits, get().paneConfigs);
+
+        if (!directProvider) {
+          console.warn("Usage limits missing provider; inferred provider:", provider, data);
+        }
+
         const parsedLimits: UsageLimits = {
           fiveHour: limits.five_hour ? {
             utilization: (limits.five_hour as Record<string, unknown>).utilization as number,
