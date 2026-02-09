@@ -136,7 +136,7 @@ export function UsageLimitsPanel() {
   // Get usage limits for the current session's CLI client
   const currentLimits = useMemo(() => {
     if (!currentCliClientId) return null;
-    return usageLimits.get(currentCliClientId) ?? null;
+    return usageLimits.get(currentCliClientId)?.claude ?? null;
   }, [currentCliClientId, usageLimits]);
 
   if (!currentLimits) {

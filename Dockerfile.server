@@ -1,23 +1,4 @@
-# Build stage
-FROM rust:1.83-slim-bookworm AS builder
-
-WORKDIR /app
-
-# Install build dependencies
-RUN apt-get update && apt-get install -y \
-    pkg-config \
-    libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy workspace files
-COPY Cargo.toml Cargo.lock ./
-COPY crates ./crates
-
-# Build release binary
-RUN cargo build --release --package apas-server
-
-# Runtime stage
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 WORKDIR /app
 
@@ -26,8 +7,8 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy binary from builder
-COPY --from=builder /app/target/release/apas-server /usr/local/bin/
+# Copy release binary built on the host
+COPY target/release/apas-server /usr/local/bin/apas-server
 
 # Create data directory for SQLite
 RUN mkdir -p /app/data

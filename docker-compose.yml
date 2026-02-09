@@ -5,7 +5,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.server
+      network: host
     container_name: apas-server
+    privileged: true
+    security_opt:
+      - seccomp=unconfined
     ports:
       - "8080:8080"
     volumes:
@@ -26,6 +30,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.web
+      network: host
     container_name: apas-web
     ports:
       - "3000:3000"

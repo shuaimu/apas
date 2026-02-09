@@ -5,6 +5,7 @@ import { useStore, Message, PaneConfig, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, p
 import { UserMessage } from "../chat/UserMessage";
 import { AssistantMessage } from "../chat/AssistantMessage";
 import { TabBar } from "./TabBar";
+import { UsageLimitsDisplay } from "../UsageLimits";
 
 // Sentinel pane_id for the single-pane fallback (no pane system)
 const PANE_ID_MAIN = 0;
@@ -78,6 +79,7 @@ export function TabbedView() {
   const hasMoreMessages = useStore((s) => s.hasMoreMessages);
   const isLoadingMore = useStore((s) => s.isLoadingMore);
   const cliClientId = useStore((s) => s.cliClientId);
+  const usageLimits = useStore((s) => s.usageLimits);
 
   const sendMessageToPane = useStore((s) => s.sendMessageToPane);
   const loadMoreMessages = useStore((s) => s.loadMoreMessages);
@@ -202,6 +204,12 @@ export function TabbedView() {
   const activeStatus = activeTabId != null ? paneStatuses[paneKey(activeTabId)] || null : null;
   const activeIsPaused = activeTabId != null ? pausedPanes.includes(activeTabId) : false;
   const activeIsBot = activeConfig?.mode === "deadloop";
+  const activeProvider = activeConfig?.provider;
+
+  const currentUsageLimits = useMemo(() => {
+    if (!cliClientId) return null;
+    return usageLimits.get(cliClientId)?.codex ?? null;
+  }, [cliClientId, usageLimits]);
 
   const handleLoadMore = useCallback(() => {
     if (activeTabId == null) return;
@@ -317,6 +325,15 @@ export function TabbedView() {
               Start Bot
             </button>
           )
+        )}
+
+        {activeProvider === "codex" && currentUsageLimits && (
+          <div className="ml-1">
+            <div className="text-[10px] uppercase tracking-wide text-gray-400 dark:text-gray-500 mb-0.5">
+              Codex Usage
+            </div>
+            <UsageLimitsDisplay limits={currentUsageLimits} compact />
+          </div>
         )}
 
         <div className="flex-1" />

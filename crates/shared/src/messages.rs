@@ -67,10 +67,7 @@ pub enum CliToServer {
     },
 
     /// Report deadloop pause status to server (legacy - use PanePaused for new code)
-    DeadloopStatus {
-        session_id: Uuid,
-        is_paused: bool,
-    },
+    DeadloopStatus { session_id: Uuid, is_paused: bool },
 
     /// Report pane pause status to server
     PanePaused {
@@ -95,8 +92,12 @@ pub enum CliToServer {
         panes: Vec<PaneConfig>,
     },
 
-    /// Report usage limits from the Anthropic API
-    UsageLimits { limits: UsageLimits },
+    /// Report usage limits for a provider
+    UsageLimits {
+        #[serde(default)]
+        provider: Provider,
+        limits: UsageLimits,
+    },
 }
 
 /// Messages sent from server to CLI client
@@ -116,7 +117,10 @@ pub enum ServerToCli {
     },
 
     /// New session assigned to this CLI
-    SessionAssigned { session_id: Uuid, working_dir: Option<String> },
+    SessionAssigned {
+        session_id: Uuid,
+        working_dir: Option<String>,
+    },
 
     /// User input from web client
     Input {
@@ -148,7 +152,10 @@ pub enum ServerToCli {
     ResumePane { session_id: Uuid, pane_id: u32 },
 
     /// Add a new pane to the session
-    AddPane { session_id: Uuid, pane_config: PaneConfig },
+    AddPane {
+        session_id: Uuid,
+        pane_config: PaneConfig,
+    },
 
     /// Remove a pane from the session
     RemovePane { session_id: Uuid, pane_id: u32 },
@@ -346,10 +353,7 @@ pub enum ServerToWeb {
     },
 
     /// Deadloop pause status update (legacy - use PanePaused for new code)
-    DeadloopStatus {
-        session_id: Uuid,
-        is_paused: bool,
-    },
+    DeadloopStatus { session_id: Uuid, is_paused: bool },
 
     /// Pane pause status update
     PanePaused {
@@ -376,6 +380,8 @@ pub enum ServerToWeb {
     /// Usage limits update from a CLI client
     UsageLimits {
         cli_client_id: Uuid,
+        #[serde(default)]
+        provider: Provider,
         limits: UsageLimits,
     },
 
@@ -439,9 +445,10 @@ pub enum PaneType {
 }
 
 /// Provider for a pane
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
+    #[default]
     Claude,
     Codex,
 }
@@ -590,7 +597,7 @@ pub struct UsageLimitWindow {
     pub resets_at: Option<String>,
 }
 
-/// Usage limits from the Anthropic API
+/// Usage limits from the provider API/logs
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UsageLimits {
     /// 5-hour rolling window usage
@@ -682,9 +689,7 @@ pub struct ClaudeUserMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClaudeContentBlock {
     /// Text content from Claude
-    Text {
-        text: String,
-    },
+    Text { text: String },
     /// Tool use request from Claude
     ToolUse {
         id: String,
@@ -711,17 +716,13 @@ pub enum ClaudeContentBlock {
 pub enum CodexStreamMessage {
     /// Thread started — contains the session/thread ID
     #[serde(rename = "thread.started")]
-    ThreadStarted {
-        thread_id: String,
-    },
+    ThreadStarted { thread_id: String },
     /// Turn started
     #[serde(rename = "turn.started")]
     TurnStarted {},
     /// An item has been completed (message, tool use, tool result, reasoning)
     #[serde(rename = "item.completed")]
-    ItemCompleted {
-        item: CodexItem,
-    },
+    ItemCompleted { item: CodexItem },
     /// Turn completed with usage info
     #[serde(rename = "turn.completed")]
     TurnCompleted {
@@ -730,9 +731,7 @@ pub enum CodexStreamMessage {
     },
     /// Error message
     #[serde(rename = "error")]
-    Error {
-        message: String,
-    },
+    Error { message: String },
     /// Turn failed with error
     #[serde(rename = "turn.failed")]
     TurnFailed {
@@ -782,7 +781,10 @@ pub struct CodexErrorInfo {
 
 /// Convert a Codex stream message to a Claude stream message for uniform handling.
 /// Returns None for messages that don't map (e.g., thread.started, turn.started).
-pub fn convert_codex_to_claude(msg: &CodexStreamMessage, session_id_str: &str) -> Option<ClaudeStreamMessage> {
+pub fn convert_codex_to_claude(
+    msg: &CodexStreamMessage,
+    session_id_str: &str,
+) -> Option<ClaudeStreamMessage> {
     match msg {
         CodexStreamMessage::ItemCompleted { item } => {
             match item.item_type.as_str() {
@@ -828,7 +830,11 @@ pub fn convert_codex_to_claude(msg: &CodexStreamMessage, session_id_str: &str) -
                     })
                 }
                 "tool_result" | "function_call_output" => {
-                    let content = item.output.clone().or_else(|| item.text.clone()).unwrap_or_default();
+                    let content = item
+                        .output
+                        .clone()
+                        .or_else(|| item.text.clone())
+                        .unwrap_or_default();
                     Some(ClaudeStreamMessage::User {
                         message: ClaudeUserMessage {
                             content: vec![ClaudeContentBlock::ToolResult {
@@ -862,12 +868,16 @@ pub fn convert_codex_to_claude(msg: &CodexStreamMessage, session_id_str: &str) -
             }
         }
         CodexStreamMessage::TurnCompleted { usage } => {
-            let (input_tokens, output_tokens) = usage.as_ref()
+            let (input_tokens, output_tokens) = usage
+                .as_ref()
                 .map(|u| (u.input_tokens, u.output_tokens))
                 .unwrap_or((0, 0));
             Some(ClaudeStreamMessage::Result {
                 subtype: "success".to_string(),
-                result: format!("Turn completed ({} in, {} out tokens)", input_tokens, output_tokens),
+                result: format!(
+                    "Turn completed ({} in, {} out tokens)",
+                    input_tokens, output_tokens
+                ),
                 total_cost_usd: 0.0,
                 duration_ms: 0,
                 session_id: session_id_str.to_string(),
@@ -875,19 +885,20 @@ pub fn convert_codex_to_claude(msg: &CodexStreamMessage, session_id_str: &str) -
                 extra: serde_json::Value::Null,
             })
         }
-        CodexStreamMessage::Error { message } => {
-            Some(ClaudeStreamMessage::Result {
-                subtype: "error".to_string(),
-                result: message.clone(),
-                total_cost_usd: 0.0,
-                duration_ms: 0,
-                session_id: session_id_str.to_string(),
-                is_error: true,
-                extra: serde_json::Value::Null,
-            })
-        }
+        CodexStreamMessage::Error { message } => Some(ClaudeStreamMessage::Result {
+            subtype: "error".to_string(),
+            result: message.clone(),
+            total_cost_usd: 0.0,
+            duration_ms: 0,
+            session_id: session_id_str.to_string(),
+            is_error: true,
+            extra: serde_json::Value::Null,
+        }),
         CodexStreamMessage::TurnFailed { error } => {
-            let msg = error.as_ref().and_then(|e| e.message.clone()).unwrap_or_else(|| "Turn failed".to_string());
+            let msg = error
+                .as_ref()
+                .and_then(|e| e.message.clone())
+                .unwrap_or_else(|| "Turn failed".to_string());
             Some(ClaudeStreamMessage::Result {
                 subtype: "error".to_string(),
                 result: msg,
@@ -917,7 +928,11 @@ impl CliToServer {
         }
     }
 
-    pub fn output_with_type(session_id: Uuid, data: impl Into<String>, output_type: OutputType) -> Self {
+    pub fn output_with_type(
+        session_id: Uuid,
+        data: impl Into<String>,
+        output_type: OutputType,
+    ) -> Self {
         Self::Output {
             session_id,
             data: data.into(),
@@ -927,7 +942,11 @@ impl CliToServer {
         }
     }
 
-    pub fn output_with_pane(session_id: Uuid, data: impl Into<String>, pane_type: PaneType) -> Self {
+    pub fn output_with_pane(
+        session_id: Uuid,
+        data: impl Into<String>,
+        pane_type: PaneType,
+    ) -> Self {
         Self::Output {
             session_id,
             data: data.into(),
@@ -996,7 +1015,11 @@ mod tests {
 
         let deserialized: CliToServer = serde_json::from_str(&json).unwrap();
         match deserialized {
-            CliToServer::SessionStart { session_id: sid, working_dir, .. } => {
+            CliToServer::SessionStart {
+                session_id: sid,
+                working_dir,
+                ..
+            } => {
                 assert_eq!(sid, session_id);
                 assert_eq!(working_dir, Some("/home/user/project".to_string()));
             }
@@ -1009,7 +1032,13 @@ mod tests {
         let session_id = Uuid::new_v4();
         let msg = CliToServer::output(session_id, "Hello, world!");
         match msg {
-            CliToServer::Output { session_id: sid, data, output_type, pane_type, .. } => {
+            CliToServer::Output {
+                session_id: sid,
+                data,
+                output_type,
+                pane_type,
+                ..
+            } => {
                 assert_eq!(sid, session_id);
                 assert_eq!(data, "Hello, world!");
                 assert_eq!(output_type, OutputType::Text);
@@ -1050,7 +1079,12 @@ mod tests {
     fn test_server_to_web_helpers() {
         let msg = ServerToWeb::output("Test output");
         match msg {
-            ServerToWeb::Output { content, output_type, pane_type, .. } => {
+            ServerToWeb::Output {
+                content,
+                output_type,
+                pane_type,
+                ..
+            } => {
                 assert_eq!(content, "Test output");
                 assert_eq!(output_type, OutputType::Text);
                 assert_eq!(pane_type, None);
@@ -1146,7 +1180,12 @@ mod tests {
         let json = r#"{"type":"system","subtype":"init","session_id":"abc-123","tools":["Read","Edit"],"model":"claude-opus","cwd":"/home/user"}"#;
         let msg: ClaudeStreamMessage = serde_json::from_str(json).unwrap();
         match msg {
-            ClaudeStreamMessage::System { subtype, tools, model, .. } => {
+            ClaudeStreamMessage::System {
+                subtype,
+                tools,
+                model,
+                ..
+            } => {
                 assert_eq!(subtype, "init");
                 assert_eq!(tools, vec!["Read", "Edit"]);
                 assert_eq!(model, "claude-opus");
@@ -1176,16 +1215,14 @@ mod tests {
         let json = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tool-1","name":"Read","input":{"file_path":"/tmp/test.txt"}}],"model":"claude"},"session_id":"abc-123"}"#;
         let msg: ClaudeStreamMessage = serde_json::from_str(json).unwrap();
         match msg {
-            ClaudeStreamMessage::Assistant { message, .. } => {
-                match &message.content[0] {
-                    ClaudeContentBlock::ToolUse { id, name, input } => {
-                        assert_eq!(id, "tool-1");
-                        assert_eq!(name, "Read");
-                        assert_eq!(input["file_path"], "/tmp/test.txt");
-                    }
-                    _ => panic!("Expected ToolUse content block"),
+            ClaudeStreamMessage::Assistant { message, .. } => match &message.content[0] {
+                ClaudeContentBlock::ToolUse { id, name, input } => {
+                    assert_eq!(id, "tool-1");
+                    assert_eq!(name, "Read");
+                    assert_eq!(input["file_path"], "/tmp/test.txt");
                 }
-            }
+                _ => panic!("Expected ToolUse content block"),
+            },
             _ => panic!("Expected Assistant variant"),
         }
     }
@@ -1195,7 +1232,13 @@ mod tests {
         let json = r#"{"type":"result","subtype":"success","result":"Done","total_cost_usd":0.05,"duration_ms":1000,"session_id":"abc-123","is_error":false}"#;
         let msg: ClaudeStreamMessage = serde_json::from_str(json).unwrap();
         match msg {
-            ClaudeStreamMessage::Result { subtype, result, total_cost_usd, is_error, .. } => {
+            ClaudeStreamMessage::Result {
+                subtype,
+                result,
+                total_cost_usd,
+                is_error,
+                ..
+            } => {
                 assert_eq!(subtype, "success");
                 assert_eq!(result, "Done");
                 assert!((total_cost_usd - 0.05).abs() < 0.001);

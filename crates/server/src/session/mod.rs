@@ -1,5 +1,7 @@
 use dashmap::DashMap;
-use shared::{CliClientInfo, CliClientStatus, PaneConfig, ServerToCli, ServerToWeb, UsageLimits};
+use shared::{
+    CliClientInfo, CliClientStatus, PaneConfig, Provider, ServerToCli, ServerToWeb, UsageLimits,
+};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -15,8 +17,8 @@ pub struct SessionManager {
     cli_sessions: DashMap<Uuid, Vec<Uuid>>,
     /// Map of CLI client ID -> user ID (owner)
     cli_users: DashMap<Uuid, Uuid>,
-    /// Map of CLI client ID -> latest usage limits
-    cli_usage_limits: DashMap<Uuid, UsageLimits>,
+    /// Map of (CLI client ID, provider) -> latest usage limits
+    cli_usage_limits: DashMap<(Uuid, Provider), UsageLimits>,
 }
 
 #[derive(Debug)]
@@ -56,7 +58,15 @@ impl SessionManager {
     pub fn unregister_cli(&self, cli_id: &Uuid) {
         self.cli_senders.remove(cli_id);
         self.cli_users.remove(cli_id);
-        self.cli_usage_limits.remove(cli_id);
+        let keys_to_remove: Vec<(Uuid, Provider)> = self
+            .cli_usage_limits
+            .iter()
+            .filter(|entry| entry.key().0 == *cli_id)
+            .map(|entry| *entry.key())
+            .collect();
+        for key in keys_to_remove {
+            self.cli_usage_limits.remove(&key);
+        }
         if let Some((_, session_ids)) = self.cli_sessions.remove(cli_id) {
             for session_id in session_ids {
                 if let Some(mut session) = self.sessions.get_mut(&session_id) {
@@ -120,7 +130,10 @@ impl SessionManager {
             existing.cli_client_id = Some(cli_id);
             tracing::info!(
                 "CLI session {} updated: cli {:?} -> {} (web viewers: {})",
-                session_id, old_cli_id, cli_id, existing.web_connection_ids.len()
+                session_id,
+                old_cli_id,
+                cli_id,
+                existing.web_connection_ids.len()
             );
         } else {
             let state = SessionState {
@@ -147,7 +160,12 @@ impl SessionManager {
 
     /// Attach a web client to an existing session (to observe CLI output)
     /// If the session doesn't exist in memory, creates it (for reconnection scenarios)
-    pub fn attach_web_to_session(&self, session_id: &Uuid, web_connection_id: Uuid, cli_client_id: Option<Uuid>) -> bool {
+    pub fn attach_web_to_session(
+        &self,
+        session_id: &Uuid,
+        web_connection_id: Uuid,
+        cli_client_id: Option<Uuid>,
+    ) -> bool {
         if let Some(mut session) = self.sessions.get_mut(session_id) {
             // Add this web client if not already attached
             if !session.web_connection_ids.contains(&web_connection_id) {
@@ -157,12 +175,21 @@ impl SessionManager {
             if let Some(cli_id) = cli_client_id {
                 session.cli_client_id = Some(cli_id);
             }
-            tracing::info!("Web client {} attached to session {} (total viewers: {})", web_connection_id, session_id, session.web_connection_ids.len());
+            tracing::info!(
+                "Web client {} attached to session {} (total viewers: {})",
+                web_connection_id,
+                session_id,
+                session.web_connection_ids.len()
+            );
             return true;
         }
 
         // Session not in memory - create it (happens after server restart or reconnection)
-        tracing::info!("Creating session {} in memory for web attach (cli: {:?})", session_id, cli_client_id);
+        tracing::info!(
+            "Creating session {} in memory for web attach (cli: {:?})",
+            session_id,
+            cli_client_id
+        );
         let state = SessionState {
             session_id: *session_id,
             user_id: Uuid::nil(), // Will be updated when needed
@@ -235,7 +262,10 @@ impl SessionManager {
 
     /// Get the pause state for a session
     pub fn is_session_paused(&self, session_id: &Uuid) -> bool {
-        self.sessions.get(session_id).map(|s| s.is_paused).unwrap_or(false)
+        self.sessions
+            .get(session_id)
+            .map(|s| s.is_paused)
+            .unwrap_or(false)
     }
 
     /// Check if a session exists in memory (for determining if DB fallback is needed)
@@ -252,7 +282,10 @@ impl SessionManager {
 
     /// Get cached pane configurations for a session
     pub fn get_session_panes(&self, session_id: &Uuid) -> Vec<PaneConfig> {
-        self.sessions.get(session_id).map(|s| s.panes.clone()).unwrap_or_default()
+        self.sessions
+            .get(session_id)
+            .map(|s| s.panes.clone())
+            .unwrap_or_default()
     }
 
     // Message routing
@@ -280,7 +313,9 @@ impl SessionManager {
                 let cli_exists = self.cli_senders.contains_key(&cli_id);
                 tracing::debug!(
                     "route_to_cli: session {} -> cli {} (cli exists in senders: {})",
-                    session_id, cli_id, cli_exists
+                    session_id,
+                    cli_id,
+                    cli_exists
                 );
                 return self.send_to_cli(&cli_id, msg).await;
             } else {
@@ -302,7 +337,11 @@ impl SessionManager {
             drop(session); // Release lock before sending
             let mut any_sent = false;
             for web_id in &web_ids {
-                tracing::debug!("Routing message to web client {} for session {}", web_id, session_id);
+                tracing::debug!(
+                    "Routing message to web client {} for session {}",
+                    web_id,
+                    session_id
+                );
                 if self.send_to_web(web_id, msg.clone()).await {
                     any_sent = true;
                 }
@@ -350,7 +389,10 @@ impl SessionManager {
             .iter()
             .filter(|entry| {
                 // Only include CLIs owned by this user
-                self.cli_users.get(entry.key()).map(|u| *u == *user_id).unwrap_or(false)
+                self.cli_users
+                    .get(entry.key())
+                    .map(|u| *u == *user_id)
+                    .unwrap_or(false)
             })
             .map(|entry| {
                 let cli_id = *entry.key();
@@ -388,12 +430,14 @@ impl SessionManager {
     }
 
     /// Update usage limits for a CLI client and broadcast to web clients
-    pub fn update_usage_limits(&self, cli_id: Uuid, limits: UsageLimits) {
-        self.cli_usage_limits.insert(cli_id, limits.clone());
+    pub fn update_usage_limits(&self, cli_id: Uuid, provider: Provider, limits: UsageLimits) {
+        self.cli_usage_limits
+            .insert((cli_id, provider.clone()), limits.clone());
 
         // Broadcast to all web clients
         let msg = ServerToWeb::UsageLimits {
             cli_client_id: cli_id,
+            provider,
             limits,
         };
 
@@ -407,15 +451,17 @@ impl SessionManager {
     }
 
     /// Get usage limits for a CLI client
-    pub fn get_usage_limits(&self, cli_id: &Uuid) -> Option<UsageLimits> {
-        self.cli_usage_limits.get(cli_id).map(|r| r.clone())
+    pub fn get_usage_limits(&self, cli_id: &Uuid, provider: Provider) -> Option<UsageLimits> {
+        self.cli_usage_limits
+            .get(&(*cli_id, provider))
+            .map(|r| r.clone())
     }
 
     /// Get all usage limits for all CLI clients
-    pub fn get_all_usage_limits(&self) -> Vec<(Uuid, UsageLimits)> {
+    pub fn get_all_usage_limits(&self) -> Vec<(Uuid, Provider, UsageLimits)> {
         self.cli_usage_limits
             .iter()
-            .map(|entry| (*entry.key(), entry.value().clone()))
+            .map(|entry| (entry.key().0, entry.key().1.clone(), entry.value().clone()))
             .collect()
     }
 }

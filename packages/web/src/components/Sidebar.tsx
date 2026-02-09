@@ -5,7 +5,6 @@ import { FolderOpen, RefreshCw, Share2, Users, X, Crown, Trash2, ChevronLeft, Ba
 import Link from "next/link";
 import { useMemo, useState, useEffect } from "react";
 import { createPortal } from "react-dom";
-import { UsageLimitsDisplay } from "./UsageLimits";
 
 // Truncate path in the middle to preserve the folder name at the end
 // e.g., "/home/shuai/workspace/long-project" -> "/home/.../long-project"
@@ -59,7 +58,7 @@ interface ShareUser {
 const ADMIN_USER_ID = "88b6016d-a8b4-400c-bdc9-f0120504a4fc";
 
 export function Sidebar({ onClose, onCollapse }: SidebarProps) {
-  const { cliClients, sessions, attachSession, loadSessionMessages, refreshCliClients, listSessions, sessionId, connected, token, usageLimits, userId } = useStore();
+  const { cliClients, sessions, attachSession, loadSessionMessages, refreshCliClients, listSessions, sessionId, connected, token, userId } = useStore();
   const [shareModalOpen, setShareModalOpen] = useState(false);
   const [mounted, setMounted] = useState(false);
 
@@ -391,12 +390,6 @@ export function Sidebar({ onClose, onCollapse }: SidebarProps) {
                     </button>
                   )}
                 </div>
-                {/* Usage limits for selected session */}
-                {sessionId === project.id && project.cliClientId && usageLimits.get(project.cliClientId) && (
-                  <div className="ml-4 mt-1 mb-2">
-                    <UsageLimitsDisplay limits={usageLimits.get(project.cliClientId)!} compact={false} />
-                  </div>
-                )}
               </div>
             ))}
           </div>

@@ -46,10 +46,7 @@ fn is_version_supported(client_version: &str) -> bool {
     }
 }
 
-pub async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
@@ -97,7 +94,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         if sender.send(Message::Text(text.into())).await.is_err() {
                                             return;
                                         }
-                                        tracing::info!("CLI client registered: {} (version: {}, user: {})", cli_id, client_version, user_id);
+                                        tracing::info!(
+                                            "CLI client registered: {} (version: {}, user: {})",
+                                            cli_id,
+                                            client_version,
+                                            user_id
+                                        );
                                         break;
                                     }
                                     Err(_) => {
@@ -385,15 +387,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     )
                                     .await;
                             }
-                            Ok(CliToServer::UsageLimits { limits }) => {
+                            Ok(CliToServer::UsageLimits { provider, limits }) => {
                                 // Update and broadcast usage limits
                                 tracing::info!(
-                                    "Usage limits from CLI {}: 5h={:.1}%, 7d={:.1}%",
+                                    "Usage limits from CLI {} ({}): 5h={:.1}%, 7d={:.1}%",
                                     cli_id,
+                                    format!("{:?}", provider).to_lowercase(),
                                     limits.five_hour.as_ref().map(|w| w.utilization * 100.0).unwrap_or(0.0),
                                     limits.seven_day.as_ref().map(|w| w.utilization * 100.0).unwrap_or(0.0)
                                 );
-                                state.sessions.update_usage_limits(cli_id, limits);
+                                state.sessions.update_usage_limits(cli_id, provider, limits);
                             }
                             Ok(CliToServer::PaneList { session_id, panes }) => {
                                 // Cache pane list and forward to attached web clients
@@ -447,14 +450,25 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // Cleanup - mark all sessions for this CLI as inactive
     let session_ids = state.sessions.get_cli_session_ids(&cli_id);
     for session_id in &session_ids {
-        if let Err(e) = state.db.update_session_status(&session_id.to_string(), "inactive").await {
+        if let Err(e) = state
+            .db
+            .update_session_status(&session_id.to_string(), "inactive")
+            .await
+        {
             tracing::error!("Failed to update session {} status: {}", session_id, e);
         }
     }
 
     state.sessions.unregister_cli(&cli_id);
-    let _ = state.db.update_cli_client_status(&cli_id.to_string(), "offline").await;
-    tracing::info!("CLI client disconnected: {} (marked {} sessions as inactive)", cli_id, session_ids.len());
+    let _ = state
+        .db
+        .update_cli_client_status(&cli_id.to_string(), "offline")
+        .await;
+    tracing::info!(
+        "CLI client disconnected: {} (marked {} sessions as inactive)",
+        cli_id,
+        session_ids.len()
+    );
 }
 
 /// Convert a ClaudeStreamMessage to StoredMessages for file storage
@@ -464,7 +478,7 @@ fn stream_message_to_stored(
     message: &shared::ClaudeStreamMessage,
     pane_id: Option<u32>,
 ) -> Vec<crate::storage::StoredMessage> {
-    use shared::{ClaudeStreamMessage, ClaudeContentBlock};
+    use shared::{ClaudeContentBlock, ClaudeStreamMessage};
 
     let pane_type_str = pane_id.map(|id| id.to_string());
     let mut messages = Vec::new();
@@ -500,7 +514,11 @@ fn stream_message_to_stored(
                             pane_type: pane_type_str.clone(),
                         });
                     }
-                    ClaudeContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                    ClaudeContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => {
                         // Store tool_result with structured JSON content
                         let result_data = serde_json::json!({
                             "tool_use_id": tool_use_id,
@@ -519,11 +537,19 @@ fn stream_message_to_stored(
                 }
             }
         }
-        ClaudeStreamMessage::Result { subtype, total_cost_usd, duration_ms, .. } => {
+        ClaudeStreamMessage::Result {
+            subtype,
+            total_cost_usd,
+            duration_ms,
+            ..
+        } => {
             messages.push(crate::storage::StoredMessage {
                 id: Uuid::new_v4().to_string(),
                 role: "system".to_string(),
-                content: format!("{} - Cost: ${:.4}, Duration: {}ms", subtype, total_cost_usd, duration_ms),
+                content: format!(
+                    "{} - Cost: ${:.4}, Duration: {}ms",
+                    subtype, total_cost_usd, duration_ms
+                ),
                 message_type: "result".to_string(),
                 created_at: chrono::Utc::now().to_rfc3339(),
                 pane_type: pane_type_str,
@@ -532,7 +558,12 @@ fn stream_message_to_stored(
         ClaudeStreamMessage::User { message: msg, .. } => {
             // Store tool results from user messages
             for block in &msg.content {
-                if let ClaudeContentBlock::ToolResult { tool_use_id, content, is_error } = block {
+                if let ClaudeContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } = block
+                {
                     let result_data = serde_json::json!({
                         "tool_use_id": tool_use_id,
                         "content": content,

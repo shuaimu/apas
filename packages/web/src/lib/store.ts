@@ -52,6 +52,10 @@ export interface UsageLimits {
   fetchedAt?: string;
 }
 
+export type Provider = "claude" | "codex";
+
+export type UsageLimitsByProvider = Partial<Record<Provider, UsageLimits>>;
+
 export interface CliUsageLimits {
   cliClientId: string;
   limits: UsageLimits;
@@ -155,7 +159,7 @@ interface AppState {
   deadloopStatus: string | null;
 
   // Usage limits per CLI client
-  usageLimits: Map<string, UsageLimits>;
+  usageLimits: Map<string, UsageLimitsByProvider>;
 
   // Auth actions
   login: (token: string, userId: string) => void;
@@ -1229,6 +1233,7 @@ function handleServerMessage(
 
     case "usage_limits": {
       const cliClientId = data.cli_client_id as string;
+      const provider = (data.provider as Provider | undefined) ?? "claude";
       const limits = data.limits as Record<string, unknown>;
       if (cliClientId && limits) {
         const parsedLimits: UsageLimits = {
@@ -1244,10 +1249,11 @@ function handleServerMessage(
         };
         set((state) => {
           const newMap = new Map(state.usageLimits);
-          newMap.set(cliClientId, parsedLimits);
+          const existing = newMap.get(cliClientId) ?? {};
+          newMap.set(cliClientId, { ...existing, [provider]: parsedLimits });
           return { usageLimits: newMap };
         });
-        console.log("Usage limits updated for CLI:", cliClientId, parsedLimits);
+        console.log("Usage limits updated for CLI:", cliClientId, provider, parsedLimits);
       }
       break;
     }

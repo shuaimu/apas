@@ -4,12 +4,18 @@
 
 # Rust
 target/
+!target/release/
+target/release/*
+!target/release/apas-server
 **/*.rs.bk
-Cargo.lock
 
 # Node
 node_modules/
 packages/web/.next/
+!packages/web/.next/standalone/
+!packages/web/.next/standalone/**
+!packages/web/.next/static/
+!packages/web/.next/static/**
 packages/web/out/
 
 # IDE

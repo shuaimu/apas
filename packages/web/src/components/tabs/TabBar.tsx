@@ -64,16 +64,16 @@ export function TabBar({
               {hasActivity && !isPaused && (
                 <span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse flex-shrink-0" />
               )}
-              {isBot && isPaused && (
+              {isPaused && (
                 <span className="w-2 h-2 rounded-full bg-amber-500 flex-shrink-0" />
               )}
-              {isBot && !isPaused && !hasActivity && (
-                <span className="w-2 h-2 rounded-full bg-green-500 flex-shrink-0" />
-              )}
-
-              {/* Provider indicator */}
-              {!hasActivity && !isBot && tab.provider === "codex" && (
-                <span className="w-2 h-2 rounded-full bg-green-500 flex-shrink-0" title="Codex" />
+              {!hasActivity && !isPaused && (
+                <span
+                  className={`w-2 h-2 rounded-full flex-shrink-0 ${
+                    tab.provider === "codex" ? "bg-green-500" : "bg-blue-500"
+                  }`}
+                  title={tab.provider === "codex" ? "Codex" : "Claude"}
+                />
               )}
 
               {/* Label */}
