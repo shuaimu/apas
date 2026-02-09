@@ -728,6 +728,17 @@ pub enum CodexStreamMessage {
         #[serde(default)]
         usage: Option<CodexUsage>,
     },
+    /// Error message
+    #[serde(rename = "error")]
+    Error {
+        message: String,
+    },
+    /// Turn failed with error
+    #[serde(rename = "turn.failed")]
+    TurnFailed {
+        #[serde(default)]
+        error: Option<CodexErrorInfo>,
+    },
 }
 
 /// A completed item from Codex
@@ -760,6 +771,13 @@ pub struct CodexUsage {
     pub cached_input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+}
+
+/// Error info from Codex turn.failed
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexErrorInfo {
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 /// Convert a Codex stream message to a Claude stream message for uniform handling.
@@ -854,6 +872,29 @@ pub fn convert_codex_to_claude(msg: &CodexStreamMessage, session_id_str: &str) -
                 duration_ms: 0,
                 session_id: session_id_str.to_string(),
                 is_error: false,
+                extra: serde_json::Value::Null,
+            })
+        }
+        CodexStreamMessage::Error { message } => {
+            Some(ClaudeStreamMessage::Result {
+                subtype: "error".to_string(),
+                result: message.clone(),
+                total_cost_usd: 0.0,
+                duration_ms: 0,
+                session_id: session_id_str.to_string(),
+                is_error: true,
+                extra: serde_json::Value::Null,
+            })
+        }
+        CodexStreamMessage::TurnFailed { error } => {
+            let msg = error.as_ref().and_then(|e| e.message.clone()).unwrap_or_else(|| "Turn failed".to_string());
+            Some(ClaudeStreamMessage::Result {
+                subtype: "error".to_string(),
+                result: msg,
+                total_cost_usd: 0.0,
+                duration_ms: 0,
+                session_id: session_id_str.to_string(),
+                is_error: true,
                 extra: serde_json::Value::Null,
             })
         }

@@ -184,7 +184,7 @@ interface AppState {
   resumeDeadloop: () => void;
   pausePane: (paneId: number) => void;
   resumePane: (paneId: number) => void;
-  addPane: (provider: string, mode: string, label?: string, prompt?: string, model?: string) => void;
+  addPane: (provider: string, mode: string, label?: string, prompt?: string) => void;
   removePane: (paneId: number) => void;
   startBot: (paneId: number, prompt?: string) => void;
   stopBot: (paneId: number) => void;
@@ -707,7 +707,7 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  addPane: (provider: string, mode: string, label?: string, prompt?: string, model?: string) => {
+  addPane: (provider: string, mode: string, label?: string, prompt?: string) => {
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
@@ -716,7 +716,6 @@ export const useStore = create<AppState>((set, get) => ({
         mode,
         label: label || undefined,
         prompt: prompt || undefined,
-        model: model || undefined,
       }));
     }
   },

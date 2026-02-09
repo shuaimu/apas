@@ -183,11 +183,10 @@ export function TabbedView() {
     [removePane, activeTabId, effectiveTabs, handleSelectTab],
   );
 
-  const handleAddTab = useCallback((provider: string = "claude", model?: string) => {
+  const handleAddTab = useCallback((provider: string = "claude") => {
     const prefix = provider === "codex" ? "Codex" : "Claude";
-    const modelSuffix = model ? ` (${model})` : "";
-    const label = `${prefix} ${effectiveTabs.length + 1}${modelSuffix}`;
-    addPane(provider, "interactive", label, undefined, model);
+    const label = `${prefix} ${effectiveTabs.length + 1}`;
+    addPane(provider, "interactive", label);
   }, [addPane, effectiveTabs.length]);
 
   // Get messages for active tab
