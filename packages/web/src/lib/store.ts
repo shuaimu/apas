@@ -165,6 +165,7 @@ interface AppState {
   // Auth state
   token: string | null;
   userId: string | null;
+  userEmail: string | null;
   isAuthenticated: boolean;
 
   // Connection state
@@ -211,7 +212,8 @@ interface AppState {
   usageLimits: Map<string, UsageLimitsByProvider>;
 
   // Auth actions
-  login: (token: string, userId: string) => void;
+  login: (token: string, userId: string, userEmail: string) => void;
+  setUserEmail: (userEmail: string) => void;
   logout: () => void;
 
   // Actions
@@ -251,6 +253,7 @@ export const useStore = create<AppState>((set, get) => ({
   // Auth state - initialize from localStorage if available
   token: typeof window !== 'undefined' ? localStorage.getItem("apas_token") : null,
   userId: typeof window !== 'undefined' ? localStorage.getItem("apas_user_id") : null,
+  userEmail: typeof window !== 'undefined' ? localStorage.getItem("apas_user_email") : null,
   isAuthenticated: false,
 
   connected: false,
@@ -286,15 +289,22 @@ export const useStore = create<AppState>((set, get) => ({
   deadloopStatus: null,
   usageLimits: new Map(),
 
-  login: (token: string, userId: string) => {
+  login: (token: string, userId: string, userEmail: string) => {
     localStorage.setItem("apas_token", token);
     localStorage.setItem("apas_user_id", userId);
-    set({ token, userId, isAuthenticated: true });
+    localStorage.setItem("apas_user_email", userEmail);
+    set({ token, userId, userEmail, isAuthenticated: true });
+  },
+
+  setUserEmail: (userEmail: string) => {
+    localStorage.setItem("apas_user_email", userEmail);
+    set({ userEmail });
   },
 
   logout: () => {
     localStorage.removeItem("apas_token");
     localStorage.removeItem("apas_user_id");
+    localStorage.removeItem("apas_user_email");
     localStorage.removeItem("apas_session_id");
     const { ws, reconnectTimeout, visibilityHandler } = get();
 
@@ -314,6 +324,7 @@ export const useStore = create<AppState>((set, get) => ({
     set({
       token: null,
       userId: null,
+      userEmail: null,
       isAuthenticated: false,
       connected: false,
       ws: null,
@@ -859,7 +870,11 @@ function handleServerMessage(
         connected: true,
         isAuthenticated: true,
         userId: data.user_id as string,
+        userEmail: (data.user_email as string | undefined) ?? get().userEmail,
       });
+      if (data.user_email) {
+        localStorage.setItem("apas_user_email", data.user_email as string);
+      }
       console.log("Authenticated as user:", data.user_id);
       get().refreshCliClients();
       get().listSessions();
@@ -877,11 +892,13 @@ function handleServerMessage(
       console.error("Authentication failed:", data.reason);
       localStorage.removeItem("apas_token");
       localStorage.removeItem("apas_user_id");
+      localStorage.removeItem("apas_user_email");
       set({
         connected: false,
         isAuthenticated: false,
         token: null,
         userId: null,
+        userEmail: null,
       });
       break;
 

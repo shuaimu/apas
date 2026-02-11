@@ -55,6 +55,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             match Uuid::parse_str(&claims.sub) {
                                 Ok(uid) => {
                                     user_id = Some(uid);
+                                    let user_email = match state.db.get_user_by_id(&uid.to_string()).await {
+                                        Ok(Some(user)) => Some(user.email),
+                                        Ok(None) => None,
+                                        Err(err) => {
+                                            tracing::warn!(
+                                                "Failed to fetch email for user {}: {}",
+                                                uid,
+                                                err
+                                            );
+                                            None
+                                        }
+                                    };
                                     tracing::info!(
                                         "Web client {} authenticated as user {}",
                                         connection_id,
@@ -64,7 +76,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         .sessions
                                         .send_to_web(
                                             &connection_id,
-                                            ServerToWeb::Authenticated { user_id: uid },
+                                            ServerToWeb::Authenticated { user_id: uid, user_email },
                                         )
                                         .await;
 

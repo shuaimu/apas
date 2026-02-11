@@ -26,6 +26,7 @@ pub fn create_router(state: AppState) -> Router {
         // Auth routes
         .route("/auth/register", post(auth::register))
         .route("/auth/login", post(auth::login))
+        .route("/auth/me", get(auth::me))
         // Device code flow (CLI login)
         .route("/auth/device-code", post(auth::device_code))
         .route("/auth/device-poll", post(auth::device_poll))

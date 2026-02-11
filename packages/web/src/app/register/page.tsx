@@ -3,6 +3,7 @@
 import { useState, useEffect, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
+import { useStore } from "@/lib/store";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://apas.mpaxos.com:8080";
 
@@ -17,6 +18,7 @@ function RegisterForm() {
   const [loading, setLoading] = useState(false);
   const [deviceCode, setDeviceCode] = useState<string | null>(null);
   const [cliAuthorized, setCliAuthorized] = useState(false);
+  const login = useStore((s) => s.login);
 
   useEffect(() => {
     // Check for device code in URL (from CLI login)
@@ -54,11 +56,11 @@ function RegisterForm() {
         throw new Error(data.message || "Registration failed");
       }
 
-      const { token, user_id } = await res.json();
+      const { token, user_id, user_email } = await res.json();
 
-      // Store token in localStorage
-      localStorage.setItem("apas_token", token);
-      localStorage.setItem("apas_user_id", user_id);
+      // Store auth in app state + localStorage
+      // If server doesn't return user_email (older backend), use the register email input.
+      login(token, user_id, user_email || email);
 
       // If device code present, complete CLI authorization
       if (deviceCode) {

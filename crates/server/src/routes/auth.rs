@@ -2,7 +2,11 @@ use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
-use axum::{extract::State, Json};
+use axum::{
+    extract::State,
+    http::{header, HeaderMap},
+    Json,
+};
 use chrono::{Duration, Utc};
 use jsonwebtoken::{encode, EncodingKey, Header};
 use rand::Rng;
@@ -33,6 +37,13 @@ pub struct LoginRequest {
 pub struct AuthResponse {
     pub token: String,
     pub user_id: String,
+    pub user_email: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MeResponse {
+    pub user_id: String,
+    pub user_email: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -71,7 +82,11 @@ pub async fn register(
     // Generate token
     let token = generate_token(&user_id, &state.config.auth)?;
 
-    Ok(Json(AuthResponse { token, user_id }))
+    Ok(Json(AuthResponse {
+        token,
+        user_id,
+        user_email: user.email,
+    }))
 }
 
 pub async fn login(
@@ -98,6 +113,32 @@ pub async fn login(
     Ok(Json(AuthResponse {
         token,
         user_id: user.id,
+        user_email: user.email,
+    }))
+}
+
+/// Get current user info
+/// GET /auth/me
+pub async fn me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<MeResponse>, AppError> {
+    let auth_header = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .ok_or_else(|| AppError::AuthError("Missing or invalid Authorization header".to_string()))?;
+
+    let claims = verify_token(auth_header, &state.config.auth.jwt_secret)?;
+    let user = state
+        .db
+        .get_user_by_id(&claims.sub)
+        .await?
+        .ok_or_else(|| AppError::AuthError("User not found".to_string()))?;
+
+    Ok(Json(MeResponse {
+        user_id: user.id,
+        user_email: user.email,
     }))
 }
 
@@ -475,6 +516,7 @@ pub async fn admin_impersonate(
     Ok(Json(AuthResponse {
         token,
         user_id: user.id,
+        user_email: user.email,
     }))
 }
 

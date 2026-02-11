@@ -281,7 +281,11 @@ pub enum WebToServer {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToWeb {
     /// Authentication successful
-    Authenticated { user_id: Uuid },
+    Authenticated {
+        user_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_email: Option<String>,
+    },
 
     /// Authentication failed
     AuthenticationFailed { reason: String },
