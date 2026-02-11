@@ -37,8 +37,7 @@ export function TabBar({
     <div className="flex items-end border-b border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-800/50 flex-shrink-0 min-h-[40px]">
       <div
         ref={scrollRef}
-        className="flex-1 flex items-end overflow-x-auto scrollbar-none"
-        style={{ scrollSnapType: "x mandatory" }}
+        className="flex-1 flex flex-wrap items-end overflow-x-hidden overflow-y-hidden"
       >
         {tabs.map((tab, index) => {
           const isActive = tab.pane_id === activeTabId;
