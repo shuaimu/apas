@@ -487,19 +487,9 @@ pub const PANE_ID_DEADLOOP: u32 = 1;
 pub const PANE_ID_INTERACTIVE: u32 = 2;
 
 impl PaneConfig {
-    /// Create default pane configs (Claude deadloop + Claude interactive)
+    /// Create default pane configs for a new project (Claude interactive only)
     pub fn defaults() -> Vec<PaneConfig> {
         vec![
-            PaneConfig {
-                pane_id: PANE_ID_DEADLOOP,
-                provider: Provider::Claude,
-                mode: PaneMode::Deadloop,
-                session_id: Uuid::new_v4(),
-                is_paused: false,
-                prompt: None,
-                label: Some("Deadloop".to_string()),
-                model: None,
-            },
             PaneConfig {
                 pane_id: PANE_ID_INTERACTIVE,
                 provider: Provider::Claude,
@@ -597,7 +587,13 @@ pub struct UsageLimitWindow {
     /// Utilization as a fraction (0.0 to 1.0+)
     pub utilization: f64,
     /// When the limit resets (ISO 8601 timestamp)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "reset_at",
+        alias = "resetAt",
+        alias = "resetsAt"
+    )]
     pub resets_at: Option<String>,
 }
 
@@ -605,13 +601,25 @@ pub struct UsageLimitWindow {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UsageLimits {
     /// 5-hour rolling window usage
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "fiveHour"
+    )]
     pub five_hour: Option<UsageLimitWindow>,
     /// 7-day (weekly) rolling window usage
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "sevenDay"
+    )]
     pub seven_day: Option<UsageLimitWindow>,
     /// When the usage was last fetched (ISO 8601 timestamp)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "fetchedAt"
+    )]
     pub fetched_at: Option<String>,
 }
 
@@ -1109,6 +1117,21 @@ mod tests {
     fn test_output_type_default() {
         let output_type = OutputType::default();
         assert_eq!(output_type, OutputType::Text);
+    }
+
+    #[test]
+    fn test_default_pane_configs_are_interactive_only() {
+        let defaults = PaneConfig::defaults();
+        assert_eq!(defaults.len(), 1);
+
+        let pane = &defaults[0];
+        assert_eq!(pane.pane_id, PANE_ID_INTERACTIVE);
+        assert_eq!(pane.provider, Provider::Claude);
+        assert_eq!(pane.mode, PaneMode::Interactive);
+        assert_eq!(pane.label.as_deref(), Some("Interactive"));
+        assert!(!pane.is_paused);
+        assert!(pane.prompt.is_none());
+        assert!(pane.model.is_none());
     }
 
     #[test]
