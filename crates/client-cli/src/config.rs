@@ -48,14 +48,21 @@ impl Default for LocalConfig {
 }
 
 impl Config {
-    pub fn config_path() -> Result<PathBuf> {
+    pub fn config_dir() -> Result<PathBuf> {
         let proj_dirs = ProjectDirs::from("com", "apas", "apas")
             .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?;
 
         let config_dir = proj_dirs.config_dir();
         std::fs::create_dir_all(config_dir)?;
+        Ok(config_dir.to_path_buf())
+    }
 
-        Ok(config_dir.join("config.toml"))
+    pub fn config_path() -> Result<PathBuf> {
+        Ok(Self::config_dir()?.join("config.toml"))
+    }
+
+    pub fn daemon_pid_path() -> Result<PathBuf> {
+        Ok(Self::config_dir()?.join("daemon.pid"))
     }
 
     pub fn load() -> Result<Self> {

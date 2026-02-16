@@ -1,6 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
@@ -17,6 +19,28 @@ mod usage;
 const DEFAULT_SERVER: &str = "ws://apas.mpaxos.com:8080";
 // Web UI URL for users to view sessions
 const WEB_UI_URL: &str = "http://apas.mpaxos.com";
+
+struct DaemonPidGuard {
+    path: PathBuf,
+    pid: u32,
+}
+
+impl DaemonPidGuard {
+    fn new(path: PathBuf, pid: u32) -> Self {
+        Self { path, pid }
+    }
+}
+
+impl Drop for DaemonPidGuard {
+    fn drop(&mut self) {
+        let expected = self.pid.to_string();
+        if let Ok(contents) = fs::read_to_string(&self.path) {
+            if contents.trim() == expected {
+                let _ = fs::remove_file(&self.path);
+            }
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "apas")]
@@ -113,6 +137,13 @@ async fn main() -> Result<()> {
         update::check_and_upgrade_on_boot();
     }
 
+    // Auto-start daemon for interactive/remote CLI modes (best-effort).
+    if cli.command.is_none() && !cli.offline {
+        if let Err(err) = maybe_auto_start_daemon(&cli) {
+            tracing::warn!("Failed to auto-start daemon: {}", err);
+        }
+    }
+
     // Handle subcommands
     if let Some(command) = cli.command {
         match command {
@@ -152,6 +183,12 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             Commands::Daemon { roots } => {
+                let pid_path = config::Config::daemon_pid_path()?;
+                if let Some(existing_pid) = daemon_pid_running(&pid_path) {
+                    println!("Daemon already running (pid {}).", existing_pid);
+                    return Ok(());
+                }
+
                 let mut config = config::Config::load().unwrap_or_default();
                 let server = cli
                     .server
@@ -188,6 +225,8 @@ async fn main() -> Result<()> {
                 };
 
                 config.save()?;
+                write_daemon_pid(&pid_path, std::process::id())?;
+                let _pid_guard = DaemonPidGuard::new(pid_path, std::process::id());
                 mode::daemon::run(&server, &token, machine_id, project_roots).await?;
                 return Ok(());
             }
@@ -279,6 +318,89 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn maybe_auto_start_daemon(cli: &Cli) -> Result<()> {
+    // Auto-start only for logged-in users with persistent config token
+    // to avoid leaking one-off CLI tokens in process args.
+    let config = config::Config::load().unwrap_or_default();
+    if config.remote.token.is_none() {
+        return Ok(());
+    }
+
+    let server = cli
+        .server
+        .clone()
+        .or(config.remote.server.clone())
+        .unwrap_or_else(|| DEFAULT_SERVER.to_string());
+
+    ensure_daemon_running(&server, &config.daemon.project_roots)
+}
+
+fn ensure_daemon_running(server: &str, roots: &[String]) -> Result<()> {
+    let pid_path = config::Config::daemon_pid_path()?;
+    if daemon_pid_running(&pid_path).is_some() {
+        return Ok(());
+    }
+
+    let current_exe = std::env::current_exe()?;
+    let mut cmd = Command::new(current_exe);
+    cmd.arg("daemon").arg("--server").arg(server);
+    for root in roots {
+        cmd.arg("--root").arg(root);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let child = cmd.spawn()?;
+    write_daemon_pid(&pid_path, child.id())?;
+    Ok(())
+}
+
+fn daemon_pid_running(path: &Path) -> Option<u32> {
+    let pid = read_daemon_pid(path)?;
+    if is_apas_daemon_process(pid) {
+        Some(pid)
+    } else {
+        let _ = fs::remove_file(path);
+        None
+    }
+}
+
+fn read_daemon_pid(path: &Path) -> Option<u32> {
+    let text = fs::read_to_string(path).ok()?;
+    text.trim().parse::<u32>().ok()
+}
+
+fn write_daemon_pid(path: &Path, pid: u32) -> Result<()> {
+    fs::write(path, pid.to_string())?;
+    Ok(())
+}
+
+fn is_apas_daemon_process(pid: u32) -> bool {
+    let cmdline_path = format!("/proc/{}/cmdline", pid);
+    let raw = match fs::read(cmdline_path) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    if raw.is_empty() {
+        return false;
+    }
+
+    let args: Vec<String> = raw
+        .split(|b| *b == 0)
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| String::from_utf8_lossy(segment).to_string())
+        .collect();
+
+    if args.is_empty() {
+        return false;
+    }
+
+    let has_apas_binary = args.iter().any(|arg| arg.contains("apas"));
+    let has_daemon_arg = args.iter().any(|arg| arg == "daemon");
+    has_apas_binary && has_daemon_arg
 }
 
 async fn handle_config_command(action: ConfigAction) -> Result<()> {
