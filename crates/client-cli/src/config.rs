@@ -9,6 +9,8 @@ pub struct Config {
     pub remote: RemoteConfig,
     #[serde(default)]
     pub local: LocalConfig,
+    #[serde(default)]
+    pub daemon: DaemonConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -22,6 +24,14 @@ pub struct LocalConfig {
     pub claude_path: String,
     #[serde(default = "default_codex_path")]
     pub codex_path: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DaemonConfig {
+    #[serde(default)]
+    pub machine_id: Option<String>,
+    #[serde(default)]
+    pub project_roots: Vec<String>,
 }
 
 fn default_codex_path() -> String {

@@ -6,7 +6,10 @@ use axum::{
     response::IntoResponse,
 };
 use futures::{SinkExt, StreamExt};
-use shared::{MessageInfo, ServerToCli, ServerToWeb, SessionInfo, SessionStatus, WebToServer};
+use shared::{
+    MessageInfo, ServerToCli, ServerToDaemon, ServerToWeb, SessionInfo, SessionStatus,
+    WebToServer,
+};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -72,6 +75,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         connection_id,
                                         uid
                                     );
+                                    state.sessions.set_web_user(connection_id, uid);
                                     state
                                         .sessions
                                         .send_to_web(
@@ -96,6 +100,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                             )
                                             .await;
                                     }
+
+                                    // Send daemon-reported machines for this user.
+                                    let machines = state.sessions.get_machines_for_user(&uid);
+                                    state
+                                        .sessions
+                                        .send_to_web(
+                                            &connection_id,
+                                            ServerToWeb::Machines { machines },
+                                        )
+                                        .await;
                                 }
                                 Err(_) => {
                                     state
@@ -144,6 +158,27 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     state
                         .sessions
                         .send_to_web(&connection_id, ServerToWeb::CliClients { clients })
+                        .await;
+                }
+                Ok(WebToServer::ListMachines) => {
+                    // Require authentication
+                    let Some(uid) = user_id else {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Not authenticated".to_string(),
+                                },
+                            )
+                            .await;
+                        continue;
+                    };
+
+                    let machines = state.sessions.get_machines_for_user(&uid);
+                    state
+                        .sessions
+                        .send_to_web(&connection_id, ServerToWeb::Machines { machines })
                         .await;
                 }
                 Ok(WebToServer::StartSession { cli_client_id }) => {
@@ -369,6 +404,110 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         state
                             .sessions
                             .route_to_cli(&sid, ServerToCli::RebootCli { session_id: sid })
+                            .await;
+                    }
+                }
+                Ok(WebToServer::StartMachineProjectCli {
+                    machine_id,
+                    project_id,
+                }) => {
+                    let Some(uid) = user_id else {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Not authenticated".to_string(),
+                                },
+                            )
+                            .await;
+                        continue;
+                    };
+
+                    let allowed = state
+                        .sessions
+                        .get_machines_for_user(&uid)
+                        .into_iter()
+                        .any(|m| m.machine.machine_id == machine_id);
+
+                    if !allowed {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Machine not found".to_string(),
+                                },
+                            )
+                            .await;
+                        continue;
+                    }
+
+                    if !state
+                        .sessions
+                        .send_to_daemon(&machine_id, ServerToDaemon::StartProjectCli { project_id })
+                        .await
+                    {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Daemon is offline".to_string(),
+                                },
+                            )
+                            .await;
+                    }
+                }
+                Ok(WebToServer::StopMachineProjectCli {
+                    machine_id,
+                    project_id,
+                }) => {
+                    let Some(uid) = user_id else {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Not authenticated".to_string(),
+                                },
+                            )
+                            .await;
+                        continue;
+                    };
+
+                    let allowed = state
+                        .sessions
+                        .get_machines_for_user(&uid)
+                        .into_iter()
+                        .any(|m| m.machine.machine_id == machine_id);
+
+                    if !allowed {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Machine not found".to_string(),
+                                },
+                            )
+                            .await;
+                        continue;
+                    }
+
+                    if !state
+                        .sessions
+                        .send_to_daemon(&machine_id, ServerToDaemon::StopProjectCli { project_id })
+                        .await
+                    {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Daemon is offline".to_string(),
+                                },
+                            )
                             .await;
                     }
                 }

@@ -1,10 +1,12 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use uuid::Uuid;
 
 mod auth;
-mod config;
 mod claude;
+mod config;
 mod mode;
 mod project;
 mod tui;
@@ -64,6 +66,12 @@ enum Commands {
     Logout,
     /// Show current login status
     Whoami,
+    /// Run per-machine daemon for machine/project control in web UI
+    Daemon {
+        /// Project root directory to scan (repeatable)
+        #[arg(long = "root", short = 'r')]
+        roots: Vec<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -116,7 +124,8 @@ async fn main() -> Result<()> {
             }
             Commands::Login => {
                 let config = config::Config::load().unwrap_or_default();
-                let server = cli.server
+                let server = cli
+                    .server
                     .or(config.remote.server)
                     .unwrap_or_else(|| DEFAULT_SERVER.to_string());
                 let token = auth::login(&server).await?;
@@ -135,10 +144,51 @@ async fn main() -> Result<()> {
             }
             Commands::Whoami => {
                 let config = config::Config::load().unwrap_or_default();
-                let server = cli.server
+                let server = cli
+                    .server
                     .or(config.remote.server.clone())
                     .unwrap_or_else(|| DEFAULT_SERVER.to_string());
                 auth::whoami(&config, &server).await?;
+                return Ok(());
+            }
+            Commands::Daemon { roots } => {
+                let mut config = config::Config::load().unwrap_or_default();
+                let server = cli
+                    .server
+                    .or(config.remote.server.clone())
+                    .unwrap_or_else(|| DEFAULT_SERVER.to_string());
+                let token = match cli.token.or(config.remote.token.clone()) {
+                    Some(t) => t,
+                    None => {
+                        eprintln!("\x1b[33m🔐 Not logged in.\x1b[0m");
+                        eprintln!("   Run '\x1b[1mapas login\x1b[0m' to authenticate.");
+                        return Ok(());
+                    }
+                };
+
+                let machine_id = match config.daemon.machine_id.as_ref() {
+                    Some(raw) => Uuid::parse_str(raw).unwrap_or_else(|_| Uuid::new_v4()),
+                    None => Uuid::new_v4(),
+                };
+                config.daemon.machine_id = Some(machine_id.to_string());
+
+                let project_roots = if !roots.is_empty() {
+                    config.daemon.project_roots = roots
+                        .iter()
+                        .map(|root| root.to_string_lossy().to_string())
+                        .collect();
+                    roots
+                } else {
+                    config
+                        .daemon
+                        .project_roots
+                        .iter()
+                        .map(PathBuf::from)
+                        .collect()
+                };
+
+                config.save()?;
+                mode::daemon::run(&server, &token, machine_id, project_roots).await?;
                 return Ok(());
             }
         }
@@ -157,7 +207,8 @@ async fn main() -> Result<()> {
     } else if cli.remote {
         // Remote-only mode - no local I/O
         let config = config::Config::load()?;
-        let server = cli.server
+        let server = cli
+            .server
             .or(config.remote.server)
             .unwrap_or_else(|| DEFAULT_SERVER.to_string());
         let token = match cli.token.or(config.remote.token) {
@@ -170,14 +221,18 @@ async fn main() -> Result<()> {
         };
 
         // Show web UI hint
-        eprintln!("\x1b[36m📺 View this session in browser: {}\x1b[0m", WEB_UI_URL);
+        eprintln!(
+            "\x1b[36m📺 View this session in browser: {}\x1b[0m",
+            WEB_UI_URL
+        );
 
         tracing::info!("Starting in remote-only mode, connecting to {}", server);
         mode::remote::run(&server, &token, &working_dir).await?;
     } else if cli.hybrid {
         // Hybrid mode - single pane local terminal + streaming to server
         let config = config::Config::load()?;
-        let server = cli.server
+        let server = cli
+            .server
             .or(config.remote.server)
             .unwrap_or_else(|| DEFAULT_SERVER.to_string());
         let token = match cli.token.or(config.remote.token) {
@@ -190,14 +245,18 @@ async fn main() -> Result<()> {
         };
 
         // Show web UI hint
-        eprintln!("\x1b[36m📺 View this session in browser: {}\x1b[0m", WEB_UI_URL);
+        eprintln!(
+            "\x1b[36m📺 View this session in browser: {}\x1b[0m",
+            WEB_UI_URL
+        );
 
         tracing::info!("Starting in hybrid mode (local + streaming to {})", server);
         mode::hybrid::run(&server, &token, &working_dir).await?;
     } else {
-        // Default: dual-pane mode - split terminal with deadloop and interactive
+        // Default: tabbed mode (interactive tab by default)
         let config = config::Config::load()?;
-        let server = cli.server
+        let server = cli
+            .server
             .or(config.remote.server)
             .unwrap_or_else(|| DEFAULT_SERVER.to_string());
         let token = match cli.token.or(config.remote.token) {
@@ -210,7 +269,10 @@ async fn main() -> Result<()> {
         };
 
         // Show web UI hint
-        eprintln!("\x1b[36m📺 View this session in browser: {}\x1b[0m", WEB_UI_URL);
+        eprintln!(
+            "\x1b[36m📺 View this session in browser: {}\x1b[0m",
+            WEB_UI_URL
+        );
 
         tracing::info!("Starting in dual-pane mode (streaming to {})", server);
         mode::dual_pane::run(&server, &token, &working_dir).await?;
@@ -227,7 +289,19 @@ async fn handle_config_command(action: ConfigAction) -> Result<()> {
                 "server" => config.remote.server = Some(value),
                 "token" => config.remote.token = Some(value),
                 "claude_path" => config.local.claude_path = value,
-                _ => anyhow::bail!("Unknown config key: {}. Valid keys: server, token, claude_path", key),
+                "codex_path" => config.local.codex_path = value,
+                "daemon_machine_id" => config.daemon.machine_id = Some(value),
+                "daemon_roots" => {
+                    config.daemon.project_roots = value
+                        .split(',')
+                        .map(|v| v.trim().to_string())
+                        .filter(|v| !v.is_empty())
+                        .collect();
+                }
+                _ => anyhow::bail!(
+                    "Unknown config key: {}. Valid keys: server, token, claude_path, codex_path, daemon_machine_id, daemon_roots",
+                    key
+                ),
             }
             config.save()?;
             println!("Configuration saved");
@@ -236,17 +310,37 @@ async fn handle_config_command(action: ConfigAction) -> Result<()> {
             let config = config::Config::load()?;
             let value = match key.as_str() {
                 "server" => config.remote.server.unwrap_or_default(),
-                "token" => config.remote.token.map(|_| "****").unwrap_or_default().to_string(),
+                "token" => config
+                    .remote
+                    .token
+                    .map(|_| "****")
+                    .unwrap_or_default()
+                    .to_string(),
                 "claude_path" => config.local.claude_path,
-                _ => anyhow::bail!("Unknown config key: {}", key),
+                "codex_path" => config.local.codex_path,
+                "daemon_machine_id" => config.daemon.machine_id.unwrap_or_default(),
+                "daemon_roots" => config.daemon.project_roots.join(","),
+                _ => anyhow::bail!(
+                    "Unknown config key: {}. Valid keys: server, token, claude_path, codex_path, daemon_machine_id, daemon_roots",
+                    key
+                ),
             };
             println!("{}", value);
         }
         ConfigAction::Show => {
             let config = config::Config::load()?;
             println!("server: {}", config.remote.server.unwrap_or_default());
-            println!("token: {}", config.remote.token.map(|_| "****").unwrap_or_default());
+            println!(
+                "token: {}",
+                config.remote.token.map(|_| "****").unwrap_or_default()
+            );
             println!("claude_path: {}", config.local.claude_path);
+            println!("codex_path: {}", config.local.codex_path);
+            println!(
+                "daemon_machine_id: {}",
+                config.daemon.machine_id.unwrap_or_default()
+            );
+            println!("daemon_roots: {}", config.daemon.project_roots.join(","));
         }
         ConfigAction::Path => {
             let path = config::Config::config_path()?;

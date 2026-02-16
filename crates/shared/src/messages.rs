@@ -176,6 +176,48 @@ pub enum ServerToCli {
 }
 
 // ============================================================================
+// Daemon <-> Server Messages
+// ============================================================================
+
+/// Messages sent from machine daemon to server
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DaemonToServer {
+    /// Daemon registers with the server using auth token + machine info
+    Register {
+        token: String,
+        machine: MachineInfo,
+        projects: Vec<MachineProjectInfo>,
+    },
+
+    /// Periodic heartbeat with latest project states
+    Heartbeat { projects: Vec<MachineProjectInfo> },
+}
+
+/// Messages sent from server to machine daemon
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerToDaemon {
+    /// Registration successful
+    Registered { machine_id: Uuid },
+
+    /// Registration failed
+    RegistrationFailed { reason: String },
+
+    /// Start APAS CLI for a project on this machine
+    StartProjectCli { project_id: String },
+
+    /// Stop APAS CLI for a project on this machine
+    StopProjectCli { project_id: String },
+
+    /// Request a fresh project scan/update push
+    RefreshProjects,
+
+    /// Heartbeat response
+    Heartbeat,
+}
+
+// ============================================================================
 // Web <-> Server Messages
 // ============================================================================
 
@@ -188,6 +230,9 @@ pub enum WebToServer {
 
     /// List available CLI clients
     ListCliClients,
+
+    /// List daemon-reported machines and projects for this user
+    ListMachines,
 
     /// Start a new session (optionally specify CLI client)
     StartSession { cli_client_id: Option<Uuid> },
@@ -272,6 +317,18 @@ pub enum WebToServer {
     /// Reboot the CLI process
     RebootCli,
 
+    /// Start APAS CLI for a daemon project
+    StartMachineProjectCli {
+        machine_id: Uuid,
+        project_id: String,
+    },
+
+    /// Stop APAS CLI for a daemon project
+    StopMachineProjectCli {
+        machine_id: Uuid,
+        project_id: String,
+    },
+
     /// Download all session data
     DownloadSession { session_id: Uuid },
 }
@@ -324,6 +381,9 @@ pub enum ServerToWeb {
 
     /// List of available CLI clients
     CliClients { clients: Vec<CliClientInfo> },
+
+    /// List of daemon-reported machines and projects
+    Machines { machines: Vec<MachineWithProjects> },
 
     /// Structured message from Claude CLI stream-json output
     StreamMessage {
@@ -436,6 +496,41 @@ pub struct MessageInfo {
 // ============================================================================
 // Shared Types
 // ============================================================================
+
+/// Information about a machine reported by a daemon
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineInfo {
+    pub machine_id: Uuid,
+    pub hostname: String,
+    pub os: String,
+    pub arch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<String>,
+}
+
+/// APAS project discovered on a machine
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineProjectInfo {
+    pub project_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub path: String,
+    #[serde(default)]
+    pub is_running: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// Machine with its project list
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineWithProjects {
+    pub machine: MachineInfo,
+    pub projects: Vec<MachineProjectInfo>,
+}
 
 /// Pane type for dual-pane mode (legacy - kept for backward compatibility)
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]

@@ -1,7 +1,7 @@
 "use client";
 
 import { useStore } from "@/lib/store";
-import { FolderOpen, RefreshCw, Share2, Users, X, Crown, Trash2, ChevronLeft, BarChart3 } from "lucide-react";
+import { FolderOpen, RefreshCw, Share2, Users, X, Crown, Trash2, ChevronLeft, BarChart3, Server } from "lucide-react";
 import Link from "next/link";
 import { useMemo, useState, useEffect } from "react";
 import { createPortal } from "react-dom";
@@ -394,6 +394,16 @@ export function Sidebar({ onClose, onCollapse }: SidebarProps) {
             ))}
           </div>
         )}
+      </div>
+
+      <div className="border-t border-gray-200 dark:border-gray-800 p-2 flex-shrink-0">
+        <Link
+          href="/machines"
+          className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors"
+        >
+          <Server className="w-4 h-4" />
+          Machines
+        </Link>
       </div>
 
       {/* Admin link - only visible to admin user */}

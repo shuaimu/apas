@@ -61,6 +61,29 @@ export interface CliUsageLimits {
   limits: UsageLimits;
 }
 
+export interface MachineInfo {
+  machineId: string;
+  hostname: string;
+  os: string;
+  arch: string;
+  daemonVersion?: string;
+  lastSeen?: string;
+}
+
+export interface MachineProject {
+  projectId: string;
+  name?: string;
+  path: string;
+  isRunning: boolean;
+  pid?: number;
+  lastError?: string;
+}
+
+export interface MachineWithProjects {
+  machine: MachineInfo;
+  projects: MachineProject[];
+}
+
 export type OutputType =
   | { type: "text" }
   | { type: "code"; language?: string }
@@ -86,7 +109,7 @@ export interface PaneConfig {
 // Legacy pane_id constants (must match shared::PANE_ID_DEADLOOP / PANE_ID_INTERACTIVE)
 export const PANE_ID_DEADLOOP = 1;
 export const PANE_ID_INTERACTIVE = 2;
-const usageProviderTieBreaker = new Map<string, Provider>();
+const usageProviderHints = new Map<string, Provider>();
 
 function normalizeProvider(raw: unknown): Provider | null {
   if (typeof raw === "string") {
@@ -122,43 +145,38 @@ export function paneKey(paneId: number): string {
   return String(paneId);
 }
 
-function usageFetchedAtMs(limits: UsageLimits | undefined): number {
-  const value = limits?.fetchedAt;
-  if (!value) return 0;
-  const parsed = Date.parse(value);
-  return Number.isNaN(parsed) ? 0 : parsed;
-}
-
-function inferUsageProvider(
-  cliClientId: string,
-  usageLimitsByCli: Map<string, UsageLimitsByProvider>,
-  paneConfigs: PaneConfig[],
-): Provider {
-  const existing = usageLimitsByCli.get(cliClientId);
-
-  if (existing?.claude && !existing?.codex) return "codex";
-  if (existing?.codex && !existing?.claude) return "claude";
-
+function collectPaneProviders(paneConfigs: PaneConfig[]): Set<Provider> {
   const seenProviders = new Set<Provider>();
   for (const pane of paneConfigs) {
     const normalized = normalizeProvider(pane.provider);
     if (normalized) seenProviders.add(normalized);
   }
+  return seenProviders;
+}
+
+function inferUsageProvider(
+  cliClientId: string,
+  paneConfigs: PaneConfig[],
+): Provider {
+  const seenProviders = collectPaneProviders(paneConfigs);
+
   if (seenProviders.size === 1) {
-    return Array.from(seenProviders)[0];
+    const provider = Array.from(seenProviders)[0];
+    usageProviderHints.set(cliClientId, provider);
+    return provider;
   }
 
-  const claudeTime = usageFetchedAtMs(existing?.claude);
-  const codexTime = usageFetchedAtMs(existing?.codex);
+  const hinted = usageProviderHints.get(cliClientId);
+  if (hinted) return hinted;
 
-  if (claudeTime !== codexTime) {
-    return claudeTime <= codexTime ? "claude" : "codex";
+  // Legacy servers may omit provider; in mixed-provider sessions those payloads
+  // are typically Codex (last-write from periodic usage polling), so prefer Codex.
+  if (seenProviders.size > 1) {
+    usageProviderHints.set(cliClientId, "codex");
+    return "codex";
   }
 
-  const previous = usageProviderTieBreaker.get(cliClientId) ?? "codex";
-  const next = previous === "claude" ? "codex" : "claude";
-  usageProviderTieBreaker.set(cliClientId, next);
-  return next;
+  return "codex";
 }
 
 interface AppState {
@@ -211,6 +229,9 @@ interface AppState {
   // Usage limits per CLI client
   usageLimits: Map<string, UsageLimitsByProvider>;
 
+  // Daemon-reported machines
+  machines: MachineWithProjects[];
+
   // Auth actions
   login: (token: string, userId: string, userEmail: string) => void;
   setUserEmail: (userEmail: string) => void;
@@ -227,6 +248,9 @@ interface AppState {
   startSession: (cliClientId?: string) => void;
   attachSession: (sessionId: string) => void;
   refreshCliClients: () => void;
+  listMachines: () => void;
+  startMachineProjectCli: (machineId: string, projectId: string) => void;
+  stopMachineProjectCli: (machineId: string, projectId: string) => void;
   listSessions: () => void;
   loadSessionMessages: (sessionId: string) => void;
   loadMoreMessages: (paneType?: PaneType) => void;
@@ -288,6 +312,7 @@ export const useStore = create<AppState>((set, get) => ({
   interactiveStatus: null,
   deadloopStatus: null,
   usageLimits: new Map(),
+  machines: [],
 
   login: (token: string, userId: string, userEmail: string) => {
     localStorage.setItem("apas_token", token);
@@ -331,6 +356,7 @@ export const useStore = create<AppState>((set, get) => ({
       sessionId: null,
       cliClients: [],
       sessions: [],
+      machines: [],
       reconnectAttempts: 0,
       reconnectTimeout: null,
       visibilityHandler: null,
@@ -445,6 +471,7 @@ export const useStore = create<AppState>((set, get) => ({
       ws: null,
       sessionId: null,
       cliClients: [],
+      machines: [],
       isAttached: false,
       reconnectAttempts: 0,
       reconnectTimeout: null,
@@ -482,14 +509,13 @@ export const useStore = create<AppState>((set, get) => ({
     const hasActiveClient = cliClients.some(c => c.activeSession === sessionId);
 
     let newCliClientId: string | null = null;
+    const activeClient = cliClients.find(c => c.activeSession === sessionId);
     const sessionInfo = sessions.find(s => s.id === sessionId);
-    if (sessionInfo?.cliClientId) {
+    // Prefer live active-session mapping over persisted session metadata.
+    if (activeClient) {
+      newCliClientId = activeClient.id;
+    } else if (sessionInfo?.cliClientId) {
       newCliClientId = sessionInfo.cliClientId;
-    } else {
-      const activeClient = cliClients.find(c => c.activeSession === sessionId);
-      if (activeClient) {
-        newCliClientId = activeClient.id;
-      }
     }
 
     if (newCliClientId) {
@@ -530,6 +556,38 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
     ws.send(JSON.stringify({ type: "list_cli_clients" }));
+  },
+
+  listMachines: () => {
+    const { ws } = get();
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    ws.send(JSON.stringify({ type: "list_machines" }));
+  },
+
+  startMachineProjectCli: (machineId: string, projectId: string) => {
+    const { ws } = get();
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    ws.send(JSON.stringify({
+      type: "start_machine_project_cli",
+      machine_id: machineId,
+      project_id: projectId,
+    }));
+  },
+
+  stopMachineProjectCli: (machineId: string, projectId: string) => {
+    const { ws } = get();
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    ws.send(JSON.stringify({
+      type: "stop_machine_project_cli",
+      machine_id: machineId,
+      project_id: projectId,
+    }));
   },
 
   listSessions: () => {
@@ -711,6 +769,7 @@ export const useStore = create<AppState>((set, get) => ({
       if (!connected) return;
 
       get().refreshCliClients();
+      get().listMachines();
       get().listSessions();
 
       if (sessionId && !isAttached) {
@@ -877,6 +936,7 @@ function handleServerMessage(
       }
       console.log("Authenticated as user:", data.user_id);
       get().refreshCliClients();
+      get().listMachines();
       get().listSessions();
       get().startAutoRefresh();
       const savedSessionId = localStorage.getItem("apas_session_id");
@@ -913,14 +973,57 @@ function handleServerMessage(
       }));
 
       const { sessionId } = get();
+      const activeClientForSession = sessionId
+        ? parsedClients.find((c) => c.activeSession === sessionId)
+        : undefined;
       const hasActiveClientInOurList = sessionId
         ? parsedClients.some(c => c.activeSession === sessionId)
         : false;
 
-      set({
-        cliClients: parsedClients,
-        ...(hasActiveClientInOurList ? { isAttached: true } : {}),
+      set((state) => {
+        const next: Partial<AppState> = {
+          cliClients: parsedClients,
+          ...(hasActiveClientInOurList ? { isAttached: true } : {}),
+        };
+
+        if (activeClientForSession && state.cliClientId !== activeClientForSession.id) {
+          next.cliClientId = activeClientForSession.id;
+          if (typeof window !== "undefined") {
+            localStorage.setItem("apas_cli_client_id", activeClientForSession.id);
+          }
+        }
+
+        return next;
       });
+      break;
+    }
+
+    case "machines": {
+      const machines = (data.machines as Array<Record<string, unknown>>) || [];
+      const parsed: MachineWithProjects[] = machines.map((item) => {
+        const machine = (item.machine as Record<string, unknown>) || {};
+        const projects = (item.projects as Array<Record<string, unknown>>) || [];
+        return {
+          machine: {
+            machineId: machine.machine_id as string,
+            hostname: machine.hostname as string,
+            os: machine.os as string,
+            arch: machine.arch as string,
+            daemonVersion: machine.daemon_version as string | undefined,
+            lastSeen: machine.last_seen as string | undefined,
+          },
+          projects: projects.map((project) => ({
+            projectId: project.project_id as string,
+            name: project.name as string | undefined,
+            path: project.path as string,
+            isRunning: Boolean(project.is_running),
+            pid: project.pid as number | undefined,
+            lastError: project.last_error as string | undefined,
+          })),
+        };
+      });
+
+      set({ machines: parsed });
       break;
     }
 
@@ -994,18 +1097,33 @@ function handleServerMessage(
 
     case "sessions": {
       const sessions = (data.sessions as Array<Record<string, unknown>>) || [];
-      set({
-        sessions: sessions.map((s) => ({
-          id: s.id as string,
-          cliClientId: s.cli_client_id as string | undefined,
-          workingDir: s.working_dir as string | undefined,
-          hostname: s.hostname as string | undefined,
-          status: s.status as string,
-          createdAt: s.created_at as string | undefined,
-          isShared: s.is_shared as boolean | undefined,
-          ownerEmail: s.owner_email as string | undefined,
-          isActive: s.is_active as boolean | undefined,
-        })),
+      const parsedSessions = sessions.map((s) => ({
+        id: s.id as string,
+        cliClientId: s.cli_client_id as string | undefined,
+        workingDir: s.working_dir as string | undefined,
+        hostname: s.hostname as string | undefined,
+        status: s.status as string,
+        createdAt: s.created_at as string | undefined,
+        isShared: s.is_shared as boolean | undefined,
+        ownerEmail: s.owner_email as string | undefined,
+        isActive: s.is_active as boolean | undefined,
+      }));
+
+      set((state) => {
+        const next: Partial<AppState> = { sessions: parsedSessions };
+        if (state.sessionId) {
+          const activeClient = state.cliClients.find((c) => c.activeSession === state.sessionId);
+          const currentSession = parsedSessions.find((s) => s.id === state.sessionId);
+          const preferredCliClientId = activeClient?.id ?? currentSession?.cliClientId ?? null;
+
+          if (preferredCliClientId && state.cliClientId !== preferredCliClientId) {
+            next.cliClientId = preferredCliClientId;
+            if (typeof window !== "undefined") {
+              localStorage.setItem("apas_cli_client_id", preferredCliClientId);
+            }
+          }
+        }
+        return next;
       });
       break;
     }
@@ -1307,22 +1425,38 @@ function handleServerMessage(
         const directProvider = normalizeProvider((data as Record<string, unknown>).provider);
         const provider =
           directProvider ??
-          inferUsageProvider(cliClientId, get().usageLimits, get().paneConfigs);
+          inferUsageProvider(cliClientId, get().paneConfigs);
+
+        if (directProvider) {
+          usageProviderHints.set(cliClientId, directProvider);
+        }
 
         if (!directProvider) {
           console.warn("Usage limits missing provider; inferred provider:", provider, data);
         }
 
+        const toWindow = (raw: unknown) => {
+          if (!raw || typeof raw !== "object") return undefined;
+          const window = raw as Record<string, unknown>;
+          const utilization = typeof window.utilization === "number" ? window.utilization : undefined;
+          if (utilization === undefined) return undefined;
+          const resetRaw =
+            window.resets_at ??
+            window.reset_at ??
+            window.resetsAt ??
+            window.resetAt;
+          return {
+            utilization,
+            resetsAt: typeof resetRaw === "string" ? resetRaw : undefined,
+          };
+        };
+
         const parsedLimits: UsageLimits = {
-          fiveHour: limits.five_hour ? {
-            utilization: (limits.five_hour as Record<string, unknown>).utilization as number,
-            resetsAt: (limits.five_hour as Record<string, unknown>).resets_at as string | undefined,
-          } : undefined,
-          sevenDay: limits.seven_day ? {
-            utilization: (limits.seven_day as Record<string, unknown>).utilization as number,
-            resetsAt: (limits.seven_day as Record<string, unknown>).resets_at as string | undefined,
-          } : undefined,
-          fetchedAt: limits.fetched_at as string | undefined,
+          fiveHour: toWindow(limits.five_hour ?? limits.fiveHour),
+          sevenDay: toWindow(limits.seven_day ?? limits.sevenDay),
+          fetchedAt:
+            (typeof limits.fetched_at === "string" ? limits.fetched_at : undefined) ??
+            (typeof limits.fetchedAt === "string" ? limits.fetchedAt : undefined),
         };
         set((state) => {
           const newMap = new Map(state.usageLimits);

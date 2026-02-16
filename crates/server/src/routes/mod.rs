@@ -12,6 +12,7 @@ pub mod auth;
 mod health;
 mod share;
 mod ws_cli;
+mod ws_daemon;
 mod ws_web;
 
 pub fn create_router(state: AppState) -> Router {
@@ -46,6 +47,7 @@ pub fn create_router(state: AppState) -> Router {
         // WebSocket routes
         .route("/ws/web", get(ws_web::ws_handler))
         .route("/ws/cli", get(ws_cli::ws_handler))
+        .route("/ws/daemon", get(ws_daemon::ws_handler))
         // Middleware
         .layer(TraceLayer::new_for_http())
         .layer(cors)

@@ -1,6 +1,7 @@
 use dashmap::DashMap;
 use shared::{
-    CliClientInfo, CliClientStatus, PaneConfig, Provider, ServerToCli, ServerToWeb, UsageLimits,
+    CliClientInfo, CliClientStatus, MachineInfo, MachineProjectInfo, MachineWithProjects,
+    PaneConfig, Provider, ServerToCli, ServerToDaemon, ServerToWeb, UsageLimits,
 };
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -13,12 +14,22 @@ pub struct SessionManager {
     cli_senders: DashMap<Uuid, mpsc::Sender<ServerToCli>>,
     /// Map of web connection ID -> sender to web
     web_senders: DashMap<Uuid, mpsc::Sender<ServerToWeb>>,
+    /// Map of web connection ID -> authenticated user ID
+    web_users: DashMap<Uuid, Uuid>,
     /// Map of CLI client ID -> list of session IDs
     cli_sessions: DashMap<Uuid, Vec<Uuid>>,
     /// Map of CLI client ID -> user ID (owner)
     cli_users: DashMap<Uuid, Uuid>,
     /// Map of (CLI client ID, provider) -> latest usage limits
     cli_usage_limits: DashMap<(Uuid, Provider), UsageLimits>,
+    /// Map of machine ID -> sender to daemon
+    daemon_senders: DashMap<Uuid, mpsc::Sender<ServerToDaemon>>,
+    /// Map of machine ID -> user ID (owner)
+    daemon_users: DashMap<Uuid, Uuid>,
+    /// Map of machine ID -> machine metadata
+    machine_infos: DashMap<Uuid, MachineInfo>,
+    /// Map of machine ID -> project list
+    machine_projects: DashMap<Uuid, Vec<MachineProjectInfo>>,
 }
 
 #[derive(Debug)]
@@ -39,9 +50,14 @@ impl SessionManager {
             sessions: DashMap::new(),
             cli_senders: DashMap::new(),
             web_senders: DashMap::new(),
+            web_users: DashMap::new(),
             cli_sessions: DashMap::new(),
             cli_users: DashMap::new(),
             cli_usage_limits: DashMap::new(),
+            daemon_senders: DashMap::new(),
+            daemon_users: DashMap::new(),
+            machine_infos: DashMap::new(),
+            machine_projects: DashMap::new(),
         }
     }
 
@@ -79,14 +95,116 @@ impl SessionManager {
         self.broadcast_cli_clients_update();
     }
 
+    // Daemon management
+    pub fn register_daemon(
+        &self,
+        machine_id: Uuid,
+        user_id: Uuid,
+        sender: mpsc::Sender<ServerToDaemon>,
+        mut machine: MachineInfo,
+        projects: Vec<MachineProjectInfo>,
+    ) {
+        machine.machine_id = machine_id;
+        machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
+        self.daemon_senders.insert(machine_id, sender);
+        self.daemon_users.insert(machine_id, user_id);
+        self.machine_infos.insert(machine_id, machine);
+        self.machine_projects.insert(machine_id, projects);
+        self.broadcast_machines_update_for_user(&user_id);
+        tracing::info!("Daemon registered: {} (user: {})", machine_id, user_id);
+    }
+
+    pub fn unregister_daemon(&self, machine_id: &Uuid) {
+        let owner = self.daemon_users.get(machine_id).map(|entry| *entry);
+        self.daemon_senders.remove(machine_id);
+        self.daemon_users.remove(machine_id);
+        self.machine_infos.remove(machine_id);
+        self.machine_projects.remove(machine_id);
+
+        if let Some(user_id) = owner {
+            self.broadcast_machines_update_for_user(&user_id);
+        }
+
+        tracing::info!("Daemon unregistered: {}", machine_id);
+    }
+
+    pub fn update_daemon_projects(&self, machine_id: &Uuid, projects: Vec<MachineProjectInfo>) {
+        self.machine_projects.insert(*machine_id, projects);
+        if let Some(mut machine) = self.machine_infos.get_mut(machine_id) {
+            machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
+        }
+        if let Some(owner) = self.daemon_users.get(machine_id).map(|entry| *entry) {
+            self.broadcast_machines_update_for_user(&owner);
+        }
+    }
+
+    pub async fn send_to_daemon(&self, machine_id: &Uuid, msg: ServerToDaemon) -> bool {
+        if let Some(sender) = self.daemon_senders.get(machine_id) {
+            if sender.send(msg).await.is_ok() {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn get_machines_for_user(&self, user_id: &Uuid) -> Vec<MachineWithProjects> {
+        self.machine_infos
+            .iter()
+            .filter_map(|entry| {
+                let machine_id = *entry.key();
+                let owner_matches = self
+                    .daemon_users
+                    .get(&machine_id)
+                    .map(|owner| *owner == *user_id)
+                    .unwrap_or(false);
+                if !owner_matches {
+                    return None;
+                }
+
+                let machine = entry.value().clone();
+                let projects = self
+                    .machine_projects
+                    .get(&machine_id)
+                    .map(|p| p.clone())
+                    .unwrap_or_default();
+
+                Some(MachineWithProjects { machine, projects })
+            })
+            .collect()
+    }
+
+    fn broadcast_machines_update_for_user(&self, user_id: &Uuid) {
+        let machines = self.get_machines_for_user(user_id);
+        let msg = ServerToWeb::Machines { machines };
+
+        for web_entry in self.web_users.iter() {
+            if *web_entry.value() != *user_id {
+                continue;
+            }
+            let connection_id = *web_entry.key();
+            if let Some(sender) = self.web_senders.get(&connection_id) {
+                let sender = sender.clone();
+                let msg = msg.clone();
+                tokio::spawn(async move {
+                    let _ = sender.send(msg).await;
+                });
+            }
+        }
+    }
+
     // Web client management
     pub fn register_web(&self, connection_id: Uuid, sender: mpsc::Sender<ServerToWeb>) {
         self.web_senders.insert(connection_id, sender);
         tracing::info!("Web client registered: {}", connection_id);
     }
 
+    pub fn set_web_user(&self, connection_id: Uuid, user_id: Uuid) {
+        self.web_users.insert(connection_id, user_id);
+    }
+
     pub fn unregister_web(&self, connection_id: &Uuid) {
         self.web_senders.remove(connection_id);
+        self.web_users.remove(connection_id);
         // Remove this connection from any sessions it was viewing
         for mut session in self.sessions.iter_mut() {
             session.web_connection_ids.retain(|id| id != connection_id);
