@@ -1,8 +1,11 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
@@ -19,27 +22,39 @@ mod usage;
 const DEFAULT_SERVER: &str = "ws://apas.mpaxos.com:8080";
 // Web UI URL for users to view sessions
 const WEB_UI_URL: &str = "http://apas.mpaxos.com";
+const CURRENT_VERSION: &str = env!("APAS_VERSION");
 
-struct DaemonPidGuard {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DaemonStateFile {
+    pid: u32,
+    version: String,
+}
+
+struct DaemonStateGuard {
     path: PathBuf,
     pid: u32,
 }
 
-impl DaemonPidGuard {
+impl DaemonStateGuard {
     fn new(path: PathBuf, pid: u32) -> Self {
         Self { path, pid }
     }
 }
 
-impl Drop for DaemonPidGuard {
+impl Drop for DaemonStateGuard {
     fn drop(&mut self) {
-        let expected = self.pid.to_string();
-        if let Ok(contents) = fs::read_to_string(&self.path) {
-            if contents.trim() == expected {
+        if let Some(state) = read_daemon_state(&self.path) {
+            if state.pid == self.pid {
                 let _ = fs::remove_file(&self.path);
             }
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct RunningDaemon {
+    pid: u32,
+    version: Option<String>,
 }
 
 #[derive(Parser)]
@@ -183,10 +198,29 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             Commands::Daemon { roots } => {
-                let pid_path = config::Config::daemon_pid_path()?;
-                if let Some(existing_pid) = daemon_pid_running(&pid_path) {
-                    println!("Daemon already running (pid {}).", existing_pid);
-                    return Ok(());
+                let state_path = config::Config::daemon_state_path()?;
+                let legacy_pid_path = config::Config::daemon_pid_path()?;
+                if let Some(existing) = detect_running_daemon(&state_path, &legacy_pid_path) {
+                    let should_restart =
+                        should_restart_for_version(existing.version.as_deref(), CURRENT_VERSION);
+                    if should_restart {
+                        tracing::info!(
+                            "Restarting daemon pid {} due to older/unknown version {:?} -> {}",
+                            existing.pid,
+                            existing.version,
+                            CURRENT_VERSION
+                        );
+                        stop_daemon_process(existing.pid)?;
+                    } else {
+                        println!(
+                            "Daemon already running (pid {}, version {}).",
+                            existing.pid,
+                            existing
+                                .version
+                                .unwrap_or_else(|| "unknown".to_string())
+                        );
+                        return Ok(());
+                    }
                 }
 
                 let mut config = config::Config::load().unwrap_or_default();
@@ -225,8 +259,12 @@ async fn main() -> Result<()> {
                 };
 
                 config.save()?;
-                write_daemon_pid(&pid_path, std::process::id())?;
-                let _pid_guard = DaemonPidGuard::new(pid_path, std::process::id());
+                let state = DaemonStateFile {
+                    pid: std::process::id(),
+                    version: CURRENT_VERSION.to_string(),
+                };
+                write_daemon_state(&state_path, &state)?;
+                let _state_guard = DaemonStateGuard::new(state_path, std::process::id());
                 mode::daemon::run(&server, &token, machine_id, project_roots).await?;
                 return Ok(());
             }
@@ -334,13 +372,25 @@ fn maybe_auto_start_daemon(cli: &Cli) -> Result<()> {
         .or(config.remote.server.clone())
         .unwrap_or_else(|| DEFAULT_SERVER.to_string());
 
-    ensure_daemon_running(&server, &config.daemon.project_roots)
+    ensure_daemon_running(&server, &config.daemon.project_roots, CURRENT_VERSION)
 }
 
-fn ensure_daemon_running(server: &str, roots: &[String]) -> Result<()> {
-    let pid_path = config::Config::daemon_pid_path()?;
-    if daemon_pid_running(&pid_path).is_some() {
-        return Ok(());
+fn ensure_daemon_running(server: &str, roots: &[String], target_version: &str) -> Result<()> {
+    let state_path = config::Config::daemon_state_path()?;
+    let legacy_pid_path = config::Config::daemon_pid_path()?;
+
+    if let Some(running) = detect_running_daemon(&state_path, &legacy_pid_path) {
+        if should_restart_for_version(running.version.as_deref(), target_version) {
+            tracing::info!(
+                "Auto-restarting daemon pid {} for version upgrade {:?} -> {}",
+                running.pid,
+                running.version,
+                target_version
+            );
+            stop_daemon_process(running.pid)?;
+        } else {
+            return Ok(());
+        }
     }
 
     let current_exe = std::env::current_exe()?;
@@ -354,28 +404,109 @@ fn ensure_daemon_running(server: &str, roots: &[String]) -> Result<()> {
         .stderr(Stdio::null());
 
     let child = cmd.spawn()?;
-    write_daemon_pid(&pid_path, child.id())?;
+    let state = DaemonStateFile {
+        pid: child.id(),
+        version: target_version.to_string(),
+    };
+    write_daemon_state(&state_path, &state)?;
+    // Keep legacy pid file for compatibility with older tooling.
+    let _ = fs::write(legacy_pid_path, child.id().to_string());
     Ok(())
 }
 
-fn daemon_pid_running(path: &Path) -> Option<u32> {
-    let pid = read_daemon_pid(path)?;
-    if is_apas_daemon_process(pid) {
-        Some(pid)
-    } else {
-        let _ = fs::remove_file(path);
-        None
+fn should_restart_for_version(running_version: Option<&str>, target_version: &str) -> bool {
+    match running_version {
+        None => true, // Older daemon versions didn't persist version metadata.
+        Some(running) => match compare_versions(running, target_version) {
+            Some(std::cmp::Ordering::Less) => true,
+            Some(_) => false,
+            None => false, // Unknown format: keep current daemon to avoid accidental downgrade.
+        },
     }
 }
 
-fn read_daemon_pid(path: &Path) -> Option<u32> {
-    let text = fs::read_to_string(path).ok()?;
-    text.trim().parse::<u32>().ok()
+fn compare_versions(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    let l = parse_version(left)?;
+    let r = parse_version(right)?;
+    Some(l.cmp(&r))
 }
 
-fn write_daemon_pid(path: &Path, pid: u32) -> Result<()> {
-    fs::write(path, pid.to_string())?;
+fn parse_version(v: &str) -> Option<u64> {
+    let parts: Vec<&str> = v.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let yy: u64 = parts[0].parse().ok()?;
+    let mm: u64 = parts[1].parse().ok()?;
+    let commit: u64 = parts[2].parse().ok()?;
+    Some(yy * 1_000_000 + mm * 10_000 + commit)
+}
+
+fn detect_running_daemon(state_path: &Path, legacy_pid_path: &Path) -> Option<RunningDaemon> {
+    if let Some(state) = read_daemon_state(state_path) {
+        if is_apas_daemon_process(state.pid) {
+            return Some(RunningDaemon {
+                pid: state.pid,
+                version: Some(state.version),
+            });
+        }
+        let _ = fs::remove_file(state_path);
+    }
+
+    let legacy_pid = read_legacy_daemon_pid(legacy_pid_path)?;
+    if is_apas_daemon_process(legacy_pid) {
+        return Some(RunningDaemon {
+            pid: legacy_pid,
+            version: None,
+        });
+    }
+    let _ = fs::remove_file(legacy_pid_path);
+    None
+}
+
+fn stop_daemon_process(pid: u32) -> Result<()> {
+    if !is_apas_daemon_process(pid) {
+        return Ok(());
+    }
+
+    let _ = Command::new("kill").arg(pid.to_string()).status();
+
+    for _ in 0..40 {
+        if !is_apas_daemon_process(pid) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let _ = Command::new("kill")
+        .arg("-9")
+        .arg(pid.to_string())
+        .status();
+
+    for _ in 0..20 {
+        if !is_apas_daemon_process(pid) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    anyhow::bail!("Failed to stop existing daemon process {}", pid)
+}
+
+fn read_daemon_state(path: &Path) -> Option<DaemonStateFile> {
+    let text = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<DaemonStateFile>(&text).ok()
+}
+
+fn write_daemon_state(path: &Path, state: &DaemonStateFile) -> Result<()> {
+    let content = serde_json::to_string(state)?;
+    fs::write(path, content)?;
     Ok(())
+}
+
+fn read_legacy_daemon_pid(path: &Path) -> Option<u32> {
+    let text = fs::read_to_string(path).ok()?;
+    text.trim().parse::<u32>().ok()
 }
 
 fn is_apas_daemon_process(pid: u32) -> bool {

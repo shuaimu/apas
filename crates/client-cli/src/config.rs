@@ -65,6 +65,10 @@ impl Config {
         Ok(Self::config_dir()?.join("daemon.pid"))
     }
 
+    pub fn daemon_state_path() -> Result<PathBuf> {
+        Ok(Self::config_dir()?.join("daemon.json"))
+    }
+
     pub fn load() -> Result<Self> {
         let path = Self::config_path()?;
 
