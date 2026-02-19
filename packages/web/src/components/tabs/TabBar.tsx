@@ -1,6 +1,7 @@
 "use client";
 
 import { useRef, useEffect, useState } from "react";
+import { Code2, Sparkles } from "lucide-react";
 import { PaneConfig, paneKey } from "@/lib/store";
 
 interface TabBarProps {
@@ -9,8 +10,17 @@ interface TabBarProps {
   onSelectTab: (paneId: number) => void;
   onCloseTab: (paneId: number) => void;
   onAddTab: (provider?: string) => void;
+  onRebootCli?: () => void;
+  showRebootButton?: boolean;
   paneStatuses: Record<string, string | null>;
   pausedPanes: number[];
+}
+
+function ProviderIcon({ provider, className = "w-3.5 h-3.5" }: { provider: string; className?: string }) {
+  if (provider === "codex") {
+    return <Code2 className={className} aria-label="Codex" />;
+  }
+  return <Sparkles className={className} aria-label="Claude" />;
 }
 
 export function TabBar({
@@ -19,6 +29,8 @@ export function TabBar({
   onSelectTab,
   onCloseTab,
   onAddTab,
+  onRebootCli,
+  showRebootButton = false,
   paneStatuses,
   pausedPanes,
 }: TabBarProps) {
@@ -59,21 +71,21 @@ export function TabBar({
               }`}
               style={{ scrollSnapAlign: "start" }}
             >
-              {/* Status dot */}
-              {hasActivity && !isPaused && (
-                <span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse flex-shrink-0" />
-              )}
-              {isPaused && (
-                <span className="w-2 h-2 rounded-full bg-amber-500 flex-shrink-0" />
-              )}
-              {!hasActivity && !isPaused && (
-                <span
-                  className={`w-2 h-2 rounded-full flex-shrink-0 ${
-                    tab.provider === "codex" ? "bg-green-500" : "bg-blue-500"
-                  }`}
-                  title={tab.provider === "codex" ? "Codex" : "Claude"}
-                />
-              )}
+              {/* Provider icon + status badge */}
+              <span
+                className={`relative inline-flex items-center justify-center flex-shrink-0 ${
+                  tab.provider === "codex" ? "text-green-500" : "text-blue-500"
+                }`}
+                title={tab.provider === "codex" ? "Codex" : "Claude"}
+              >
+                <ProviderIcon provider={tab.provider} />
+                {hasActivity && !isPaused && (
+                  <span className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse" />
+                )}
+                {isPaused && (
+                  <span className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 rounded-full bg-amber-500" />
+                )}
+              </span>
 
               {/* Label */}
               <span className="truncate">
@@ -104,8 +116,21 @@ export function TabBar({
         })}
       </div>
 
-      {/* Add tab button with provider dropdown */}
-      <AddTabButton onAddTab={onAddTab} />
+      {/* Global tab-bar actions */}
+      <div className="flex items-center gap-1 pr-1">
+        <AddTabButton onAddTab={onAddTab} />
+        {showRebootButton && onRebootCli && (
+          <button
+            onClick={() => {
+              if (confirm("Are you sure you want to reboot the CLI?")) onRebootCli();
+            }}
+            className="px-2.5 h-8 my-1 text-xs font-medium rounded transition-colors bg-red-500 hover:bg-red-600 text-white"
+            title="Reboot CLI"
+          >
+            Reboot
+          </button>
+        )}
+      </div>
     </div>
   );
 }
@@ -142,7 +167,9 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string) => void }) {
             onClick={() => { onAddTab("claude"); setShowMenu(false); }}
             className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
           >
-            <span className="w-2 h-2 rounded-full bg-blue-500 flex-shrink-0" />
+            <span className="text-blue-500 flex-shrink-0">
+              <ProviderIcon provider="claude" className="w-4 h-4" />
+            </span>
             Claude Tab
           </button>
           <div className="border-t border-gray-100 dark:border-gray-700 my-0.5" />
@@ -150,7 +177,9 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string) => void }) {
             onClick={() => { onAddTab("codex"); setShowMenu(false); }}
             className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
           >
-            <span className="w-2 h-2 rounded-full bg-green-500 flex-shrink-0" />
+            <span className="text-green-500 flex-shrink-0">
+              <ProviderIcon provider="codex" className="w-4 h-4" />
+            </span>
             Codex Tab
           </button>
         </div>

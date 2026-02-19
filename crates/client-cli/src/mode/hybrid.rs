@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
-use shared::{CliToServer, ClaudeStreamMessage, ServerToCli};
+use shared::{ClaudeStreamMessage, CliToServer, ServerToCli};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -43,7 +43,10 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     let project_meta = project::get_or_create_project(working_dir)?;
     let session_id = project_meta.id;
     let project_name = project_meta.name.clone();
-    let prompt = project_meta.prompt.clone().unwrap_or_else(|| DEFAULT_PROMPT.to_string());
+    let prompt = project_meta
+        .prompt
+        .clone()
+        .unwrap_or_else(|| DEFAULT_PROMPT.to_string());
 
     // Channel for sending output to server (buffered to handle reconnections)
     let (server_tx, server_rx) = mpsc::channel::<CliToServer>(256);
@@ -66,7 +69,8 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
                 let _ = child.kill();
             }
         }
-    }).expect("Failed to set Ctrl+C handler");
+    })
+    .expect("Failed to set Ctrl+C handler");
 
     // Spawn server connection task (runs in background with auto-reconnect)
     let server_url_owned = server_url.to_string();
@@ -74,7 +78,15 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     let shutdown_clone = shutdown.clone();
     let working_dir_str = working_dir.to_string_lossy().to_string();
     let _server_task = tokio::spawn(async move {
-        run_server_connection(&server_url_owned, &token_owned, session_id, &working_dir_str, server_rx, shutdown_clone).await
+        run_server_connection(
+            &server_url_owned,
+            &token_owned,
+            session_id,
+            &working_dir_str,
+            server_rx,
+            shutdown_clone,
+        )
+        .await
     });
 
     // Run Claude with stream-json output (blocking I/O in a separate thread)
@@ -82,8 +94,18 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     let working_dir_owned = working_dir.to_path_buf();
     let shutdown_for_claude = shutdown.clone();
     let result = tokio::task::spawn_blocking(move || {
-        run_dead_loop_session(&claude_path_owned, &working_dir_owned, session_id, project_name, &prompt, server_tx, &shutdown_for_claude, child_process)
-    }).await?;
+        run_dead_loop_session(
+            &claude_path_owned,
+            &working_dir_owned,
+            session_id,
+            project_name,
+            &prompt,
+            server_tx,
+            &shutdown_for_claude,
+            child_process,
+        )
+    })
+    .await?;
 
     // Signal shutdown
     shutdown.store(true, Ordering::SeqCst);
@@ -135,7 +157,8 @@ fn run_dead_loop_session(
         // Run Claude with --print for this prompt
         let args = vec![
             "--print".to_string(),
-            "--output-format".to_string(), "stream-json".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
             "--verbose".to_string(),
             "--dangerously-skip-permissions".to_string(),
             prompt.to_string(),
@@ -158,9 +181,13 @@ fn run_dead_loop_session(
             }
         };
 
-        let stdout = child.stdout.take()
+        let stdout = child
+            .stdout
+            .take()
             .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout"))?;
-        let stderr = child.stderr.take()
+        let stderr = child
+            .stderr
+            .take()
             .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
 
         // Store child in shared handle so Ctrl+C handler can kill it
@@ -186,7 +213,8 @@ fn run_dead_loop_session(
                         || lower.contains("too many requests")
                         || lower.contains("quota exceeded")
                         || lower.contains("capacity")
-                        || lower.contains("overloaded") {
+                        || lower.contains("overloaded")
+                    {
                         rate_limit_clone.store(true, Ordering::SeqCst);
                     }
                 }
@@ -217,7 +245,13 @@ fn run_dead_loop_session(
             match serde_json::from_str::<ClaudeStreamMessage>(&line) {
                 Ok(ref message) => {
                     // Check for error results (rate limit, etc.)
-                    if let ClaudeStreamMessage::Result { is_error, subtype, result, .. } = message {
+                    if let ClaudeStreamMessage::Result {
+                        is_error,
+                        subtype,
+                        result,
+                        ..
+                    } = message
+                    {
                         if *is_error || subtype == "error" || subtype.contains("error") {
                             error_in_stream = true;
                             // Check if it's a rate limit specifically
@@ -225,7 +259,8 @@ fn run_dead_loop_session(
                             if lower_result.contains("rate")
                                 || lower_result.contains("limit")
                                 || lower_result.contains("quota")
-                                || lower_result.contains("capacity") {
+                                || lower_result.contains("capacity")
+                            {
                                 rate_limit_detected.store(true, Ordering::SeqCst);
                             }
                         }
@@ -262,10 +297,16 @@ fn run_dead_loop_session(
                 *guard = None; // Clear the handle
                 status
             } else {
-                Err(std::io::Error::new(std::io::ErrorKind::Other, "Child process not found"))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Child process not found",
+                ))
             }
         } else {
-            Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to lock child handle"))
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Failed to lock child handle",
+            ))
         };
 
         match &status {
@@ -278,13 +319,20 @@ fn run_dead_loop_session(
 
         // Check if we hit a rate limit or error
         let hit_rate_limit = rate_limit_detected.load(Ordering::SeqCst);
-        let had_error = error_in_stream || hit_rate_limit || !matches!(status, Ok(ref s) if s.success());
+        let had_error =
+            error_in_stream || hit_rate_limit || !matches!(status, Ok(ref s) if s.success());
 
         if had_error {
             if hit_rate_limit {
-                println!("\n[Rate limit detected! Backing off for {} seconds...]", backoff_seconds);
+                println!(
+                    "\n[Rate limit detected! Backing off for {} seconds...]",
+                    backoff_seconds
+                );
             } else {
-                println!("\n[Error detected. Backing off for {} seconds...]", backoff_seconds);
+                println!(
+                    "\n[Error detected. Backing off for {} seconds...]",
+                    backoff_seconds
+                );
             }
 
             // Wait with backoff (check shutdown flag periodically)
@@ -316,9 +364,18 @@ fn run_dead_loop_session(
 /// Print stream message locally for user visibility
 fn print_stream_message(message: &ClaudeStreamMessage) {
     match message {
-        ClaudeStreamMessage::System { subtype, model, tools, .. } => {
+        ClaudeStreamMessage::System {
+            subtype,
+            model,
+            tools,
+            ..
+        } => {
             if subtype == "init" {
-                println!("\n[Session started - Model: {}, Tools: {}]\n", model, tools.len());
+                println!(
+                    "\n[Session started - Model: {}, Tools: {}]\n",
+                    model,
+                    tools.len()
+                );
             }
         }
         ClaudeStreamMessage::Assistant { message: msg, .. } => {
@@ -328,13 +385,19 @@ fn print_stream_message(message: &ClaudeStreamMessage) {
                         println!("{}", text);
                     }
                     shared::ClaudeContentBlock::ToolUse { name, input, .. } => {
-                        println!("\n[Tool: {} - {}]\n", name, serde_json::to_string(input).unwrap_or_default());
+                        println!(
+                            "\n[Tool: {} - {}]\n",
+                            name,
+                            serde_json::to_string(input).unwrap_or_default()
+                        );
                     }
                     _ => {}
                 }
             }
         }
-        ClaudeStreamMessage::User { tool_use_result, .. } => {
+        ClaudeStreamMessage::User {
+            tool_use_result, ..
+        } => {
             if let Some(result) = tool_use_result {
                 if let Some(file_info) = result.get("file") {
                     if let Some(path) = file_info.get("filePath") {
@@ -343,8 +406,16 @@ fn print_stream_message(message: &ClaudeStreamMessage) {
                 }
             }
         }
-        ClaudeStreamMessage::Result { subtype, total_cost_usd, duration_ms, .. } => {
-            println!("\n[{} - Cost: ${:.4}, Duration: {}ms]\n", subtype, total_cost_usd, duration_ms);
+        ClaudeStreamMessage::Result {
+            subtype,
+            total_cost_usd,
+            duration_ms,
+            ..
+        } => {
+            println!(
+                "\n[{} - Cost: ${:.4}, Duration: {}ms]\n",
+                subtype, total_cost_usd, duration_ms
+            );
         }
     }
 }
@@ -365,7 +436,16 @@ async fn run_server_connection(
             break;
         }
 
-        match connect_to_server(server_url, token, session_id, working_dir, &mut output_rx, &shutdown).await {
+        match connect_to_server(
+            server_url,
+            token,
+            session_id,
+            working_dir,
+            &mut output_rx,
+            &shutdown,
+        )
+        .await
+        {
             Ok(_) => {
                 reconnect_delay = INITIAL_RECONNECT_DELAY;
             }
@@ -418,9 +498,15 @@ async fn connect_to_server(
                     ServerToCli::RegistrationFailed { reason } => {
                         return Err(anyhow::anyhow!("Registration failed: {}", reason));
                     }
-                    ServerToCli::VersionUnsupported { client_version, min_version } => {
+                    ServerToCli::VersionUnsupported {
+                        client_version,
+                        min_version,
+                    } => {
                         eprintln!("\n========================================");
-                        eprintln!("ERROR: Client version {} is no longer supported!", client_version);
+                        eprintln!(
+                            "ERROR: Client version {} is no longer supported!",
+                            client_version
+                        );
                         eprintln!("Minimum required version: {}", min_version);
                         eprintln!("Please update by running: apas update");
                         eprintln!("========================================\n");
@@ -439,9 +525,7 @@ async fn connect_to_server(
     }
 
     // Send SessionStart to register our local session with the server
-    let hostname = hostname::get()
-        .ok()
-        .and_then(|h| h.into_string().ok());
+    let hostname = hostname::get().ok().and_then(|h| h.into_string().ok());
     let session_start_msg = CliToServer::SessionStart {
         session_id,
         working_dir: Some(working_dir.to_string()),

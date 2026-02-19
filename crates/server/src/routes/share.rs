@@ -9,23 +9,17 @@ use chrono::{Duration, Utc};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    db::InvitationCode,
-    error::AppError,
-    routes::auth::verify_token,
-    state::AppState,
-};
+use crate::{db::InvitationCode, error::AppError, routes::auth::verify_token, state::AppState};
 
 const WEB_UI_URL: &str = "http://apas.mpaxos.com";
 
 // Helper to extract and verify JWT from Authorization header
-async fn extract_user_id(
-    state: &AppState,
-    auth_header: Option<&str>,
-) -> Result<String, AppError> {
+async fn extract_user_id(state: &AppState, auth_header: Option<&str>) -> Result<String, AppError> {
     let token = auth_header
         .and_then(|h| h.strip_prefix("Bearer "))
-        .ok_or_else(|| AppError::AuthError("Missing or invalid Authorization header".to_string()))?;
+        .ok_or_else(|| {
+            AppError::AuthError("Missing or invalid Authorization header".to_string())
+        })?;
 
     let claims = verify_token(token, &state.config.auth.jwt_secret)?;
     Ok(claims.sub)
@@ -91,7 +85,11 @@ pub async fn generate_code(
     };
     state.db.create_invitation_code(&invitation).await?;
 
-    tracing::info!("Generated share code {} for session {}", code, req.session_id);
+    tracing::info!(
+        "Generated share code {} for session {}",
+        code,
+        req.session_id
+    );
 
     Ok(Json(GenerateCodeResponse {
         share_url: format!("{}/share?code={}", WEB_UI_URL, code),
@@ -171,10 +169,7 @@ pub async fn redeem_code(
         .await?;
 
     // Delete the used invitation code (no longer needed)
-    state
-        .db
-        .delete_invitation_code(&req.code)
-        .await?;
+    state.db.delete_invitation_code(&req.code).await?;
 
     tracing::info!(
         "User {} redeemed share code {} for session {}",
@@ -242,10 +237,7 @@ pub async fn list_shares(
         });
 
     // Get shares with user emails
-    let share_rows = state
-        .db
-        .get_session_shares_with_emails(&session_id)
-        .await?;
+    let share_rows = state.db.get_session_shares_with_emails(&session_id).await?;
 
     let shares: Vec<ShareInfo> = share_rows
         .into_iter()
@@ -257,7 +249,10 @@ pub async fn list_shares(
         })
         .collect();
 
-    Ok(Json(ShareListResponse { owner: owner_info, shares }))
+    Ok(Json(ShareListResponse {
+        owner: owner_info,
+        shares,
+    }))
 }
 
 /// Revoke a user's access to a session (owner only)

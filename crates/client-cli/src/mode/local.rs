@@ -25,4 +25,3 @@ pub async fn run(working_dir: &Path) -> Result<()> {
 
     Ok(())
 }
-

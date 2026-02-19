@@ -50,13 +50,17 @@ pub struct SmtpConfig {
     pub from_name: String,
 }
 
-fn default_true() -> bool { true }
-fn default_smtp_port() -> u16 { 587 }
+fn default_true() -> bool {
+    true
+}
+fn default_smtp_port() -> u16 {
+    587
+}
 
 impl Default for SmtpConfig {
     fn default() -> Self {
         Self {
-            enabled: true,  // Enable by default, using sendmail
+            enabled: true, // Enable by default, using sendmail
             use_sendmail: true,
             host: "".to_string(),
             port: 587,

@@ -370,8 +370,14 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
 
+    const { ws: currentWs, reconnectTimeout, visibilityHandler } = get();
+
+    // Avoid opening duplicate sockets while one is already active/connecting.
+    if (currentWs && (currentWs.readyState === WebSocket.OPEN || currentWs.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+
     // Clear any existing reconnect timeout
-    const { reconnectTimeout, visibilityHandler } = get();
     if (reconnectTimeout) {
       clearTimeout(reconnectTimeout);
       set({ reconnectTimeout: null });

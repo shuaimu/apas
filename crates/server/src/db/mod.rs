@@ -156,14 +156,12 @@ impl Database {
 
     // User operations
     pub async fn create_user(&self, user: &User) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO users (id, email, password_hash) VALUES (?, ?, ?)",
-        )
-        .bind(&user.id)
-        .bind(&user.email)
-        .bind(&user.password_hash)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?, ?, ?)")
+            .bind(&user.id)
+            .bind(&user.email)
+            .bind(&user.password_hash)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -235,11 +233,13 @@ impl Database {
     }
 
     pub async fn update_cli_client_status(&self, id: &str, status: &str) -> Result<()> {
-        sqlx::query("UPDATE cli_clients SET status = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ?")
-            .bind(status)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE cli_clients SET status = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(status)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -279,13 +279,11 @@ impl Database {
     }
 
     pub async fn update_session_status(&self, id: &str, status: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE sessions SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-        )
-        .bind(status)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE sessions SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+            .bind(status)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -399,7 +397,12 @@ impl Database {
     }
 
     // Session share operations
-    pub async fn create_session_share(&self, session_id: &str, user_id: &str, invited_by: &str) -> Result<()> {
+    pub async fn create_session_share(
+        &self,
+        session_id: &str,
+        user_id: &str,
+        invited_by: &str,
+    ) -> Result<()> {
         sqlx::query(
             "INSERT OR IGNORE INTO session_shares (session_id, user_id, invited_by) VALUES (?, ?, ?)",
         )
@@ -411,7 +414,10 @@ impl Database {
         Ok(())
     }
 
-    pub async fn get_shared_sessions_for_user(&self, user_id: &str) -> Result<Vec<(Session, String)>> {
+    pub async fn get_shared_sessions_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<(Session, String)>> {
         // Returns sessions shared with this user along with the owner's email
         let rows = sqlx::query(
             r#"
@@ -469,28 +475,27 @@ impl Database {
     }
 
     pub async fn delete_session_share(&self, session_id: &str, user_id: &str) -> Result<bool> {
-        let result = sqlx::query(
-            "DELETE FROM session_shares WHERE session_id = ? AND user_id = ?",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .execute(&self.pool)
-        .await?;
+        let result = sqlx::query("DELETE FROM session_shares WHERE session_id = ? AND user_id = ?")
+            .bind(session_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
         Ok(result.rows_affected() > 0)
     }
 
     pub async fn get_session_owner(&self, session_id: &str) -> Result<Option<String>> {
-        let owner = sqlx::query_scalar::<_, String>(
-            "SELECT user_id FROM sessions WHERE id = ?",
-        )
-        .bind(session_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let owner = sqlx::query_scalar::<_, String>("SELECT user_id FROM sessions WHERE id = ?")
+            .bind(session_id)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(owner)
     }
 
     /// Get session owner info (user_id and email)
-    pub async fn get_session_owner_info(&self, session_id: &str) -> Result<Option<(String, String)>> {
+    pub async fn get_session_owner_info(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(String, String)>> {
         let row = sqlx::query(
             r#"
             SELECT u.id, u.email
@@ -510,7 +515,10 @@ impl Database {
     }
 
     /// Get all users who have shared access to a session (with their emails)
-    pub async fn get_session_shares_with_emails(&self, session_id: &str) -> Result<Vec<(String, String, Option<String>)>> {
+    pub async fn get_session_shares_with_emails(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(String, String, Option<String>)>> {
         let rows = sqlx::query(
             r#"
             SELECT u.id, u.email, ss.created_at
@@ -524,10 +532,13 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows.iter().map(|r| {
-            use sqlx::Row;
-            (r.get("id"), r.get("email"), r.get("created_at"))
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| {
+                use sqlx::Row;
+                (r.get("id"), r.get("email"), r.get("created_at"))
+            })
+            .collect())
     }
 
     // ========================================================================
@@ -553,20 +564,20 @@ impl Database {
     /// Get active session count (sessions with activity in last 24 hours)
     pub async fn get_active_session_count(&self) -> Result<i64> {
         let row: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM sessions WHERE updated_at > datetime('now', '-1 day')"
+            "SELECT COUNT(*) FROM sessions WHERE updated_at > datetime('now', '-1 day')",
         )
-            .fetch_one(&self.pool)
-            .await?;
+        .fetch_one(&self.pool)
+        .await?;
         Ok(row.0)
     }
 
     /// Get users created in last 7 days
     pub async fn get_recent_user_count(&self) -> Result<i64> {
         let row: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM users WHERE created_at > datetime('now', '-7 days')"
+            "SELECT COUNT(*) FROM users WHERE created_at > datetime('now', '-7 days')",
         )
-            .fetch_one(&self.pool)
-            .await?;
+        .fetch_one(&self.pool)
+        .await?;
         Ok(row.0)
     }
 
@@ -587,18 +598,23 @@ impl Database {
     }
 
     /// Get recent users (last 10 registered)
-    pub async fn get_recent_users(&self, limit: i32) -> Result<Vec<(String, String, Option<String>)>> {
-        let rows = sqlx::query(
-            "SELECT id, email, created_at FROM users ORDER BY created_at DESC LIMIT ?"
-        )
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?;
+    pub async fn get_recent_users(
+        &self,
+        limit: i32,
+    ) -> Result<Vec<(String, String, Option<String>)>> {
+        let rows =
+            sqlx::query("SELECT id, email, created_at FROM users ORDER BY created_at DESC LIMIT ?")
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?;
 
-        Ok(rows.iter().map(|r| {
-            use sqlx::Row;
-            (r.get("id"), r.get("email"), r.get("created_at"))
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| {
+                use sqlx::Row;
+                (r.get("id"), r.get("email"), r.get("created_at"))
+            })
+            .collect())
     }
 
     /// Get sessions per day for last N days
@@ -610,15 +626,18 @@ impl Database {
             WHERE created_at > datetime('now', '-' || ? || ' days')
             GROUP BY date(created_at)
             ORDER BY day DESC
-            "#
+            "#,
         )
-            .bind(days)
-            .fetch_all(&self.pool)
-            .await?;
+        .bind(days)
+        .fetch_all(&self.pool)
+        .await?;
 
-        Ok(rows.iter().map(|r| {
-            use sqlx::Row;
-            (r.get("day"), r.get("count"))
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| {
+                use sqlx::Row;
+                (r.get("day"), r.get("count"))
+            })
+            .collect())
     }
 }

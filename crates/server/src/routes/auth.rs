@@ -13,12 +13,14 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{db::User, error::AppError, state::{AppState, DeviceCodeState, PasswordResetState}};
+use crate::{
+    db::User,
+    error::AppError,
+    state::{AppState, DeviceCodeState, PasswordResetState},
+};
 use lettre::{
-    message::header::ContentType,
-    transport::smtp::authentication::Credentials,
-    AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
-    AsyncSendmailTransport,
+    message::header::ContentType, transport::smtp::authentication::Credentials,
+    AsyncSendmailTransport, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
 };
 
 #[derive(Debug, Deserialize)]
@@ -101,8 +103,8 @@ pub async fn login(
         .ok_or_else(|| AppError::AuthError("Invalid email or password".to_string()))?;
 
     // Verify password
-    let parsed_hash = PasswordHash::new(&user.password_hash)
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let parsed_hash =
+        PasswordHash::new(&user.password_hash).map_err(|e| AppError::Internal(e.to_string()))?;
     Argon2::default()
         .verify_password(req.password.as_bytes(), &parsed_hash)
         .map_err(|_| AppError::AuthError("Invalid email or password".to_string()))?;
@@ -142,9 +144,14 @@ pub async fn me(
     }))
 }
 
-fn generate_token(user_id: &str, auth_config: &crate::config::AuthConfig) -> Result<String, AppError> {
+fn generate_token(
+    user_id: &str,
+    auth_config: &crate::config::AuthConfig,
+) -> Result<String, AppError> {
     let expiration = chrono::Utc::now()
-        .checked_add_signed(chrono::Duration::hours(auth_config.token_expiry_hours as i64))
+        .checked_add_signed(chrono::Duration::hours(
+            auth_config.token_expiry_hours as i64,
+        ))
         .ok_or_else(|| AppError::Internal("Failed to calculate expiration".to_string()))?
         .timestamp() as usize;
 
@@ -254,8 +261,12 @@ pub async fn device_poll(
 
     match removed {
         Some((code, code_state)) => {
-            tracing::info!("Found device code {}, user_id: {:?}, expires_at: {:?}",
-                code, code_state.user_id, code_state.expires_at);
+            tracing::info!(
+                "Found device code {}, user_id: {:?}, expires_at: {:?}",
+                code,
+                code_state.user_id,
+                code_state.expires_at
+            );
 
             if code_state.expires_at <= Utc::now() {
                 tracing::info!("Device code {} expired", code);
@@ -332,7 +343,10 @@ pub async fn forgot_password(
 
     // Always return success to prevent email enumeration
     if user.is_none() {
-        tracing::info!("Password reset requested for non-existent email: {}", req.email);
+        tracing::info!(
+            "Password reset requested for non-existent email: {}",
+            req.email
+        );
         return Ok(Json(serde_json::json!({
             "success": true,
             "message": "If your email is registered, you will receive a password reset link."
@@ -361,14 +375,19 @@ pub async fn forgot_password(
     if state.config.smtp.enabled {
         let reset_url = format!("{}/reset-password?token={}", WEB_UI_URL, token);
 
-        if let Err(e) = send_password_reset_email(&state.config.smtp, &req.email, &reset_url).await {
+        if let Err(e) = send_password_reset_email(&state.config.smtp, &req.email, &reset_url).await
+        {
             tracing::error!("Failed to send password reset email: {}", e);
             // Don't expose email errors to user
         } else {
             tracing::info!("Password reset email sent to {}", req.email);
         }
     } else {
-        tracing::warn!("SMTP not configured, password reset token: {} for {}", token, req.email);
+        tracing::warn!(
+            "SMTP not configured, password reset token: {} for {}",
+            token,
+            req.email
+        );
     }
 
     Ok(Json(serde_json::json!({
@@ -384,10 +403,14 @@ pub async fn reset_password(
     Json(req): Json<ResetPasswordRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Clean up expired tokens
-    state.password_reset_tokens.retain(|_, v| v.expires_at > Utc::now());
+    state
+        .password_reset_tokens
+        .retain(|_, v| v.expires_at > Utc::now());
 
     // Validate token
-    let reset_state = state.password_reset_tokens.get(&req.token)
+    let reset_state = state
+        .password_reset_tokens
+        .get(&req.token)
         .ok_or_else(|| AppError::BadRequest("Invalid or expired reset token".to_string()))?;
 
     if reset_state.expires_at <= Utc::now() {
@@ -400,7 +423,9 @@ pub async fn reset_password(
 
     // Validate password length
     if req.password.len() < 6 {
-        return Err(AppError::BadRequest("Password must be at least 6 characters".to_string()));
+        return Err(AppError::BadRequest(
+            "Password must be at least 6 characters".to_string(),
+        ));
     }
 
     // Hash new password
@@ -412,7 +437,10 @@ pub async fn reset_password(
         .to_string();
 
     // Update password in database
-    let updated = state.db.update_user_password(&email, &password_hash).await?;
+    let updated = state
+        .db
+        .update_user_password(&email, &password_hash)
+        .await?;
 
     if !updated {
         return Err(AppError::Internal("Failed to update password".to_string()));
@@ -469,15 +497,13 @@ async fn send_password_reset_email(
         mailer.send(email).await?;
     } else {
         // Use SMTP server
-        let creds = Credentials::new(
-            smtp_config.username.clone(),
-            smtp_config.password.clone(),
-        );
+        let creds = Credentials::new(smtp_config.username.clone(), smtp_config.password.clone());
 
-        let mailer: AsyncSmtpTransport<Tokio1Executor> = AsyncSmtpTransport::<Tokio1Executor>::relay(&smtp_config.host)?
-            .credentials(creds)
-            .port(smtp_config.port)
-            .build();
+        let mailer: AsyncSmtpTransport<Tokio1Executor> =
+            AsyncSmtpTransport::<Tokio1Executor>::relay(&smtp_config.host)?
+                .credentials(creds)
+                .port(smtp_config.port)
+                .build();
 
         mailer.send(email).await?;
     }
@@ -543,8 +569,13 @@ pub async fn admin_list_users(
 
     let users = state.db.get_all_users().await?;
 
-    Ok(Json(users.into_iter().map(|u| UserInfo {
-        id: u.id,
-        email: u.email,
-    }).collect()))
+    Ok(Json(
+        users
+            .into_iter()
+            .map(|u| UserInfo {
+                id: u.id,
+                email: u.email,
+            })
+            .collect(),
+    ))
 }

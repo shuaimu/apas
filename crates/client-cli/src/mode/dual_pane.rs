@@ -1,8 +1,7 @@
 //! Tab-based mode: Multiple independent Claude sessions as tabs
 //!
-//! Starts with two default tabs:
-//! - Tab 1: Deadloop (autonomous worker)
-//! - Tab 2: Interactive session
+//! New projects start with one default tab:
+//! - Interactive session
 //!
 //! Users can create and close tabs dynamically from both TUI and web UI.
 
@@ -70,9 +69,10 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     let mut metadata = get_or_create_project(working_dir)?;
     let session_id = metadata.id;
 
-    // Get or create Claude session IDs for persistence across restarts
-    let deadloop_claude_session_id = metadata.get_or_create_deadloop_session_id();
-    let interactive_claude_session_id = metadata.get_or_create_interactive_session_id();
+    // Persist migrated metadata and ensure there is always at least one pane.
+    if metadata.panes.is_empty() {
+        metadata.panes = shared::PaneConfig::defaults();
+    }
     save_project(working_dir, &metadata)?;
 
     let prompt = metadata
@@ -85,6 +85,43 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     let server_url = server_url.to_string();
     let token = token.to_string();
 
+    // Build startup pane list from persisted metadata.
+    let mut tabs_to_restore: Vec<(
+        u32,
+        Uuid,
+        String,
+        shared::PaneMode,
+        Provider,
+        Option<String>,
+        bool,
+    )> = metadata
+        .panes
+        .iter()
+        .map(|pane| {
+            let label = pane.label.clone().unwrap_or_else(|| match pane.pane_id {
+                shared::PANE_ID_DEADLOOP => "Deadloop".to_string(),
+                shared::PANE_ID_INTERACTIVE => "Interactive".to_string(),
+                _ => format!("Tab {}", pane.pane_id),
+            });
+            let is_paused = if pane.pane_id == shared::PANE_ID_DEADLOOP {
+                pane.is_paused || metadata.is_paused
+            } else {
+                pane.is_paused
+            };
+
+            (
+                pane.pane_id,
+                pane.session_id,
+                label,
+                pane.mode.clone(),
+                pane.provider,
+                pane.prompt.clone(),
+                is_paused,
+            )
+        })
+        .collect();
+    tabs_to_restore.sort_by_key(|(pane_id, ..)| *pane_id);
+
     // Channel for sending to server
     let (server_tx, server_rx) = tokio_mpsc::channel::<CliToServer>(256);
 
@@ -93,78 +130,18 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
 
     // Per-pane pause flags (for deadloop panes)
     let pane_pauses: PanePauses = Arc::new(Mutex::new(HashMap::new()));
-    let deadloop_pause = Arc::new(AtomicBool::new(metadata.is_paused));
-    {
-        let mut pauses = pane_pauses.lock().unwrap();
-        pauses.insert(shared::PANE_ID_DEADLOOP, deadloop_pause.clone());
-    }
 
     // Reboot flag
     let reboot_requested = Arc::new(AtomicBool::new(false));
 
     // Per-pane metadata (mode, prompt, child process)
     let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
-    let deadloop_child: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
-    {
-        let mut metas = pane_metas.lock().unwrap();
-        metas.insert(
-            shared::PANE_ID_DEADLOOP,
-            PaneMeta {
-                mode: shared::PaneMode::Deadloop,
-                provider: Provider::Claude,
-                prompt: Some(prompt.clone()),
-                child_process: deadloop_child.clone(),
-            },
-        );
-        metas.insert(
-            shared::PANE_ID_INTERACTIVE,
-            PaneMeta {
-                mode: shared::PaneMode::Interactive,
-                provider: Provider::Claude,
-                prompt: None,
-                child_process: Arc::new(Mutex::new(None)),
-            },
-        );
-    }
 
     // Per-pane input channels
     let input_channels: InputChannels = Arc::new(Mutex::new(HashMap::new()));
 
     // Track pane_id -> claude_session_id for persistence
     let pane_sessions: Arc<Mutex<HashMap<u32, Uuid>>> = Arc::new(Mutex::new(HashMap::new()));
-    {
-        let mut ps = pane_sessions.lock().unwrap();
-        ps.insert(shared::PANE_ID_DEADLOOP, deadloop_claude_session_id);
-        ps.insert(shared::PANE_ID_INTERACTIVE, interactive_claude_session_id);
-    }
-
-    // Collect dynamic tabs to restore from .apas metadata
-    let dynamic_tabs_to_restore: Vec<(
-        u32,
-        Uuid,
-        String,
-        shared::PaneMode,
-        Provider,
-        Option<String>,
-    )> = metadata
-        .panes
-        .iter()
-        .filter(|p| {
-            p.pane_id != shared::PANE_ID_DEADLOOP && p.pane_id != shared::PANE_ID_INTERACTIVE
-        })
-        .map(|p| {
-            (
-                p.pane_id,
-                p.session_id,
-                p.label
-                    .clone()
-                    .unwrap_or_else(|| format!("Tab {}", p.pane_id)),
-                p.mode.clone(),
-                p.provider.clone(),
-                p.prompt.clone(),
-            )
-        })
-        .collect();
 
     // TUI channels
     let (tui_input_tx, tui_input_rx) = mpsc::channel::<(u32, String)>();
@@ -172,12 +149,64 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     let (event_tx, event_rx) = mpsc::channel::<TuiEvent>();
     let (command_tx, command_rx) = mpsc::channel::<TuiCommand>();
 
-    // Create per-pane input channel for the interactive pane
-    // Both TUI and web input are routed through this single channel via input_channels
-    let (interactive_input_tx, interactive_input_rx) = mpsc::channel::<PaneInput>();
+    // Startup payloads for initial pane sessions.
+    let mut deadloop_startups: Vec<(
+        u32,
+        Uuid,
+        Provider,
+        String,
+        Arc<AtomicBool>,
+        Arc<Mutex<Option<std::process::Child>>>,
+    )> = Vec::new();
+    let mut interactive_startups: Vec<(u32, Uuid, Provider, mpsc::Receiver<PaneInput>)> =
+        Vec::new();
     {
+        let mut pauses = pane_pauses.lock().unwrap();
+        let mut metas = pane_metas.lock().unwrap();
         let mut channels = input_channels.lock().unwrap();
-        channels.insert(shared::PANE_ID_INTERACTIVE, interactive_input_tx);
+        let mut sessions = pane_sessions.lock().unwrap();
+
+        for (pane_id, pane_session_id, _, mode, provider, tab_prompt, is_paused) in &tabs_to_restore
+        {
+            let child_proc: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
+            metas.insert(
+                *pane_id,
+                PaneMeta {
+                    mode: mode.clone(),
+                    provider: *provider,
+                    prompt: tab_prompt.clone(),
+                    child_process: child_proc.clone(),
+                },
+            );
+            sessions.insert(*pane_id, *pane_session_id);
+
+            if *mode == shared::PaneMode::Deadloop {
+                let pause_flag = Arc::new(AtomicBool::new(*is_paused));
+                pauses.insert(*pane_id, pause_flag.clone());
+                let dl_prompt = tab_prompt.clone().unwrap_or_else(|| prompt.clone());
+                deadloop_startups.push((
+                    *pane_id,
+                    *pane_session_id,
+                    *provider,
+                    dl_prompt,
+                    pause_flag,
+                    child_proc,
+                ));
+            } else {
+                let (input_tx, input_rx) = mpsc::channel::<PaneInput>();
+                channels.insert(*pane_id, input_tx);
+                interactive_startups.push((*pane_id, *pane_session_id, *provider, input_rx));
+            }
+        }
+    }
+
+    let initial_tabs: Vec<(u32, String, shared::PaneMode)> = tabs_to_restore
+        .iter()
+        .map(|(pane_id, _, label, mode, ..)| (*pane_id, label.clone(), mode.clone()))
+        .collect();
+
+    if initial_tabs.is_empty() {
+        tracing::warn!("No panes available to restore; UI will start with no tabs.");
     }
 
     // Setup Ctrl+C handler
@@ -230,170 +259,96 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
         })
     };
 
-    // Send initial messages
-    let _ = output_tx.send(PaneOutput {
-        text: "[Deadloop pane initializing...]".to_string(),
-        pane_id: shared::PANE_ID_DEADLOOP,
-    });
-    let _ = output_tx.send(PaneOutput {
-        text: "[Interactive pane initializing...]".to_string(),
-        pane_id: shared::PANE_ID_INTERACTIVE,
-    });
-
-    if metadata.is_paused {
-        let _ = output_tx.send(PaneOutput {
-            text: "[Deadloop starting in paused state (from previous session)]".to_string(),
-            pane_id: shared::PANE_ID_DEADLOOP,
-        });
-    }
-
-    // Spawn deadloop session thread
-    let deadloop_thread = {
-        let output_tx = output_tx.clone();
-        let server_tx = server_tx.clone();
-        let shutdown = shutdown.clone();
-        let pause = deadloop_pause.clone();
-        let working_dir = working_dir_str.clone();
-        let claude_path = claude_path.clone();
-        let child_process = deadloop_child.clone();
-        let prompt = prompt.clone();
-        thread::spawn(move || {
-            run_deadloop_session(
-                &claude_path,
-                &working_dir,
-                session_id,
-                deadloop_claude_session_id,
-                shared::PANE_ID_DEADLOOP,
-                &prompt,
-                &Provider::Claude,
-                output_tx,
-                server_tx,
-                shutdown,
-                pause,
-                child_process,
-            )
-        })
-    };
-
-    // Spawn centralized input router — routes TUI input to correct pane via input_channels
-    spawn_centralized_input_router(tui_input_rx, input_channels.clone(), shutdown.clone());
-
-    // Spawn interactive session thread
-    let interactive_thread = {
-        let output_tx = output_tx.clone();
-        let server_tx = server_tx.clone();
-        let shutdown = shutdown.clone();
-        let working_dir = working_dir_str.clone();
-        let claude_path = claude_path.clone();
-        thread::spawn(move || {
-            run_pane_session(
-                &claude_path,
-                &working_dir,
-                session_id,
-                interactive_claude_session_id,
-                shared::PANE_ID_INTERACTIVE,
-                &Provider::Claude,
-                interactive_input_rx,
-                output_tx,
-                server_tx,
-                shutdown,
-            )
-        })
-    };
-
-    // Restore dynamic tabs from .apas metadata
-    for (pane_id, claude_session_id, label, mode, provider, tab_prompt) in &dynamic_tabs_to_restore
-    {
-        let child_proc: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
+    // Send initial messages for restored panes.
+    for (pane_id, _, label, mode, _, _, is_paused) in &tabs_to_restore {
+        let init_text = if *pane_id == shared::PANE_ID_DEADLOOP
+            && *mode == shared::PaneMode::Deadloop
         {
-            let mut metas = pane_metas.lock().unwrap();
-            metas.insert(
-                *pane_id,
-                PaneMeta {
-                    mode: mode.clone(),
-                    provider: provider.clone(),
-                    prompt: tab_prompt.clone(),
-                    child_process: child_proc.clone(),
-                },
-            );
-        }
+            "[Deadloop pane initializing...]".to_string()
+        } else if *pane_id == shared::PANE_ID_INTERACTIVE && *mode == shared::PaneMode::Interactive
         {
-            let mut ps = pane_sessions.lock().unwrap();
-            ps.insert(*pane_id, *claude_session_id);
-        }
+            "[Interactive pane initializing...]".to_string()
+        } else {
+            format!("[Restored tab: {}]", label)
+        };
         let _ = output_tx.send(PaneOutput {
-            text: format!("[Restored tab: {}]", label),
+            text: init_text,
             pane_id: *pane_id,
         });
 
+        if *mode == shared::PaneMode::Deadloop && *is_paused {
+            let paused_text = if *pane_id == shared::PANE_ID_DEADLOOP {
+                "[Deadloop starting in paused state (from previous session)]".to_string()
+            } else {
+                "[Bot starting in paused state (from previous session)]".to_string()
+            };
+            let _ = output_tx.send(PaneOutput {
+                text: paused_text,
+                pane_id: *pane_id,
+            });
+        }
+    }
+
+    // Spawn centralized input router — routes TUI input to correct pane via input_channels.
+    spawn_centralized_input_router(tui_input_rx, input_channels.clone(), shutdown.clone());
+
+    // Spawn pane session threads for restored panes.
+    let mut pane_threads = Vec::new();
+
+    for (pane_id, pane_session_id, provider, dl_prompt, pause_flag, child_process) in
+        deadloop_startups
+    {
+        let output_tx = output_tx.clone();
+        let server_tx = server_tx.clone();
+        let shutdown = shutdown.clone();
+        let working_dir = working_dir_str.clone();
+        let sid = session_id;
         let binary_path = match provider {
             Provider::Claude => claude_path.clone(),
             Provider::Codex => codex_path.clone(),
         };
+        pane_threads.push(thread::spawn(move || {
+            run_deadloop_session(
+                &binary_path,
+                &working_dir,
+                sid,
+                pane_session_id,
+                pane_id,
+                &dl_prompt,
+                &provider,
+                output_tx,
+                server_tx,
+                shutdown,
+                pause_flag,
+                child_process,
+            )
+        }));
+    }
 
-        if *mode == shared::PaneMode::Deadloop {
-            // Deadloop tab: spawn deadloop session with its own pause flag
-            let pause_flag = Arc::new(AtomicBool::new(false));
-            {
-                let mut pauses = pane_pauses.lock().unwrap();
-                pauses.insert(*pane_id, pause_flag.clone());
-            }
-            let output_tx = output_tx.clone();
-            let server_tx = server_tx.clone();
-            let shutdown = shutdown.clone();
-            let working_dir = working_dir_str.clone();
-            let sid = session_id;
-            let csid = *claude_session_id;
-            let pid = *pane_id;
-            let dl_prompt = tab_prompt.clone().unwrap_or_else(|| prompt.clone());
-            let child_proc = child_proc.clone();
-            let prov = provider.clone();
-            thread::spawn(move || {
-                run_deadloop_session(
-                    &binary_path,
-                    &working_dir,
-                    sid,
-                    csid,
-                    pid,
-                    &dl_prompt,
-                    &prov,
-                    output_tx,
-                    server_tx,
-                    shutdown,
-                    pause_flag,
-                    child_proc,
-                )
-            });
-        } else {
-            // Interactive tab: spawn interactive session
-            let (input_tx, input_rx) = mpsc::channel::<PaneInput>();
-            {
-                let mut channels = input_channels.lock().unwrap();
-                channels.insert(*pane_id, input_tx);
-            }
-            let output_tx = output_tx.clone();
-            let server_tx = server_tx.clone();
-            let shutdown = shutdown.clone();
-            let working_dir = working_dir_str.clone();
-            let sid = session_id;
-            let csid = *claude_session_id;
-            let pid = *pane_id;
-            let prov = provider.clone();
-            thread::spawn(move || {
-                run_pane_session(
-                    &binary_path,
-                    &working_dir,
-                    sid,
-                    csid,
-                    pid,
-                    &prov,
-                    input_rx,
-                    output_tx,
-                    server_tx,
-                    shutdown,
-                )
-            });
-        }
+    for (pane_id, pane_session_id, provider, input_rx) in interactive_startups {
+        let output_tx = output_tx.clone();
+        let server_tx = server_tx.clone();
+        let shutdown = shutdown.clone();
+        let working_dir = working_dir_str.clone();
+        let sid = session_id;
+        let binary_path = match provider {
+            Provider::Claude => claude_path.clone(),
+            Provider::Codex => codex_path.clone(),
+        };
+        pane_threads.push(thread::spawn(move || {
+            run_pane_session(
+                &binary_path,
+                &working_dir,
+                sid,
+                pane_session_id,
+                pane_id,
+                &provider,
+                input_rx,
+                output_tx,
+                server_tx,
+                shutdown,
+            )
+        }));
     }
 
     // TUI event handler thread — processes AddTab/CloseTab events
@@ -430,23 +385,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
         })
     };
 
-    // Run TUI in main thread
-    let mut initial_tabs = vec![
-        (
-            shared::PANE_ID_DEADLOOP,
-            "Deadloop".to_string(),
-            shared::PaneMode::Deadloop,
-        ),
-        (
-            shared::PANE_ID_INTERACTIVE,
-            "Interactive".to_string(),
-            shared::PaneMode::Interactive,
-        ),
-    ];
-    // Add restored dynamic tabs
-    for (pane_id, _, label, mode, _, _) in &dynamic_tabs_to_restore {
-        initial_tabs.push((*pane_id, label.clone(), mode.clone()));
-    }
+    // Run TUI in main thread.
     let mut app = App::new(tui_input_tx, output_rx, event_tx, command_rx, initial_tabs)
         .with_shutdown(shutdown.clone());
     if let Err(e) = app.run() {
@@ -474,9 +413,10 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
         std::process::exit(1);
     }
 
-    // Wait for threads
-    let _ = deadloop_thread.join();
-    let _ = interactive_thread.join();
+    // Wait for threads.
+    for thread in pane_threads {
+        let _ = thread.join();
+    }
     let _ = tui_event_thread.join();
     server_task.abort();
 

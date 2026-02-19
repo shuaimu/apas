@@ -57,7 +57,10 @@ pub async fn login(server_url: &str) -> Result<String> {
     println!();
     println!("   \x1b[4m{}\x1b[0m", device_code.url);
     println!();
-    println!("\x1b[90mWaiting for login... (expires in {} seconds)\x1b[0m", device_code.expires_in);
+    println!(
+        "\x1b[90mWaiting for login... (expires in {} seconds)\x1b[0m",
+        device_code.expires_in
+    );
 
     // 3. Poll for completion
     let poll_interval = Duration::from_secs(2);
@@ -88,7 +91,10 @@ pub async fn login(server_url: &str) -> Result<String> {
 
         if !poll_resp.status().is_success() {
             if attempt % 5 == 0 {
-                eprintln!("\x1b[33mPoll returned {}, retrying...\x1b[0m", poll_resp.status());
+                eprintln!(
+                    "\x1b[33mPoll returned {}, retrying...\x1b[0m",
+                    poll_resp.status()
+                );
             }
             continue;
         }

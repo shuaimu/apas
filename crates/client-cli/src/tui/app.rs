@@ -69,17 +69,31 @@ pub enum TuiEvent {
     },
     CloseTab(u32),
     /// Start bot (deadloop) on an existing interactive pane
-    StartBot { pane_id: u32, prompt: Option<String> },
+    StartBot {
+        pane_id: u32,
+        prompt: Option<String>,
+    },
     /// Stop bot on a deadloop pane (revert to interactive)
-    StopBot { pane_id: u32 },
+    StopBot {
+        pane_id: u32,
+    },
 }
 
 /// Commands sent back to the TUI from event handlers
 #[derive(Debug)]
 pub enum TuiCommand {
-    AddTab { pane_id: u32, label: String, mode: PaneMode },
-    RemoveTab { pane_id: u32 },
-    SetMode { pane_id: u32, mode: PaneMode },
+    AddTab {
+        pane_id: u32,
+        label: String,
+        mode: PaneMode,
+    },
+    RemoveTab {
+        pane_id: u32,
+    },
+    SetMode {
+        pane_id: u32,
+        mode: PaneMode,
+    },
 }
 
 /// Main TUI application state
@@ -193,7 +207,11 @@ impl App {
     fn process_commands(&mut self) {
         while let Ok(cmd) = self.command_rx.try_recv() {
             match cmd {
-                TuiCommand::AddTab { pane_id, label, mode } => {
+                TuiCommand::AddTab {
+                    pane_id,
+                    label,
+                    mode,
+                } => {
                     self.add_tab(pane_id, label, mode);
                     // Switch to newly created tab
                     self.active_tab = self.tabs.len() - 1;
@@ -290,18 +308,24 @@ impl App {
                 }
                 KeyCode::Enter => {
                     // Deadloop tabs don't accept user input
-                    if tab.mode == PaneMode::Deadloop { return; }
+                    if tab.mode == PaneMode::Deadloop {
+                        return;
+                    }
                     if !tab.input.is_empty() {
                         let input = std::mem::take(&mut tab.input);
                         let _ = self.input_tx.send((tab.pane_id, input));
                     }
                 }
                 KeyCode::Char(c) => {
-                    if tab.mode == PaneMode::Deadloop { return; }
+                    if tab.mode == PaneMode::Deadloop {
+                        return;
+                    }
                     tab.input.push(c);
                 }
                 KeyCode::Backspace => {
-                    if tab.mode == PaneMode::Deadloop { return; }
+                    if tab.mode == PaneMode::Deadloop {
+                        return;
+                    }
                     tab.input.pop();
                 }
                 KeyCode::Up => {
@@ -375,14 +399,8 @@ impl App {
                     Style::default().fg(Color::Black).bg(Color::White).bold(),
                 ));
             } else {
-                spans.push(Span::styled(
-                    num,
-                    Style::default().fg(Color::Gray),
-                ));
-                spans.push(Span::styled(
-                    label,
-                    Style::default().fg(Color::Gray),
-                ));
+                spans.push(Span::styled(num, Style::default().fg(Color::Gray)));
+                spans.push(Span::styled(label, Style::default().fg(Color::Gray)));
             }
 
             // Separator
@@ -393,8 +411,7 @@ impl App {
         spans.push(Span::styled(" + ", Style::default().fg(Color::DarkGray)));
 
         let line = Line::from(spans);
-        let paragraph = Paragraph::new(line)
-            .style(Style::default().bg(Color::DarkGray));
+        let paragraph = Paragraph::new(line).style(Style::default().bg(Color::DarkGray));
         frame.render_widget(paragraph, area);
     }
 
@@ -426,7 +443,9 @@ impl App {
 
         // --- Output area ---
         let viewport_width = content_layout[0].width as usize;
-        let content_lines: u16 = tab.output.iter()
+        let content_lines: u16 = tab
+            .output
+            .iter()
             .map(|line| {
                 if line.is_empty() || viewport_width == 0 {
                     1
@@ -458,7 +477,11 @@ impl App {
         let input_block = Block::default()
             .title(if is_deadloop { " Bot Mode " } else { " Input " })
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(if is_deadloop { Color::DarkGray } else { Color::Green }));
+            .border_style(Style::default().fg(if is_deadloop {
+                Color::DarkGray
+            } else {
+                Color::Green
+            }));
 
         let input_inner = input_block.inner(content_layout[1]);
         frame.render_widget(input_block, content_layout[1]);
@@ -468,8 +491,11 @@ impl App {
         } else {
             format!("{}_", tab.input)
         };
-        let input_paragraph = Paragraph::new(input_text)
-            .style(if is_deadloop { Style::default().fg(Color::DarkGray) } else { Style::default() });
+        let input_paragraph = Paragraph::new(input_text).style(if is_deadloop {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default()
+        });
         frame.render_widget(input_paragraph, input_inner);
     }
 
@@ -486,26 +512,28 @@ impl App {
             tab_info
         );
 
-        let paragraph = Paragraph::new(status)
-            .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+        let paragraph =
+            Paragraph::new(status).style(Style::default().bg(Color::DarkGray).fg(Color::White));
         frame.render_widget(paragraph, area);
     }
 }
 
 /// Create channels for TUI communication
 pub fn create_channels() -> (
-    Sender<(u32, String)>,    // input_tx: (pane_id, text)
-    Receiver<(u32, String)>,  // input_rx
-    Sender<PaneOutput>,       // output_tx
-    Receiver<PaneOutput>,     // output_rx
-    Sender<TuiEvent>,         // event_tx
-    Receiver<TuiEvent>,       // event_rx
-    Sender<TuiCommand>,       // command_tx
-    Receiver<TuiCommand>,     // command_rx
+    Sender<(u32, String)>,   // input_tx: (pane_id, text)
+    Receiver<(u32, String)>, // input_rx
+    Sender<PaneOutput>,      // output_tx
+    Receiver<PaneOutput>,    // output_rx
+    Sender<TuiEvent>,        // event_tx
+    Receiver<TuiEvent>,      // event_rx
+    Sender<TuiCommand>,      // command_tx
+    Receiver<TuiCommand>,    // command_rx
 ) {
     let (input_tx, input_rx) = mpsc::channel();
     let (output_tx, output_rx) = mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel();
     let (command_tx, command_rx) = mpsc::channel();
-    (input_tx, input_rx, output_tx, output_rx, event_tx, event_rx, command_tx, command_rx)
+    (
+        input_tx, input_rx, output_tx, output_rx, event_tx, event_rx, command_tx, command_rx,
+    )
 }

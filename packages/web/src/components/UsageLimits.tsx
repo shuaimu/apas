@@ -8,6 +8,7 @@ function formatTimeUntilReset(resetsAt: string | undefined): string {
 
   const now = new Date();
   const resetDate = new Date(resetsAt);
+  if (Number.isNaN(resetDate.getTime())) return "";
   const diffMs = resetDate.getTime() - now.getTime();
 
   if (diffMs <= 0) return "resetting...";
@@ -23,6 +24,53 @@ function formatTimeUntilReset(resetsAt: string | undefined): string {
     return `${hours}h ${minutes}m`;
   }
   return `${minutes}m`;
+}
+
+function formatResetDateTime(resetsAt: string | undefined): string {
+  if (!resetsAt) return "";
+
+  const now = new Date();
+  const resetDate = new Date(resetsAt);
+  if (Number.isNaN(resetDate.getTime())) return "";
+
+  const sameDay = resetDate.toDateString() === now.toDateString();
+  const sameYear = resetDate.getFullYear() === now.getFullYear();
+
+  if (sameDay) {
+    return new Intl.DateTimeFormat(undefined, {
+      hour: "numeric",
+      minute: "2-digit",
+    }).format(resetDate);
+  }
+
+  if (sameYear) {
+    return new Intl.DateTimeFormat(undefined, {
+      weekday: "short",
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    }).format(resetDate);
+  }
+
+  return new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(resetDate);
+}
+
+function formatResetMeta(resetsAt: string | undefined): string {
+  if (!resetsAt) return "";
+  const relative = formatTimeUntilReset(resetsAt);
+  const absolute = formatResetDateTime(resetsAt);
+
+  if (relative === "resetting...") return relative;
+  if (relative && absolute) return `${relative} · resets ${absolute}`;
+  if (absolute) return `resets ${absolute}`;
+  return relative;
 }
 
 function getUtilizationColor(utilization: number): string {
@@ -48,6 +96,7 @@ interface UsageBarProps {
 function UsageBar({ label, utilization, resetsAt }: UsageBarProps) {
   const percentage = Math.min(utilization * 100, 100);
   const displayPercentage = (utilization * 100).toFixed(0);
+  const resetMeta = formatResetMeta(resetsAt);
 
   return (
     <div className="space-y-1">
@@ -55,9 +104,9 @@ function UsageBar({ label, utilization, resetsAt }: UsageBarProps) {
         <span className="text-gray-600 dark:text-gray-400">{label}</span>
         <span className={`font-medium ${getTextColor(utilization)}`}>
           {displayPercentage}%
-          {resetsAt && (
+          {resetMeta && (
             <span className="text-gray-500 ml-1">
-              ({formatTimeUntilReset(resetsAt)})
+              ({resetMeta})
             </span>
           )}
         </span>
@@ -77,22 +126,47 @@ interface UsageLimitsDisplayProps {
   compact?: boolean;
 }
 
+interface CompactUsageWindow {
+  label: string;
+  utilization: number;
+  resetsAt: string | undefined;
+}
+
 export function UsageLimitsDisplay({ limits, compact = false }: UsageLimitsDisplayProps) {
   if (!limits.fiveHour && !limits.sevenDay) {
     return null;
   }
 
   if (compact) {
-    // Compact mode: just show the most concerning limit
-    const sevenDayUtil = limits.sevenDay?.utilization ?? 0;
-    const fiveHourUtil = limits.fiveHour?.utilization ?? 0;
-    const maxUtil = Math.max(sevenDayUtil, fiveHourUtil);
-    const percentage = (maxUtil * 100).toFixed(0);
+    // In compact mode, prefer weekly usage whenever available.
+    const primary: CompactUsageWindow | null = limits.sevenDay
+      ? {
+          label: "Weekly",
+          utilization: limits.sevenDay.utilization,
+          resetsAt: limits.sevenDay.resetsAt,
+        }
+      : limits.fiveHour
+      ? {
+          label: "5h",
+          utilization: limits.fiveHour.utilization,
+          resetsAt: limits.fiveHour.resetsAt,
+        }
+      : null;
+
+    if (!primary) return null;
+
+    const percentage = (primary.utilization * 100).toFixed(0);
+    const resetMeta = formatResetMeta(primary.resetsAt);
 
     return (
-      <div className={`flex items-center gap-1 text-xs ${getTextColor(maxUtil)}`}>
-        <div className={`w-2 h-2 rounded-full ${getUtilizationColor(maxUtil)}`} />
+      <div className={`flex items-center gap-1 text-xs ${getTextColor(primary.utilization)}`}>
+        <div className={`w-2 h-2 rounded-full ${getUtilizationColor(primary.utilization)}`} />
         <span>{percentage}% used</span>
+        {resetMeta && (
+          <span className="text-gray-500 dark:text-gray-400">
+            · {primary.label.toLowerCase()} {resetMeta}
+          </span>
+        )}
       </div>
     );
   }

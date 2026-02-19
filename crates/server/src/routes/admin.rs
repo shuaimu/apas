@@ -1,12 +1,8 @@
-use axum::{
-    extract::State,
-    http::HeaderMap,
-    Json,
-};
+use axum::{extract::State, http::HeaderMap, Json};
 use serde::Serialize;
 
-use crate::{error::AppError, state::AppState};
 use super::auth::verify_token;
+use crate::{error::AppError, state::AppState};
 
 /// Admin email - only this user can access admin endpoints
 const ADMIN_EMAIL: &str = "shuai@cs.stonybrook.edu";

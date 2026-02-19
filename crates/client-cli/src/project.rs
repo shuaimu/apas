@@ -65,7 +65,9 @@ impl ProjectMetadata {
         if self.panes.is_empty() {
             // Migrate from legacy fields
             let deadloop_session = self.deadloop_claude_session_id.unwrap_or_else(Uuid::new_v4);
-            let interactive_session = self.interactive_claude_session_id.unwrap_or_else(Uuid::new_v4);
+            let interactive_session = self
+                .interactive_claude_session_id
+                .unwrap_or_else(Uuid::new_v4);
 
             self.panes = vec![
                 PaneConfig {
@@ -96,7 +98,11 @@ impl ProjectMetadata {
     pub fn get_or_create_deadloop_session_id(&mut self) -> Uuid {
         self.migrate_legacy();
         // Find the first deadloop pane
-        if let Some(pane) = self.panes.iter().find(|p| p.pane_id == shared::PANE_ID_DEADLOOP) {
+        if let Some(pane) = self
+            .panes
+            .iter()
+            .find(|p| p.pane_id == shared::PANE_ID_DEADLOOP)
+        {
             return pane.session_id;
         }
         // Fallback to legacy field
@@ -113,7 +119,11 @@ impl ProjectMetadata {
     pub fn get_or_create_interactive_session_id(&mut self) -> Uuid {
         self.migrate_legacy();
         // Find the first interactive pane
-        if let Some(pane) = self.panes.iter().find(|p| p.pane_id == shared::PANE_ID_INTERACTIVE) {
+        if let Some(pane) = self
+            .panes
+            .iter()
+            .find(|p| p.pane_id == shared::PANE_ID_INTERACTIVE)
+        {
             return pane.session_id;
         }
         // Fallback to legacy field
@@ -150,10 +160,7 @@ pub fn get_or_create_project(dir: &Path) -> Result<ProjectMetadata> {
         Ok(metadata)
     } else {
         // Create new metadata with directory name as project name
-        let name = dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(String::from);
+        let name = dir.file_name().and_then(|n| n.to_str()).map(String::from);
 
         let metadata = ProjectMetadata {
             id: Uuid::new_v4(),

@@ -109,9 +109,15 @@ async fn run_connection(
                     ServerToCli::RegistrationFailed { reason } => {
                         return Err(anyhow::anyhow!("Registration failed: {}", reason));
                     }
-                    ServerToCli::VersionUnsupported { client_version, min_version } => {
+                    ServerToCli::VersionUnsupported {
+                        client_version,
+                        min_version,
+                    } => {
                         eprintln!("\n========================================");
-                        eprintln!("ERROR: Client version {} is no longer supported!", client_version);
+                        eprintln!(
+                            "ERROR: Client version {} is no longer supported!",
+                            client_version
+                        );
                         eprintln!("Minimum required version: {}", min_version);
                         eprintln!("Please update by running: apas update");
                         eprintln!("========================================\n");
@@ -194,7 +200,9 @@ async fn run_connection(
                             }
                         });
                     }
-                    Ok(ServerToCli::Input { session_id, data, .. }) => {
+                    Ok(ServerToCli::Input {
+                        session_id, data, ..
+                    }) => {
                         // Forward input to the appropriate Claude process
                         let processes = processes.lock().await;
                         if let Some(sender) = processes.get(&session_id) {
@@ -202,11 +210,7 @@ async fn run_connection(
                         }
                     }
                     Ok(ServerToCli::Signal { session_id, signal }) => {
-                        tracing::info!(
-                            "Received signal {} for session {}",
-                            signal,
-                            session_id
-                        );
+                        tracing::info!("Received signal {} for session {}", signal, session_id);
                         // TODO: Forward signal to Claude process
                     }
                     Ok(ServerToCli::SessionDisconnected { session_id }) => {

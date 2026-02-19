@@ -33,7 +33,11 @@ async fn async_main() -> Result<()> {
 
     // Load configuration
     let config = config::Config::load()?;
-    tracing::info!("Starting APAS server on {}:{}", config.server.host, config.server.port);
+    tracing::info!(
+        "Starting APAS server on {}:{}",
+        config.server.host,
+        config.server.port
+    );
 
     // Initialize database
     let db = db::Database::new(&config.database.path).await?;

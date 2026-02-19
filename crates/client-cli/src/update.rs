@@ -102,10 +102,7 @@ fn get_source_version() -> Option<String> {
     let commit_count = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
     // Get date in YY.MM format
-    let output = Command::new("date")
-        .args(["+%y.%m"])
-        .output()
-        .ok()?;
+    let output = Command::new("date").args(["+%y.%m"]).output().ok()?;
 
     let date = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
@@ -151,8 +148,8 @@ fn pull_and_build() -> Result<PathBuf> {
 
 /// Install a new binary by replacing the current one
 fn install_binary(new_binary: &PathBuf) -> Result<()> {
-    let current_exe = get_current_exe()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine executable path"))?;
+    let current_exe =
+        get_current_exe().ok_or_else(|| anyhow::anyhow!("Cannot determine executable path"))?;
 
     // Backup and replace
     let backup_path = current_exe.with_extension("old");
@@ -203,9 +200,7 @@ pub async fn check_and_update() -> Result<()> {
 
     // Get new version
     let current_exe = get_current_exe().unwrap();
-    let output = Command::new(&current_exe)
-        .args(["--version"])
-        .output();
+    let output = Command::new(&current_exe).args(["--version"]).output();
 
     let new_version = output
         .map(|o| {
@@ -281,7 +276,10 @@ pub fn check_and_upgrade_on_boot() {
             return;
         }
 
-        eprintln!("[Auto-update] Update available: {} -> {}", CURRENT_VERSION, remote_version_str);
+        eprintln!(
+            "[Auto-update] Update available: {} -> {}",
+            CURRENT_VERSION, remote_version_str
+        );
     } else {
         eprintln!("[Auto-update] New commits available, updating...");
     }

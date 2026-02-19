@@ -118,6 +118,7 @@ export function TabbedView() {
   // Active tab state, persisted per project
   const [activeTabId, setActiveTabId] = useState<number | null>(null);
   const prevTabIdsRef = useRef<number[]>([]);
+  const shouldAutoSelectNewTabRef = useRef(false);
 
   // Stable list of tab IDs (avoids re-running effects on every message)
   const tabIds = useMemo(
@@ -146,10 +147,11 @@ export function TabbedView() {
       return;
     }
     const added = ids.filter((id) => !prevIds.includes(id));
-    if (added.length > 0) {
+    if (added.length > 0 && shouldAutoSelectNewTabRef.current) {
       const nextActive = added[added.length - 1];
       setActiveTabId(nextActive);
       setProjectLayout(cliClientId, "active_tab", String(nextActive));
+      shouldAutoSelectNewTabRef.current = false;
     }
     prevTabIdsRef.current = ids;
   }, [cliClientId, tabIds]);
@@ -188,6 +190,7 @@ export function TabbedView() {
   const handleAddTab = useCallback((provider: string = "claude") => {
     const prefix = provider === "codex" ? "Codex" : "Claude";
     const label = `${prefix} ${effectiveTabs.length + 1}`;
+    shouldAutoSelectNewTabRef.current = true;
     addPane(provider, "interactive", label);
   }, [addPane, effectiveTabs.length]);
 
@@ -283,6 +286,8 @@ export function TabbedView() {
         onSelectTab={handleSelectTab}
         onCloseTab={handleCloseTab}
         onAddTab={handleAddTab}
+        onRebootCli={rebootCli}
+        showRebootButton={isAttached}
         paneStatuses={paneStatuses}
         pausedPanes={pausedPanes}
       />
@@ -344,16 +349,6 @@ export function TabbedView() {
         <div className="flex-1" />
 
         {/* Actions */}
-        {isAttached && (
-          <button
-            onClick={() => {
-              if (confirm("Are you sure you want to reboot the CLI?")) rebootCli();
-            }}
-            className="px-2.5 py-1 text-xs font-medium rounded transition-colors bg-red-500 hover:bg-red-600 text-white"
-          >
-            Reboot
-          </button>
-        )}
         <button
           onClick={downloadSession}
           className="px-2.5 py-1 text-xs font-medium rounded transition-colors bg-blue-500 hover:bg-blue-600 text-white"

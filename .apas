@@ -5,22 +5,13 @@
   "prompt": null,
   "panes": [
     {
-      "pane_id": 231,
-      "provider": "codex",
+      "pane_id": 2,
+      "provider": "claude",
       "mode": "interactive",
-      "session_id": "883ffc60-637d-4faf-9198-dc42c9917d5c",
+      "session_id": "6df404b0-945c-4d2f-a0a0-a8b50bb314e4",
       "is_paused": false,
       "prompt": null,
-      "label": "Tab 231"
-    },
-    {
-      "pane_id": 276,
-      "provider": "codex",
-      "mode": "interactive",
-      "session_id": "61b97e62-b612-46dc-a3de-007d6ce3c9f7",
-      "is_paused": false,
-      "prompt": null,
-      "label": "Tab 276"
+      "label": "Interactive"
     },
     {
       "pane_id": 939,

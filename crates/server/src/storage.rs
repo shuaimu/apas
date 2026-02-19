@@ -92,7 +92,11 @@ impl FileStorage {
     }
 
     /// Read messages for a session, optionally limited to the most recent N
-    pub async fn get_messages_with_limit(&self, session_id: &Uuid, limit: Option<usize>) -> Result<Vec<StoredMessage>> {
+    pub async fn get_messages_with_limit(
+        &self,
+        session_id: &Uuid,
+        limit: Option<usize>,
+    ) -> Result<Vec<StoredMessage>> {
         let (messages, _) = self.get_messages_paginated(session_id, limit, None).await?;
         Ok(messages)
     }
@@ -164,7 +168,8 @@ impl FileStorage {
         pane_type: Option<shared::PaneType>,
     ) -> Result<(Vec<StoredMessage>, bool)> {
         let pane_filter = pane_type.map(|p| shared::PaneConfig::pane_id_from_legacy(&p));
-        self.get_messages_paginated_by_pane_id(session_id, limit, before_id, pane_filter).await
+        self.get_messages_paginated_by_pane_id(session_id, limit, before_id, pane_filter)
+            .await
     }
 
     /// Read messages for a session with pagination support, optionally filtered by pane_id
@@ -198,8 +203,10 @@ impl FileStorage {
                         let filter_str = filter.to_string();
                         // Match exact numeric pane_id, or legacy "deadloop"/"interactive" values
                         let matches = msg.pane_type.as_deref() == Some(&filter_str)
-                            || (filter == shared::PANE_ID_DEADLOOP && msg.pane_type.as_deref() == Some("deadloop"))
-                            || (filter == shared::PANE_ID_INTERACTIVE && msg.pane_type.as_deref() == Some("interactive"));
+                            || (filter == shared::PANE_ID_DEADLOOP
+                                && msg.pane_type.as_deref() == Some("deadloop"))
+                            || (filter == shared::PANE_ID_INTERACTIVE
+                                && msg.pane_type.as_deref() == Some("interactive"));
                         if matches {
                             all_messages.push(msg);
                         }
@@ -255,7 +262,8 @@ impl FileStorage {
         let mut lines = reader.lines();
 
         // Dynamic pane bucketing using HashMap instead of hardcoded categories
-        let mut pane_buckets: std::collections::HashMap<Option<String>, Vec<StoredMessage>> = std::collections::HashMap::new();
+        let mut pane_buckets: std::collections::HashMap<Option<String>, Vec<StoredMessage>> =
+            std::collections::HashMap::new();
 
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
@@ -278,7 +286,9 @@ impl FileStorage {
         }
 
         // Check if there are more messages than we're returning
-        let has_more = pane_buckets.values().any(|msgs| msgs.len() > limit_per_pane);
+        let has_more = pane_buckets
+            .values()
+            .any(|msgs| msgs.len() > limit_per_pane);
 
         // Take the most recent N messages from each bucket
         let mut combined = Vec::new();
