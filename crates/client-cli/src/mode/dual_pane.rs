@@ -586,6 +586,7 @@ fn handle_tui_events(
                         &input_channels,
                         session_id,
                         &pane_sessions,
+                        &pane_pauses,
                     ),
                 });
 
@@ -705,6 +706,7 @@ fn handle_tui_events(
                         &input_channels,
                         session_id,
                         &pane_sessions,
+                        &pane_pauses,
                     ),
                 });
 
@@ -766,6 +768,7 @@ fn handle_tui_events(
                         &input_channels,
                         session_id,
                         &pane_sessions,
+                        &pane_pauses,
                     ),
                 });
 
@@ -868,6 +871,7 @@ fn handle_tui_events(
                         &input_channels,
                         session_id,
                         &pane_sessions,
+                        &pane_pauses,
                     ),
                 });
 
@@ -978,6 +982,7 @@ fn handle_tui_events(
                         &input_channels,
                         session_id,
                         &pane_sessions,
+                        &pane_pauses,
                     ),
                 });
 
@@ -999,10 +1004,12 @@ fn build_pane_list(
     input_channels: &InputChannels,
     session_id: Uuid,
     pane_sessions: &Arc<Mutex<HashMap<u32, Uuid>>>,
+    pane_pauses: &PanePauses,
 ) -> Vec<shared::PaneConfig> {
     let metas = pane_metas.lock().unwrap();
     let channels = input_channels.lock().unwrap();
     let ps = pane_sessions.lock().unwrap();
+    let pauses = pane_pauses.lock().unwrap();
     let mut panes = Vec::new();
 
     // Build from metas (covers deadloop panes which don't have input channels)
@@ -1013,12 +1020,16 @@ fn build_pane_list(
             shared::PANE_ID_INTERACTIVE => "Interactive".to_string(),
             _ => format!("Tab {}", pane_id),
         };
+        let is_paused = pauses
+            .get(&pane_id)
+            .map(|f| f.load(Ordering::SeqCst))
+            .unwrap_or(false);
         panes.push(shared::PaneConfig {
             pane_id,
             provider: meta.provider.clone(),
             mode: meta.mode.clone(),
             session_id: claude_sid,
-            is_paused: false,
+            is_paused,
             prompt: meta.prompt.clone(),
             label: Some(label),
             model: None,
@@ -1976,7 +1987,7 @@ async fn run_server_connection(
                 // Send session start with pane list
                 let hostname = hostname::get().ok().and_then(|h| h.into_string().ok());
                 let pane_list =
-                    build_pane_list(&pane_metas, &input_channels, session_id, &pane_sessions);
+                    build_pane_list(&pane_metas, &input_channels, session_id, &pane_sessions, &pane_pauses);
 
                 let session_start = CliToServer::SessionStart {
                     session_id,

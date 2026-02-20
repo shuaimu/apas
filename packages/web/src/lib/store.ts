@@ -1070,7 +1070,14 @@ function handleServerMessage(
         ...pane,
         provider: normalizeProvider(pane.provider) ?? "claude",
       }));
-      set({ paneConfigs: panes });
+      // Sync is_paused from pane configs to pausedPanes state
+      const pausedPaneIds = panes.filter((p) => p.is_paused).map((p) => p.pane_id);
+      set({
+        paneConfigs: panes,
+        pausedPanes: pausedPaneIds,
+        // Legacy compat
+        isDeadloopPaused: pausedPaneIds.includes(PANE_ID_DEADLOOP),
+      });
       break;
     }
 
