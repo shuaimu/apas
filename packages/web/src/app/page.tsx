@@ -191,7 +191,7 @@ export default function Home() {
           `}
             style={{ width: typeof window !== 'undefined' && window.innerWidth >= 768 ? sidebarWidth : 256 }}
           >
-            <Sidebar onClose={() => setSidebarOpen(false)} onCollapse={toggleSidebarCollapsed} />
+            <Sidebar onClose={() => setSidebarOpen(false)} onCollapse={toggleSidebarCollapsed} width={typeof window !== 'undefined' && window.innerWidth >= 768 ? sidebarWidth : undefined} />
           </div>
 
           {/* Sidebar resize handle - only on desktop */}

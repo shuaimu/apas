@@ -44,6 +44,7 @@ function truncatePath(path: string, maxLength: number = 22): string {
 interface SidebarProps {
   onClose?: () => void;
   onCollapse?: () => void;
+  width?: number;
 }
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://apas.mpaxos.com:8080";
@@ -57,7 +58,7 @@ interface ShareUser {
 
 const ADMIN_USER_ID = "88b6016d-a8b4-400c-bdc9-f0120504a4fc";
 
-export function Sidebar({ onClose, onCollapse }: SidebarProps) {
+export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
   const { cliClients, sessions, attachSession, loadSessionMessages, refreshCliClients, listSessions, sessionId, connected, token, userId } = useStore();
   const [shareModalOpen, setShareModalOpen] = useState(false);
   const [mounted, setMounted] = useState(false);
@@ -363,7 +364,7 @@ export function Sidebar({ onClose, onCollapse }: SidebarProps) {
                       </div>
                     )}
                     <div className="font-medium overflow-hidden whitespace-nowrap" title={project.workingDir}>
-                      {truncatePath(project.workingDir)}
+                      {truncatePath(project.workingDir, width ? Math.max(12, Math.floor((width - 56) / 7.5)) : 22)}
                     </div>
                     <div className="text-xs text-gray-500 truncate">
                       {project.isShared ? (
