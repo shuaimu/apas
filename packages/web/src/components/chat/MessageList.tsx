@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef, useCallback, memo } from "react";
 import { useStore, Message } from "@/lib/store";
 import { UserMessage } from "./UserMessage";
 import { AssistantMessage } from "./AssistantMessage";
@@ -128,7 +128,7 @@ export function MessageList() {
     if (shouldAutoScroll.current && !isRestoringScroll.current) {
       messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }
-  }, [messages]);
+  }, [messages.length]);
 
   if (messages.length === 0) {
     return (
@@ -179,7 +179,7 @@ function formatTimestamp(date: Date): string {
   }
 }
 
-function MessageComponent({ message }: { message: Message }) {
+const MessageComponent = memo(function MessageComponent({ message }: { message: Message }) {
   switch (message.role) {
     case "user":
       return <UserMessage message={message} />;
@@ -195,4 +195,4 @@ function MessageComponent({ message }: { message: Message }) {
     default:
       return null;
   }
-}
+});

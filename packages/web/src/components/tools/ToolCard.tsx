@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { memo, useState } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -30,7 +30,7 @@ const toolIcons: Record<string, React.ReactNode> = {
   Glob: <Search className="w-4 h-4" />,
 };
 
-export function ToolCard({ tool, input, result, success, type }: ToolCardProps) {
+export const ToolCard = memo(function ToolCard({ tool, input, result, success, type }: ToolCardProps) {
   const [expanded, setExpanded] = useState(false);
 
   const icon = toolIcons[tool] || <Wrench className="w-4 h-4" />;
@@ -93,4 +93,4 @@ export function ToolCard({ tool, input, result, success, type }: ToolCardProps) 
       )}
     </div>
   );
-}
+});

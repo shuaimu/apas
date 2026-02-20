@@ -1,5 +1,6 @@
 "use client";
 
+import { memo } from "react";
 import { Message } from "@/lib/store";
 import { User } from "lucide-react";
 
@@ -19,7 +20,7 @@ function formatTimestamp(date: Date): string {
   }
 }
 
-export function UserMessage({ message }: UserMessageProps) {
+export const UserMessage = memo(function UserMessage({ message }: UserMessageProps) {
   return (
     <div className="flex gap-2 sm:gap-3 justify-end min-w-0">
       <div className="max-w-[85%] sm:max-w-[80%] min-w-0">
@@ -35,4 +36,4 @@ export function UserMessage({ message }: UserMessageProps) {
       </div>
     </div>
   );
-}
+});

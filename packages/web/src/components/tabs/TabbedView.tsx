@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useCallback, useEffect, useState, useMemo } from "react";
+import { useRef, useCallback, useEffect, useState, useMemo, memo } from "react";
 import { useStore, Message, PaneConfig, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, paneKey } from "@/lib/store";
 import { UserMessage } from "../chat/UserMessage";
 import { AssistantMessage } from "../chat/AssistantMessage";
@@ -79,7 +79,6 @@ export function TabbedView() {
   const hasMoreMessages = useStore((s) => s.hasMoreMessages);
   const isLoadingMore = useStore((s) => s.isLoadingMore);
   const cliClientId = useStore((s) => s.cliClientId);
-  const usageLimits = useStore((s) => s.usageLimits);
 
   const sendMessageToPane = useStore((s) => s.sendMessageToPane);
   const loadMoreMessages = useStore((s) => s.loadMoreMessages);
@@ -209,10 +208,16 @@ export function TabbedView() {
   const activeIsBot = activeConfig?.mode === "deadloop";
   const activeProvider = activeConfig?.provider;
 
-  const currentUsageLimits = useMemo(() => {
-    if (!cliClientId || !activeProvider) return null;
-    return usageLimits.get(cliClientId)?.[activeProvider] ?? null;
-  }, [activeProvider, cliClientId, usageLimits]);
+  // Use a targeted selector to avoid re-renders when unrelated usage limits change
+  const currentUsageLimits = useStore(
+    useCallback(
+      (s) => {
+        if (!cliClientId || !activeProvider) return null;
+        return s.usageLimits.get(cliClientId)?.[activeProvider] ?? null;
+      },
+      [cliClientId, activeProvider],
+    ),
+  );
 
   const usageLabel = useMemo(() => {
     if (!activeProvider) return "Usage";
@@ -409,6 +414,7 @@ function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore }: Messa
   const shouldAutoScroll = useRef(true);
   const prevScrollHeight = useRef<number>(0);
   const isRestoringScroll = useRef(false);
+  const scrollThrottleRef = useRef<number>(0);
 
   const scrollKey = getScrollKey(sessionId, paneId);
 
@@ -426,7 +432,14 @@ function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore }: Messa
 
   const handleScroll = useCallback(() => {
     if (isRestoringScroll.current) return;
+
+    // Always update auto-scroll flag (cheap check)
     shouldAutoScroll.current = checkIfAtBottom();
+
+    // Throttle the expensive parts (scroll position saving, load-more checks)
+    const now = Date.now();
+    if (now - scrollThrottleRef.current < 250) return;
+    scrollThrottleRef.current = now;
 
     if (containerRef.current) {
       scrollPositions.set(scrollKey, {
@@ -492,12 +505,12 @@ function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore }: Messa
     }
   }, [messages.length]);
 
-  // Auto-scroll for new messages
+  // Auto-scroll for new messages (only when count changes, not on every array ref change)
   useEffect(() => {
     if (shouldAutoScroll.current && !isRestoringScroll.current) {
       messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }
-  }, [messages]);
+  }, [messages.length]);
 
   if (messages.length === 0) {
     return (
@@ -529,7 +542,7 @@ function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore }: Messa
 
 // --- MessageComponent ---
 
-function MessageComponent({ message }: { message: Message }) {
+const MessageComponent = memo(function MessageComponent({ message }: { message: Message }) {
   switch (message.role) {
     case "user":
       return <UserMessage message={message} />;
@@ -544,7 +557,7 @@ function MessageComponent({ message }: { message: Message }) {
     default:
       return null;
   }
-}
+});
 
 // --- InteractiveInput ---
 

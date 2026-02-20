@@ -1,5 +1,6 @@
 "use client";
 
+import { memo } from "react";
 import { Message } from "@/lib/store";
 import { Bot } from "lucide-react";
 import ReactMarkdown from "react-markdown";
@@ -10,6 +11,14 @@ import { ApprovalPrompt } from "@/components/tools/ApprovalPrompt";
 
 interface AssistantMessageProps {
   message: Message;
+}
+
+interface CommandExecutionEventPreview {
+  command: string | null;
+  status: string | null;
+  exitCode: number | null;
+  aggregatedOutput: string | null;
+  formattedPayload: string;
 }
 
 function formatTimestamp(date: Date): string {
@@ -24,7 +33,72 @@ function formatTimestamp(date: Date): string {
   }
 }
 
-export function AssistantMessage({ message }: AssistantMessageProps) {
+function parseCommandExecutionEventPreview(content: string): CommandExecutionEventPreview | null {
+  const trimmed = content.trim();
+  if (!trimmed.startsWith("{") || !trimmed.includes("item.completed")) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as {
+      type?: string;
+      item?: {
+        type?: string;
+        command?: unknown;
+        status?: unknown;
+        exit_code?: unknown;
+        aggregated_output?: unknown;
+      };
+    };
+
+    if (parsed.type !== "item.completed" || parsed.item?.type !== "command_execution") {
+      return null;
+    }
+
+    const command = typeof parsed.item.command === "string" ? parsed.item.command : null;
+    const status = typeof parsed.item.status === "string" ? parsed.item.status : null;
+    const exitCode = typeof parsed.item.exit_code === "number" ? parsed.item.exit_code : null;
+    const aggregatedOutput = typeof parsed.item.aggregated_output === "string" ? parsed.item.aggregated_output : null;
+
+    return {
+      command,
+      status,
+      exitCode,
+      aggregatedOutput,
+      formattedPayload: JSON.stringify(parsed, null, 2),
+    };
+  } catch {
+    if (
+      !trimmed.includes('"type":"item.completed"') ||
+      !trimmed.includes('"type":"command_execution"') ||
+      !trimmed.includes('"aggregated_output"')
+    ) {
+      return null;
+    }
+
+    const commandMatch = trimmed.match(/"command":"([\s\S]*?)","aggregated_output":/);
+    const statusMatch = trimmed.match(/"status":"([^"]+)"/);
+    const exitCodeMatch = trimmed.match(/"exit_code":(-?\d+)/);
+    const aggregatedOutputMatch = trimmed.match(/"aggregated_output":"([\s\S]*?)","exit_code":/);
+
+    return {
+      command: commandMatch ? commandMatch[1] : null,
+      status: statusMatch ? statusMatch[1] : null,
+      exitCode: exitCodeMatch ? Number(exitCodeMatch[1]) : null,
+      aggregatedOutput: aggregatedOutputMatch ? aggregatedOutputMatch[1].replace(/\\n/g, "\n") : null,
+      formattedPayload: trimmed,
+    };
+  }
+}
+
+function truncateValue(value: string, max = 140): string {
+  if (value.length <= max) {
+    return value;
+  }
+  return `${value.slice(0, max)}...`;
+}
+
+export const AssistantMessage = memo(function AssistantMessage({ message }: AssistantMessageProps) {
   const outputType = message.outputType;
 
   return (
@@ -40,7 +114,7 @@ export function AssistantMessage({ message }: AssistantMessageProps) {
       </div>
     </div>
   );
-}
+});
 
 function renderContent(message: Message, outputType: Message["outputType"]) {
   if (!outputType) {
@@ -100,6 +174,39 @@ function renderContent(message: Message, outputType: Message["outputType"]) {
 }
 
 function TextContent({ content }: { content: string }) {
+  const commandExecutionEvent = parseCommandExecutionEventPreview(content);
+
+  if (commandExecutionEvent) {
+    const commandLabel = commandExecutionEvent.command
+      ? truncateValue(commandExecutionEvent.command)
+      : "command_execution";
+    const outputLineCount = commandExecutionEvent.aggregatedOutput
+      ? commandExecutionEvent.aggregatedOutput.split("\n").length
+      : null;
+    const metaParts = [
+      commandExecutionEvent.status ? `status: ${commandExecutionEvent.status}` : null,
+      commandExecutionEvent.exitCode !== null ? `exit: ${commandExecutionEvent.exitCode}` : null,
+      outputLineCount !== null ? `${outputLineCount} output lines` : null,
+    ].filter(Boolean);
+
+    return (
+      <div className="bg-gray-100 dark:bg-gray-800 rounded-2xl rounded-tl-sm px-3 sm:px-4 py-2 max-w-full">
+        <details>
+          <summary className="cursor-pointer select-none text-sm font-medium text-gray-700 dark:text-gray-200">
+            <span className="mr-2 rounded bg-gray-200 dark:bg-gray-700 px-2 py-0.5 text-xs font-semibold text-gray-600 dark:text-gray-300">
+              item.completed
+            </span>
+            <span className="break-all">{commandLabel}</span>
+          </summary>
+          {metaParts.length > 0 ? (
+            <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">{metaParts.join(" • ")}</div>
+          ) : null}
+          <CodeBlock code={commandExecutionEvent.formattedPayload} language="json" />
+        </details>
+      </div>
+    );
+  }
+
   return (
     <div className="bg-gray-100 dark:bg-gray-800 rounded-2xl rounded-tl-sm px-3 sm:px-4 py-2 prose dark:prose-invert prose-sm sm:prose-base max-w-full overflow-x-auto">
       <ReactMarkdown
