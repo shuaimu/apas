@@ -217,10 +217,25 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 working_dir,
                                 hostname,
                                 pane_type: _,
-                                panes: _,
+                                panes,
                             }) => {
                                 // CLI is starting a local session (hybrid mode)
                                 state.sessions.create_cli_session(session_id, cli_id);
+
+                                // Cache initial pane list if provided
+                                if let Some(pane_list) = &panes {
+                                    if !pane_list.is_empty() {
+                                        state.sessions.set_session_panes(&session_id, pane_list.clone());
+                                        // Forward to any already-attached web clients
+                                        state.sessions.route_to_web(
+                                            &session_id,
+                                            ServerToWeb::PaneList {
+                                                session_id,
+                                                panes: pane_list.clone(),
+                                            },
+                                        ).await;
+                                    }
+                                }
 
                                 // Persist session to database
                                 let session = crate::db::Session {
