@@ -411,7 +411,6 @@ fn ensure_daemon_running(server: &str, roots: &[String], target_version: &str) -
         .append(true)
         .open(&log_path)
         .unwrap_or_else(|_| fs::File::create("/dev/null").unwrap());
-    cmd.env("RUST_LOG", "info");
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(log_file));
