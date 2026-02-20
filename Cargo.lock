@@ -108,6 +108,7 @@ dependencies = [
  "dirs",
  "futures",
  "hostname",
+ "libc",
  "ratatui",
  "reqwest",
  "serde",

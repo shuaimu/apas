@@ -200,26 +200,32 @@ async fn main() -> Result<()> {
             Commands::Daemon { roots } => {
                 let state_path = config::Config::daemon_state_path()?;
                 let legacy_pid_path = config::Config::daemon_pid_path()?;
+                let my_pid = std::process::id();
                 if let Some(existing) = detect_running_daemon(&state_path, &legacy_pid_path) {
-                    let should_restart =
-                        should_restart_for_version(existing.version.as_deref(), CURRENT_VERSION);
-                    if should_restart {
-                        tracing::info!(
-                            "Restarting daemon pid {} due to older/unknown version {:?} -> {}",
-                            existing.pid,
-                            existing.version,
-                            CURRENT_VERSION
+                    // Skip if the detected PID is ourselves (auto-start wrote state before we ran)
+                    if existing.pid != my_pid {
+                        let should_restart = should_restart_for_version(
+                            existing.version.as_deref(),
+                            CURRENT_VERSION,
                         );
-                        stop_daemon_process(existing.pid)?;
-                    } else {
-                        println!(
-                            "Daemon already running (pid {}, version {}).",
-                            existing.pid,
-                            existing
-                                .version
-                                .unwrap_or_else(|| "unknown".to_string())
-                        );
-                        return Ok(());
+                        if should_restart {
+                            tracing::info!(
+                                "Restarting daemon pid {} due to older/unknown version {:?} -> {}",
+                                existing.pid,
+                                existing.version,
+                                CURRENT_VERSION
+                            );
+                            stop_daemon_process(existing.pid)?;
+                        } else {
+                            println!(
+                                "Daemon already running (pid {}, version {}).",
+                                existing.pid,
+                                existing
+                                    .version
+                                    .unwrap_or_else(|| "unknown".to_string())
+                            );
+                            return Ok(());
+                        }
                     }
                 }
 
@@ -399,9 +405,29 @@ fn ensure_daemon_running(server: &str, roots: &[String], target_version: &str) -
     for root in roots {
         cmd.arg("--root").arg(root);
     }
+    let log_path = state_path.with_file_name("daemon.log");
+    let log_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .unwrap_or_else(|_| fs::File::create("/dev/null").unwrap());
+    cmd.env("RUST_LOG", "info");
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::from(log_file));
+
+    // Detach daemon into its own session so it survives parent exit
+    // without becoming a zombie.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
 
     let child = cmd.spawn()?;
     let state = DaemonStateFile {
