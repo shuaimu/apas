@@ -90,9 +90,6 @@ export function TabbedView() {
   const stopBot = useStore((s) => s.stopBot);
   const rebootCli = useStore((s) => s.rebootCli);
   const downloadSession = useStore((s) => s.downloadSession);
-  // Legacy pause/resume for backward compat with CLI
-  const pauseDeadloop = useStore((s) => s.pauseDeadloop);
-  const resumeDeadloop = useStore((s) => s.resumeDeadloop);
 
   // Determine effective tabs: use paneConfigs from server, or synthesize from observed messages
   const effectiveTabs = useMemo(() => {
@@ -238,6 +235,12 @@ export function TabbedView() {
   const handleSend = useCallback(
     (text: string) => {
       if (activeTabId == null) return { success: false, error: "No active tab" };
+      if (activeIsBot) {
+        return {
+          success: false,
+          error: "This pane is in bot mode. Click Stop Bot to switch to interactive mode.",
+        };
+      }
       if (activeTabId === PANE_ID_MAIN) {
         const { ws } = useStore.getState();
         if (!ws || ws.readyState !== WebSocket.OPEN) return { success: false, error: "Not connected" };
@@ -246,19 +249,17 @@ export function TabbedView() {
       }
       return sendMessageToPane(text, activeTabId);
     },
-    [activeTabId, sendMessageToPane],
+    [activeIsBot, activeTabId, sendMessageToPane],
   );
 
   const handlePauseResume = useCallback(() => {
     if (activeTabId == null) return;
     if (activeIsPaused) {
       resumePane(activeTabId);
-      if (activeTabId === PANE_ID_DEADLOOP) resumeDeadloop();
     } else {
       pausePane(activeTabId);
-      if (activeTabId === PANE_ID_DEADLOOP) pauseDeadloop();
     }
-  }, [activeTabId, activeIsPaused, pausePane, resumePane, pauseDeadloop, resumeDeadloop]);
+  }, [activeTabId, activeIsPaused, pausePane, resumePane]);
 
   const handleStartBot = useCallback(() => {
     if (activeTabId == null) return;
@@ -391,9 +392,11 @@ export function TabbedView() {
 
       {/* Input box - disabled for running deadloop panes */}
       <div className="p-3 border-t border-gray-200 dark:border-gray-700 flex-shrink-0">
-        {activeIsBot && !activeIsPaused ? (
+        {activeIsBot ? (
           <div className="text-center text-sm text-gray-400 dark:text-gray-500 py-2">
-            Bot is running autonomously. Pause to send messages.
+            {activeIsPaused
+              ? "Bot is paused. Resume to continue autonomous mode, or Stop Bot to switch to interactive mode."
+              : "Bot is running autonomously. Pause or stop the bot to make changes."}
           </div>
         ) : (
           <InteractiveInput onSend={handleSend} />
