@@ -105,6 +105,7 @@ export function TabBar({
                       ? "opacity-60 hover:opacity-100"
                       : "opacity-0 group-hover:opacity-60 hover:!opacity-100"
                   }`}
+                  title="Close tab"
                 >
                   <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />

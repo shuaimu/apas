@@ -84,6 +84,9 @@ export interface MachineWithProjects {
   projects: MachineProject[];
 }
 
+// Map tool_use_id (e.g. "toolu_01Xwe...") to human-readable tool name (e.g. "Read", "Bash")
+const toolNameMap = new Map<string, string>();
+
 export type OutputType =
   | { type: "text" }
   | { type: "code"; language?: string }
@@ -1168,15 +1171,20 @@ function handleServerMessage(
               input: toolData.input,
             };
             displayContent = `Using ${toolData.name}: ${JSON.stringify(toolData.input)}`;
+            // Store id→name mapping so tool_result can look it up
+            if (toolData.id && toolData.name) {
+              toolNameMap.set(toolData.id as string, toolData.name as string);
+            }
           } catch {
             outputType = { type: "text" };
           }
         } else if (messageType === "tool_result") {
           try {
             const resultData = JSON.parse(content);
+            const toolUseId = resultData.tool_use_id as string;
             outputType = {
               type: "tool_result",
-              tool: resultData.tool_use_id as string,
+              tool: toolNameMap.get(toolUseId) || toolUseId,
               success: !resultData.is_error,
             };
             displayContent = resultData.content as string || content;
@@ -1329,6 +1337,10 @@ function handleServerMessage(
               };
               addMessageWithPaneRouting(set, get, assistantMessage, paneType, paneId);
             } else if (block.type === "tool_use") {
+              // Store id→name mapping so tool_result can look it up
+              if (block.id && block.name) {
+                toolNameMap.set(block.id as string, block.name as string);
+              }
               const toolMessage: Message = {
                 id: generateId(),
                 role: "assistant",
@@ -1346,6 +1358,7 @@ function handleServerMessage(
         if (content) {
           for (const block of content) {
             if (block.type === "tool_result") {
+              const toolUseId = block.tool_use_id as string;
               const toolResultMessage: Message = {
                 id: generateId(),
                 role: "assistant",
@@ -1353,7 +1366,7 @@ function handleServerMessage(
                 timestamp: new Date(),
                 outputType: {
                   type: "tool_result",
-                  tool: block.tool_use_id as string,
+                  tool: toolNameMap.get(toolUseId) || toolUseId,
                   success: !(block.is_error as boolean),
                 },
               };

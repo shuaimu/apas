@@ -310,6 +310,10 @@ export function TabbedView() {
                     ? "bg-green-500 hover:bg-green-600 text-white"
                     : "bg-amber-500 hover:bg-amber-600 text-white"
                 }`}
+                title={activeIsPaused
+                  ? "Resume autonomous bot execution"
+                  : "Pause the bot so you can send messages manually"
+                }
               >
                 {activeIsPaused ? (
                   <>
@@ -326,6 +330,7 @@ export function TabbedView() {
               <button
                 onClick={handleStopBot}
                 className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-red-500 hover:bg-red-600 text-white"
+                title="Stop the bot and end autonomous execution"
               >
                 <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h12v12H6z" /></svg>
                 Stop Bot
@@ -335,6 +340,7 @@ export function TabbedView() {
             <button
               onClick={handleStartBot}
               className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-green-500 hover:bg-green-600 text-white"
+              title="Start autonomous bot execution in this tab"
             >
               <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
               Start Bot
