@@ -275,6 +275,42 @@ impl Database {
         .bind(&session.status)
         .execute(&self.pool)
         .await?;
+
+        // Migrate shares from old sessions with same working_dir + hostname to this session.
+        // This handles the case where a .apas file is regenerated (new session ID) but
+        // shares still reference the old session ID.
+        if let (Some(working_dir), Some(hostname)) = (&session.working_dir, &session.hostname) {
+            let migrated = sqlx::query(
+                r#"
+                UPDATE session_shares SET session_id = ?
+                WHERE session_id IN (
+                    SELECT id FROM sessions
+                    WHERE working_dir = ? AND hostname = ? AND id != ?
+                )
+                AND user_id NOT IN (
+                    SELECT user_id FROM session_shares WHERE session_id = ?
+                )
+                "#,
+            )
+            .bind(&session.id)
+            .bind(working_dir)
+            .bind(hostname)
+            .bind(&session.id)
+            .bind(&session.id)
+            .execute(&self.pool)
+            .await?;
+
+            if migrated.rows_affected() > 0 {
+                tracing::info!(
+                    "Migrated {} share(s) from old sessions to new session {} ({}@{})",
+                    migrated.rows_affected(),
+                    session.id,
+                    working_dir,
+                    hostname
+                );
+            }
+        }
+
         Ok(())
     }
 

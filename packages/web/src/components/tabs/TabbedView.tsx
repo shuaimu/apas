@@ -82,8 +82,6 @@ export function TabbedView() {
 
   const sendMessageToPane = useStore((s) => s.sendMessageToPane);
   const loadMoreMessages = useStore((s) => s.loadMoreMessages);
-  const pausePane = useStore((s) => s.pausePane);
-  const resumePane = useStore((s) => s.resumePane);
   const addPane = useStore((s) => s.addPane);
   const removePane = useStore((s) => s.removePane);
   const startBot = useStore((s) => s.startBot);
@@ -252,15 +250,6 @@ export function TabbedView() {
     [activeIsBot, activeTabId, sendMessageToPane],
   );
 
-  const handlePauseResume = useCallback(() => {
-    if (activeTabId == null) return;
-    if (activeIsPaused) {
-      resumePane(activeTabId);
-    } else {
-      pausePane(activeTabId);
-    }
-  }, [activeTabId, activeIsPaused, pausePane, resumePane]);
-
   const handleStartBot = useCallback(() => {
     if (activeTabId == null) return;
     startBot(activeTabId);
@@ -300,43 +289,17 @@ export function TabbedView() {
 
       {/* Toolbar */}
       <div className="flex items-center gap-2 px-3 py-1.5 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30 flex-shrink-0">
-        {/* Start/Stop Bot + Pause/Resume */}
+        {/* Start/Stop Bot */}
         {isAttached && activeTabId != null && activeTabId !== PANE_ID_MAIN && (
           activeIsBot ? (
-            <>
-              <button
-                onClick={handlePauseResume}
-                className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors ${
-                  activeIsPaused
-                    ? "bg-green-500 hover:bg-green-600 text-white"
-                    : "bg-amber-500 hover:bg-amber-600 text-white"
-                }`}
-                title={activeIsPaused
-                  ? "Resume autonomous bot execution"
-                  : "Pause the bot so you can send messages manually"
-                }
-              >
-                {activeIsPaused ? (
-                  <>
-                    <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
-                    Resume Bot
-                  </>
-                ) : (
-                  <>
-                    <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z" /></svg>
-                    Pause Bot
-                  </>
-                )}
-              </button>
-              <button
-                onClick={handleStopBot}
-                className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-red-500 hover:bg-red-600 text-white"
-                title="Stop the bot and end autonomous execution"
-              >
-                <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h12v12H6z" /></svg>
-                Stop Bot
-              </button>
-            </>
+            <button
+              onClick={handleStopBot}
+              className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-red-500 hover:bg-red-600 text-white"
+              title="Request stop after current work finishes, then switch to interactive mode"
+            >
+              <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h12v12H6z" /></svg>
+              Stop Bot
+            </button>
           ) : (
             <button
               onClick={handleStartBot}
@@ -395,8 +358,8 @@ export function TabbedView() {
         {activeIsBot ? (
           <div className="text-center text-sm text-gray-400 dark:text-gray-500 py-2">
             {activeIsPaused
-              ? "Bot is paused. Resume to continue autonomous mode, or Stop Bot to switch to interactive mode."
-              : "Bot is running autonomously. Pause or stop the bot to make changes."}
+              ? "Bot is paused from previous state. Click Stop Bot to switch to interactive mode."
+              : "Bot is running autonomously. Click Stop Bot to switch to interactive mode after current work finishes."}
           </div>
         ) : (
           <InteractiveInput onSend={handleSend} />

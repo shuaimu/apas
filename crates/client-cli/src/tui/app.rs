@@ -77,6 +77,10 @@ pub enum TuiEvent {
     StopBot {
         pane_id: u32,
     },
+    /// Internal event: deadloop iteration completed after stop request, now switch mode.
+    FinalizeStopBot {
+        pane_id: u32,
+    },
 }
 
 /// Commands sent back to the TUI from event handlers

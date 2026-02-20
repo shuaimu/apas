@@ -43,6 +43,9 @@ type InputChannels = Arc<Mutex<HashMap<u32, mpsc::Sender<PaneInput>>>>;
 /// Per-pane pause flags (for deadloop panes).
 type PanePauses = Arc<Mutex<HashMap<u32, Arc<AtomicBool>>>>;
 
+/// Per-pane graceful stop requests (for deadloop panes).
+type PaneStopRequests = Arc<Mutex<HashMap<u32, Arc<AtomicBool>>>>;
+
 /// Per-pane metadata: mode, provider, prompt, and child process handle.
 #[derive(Clone)]
 struct PaneMeta {
@@ -131,6 +134,9 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     // Per-pane pause flags (for deadloop panes)
     let pane_pauses: PanePauses = Arc::new(Mutex::new(HashMap::new()));
 
+    // Per-pane graceful stop requests (for deadloop panes)
+    let pane_stop_requests: PaneStopRequests = Arc::new(Mutex::new(HashMap::new()));
+
     // Reboot flag
     let reboot_requested = Arc::new(AtomicBool::new(false));
 
@@ -156,12 +162,14 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
         Provider,
         String,
         Arc<AtomicBool>,
+        Arc<AtomicBool>,
         Arc<Mutex<Option<std::process::Child>>>,
     )> = Vec::new();
     let mut interactive_startups: Vec<(u32, Uuid, Provider, mpsc::Receiver<PaneInput>)> =
         Vec::new();
     {
         let mut pauses = pane_pauses.lock().unwrap();
+        let mut stop_requests = pane_stop_requests.lock().unwrap();
         let mut metas = pane_metas.lock().unwrap();
         let mut channels = input_channels.lock().unwrap();
         let mut sessions = pane_sessions.lock().unwrap();
@@ -182,7 +190,9 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
 
             if *mode == shared::PaneMode::Deadloop {
                 let pause_flag = Arc::new(AtomicBool::new(*is_paused));
+                let stop_flag = Arc::new(AtomicBool::new(false));
                 pauses.insert(*pane_id, pause_flag.clone());
+                stop_requests.insert(*pane_id, stop_flag.clone());
                 let dl_prompt = tab_prompt.clone().unwrap_or_else(|| prompt.clone());
                 deadloop_startups.push((
                     *pane_id,
@@ -190,6 +200,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
                     *provider,
                     dl_prompt,
                     pause_flag,
+                    stop_flag,
                     child_proc,
                 ));
             } else {
@@ -295,12 +306,13 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     // Spawn pane session threads for restored panes.
     let mut pane_threads = Vec::new();
 
-    for (pane_id, pane_session_id, provider, dl_prompt, pause_flag, child_process) in
+    for (pane_id, pane_session_id, provider, dl_prompt, pause_flag, stop_flag, child_process) in
         deadloop_startups
     {
         let output_tx = output_tx.clone();
         let server_tx = server_tx.clone();
         let shutdown = shutdown.clone();
+        let event_tx = event_tx.clone();
         let working_dir = working_dir_str.clone();
         let sid = session_id;
         let binary_path = match provider {
@@ -320,7 +332,9 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
                 server_tx,
                 shutdown,
                 pause_flag,
+                stop_flag,
                 child_process,
+                event_tx,
             )
         }));
     }
@@ -363,11 +377,14 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
         let codex_path_event = codex_path.clone();
         let pane_sessions_event = pane_sessions.clone();
         let pane_pauses_event = pane_pauses.clone();
+        let pane_stop_requests_event = pane_stop_requests.clone();
         let pane_metas_event = pane_metas.clone();
+        let event_tx_event = event_tx.clone();
         let default_prompt = prompt.clone();
         thread::spawn(move || {
             handle_tui_events(
                 event_rx,
+                event_tx_event,
                 shutdown,
                 output_tx_event,
                 server_tx_event,
@@ -379,6 +396,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
                 command_tx,
                 pane_sessions_event,
                 pane_pauses_event,
+                pane_stop_requests_event,
                 pane_metas_event,
                 &default_prompt,
             )
@@ -494,6 +512,7 @@ fn save_pane_configs(
 /// Handle TUI events (AddTab, CloseTab) in a background thread
 fn handle_tui_events(
     event_rx: mpsc::Receiver<TuiEvent>,
+    event_tx: mpsc::Sender<TuiEvent>,
     shutdown: Arc<AtomicBool>,
     output_tx: mpsc::Sender<PaneOutput>,
     server_tx: tokio_mpsc::Sender<CliToServer>,
@@ -505,6 +524,7 @@ fn handle_tui_events(
     command_tx: mpsc::Sender<TuiCommand>,
     pane_sessions: Arc<Mutex<HashMap<u32, Uuid>>>,
     pane_pauses: PanePauses,
+    pane_stop_requests: PaneStopRequests,
     pane_metas: PaneMetas,
     default_prompt: &str,
 ) {
@@ -646,14 +666,20 @@ fn handle_tui_events(
                 if mode == shared::PaneMode::Deadloop {
                     // Deadloop tab: spawn deadloop session with its own pause flag
                     let pause_flag = Arc::new(AtomicBool::new(false));
+                    let stop_flag = Arc::new(AtomicBool::new(false));
                     {
                         let mut pauses = pane_pauses.lock().unwrap();
                         pauses.insert(pane_id, pause_flag.clone());
+                    }
+                    {
+                        let mut stop_requests = pane_stop_requests.lock().unwrap();
+                        stop_requests.insert(pane_id, stop_flag.clone());
                     }
                     let dl_prompt = prompt.unwrap_or_else(|| default_prompt.to_string());
                     let output_tx = output_tx.clone();
                     let server_tx = server_tx.clone();
                     let shutdown = shutdown.clone();
+                    let event_tx = event_tx.clone();
                     let working_dir = working_dir.to_string();
                     thread::spawn(move || {
                         run_deadloop_session(
@@ -668,7 +694,9 @@ fn handle_tui_events(
                             server_tx,
                             shutdown,
                             pause_flag,
+                            stop_flag,
                             child_proc,
+                            event_tx,
                         )
                     });
                 } else {
@@ -730,6 +758,10 @@ fn handle_tui_events(
                 {
                     let mut pauses = pane_pauses.lock().unwrap();
                     pauses.remove(&pane_id);
+                }
+                {
+                    let mut stop_requests = pane_stop_requests.lock().unwrap();
+                    stop_requests.remove(&pane_id);
                 }
                 {
                     let metas = pane_metas.lock().unwrap();
@@ -798,11 +830,16 @@ fn handle_tui_events(
 
                 // 2. Create pause flag and child process for the deadloop
                 let pause_flag = Arc::new(AtomicBool::new(false));
+                let stop_flag = Arc::new(AtomicBool::new(false));
                 let child_proc: Arc<Mutex<Option<std::process::Child>>> =
                     Arc::new(Mutex::new(None));
                 {
                     let mut pauses = pane_pauses.lock().unwrap();
                     pauses.insert(pane_id, pause_flag.clone());
+                }
+                {
+                    let mut stop_requests = pane_stop_requests.lock().unwrap();
+                    stop_requests.insert(pane_id, stop_flag.clone());
                 }
                 {
                     let mut metas = pane_metas.lock().unwrap();
@@ -844,6 +881,7 @@ fn handle_tui_events(
                     let output_tx = output_tx.clone();
                     let server_tx = server_tx.clone();
                     let shutdown = shutdown.clone();
+                    let event_tx = event_tx.clone();
                     let working_dir = working_dir.to_string();
                     thread::spawn(move || {
                         run_deadloop_session(
@@ -858,7 +896,9 @@ fn handle_tui_events(
                             server_tx,
                             shutdown,
                             pause_flag,
+                            stop_flag,
                             child_proc,
+                            event_tx,
                         )
                     });
                 }
@@ -882,42 +922,67 @@ fn handle_tui_events(
                 );
             }
             Ok(TuiEvent::StopBot { pane_id }) => {
-                // Get existing provider from pane meta (preserve across mode switch)
-                let provider = {
+                let is_deadloop = {
                     let metas = pane_metas.lock().unwrap();
                     metas
                         .get(&pane_id)
-                        .map(|m| m.provider.clone())
-                        .unwrap_or(Provider::Claude)
+                        .map(|m| m.mode == shared::PaneMode::Deadloop)
+                        .unwrap_or(false)
                 };
 
-                // Convert deadloop pane back to interactive:
-                // 1. Kill the deadloop child process
-                {
-                    let metas = pane_metas.lock().unwrap();
-                    if let Some(meta) = metas.get(&pane_id) {
-                        if let Ok(mut guard) = meta.child_process.lock() {
-                            if let Some(ref mut child) = *guard {
-                                let _ = child.kill();
-                            }
-                        }
-                    }
+                if !is_deadloop {
+                    continue;
                 }
 
-                // 2. Remove pause flag
+                let first_request = {
+                    let mut stop_requests = pane_stop_requests.lock().unwrap();
+                    if let Some(flag) = stop_requests.get(&pane_id) {
+                        !flag.swap(true, Ordering::SeqCst)
+                    } else {
+                        stop_requests.insert(pane_id, Arc::new(AtomicBool::new(true)));
+                        true
+                    }
+                };
+
+                if first_request {
+                    let _ = output_tx.send(PaneOutput {
+                        text: "[Stop requested — waiting for current work to finish...]"
+                            .to_string(),
+                        pane_id,
+                    });
+                }
+            }
+            Ok(TuiEvent::FinalizeStopBot { pane_id }) => {
+                // Ignore duplicate finalize requests after mode already changed.
+                let provider = {
+                    let metas = pane_metas.lock().unwrap();
+                    let Some(meta) = metas.get(&pane_id) else {
+                        continue;
+                    };
+                    if meta.mode != shared::PaneMode::Deadloop {
+                        continue;
+                    }
+                    meta.provider.clone()
+                };
+
+                // Remove deadloop control flags.
                 {
                     let mut pauses = pane_pauses.lock().unwrap();
                     pauses.remove(&pane_id);
                 }
+                {
+                    let mut stop_requests = pane_stop_requests.lock().unwrap();
+                    stop_requests.remove(&pane_id);
+                }
 
-                // 3. Create input channel for interactive mode
+                // Create input channel for interactive mode.
                 let (input_tx, input_rx) = mpsc::channel::<PaneInput>();
                 {
                     let mut channels = input_channels.lock().unwrap();
                     channels.insert(pane_id, input_tx);
                 }
 
-                // 4. Update pane meta to interactive
+                // Update pane meta to interactive.
                 {
                     let mut metas = pane_metas.lock().unwrap();
                     metas.insert(
@@ -931,7 +996,7 @@ fn handle_tui_events(
                     );
                 }
 
-                // 5. Notify TUI to update tab mode
+                // Notify TUI to update tab mode.
                 let _ = command_tx.send(TuiCommand::SetMode {
                     pane_id,
                     mode: shared::PaneMode::Interactive,
@@ -942,13 +1007,13 @@ fn handle_tui_events(
                     pane_id,
                 });
 
-                // 6. Get claude session id for this pane
+                // Get session id for this pane.
                 let claude_session_id = {
                     let ps = pane_sessions.lock().unwrap();
                     ps.get(&pane_id).copied().unwrap_or_else(Uuid::new_v4)
                 };
 
-                // 7. Spawn interactive session
+                // Spawn interactive session.
                 let binary_path = match &provider {
                     Provider::Claude => claude_path.to_string(),
                     Provider::Codex => codex_path.to_string(),
@@ -974,7 +1039,7 @@ fn handle_tui_events(
                     });
                 }
 
-                // 8. Send updated pane list
+                // Publish updated pane list and persist config.
                 let _ = server_tx.blocking_send(CliToServer::PaneList {
                     session_id,
                     panes: build_pane_list(
@@ -1162,7 +1227,9 @@ fn run_deadloop_session(
     server_tx: tokio_mpsc::Sender<CliToServer>,
     shutdown: Arc<AtomicBool>,
     pause: Arc<AtomicBool>,
+    stop_requested: Arc<AtomicBool>,
     child_process: Arc<Mutex<Option<std::process::Child>>>,
+    event_tx: mpsc::Sender<TuiEvent>,
 ) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_deadloop_session_inner(
@@ -1177,7 +1244,9 @@ fn run_deadloop_session(
             server_tx,
             shutdown,
             pause,
+            stop_requested,
             child_process,
+            event_tx,
         )
     }));
 
@@ -1208,7 +1277,9 @@ fn run_deadloop_session_inner(
     server_tx: tokio_mpsc::Sender<CliToServer>,
     shutdown: Arc<AtomicBool>,
     pause: Arc<AtomicBool>,
+    stop_requested: Arc<AtomicBool>,
     child_process: Arc<Mutex<Option<std::process::Child>>>,
+    event_tx: mpsc::Sender<TuiEvent>,
 ) {
     // For Codex, we need to capture the real thread_id from the first invocation
     // and use it for subsequent `codex exec resume` calls.
@@ -1230,6 +1301,15 @@ fn run_deadloop_session_inner(
     let mut was_paused = false;
 
     while !shutdown.load(Ordering::SeqCst) {
+        if stop_requested.load(Ordering::SeqCst) {
+            let _ = output_tx.send(PaneOutput {
+                text: "[Current work finished — stopping bot...]".to_string(),
+                pane_id,
+            });
+            let _ = event_tx.send(TuiEvent::FinalizeStopBot { pane_id });
+            return;
+        }
+
         if pause.load(Ordering::SeqCst) {
             if !was_paused {
                 was_paused = true;
@@ -1986,8 +2066,13 @@ async fn run_server_connection(
 
                 // Send session start with pane list
                 let hostname = hostname::get().ok().and_then(|h| h.into_string().ok());
-                let pane_list =
-                    build_pane_list(&pane_metas, &input_channels, session_id, &pane_sessions, &pane_pauses);
+                let pane_list = build_pane_list(
+                    &pane_metas,
+                    &input_channels,
+                    session_id,
+                    &pane_sessions,
+                    &pane_pauses,
+                );
 
                 let session_start = CliToServer::SessionStart {
                     session_id,
