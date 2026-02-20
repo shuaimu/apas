@@ -570,6 +570,8 @@ pub struct PaneConfig {
     #[serde(default)]
     pub is_paused: bool, // Only meaningful for deadloop
     #[serde(default)]
+    pub stop_requested: bool, // Graceful stop pending (deadloop will stop after current iteration)
+    #[serde(default)]
     pub prompt: Option<String>, // Custom prompt for deadloop
     #[serde(default)]
     pub label: Option<String>, // User-facing label like "Deadloop" or "Interactive"
@@ -591,6 +593,7 @@ impl PaneConfig {
                 mode: PaneMode::Interactive,
                 session_id: Uuid::new_v4(),
                 is_paused: false,
+                stop_requested: false,
                 prompt: None,
                 label: Some("Interactive".to_string()),
                 model: None,

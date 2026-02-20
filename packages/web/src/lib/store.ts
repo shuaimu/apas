@@ -104,6 +104,7 @@ export interface PaneConfig {
   mode: "deadloop" | "interactive";
   session_id: string;
   is_paused: boolean;
+  stop_requested?: boolean;
   prompt?: string;
   label?: string;
   model?: string;

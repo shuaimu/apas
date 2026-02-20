@@ -201,6 +201,7 @@ export function TabbedView() {
   const activeStatus = activeTabId != null ? paneStatuses[paneKey(activeTabId)] || null : null;
   const activeIsPaused = activeTabId != null ? pausedPanes.includes(activeTabId) : false;
   const activeIsBot = activeConfig?.mode === "deadloop";
+  const activeStopRequested = activeConfig?.stop_requested === true;
   const activeProvider = activeConfig?.provider;
 
   // Use a targeted selector to avoid re-renders when unrelated usage limits change
@@ -292,14 +293,25 @@ export function TabbedView() {
         {/* Start/Stop Bot */}
         {isAttached && activeTabId != null && activeTabId !== PANE_ID_MAIN && (
           activeIsBot ? (
-            <button
-              onClick={handleStopBot}
-              className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-red-500 hover:bg-red-600 text-white"
-              title="Request stop after current work finishes, then switch to interactive mode"
-            >
-              <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h12v12H6z" /></svg>
-              Stop Bot
-            </button>
+            activeStopRequested ? (
+              <button
+                onClick={handleStopBot}
+                className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-amber-600 hover:bg-amber-700 text-white"
+                title="Force stop immediately — kill the current process"
+              >
+                <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><path d="M6 18L18 6M6 6l12 12" /></svg>
+                Force Stop
+              </button>
+            ) : (
+              <button
+                onClick={handleStopBot}
+                className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-red-500 hover:bg-red-600 text-white"
+                title="Stop after current work finishes (click again to force stop)"
+              >
+                <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h12v12H6z" /></svg>
+                Stop Bot
+              </button>
+            )
           ) : (
             <button
               onClick={handleStartBot}
@@ -357,9 +369,11 @@ export function TabbedView() {
       <div className="p-3 border-t border-gray-200 dark:border-gray-700 flex-shrink-0">
         {activeIsBot ? (
           <div className="text-center text-sm text-gray-400 dark:text-gray-500 py-2">
-            {activeIsPaused
-              ? "Bot is paused from previous state. Click Stop Bot to switch to interactive mode."
-              : "Bot is running autonomously. Click Stop Bot to switch to interactive mode after current work finishes."}
+            {activeStopRequested
+              ? "Stop requested — waiting for current work to finish. Click Force Stop to kill immediately."
+              : activeIsPaused
+                ? "Bot is paused from previous state. Click Stop Bot to switch to interactive mode."
+                : "Bot is running autonomously. Click Stop Bot to switch to interactive mode after current work finishes."}
           </div>
         ) : (
           <InteractiveInput onSend={handleSend} />

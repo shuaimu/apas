@@ -557,6 +557,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             mode,
                             session_id: uuid::Uuid::new_v4(),
                             is_paused: false,
+                            stop_requested: false,
                             prompt,
                             label,
                             model,

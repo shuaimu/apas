@@ -77,7 +77,7 @@ pub enum TuiEvent {
     StopBot {
         pane_id: u32,
     },
-    /// Internal event: deadloop iteration completed after stop request, now switch mode.
+    /// Finalize a graceful stop — deadloop finished its current iteration
     FinalizeStopBot {
         pane_id: u32,
     },

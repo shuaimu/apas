@@ -395,7 +395,7 @@ fn ensure_daemon_running(server: &str, roots: &[String], target_version: &str) -
 
     let current_exe = std::env::current_exe()?;
     let mut cmd = Command::new(current_exe);
-    cmd.arg("daemon").arg("--server").arg(server);
+    cmd.arg("--server").arg(server).arg("daemon");
     for root in roots {
         cmd.arg("--root").arg(root);
     }

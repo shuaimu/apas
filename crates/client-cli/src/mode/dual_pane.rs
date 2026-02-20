@@ -241,6 +241,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     let server_task = {
         let shutdown = shutdown.clone();
         let pane_pauses = pane_pauses.clone();
+        let pane_stop_requests = pane_stop_requests.clone();
         let reboot = reboot_requested.clone();
         let server_url = server_url.clone();
         let token = token.clone();
@@ -259,6 +260,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
                 server_rx,
                 shutdown,
                 pane_pauses,
+                pane_stop_requests,
                 reboot,
                 input_channels,
                 pane_metas,
@@ -497,6 +499,7 @@ fn save_pane_configs(
                     mode,
                     session_id: claude_sid,
                     is_paused: false,
+                    stop_requested: false,
                     prompt,
                     label: Some(label),
                     model: None,
@@ -607,6 +610,7 @@ fn handle_tui_events(
                         session_id,
                         &pane_sessions,
                         &pane_pauses,
+                        &pane_stop_requests,
                     ),
                 });
 
@@ -735,6 +739,7 @@ fn handle_tui_events(
                         session_id,
                         &pane_sessions,
                         &pane_pauses,
+                        &pane_stop_requests,
                     ),
                 });
 
@@ -801,6 +806,7 @@ fn handle_tui_events(
                         session_id,
                         &pane_sessions,
                         &pane_pauses,
+                        &pane_stop_requests,
                     ),
                 });
 
@@ -912,6 +918,7 @@ fn handle_tui_events(
                         session_id,
                         &pane_sessions,
                         &pane_pauses,
+                        &pane_stop_requests,
                     ),
                 });
 
@@ -922,38 +929,92 @@ fn handle_tui_events(
                 );
             }
             Ok(TuiEvent::StopBot { pane_id }) => {
-                let is_deadloop = {
+                // Validate pane is a deadloop
+                {
                     let metas = pane_metas.lock().unwrap();
-                    metas
+                    let Some(meta) = metas.get(&pane_id) else {
+                        continue;
+                    };
+                    if meta.mode != shared::PaneMode::Deadloop {
+                        continue;
+                    }
+                }
+
+                // Check if stop is already requested (two-stage stop)
+                let already_requested = {
+                    let stop_requests = pane_stop_requests.lock().unwrap();
+                    stop_requests
                         .get(&pane_id)
-                        .map(|m| m.mode == shared::PaneMode::Deadloop)
+                        .map(|f| f.load(Ordering::SeqCst))
                         .unwrap_or(false)
                 };
 
-                if !is_deadloop {
-                    continue;
-                }
-
-                let first_request = {
-                    let mut stop_requests = pane_stop_requests.lock().unwrap();
-                    if let Some(flag) = stop_requests.get(&pane_id) {
-                        !flag.swap(true, Ordering::SeqCst)
-                    } else {
-                        stop_requests.insert(pane_id, Arc::new(AtomicBool::new(true)));
-                        true
+                if !already_requested {
+                    // === Stage 1: Graceful stop ===
+                    // Set the stop_requested flag; deadloop will stop after current iteration
+                    {
+                        let stop_requests = pane_stop_requests.lock().unwrap();
+                        if let Some(flag) = stop_requests.get(&pane_id) {
+                            flag.store(true, Ordering::SeqCst);
+                        }
                     }
-                };
 
-                if first_request {
                     let _ = output_tx.send(PaneOutput {
-                        text: "[Stop requested — waiting for current work to finish...]"
+                        text: "[Stop requested — will stop after current work finishes...]"
                             .to_string(),
                         pane_id,
                     });
+
+                    // Notify web clients
+                    let _ = server_tx.blocking_send(CliToServer::StreamMessage {
+                        session_id,
+                        message: shared::ClaudeStreamMessage::Result {
+                            subtype: "text".to_string(),
+                            result: "[Stop requested — will stop after current work finishes...]"
+                                .to_string(),
+                            is_error: false,
+                            total_cost_usd: 0.0,
+                            duration_ms: 0,
+                            session_id: session_id.to_string(),
+                            extra: serde_json::Value::Null,
+                        },
+                        pane_type: None,
+                        pane_id: Some(pane_id),
+                    });
+
+                    // Send updated PaneList so web sees stop_requested=true
+                    let _ = server_tx.blocking_send(CliToServer::PaneList {
+                        session_id,
+                        panes: build_pane_list(
+                            &pane_metas,
+                            &input_channels,
+                            session_id,
+                            &pane_sessions,
+                            &pane_pauses,
+                            &pane_stop_requests,
+                        ),
+                    });
+                } else {
+                    // === Stage 2: Force stop ===
+                    // Kill the deadloop child process immediately
+                    {
+                        let metas = pane_metas.lock().unwrap();
+                        if let Some(meta) = metas.get(&pane_id) {
+                            if let Ok(mut guard) = meta.child_process.lock() {
+                                if let Some(ref mut child) = *guard {
+                                    let _ = child.kill();
+                                }
+                            }
+                        }
+                    }
+
+                    // Reuse FinalizeStopBot logic
+                    let _ = event_tx.send(TuiEvent::FinalizeStopBot { pane_id });
                 }
             }
             Ok(TuiEvent::FinalizeStopBot { pane_id }) => {
-                // Ignore duplicate finalize requests after mode already changed.
+                // Finalize stop: switch from deadloop to interactive mode.
+                // Called after deadloop finishes gracefully OR after force-kill.
                 let provider = {
                     let metas = pane_metas.lock().unwrap();
                     let Some(meta) = metas.get(&pane_id) else {
@@ -1007,6 +1068,22 @@ fn handle_tui_events(
                     pane_id,
                 });
 
+                // Notify web clients
+                let _ = server_tx.blocking_send(CliToServer::StreamMessage {
+                    session_id,
+                    message: shared::ClaudeStreamMessage::Result {
+                        subtype: "text".to_string(),
+                        result: "[Bot stopped — switched to interactive mode]".to_string(),
+                        is_error: false,
+                        total_cost_usd: 0.0,
+                        duration_ms: 0,
+                        session_id: session_id.to_string(),
+                        extra: serde_json::Value::Null,
+                    },
+                    pane_type: None,
+                    pane_id: Some(pane_id),
+                });
+
                 // Get session id for this pane.
                 let claude_session_id = {
                     let ps = pane_sessions.lock().unwrap();
@@ -1048,6 +1125,7 @@ fn handle_tui_events(
                         session_id,
                         &pane_sessions,
                         &pane_pauses,
+                        &pane_stop_requests,
                     ),
                 });
 
@@ -1070,11 +1148,13 @@ fn build_pane_list(
     session_id: Uuid,
     pane_sessions: &Arc<Mutex<HashMap<u32, Uuid>>>,
     pane_pauses: &PanePauses,
+    pane_stop_requests: &PaneStopRequests,
 ) -> Vec<shared::PaneConfig> {
     let metas = pane_metas.lock().unwrap();
     let channels = input_channels.lock().unwrap();
     let ps = pane_sessions.lock().unwrap();
     let pauses = pane_pauses.lock().unwrap();
+    let stops = pane_stop_requests.lock().unwrap();
     let mut panes = Vec::new();
 
     // Build from metas (covers deadloop panes which don't have input channels)
@@ -1089,12 +1169,17 @@ fn build_pane_list(
             .get(&pane_id)
             .map(|f| f.load(Ordering::SeqCst))
             .unwrap_or(false);
+        let stop_requested = stops
+            .get(&pane_id)
+            .map(|f| f.load(Ordering::SeqCst))
+            .unwrap_or(false);
         panes.push(shared::PaneConfig {
             pane_id,
             provider: meta.provider.clone(),
             mode: meta.mode.clone(),
             session_id: claude_sid,
             is_paused,
+            stop_requested,
             prompt: meta.prompt.clone(),
             label: Some(label),
             model: None,
@@ -1111,6 +1196,7 @@ fn build_pane_list(
                 mode: shared::PaneMode::Interactive,
                 session_id: claude_sid,
                 is_paused: false,
+                stop_requested: false,
                 prompt: None,
                 label: Some(format!("Tab {}", pane_id)),
                 model: None,
@@ -1302,10 +1388,7 @@ fn run_deadloop_session_inner(
 
     while !shutdown.load(Ordering::SeqCst) {
         if stop_requested.load(Ordering::SeqCst) {
-            let _ = output_tx.send(PaneOutput {
-                text: "[Current work finished — stopping bot...]".to_string(),
-                pane_id,
-            });
+            // Graceful stop: current iteration finished, finalize the mode switch
             let _ = event_tx.send(TuiEvent::FinalizeStopBot { pane_id });
             return;
         }
@@ -1931,6 +2014,7 @@ async fn run_server_connection(
     mut output_rx: tokio_mpsc::Receiver<CliToServer>,
     shutdown: Arc<AtomicBool>,
     pane_pauses: PanePauses,
+    pane_stop_requests: PaneStopRequests,
     reboot_requested: Arc<AtomicBool>,
     input_channels: InputChannels,
     pane_metas: PaneMetas,
@@ -2072,6 +2156,7 @@ async fn run_server_connection(
                     session_id,
                     &pane_sessions,
                     &pane_pauses,
+                    &pane_stop_requests,
                 );
 
                 let session_start = CliToServer::SessionStart {

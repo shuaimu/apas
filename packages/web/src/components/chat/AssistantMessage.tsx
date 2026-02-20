@@ -14,6 +14,7 @@ interface AssistantMessageProps {
 }
 
 interface CommandExecutionEventPreview {
+  eventType: string;
   command: string | null;
   status: string | null;
   exitCode: number | null;
@@ -33,9 +34,11 @@ function formatTimestamp(date: Date): string {
   }
 }
 
+const FOLDABLE_EVENT_TYPES = ["item.completed", "item.started"];
+
 function parseCommandExecutionEventPreview(content: string): CommandExecutionEventPreview | null {
   const trimmed = content.trim();
-  if (!trimmed.startsWith("{") || !trimmed.includes("item.completed")) {
+  if (!trimmed.startsWith("{") || !FOLDABLE_EVENT_TYPES.some(t => trimmed.includes(t))) {
     return null;
   }
 
@@ -51,7 +54,7 @@ function parseCommandExecutionEventPreview(content: string): CommandExecutionEve
       };
     };
 
-    if (parsed.type !== "item.completed" || parsed.item?.type !== "command_execution") {
+    if (!parsed.type || !FOLDABLE_EVENT_TYPES.includes(parsed.type) || parsed.item?.type !== "command_execution") {
       return null;
     }
 
@@ -61,6 +64,7 @@ function parseCommandExecutionEventPreview(content: string): CommandExecutionEve
     const aggregatedOutput = typeof parsed.item.aggregated_output === "string" ? parsed.item.aggregated_output : null;
 
     return {
+      eventType: parsed.type,
       command,
       status,
       exitCode,
@@ -68,10 +72,10 @@ function parseCommandExecutionEventPreview(content: string): CommandExecutionEve
       formattedPayload: JSON.stringify(parsed, null, 2),
     };
   } catch {
+    const eventTypeMatch = trimmed.match(/"type":"(item\.(?:completed|started))"/);
     if (
-      !trimmed.includes('"type":"item.completed"') ||
-      !trimmed.includes('"type":"command_execution"') ||
-      !trimmed.includes('"aggregated_output"')
+      !eventTypeMatch ||
+      !trimmed.includes('"type":"command_execution"')
     ) {
       return null;
     }
@@ -82,6 +86,7 @@ function parseCommandExecutionEventPreview(content: string): CommandExecutionEve
     const aggregatedOutputMatch = trimmed.match(/"aggregated_output":"([\s\S]*?)","exit_code":/);
 
     return {
+      eventType: eventTypeMatch[1],
       command: commandMatch ? commandMatch[1] : null,
       status: statusMatch ? statusMatch[1] : null,
       exitCode: exitCodeMatch ? Number(exitCodeMatch[1]) : null,
@@ -194,7 +199,7 @@ function TextContent({ content }: { content: string }) {
         <details>
           <summary className="cursor-pointer select-none text-sm font-medium text-gray-700 dark:text-gray-200">
             <span className="mr-2 rounded bg-gray-200 dark:bg-gray-700 px-2 py-0.5 text-xs font-semibold text-gray-600 dark:text-gray-300">
-              item.completed
+              {commandExecutionEvent.eventType}
             </span>
             <span className="break-all">{commandLabel}</span>
           </summary>
