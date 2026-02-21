@@ -9,6 +9,14 @@ import { UsageLimitsDisplay } from "../UsageLimits";
 
 // Sentinel pane_id for the single-pane fallback (no pane system)
 const PANE_ID_MAIN = 0;
+const DEFAULT_BOT_LOOP_PROMPT = `Work on tasks defined in TODO.md. Do the following steps. Don't ask me for advice, just pick the best option you think that is honest, complete, and not corner-cutting:
+
+1. Do a git pull to check if there are any remote updates. Pick the top high-priority undone task, choose its first leaf task. If there are no undone TODO items left, sleep a minute and exit.
+2. Analyze the task, check if this can be done with not too many LOC (i.e., smaller than 500 lines code give or take). If not, try to analyze this task and break it down into several smaller tasks, expanding it in the TODO.md. The breakdown can be nested and hierarchical. Try to make each leaf task small enough (<500 lines LOC). You can document your analysis in the doc folder for future reference.
+3. Try to execute the first leaf task. Make a plan for the task before execute. You can document key findings in either the TODO.md (a few sentences in the TODO item, or doc it in the docs folder for longer details and discussions.
+4. Make sure to add comprehensive test for the task executed. Run the whole test suites to make sure no regression happens. If tests fail, fix them using the best, honest, complete approach, run test suites again to verify fixes work. Repeat this step until no tests fail.
+5. Prepare for git commit, remove all temporary files, especially not to commit any binary files. For plan files, remove the implementation plan and keep the design rational and user manual and put it in the docs folder.
+6. Git commit the changes. First do git pull --rebase, and fix conflicts if any. Then do git push.`;
 
 // Store scroll positions per session+pane combination
 interface ScrollState {
@@ -261,7 +269,10 @@ export function TabbedView() {
   const handleStartBot = useCallback(() => {
     if (activeTabId == null) return;
     setStartBotPaneId(activeTabId);
-    setBotPromptDraft(activeConfig?.prompt || "");
+    const savedPrompt = activeConfig?.prompt;
+    setBotPromptDraft(
+      savedPrompt && savedPrompt.trim().length > 0 ? savedPrompt : DEFAULT_BOT_LOOP_PROMPT,
+    );
     setStartBotModalOpen(true);
   }, [activeConfig?.prompt, activeTabId]);
 
@@ -278,7 +289,7 @@ export function TabbedView() {
   const handleConfirmStartBot = useCallback(() => {
     if (startBotPaneId == null) return;
     const trimmed = botPromptDraft.trim();
-    startBot(startBotPaneId, trimmed.length > 0 ? botPromptDraft : undefined);
+    startBot(startBotPaneId, trimmed.length > 0 ? botPromptDraft : DEFAULT_BOT_LOOP_PROMPT);
     setStartBotModalOpen(false);
     setStartBotPaneId(null);
   }, [botPromptDraft, startBot, startBotPaneId]);
@@ -447,8 +458,7 @@ function StartBotPromptModal({
             Start Bot on {tabLabel}
           </h3>
           <p className="text-xs mt-1 text-gray-500 dark:text-gray-400">
-            Edit the loop prompt for this tab. Leave empty to use the existing saved prompt for
-            this tab, or the default prompt if none is saved.
+            Edit the loop prompt for this tab. This prompt is saved per tab in `.apas`.
           </p>
         </div>
         <div className="p-4">
