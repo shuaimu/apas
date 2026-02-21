@@ -220,7 +220,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 panes,
                             }) => {
                                 // CLI is starting a local session (hybrid mode)
-                                state.sessions.create_cli_session(session_id, cli_id);
+                                state.sessions.create_cli_session(
+                                    session_id,
+                                    cli_id,
+                                    working_dir.clone(),
+                                    hostname.clone(),
+                                );
 
                                 // Cache initial pane list if provided
                                 if let Some(pane_list) = &panes {

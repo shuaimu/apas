@@ -246,16 +246,21 @@ fn find_project_dirs(root: &Path) -> Vec<PathBuf> {
             }
 
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            // Skip hidden directories (except we already checked for .apas)
+            if name.starts_with('.') {
+                continue;
+            }
             if matches!(
                 name,
-                ".git"
-                    | "node_modules"
+                "node_modules"
                     | "target"
-                    | ".next"
-                    | ".turbo"
-                    | ".cache"
-                    | ".idea"
-                    | ".vscode"
+                    | "vendor"
+                    | "dist"
+                    | "__pycache__"
+                    | "nfs"
+                    | "snap"
+                    | "go"
+                    | "thinclient_drives"
             ) {
                 continue;
             }
@@ -289,7 +294,10 @@ pub async fn run(
         .unwrap_or_else(|| "unknown".to_string());
 
     let roots = if project_roots.is_empty() {
-        vec![std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))]
+        // Default to home directory so the daemon discovers all user projects
+        vec![dirs::home_dir().unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        })]
     } else {
         project_roots
     };

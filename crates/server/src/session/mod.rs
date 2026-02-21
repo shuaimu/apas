@@ -1,4 +1,5 @@
 use dashmap::DashMap;
+use std::collections::{HashMap, HashSet};
 use shared::{
     CliClientInfo, CliClientStatus, MachineInfo, MachineProjectInfo, MachineWithProjects,
     PaneConfig, Provider, ServerToCli, ServerToDaemon, ServerToWeb, UsageLimits,
@@ -42,6 +43,10 @@ pub struct SessionState {
     pub is_paused: bool,
     /// Cached pane configurations (last PaneList from CLI)
     pub panes: Vec<PaneConfig>,
+    /// Working directory of the CLI session
+    pub working_dir: Option<String>,
+    /// Hostname of the CLI session
+    pub hostname: Option<String>,
 }
 
 impl SessionManager {
@@ -148,6 +153,22 @@ impl SessionManager {
     }
 
     pub fn get_machines_for_user(&self, user_id: &Uuid) -> Vec<MachineWithProjects> {
+        // Collect working dirs of active CLI sessions grouped by hostname
+        let mut active_dirs_by_host: HashMap<String, HashSet<String>> = HashMap::new();
+        for session_entry in self.sessions.iter() {
+            let session = session_entry.value();
+            if session.cli_client_id.is_some() {
+                if let (Some(hostname), Some(working_dir)) =
+                    (&session.hostname, &session.working_dir)
+                {
+                    active_dirs_by_host
+                        .entry(hostname.clone())
+                        .or_default()
+                        .insert(working_dir.clone());
+                }
+            }
+        }
+
         self.machine_infos
             .iter()
             .filter_map(|entry| {
@@ -162,11 +183,20 @@ impl SessionManager {
                 }
 
                 let machine = entry.value().clone();
-                let projects = self
+                let mut projects = self
                     .machine_projects
                     .get(&machine_id)
                     .map(|p| p.clone())
                     .unwrap_or_default();
+
+                // Enrich is_running from active CLI sessions on the same host
+                if let Some(active_dirs) = active_dirs_by_host.get(&machine.hostname) {
+                    for project in &mut projects {
+                        if !project.is_running && active_dirs.contains(&project.path) {
+                            project.is_running = true;
+                        }
+                    }
+                }
 
                 Some(MachineWithProjects { machine, projects })
             })
@@ -221,6 +251,8 @@ impl SessionManager {
             web_connection_ids: vec![web_connection_id],
             is_paused: false,
             panes: Vec::new(),
+            working_dir: None,
+            hostname: None,
         };
         self.sessions.insert(session_id, state);
         tracing::info!("Session created: {}", session_id);
@@ -241,11 +273,19 @@ impl SessionManager {
 
     /// Create or update a CLI-initiated session (hybrid mode)
     /// Preserves web connections if session already exists (for reconnection)
-    pub fn create_cli_session(&self, session_id: Uuid, cli_id: Uuid) {
+    pub fn create_cli_session(
+        &self,
+        session_id: Uuid,
+        cli_id: Uuid,
+        working_dir: Option<String>,
+        hostname: Option<String>,
+    ) {
         // Check if session already exists (preserve web connections)
         if let Some(mut existing) = self.sessions.get_mut(&session_id) {
             let old_cli_id = existing.cli_client_id;
             existing.cli_client_id = Some(cli_id);
+            existing.working_dir = working_dir;
+            existing.hostname = hostname;
             tracing::info!(
                 "CLI session {} updated: cli {:?} -> {} (web viewers: {})",
                 session_id,
@@ -261,6 +301,8 @@ impl SessionManager {
                 web_connection_ids: Vec::new(),
                 is_paused: false,
                 panes: Vec::new(),
+                working_dir,
+                hostname,
             };
             self.sessions.insert(session_id, state);
             tracing::info!("CLI session created: {} (cli: {})", session_id, cli_id);
@@ -315,6 +357,8 @@ impl SessionManager {
             web_connection_ids: vec![web_connection_id],
             is_paused: false,
             panes: Vec::new(),
+            working_dir: None,
+            hostname: None,
         };
         self.sessions.insert(*session_id, state);
 
@@ -353,6 +397,8 @@ impl SessionManager {
             web_connection_ids: s.web_connection_ids.clone(),
             is_paused: s.is_paused,
             panes: s.panes.clone(),
+            working_dir: s.working_dir.clone(),
+            hostname: s.hostname.clone(),
         })
     }
 
