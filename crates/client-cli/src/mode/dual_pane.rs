@@ -78,11 +78,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     }
     save_project(working_dir, &metadata)?;
 
-    let prompt = metadata
-        .prompt
-        .clone()
-        .filter(|p| !p.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_PROMPT.to_string());
+    let default_prompt = DEFAULT_PROMPT.to_string();
 
     let working_dir_str = working_dir.to_string_lossy().to_string();
     let server_url = server_url.to_string();
@@ -193,7 +189,10 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
                 let stop_flag = Arc::new(AtomicBool::new(false));
                 pauses.insert(*pane_id, pause_flag.clone());
                 stop_requests.insert(*pane_id, stop_flag.clone());
-                let dl_prompt = tab_prompt.clone().unwrap_or_else(|| prompt.clone());
+                let dl_prompt = tab_prompt
+                    .clone()
+                    .filter(|p| !p.trim().is_empty())
+                    .unwrap_or_else(|| default_prompt.clone());
                 deadloop_startups.push((
                     *pane_id,
                     *pane_session_id,
@@ -382,7 +381,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
         let pane_stop_requests_event = pane_stop_requests.clone();
         let pane_metas_event = pane_metas.clone();
         let event_tx_event = event_tx.clone();
-        let default_prompt = prompt.clone();
+        let default_prompt_for_events = default_prompt.clone();
         thread::spawn(move || {
             handle_tui_events(
                 event_rx,
@@ -400,7 +399,7 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
                 pane_pauses_event,
                 pane_stop_requests_event,
                 pane_metas_event,
-                &default_prompt,
+                &default_prompt_for_events,
             )
         })
     };
@@ -818,14 +817,15 @@ fn handle_tui_events(
                 );
             }
             Ok(TuiEvent::StartBot { pane_id, prompt }) => {
-                // Get existing provider from pane meta (preserve across mode switch)
-                let provider = {
+                // Preserve provider and any existing per-pane prompt across mode switches.
+                let (provider, existing_prompt) = {
                     let metas = pane_metas.lock().unwrap();
-                    metas
-                        .get(&pane_id)
-                        .map(|m| m.provider.clone())
-                        .unwrap_or(Provider::Claude)
+                    match metas.get(&pane_id) {
+                        Some(meta) => (meta.provider, meta.prompt.clone()),
+                        None => (Provider::Claude, None),
+                    }
                 };
+                let resolved_prompt = prompt.filter(|p| !p.trim().is_empty()).or(existing_prompt);
 
                 // Convert interactive pane to deadloop:
                 // 1. Remove input channel (kills interactive session thread)
@@ -853,8 +853,8 @@ fn handle_tui_events(
                         pane_id,
                         PaneMeta {
                             mode: shared::PaneMode::Deadloop,
-                            provider: provider.clone(),
-                            prompt: prompt.clone(),
+                            provider,
+                            prompt: resolved_prompt.clone(),
                             child_process: child_proc.clone(),
                         },
                     );
@@ -878,7 +878,7 @@ fn handle_tui_events(
                 };
 
                 // 5. Spawn deadloop session
-                let dl_prompt = prompt.unwrap_or_else(|| default_prompt.to_string());
+                let dl_prompt = resolved_prompt.unwrap_or_else(|| default_prompt.to_string());
                 let binary_path = match &provider {
                     Provider::Claude => claude_path.to_string(),
                     Provider::Codex => codex_path.to_string(),
@@ -1015,7 +1015,7 @@ fn handle_tui_events(
             Ok(TuiEvent::FinalizeStopBot { pane_id }) => {
                 // Finalize stop: switch from deadloop to interactive mode.
                 // Called after deadloop finishes gracefully OR after force-kill.
-                let provider = {
+                let (provider, saved_prompt) = {
                     let metas = pane_metas.lock().unwrap();
                     let Some(meta) = metas.get(&pane_id) else {
                         continue;
@@ -1023,7 +1023,7 @@ fn handle_tui_events(
                     if meta.mode != shared::PaneMode::Deadloop {
                         continue;
                     }
-                    meta.provider.clone()
+                    (meta.provider, meta.prompt.clone())
                 };
 
                 // Remove deadloop control flags.
@@ -1050,8 +1050,8 @@ fn handle_tui_events(
                         pane_id,
                         PaneMeta {
                             mode: shared::PaneMode::Interactive,
-                            provider: provider.clone(),
-                            prompt: None,
+                            provider,
+                            prompt: saved_prompt,
                             child_process: Arc::new(Mutex::new(None)),
                         },
                     );

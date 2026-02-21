@@ -113,6 +113,9 @@ export function TabbedView() {
   const [activeTabId, setActiveTabId] = useState<number | null>(null);
   const prevTabIdsRef = useRef<number[]>([]);
   const shouldAutoSelectNewTabRef = useRef(false);
+  const [startBotModalOpen, setStartBotModalOpen] = useState(false);
+  const [startBotPaneId, setStartBotPaneId] = useState<number | null>(null);
+  const [botPromptDraft, setBotPromptDraft] = useState("");
 
   // Stable list of tab IDs (avoids re-running effects on every message)
   const tabIds = useMemo(
@@ -203,6 +206,10 @@ export function TabbedView() {
   const activeIsBot = activeConfig?.mode === "deadloop";
   const activeStopRequested = activeConfig?.stop_requested === true;
   const activeProvider = activeConfig?.provider;
+  const startBotTargetConfig = useMemo(
+    () => effectiveTabs.find((t) => t.pane_id === startBotPaneId),
+    [effectiveTabs, startBotPaneId],
+  );
 
   // Use a targeted selector to avoid re-renders when unrelated usage limits change
   const currentUsageLimits = useStore(
@@ -253,13 +260,28 @@ export function TabbedView() {
 
   const handleStartBot = useCallback(() => {
     if (activeTabId == null) return;
-    startBot(activeTabId);
-  }, [activeTabId, startBot]);
+    setStartBotPaneId(activeTabId);
+    setBotPromptDraft(activeConfig?.prompt || "");
+    setStartBotModalOpen(true);
+  }, [activeConfig?.prompt, activeTabId]);
 
   const handleStopBot = useCallback(() => {
     if (activeTabId == null) return;
     stopBot(activeTabId);
   }, [activeTabId, stopBot]);
+
+  const handleCancelStartBot = useCallback(() => {
+    setStartBotModalOpen(false);
+    setStartBotPaneId(null);
+  }, []);
+
+  const handleConfirmStartBot = useCallback(() => {
+    if (startBotPaneId == null) return;
+    const trimmed = botPromptDraft.trim();
+    startBot(startBotPaneId, trimmed.length > 0 ? botPromptDraft : undefined);
+    setStartBotModalOpen(false);
+    setStartBotPaneId(null);
+  }, [botPromptDraft, startBot, startBotPaneId]);
 
   // No session or no tabs - empty state
   if (!sessionId || effectiveTabs.length === 0) {
@@ -378,6 +400,80 @@ export function TabbedView() {
         ) : (
           <InteractiveInput onSend={handleSend} />
         )}
+      </div>
+
+      <StartBotPromptModal
+        open={startBotModalOpen}
+        prompt={botPromptDraft}
+        tabLabel={startBotTargetConfig?.label || (startBotPaneId != null ? `Tab ${startBotPaneId}` : "Tab")}
+        onPromptChange={setBotPromptDraft}
+        onCancel={handleCancelStartBot}
+        onConfirm={handleConfirmStartBot}
+      />
+    </div>
+  );
+}
+
+interface StartBotPromptModalProps {
+  open: boolean;
+  prompt: string;
+  tabLabel: string;
+  onPromptChange: (value: string) => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+}
+
+function StartBotPromptModal({
+  open,
+  prompt,
+  tabLabel,
+  onPromptChange,
+  onCancel,
+  onConfirm,
+}: StartBotPromptModalProps) {
+  if (!open) return null;
+
+  return (
+    <div
+      className="fixed inset-0 z-[100] bg-black/50 flex items-center justify-center p-4"
+      onClick={onCancel}
+    >
+      <div
+        className="w-full max-w-2xl bg-white dark:bg-gray-900 rounded-xl shadow-xl border border-gray-200 dark:border-gray-700"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
+          <h3 className="text-sm font-semibold text-gray-900 dark:text-gray-100">
+            Start Bot on {tabLabel}
+          </h3>
+          <p className="text-xs mt-1 text-gray-500 dark:text-gray-400">
+            Edit the loop prompt for this tab. Leave empty to use the existing saved prompt for
+            this tab, or the default prompt if none is saved.
+          </p>
+        </div>
+        <div className="p-4">
+          <textarea
+            value={prompt}
+            onChange={(e) => onPromptChange(e.target.value)}
+            rows={10}
+            className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+            placeholder="Enter bot loop prompt..."
+          />
+        </div>
+        <div className="px-4 py-3 border-t border-gray-200 dark:border-gray-700 flex items-center justify-end gap-2">
+          <button
+            onClick={onCancel}
+            className="px-3 py-1.5 text-xs font-medium rounded bg-gray-200 hover:bg-gray-300 dark:bg-gray-700 dark:hover:bg-gray-600 text-gray-800 dark:text-gray-100"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            className="px-3 py-1.5 text-xs font-medium rounded bg-green-500 hover:bg-green-600 text-white"
+          >
+            Start Bot
+          </button>
+        </div>
       </div>
     </div>
   );
