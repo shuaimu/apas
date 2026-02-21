@@ -52,14 +52,31 @@ function setProjectLayout(cliClientId: string | null, key: string, value: string
 // Synthesize PaneConfig entries from observed pane_id keys when no PaneList was received
 function synthesizeConfigs(
   paneMessages: Record<string, Message[]>,
+  paneStatuses: Record<string, string | null>,
   pausedPanes: number[],
+  activePaneId: number | null,
   sessionId: string | null,
 ): PaneConfig[] {
   const configs: PaneConfig[] = [];
-  const keys = Object.keys(paneMessages).sort();
-  for (const key of keys) {
+  const paneIds = new Set<number>();
+
+  for (const key of Object.keys(paneMessages)) {
     const numericId = parseInt(key, 10);
-    if (isNaN(numericId)) continue;
+    if (!isNaN(numericId)) paneIds.add(numericId);
+  }
+  for (const key of Object.keys(paneStatuses)) {
+    const numericId = parseInt(key, 10);
+    if (!isNaN(numericId)) paneIds.add(numericId);
+  }
+  for (const paneId of pausedPanes) {
+    paneIds.add(paneId);
+  }
+  if (activePaneId != null && activePaneId > PANE_ID_MAIN) {
+    paneIds.add(activePaneId);
+  }
+
+  const sortedPaneIds = Array.from(paneIds).sort((a, b) => a - b);
+  for (const numericId of sortedPaneIds) {
     const isDeadloop = numericId === PANE_ID_DEADLOOP;
     configs.push({
       pane_id: numericId,
@@ -97,11 +114,19 @@ export function TabbedView() {
   const rebootCli = useStore((s) => s.rebootCli);
   const downloadSession = useStore((s) => s.downloadSession);
 
+  // Active tab state, persisted per project
+  const [activeTabId, setActiveTabId] = useState<number | null>(null);
+  const prevTabIdsRef = useRef<number[]>([]);
+  const shouldAutoSelectNewTabRef = useRef(false);
+  const [startBotModalOpen, setStartBotModalOpen] = useState(false);
+  const [startBotPaneId, setStartBotPaneId] = useState<number | null>(null);
+  const [botPromptDraft, setBotPromptDraft] = useState("");
+
   // Determine effective tabs: use paneConfigs from server, or synthesize from observed messages
   const effectiveTabs = useMemo(() => {
     if (paneConfigs.length > 0) return paneConfigs;
     if (isDualPane && Object.keys(paneMessages).length > 0) {
-      return synthesizeConfigs(paneMessages, pausedPanes, sessionId);
+      return synthesizeConfigs(paneMessages, paneStatuses, pausedPanes, activeTabId, sessionId);
     }
     // Single-pane: synthesize a single tab
     if (messages.length > 0) {
@@ -117,14 +142,6 @@ export function TabbedView() {
     return [];
   }, [paneConfigs, isDualPane, paneMessages, pausedPanes, sessionId, messages.length]);
 
-  // Active tab state, persisted per project
-  const [activeTabId, setActiveTabId] = useState<number | null>(null);
-  const prevTabIdsRef = useRef<number[]>([]);
-  const shouldAutoSelectNewTabRef = useRef(false);
-  const [startBotModalOpen, setStartBotModalOpen] = useState(false);
-  const [startBotPaneId, setStartBotPaneId] = useState<number | null>(null);
-  const [botPromptDraft, setBotPromptDraft] = useState("");
-
   // Stable list of tab IDs (avoids re-running effects on every message)
   const tabIds = useMemo(
     () => effectiveTabs.map((t) => t.pane_id).join(","),
@@ -134,6 +151,7 @@ export function TabbedView() {
   // Load saved active tab when project or available tabs change
   useEffect(() => {
     const ids = tabIds.split(",").filter(Boolean).map(Number);
+    if (activeTabId != null && ids.includes(activeTabId)) return;
     const saved = getProjectLayout(cliClientId, "active_tab", "");
     const savedNum = saved ? parseInt(saved, 10) : NaN;
     if (!isNaN(savedNum) && ids.includes(savedNum)) {
@@ -141,7 +159,7 @@ export function TabbedView() {
     } else if (ids.length > 0) {
       setActiveTabId(ids[0]);
     }
-  }, [cliClientId, tabIds]);
+  }, [activeTabId, cliClientId, tabIds]);
 
   // Auto-switch to newly created tabs
   useEffect(() => {
@@ -160,14 +178,6 @@ export function TabbedView() {
     }
     prevTabIdsRef.current = ids;
   }, [cliClientId, tabIds]);
-
-  // If active tab no longer exists, reset to first
-  useEffect(() => {
-    const ids = tabIds.split(",").filter(Boolean).map(Number);
-    if (activeTabId != null && ids.length > 0 && !ids.includes(activeTabId)) {
-      setActiveTabId(ids[0]);
-    }
-  }, [activeTabId, tabIds]);
 
   const handleSelectTab = useCallback(
     (paneId: number) => {
