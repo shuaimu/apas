@@ -1438,9 +1438,18 @@ fn run_deadloop_session_inner(
             pane_id,
         });
 
+        // On resume iterations, use a short continuation prompt to avoid
+        // bloating the conversation context with repeated copies of the full prompt.
+        let is_resume = !first_message || try_resume_first;
+        let iteration_prompt = if is_resume && iteration > 1 {
+            "Continue with the next iteration."
+        } else {
+            prompt
+        };
+
         let _ = server_tx.try_send(CliToServer::UserInput {
             session_id,
-            text: format!("[Iteration {}]\n{}", iteration, prompt),
+            text: format!("[Iteration {}]\n{}", iteration, iteration_prompt),
             pane_type: Some(PaneType::Deadloop),
             pane_id: Some(pane_id),
         });
@@ -1455,7 +1464,7 @@ fn run_deadloop_session_inner(
         let (args, using_resume) = build_agent_args(
             provider,
             &claude_session_id,
-            prompt,
+            iteration_prompt,
             first_message,
             try_resume_first,
         );
