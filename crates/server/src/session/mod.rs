@@ -1,9 +1,10 @@
 use dashmap::DashMap;
-use std::collections::{HashMap, HashSet};
 use shared::{
     CliClientInfo, CliClientStatus, MachineInfo, MachineProjectInfo, MachineWithProjects,
     PaneConfig, Provider, ServerToCli, ServerToDaemon, ServerToWeb, UsageLimits,
 };
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -78,7 +79,7 @@ impl SessionManager {
 
     pub fn unregister_cli(&self, cli_id: &Uuid) {
         self.cli_senders.remove(cli_id);
-        self.cli_users.remove(cli_id);
+        let owner = self.cli_users.remove(cli_id).map(|(_, uid)| uid);
         let keys_to_remove: Vec<(Uuid, Provider)> = self
             .cli_usage_limits
             .iter()
@@ -98,6 +99,10 @@ impl SessionManager {
         tracing::info!("CLI client unregistered: {}", cli_id);
         // Broadcast updated client list to all web clients
         self.broadcast_cli_clients_update();
+        // Broadcast updated machines (is_running depends on active CLI sessions)
+        if let Some(user_id) = owner {
+            self.broadcast_machines_update_for_user(&user_id);
+        }
     }
 
     // Daemon management
@@ -144,12 +149,15 @@ impl SessionManager {
     }
 
     pub async fn send_to_daemon(&self, machine_id: &Uuid, msg: ServerToDaemon) -> bool {
-        if let Some(sender) = self.daemon_senders.get(machine_id) {
-            if sender.send(msg).await.is_ok() {
-                return true;
-            }
+        let sender = self.daemon_senders.get(machine_id).map(|s| s.clone());
+        if let Some(sender) = sender {
+            matches!(
+                tokio::time::timeout(Duration::from_secs(5), sender.send(msg)).await,
+                Ok(Ok(()))
+            )
+        } else {
+            false
         }
-        false
     }
 
     pub fn get_machines_for_user(&self, user_id: &Uuid) -> Vec<MachineWithProjects> {
@@ -213,11 +221,9 @@ impl SessionManager {
             }
             let connection_id = *web_entry.key();
             if let Some(sender) = self.web_senders.get(&connection_id) {
-                let sender = sender.clone();
-                let msg = msg.clone();
-                tokio::spawn(async move {
-                    let _ = sender.send(msg).await;
-                });
+                // Use try_send to avoid blocking and unbounded task spawning.
+                // Dropping a periodic broadcast message is acceptable.
+                let _ = sender.try_send(msg.clone());
             }
         }
     }
@@ -313,6 +319,11 @@ impl SessionManager {
             if !sessions.contains(&session_id) {
                 sessions.push(session_id);
             }
+        }
+
+        // Broadcast machines update (is_running depends on active sessions)
+        if let Some(user_id) = self.cli_users.get(&cli_id).map(|e| *e) {
+            self.broadcast_machines_update_for_user(&user_id);
         }
         // Broadcast updated client list to all web clients (shows active session)
         self.broadcast_cli_clients_update();
@@ -454,21 +465,31 @@ impl SessionManager {
 
     // Message routing
     pub async fn send_to_cli(&self, cli_id: &Uuid, msg: ServerToCli) -> bool {
-        if let Some(sender) = self.cli_senders.get(cli_id) {
-            if sender.send(msg).await.is_ok() {
-                return true;
-            }
+        // Clone sender and drop DashMap Ref before awaiting to prevent deadlock.
+        // Holding the Ref across .await would block DashMap write operations
+        // (e.g., unregister_cli) on the same shard, freezing the server.
+        let sender = self.cli_senders.get(cli_id).map(|s| s.clone());
+        if let Some(sender) = sender {
+            matches!(
+                tokio::time::timeout(Duration::from_secs(5), sender.send(msg)).await,
+                Ok(Ok(()))
+            )
+        } else {
+            false
         }
-        false
     }
 
     pub async fn send_to_web(&self, connection_id: &Uuid, msg: ServerToWeb) -> bool {
-        if let Some(sender) = self.web_senders.get(connection_id) {
-            if sender.send(msg).await.is_ok() {
-                return true;
-            }
+        // Clone sender and drop DashMap Ref before awaiting to prevent deadlock.
+        let sender = self.web_senders.get(connection_id).map(|s| s.clone());
+        if let Some(sender) = sender {
+            matches!(
+                tokio::time::timeout(Duration::from_secs(5), sender.send(msg)).await,
+                Ok(Ok(()))
+            )
+        } else {
+            false
         }
-        false
     }
 
     pub async fn route_to_cli(&self, session_id: &Uuid, msg: ServerToCli) -> bool {
@@ -585,11 +606,8 @@ impl SessionManager {
         let msg = ServerToWeb::CliClients { clients };
 
         for entry in self.web_senders.iter() {
-            let sender = entry.value().clone();
-            let msg_clone = msg.clone();
-            tokio::spawn(async move {
-                let _ = sender.send(msg_clone).await;
-            });
+            // Use try_send to avoid blocking and unbounded task spawning.
+            let _ = entry.value().try_send(msg.clone());
         }
     }
 
@@ -606,11 +624,8 @@ impl SessionManager {
         };
 
         for entry in self.web_senders.iter() {
-            let sender = entry.value().clone();
-            let msg_clone = msg.clone();
-            tokio::spawn(async move {
-                let _ = sender.send(msg_clone).await;
-            });
+            // Use try_send to avoid blocking and unbounded task spawning.
+            let _ = entry.value().try_send(msg.clone());
         }
     }
 

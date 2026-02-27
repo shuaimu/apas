@@ -7,8 +7,7 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use shared::{
-    MessageInfo, ServerToCli, ServerToDaemon, ServerToWeb, SessionInfo, SessionStatus,
-    WebToServer,
+    MessageInfo, ServerToCli, ServerToDaemon, ServerToWeb, SessionInfo, SessionStatus, WebToServer,
 };
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -58,18 +57,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             match Uuid::parse_str(&claims.sub) {
                                 Ok(uid) => {
                                     user_id = Some(uid);
-                                    let user_email = match state.db.get_user_by_id(&uid.to_string()).await {
-                                        Ok(Some(user)) => Some(user.email),
-                                        Ok(None) => None,
-                                        Err(err) => {
-                                            tracing::warn!(
-                                                "Failed to fetch email for user {}: {}",
-                                                uid,
-                                                err
-                                            );
-                                            None
-                                        }
-                                    };
+                                    let user_email =
+                                        match state.db.get_user_by_id(&uid.to_string()).await {
+                                            Ok(Some(user)) => Some(user.email),
+                                            Ok(None) => None,
+                                            Err(err) => {
+                                                tracing::warn!(
+                                                    "Failed to fetch email for user {}: {}",
+                                                    uid,
+                                                    err
+                                                );
+                                                None
+                                            }
+                                        };
                                     tracing::info!(
                                         "Web client {} authenticated as user {}",
                                         connection_id,
@@ -80,7 +80,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         .sessions
                                         .send_to_web(
                                             &connection_id,
-                                            ServerToWeb::Authenticated { user_id: uid, user_email },
+                                            ServerToWeb::Authenticated {
+                                                user_id: uid,
+                                                user_email,
+                                            },
                                         )
                                         .await;
 
@@ -1058,8 +1061,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     }
 
-    // Cleanup
-    state.sessions.unregister_web(&connection_id);
+    // Cleanup: abort send_task first so the channel receiver is dropped,
+    // preventing deadlock if a sender is awaiting on a full channel
+    // while unregister_web tries to acquire a write lock on the same DashMap shard.
     send_task.abort();
+    state.sessions.unregister_web(&connection_id);
     tracing::info!("Web client disconnected: {}", connection_id);
 }

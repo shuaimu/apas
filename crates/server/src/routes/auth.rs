@@ -129,7 +129,9 @@ pub async fn me(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|h| h.strip_prefix("Bearer "))
-        .ok_or_else(|| AppError::AuthError("Missing or invalid Authorization header".to_string()))?;
+        .ok_or_else(|| {
+            AppError::AuthError("Missing or invalid Authorization header".to_string())
+        })?;
 
     let claims = verify_token(auth_header, &state.config.auth.jwt_secret)?;
     let user = state

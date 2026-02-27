@@ -178,6 +178,26 @@ function renderContent(message: Message, outputType: Message["outputType"]) {
   }
 }
 
+/** Detect raw Claude stream-json messages (e.g. user tool_result) that leaked through as text */
+function parseRawStreamMessage(content: string): { msgType: string; summary: string; formatted: string } | null {
+  const trimmed = content.trim();
+  if (!trimmed.startsWith("{")) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed.type && parsed.message && typeof parsed.type === "string") {
+      const msgType = parsed.type as string;
+      let summary = msgType;
+      if (parsed.message?.content && Array.isArray(parsed.message.content)) {
+        const blockTypes = (parsed.message.content as Array<{ type?: string }>)
+          .map((b) => b.type || "unknown");
+        summary = `${msgType} [${blockTypes.join(", ")}]`;
+      }
+      return { msgType, summary, formatted: JSON.stringify(parsed, null, 2) };
+    }
+  } catch { /* not JSON */ }
+  return null;
+}
+
 function TextContent({ content }: { content: string }) {
   const commandExecutionEvent = parseCommandExecutionEventPreview(content);
 
@@ -207,6 +227,24 @@ function TextContent({ content }: { content: string }) {
             <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">{metaParts.join(" • ")}</div>
           ) : null}
           <CodeBlock code={commandExecutionEvent.formattedPayload} language="json" />
+        </details>
+      </div>
+    );
+  }
+
+  // Fold raw Claude stream-json messages that leaked through as text output
+  const rawStream = parseRawStreamMessage(content);
+  if (rawStream) {
+    return (
+      <div className="bg-gray-100 dark:bg-gray-800 rounded-2xl rounded-tl-sm px-3 sm:px-4 py-2 max-w-full">
+        <details>
+          <summary className="cursor-pointer select-none text-sm font-medium text-gray-700 dark:text-gray-200">
+            <span className="mr-2 rounded bg-gray-200 dark:bg-gray-700 px-2 py-0.5 text-xs font-semibold text-gray-600 dark:text-gray-300">
+              {rawStream.msgType}
+            </span>
+            <span className="break-all">{rawStream.summary}</span>
+          </summary>
+          <CodeBlock code={rawStream.formatted} language="json" />
         </details>
       </div>
     );

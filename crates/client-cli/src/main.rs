@@ -70,6 +70,10 @@ struct Cli {
     #[arg(long, conflicts_with = "offline")]
     remote: bool,
 
+    /// Run headless - same as default tabbed mode but without TUI (for daemon-spawned sessions)
+    #[arg(long, conflicts_with_all = ["offline", "remote", "hybrid"])]
+    headless: bool,
+
     /// Run in hybrid mode - single pane with local terminal + streaming (legacy)
     #[arg(long, conflicts_with_all = ["offline", "remote"])]
     hybrid: bool,
@@ -220,9 +224,7 @@ async fn main() -> Result<()> {
                             println!(
                                 "Daemon already running (pid {}, version {}).",
                                 existing.pid,
-                                existing
-                                    .version
-                                    .unwrap_or_else(|| "unknown".to_string())
+                                existing.version.unwrap_or_else(|| "unknown".to_string())
                             );
                             return Ok(());
                         }
@@ -287,6 +289,23 @@ async fn main() -> Result<()> {
         // Offline/local mode - no server connection
         tracing::info!("Starting in offline mode (no server connection)");
         mode::local::run(&working_dir).await?;
+    } else if cli.headless {
+        // Headless mode - tabbed mode without TUI (for daemon-spawned sessions)
+        let config = config::Config::load()?;
+        let server = cli
+            .server
+            .or(config.remote.server)
+            .unwrap_or_else(|| DEFAULT_SERVER.to_string());
+        let token = match cli.token.or(config.remote.token) {
+            Some(t) => t,
+            None => {
+                eprintln!("Not logged in. Run 'apas login' to authenticate.");
+                return Ok(());
+            }
+        };
+
+        tracing::info!("Starting in headless mode (streaming to {})", server);
+        mode::dual_pane::run_headless(&server, &token, &working_dir).await?;
     } else if cli.remote {
         // Remote-only mode - no local I/O
         let config = config::Config::load()?;
@@ -503,10 +522,7 @@ fn stop_daemon_process(pid: u32) -> Result<()> {
         thread::sleep(Duration::from_millis(100));
     }
 
-    let _ = Command::new("kill")
-        .arg("-9")
-        .arg(pid.to_string())
-        .status();
+    let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
 
     for _ in 0..20 {
         if !is_apas_daemon_process(pid) {

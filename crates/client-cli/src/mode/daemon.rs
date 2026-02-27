@@ -66,7 +66,9 @@ impl DaemonState {
         let stale_ids: Vec<String> = self
             .projects
             .keys()
-            .filter(|project_id| !seen.contains(*project_id) && !self.processes.contains_key(*project_id))
+            .filter(|project_id| {
+                !seen.contains(*project_id) && !self.processes.contains_key(*project_id)
+            })
             .cloned()
             .collect();
         for project_id in stale_ids {
@@ -140,15 +142,24 @@ impl DaemonState {
             .get_mut(project_id)
             .ok_or_else(|| anyhow::anyhow!("Unknown project id: {}", project_id))?;
 
-        let executable = std::env::current_exe()?;
+        // Prefer the on-disk path, falling back to current_exe().
+        // current_exe() can return a "(deleted)" path if the binary was
+        // replaced while the daemon is still running.
+        let executable = std::env::current_exe()
+            .ok()
+            .filter(|p| p.exists())
+            .or_else(|| dirs::home_dir().map(|h| h.join(".local/bin/apas")).filter(|p| p.exists()))
+            .unwrap_or_else(|| PathBuf::from("apas"));
         let child = Command::new(executable)
-            .arg("--remote")
+            .arg("--headless")
             .arg("--server")
             .arg(server_url)
             .arg("--token")
             .arg(token)
             .arg("-d")
             .arg(&project.path)
+            // Clear CLAUDECODE so child CLI can spawn Claude without nesting error
+            .env_remove("CLAUDECODE")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -245,7 +256,10 @@ fn find_project_dirs(root: &Path) -> Vec<PathBuf> {
                 continue;
             }
 
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
             // Skip hidden directories (except we already checked for .apas)
             if name.starts_with('.') {
                 continue;
@@ -295,9 +309,8 @@ pub async fn run(
 
     let roots = if project_roots.is_empty() {
         // Default to home directory so the daemon discovers all user projects
-        vec![dirs::home_dir().unwrap_or_else(|| {
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-        })]
+        vec![dirs::home_dir()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))]
     } else {
         project_roots
     };
@@ -391,7 +404,11 @@ async fn run_connection(
                 ws_sender.send(Message::Pong(data)).await?;
             }
             Some(Err(err)) => return Err(err.into()),
-            None => return Err(anyhow::anyhow!("Daemon websocket closed during registration")),
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Daemon websocket closed during registration"
+                ))
+            }
             _ => {}
         }
     }

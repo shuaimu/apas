@@ -586,19 +586,17 @@ pub const PANE_ID_INTERACTIVE: u32 = 2;
 impl PaneConfig {
     /// Create default pane configs for a new project (Claude interactive only)
     pub fn defaults() -> Vec<PaneConfig> {
-        vec![
-            PaneConfig {
-                pane_id: PANE_ID_INTERACTIVE,
-                provider: Provider::Claude,
-                mode: PaneMode::Interactive,
-                session_id: Uuid::new_v4(),
-                is_paused: false,
-                stop_requested: false,
-                prompt: None,
-                label: Some("Interactive".to_string()),
-                model: None,
-            },
-        ]
+        vec![PaneConfig {
+            pane_id: PANE_ID_INTERACTIVE,
+            provider: Provider::Claude,
+            mode: PaneMode::Interactive,
+            session_id: Uuid::new_v4(),
+            is_paused: false,
+            stop_requested: false,
+            prompt: None,
+            label: Some("Interactive".to_string()),
+            model: None,
+        }]
     }
 
     /// Map legacy PaneType to numeric pane_id
@@ -699,25 +697,13 @@ pub struct UsageLimitWindow {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UsageLimits {
     /// 5-hour rolling window usage
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        alias = "fiveHour"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "fiveHour")]
     pub five_hour: Option<UsageLimitWindow>,
     /// 7-day (weekly) rolling window usage
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        alias = "sevenDay"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "sevenDay")]
     pub seven_day: Option<UsageLimitWindow>,
     /// When the usage was last fetched (ISO 8601 timestamp)
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        alias = "fetchedAt"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "fetchedAt")]
     pub fetched_at: Option<String>,
 }
 
@@ -807,12 +793,43 @@ pub enum ClaudeContentBlock {
         input: serde_json::Value,
     },
     /// Tool result (in user messages)
+    /// Note: Claude CLI can send `content` as either a string or an array of
+    /// content parts. We use a custom deserializer to handle both.
     ToolResult {
         tool_use_id: String,
+        #[serde(deserialize_with = "deserialize_tool_result_content")]
         content: String,
         #[serde(default)]
         is_error: bool,
     },
+}
+
+/// Deserialize tool_result content which can be either a string or an array of
+/// content parts (e.g. `[{"type":"text","text":"..."}]`).
+fn deserialize_tool_result_content<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::String(s) => Ok(s),
+        serde_json::Value::Array(arr) => {
+            // Extract text from content parts like [{"type":"text","text":"..."}]
+            let texts: Vec<String> = arr
+                .iter()
+                .filter_map(|item| item.get("text").and_then(|t| t.as_str()).map(String::from))
+                .collect();
+            if texts.is_empty() {
+                // Fallback: serialize the array as JSON string
+                Ok(serde_json::to_string(&serde_json::Value::Array(arr))
+                    .unwrap_or_default())
+            } else {
+                Ok(texts.join("\n"))
+            }
+        }
+        serde_json::Value::Null => Ok(String::new()),
+        other => Ok(other.to_string()),
+    }
 }
 
 // ============================================================================

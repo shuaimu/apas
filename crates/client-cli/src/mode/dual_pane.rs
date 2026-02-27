@@ -60,9 +60,20 @@ type PaneMetas = Arc<Mutex<HashMap<u32, PaneMeta>>>;
 
 /// Run in tab-based mode
 pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()> {
-    // Clear terminal screen for a clean start
-    print!("\x1B[2J\x1B[H");
-    let _ = std::io::Write::flush(&mut std::io::stdout());
+    run_inner(server_url, token, working_dir, false).await
+}
+
+/// Run in headless mode — same as normal but without TUI (for daemon-spawned sessions)
+pub async fn run_headless(server_url: &str, token: &str, working_dir: &Path) -> Result<()> {
+    run_inner(server_url, token, working_dir, true).await
+}
+
+async fn run_inner(server_url: &str, token: &str, working_dir: &Path, headless: bool) -> Result<()> {
+    if !headless {
+        // Clear terminal screen for a clean start
+        print!("\x1B[2J\x1B[H");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
 
     let config = crate::config::Config::load().unwrap_or_default();
     let claude_path = config.local.claude_path.clone();
@@ -404,15 +415,33 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
         })
     };
 
-    // Run TUI in main thread.
-    let mut app = App::new(tui_input_tx, output_rx, event_tx, command_rx, initial_tabs)
-        .with_shutdown(shutdown.clone());
-    if let Err(e) = app.run() {
-        tracing::error!("TUI error: {}", e);
-    }
+    if headless {
+        // Headless mode: drain output (nobody reads it) and wait for server task
+        drop(output_rx);
+        drop(command_rx);
+        drop(tui_input_tx);
+        tracing::info!("Running in headless mode, waiting for server connection...");
+        let _ = server_task.await;
+        shutdown.store(true, Ordering::SeqCst);
+    } else {
+        // Run TUI in main thread.
+        let mut app = App::new(tui_input_tx, output_rx, event_tx, command_rx, initial_tabs)
+            .with_shutdown(shutdown.clone());
+        if let Err(e) = app.run() {
+            tracing::error!("TUI error: {}", e);
+        }
+        // Signal shutdown
+        shutdown.store(true, Ordering::SeqCst);
 
-    // Signal shutdown
-    shutdown.store(true, Ordering::SeqCst);
+        // If reboot was requested, restart immediately
+        if reboot_requested.load(Ordering::SeqCst) {
+            server_task.abort();
+            crate::update::restart_cli();
+            std::process::exit(1);
+        }
+
+        server_task.abort();
+    }
 
     // Kill all running child processes
     if let Ok(metas) = pane_metas.lock() {
@@ -425,19 +454,11 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
         }
     }
 
-    // If reboot was requested, restart immediately
-    if reboot_requested.load(Ordering::SeqCst) {
-        server_task.abort();
-        crate::update::restart_cli();
-        std::process::exit(1);
-    }
-
     // Wait for threads.
     for thread in pane_threads {
         let _ = thread.join();
     }
     let _ = tui_event_thread.join();
-    server_task.abort();
 
     Ok(())
 }

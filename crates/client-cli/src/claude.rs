@@ -18,6 +18,8 @@ impl ClaudeProcess {
     ) -> Result<(Self, mpsc::Receiver<String>, mpsc::Receiver<String>)> {
         let mut child = Command::new(claude_path)
             .current_dir(working_dir)
+            // Clear CLAUDECODE env var so Claude doesn't think it's nested
+            .env_remove("CLAUDECODE")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

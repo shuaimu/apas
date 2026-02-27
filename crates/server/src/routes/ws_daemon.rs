@@ -35,39 +35,37 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         token,
                         machine,
                         projects,
-                    }) => {
-                        match verify_token(&token, &state.config.auth.jwt_secret) {
-                            Ok(claims) => match Uuid::parse_str(&claims.sub) {
-                                Ok(uid) => {
-                                    user_id = uid;
-                                    let mut normalized = machine;
-                                    if normalized.machine_id.is_nil() {
-                                        normalized.machine_id = Uuid::new_v4();
-                                    }
-                                    machine_id = normalized.machine_id;
-                                    machine_info = normalized;
-                                    initial_projects = projects;
-                                    break;
+                    }) => match verify_token(&token, &state.config.auth.jwt_secret) {
+                        Ok(claims) => match Uuid::parse_str(&claims.sub) {
+                            Ok(uid) => {
+                                user_id = uid;
+                                let mut normalized = machine;
+                                if normalized.machine_id.is_nil() {
+                                    normalized.machine_id = Uuid::new_v4();
                                 }
-                                Err(_) => {
-                                    let response = ServerToDaemon::RegistrationFailed {
-                                        reason: "Invalid user ID in token".to_string(),
-                                    };
-                                    let text = serde_json::to_string(&response).unwrap();
-                                    let _ = sender.send(Message::Text(text.into())).await;
-                                    return;
-                                }
-                            },
-                            Err(err) => {
+                                machine_id = normalized.machine_id;
+                                machine_info = normalized;
+                                initial_projects = projects;
+                                break;
+                            }
+                            Err(_) => {
                                 let response = ServerToDaemon::RegistrationFailed {
-                                    reason: format!("Authentication failed: {}", err),
+                                    reason: "Invalid user ID in token".to_string(),
                                 };
                                 let text = serde_json::to_string(&response).unwrap();
                                 let _ = sender.send(Message::Text(text.into())).await;
                                 return;
                             }
+                        },
+                        Err(err) => {
+                            let response = ServerToDaemon::RegistrationFailed {
+                                reason: format!("Authentication failed: {}", err),
+                            };
+                            let text = serde_json::to_string(&response).unwrap();
+                            let _ = sender.send(Message::Text(text.into())).await;
+                            return;
                         }
-                    }
+                    },
                     Ok(DaemonToServer::Heartbeat { .. }) => {
                         tracing::warn!("Daemon sent heartbeat before register");
                     }
