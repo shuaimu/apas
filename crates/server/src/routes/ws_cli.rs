@@ -467,15 +467,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     }
 
-    // Cleanup - mark all sessions for this CLI as inactive
+    // Cleanup - mark all sessions for this CLI as inactive and clear cli_client_id
     let session_ids = state.sessions.get_cli_session_ids(&cli_id);
     for session_id in &session_ids {
         if let Err(e) = state
             .db
-            .update_session_status(&session_id.to_string(), "inactive")
+            .clear_session_cli(&session_id.to_string())
             .await
         {
-            tracing::error!("Failed to update session {} status: {}", session_id, e);
+            tracing::error!("Failed to clear session {} cli_client_id: {}", session_id, e);
         }
     }
 

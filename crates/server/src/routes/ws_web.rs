@@ -670,11 +670,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         continue;
                     }
 
-                    // Look up CLI client ID from database for this session
+                    // Look up CLI client ID from database, but only trust it if
+                    // the CLI is actually connected (prevents stale IDs after server restart)
                     let cli_client_id = match state.db.get_session(&sid.to_string()).await {
                         Ok(Some(db_session)) => db_session
                             .cli_client_id
-                            .and_then(|id| Uuid::parse_str(&id).ok()),
+                            .and_then(|id| Uuid::parse_str(&id).ok())
+                            .filter(|id| state.sessions.is_cli_connected(id)),
                         _ => None,
                     };
 

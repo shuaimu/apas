@@ -9,7 +9,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
 
@@ -17,6 +17,8 @@ const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_DISCOVERY_DEPTH: usize = 8;
+const RESTART_COOLDOWN: Duration = Duration::from_secs(60);
+const MAX_RESTART_ATTEMPTS: u32 = 3;
 const VERSION: &str = env!("APAS_VERSION");
 
 #[derive(Debug)]
@@ -27,12 +29,19 @@ struct ProjectEntry {
     last_error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct RestartInfo {
+    attempts: u32,
+    last_crash: Instant,
+}
+
 #[derive(Debug)]
 struct DaemonState {
     machine_info: MachineInfo,
     project_roots: Vec<PathBuf>,
     projects: HashMap<String, ProjectEntry>,
     processes: HashMap<String, Child>,
+    restart_info: HashMap<String, RestartInfo>,
 }
 
 impl DaemonState {
@@ -42,6 +51,7 @@ impl DaemonState {
             project_roots,
             projects: HashMap::new(),
             processes: HashMap::new(),
+            restart_info: HashMap::new(),
         }
     }
 
@@ -76,7 +86,7 @@ impl DaemonState {
         }
     }
 
-    fn reap_exited_processes(&mut self) {
+    fn reap_exited_processes(&mut self, server_url: &str, token: &str) {
         let mut exited = Vec::new();
         for (project_id, child) in &mut self.processes {
             match child.try_wait() {
@@ -99,15 +109,50 @@ impl DaemonState {
             }
         }
 
-        for project_id in exited {
-            self.processes.remove(&project_id);
+        for project_id in &exited {
+            self.processes.remove(project_id);
         }
-    }
 
-    fn stop_all(&mut self) {
-        let project_ids: Vec<String> = self.processes.keys().cloned().collect();
-        for project_id in project_ids {
-            let _ = self.stop_project(&project_id);
+        // Auto-restart crashed processes (with cooldown)
+        let now = Instant::now();
+        for project_id in exited {
+            let info = self.restart_info.entry(project_id.clone()).or_insert(RestartInfo {
+                attempts: 0,
+                last_crash: now,
+            });
+
+            if info.last_crash.elapsed() > RESTART_COOLDOWN {
+                // Cooldown passed — reset counter
+                info.attempts = 0;
+            }
+
+            info.attempts += 1;
+            info.last_crash = now;
+
+            if info.attempts > MAX_RESTART_ATTEMPTS {
+                tracing::error!(
+                    "Project {} crashed {} times within cooldown, not restarting",
+                    project_id,
+                    info.attempts
+                );
+                if let Some(project) = self.projects.get_mut(&project_id) {
+                    project.last_error = Some(format!(
+                        "Exceeded max restart attempts ({})",
+                        MAX_RESTART_ATTEMPTS
+                    ));
+                }
+                continue;
+            }
+
+            tracing::warn!(
+                "Auto-restarting crashed project CLI: {} (attempt {}/{})",
+                project_id,
+                info.attempts,
+                MAX_RESTART_ATTEMPTS
+            );
+            if let Err(e) = self.start_project(&project_id, server_url, token) {
+                tracing::error!("Failed to auto-restart project {}: {}", project_id, e);
+            }
         }
     }
 
@@ -131,7 +176,16 @@ impl DaemonState {
     }
 
     fn start_project(&mut self, project_id: &str, server_url: &str, token: &str) -> Result<()> {
-        self.reap_exited_processes();
+        // Don't auto-restart here to avoid recursion — just reap
+        let mut exited = Vec::new();
+        for (pid, child) in &mut self.processes {
+            if let Ok(Some(_)) = child.try_wait() {
+                exited.push(pid.clone());
+            }
+        }
+        for pid in exited {
+            self.processes.remove(&pid);
+        }
 
         if self.processes.contains_key(project_id) {
             return Ok(());
@@ -195,6 +249,7 @@ struct StoredProject {
     id: Uuid,
     name: Option<String>,
 }
+
 
 fn discover_projects(roots: &[PathBuf]) -> Vec<ProjectEntry> {
     let mut results = Vec::new();
@@ -344,7 +399,7 @@ pub async fn run(
     let mut reconnect_delay = INITIAL_RECONNECT_DELAY;
 
     while !shutdown.load(Ordering::SeqCst) {
-        state.reap_exited_processes();
+        state.reap_exited_processes(server_url, token);
         state.refresh_projects();
 
         match run_connection(server_url, token, &mut state, shutdown.clone()).await {
@@ -363,8 +418,10 @@ pub async fn run(
         }
     }
 
-    state.stop_all();
-    tracing::info!("Daemon stopped");
+    // Don't kill headless CLIs on shutdown — they are self-sufficient and will
+    // keep running with their own server reconnection loops. This allows the
+    // daemon to be restarted/upgraded without disrupting active sessions.
+    tracing::info!("Daemon stopped (headless CLIs left running)");
     Ok(())
 }
 
@@ -423,7 +480,7 @@ async fn run_connection(
 
         tokio::select! {
             _ = heartbeat.tick() => {
-                state.reap_exited_processes();
+                state.reap_exited_processes(server_url, token);
                 state.refresh_projects();
 
                 let heartbeat_msg = DaemonToServer::Heartbeat {
@@ -442,6 +499,8 @@ async fn run_connection(
                                 return Err(anyhow::anyhow!("Daemon auth dropped: {}", reason));
                             }
                             ServerToDaemon::StartProjectCli { project_id } => {
+                                // Manual start resets restart cooldown
+                                state.restart_info.remove(&project_id);
                                 if let Err(err) = state.start_project(&project_id, server_url, token) {
                                     tracing::warn!("Failed to start project {}: {}", project_id, err);
                                 }

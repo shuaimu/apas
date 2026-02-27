@@ -323,6 +323,15 @@ impl Database {
         Ok(())
     }
 
+    /// Mark session as inactive and clear cli_client_id (CLI disconnected)
+    pub async fn clear_session_cli(&self, id: &str) -> Result<()> {
+        sqlx::query("UPDATE sessions SET status = 'inactive', cli_client_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn update_session_paused(&self, id: &str, is_paused: bool) -> Result<()> {
         sqlx::query(
             "UPDATE sessions SET is_paused = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",

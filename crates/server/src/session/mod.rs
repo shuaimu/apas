@@ -105,6 +105,11 @@ impl SessionManager {
         }
     }
 
+    /// Check if a CLI client is currently connected (has an active sender)
+    pub fn is_cli_connected(&self, cli_id: &Uuid) -> bool {
+        self.cli_senders.contains_key(cli_id)
+    }
+
     // Daemon management
     pub fn register_daemon(
         &self,
@@ -139,6 +144,15 @@ impl SessionManager {
     }
 
     pub fn update_daemon_projects(&self, machine_id: &Uuid, projects: Vec<MachineProjectInfo>) {
+        let running_count = projects.iter().filter(|p| p.is_running).count();
+        if running_count > 0 {
+            tracing::debug!(
+                "Daemon {} heartbeat: {}/{} projects running",
+                machine_id,
+                running_count,
+                projects.len()
+            );
+        }
         self.machine_projects.insert(*machine_id, projects);
         if let Some(mut machine) = self.machine_infos.get_mut(machine_id) {
             machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
