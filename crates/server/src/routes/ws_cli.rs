@@ -231,6 +231,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 if let Some(pane_list) = &panes {
                                     if !pane_list.is_empty() {
                                         state.sessions.set_session_panes(&session_id, pane_list.clone());
+                                        if let Err(e) = state.storage.save_pane_list(&session_id, pane_list).await {
+                                            tracing::warn!(
+                                                "Failed to persist initial pane list for session {}: {}",
+                                                session_id,
+                                                e
+                                            );
+                                        }
                                         // Forward to any already-attached web clients
                                         state.sessions.route_to_web(
                                             &session_id,
@@ -422,6 +429,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 // Cache pane list and forward to attached web clients
                                 tracing::info!("CLI {} sent pane list for session {}: {} panes", cli_id, session_id, panes.len());
                                 state.sessions.set_session_panes(&session_id, panes.clone());
+                                if let Err(e) = state.storage.save_pane_list(&session_id, &panes).await {
+                                    tracing::warn!(
+                                        "Failed to persist pane list for session {}: {}",
+                                        session_id,
+                                        e
+                                    );
+                                }
                                 let web_msg = ServerToWeb::PaneList {
                                     session_id,
                                     panes,

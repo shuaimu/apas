@@ -38,6 +38,11 @@ impl FileStorage {
         self.session_dir(session_id).join("messages.jsonl")
     }
 
+    /// Get the pane list metadata file path for a session
+    fn panes_file(&self, session_id: &Uuid) -> PathBuf {
+        self.session_dir(session_id).join("panes.json")
+    }
+
     /// Ensure the session directory exists
     async fn ensure_session_dir(&self, session_id: &Uuid) -> Result<()> {
         let dir = self.session_dir(session_id);
@@ -61,6 +66,30 @@ impl FileStorage {
         file.write_all(json.as_bytes()).await?;
 
         Ok(())
+    }
+
+    /// Persist pane configurations for a session so inactive sessions can restore tabs after restart
+    pub async fn save_pane_list(
+        &self,
+        session_id: &Uuid,
+        panes: &[shared::PaneConfig],
+    ) -> Result<()> {
+        self.ensure_session_dir(session_id).await?;
+        let file_path = self.panes_file(session_id);
+        let json = serde_json::to_vec(panes)?;
+        fs::write(file_path, json).await?;
+        Ok(())
+    }
+
+    /// Load persisted pane configurations for a session
+    pub async fn load_pane_list(&self, session_id: &Uuid) -> Result<Vec<shared::PaneConfig>> {
+        let file_path = self.panes_file(session_id);
+        if !file_path.exists() {
+            return Ok(Vec::new());
+        }
+        let data = fs::read(file_path).await?;
+        let panes = serde_json::from_slice::<Vec<shared::PaneConfig>>(&data)?;
+        Ok(panes)
     }
 
     /// Read ALL messages for a session (no limit)
@@ -200,14 +229,7 @@ impl FileStorage {
                 Ok(msg) => {
                     // Filter by pane_id if specified
                     if let Some(filter) = pane_id {
-                        let filter_str = filter.to_string();
-                        // Match exact numeric pane_id, or legacy "deadloop"/"interactive" values
-                        let matches = msg.pane_type.as_deref() == Some(&filter_str)
-                            || (filter == shared::PANE_ID_DEADLOOP
-                                && msg.pane_type.as_deref() == Some("deadloop"))
-                            || (filter == shared::PANE_ID_INTERACTIVE
-                                && msg.pane_type.as_deref() == Some("interactive"));
-                        if matches {
+                        if parse_stored_pane_id(msg.pane_type.as_deref()) == Some(filter) {
                             all_messages.push(msg);
                         }
                     } else {
@@ -271,12 +293,9 @@ impl FileStorage {
             }
             match serde_json::from_str::<StoredMessage>(&line) {
                 Ok(msg) => {
-                    // Normalize legacy pane_type values to new pane_id format
-                    let bucket_key = match msg.pane_type.as_deref() {
-                        Some("deadloop") => Some("claude-deadloop-1".to_string()),
-                        Some("interactive") => Some("claude-interactive-1".to_string()),
-                        other => other.map(|s| s.to_string()),
-                    };
+                    // Normalize pane identifiers so legacy and numeric representations
+                    // of the same pane collapse into a single bucket.
+                    let bucket_key = normalized_bucket_key(msg.pane_type.as_deref());
                     pane_buckets.entry(bucket_key).or_default().push(msg);
                 }
                 Err(e) => {
@@ -334,5 +353,84 @@ impl FileStorage {
         }
 
         Ok(sessions)
+    }
+}
+
+fn normalized_bucket_key(raw_pane_type: Option<&str>) -> Option<String> {
+    if let Some(id) = parse_stored_pane_id(raw_pane_type) {
+        return Some(id.to_string());
+    }
+    raw_pane_type.map(|s| s.to_string())
+}
+
+fn parse_stored_pane_id(raw_pane_type: Option<&str>) -> Option<u32> {
+    let raw = raw_pane_type?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    if raw.eq_ignore_ascii_case("deadloop") {
+        return Some(shared::PANE_ID_DEADLOOP);
+    }
+    if raw.eq_ignore_ascii_case("interactive") {
+        return Some(shared::PANE_ID_INTERACTIVE);
+    }
+    if let Ok(id) = raw.parse::<u32>() {
+        return Some(id);
+    }
+
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("deadloop") {
+        return Some(shared::PANE_ID_DEADLOOP);
+    }
+    if lower.contains("interactive") {
+        return Some(shared::PANE_ID_INTERACTIVE);
+    }
+
+    let trailing_digits_rev: String = lower
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if trailing_digits_rev.is_empty() {
+        return None;
+    }
+    let trailing_digits: String = trailing_digits_rev.chars().rev().collect();
+    trailing_digits.parse::<u32>().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalized_bucket_key, parse_stored_pane_id};
+
+    #[test]
+    fn parse_stored_pane_id_handles_legacy_numeric_and_composite_formats() {
+        assert_eq!(parse_stored_pane_id(Some("deadloop")), Some(shared::PANE_ID_DEADLOOP));
+        assert_eq!(
+            parse_stored_pane_id(Some("interactive")),
+            Some(shared::PANE_ID_INTERACTIVE)
+        );
+        assert_eq!(parse_stored_pane_id(Some("939")), Some(939));
+        assert_eq!(
+            parse_stored_pane_id(Some("claude-interactive-1")),
+            Some(shared::PANE_ID_INTERACTIVE)
+        );
+        assert_eq!(
+            parse_stored_pane_id(Some("codex-deadloop-7")),
+            Some(shared::PANE_ID_DEADLOOP)
+        );
+        assert_eq!(parse_stored_pane_id(Some("pane-42")), Some(42));
+        assert_eq!(parse_stored_pane_id(Some("unknown")), None);
+        assert_eq!(parse_stored_pane_id(None), None);
+    }
+
+    #[test]
+    fn normalized_bucket_key_collapses_equivalent_pane_identifiers() {
+        assert_eq!(normalized_bucket_key(Some("interactive")), Some("2".to_string()));
+        assert_eq!(normalized_bucket_key(Some("2")), Some("2".to_string()));
+        assert_eq!(
+            normalized_bucket_key(Some("claude-interactive-1")),
+            Some("2".to_string())
+        );
     }
 }

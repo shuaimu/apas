@@ -128,11 +128,18 @@ function normalizeProvider(raw: unknown): Provider | null {
 function normalizePaneId(paneType: string | undefined, paneId: number | undefined): number | undefined {
   if (paneId != null) return paneId;
   if (!paneType) return undefined;
-  if (paneType === "deadloop") return PANE_ID_DEADLOOP;
-  if (paneType === "interactive") return PANE_ID_INTERACTIVE;
+  const normalized = paneType.trim().toLowerCase();
+  if (normalized === "deadloop" || normalized.includes("deadloop")) return PANE_ID_DEADLOOP;
+  if (normalized === "interactive" || normalized.includes("interactive")) return PANE_ID_INTERACTIVE;
   // Try parsing as number (for stored messages with numeric string pane_type)
-  const parsed = parseInt(paneType, 10);
+  const parsed = parseInt(normalized, 10);
   if (!isNaN(parsed)) return parsed;
+  // Fallback: parse trailing numeric suffix from legacy composite formats.
+  const suffixMatch = normalized.match(/(\d+)$/);
+  if (suffixMatch) {
+    const suffix = parseInt(suffixMatch[1], 10);
+    if (!isNaN(suffix)) return suffix;
+  }
   return undefined;
 }
 
@@ -257,7 +264,7 @@ interface AppState {
   stopMachineProjectCli: (machineId: string, projectId: string) => void;
   listSessions: () => void;
   loadSessionMessages: (sessionId: string) => void;
-  loadMoreMessages: (paneType?: PaneType) => void;
+  loadMoreMessages: (pane?: PaneType | number) => void;
   prependMessages: (messages: Message[], hasMore: boolean) => void;
   sendMessageToPane: (text: string, pane: PaneType | number) => { success: boolean; error?: string };
   addMessageToPane: (message: Message, pane: PaneType | number) => void;
@@ -672,7 +679,7 @@ export const useStore = create<AppState>((set, get) => ({
     set({ messages: [] });
   },
 
-  loadMoreMessages: (paneType?: PaneType) => {
+  loadMoreMessages: (pane?: PaneType | number) => {
     const { ws, sessionId, messages, paneMessages, isDualPane, loadingMorePane, hasMoreMessages, paneHasMore } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return;
@@ -681,8 +688,10 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
 
-    // Determine pane_id from paneType
-    const paneId = paneType ? normalizePaneId(paneType, undefined) : undefined;
+    const paneId = typeof pane === "number"
+      ? pane
+      : (pane ? normalizePaneId(pane, undefined) : undefined);
+    const paneType = typeof pane === "string" ? pane : legacyPaneType(paneId) as PaneType | undefined;
 
     let targetMessages: Message[];
     let hasMore: boolean;

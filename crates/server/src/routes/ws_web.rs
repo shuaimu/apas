@@ -19,6 +19,87 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> 
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
+fn parse_stored_pane_id(raw_pane_type: Option<&str>) -> Option<u32> {
+    let raw = raw_pane_type?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    if raw.eq_ignore_ascii_case("deadloop") {
+        return Some(shared::PANE_ID_DEADLOOP);
+    }
+    if raw.eq_ignore_ascii_case("interactive") {
+        return Some(shared::PANE_ID_INTERACTIVE);
+    }
+    if let Ok(id) = raw.parse::<u32>() {
+        return Some(id);
+    }
+
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("deadloop") {
+        return Some(shared::PANE_ID_DEADLOOP);
+    }
+    if lower.contains("interactive") {
+        return Some(shared::PANE_ID_INTERACTIVE);
+    }
+
+    let trailing_digits_rev: String = lower
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if trailing_digits_rev.is_empty() {
+        return None;
+    }
+    let trailing_digits: String = trailing_digits_rev.chars().rev().collect();
+    trailing_digits.parse::<u32>().ok()
+}
+
+fn to_message_info(message: crate::storage::StoredMessage) -> MessageInfo {
+    let pane_id = parse_stored_pane_id(message.pane_type.as_deref());
+    MessageInfo {
+        id: message.id,
+        role: message.role,
+        content: message.content,
+        message_type: message.message_type,
+        created_at: Some(message.created_at),
+        pane_type: message.pane_type,
+        pane_id,
+    }
+}
+
+fn infer_panes_from_messages(session_id: Uuid, messages: &[MessageInfo]) -> Vec<shared::PaneConfig> {
+    let mut pane_ids: Vec<u32> = messages.iter().filter_map(|m| m.pane_id).collect();
+    pane_ids.sort_unstable();
+    pane_ids.dedup();
+
+    pane_ids
+        .into_iter()
+        .map(|pane_id| {
+            let (mode, label) = match pane_id {
+                shared::PANE_ID_DEADLOOP => (shared::PaneMode::Deadloop, "Deadloop".to_string()),
+                shared::PANE_ID_INTERACTIVE => {
+                    (shared::PaneMode::Interactive, "Interactive".to_string())
+                }
+                _ => (shared::PaneMode::Interactive, format!("Tab {}", pane_id)),
+            };
+            shared::PaneConfig {
+                pane_id,
+                provider: shared::Provider::Claude,
+                mode,
+                // We cannot recover provider-specific resume session IDs from historical
+                // messages alone, so we fall back to the project session ID.
+                session_id,
+                is_paused: false,
+                stop_requested: false,
+                prompt: None,
+                label: Some(label),
+                model: None,
+            }
+        })
+        .collect()
+}
+
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
     let connection_id = Uuid::new_v4();
@@ -753,29 +834,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         let (messages, has_more) =
                             match state.storage.get_messages_per_pane(&sid, 100).await {
                                 Ok((stored_messages, has_more)) => {
-                                    let messages: Vec<MessageInfo> = stored_messages
-                                        .into_iter()
-                                        .map(|m| {
-                                            let pane_id = m.pane_type.as_deref().and_then(|s| {
-                                                s.parse::<u32>().ok().or_else(|| match s {
-                                                    "deadloop" => Some(shared::PANE_ID_DEADLOOP),
-                                                    "interactive" => {
-                                                        Some(shared::PANE_ID_INTERACTIVE)
-                                                    }
-                                                    _ => None,
-                                                })
-                                            });
-                                            MessageInfo {
-                                                id: m.id,
-                                                role: m.role,
-                                                content: m.content,
-                                                message_type: m.message_type,
-                                                created_at: Some(m.created_at),
-                                                pane_type: m.pane_type,
-                                                pane_id,
-                                            }
-                                        })
-                                        .collect();
+                                    let messages: Vec<MessageInfo> =
+                                        stored_messages.into_iter().map(to_message_info).collect();
                                     (messages, has_more)
                                 }
                                 Err(e) => {
@@ -787,6 +847,45 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     (Vec::new(), false)
                                 }
                             };
+
+                        // Restore pane list for inactive sessions:
+                        // 1) in-memory cache, 2) persisted pane metadata, 3) inferred from messages.
+                        let mut panes_to_send = state.sessions.get_session_panes(&sid);
+                        if panes_to_send.is_empty() {
+                            match state.storage.load_pane_list(&sid).await {
+                                Ok(stored_panes) if !stored_panes.is_empty() => {
+                                    state.sessions.set_session_panes(&sid, stored_panes.clone());
+                                    panes_to_send = stored_panes;
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to load pane list metadata for session {}: {}",
+                                        sid,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        if panes_to_send.is_empty() {
+                            panes_to_send = infer_panes_from_messages(sid, &messages);
+                            if !panes_to_send.is_empty() {
+                                state.sessions.set_session_panes(&sid, panes_to_send.clone());
+                            }
+                        }
+                        if !panes_to_send.is_empty() {
+                            state
+                                .sessions
+                                .send_to_web(
+                                    &connection_id,
+                                    ServerToWeb::PaneList {
+                                        session_id: sid,
+                                        panes: panes_to_send,
+                                    },
+                                )
+                                .await;
+                        }
+
                         state
                             .sessions
                             .send_to_web(
@@ -798,21 +897,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 },
                             )
                             .await;
-
-                        // Send cached pane list if available
-                        let cached_panes = state.sessions.get_session_panes(&sid);
-                        if !cached_panes.is_empty() {
-                            state
-                                .sessions
-                                .send_to_web(
-                                    &connection_id,
-                                    ServerToWeb::PaneList {
-                                        session_id: sid,
-                                        panes: cached_panes,
-                                    },
-                                )
-                                .await;
-                        }
 
                         tracing::info!("Web client attached to CLI session {}", sid);
                     } else {
@@ -944,27 +1028,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         .await
                     {
                         Ok((stored_messages, has_more)) => {
-                            let messages: Vec<MessageInfo> = stored_messages
-                                .into_iter()
-                                .map(|m| {
-                                    let pane_id = m.pane_type.as_deref().and_then(|s| {
-                                        s.parse::<u32>().ok().or_else(|| match s {
-                                            "deadloop" => Some(shared::PANE_ID_DEADLOOP),
-                                            "interactive" => Some(shared::PANE_ID_INTERACTIVE),
-                                            _ => None,
-                                        })
-                                    });
-                                    MessageInfo {
-                                        id: m.id,
-                                        role: m.role,
-                                        content: m.content,
-                                        message_type: m.message_type,
-                                        created_at: Some(m.created_at),
-                                        pane_type: m.pane_type,
-                                        pane_id,
-                                    }
-                                })
-                                .collect();
+                            let messages: Vec<MessageInfo> =
+                                stored_messages.into_iter().map(to_message_info).collect();
                             state
                                 .sessions
                                 .send_to_web(
@@ -1007,27 +1072,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     // Get all messages without limit
                     match state.storage.get_messages(&sid).await {
                         Ok(stored_messages) => {
-                            let messages: Vec<MessageInfo> = stored_messages
-                                .into_iter()
-                                .map(|m| {
-                                    let pane_id = m.pane_type.as_deref().and_then(|s| {
-                                        s.parse::<u32>().ok().or_else(|| match s {
-                                            "deadloop" => Some(shared::PANE_ID_DEADLOOP),
-                                            "interactive" => Some(shared::PANE_ID_INTERACTIVE),
-                                            _ => None,
-                                        })
-                                    });
-                                    MessageInfo {
-                                        id: m.id,
-                                        role: m.role,
-                                        content: m.content,
-                                        message_type: m.message_type,
-                                        created_at: Some(m.created_at),
-                                        pane_type: m.pane_type,
-                                        pane_id,
-                                    }
-                                })
-                                .collect();
+                            let messages: Vec<MessageInfo> =
+                                stored_messages.into_iter().map(to_message_info).collect();
                             state
                                 .sessions
                                 .send_to_web(

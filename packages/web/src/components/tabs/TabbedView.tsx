@@ -78,13 +78,18 @@ function synthesizeConfigs(
   const sortedPaneIds = Array.from(paneIds).sort((a, b) => a - b);
   for (const numericId of sortedPaneIds) {
     const isDeadloop = numericId === PANE_ID_DEADLOOP;
+    const isLegacyInteractive = numericId === PANE_ID_INTERACTIVE;
     configs.push({
       pane_id: numericId,
       provider: "claude",
       mode: isDeadloop ? "deadloop" : "interactive",
       session_id: sessionId || "",
       is_paused: pausedPanes.includes(numericId),
-      label: isDeadloop ? "Deadloop" : "Interactive",
+      label: isDeadloop
+        ? "Deadloop"
+        : isLegacyInteractive
+          ? "Interactive"
+          : `Tab ${numericId}`,
     });
   }
   return configs;
@@ -250,9 +255,7 @@ export function TabbedView() {
     if (activeTabId === PANE_ID_MAIN) {
       loadMoreMessages();
     } else {
-      // Map pane_id to legacy pane_type for loadMoreMessages
-      const legacyType = activeTabId === PANE_ID_DEADLOOP ? "deadloop" : activeTabId === PANE_ID_INTERACTIVE ? "interactive" : undefined;
-      loadMoreMessages(legacyType as "deadloop" | "interactive" | undefined);
+      loadMoreMessages(activeTabId);
     }
   }, [activeTabId, loadMoreMessages]);
 
