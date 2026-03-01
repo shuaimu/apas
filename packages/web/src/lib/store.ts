@@ -257,7 +257,7 @@ interface AppState {
   reject: (toolCallId: string) => void;
   clearMessages: () => void;
   startSession: (cliClientId?: string) => void;
-  attachSession: (sessionId: string) => void;
+  attachSession: (sessionId: string, forceReload?: boolean) => void;
   refreshCliClients: () => void;
   listMachines: () => void;
   startMachineProjectCli: (machineId: string, projectId: string) => void;
@@ -454,9 +454,9 @@ export const useStore = create<AppState>((set, get) => ({
             console.log("Connection appears healthy, refreshing data...");
             get().refreshCliClients();
             get().listSessions();
-            if (sessionId && !isAttached) {
-              console.log("Session exists but not attached, re-attaching...");
-              get().attachSession(sessionId);
+            if (sessionId) {
+              console.log("Refreshing attached session after foreground...");
+              get().attachSession(sessionId, true);
             }
           }
         }
@@ -511,7 +511,7 @@ export const useStore = create<AppState>((set, get) => ({
     }));
   },
 
-  attachSession: (sessionId: string) => {
+  attachSession: (sessionId: string, forceReload = false) => {
     const { ws, sessionId: currentSessionId } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       console.error("WebSocket not connected");
@@ -539,7 +539,7 @@ export const useStore = create<AppState>((set, get) => ({
       localStorage.setItem("apas_cli_client_id", newCliClientId);
     }
 
-    if (!isSameSession) {
+    if (!isSameSession || forceReload) {
       set({
         sessionId,
         cliClientId: newCliClientId,
@@ -962,7 +962,7 @@ function handleServerMessage(
       if (savedSessionId) {
         console.log("Restoring session:", savedSessionId);
         setTimeout(() => {
-          get().attachSession(savedSessionId);
+          get().attachSession(savedSessionId, true);
         }, 500);
       }
       break;
