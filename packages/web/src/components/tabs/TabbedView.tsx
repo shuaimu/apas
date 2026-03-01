@@ -22,6 +22,8 @@ const DEFAULT_BOT_LOOP_PROMPT = `Work on tasks defined in TODO.md. Do the follow
 interface ScrollState {
   scrollTop: number;
   wasAtBottom: boolean;
+  scrollHeight: number;
+  clientHeight: number;
 }
 const scrollPositions = new Map<string, ScrollState>();
 
@@ -520,6 +522,7 @@ function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore }: Messa
   const prevScrollHeight = useRef<number>(0);
   const isRestoringScroll = useRef(false);
   const scrollThrottleRef = useRef<number>(0);
+  const hasRestoredRef = useRef(false);
 
   const scrollKey = getScrollKey(sessionId, paneId);
 
@@ -550,6 +553,8 @@ function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore }: Messa
       scrollPositions.set(scrollKey, {
         scrollTop: containerRef.current.scrollTop,
         wasAtBottom: shouldAutoScroll.current,
+        scrollHeight: containerRef.current.scrollHeight,
+        clientHeight: containerRef.current.clientHeight,
       });
     }
 
@@ -562,31 +567,52 @@ function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore }: Messa
   // Save scroll position on unmount (component is keyed by paneId, so unmount = tab switch)
   useEffect(() => {
     return () => {
-      if (containerRef.current) {
+      const container = containerRef.current;
+      if (container) {
+        const wasAtBottom =
+          container.scrollHeight - container.scrollTop - container.clientHeight <= 100;
         scrollPositions.set(scrollKey, {
-          scrollTop: containerRef.current.scrollTop,
-          wasAtBottom: shouldAutoScroll.current,
+          scrollTop: container.scrollTop,
+          wasAtBottom,
+          scrollHeight: container.scrollHeight,
+          clientHeight: container.clientHeight,
         });
       }
     };
   }, [scrollKey]);
 
-  // Restore scroll position on mount
+  // Restore scroll position once messages are available.
+  // Waiting avoids restoring against an empty/partial DOM during session re-attach.
   useEffect(() => {
     if (!containerRef.current) return;
+    if (hasRestoredRef.current) return;
+    if (messages.length === 0) return;
 
     const savedState = scrollPositions.get(scrollKey);
     if (savedState) {
       isRestoringScroll.current = true;
       shouldAutoScroll.current = savedState.wasAtBottom;
       requestAnimationFrame(() => {
-        if (containerRef.current) {
+        const container = containerRef.current;
+        if (container) {
+          const maxScrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
           if (savedState.wasAtBottom) {
-            containerRef.current.scrollTop = containerRef.current.scrollHeight;
+            container.scrollTop = maxScrollTop;
           } else {
-            containerRef.current.scrollTop = savedState.scrollTop;
+            const savedMaxScrollTop = Math.max(
+              0,
+              savedState.scrollHeight - savedState.clientHeight,
+            );
+            const nextScrollTop = savedMaxScrollTop > 0
+              ? (savedState.scrollTop / savedMaxScrollTop) * maxScrollTop
+              : savedState.scrollTop;
+            container.scrollTop = Math.max(
+              0,
+              Math.min(maxScrollTop, nextScrollTop),
+            );
           }
         }
+        hasRestoredRef.current = true;
         isRestoringScroll.current = false;
       });
     } else {
@@ -594,9 +620,9 @@ function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore }: Messa
       requestAnimationFrame(() => {
         messagesEndRef.current?.scrollIntoView();
       });
+      hasRestoredRef.current = true;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [messages.length, scrollKey]);
 
   // Maintain scroll position when prepending messages
   useEffect(() => {
