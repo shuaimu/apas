@@ -470,6 +470,26 @@ async fn run_connection(
         }
     }
 
+    // Auto-start all discovered projects on daemon (re)connect.
+    // When systemd restarts the daemon, it kills the entire cgroup including
+    // headless CLIs, so we need to restart them.
+    {
+        let project_ids: Vec<String> = state.projects.keys().cloned().collect();
+        for project_id in project_ids {
+            if !state.processes.contains_key(&project_id) {
+                if let Err(err) = state.start_project(&project_id, server_url, token) {
+                    tracing::warn!("Auto-start failed for project {}: {}", project_id, err);
+                }
+            }
+        }
+        // Report updated state to server
+        let update = DaemonToServer::Heartbeat {
+            projects: state.snapshot_projects(),
+        };
+        let text = serde_json::to_string(&update)?;
+        ws_sender.send(Message::Text(text.into())).await?;
+    }
+
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 

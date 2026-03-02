@@ -265,6 +265,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     tracing::error!("Failed to persist session to database: {}", e);
                                 }
 
+                                // Notify any already-attached web clients that CLI is (re)connected
+                                state.sessions.route_to_web(
+                                    &session_id,
+                                    ServerToWeb::SessionAttached {
+                                        session_id,
+                                        has_active_cli: true,
+                                    },
+                                ).await;
+
                                 tracing::info!("CLI {} started local session {}", cli_id, session_id);
                             }
                             Ok(CliToServer::Output {

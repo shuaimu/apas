@@ -1475,6 +1475,8 @@ fn run_deadloop_session_inner(
         match Command::new(binary_path)
             .args(&args)
             .current_dir(working_dir)
+            // Clear CLAUDECODE so Claude CLI doesn't refuse to start (nesting detection)
+            .env_remove("CLAUDECODE")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1829,6 +1831,8 @@ fn run_pane_session(
         match Command::new(binary_path)
             .args(&args)
             .current_dir(working_dir)
+            // Clear CLAUDECODE so Claude CLI doesn't refuse to start (nesting detection)
+            .env_remove("CLAUDECODE")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1855,7 +1859,9 @@ fn run_pane_session(
                 });
 
                 let output_tx_stderr = output_tx.clone();
+                let server_tx_stderr = server_tx.clone();
                 let pane_id_stderr = pane_id;
+                let sid_stderr = session_id;
                 let stderr_thread = thread::spawn(move || {
                     let reader = BufReader::new(stderr);
                     for line in reader.lines() {
@@ -1864,6 +1870,14 @@ fn run_pane_session(
                                 let _ = output_tx_stderr.send(PaneOutput {
                                     text: format!("[stderr] {}", line),
                                     pane_id: pane_id_stderr,
+                                });
+                                // Also forward stderr to server so it's visible in web UI
+                                let _ = server_tx_stderr.blocking_send(CliToServer::Output {
+                                    session_id: sid_stderr,
+                                    data: format!("[stderr] {}", line),
+                                    output_type: shared::OutputType::Text,
+                                    pane_type: Some(PaneType::Interactive),
+                                    pane_id: Some(pane_id_stderr),
                                 });
                             }
                         }
@@ -1939,24 +1953,47 @@ fn run_pane_session(
                     status: None,
                 });
 
-                let had_error = exit_status.map(|s| !s.success()).unwrap_or(true);
+                let had_error = exit_status.as_ref().map(|s| !s.success()).unwrap_or(true);
                 if had_error {
-                    if first_message && using_resume {
+                    let exit_msg = match &exit_status {
+                        Ok(s) => format!("exit code {}", s),
+                        Err(e) => format!("wait error: {}", e),
+                    };
+                    let error_text = if first_message && using_resume {
                         try_resume_first = false;
-                        let _ = output_tx.send(PaneOutput {
-                            text: "[Session not found, will create new session on next message...]"
-                                .to_string(),
-                            pane_id,
-                        });
-                    }
+                        format!("[Session resume failed ({}), will create new session on next message...]", exit_msg)
+                    } else {
+                        format!("[Claude process failed: {}]", exit_msg)
+                    };
+                    let _ = output_tx.send(PaneOutput {
+                        text: error_text.clone(),
+                        pane_id,
+                    });
+                    // Forward error to server so it's visible in web UI
+                    let _ = server_tx.blocking_send(CliToServer::Output {
+                        session_id,
+                        data: error_text,
+                        output_type: shared::OutputType::Text,
+                        pane_type: Some(PaneType::Interactive),
+                        pane_id: Some(pane_id),
+                    });
                 } else {
                     first_message = false;
                 }
             }
             Err(e) => {
+                let error_text = format!("[Error spawning claude: {}]", e);
                 let _ = output_tx.send(PaneOutput {
-                    text: format!("[Error: {}]", e),
+                    text: error_text.clone(),
                     pane_id,
+                });
+                // Forward spawn error to server so it's visible in web UI
+                let _ = server_tx.blocking_send(CliToServer::Output {
+                    session_id,
+                    data: error_text,
+                    output_type: shared::OutputType::Text,
+                    pane_type: Some(PaneType::Interactive),
+                    pane_id: Some(pane_id),
                 });
                 if first_message && using_resume {
                     try_resume_first = false;

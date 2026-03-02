@@ -92,7 +92,11 @@ impl SessionManager {
         if let Some((_, session_ids)) = self.cli_sessions.remove(cli_id) {
             for session_id in session_ids {
                 if let Some(mut session) = self.sessions.get_mut(&session_id) {
-                    session.cli_client_id = None;
+                    // Only clear if this CLI is still the active one for this session.
+                    // A new CLI may have already taken over (reconnect scenario).
+                    if session.cli_client_id == Some(*cli_id) {
+                        session.cli_client_id = None;
+                    }
                 }
             }
         }
@@ -306,12 +310,26 @@ impl SessionManager {
             existing.cli_client_id = Some(cli_id);
             existing.working_dir = working_dir;
             existing.hostname = hostname;
+            // Drop the RefMut before accessing cli_sessions to avoid potential deadlock
+            let web_viewers = existing.web_connection_ids.len();
+            drop(existing);
+
+            // Remove session from old CLI's tracking to prevent stale unregister_cli
+            // from clearing the new CLI's association
+            if let Some(old_id) = old_cli_id {
+                if old_id != cli_id {
+                    if let Some(mut old_sessions) = self.cli_sessions.get_mut(&old_id) {
+                        old_sessions.retain(|s| *s != session_id);
+                    }
+                }
+            }
+
             tracing::info!(
                 "CLI session {} updated: cli {:?} -> {} (web viewers: {})",
                 session_id,
                 old_cli_id,
                 cli_id,
-                existing.web_connection_ids.len()
+                web_viewers,
             );
         } else {
             let state = SessionState {
