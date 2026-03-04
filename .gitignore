@@ -21,6 +21,9 @@ Thumbs.db
 /data/
 *.db
 
+# Per-machine project metadata (contains unique session IDs)
+.apas
+
 # Environment
 .env
 .env.local
