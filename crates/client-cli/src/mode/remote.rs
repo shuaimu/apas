@@ -275,7 +275,8 @@ async fn run_connection(
                     | Ok(ServerToCli::AddPane { .. })
                     | Ok(ServerToCli::RemovePane { .. })
                     | Ok(ServerToCli::StartBot { .. })
-                    | Ok(ServerToCli::StopBot { .. }) => {
+                    | Ok(ServerToCli::StopBot { .. })
+                    | Ok(ServerToCli::RequestPaneList { .. }) => {
                         // Pause/resume/pane/bot management not supported in remote mode
                     }
                     Ok(ServerToCli::RebootCli { .. }) => {

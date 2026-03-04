@@ -34,6 +34,30 @@ const DEFAULT_PROMPT: &str = r#"Work on tasks defined in TODO.md. Do the followi
 
 /// Pane input: (text, from_tui). from_tui=true means input came from TUI keyboard,
 /// from_tui=false means it came from web (server already echoed it to web clients).
+/// Resolve a binary name to an absolute path using the current PATH.
+/// Falls back to the original name if resolution fails.
+fn resolve_binary_path(name: &str) -> String {
+    // Already absolute
+    if name.starts_with('/') {
+        return name.to_string();
+    }
+    // Use `which` via PATH lookup
+    if let Ok(output) = Command::new("which")
+        .arg(name)
+        .output()
+    {
+        if output.status.success() {
+            if let Ok(path) = String::from_utf8(output.stdout) {
+                let path = path.trim();
+                if !path.is_empty() {
+                    return path.to_string();
+                }
+            }
+        }
+    }
+    name.to_string()
+}
+
 type PaneInput = (String, bool);
 
 /// Per-pane input channel registry.
@@ -76,8 +100,10 @@ async fn run_inner(server_url: &str, token: &str, working_dir: &Path, headless: 
     }
 
     let config = crate::config::Config::load().unwrap_or_default();
-    let claude_path = config.local.claude_path.clone();
-    let codex_path = config.local.codex_path.clone();
+    // Resolve binary paths to absolute paths at startup (while PATH is correct).
+    // Systemd-run environments may have a minimal PATH that misses nvm/cargo bins.
+    let claude_path = resolve_binary_path(&config.local.claude_path);
+    let codex_path = resolve_binary_path(&config.local.codex_path);
 
     // Load or create project metadata
     let mut metadata = get_or_create_project(working_dir)?;
@@ -172,7 +198,7 @@ async fn run_inner(server_url: &str, token: &str, working_dir: &Path, headless: 
         Arc<AtomicBool>,
         Arc<Mutex<Option<std::process::Child>>>,
     )> = Vec::new();
-    let mut interactive_startups: Vec<(u32, Uuid, Provider, mpsc::Receiver<PaneInput>)> =
+    let mut interactive_startups: Vec<(u32, Uuid, Provider, mpsc::Receiver<PaneInput>, Arc<Mutex<Option<std::process::Child>>>)> =
         Vec::new();
     {
         let mut pauses = pane_pauses.lock().unwrap();
@@ -216,7 +242,7 @@ async fn run_inner(server_url: &str, token: &str, working_dir: &Path, headless: 
             } else {
                 let (input_tx, input_rx) = mpsc::channel::<PaneInput>();
                 channels.insert(*pane_id, input_tx);
-                interactive_startups.push((*pane_id, *pane_session_id, *provider, input_rx));
+                interactive_startups.push((*pane_id, *pane_session_id, *provider, input_rx, child_proc));
             }
         }
     }
@@ -351,7 +377,7 @@ async fn run_inner(server_url: &str, token: &str, working_dir: &Path, headless: 
         }));
     }
 
-    for (pane_id, pane_session_id, provider, input_rx) in interactive_startups {
+    for (pane_id, pane_session_id, provider, input_rx, child_proc) in interactive_startups {
         let output_tx = output_tx.clone();
         let server_tx = server_tx.clone();
         let shutdown = shutdown.clone();
@@ -373,6 +399,7 @@ async fn run_inner(server_url: &str, token: &str, working_dir: &Path, headless: 
                 output_tx,
                 server_tx,
                 shutdown,
+                child_proc,
             )
         }));
     }
@@ -573,6 +600,8 @@ fn handle_tui_events(
                     let mut ps = pane_sessions.lock().unwrap();
                     ps.insert(pane_id, claude_session_id);
                 }
+                let child_proc: Arc<Mutex<Option<std::process::Child>>> =
+                    Arc::new(Mutex::new(None));
                 {
                     let mut metas = pane_metas.lock().unwrap();
                     metas.insert(
@@ -581,7 +610,7 @@ fn handle_tui_events(
                             mode: mode.clone(),
                             provider: provider.clone(),
                             prompt: None,
-                            child_process: Arc::new(Mutex::new(None)),
+                            child_process: child_proc.clone(),
                         },
                     );
                 }
@@ -617,6 +646,7 @@ fn handle_tui_events(
                             output_tx,
                             server_tx,
                             shutdown,
+                            child_proc,
                         )
                     });
                 }
@@ -746,6 +776,7 @@ fn handle_tui_events(
                             output_tx,
                             server_tx,
                             shutdown,
+                            child_proc,
                         )
                     });
                 }
@@ -950,15 +981,45 @@ fn handle_tui_events(
                 );
             }
             Ok(TuiEvent::StopBot { pane_id }) => {
-                // Validate pane is a deadloop
-                {
+                let pane_mode = {
                     let metas = pane_metas.lock().unwrap();
                     let Some(meta) = metas.get(&pane_id) else {
                         continue;
                     };
-                    if meta.mode != shared::PaneMode::Deadloop {
-                        continue;
+                    meta.mode.clone()
+                };
+
+                // For interactive panes: force-kill the child process directly
+                if pane_mode == shared::PaneMode::Interactive {
+                    {
+                        let metas = pane_metas.lock().unwrap();
+                        if let Some(meta) = metas.get(&pane_id) {
+                            if let Ok(mut guard) = meta.child_process.lock() {
+                                if let Some(ref mut child) = *guard {
+                                    let _ = child.kill();
+                                }
+                            }
+                        }
                     }
+                    let _ = output_tx.send(PaneOutput {
+                        text: "[Process killed]".to_string(),
+                        pane_id,
+                    });
+                    let _ = server_tx.blocking_send(CliToServer::StreamMessage {
+                        session_id,
+                        message: shared::ClaudeStreamMessage::Result {
+                            subtype: "text".to_string(),
+                            result: "[Process killed]".to_string(),
+                            is_error: false,
+                            total_cost_usd: 0.0,
+                            duration_ms: 0,
+                            session_id: session_id.to_string(),
+                            extra: serde_json::Value::Null,
+                        },
+                        pane_type: None,
+                        pane_id: Some(pane_id),
+                    });
+                    continue;
                 }
 
                 // Check if stop is already requested (two-stage stop)
@@ -1065,6 +1126,8 @@ fn handle_tui_events(
                 }
 
                 // Update pane meta to interactive.
+                let child_proc: Arc<Mutex<Option<std::process::Child>>> =
+                    Arc::new(Mutex::new(None));
                 {
                     let mut metas = pane_metas.lock().unwrap();
                     metas.insert(
@@ -1073,7 +1136,7 @@ fn handle_tui_events(
                             mode: shared::PaneMode::Interactive,
                             provider,
                             prompt: saved_prompt,
-                            child_process: Arc::new(Mutex::new(None)),
+                            child_process: child_proc.clone(),
                         },
                     );
                 }
@@ -1133,6 +1196,7 @@ fn handle_tui_events(
                             output_tx,
                             server_tx,
                             shutdown,
+                            child_proc,
                         )
                     });
                 }
@@ -1761,6 +1825,7 @@ fn run_pane_session(
     output_tx: mpsc::Sender<PaneOutput>,
     server_tx: tokio_mpsc::Sender<CliToServer>,
     shutdown: Arc<AtomicBool>,
+    child_process: Arc<Mutex<Option<std::process::Child>>>,
 ) {
     let mut first_message = true;
     let mut try_resume_first = true;
@@ -1842,6 +1907,12 @@ fn run_pane_session(
                 let stdout = child.stdout.take().unwrap();
                 let stderr = child.stderr.take().unwrap();
 
+                // Store child in shared Arc so StopBot can kill it
+                {
+                    let mut guard = child_process.lock().unwrap();
+                    *guard = Some(child);
+                }
+
                 let (stdout_tx, stdout_rx) = mpsc::channel::<Option<String>>();
                 let stdout_thread = thread::spawn(move || {
                     let reader = BufReader::new(stdout);
@@ -1887,7 +1958,11 @@ fn run_pane_session(
                 let check_interval = Duration::from_millis(100);
                 loop {
                     if shutdown.load(Ordering::SeqCst) {
-                        let _ = child.kill();
+                        if let Ok(mut guard) = child_process.lock() {
+                            if let Some(ref mut c) = *guard {
+                                let _ = c.kill();
+                            }
+                        }
                         break;
                     }
 
@@ -1942,7 +2017,15 @@ fn run_pane_session(
                     }
                 }
 
-                let exit_status = child.wait();
+                let exit_status = {
+                    let mut guard = child_process.lock().unwrap();
+                    guard.as_mut().map(|c| c.wait())
+                };
+                // Clear child reference after wait
+                {
+                    let mut guard = child_process.lock().unwrap();
+                    *guard = None;
+                }
                 let _ = stdout_thread.join();
                 let _ = stderr_thread.join();
 
@@ -1953,6 +2036,10 @@ fn run_pane_session(
                     status: None,
                 });
 
+                let exit_status = exit_status.unwrap_or(Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "child already taken",
+                )));
                 let had_error = exit_status.as_ref().map(|s| !s.success()).unwrap_or(true);
                 if had_error {
                     let exit_msg = match &exit_status {
@@ -2435,6 +2522,13 @@ async fn run_server_connection(
                                                 reboot_requested.store(true, Ordering::SeqCst);
                                                 shutdown.store(true, Ordering::SeqCst);
                                                 return Ok(());
+                                            }
+                                            ServerToCli::RequestPaneList { .. } => {
+                                                let panes = build_pane_list(&pane_metas, &input_channels, session_id,
+                                                    &pane_sessions, &pane_pauses, &pane_stop_requests);
+                                                let msg = serde_json::to_string(&CliToServer::PaneList {
+                                                    session_id, panes }).unwrap_or_default();
+                                                let _ = ws_sender.send(Message::Text(msg.into())).await;
                                             }
                                             _ => {}
                                         }

@@ -173,6 +173,9 @@ pub enum ServerToCli {
 
     /// Reboot the CLI process
     RebootCli { session_id: Uuid },
+
+    /// Request CLI to send its current PaneList
+    RequestPaneList { session_id: Uuid },
 }
 
 // ============================================================================

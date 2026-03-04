@@ -686,16 +686,37 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 ServerToCli::StartBot {
                                     session_id: sid,
                                     pane_id,
-                                    prompt,
+                                    prompt: prompt.clone(),
                                 },
                             )
                             .await;
+
+                        // Optimistically update cached pane state so web
+                        // reflects the change even if the CLI PaneList is lost.
+                        let mut panes = state.sessions.get_session_panes(&sid);
+                        if let Some(pane) = panes.iter_mut().find(|p| p.pane_id == pane_id) {
+                            pane.mode = shared::PaneMode::Deadloop;
+                            pane.prompt = prompt;
+                            pane.stop_requested = false;
+                            state.sessions.set_session_panes(&sid, panes.clone());
+                            let _ = state.storage.save_pane_list(&sid, &panes).await;
+                            state
+                                .sessions
+                                .route_to_web(
+                                    &sid,
+                                    ServerToWeb::PaneList {
+                                        session_id: sid,
+                                        panes,
+                                    },
+                                )
+                                .await;
+                        }
                     }
                 }
                 Ok(WebToServer::StopBot { pane_id }) => {
                     if let Some(sid) = session_id {
                         tracing::info!("Stopping bot on pane {} for session {}", pane_id, sid);
-                        state
+                        let routed = state
                             .sessions
                             .route_to_cli(
                                 &sid,
@@ -705,6 +726,26 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 },
                             )
                             .await;
+                        tracing::info!("StopBot routed to CLI: {}", routed);
+
+                        // Optimistically set stop_requested so web shows
+                        // "Force Stop" without waiting for CLI PaneList.
+                        let mut panes = state.sessions.get_session_panes(&sid);
+                        if let Some(pane) = panes.iter_mut().find(|p| p.pane_id == pane_id) {
+                            pane.stop_requested = true;
+                            state.sessions.set_session_panes(&sid, panes.clone());
+                            let _ = state.storage.save_pane_list(&sid, &panes).await;
+                            state
+                                .sessions
+                                .route_to_web(
+                                    &sid,
+                                    ServerToWeb::PaneList {
+                                        session_id: sid,
+                                        panes,
+                                    },
+                                )
+                                .await;
+                        }
                     }
                 }
                 Ok(WebToServer::ResumeSession { session_id: sid }) => {
@@ -885,6 +926,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 )
                                 .await;
                         }
+
+                        // Request fresh pane list from CLI to correct any stale cached data
+                        state
+                            .sessions
+                            .route_to_cli(
+                                &sid,
+                                ServerToCli::RequestPaneList { session_id: sid },
+                            )
+                            .await;
 
                         state
                             .sessions

@@ -21,6 +21,46 @@ const RESTART_COOLDOWN: Duration = Duration::from_secs(60);
 const MAX_RESTART_ATTEMPTS: u32 = 3;
 const VERSION: &str = env!("APAS_VERSION");
 
+/// Check if there's already a running `apas --headless` process for the given project path.
+/// Prevents the daemon from spawning duplicates when a CLI was started externally
+/// or survived a daemon restart.
+fn is_headless_running_for(project_path: &Path) -> bool {
+    let path_str = project_path.to_string_lossy();
+    let my_pid = std::process::id();
+
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let pid: u32 = match entry.file_name().to_str().and_then(|s| s.parse().ok()) {
+            Some(pid) => pid,
+            None => continue,
+        };
+        if pid == my_pid {
+            continue;
+        }
+        let cmdline_path = entry.path().join("cmdline");
+        let Ok(data) = std::fs::read(&cmdline_path) else {
+            continue;
+        };
+        let args: Vec<&str> = data
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| std::str::from_utf8(s).ok())
+            .collect();
+
+        let is_apas = args.first().map_or(false, |a| a.contains("apas"));
+        let has_headless = args.iter().any(|a| *a == "--headless");
+        let has_dir = args
+            .windows(2)
+            .any(|w| w[0] == "-d" && w[1] == path_str.as_ref());
+        if is_apas && has_headless && has_dir {
+            return true;
+        }
+    }
+    false
+}
+
 #[derive(Debug)]
 struct ProjectEntry {
     project_id: String,
@@ -195,6 +235,16 @@ impl DaemonState {
             .projects
             .get_mut(project_id)
             .ok_or_else(|| anyhow::anyhow!("Unknown project id: {}", project_id))?;
+
+        // Check if an external process (e.g. manually started via systemd-run,
+        // or surviving from a previous daemon) is already running for this project.
+        if is_headless_running_for(&project.path) {
+            tracing::info!(
+                "Project {} already has a running headless CLI, skipping spawn",
+                project_id
+            );
+            return Ok(());
+        }
 
         // Prefer the on-disk path, falling back to current_exe().
         // current_exe() can return a "(deleted)" path if the binary was
