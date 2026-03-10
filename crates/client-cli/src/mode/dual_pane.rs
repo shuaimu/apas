@@ -879,6 +879,28 @@ fn handle_tui_events(
                 };
                 let resolved_prompt = prompt.filter(|p| !p.trim().is_empty()).or(existing_prompt);
 
+                // If pane is currently in Deadloop mode (e.g. a quick
+                // Stop→Start cycle where the old thread hasn't exited yet),
+                // signal the old deadloop thread to stop and kill its child
+                // process so it doesn't linger as an orphan.
+                {
+                    let metas = pane_metas.lock().unwrap();
+                    if let Some(meta) = metas.get(&pane_id) {
+                        if meta.mode == shared::PaneMode::Deadloop {
+                            // Signal old deadloop thread to exit
+                            if let Some(old_flag) = pane_stop_requests.lock().unwrap().get(&pane_id) {
+                                old_flag.store(true, Ordering::SeqCst);
+                            }
+                            // Kill old child process so it doesn't burn tokens
+                            if let Ok(mut guard) = meta.child_process.lock() {
+                                if let Some(ref mut child) = *guard {
+                                    let _ = child.kill();
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Convert interactive pane to deadloop:
                 // 1. Remove input channel (kills interactive session thread)
                 {
@@ -1090,13 +1112,41 @@ fn handle_tui_events(
                         }
                     }
 
-                    // Reuse FinalizeStopBot logic
-                    let _ = event_tx.send(TuiEvent::FinalizeStopBot { pane_id });
+                    // Reuse FinalizeStopBot logic — pass current stop_flag so
+                    // the handler can verify it belongs to THIS deadloop.
+                    let current_stop_flag = {
+                        let stops = pane_stop_requests.lock().unwrap();
+                        stops.get(&pane_id).cloned()
+                    };
+                    if let Some(sf) = current_stop_flag {
+                        let _ = event_tx.send(TuiEvent::FinalizeStopBot {
+                            pane_id,
+                            stop_flag: sf,
+                        });
+                    }
                 }
             }
-            Ok(TuiEvent::FinalizeStopBot { pane_id }) => {
+            Ok(TuiEvent::FinalizeStopBot { pane_id, stop_flag }) => {
                 // Finalize stop: switch from deadloop to interactive mode.
                 // Called after deadloop finishes gracefully OR after force-kill.
+                //
+                // IMPORTANT: Verify that the stop_flag belongs to the CURRENT
+                // deadloop for this pane. A stale FinalizeStopBot from an old
+                // deadloop thread (that was still cleaning up when a new
+                // StartBot spawned a replacement) must be ignored. Otherwise
+                // it would kill the new deadloop and orphan its thread.
+                {
+                    let stops = pane_stop_requests.lock().unwrap();
+                    if let Some(current) = stops.get(&pane_id) {
+                        if !Arc::ptr_eq(&stop_flag, current) {
+                            // This FinalizeStopBot is from an old deadloop — ignore it.
+                            continue;
+                        }
+                    }
+                    // If there's no entry, the flags were already cleaned up
+                    // (e.g. pane was removed). Still safe to proceed.
+                }
+
                 let (provider, saved_prompt) = {
                     let metas = pane_metas.lock().unwrap();
                     let Some(meta) = metas.get(&pane_id) else {
@@ -1466,7 +1516,7 @@ fn run_deadloop_session_inner(
 
     let mut iteration = 0;
     let mut backoff_seconds = 2u64;
-    const MAX_BACKOFF: u64 = 3600;
+    const MAX_BACKOFF: u64 = 120;
     let mut first_message = true;
     let mut try_resume_first = true;
     let mut was_paused = false;
@@ -1474,7 +1524,10 @@ fn run_deadloop_session_inner(
     while !shutdown.load(Ordering::SeqCst) {
         if stop_requested.load(Ordering::SeqCst) {
             // Graceful stop: current iteration finished, finalize the mode switch
-            let _ = event_tx.send(TuiEvent::FinalizeStopBot { pane_id });
+            let _ = event_tx.send(TuiEvent::FinalizeStopBot {
+                pane_id,
+                stop_flag: stop_requested.clone(),
+            });
             return;
         }
 
@@ -1778,12 +1831,30 @@ fn run_deadloop_session_inner(
                         thread::sleep(Duration::from_secs(1));
                     } else {
                         backoff_seconds = std::cmp::min(backoff_seconds * 2, MAX_BACKOFF);
+                        let backoff_msg = format!("[Backing off for {}s before retry]", backoff_seconds);
                         let _ = output_tx.send(PaneOutput {
-                            text: format!("[Backing off for {}s before retry]", backoff_seconds),
+                            text: backoff_msg.clone(),
                             pane_id,
                         });
+                        // Also notify web clients so they can see the backoff
+                        let _ = server_tx.try_send(CliToServer::StreamMessage {
+                            session_id,
+                            message: shared::ClaudeStreamMessage::Result {
+                                subtype: "text".to_string(),
+                                result: backoff_msg,
+                                is_error: false,
+                                total_cost_usd: 0.0,
+                                duration_ms: 0,
+                                session_id: session_id.to_string(),
+                                extra: serde_json::Value::Null,
+                            },
+                            pane_type: Some(PaneType::Deadloop),
+                            pane_id: Some(pane_id),
+                        });
                         for _ in 0..backoff_seconds {
-                            if shutdown.load(Ordering::SeqCst) {
+                            if shutdown.load(Ordering::SeqCst)
+                                || stop_requested.load(Ordering::SeqCst)
+                            {
                                 break;
                             }
                             thread::sleep(Duration::from_secs(1));
@@ -1796,8 +1867,9 @@ fn run_deadloop_session_inner(
                 }
             }
             Err(e) => {
+                let err_msg = format!("[Error starting agent: {}]", e);
                 let _ = output_tx.send(PaneOutput {
-                    text: format!("[Error starting agent: {}]", e),
+                    text: err_msg.clone(),
                     pane_id,
                 });
                 let _ = server_tx.try_send(CliToServer::PaneStatus {
@@ -1806,7 +1878,29 @@ fn run_deadloop_session_inner(
                     pane_id: Some(pane_id),
                     status: None,
                 });
-                thread::sleep(Duration::from_secs(5));
+                // Also notify web clients about the error
+                let _ = server_tx.try_send(CliToServer::StreamMessage {
+                    session_id,
+                    message: shared::ClaudeStreamMessage::Result {
+                        subtype: "text".to_string(),
+                        result: err_msg,
+                        is_error: true,
+                        total_cost_usd: 0.0,
+                        duration_ms: 0,
+                        session_id: session_id.to_string(),
+                        extra: serde_json::Value::Null,
+                    },
+                    pane_type: Some(PaneType::Deadloop),
+                    pane_id: Some(pane_id),
+                });
+                for _ in 0..5 {
+                    if shutdown.load(Ordering::SeqCst)
+                        || stop_requested.load(Ordering::SeqCst)
+                    {
+                        break;
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                }
             }
         }
     }

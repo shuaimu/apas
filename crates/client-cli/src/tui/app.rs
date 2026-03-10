@@ -77,9 +77,12 @@ pub enum TuiEvent {
     StopBot {
         pane_id: u32,
     },
-    /// Finalize a graceful stop — deadloop finished its current iteration
+    /// Finalize a graceful stop — deadloop finished its current iteration.
+    /// Carries the stop_flag Arc so the handler can verify it belongs to the
+    /// current deadloop (prevents stale finalize from killing a newer deadloop).
     FinalizeStopBot {
         pane_id: u32,
+        stop_flag: Arc<AtomicBool>,
     },
 }
 
