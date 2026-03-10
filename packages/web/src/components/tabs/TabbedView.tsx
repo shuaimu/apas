@@ -126,8 +126,6 @@ export function TabbedView() {
 
   // Active tab state, persisted per project
   const [activeTabId, setActiveTabId] = useState<number | null>(null);
-  const prevTabIdsRef = useRef<number[]>([]);
-  const shouldAutoSelectNewTabRef = useRef(false);
   const [startBotModalOpen, setStartBotModalOpen] = useState(false);
   const [startBotPaneId, setStartBotPaneId] = useState<number | null>(null);
   const [botPromptDraft, setBotPromptDraft] = useState("");
@@ -186,33 +184,28 @@ export function TabbedView() {
   // Load saved active tab when project or available tabs change
   useEffect(() => {
     const ids = tabIds.split(",").filter(Boolean).map(Number);
+    if (ids.length === 0) return;
     if (activeTabId != null && ids.includes(activeTabId)) return;
-    const saved = getProjectLayout(cliClientId, "active_tab", "");
-    const savedNum = saved ? parseInt(saved, 10) : NaN;
-    if (!isNaN(savedNum) && ids.includes(savedNum)) {
-      setActiveTabId(savedNum);
-    } else if (ids.length > 0) {
-      setActiveTabId(ids[0]);
-    }
-  }, [activeTabId, cliClientId, tabIds]);
-
-  // Auto-switch to newly created tabs
-  useEffect(() => {
-    const ids = tabIds.split(",").filter(Boolean).map(Number);
-    const prevIds = prevTabIdsRef.current;
-    if (prevIds.length === 0) {
-      prevTabIdsRef.current = ids;
+    // When pane list is synthesized (pane_list missing/stale), keep current
+    // local selection to avoid unintended tab jumps from transient data.
+    if (activeTabId != null && paneConfigs.length === 0) {
       return;
     }
-    const added = ids.filter((id) => !prevIds.includes(id));
-    if (added.length > 0 && shouldAutoSelectNewTabRef.current) {
-      const nextActive = added[added.length - 1];
-      setActiveTabId(nextActive);
-      setProjectLayout(cliClientId, "active_tab", String(nextActive));
-      shouldAutoSelectNewTabRef.current = false;
+
+    // Initial selection: restore from persisted preference if possible.
+    if (activeTabId == null) {
+      const saved = getProjectLayout(cliClientId, "active_tab", "");
+      const savedNum = saved ? parseInt(saved, 10) : NaN;
+      if (!isNaN(savedNum) && ids.includes(savedNum)) {
+        setActiveTabId(savedNum);
+        return;
+      }
     }
-    prevTabIdsRef.current = ids;
-  }, [cliClientId, tabIds]);
+
+    // Active tab was removed (authoritative pane_list): move to first visible tab.
+    setActiveTabId(ids[0]);
+    setProjectLayout(cliClientId, "active_tab", String(ids[0]));
+  }, [activeTabId, cliClientId, paneConfigs.length, tabIds]);
 
   const handleSelectTab = useCallback(
     (paneId: number) => {
@@ -242,7 +235,6 @@ export function TabbedView() {
     const label = `${prefix} ${effectiveTabs.length + 1}`;
     const result = addPane(provider, "interactive", label);
     if (result.success) {
-      shouldAutoSelectNewTabRef.current = true;
       setAddTabError(null);
     } else {
       setAddTabError(result.error || "Failed to create tab");
