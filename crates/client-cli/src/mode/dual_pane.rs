@@ -926,10 +926,11 @@ fn handle_tui_events(
                 };
                 let resolved_prompt = prompt.filter(|p| !p.trim().is_empty()).or(existing_prompt);
 
-                // If pane is currently in Deadloop mode (e.g. a quick
-                // Stop→Start cycle where the old thread hasn't exited yet),
-                // signal the old deadloop thread to stop and kill its child
-                // process so it doesn't linger as an orphan.
+                // Kill any old child process and wait for it to fully exit
+                // so the Claude session ID is released before we --resume.
+                // This covers both the Deadloop→StartBot and the
+                // Stop→FinalizeStopBot→StartBot paths (where mode is
+                // already Interactive but the old process may still linger).
                 {
                     let metas = pane_metas.lock().unwrap();
                     if let Some(meta) = metas.get(&pane_id) {
@@ -938,14 +939,13 @@ fn handle_tui_events(
                             if let Some(old_flag) = pane_stop_requests.lock().unwrap().get(&pane_id) {
                                 old_flag.store(true, Ordering::SeqCst);
                             }
-                            // Kill old child process and wait for it to fully exit
-                            // so the session ID is released before we --resume.
-                            if let Ok(mut guard) = meta.child_process.lock() {
-                                if let Some(child) = guard.take() {
-                                    let mut child = child;
-                                    let _ = child.kill();
-                                    let _ = child.wait();
-                                }
+                        }
+                        // Kill and wait regardless of mode
+                        if let Ok(mut guard) = meta.child_process.lock() {
+                            if let Some(child) = guard.take() {
+                                let mut child = child;
+                                let _ = child.kill();
+                                let _ = child.wait();
                             }
                         }
                     }
@@ -1162,13 +1162,15 @@ fn handle_tui_events(
                     );
                 } else {
                     // === Stage 2: Force stop ===
-                    // Kill the deadloop child process immediately
+                    // Kill the deadloop child process and wait for full exit
                     {
                         let metas = pane_metas.lock().unwrap();
                         if let Some(meta) = metas.get(&pane_id) {
                             if let Ok(mut guard) = meta.child_process.lock() {
-                                if let Some(ref mut child) = *guard {
+                                if let Some(child) = guard.take() {
+                                    let mut child = child;
                                     let _ = child.kill();
+                                    let _ = child.wait();
                                 }
                             }
                         }
@@ -1407,6 +1409,24 @@ fn build_pane_list(
     panes
 }
 
+/// Kill any OS processes whose command line contains the given session ID.
+/// This ensures the Claude session lock is released before we `--resume`.
+fn kill_processes_using_session(session_id: &str) {
+    let my_pid = std::process::id().to_string();
+    if let Ok(output) = Command::new("pgrep").args(["-f", session_id]).output() {
+        if let Ok(stdout) = std::str::from_utf8(&output.stdout) {
+            for line in stdout.lines() {
+                let pid = line.trim();
+                if !pid.is_empty() && pid != my_pid {
+                    let _ = Command::new("kill").args(["-9", pid]).output();
+                }
+            }
+        }
+    }
+    // Brief pause to let the OS fully release the session
+    thread::sleep(Duration::from_millis(500));
+}
+
 /// Build CLI arguments based on provider, session state, and prompt.
 /// Returns (args, is_using_resume).
 fn build_agent_args(
@@ -1579,13 +1599,9 @@ fn run_deadloop_session_inner(
     });
 
     let mut iteration = 0;
-    let mut backoff_seconds = 2u64;
-    const MAX_BACKOFF: u64 = 120;
     let mut first_message = true;
     let mut try_resume_first = true;
     let mut was_paused = false;
-    const IDLE_THRESHOLD_SECS: u64 = 60;
-    const IDLE_WAIT_SECS: u64 = 600; // 10 minutes
 
     while !shutdown.load(Ordering::SeqCst) {
         if stop_requested.load(Ordering::SeqCst) {
@@ -1616,7 +1632,6 @@ fn run_deadloop_session_inner(
         }
 
         iteration += 1;
-        let iteration_start = std::time::Instant::now();
         let _ = output_tx.send(PaneOutput {
             text: format!("=== Iteration {} ===", iteration),
             pane_id,
@@ -1629,10 +1644,7 @@ fn run_deadloop_session_inner(
 
         let _ = server_tx.try_send(CliToServer::UserInput {
             session_id,
-            text: format!(
-                "[Iteration {} - next iteration in {}m]\n{}",
-                iteration, IDLE_WAIT_SECS / 60, iteration_prompt
-            ),
+            text: format!("[Iteration {}]\n{}", iteration, iteration_prompt),
             pane_type: Some(PaneType::Deadloop),
             pane_id: Some(pane_id),
         });
@@ -1654,6 +1666,10 @@ fn run_deadloop_session_inner(
         if first_message && !try_resume_first {
             first_message = false;
         }
+
+        // Kill any lingering Claude processes that still hold this session ID.
+        // This can happen after Stop→Start when the old process wasn't fully reaped.
+        kill_processes_using_session(&claude_session_id.to_string());
 
         match Command::new(binary_path)
             .args(&args)
@@ -1888,7 +1904,10 @@ fn run_deadloop_session_inner(
                 });
 
                 if had_error || exit_was_error {
-                    if first_message && using_resume {
+                    if first_message && using_resume && exit_was_error && !had_error {
+                        // Process failed to start (e.g. session not found).
+                        // Generate a new session ID and create a fresh session.
+                        claude_session_id = Uuid::new_v4();
                         try_resume_first = false;
                         let _ = output_tx.send(PaneOutput {
                             text: "[Session not found, will create new session...]".to_string(),
@@ -1896,63 +1915,11 @@ fn run_deadloop_session_inner(
                         });
                         thread::sleep(Duration::from_secs(1));
                     } else {
-                        backoff_seconds = std::cmp::min(backoff_seconds * 2, MAX_BACKOFF);
-                        let backoff_msg = format!("[Backing off for {}s before retry]", backoff_seconds);
-                        let _ = output_tx.send(PaneOutput {
-                            text: backoff_msg.clone(),
-                            pane_id,
-                        });
-                        // Also notify web clients so they can see the backoff
-                        let _ = server_tx.try_send(CliToServer::StreamMessage {
-                            session_id,
-                            message: shared::ClaudeStreamMessage::Result {
-                                subtype: "text".to_string(),
-                                result: backoff_msg,
-                                is_error: false,
-                                total_cost_usd: 0.0,
-                                duration_ms: 0,
-                                session_id: session_id.to_string(),
-                                extra: serde_json::Value::Null,
-                            },
-                            pane_type: Some(PaneType::Deadloop),
-                            pane_id: Some(pane_id),
-                        });
-                        for _ in 0..backoff_seconds {
-                            if shutdown.load(Ordering::SeqCst)
-                                || stop_requested.load(Ordering::SeqCst)
-                            {
-                                break;
-                            }
-                            thread::sleep(Duration::from_secs(1));
-                        }
+                        thread::sleep(Duration::from_secs(2));
                     }
                 } else {
                     first_message = false;
-                    backoff_seconds = 2;
-                    let elapsed = iteration_start.elapsed().as_secs();
-                    if elapsed < IDLE_THRESHOLD_SECS {
-                        // Iteration finished quickly — likely nothing to do.
-                        // Wait before next iteration to avoid busy-looping.
-                        let wait = IDLE_WAIT_SECS;
-                        let _ = output_tx.send(PaneOutput {
-                            text: format!(
-                                "[Iteration completed in {}s (idle). Waiting {}m before next iteration...]",
-                                elapsed, wait / 60
-                            ),
-                            pane_id,
-                        });
-                        for _ in 0..wait {
-                            if shutdown.load(Ordering::SeqCst)
-                                || stop_requested.load(Ordering::SeqCst)
-                                || pause.load(Ordering::SeqCst)
-                            {
-                                break;
-                            }
-                            thread::sleep(Duration::from_secs(1));
-                        }
-                    } else {
-                        thread::sleep(Duration::from_secs(2));
-                    }
+                    thread::sleep(Duration::from_secs(2));
                 }
             }
             Err(e) => {
@@ -2330,14 +2297,22 @@ fn format_stream_message(message: &ClaudeStreamMessage) -> String {
         }
         ClaudeStreamMessage::Result {
             subtype,
+            result,
             total_cost_usd,
             duration_ms,
             ..
         } => {
-            format!(
-                "[{} - Cost: ${:.4}, Duration: {}ms]",
-                subtype, total_cost_usd, duration_ms
-            )
+            if result.is_empty() {
+                format!(
+                    "[{} - Cost: ${:.4}, Duration: {}ms]",
+                    subtype, total_cost_usd, duration_ms
+                )
+            } else {
+                format!(
+                    "[{}: {} - Cost: ${:.4}, Duration: {}ms]",
+                    subtype, result, total_cost_usd, duration_ms
+                )
+            }
         }
     }
 }

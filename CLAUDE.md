@@ -198,7 +198,7 @@ journalctl -u apas-web -f
 ```bash
 # Build locally
 # cargo build -p apas-server --release
-cargo build -p apas --release
+cargo build --release
 
 # Stop server
 ssh root@apas.mpaxos.com "systemctl stop apas-server"
@@ -206,8 +206,12 @@ ssh root@apas.mpaxos.com "systemctl stop apas-server"
 # Copy binary to server
 scp target/release/apas-server root@apas.mpaxos.com:/opt/apas/
 
+sleep 1
+
 # Restart server
 ssh root@apas.mpaxos.com "systemctl restart apas-server"
+
+sleep 1
 
 # For web updates
 rsync -av --exclude 'node_modules' --exclude '.next' packages/web/ root@apas.mpaxos.com:/opt/apas/web/

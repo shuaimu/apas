@@ -1492,7 +1492,7 @@ function handleServerMessage(
         const resultMessage: Message = {
           id: generateId(),
           role: "system",
-          content: `${msg.subtype} - Cost: $${(msg.total_cost_usd as number || 0).toFixed(4)}, Duration: ${msg.duration_ms}ms`,
+          content: `${msg.subtype}${msg.result ? ': ' + msg.result : ''} - Cost: $${(msg.total_cost_usd as number || 0).toFixed(4)}, Duration: ${msg.duration_ms}ms`,
           timestamp: new Date(),
           outputType: { type: "system" },
         };
