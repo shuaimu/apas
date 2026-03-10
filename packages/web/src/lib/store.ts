@@ -143,6 +143,25 @@ function normalizePaneId(paneType: string | undefined, paneId: number | undefine
   return undefined;
 }
 
+function normalizePaneModeHint(paneType: string | undefined): PaneType | undefined {
+  if (!paneType) return undefined;
+  const normalized = paneType.trim().toLowerCase();
+  if (normalized === "deadloop" || normalized.includes("deadloop")) return "deadloop";
+  if (normalized === "interactive" || normalized.includes("interactive")) return "interactive";
+  return undefined;
+}
+
+function normalizeRawPaneId(rawPaneId: number | string | undefined): number | undefined {
+  if (typeof rawPaneId === "number") {
+    return isNaN(rawPaneId) ? undefined : rawPaneId;
+  }
+  if (typeof rawPaneId === "string") {
+    const parsed = parseInt(rawPaneId, 10);
+    return isNaN(parsed) ? undefined : parsed;
+  }
+  return undefined;
+}
+
 // Reverse map: numeric pane_id to legacy pane_type for wire compat
 function legacyPaneType(paneId: number | undefined): string | undefined {
   if (paneId == null) return undefined;
@@ -225,6 +244,7 @@ interface AppState {
   paneMessages: Record<string, Message[]>;
   paneHasMore: Record<string, boolean>;
   paneStatuses: Record<string, string | null>;
+  paneModes: Record<string, PaneType>;
   pausedPanes: number[]; // pane_ids that are paused
   loadingMorePane: number | null;
 
@@ -312,6 +332,7 @@ export const useStore = create<AppState>((set, get) => ({
   paneMessages: {},
   paneHasMore: {},
   paneStatuses: {},
+  paneModes: {},
   pausedPanes: [],
   loadingMorePane: null,
   // Legacy compat getters (populated from dynamic state)
@@ -368,6 +389,7 @@ export const useStore = create<AppState>((set, get) => ({
       cliClients: [],
       sessions: [],
       machines: [],
+      paneModes: {},
       reconnectAttempts: 0,
       reconnectTimeout: null,
       visibilityHandler: null,
@@ -489,6 +511,7 @@ export const useStore = create<AppState>((set, get) => ({
       sessionId: null,
       cliClients: [],
       machines: [],
+      paneModes: {},
       isAttached: false,
       reconnectAttempts: 0,
       reconnectTimeout: null,
@@ -503,7 +526,22 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
 
-    set({ messages: [], sessionId: null });
+    set({
+      messages: [],
+      sessionId: null,
+      paneMessages: {},
+      paneHasMore: {},
+      paneStatuses: {},
+      paneModes: {},
+      pausedPanes: [],
+      paneConfigs: [],
+      deadloopMessages: [],
+      interactiveMessages: [],
+      isDualPane: false,
+      isDeadloopPaused: false,
+      interactiveStatus: null,
+      deadloopStatus: null,
+    });
 
     ws.send(JSON.stringify({
       type: "start_session",
@@ -547,6 +585,7 @@ export const useStore = create<AppState>((set, get) => ({
         paneMessages: {},
         paneHasMore: {},
         paneStatuses: {},
+        paneModes: {},
         pausedPanes: [],
         paneConfigs: [],
         deadloopMessages: [],
@@ -626,8 +665,15 @@ export const useStore = create<AppState>((set, get) => ({
       messages: [],
       paneMessages: {},
       paneHasMore: {},
+      paneStatuses: {},
+      paneModes: {},
+      pausedPanes: [],
+      paneConfigs: [],
       deadloopMessages: [],
       interactiveMessages: [],
+      isDeadloopPaused: false,
+      interactiveStatus: null,
+      deadloopStatus: null,
       isDualPane: false,
       isAttached: false
     });
@@ -903,6 +949,21 @@ export const useStore = create<AppState>((set, get) => ({
 }));
 
 // Helper function to route messages to correct array based on pane_id
+function updatePaneModeHint(
+  set: (partial: Partial<AppState> | ((state: AppState) => Partial<AppState>)) => void,
+  get: () => AppState,
+  rawPaneType: string | undefined,
+  rawPaneId: number | string | undefined,
+) {
+  const modeHint = normalizePaneModeHint(rawPaneType);
+  if (!modeHint) return;
+  const paneId = normalizePaneId(rawPaneType, normalizeRawPaneId(rawPaneId));
+  if (!paneId) return;
+  const key = paneKey(paneId);
+  if (get().paneModes[key] === modeHint) return;
+  set((state) => ({ paneModes: { ...state.paneModes, [key]: modeHint } }));
+}
+
 function addMessageWithPaneRouting(
   set: (partial: Partial<AppState> | ((state: AppState) => Partial<AppState>)) => void,
   get: () => AppState,
@@ -910,8 +971,7 @@ function addMessageWithPaneRouting(
   rawPaneType: string | undefined,
   rawPaneId: number | string | undefined
 ) {
-  const numericPaneId = typeof rawPaneId === "string" ? parseInt(rawPaneId, 10) : rawPaneId;
-  const paneId = normalizePaneId(rawPaneType, isNaN(numericPaneId as number) ? undefined : numericPaneId as number | undefined);
+  const paneId = normalizePaneId(rawPaneType, normalizeRawPaneId(rawPaneId));
   let { isDualPane } = get();
 
   // Auto-detect dual pane mode when we receive a pane identifier
@@ -1066,10 +1126,14 @@ function handleServerMessage(
       const paneType = data.pane_type as string | undefined;
       const paneId = normalizePaneId(paneType, data.pane_id as number | undefined);
       const status = data.status as string | null;
+      const modeHint = normalizePaneModeHint(paneType);
 
       if (paneId) {
         set((state) => ({
           paneStatuses: { ...state.paneStatuses, [paneId]: status },
+          paneModes: modeHint
+            ? { ...state.paneModes, [paneId]: modeHint }
+            : state.paneModes,
           // Legacy compat
           interactiveStatus: paneId === PANE_ID_INTERACTIVE ? status : state.interactiveStatus,
           deadloopStatus: paneId === PANE_ID_DEADLOOP ? status : state.deadloopStatus,
@@ -1083,10 +1147,15 @@ function handleServerMessage(
         ...pane,
         provider: normalizeProvider(pane.provider) ?? "claude",
       }));
+      const paneModes = panes.reduce<Record<string, PaneType>>((acc, pane) => {
+        acc[paneKey(pane.pane_id)] = pane.mode;
+        return acc;
+      }, {});
       // Sync is_paused from pane configs to pausedPanes state
       const pausedPaneIds = panes.filter((p) => p.is_paused).map((p) => p.pane_id);
       set({
         paneConfigs: panes,
+        paneModes,
         pausedPanes: pausedPaneIds,
         // Legacy compat
         isDeadloopPaused: pausedPaneIds.includes(PANE_ID_DEADLOOP),
@@ -1104,7 +1173,8 @@ function handleServerMessage(
         outputType,
       };
       const paneType = data.pane_type as string | undefined;
-      const paneId = data.pane_id as string | undefined;
+      const paneId = data.pane_id as number | string | undefined;
+      updatePaneModeHint(set, get, paneType, paneId);
       addMessageWithPaneRouting(set, get, message, paneType, paneId);
       break;
     }
@@ -1223,17 +1293,24 @@ function handleServerMessage(
       const { isDualPane } = get();
       const paneMsgBuckets: Record<string, Message[]> = {};
       const mainMsgs: Message[] = [];
+      const paneModeHints: Record<string, PaneType> = {};
 
       messages.forEach((m, i) => {
-        const paneId = normalizePaneId(m.pane_type as string | undefined, m.pane_id as number | undefined);
+        const rawPaneType = m.pane_type as string | undefined;
+        const paneId = normalizePaneId(rawPaneType, m.pane_id as number | undefined);
         const msg = parsedMessages[i];
         if (paneId) {
           if (!paneMsgBuckets[paneId]) paneMsgBuckets[paneId] = [];
           paneMsgBuckets[paneId].push(msg);
+          const modeHint = normalizePaneModeHint(rawPaneType);
+          if (modeHint) {
+            paneModeHints[paneKey(paneId)] = modeHint;
+          }
         } else {
           mainMsgs.push(msg);
         }
       });
+      const hasPaneModeHints = Object.keys(paneModeHints).length > 0;
 
       if (isLoadingMore) {
         // Prepend older messages
@@ -1253,6 +1330,10 @@ function handleServerMessage(
               loadingMorePane: null,
             };
 
+            if (hasPaneModeHints) {
+              updates.paneModes = { ...state.paneModes, ...paneModeHints };
+            }
+
             // Update the appropriate hasMore flag
             if (loadingMorePane) {
               updates.paneHasMore = { ...state.paneHasMore, [loadingMorePane]: hasMore };
@@ -1265,11 +1346,18 @@ function handleServerMessage(
             return updates;
           });
         } else {
+          if (hasPaneModeHints) {
+            set((state) => ({ paneModes: { ...state.paneModes, ...paneModeHints } }));
+          }
           get().prependMessages(parsedMessages, hasMore);
         }
       } else if (isDualPane || hasPaneType) {
         // Initial load - dual pane mode
-        const { paneMessages: existingPaneMessages, messages: existingMain } = get();
+        const {
+          paneMessages: existingPaneMessages,
+          messages: existingMain,
+          paneModes: existingPaneModes,
+        } = get();
         const newPaneMessages = { ...existingPaneMessages };
         const newPaneHasMore: Record<string, boolean> = {};
         for (const [paneId, msgs] of Object.entries(paneMsgBuckets)) {
@@ -1286,15 +1374,21 @@ function handleServerMessage(
           hasMoreMessages: hasMore,
           hasMoreDeadloop: newPaneHasMore[paneKey(PANE_ID_DEADLOOP)] || false,
           hasMoreInteractive: newPaneHasMore[paneKey(PANE_ID_INTERACTIVE)] || false,
+          paneModes: hasPaneModeHints
+            ? { ...existingPaneModes, ...paneModeHints }
+            : existingPaneModes,
           isDualPane: true,
         });
       } else {
         // Initial load - single pane mode
-        set({
+        set((state) => ({
           sessionId: data.session_id as string,
           messages: parsedMessages,
           hasMoreMessages: hasMore,
-        });
+          paneModes: hasPaneModeHints
+            ? { ...state.paneModes, ...paneModeHints }
+            : state.paneModes,
+        }));
       }
       break;
     }
@@ -1314,7 +1408,8 @@ function handleServerMessage(
         outputType: { type: "text" },
       };
       const paneType = data.pane_type as string | undefined;
-      const paneId = data.pane_id as string | undefined;
+      const paneId = data.pane_id as number | string | undefined;
+      updatePaneModeHint(set, get, paneType, paneId);
       addMessageWithPaneRouting(set, get, userMessage, paneType, paneId);
       break;
     }
@@ -1330,7 +1425,8 @@ function handleServerMessage(
       if (!msg) break;
 
       const paneType = data.pane_type as string | undefined;
-      const paneId = data.pane_id as string | undefined;
+      const paneId = data.pane_id as number | string | undefined;
+      updatePaneModeHint(set, get, paneType, paneId);
       const msgType = msg.type as string;
       if (msgType === "assistant") {
         const message = msg.message as Record<string, unknown>;

@@ -55,6 +55,7 @@ function setProjectLayout(cliClientId: string | null, key: string, value: string
 function synthesizeConfigs(
   paneMessages: Record<string, Message[]>,
   paneStatuses: Record<string, string | null>,
+  paneModes: Record<string, "deadloop" | "interactive">,
   pausedPanes: number[],
   activePaneId: number | null,
   sessionId: string | null,
@@ -79,15 +80,16 @@ function synthesizeConfigs(
 
   const sortedPaneIds = Array.from(paneIds).sort((a, b) => a - b);
   for (const numericId of sortedPaneIds) {
-    const isDeadloop = numericId === PANE_ID_DEADLOOP;
+    const hintedMode = paneModes[paneKey(numericId)];
+    const isDeadloop = hintedMode ? hintedMode === "deadloop" : numericId === PANE_ID_DEADLOOP;
     const isLegacyInteractive = numericId === PANE_ID_INTERACTIVE;
     configs.push({
       pane_id: numericId,
       provider: "claude",
-      mode: isDeadloop ? "deadloop" : "interactive",
+      mode: hintedMode || (isDeadloop ? "deadloop" : "interactive"),
       session_id: sessionId || "",
       is_paused: pausedPanes.includes(numericId),
-      label: isDeadloop
+      label: numericId === PANE_ID_DEADLOOP
         ? "Deadloop"
         : isLegacyInteractive
           ? "Interactive"
@@ -104,6 +106,7 @@ export function TabbedView() {
   const paneMessages = useStore((s) => s.paneMessages);
   const paneHasMore = useStore((s) => s.paneHasMore);
   const paneStatuses = useStore((s) => s.paneStatuses);
+  const paneModes = useStore((s) => s.paneModes);
   const pausedPanes = useStore((s) => s.pausedPanes);
   const loadingMorePane = useStore((s) => s.loadingMorePane);
   const isAttached = useStore((s) => s.isAttached);
@@ -131,9 +134,23 @@ export function TabbedView() {
 
   // Determine effective tabs: use paneConfigs from server, or synthesize from observed messages
   const effectiveTabs = useMemo(() => {
-    if (paneConfigs.length > 0) return paneConfigs;
+    const applyModeHints = (tabs: PaneConfig[]) =>
+      tabs.map((tab) => {
+        const hintedMode = paneModes[paneKey(tab.pane_id)];
+        if (!hintedMode || hintedMode === tab.mode) return tab;
+        return { ...tab, mode: hintedMode };
+      });
+
+    if (paneConfigs.length > 0) return applyModeHints(paneConfigs);
     if (isDualPane && Object.keys(paneMessages).length > 0) {
-      return synthesizeConfigs(paneMessages, paneStatuses, pausedPanes, activeTabId, sessionId);
+      return synthesizeConfigs(
+        paneMessages,
+        paneStatuses,
+        paneModes,
+        pausedPanes,
+        activeTabId,
+        sessionId,
+      );
     }
     // Single-pane: synthesize a single tab
     if (messages.length > 0) {
@@ -147,7 +164,17 @@ export function TabbedView() {
       }];
     }
     return [];
-  }, [paneConfigs, isDualPane, paneMessages, pausedPanes, sessionId, messages.length]);
+  }, [
+    paneConfigs,
+    paneModes,
+    isDualPane,
+    paneMessages,
+    paneStatuses,
+    pausedPanes,
+    activeTabId,
+    sessionId,
+    messages.length,
+  ]);
 
   // Stable list of tab IDs (avoids re-running effects on every message)
   const tabIds = useMemo(
