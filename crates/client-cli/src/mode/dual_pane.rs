@@ -938,10 +938,13 @@ fn handle_tui_events(
                             if let Some(old_flag) = pane_stop_requests.lock().unwrap().get(&pane_id) {
                                 old_flag.store(true, Ordering::SeqCst);
                             }
-                            // Kill old child process so it doesn't burn tokens
+                            // Kill old child process and wait for it to fully exit
+                            // so the session ID is released before we --resume.
                             if let Ok(mut guard) = meta.child_process.lock() {
-                                if let Some(ref mut child) = *guard {
+                                if let Some(child) = guard.take() {
+                                    let mut child = child;
                                     let _ = child.kill();
+                                    let _ = child.wait();
                                 }
                             }
                         }
@@ -992,7 +995,7 @@ fn handle_tui_events(
                     pane_id,
                 });
 
-                // 4. Get claude session id for this pane
+                // 4. Reuse claude session id for --resume history continuity
                 let claude_session_id = {
                     let ps = pane_sessions.lock().unwrap();
                     ps.get(&pane_id).copied().unwrap_or_else(Uuid::new_v4)
@@ -1626,7 +1629,10 @@ fn run_deadloop_session_inner(
 
         let _ = server_tx.try_send(CliToServer::UserInput {
             session_id,
-            text: format!("[Iteration {}]\n{}", iteration, iteration_prompt),
+            text: format!(
+                "[Iteration {} - next iteration in {}m]\n{}",
+                iteration, IDLE_WAIT_SECS / 60, iteration_prompt
+            ),
             pane_type: Some(PaneType::Deadloop),
             pane_id: Some(pane_id),
         });
@@ -1934,12 +1940,6 @@ fn run_deadloop_session_inner(
                                 elapsed, wait / 60
                             ),
                             pane_id,
-                        });
-                        let _ = server_tx.try_send(CliToServer::PaneStatus {
-                            session_id,
-                            pane_type: PaneType::Deadloop,
-                            pane_id: Some(pane_id),
-                            status: Some(format!("Idle – next check in {}m", wait / 60)),
                         });
                         for _ in 0..wait {
                             if shutdown.load(Ordering::SeqCst)
