@@ -1581,6 +1581,8 @@ fn run_deadloop_session_inner(
     let mut first_message = true;
     let mut try_resume_first = true;
     let mut was_paused = false;
+    const IDLE_THRESHOLD_SECS: u64 = 60;
+    const IDLE_WAIT_SECS: u64 = 600; // 10 minutes
 
     while !shutdown.load(Ordering::SeqCst) {
         if stop_requested.load(Ordering::SeqCst) {
@@ -1611,19 +1613,16 @@ fn run_deadloop_session_inner(
         }
 
         iteration += 1;
+        let iteration_start = std::time::Instant::now();
         let _ = output_tx.send(PaneOutput {
             text: format!("=== Iteration {} ===", iteration),
             pane_id,
         });
 
-        // On resume iterations, use a short continuation prompt to avoid
-        // bloating the conversation context with repeated copies of the full prompt.
+        // Always use the original user-defined prompt so the agent retains
+        // the full task context across resume iterations.
         let is_resume = !first_message || try_resume_first;
-        let iteration_prompt = if is_resume && iteration > 1 {
-            "Continue with the next iteration."
-        } else {
-            prompt
-        };
+        let iteration_prompt = prompt;
 
         let _ = server_tx.try_send(CliToServer::UserInput {
             session_id,
@@ -1924,7 +1923,36 @@ fn run_deadloop_session_inner(
                 } else {
                     first_message = false;
                     backoff_seconds = 2;
-                    thread::sleep(Duration::from_secs(2));
+                    let elapsed = iteration_start.elapsed().as_secs();
+                    if elapsed < IDLE_THRESHOLD_SECS {
+                        // Iteration finished quickly — likely nothing to do.
+                        // Wait before next iteration to avoid busy-looping.
+                        let wait = IDLE_WAIT_SECS;
+                        let _ = output_tx.send(PaneOutput {
+                            text: format!(
+                                "[Iteration completed in {}s (idle). Waiting {}m before next iteration...]",
+                                elapsed, wait / 60
+                            ),
+                            pane_id,
+                        });
+                        let _ = server_tx.try_send(CliToServer::PaneStatus {
+                            session_id,
+                            pane_type: PaneType::Deadloop,
+                            pane_id: Some(pane_id),
+                            status: Some(format!("Idle – next check in {}m", wait / 60)),
+                        });
+                        for _ in 0..wait {
+                            if shutdown.load(Ordering::SeqCst)
+                                || stop_requested.load(Ordering::SeqCst)
+                                || pause.load(Ordering::SeqCst)
+                            {
+                                break;
+                            }
+                            thread::sleep(Duration::from_secs(1));
+                        }
+                    } else {
+                        thread::sleep(Duration::from_secs(2));
+                    }
                 }
             }
             Err(e) => {
