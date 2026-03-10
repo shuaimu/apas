@@ -294,7 +294,7 @@ interface AppState {
   resumeDeadloop: () => void;
   pausePane: (paneId: number) => void;
   resumePane: (paneId: number) => void;
-  addPane: (provider: string, mode: string, label?: string, prompt?: string) => void;
+  addPane: (provider: string, mode: string, label?: string, prompt?: string) => { success: boolean; error?: string };
   removePane: (paneId: number) => void;
   startBot: (paneId: number, prompt?: string) => void;
   stopBot: (paneId: number) => void;
@@ -896,16 +896,24 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   addPane: (provider: string, mode: string, label?: string, prompt?: string) => {
-    const { ws } = get();
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
-        type: "add_pane",
-        provider,
-        mode,
-        label: label || undefined,
-        prompt: prompt || undefined,
-      }));
+    const { ws, sessionId, isAttached } = get();
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return { success: false, error: "Not connected to server" };
     }
+    if (!sessionId) {
+      return { success: false, error: "No session selected" };
+    }
+    if (!isAttached) {
+      return { success: false, error: "Project is not running. Start the CLI client first." };
+    }
+    ws.send(JSON.stringify({
+      type: "add_pane",
+      provider,
+      mode,
+      label: label || undefined,
+      prompt: prompt || undefined,
+    }));
+    return { success: true };
   },
 
   removePane: (paneId: number) => {

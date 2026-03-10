@@ -131,6 +131,7 @@ export function TabbedView() {
   const [startBotModalOpen, setStartBotModalOpen] = useState(false);
   const [startBotPaneId, setStartBotPaneId] = useState<number | null>(null);
   const [botPromptDraft, setBotPromptDraft] = useState("");
+  const [addTabError, setAddTabError] = useState<string | null>(null);
 
   // Determine effective tabs: use paneConfigs from server, or synthesize from observed messages
   const effectiveTabs = useMemo(() => {
@@ -239,8 +240,14 @@ export function TabbedView() {
   const handleAddTab = useCallback((provider: string = "claude") => {
     const prefix = provider === "codex" ? "Codex" : "Claude";
     const label = `${prefix} ${effectiveTabs.length + 1}`;
-    shouldAutoSelectNewTabRef.current = true;
-    addPane(provider, "interactive", label);
+    const result = addPane(provider, "interactive", label);
+    if (result.success) {
+      shouldAutoSelectNewTabRef.current = true;
+      setAddTabError(null);
+    } else {
+      setAddTabError(result.error || "Failed to create tab");
+      setTimeout(() => setAddTabError(null), 4000);
+    }
   }, [addPane, effectiveTabs.length]);
 
   // Get messages for active tab
@@ -362,6 +369,24 @@ export function TabbedView() {
         paneStatuses={paneStatuses}
         pausedPanes={pausedPanes}
       />
+
+      {/* Add tab error notification */}
+      {addTabError && (
+        <div className="flex items-center gap-2 px-3 py-1.5 bg-red-50 dark:bg-red-900/30 border-b border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 text-xs flex-shrink-0">
+          <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z" />
+          </svg>
+          <span>{addTabError}</span>
+          <button
+            onClick={() => setAddTabError(null)}
+            className="ml-auto text-red-500 dark:text-red-400 hover:text-red-700 dark:hover:text-red-200"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+      )}
 
       {/* Toolbar */}
       <div className="flex items-center gap-2 px-3 py-1.5 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30 flex-shrink-0">
