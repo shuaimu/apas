@@ -9,7 +9,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
 
@@ -17,8 +17,6 @@ const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_DISCOVERY_DEPTH: usize = 8;
-const RESTART_COOLDOWN: Duration = Duration::from_secs(60);
-const MAX_RESTART_ATTEMPTS: u32 = 3;
 const VERSION: &str = env!("APAS_VERSION");
 
 /// Check if there's already a running `apas --headless` process for the given project path.
@@ -69,19 +67,12 @@ struct ProjectEntry {
     last_error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-struct RestartInfo {
-    attempts: u32,
-    last_crash: Instant,
-}
-
 #[derive(Debug)]
 struct DaemonState {
     machine_info: MachineInfo,
     project_roots: Vec<PathBuf>,
     projects: HashMap<String, ProjectEntry>,
     processes: HashMap<String, Child>,
-    restart_info: HashMap<String, RestartInfo>,
 }
 
 impl DaemonState {
@@ -91,7 +82,6 @@ impl DaemonState {
             project_roots,
             projects: HashMap::new(),
             processes: HashMap::new(),
-            restart_info: HashMap::new(),
         }
     }
 
@@ -126,7 +116,7 @@ impl DaemonState {
         }
     }
 
-    fn reap_exited_processes(&mut self, server_url: &str, token: &str) {
+    fn reap_exited_processes(&mut self) {
         let mut exited = Vec::new();
         for (project_id, child) in &mut self.processes {
             match child.try_wait() {
@@ -152,48 +142,6 @@ impl DaemonState {
         for project_id in &exited {
             self.processes.remove(project_id);
         }
-
-        // Auto-restart crashed processes (with cooldown)
-        let now = Instant::now();
-        for project_id in exited {
-            let info = self.restart_info.entry(project_id.clone()).or_insert(RestartInfo {
-                attempts: 0,
-                last_crash: now,
-            });
-
-            if info.last_crash.elapsed() > RESTART_COOLDOWN {
-                // Cooldown passed — reset counter
-                info.attempts = 0;
-            }
-
-            info.attempts += 1;
-            info.last_crash = now;
-
-            if info.attempts > MAX_RESTART_ATTEMPTS {
-                tracing::error!(
-                    "Project {} crashed {} times within cooldown, not restarting",
-                    project_id,
-                    info.attempts
-                );
-                if let Some(project) = self.projects.get_mut(&project_id) {
-                    project.last_error = Some(format!(
-                        "Exceeded max restart attempts ({})",
-                        MAX_RESTART_ATTEMPTS
-                    ));
-                }
-                continue;
-            }
-
-            tracing::warn!(
-                "Auto-restarting crashed project CLI: {} (attempt {}/{})",
-                project_id,
-                info.attempts,
-                MAX_RESTART_ATTEMPTS
-            );
-            if let Err(e) = self.start_project(&project_id, server_url, token) {
-                tracing::error!("Failed to auto-restart project {}: {}", project_id, e);
-            }
-        }
     }
 
     fn snapshot_projects(&self) -> Vec<MachineProjectInfo> {
@@ -216,7 +164,7 @@ impl DaemonState {
     }
 
     fn start_project(&mut self, project_id: &str, server_url: &str, token: &str) -> Result<()> {
-        // Don't auto-restart here to avoid recursion — just reap
+        // Reap any exited tracked processes before deciding whether to spawn.
         let mut exited = Vec::new();
         for (pid, child) in &mut self.processes {
             if let Ok(Some(_)) = child.try_wait() {
@@ -252,7 +200,11 @@ impl DaemonState {
         let executable = std::env::current_exe()
             .ok()
             .filter(|p| p.exists())
-            .or_else(|| dirs::home_dir().map(|h| h.join(".local/bin/apas")).filter(|p| p.exists()))
+            .or_else(|| {
+                dirs::home_dir()
+                    .map(|h| h.join(".local/bin/apas"))
+                    .filter(|p| p.exists())
+            })
             .unwrap_or_else(|| PathBuf::from("apas"));
         let child = Command::new(executable)
             .arg("--headless")
@@ -299,7 +251,6 @@ struct StoredProject {
     id: Uuid,
     name: Option<String>,
 }
-
 
 fn discover_projects(roots: &[PathBuf]) -> Vec<ProjectEntry> {
     let mut results = Vec::new();
@@ -449,7 +400,7 @@ pub async fn run(
     let mut reconnect_delay = INITIAL_RECONNECT_DELAY;
 
     while !shutdown.load(Ordering::SeqCst) {
-        state.reap_exited_processes(server_url, token);
+        state.reap_exited_processes();
         state.refresh_projects();
 
         match run_connection(server_url, token, &mut state, shutdown.clone()).await {
@@ -520,25 +471,13 @@ async fn run_connection(
         }
     }
 
-    // Auto-start all discovered projects on daemon (re)connect.
-    // When systemd restarts the daemon, it kills the entire cgroup including
-    // headless CLIs, so we need to restart them.
-    {
-        let project_ids: Vec<String> = state.projects.keys().cloned().collect();
-        for project_id in project_ids {
-            if !state.processes.contains_key(&project_id) {
-                if let Err(err) = state.start_project(&project_id, server_url, token) {
-                    tracing::warn!("Auto-start failed for project {}: {}", project_id, err);
-                }
-            }
-        }
-        // Report updated state to server
-        let update = DaemonToServer::Heartbeat {
-            projects: state.snapshot_projects(),
-        };
-        let text = serde_json::to_string(&update)?;
-        ws_sender.send(Message::Text(text.into())).await?;
-    }
+    // Report current state to server. CLI processes are only started explicitly
+    // via StartProjectCli and are not auto-started on daemon reconnect.
+    let update = DaemonToServer::Heartbeat {
+        projects: state.snapshot_projects(),
+    };
+    let text = serde_json::to_string(&update)?;
+    ws_sender.send(Message::Text(text.into())).await?;
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -550,7 +489,7 @@ async fn run_connection(
 
         tokio::select! {
             _ = heartbeat.tick() => {
-                state.reap_exited_processes(server_url, token);
+                state.reap_exited_processes();
                 state.refresh_projects();
 
                 let heartbeat_msg = DaemonToServer::Heartbeat {
@@ -569,8 +508,6 @@ async fn run_connection(
                                 return Err(anyhow::anyhow!("Daemon auth dropped: {}", reason));
                             }
                             ServerToDaemon::StartProjectCli { project_id } => {
-                                // Manual start resets restart cooldown
-                                state.restart_info.remove(&project_id);
                                 if let Err(err) = state.start_project(&project_id, server_url, token) {
                                     tracing::warn!("Failed to start project {}: {}", project_id, err);
                                 }

@@ -42,10 +42,7 @@ fn resolve_binary_path(name: &str) -> String {
         return name.to_string();
     }
     // Use `which` via PATH lookup
-    if let Ok(output) = Command::new("which")
-        .arg(name)
-        .output()
-    {
+    if let Ok(output) = Command::new("which").arg(name).output() {
         if output.status.success() {
             if let Ok(path) = String::from_utf8(output.stdout) {
                 let path = path.trim();
@@ -92,7 +89,12 @@ pub async fn run_headless(server_url: &str, token: &str, working_dir: &Path) -> 
     run_inner(server_url, token, working_dir, true).await
 }
 
-async fn run_inner(server_url: &str, token: &str, working_dir: &Path, headless: bool) -> Result<()> {
+async fn run_inner(
+    server_url: &str,
+    token: &str,
+    working_dir: &Path,
+    headless: bool,
+) -> Result<()> {
     if !headless {
         // Clear terminal screen for a clean start
         print!("\x1B[2J\x1B[H");
@@ -134,22 +136,33 @@ async fn run_inner(server_url: &str, token: &str, working_dir: &Path, headless: 
         .panes
         .iter()
         .map(|pane| {
+            // If a stop was requested but never finalized before a crash/restart,
+            // restore as interactive to avoid accidentally re-starting bot mode.
+            let mode = if pane.mode == shared::PaneMode::Deadloop && pane.stop_requested {
+                shared::PaneMode::Interactive
+            } else {
+                pane.mode.clone()
+            };
             let label = pane.label.clone().unwrap_or_else(|| match pane.pane_id {
                 shared::PANE_ID_DEADLOOP => "Deadloop".to_string(),
                 shared::PANE_ID_INTERACTIVE => "Interactive".to_string(),
                 _ => format!("Tab {}", pane.pane_id),
             });
-            let is_paused = if pane.pane_id == shared::PANE_ID_DEADLOOP {
-                pane.is_paused || metadata.is_paused
+            let is_paused = if mode == shared::PaneMode::Deadloop {
+                if pane.pane_id == shared::PANE_ID_DEADLOOP {
+                    pane.is_paused || metadata.is_paused
+                } else {
+                    pane.is_paused
+                }
             } else {
-                pane.is_paused
+                false
             };
 
             (
                 pane.pane_id,
                 pane.session_id,
                 label,
-                pane.mode.clone(),
+                mode,
                 pane.provider,
                 pane.prompt.clone(),
                 is_paused,
@@ -198,8 +211,13 @@ async fn run_inner(server_url: &str, token: &str, working_dir: &Path, headless: 
         Arc<AtomicBool>,
         Arc<Mutex<Option<std::process::Child>>>,
     )> = Vec::new();
-    let mut interactive_startups: Vec<(u32, Uuid, Provider, mpsc::Receiver<PaneInput>, Arc<Mutex<Option<std::process::Child>>>)> =
-        Vec::new();
+    let mut interactive_startups: Vec<(
+        u32,
+        Uuid,
+        Provider,
+        mpsc::Receiver<PaneInput>,
+        Arc<Mutex<Option<std::process::Child>>>,
+    )> = Vec::new();
     {
         let mut pauses = pane_pauses.lock().unwrap();
         let mut stop_requests = pane_stop_requests.lock().unwrap();
@@ -242,7 +260,13 @@ async fn run_inner(server_url: &str, token: &str, working_dir: &Path, headless: 
             } else {
                 let (input_tx, input_rx) = mpsc::channel::<PaneInput>();
                 channels.insert(*pane_id, input_tx);
-                interactive_startups.push((*pane_id, *pane_session_id, *provider, input_rx, child_proc));
+                interactive_startups.push((
+                    *pane_id,
+                    *pane_session_id,
+                    *provider,
+                    input_rx,
+                    child_proc,
+                ));
             }
         }
     }
@@ -516,10 +540,27 @@ fn spawn_centralized_input_router(
 /// Persist current pane configs (including dynamic tabs) to the .apas file
 fn save_pane_configs(
     working_dir: &str,
-    pane_sessions: &HashMap<u32, Uuid>,
-    pane_metas: &HashMap<u32, PaneMeta>,
+    pane_sessions: &Arc<Mutex<HashMap<u32, Uuid>>>,
+    pane_metas: &PaneMetas,
+    pane_pauses: &PanePauses,
+    pane_stop_requests: &PaneStopRequests,
 ) {
     if let Ok(mut metadata) = get_or_create_project(Path::new(working_dir)) {
+        let pane_sessions = pane_sessions.lock().unwrap().clone();
+        let pane_metas = pane_metas.lock().unwrap().clone();
+        let paused: HashMap<u32, bool> = pane_pauses
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(&pane_id, flag)| (pane_id, flag.load(Ordering::SeqCst)))
+            .collect();
+        let stop_requested: HashMap<u32, bool> = pane_stop_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(&pane_id, flag)| (pane_id, flag.load(Ordering::SeqCst)))
+            .collect();
+
         // Rebuild panes list from pane_sessions and pane_metas
         let mut panes: Vec<shared::PaneConfig> = pane_sessions
             .iter()
@@ -545,8 +586,8 @@ fn save_pane_configs(
                     provider,
                     mode,
                     session_id: claude_sid,
-                    is_paused: false,
-                    stop_requested: false,
+                    is_paused: paused.get(&pane_id).copied().unwrap_or(false),
+                    stop_requested: stop_requested.get(&pane_id).copied().unwrap_or(false),
                     prompt,
                     label: Some(label),
                     model: None,
@@ -667,8 +708,10 @@ fn handle_tui_events(
                 // Persist to .apas
                 save_pane_configs(
                     working_dir,
-                    &pane_sessions.lock().unwrap(),
-                    &pane_metas.lock().unwrap(),
+                    &pane_sessions,
+                    &pane_metas,
+                    &pane_pauses,
+                    &pane_stop_requests,
                 );
             }
             Ok(TuiEvent::AddTabWithConfig {
@@ -797,8 +840,10 @@ fn handle_tui_events(
                 // Persist to .apas
                 save_pane_configs(
                     working_dir,
-                    &pane_sessions.lock().unwrap(),
-                    &pane_metas.lock().unwrap(),
+                    &pane_sessions,
+                    &pane_metas,
+                    &pane_pauses,
+                    &pane_stop_requests,
                 );
             }
             Ok(TuiEvent::CloseTab(pane_id)) => {
@@ -864,8 +909,10 @@ fn handle_tui_events(
                 // Persist to .apas
                 save_pane_configs(
                     working_dir,
-                    &pane_sessions.lock().unwrap(),
-                    &pane_metas.lock().unwrap(),
+                    &pane_sessions,
+                    &pane_metas,
+                    &pane_pauses,
+                    &pane_stop_requests,
                 );
             }
             Ok(TuiEvent::StartBot { pane_id, prompt }) => {
@@ -998,8 +1045,10 @@ fn handle_tui_events(
 
                 save_pane_configs(
                     working_dir,
-                    &pane_sessions.lock().unwrap(),
-                    &pane_metas.lock().unwrap(),
+                    &pane_sessions,
+                    &pane_metas,
+                    &pane_pauses,
+                    &pane_stop_requests,
                 );
             }
             Ok(TuiEvent::StopBot { pane_id }) => {
@@ -1098,6 +1147,16 @@ fn handle_tui_events(
                             &pane_stop_requests,
                         ),
                     });
+
+                    // Persist stop_requested immediately so a crash/restart before
+                    // FinalizeStopBot does not resurrect bot mode.
+                    save_pane_configs(
+                        working_dir,
+                        &pane_sessions,
+                        &pane_metas,
+                        &pane_pauses,
+                        &pane_stop_requests,
+                    );
                 } else {
                     // === Stage 2: Force stop ===
                     // Kill the deadloop child process immediately
@@ -1266,8 +1325,10 @@ fn handle_tui_events(
 
                 save_pane_configs(
                     working_dir,
-                    &pane_sessions.lock().unwrap(),
-                    &pane_metas.lock().unwrap(),
+                    &pane_sessions,
+                    &pane_metas,
+                    &pane_pauses,
+                    &pane_stop_requests,
                 );
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
