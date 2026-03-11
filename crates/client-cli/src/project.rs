@@ -5,6 +5,22 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 const APAS_FILE: &str = ".apas";
+const USER_REGISTRY_DIR: &str = ".apas";
+const USER_PROJECTS_FILE: &str = "projects.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisteredProject {
+    pub project_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ProjectRegistry {
+    #[serde(default)]
+    projects: Vec<RegisteredProject>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectMetadata {
@@ -149,6 +165,81 @@ impl ProjectMetadata {
     }
 }
 
+pub fn project_registry_path() -> Result<PathBuf> {
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+    let registry_dir = home.join(USER_REGISTRY_DIR);
+    std::fs::create_dir_all(&registry_dir)?;
+    Ok(registry_dir.join(USER_PROJECTS_FILE))
+}
+
+pub fn list_registered_projects() -> Result<Vec<RegisteredProject>> {
+    let path = project_registry_path()?;
+    let registry = read_project_registry(&path)?;
+    Ok(registry.projects)
+}
+
+pub fn register_project(dir: &Path, metadata: &ProjectMetadata) -> Result<()> {
+    let path = project_registry_path()?;
+    let mut registry = match read_project_registry(&path) {
+        Ok(registry) => registry,
+        Err(err) => {
+            tracing::warn!(
+                "Project registry at {:?} is unreadable ({}), recreating it",
+                path,
+                err
+            );
+            ProjectRegistry::default()
+        }
+    };
+    let normalized_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let dir_str = normalized_dir.to_string_lossy().to_string();
+    let project_id = metadata.id.to_string();
+
+    // De-duplicate by project id and by path.
+    registry
+        .projects
+        .retain(|entry| entry.project_id != project_id && entry.path != dir_str);
+
+    registry.projects.push(RegisteredProject {
+        project_id,
+        name: metadata.name.clone(),
+        path: dir_str,
+    });
+    registry.projects.sort_by(|a, b| a.path.cmp(&b.path));
+
+    write_project_registry(&path, &registry)
+}
+
+fn read_project_registry(path: &Path) -> Result<ProjectRegistry> {
+    if !path.exists() {
+        return Ok(ProjectRegistry::default());
+    }
+
+    let content = std::fs::read_to_string(path)?;
+    if content.trim().is_empty() {
+        return Ok(ProjectRegistry::default());
+    }
+
+    // Backward/format compatibility: support both wrapped object and plain array.
+    if let Ok(registry) = serde_json::from_str::<ProjectRegistry>(&content) {
+        return Ok(registry);
+    }
+    if let Ok(projects) = serde_json::from_str::<Vec<RegisteredProject>>(&content) {
+        return Ok(ProjectRegistry { projects });
+    }
+
+    anyhow::bail!("Failed to parse project registry at {:?}", path)
+}
+
+fn write_project_registry(path: &Path, registry: &ProjectRegistry) -> Result<()> {
+    let content = serde_json::to_string_pretty(registry)?;
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, content)?;
+    std::fs::rename(tmp_path, path)?;
+    Ok(())
+}
+
 /// Get or create the .apas metadata file for a directory
 pub fn get_or_create_project(dir: &Path) -> Result<ProjectMetadata> {
     let apas_path = dir.join(APAS_FILE);
@@ -159,6 +250,9 @@ pub fn get_or_create_project(dir: &Path) -> Result<ProjectMetadata> {
         let mut metadata: ProjectMetadata = serde_json::from_str(&content)?;
         // Migrate legacy pane config if needed
         metadata.migrate_legacy();
+        if let Err(err) = register_project(dir, &metadata) {
+            tracing::warn!("Failed to register project in user registry: {}", err);
+        }
         Ok(metadata)
     } else {
         // Create new metadata with directory name as project name
@@ -178,6 +272,9 @@ pub fn get_or_create_project(dir: &Path) -> Result<ProjectMetadata> {
         // Save to file
         let content = serde_json::to_string_pretty(&metadata)?;
         std::fs::write(&apas_path, content)?;
+        if let Err(err) = register_project(dir, &metadata) {
+            tracing::warn!("Failed to register project in user registry: {}", err);
+        }
 
         tracing::info!("Created new project: {} ({:?})", metadata.id, metadata.name);
         Ok(metadata)
@@ -189,6 +286,9 @@ pub fn save_project(dir: &Path, metadata: &ProjectMetadata) -> Result<()> {
     let apas_path = dir.join(APAS_FILE);
     let content = serde_json::to_string_pretty(metadata)?;
     std::fs::write(&apas_path, content)?;
+    if let Err(err) = register_project(dir, metadata) {
+        tracing::warn!("Failed to register project in user registry: {}", err);
+    }
     tracing::debug!("Saved project metadata to {:?}", apas_path);
     Ok(())
 }
