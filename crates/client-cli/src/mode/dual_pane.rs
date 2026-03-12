@@ -1519,6 +1519,39 @@ fn parse_agent_output(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::build_agent_args;
+    use shared::Provider;
+    use uuid::Uuid;
+
+    const FULL_PROMPT: &str =
+        "Work on tasks defined in TODO.md.\n1. Analyze\n2. Implement\n3. Test";
+
+    #[test]
+    fn build_agent_args_claude_resume_keeps_full_prompt() {
+        let session_id = Uuid::new_v4();
+        let (args, using_resume) =
+            build_agent_args(&Provider::Claude, &session_id, FULL_PROMPT, false, true);
+
+        assert!(using_resume);
+        assert!(args.iter().any(|arg| arg == "--resume"));
+        assert_eq!(args.last().map(String::as_str), Some(FULL_PROMPT));
+    }
+
+    #[test]
+    fn build_agent_args_codex_resume_keeps_full_prompt() {
+        let session_id = Uuid::new_v4();
+        let (args, using_resume) =
+            build_agent_args(&Provider::Codex, &session_id, FULL_PROMPT, false, true);
+
+        assert!(using_resume);
+        assert_eq!(args.get(0).map(String::as_str), Some("exec"));
+        assert_eq!(args.get(1).map(String::as_str), Some("resume"));
+        assert_eq!(args.last().map(String::as_str), Some(FULL_PROMPT));
+    }
+}
+
 /// Run the deadloop (autonomous) session on any pane
 fn run_deadloop_session(
     binary_path: &str,
@@ -1639,7 +1672,6 @@ fn run_deadloop_session_inner(
 
         // Always use the original user-defined prompt so the agent retains
         // the full task context across resume iterations.
-        let is_resume = !first_message || try_resume_first;
         let iteration_prompt = prompt;
 
         let _ = server_tx.try_send(CliToServer::UserInput {
