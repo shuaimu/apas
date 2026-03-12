@@ -405,7 +405,10 @@ mod tests {
 
     #[test]
     fn parse_stored_pane_id_handles_legacy_numeric_and_composite_formats() {
-        assert_eq!(parse_stored_pane_id(Some("deadloop")), Some(shared::PANE_ID_DEADLOOP));
+        assert_eq!(
+            parse_stored_pane_id(Some("deadloop")),
+            Some(shared::PANE_ID_DEADLOOP)
+        );
         assert_eq!(
             parse_stored_pane_id(Some("interactive")),
             Some(shared::PANE_ID_INTERACTIVE)
@@ -426,7 +429,10 @@ mod tests {
 
     #[test]
     fn normalized_bucket_key_collapses_equivalent_pane_identifiers() {
-        assert_eq!(normalized_bucket_key(Some("interactive")), Some("2".to_string()));
+        assert_eq!(
+            normalized_bucket_key(Some("interactive")),
+            Some("2".to_string())
+        );
         assert_eq!(normalized_bucket_key(Some("2")), Some("2".to_string()));
         assert_eq!(
             normalized_bucket_key(Some("claude-interactive-1")),

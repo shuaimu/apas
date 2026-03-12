@@ -824,8 +824,7 @@ where
                 .collect();
             if texts.is_empty() {
                 // Fallback: serialize the array as JSON string
-                Ok(serde_json::to_string(&serde_json::Value::Array(arr))
-                    .unwrap_or_default())
+                Ok(serde_json::to_string(&serde_json::Value::Array(arr)).unwrap_or_default())
             } else {
                 Ok(texts.join("\n"))
             }

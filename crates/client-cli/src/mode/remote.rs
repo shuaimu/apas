@@ -1,6 +1,6 @@
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
-use shared::{CliToServer, ClaudeStreamMessage, PaneType, ServerToCli};
+use shared::{ClaudeStreamMessage, CliToServer, PaneType, ServerToCli};
 use std::io::BufRead;
 use std::path::Path;
 use std::process::Stdio;
@@ -148,9 +148,7 @@ async fn run_connection(
     // so the server associates this CLI with the project's session,
     // then start a session handler per pane ready to receive input.
     if let Ok(project) = crate::project::get_or_create_project(working_dir) {
-        let hostname = hostname::get()
-            .ok()
-            .and_then(|v| v.into_string().ok());
+        let hostname = hostname::get().ok().and_then(|v| v.into_string().ok());
         let session_start = CliToServer::SessionStart {
             session_id: project.id,
             working_dir: Some(working_dir.to_string_lossy().to_string()),
@@ -160,7 +158,11 @@ async fn run_connection(
         };
         let msg_text = serde_json::to_string(&session_start)?;
         ws_sender.send(Message::Text(msg_text.into())).await?;
-        tracing::info!("Sent SessionStart for project {} (session {})", project.name.as_deref().unwrap_or("unnamed"), project.id);
+        tracing::info!(
+            "Sent SessionStart for project {} (session {})",
+            project.name.as_deref().unwrap_or("unnamed"),
+            project.id
+        );
 
         // Spawn a session handler for each pane
         let session_id = project.id;
@@ -172,9 +174,16 @@ async fn run_connection(
             let spawn_inputs = pane_inputs.clone();
             let spawn_claude_path = claude_path.to_string();
             tokio::spawn(async move {
-                if let Err(e) =
-                    handle_pane(session_id, claude_session_id, pane_id, &spawn_claude_path, &dir, spawn_tx, spawn_inputs)
-                        .await
+                if let Err(e) = handle_pane(
+                    session_id,
+                    claude_session_id,
+                    pane_id,
+                    &spawn_claude_path,
+                    &dir,
+                    spawn_tx,
+                    spawn_inputs,
+                )
+                .await
                 {
                     tracing::error!("Session {} pane {} error: {}", session_id, pane_id, e);
                 }
@@ -232,16 +241,25 @@ async fn run_connection(
                         let claude_session_id = Uuid::new_v4();
 
                         tokio::spawn(async move {
-                            if let Err(e) =
-                                handle_pane(session_id, claude_session_id, shared::PANE_ID_INTERACTIVE, &claude_path, &dir, ws_tx, pane_inputs)
-                                    .await
+                            if let Err(e) = handle_pane(
+                                session_id,
+                                claude_session_id,
+                                shared::PANE_ID_INTERACTIVE,
+                                &claude_path,
+                                &dir,
+                                ws_tx,
+                                pane_inputs,
+                            )
+                            .await
                             {
                                 tracing::error!("Session {} error: {}", session_id, e);
                             }
                         });
                     }
                     Ok(ServerToCli::Input {
-                        session_id, data, pane_id,
+                        session_id,
+                        data,
+                        pane_id,
                     }) => {
                         // Route input to the correct pane handler
                         let target_pane = pane_id.unwrap_or(shared::PANE_ID_INTERACTIVE);
@@ -249,7 +267,11 @@ async fn run_connection(
                         if let Some(sender) = pane_inputs.get(&target_pane) {
                             let _ = sender.send(data).await;
                         } else {
-                            tracing::warn!("No handler for pane {} in session {}", target_pane, session_id);
+                            tracing::warn!(
+                                "No handler for pane {} in session {}",
+                                target_pane,
+                                session_id
+                            );
                         }
                     }
                     Ok(ServerToCli::Signal { session_id, signal }) => {
@@ -326,7 +348,9 @@ async fn handle_pane(
 ) -> Result<()> {
     tracing::info!(
         "Pane handler ready: session={}, claude_session={}, pane={}",
-        session_id, claude_session_id, pane_id
+        session_id,
+        claude_session_id,
+        pane_id
     );
 
     // Channel for input to this pane
@@ -466,9 +490,7 @@ async fn handle_pane(
                 // Handle errors (e.g., --resume failed for non-existent session)
                 let had_error = exit_status.map(|s| !s.success()).unwrap_or(true);
                 if had_error && first_message && using_resume {
-                    tracing::warn!(
-                        "Claude --resume failed, will use --session-id on next message"
-                    );
+                    tracing::warn!("Claude --resume failed, will use --session-id on next message");
                     try_resume_first = false;
                 } else if first_message {
                     first_message = false;

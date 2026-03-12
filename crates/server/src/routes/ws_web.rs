@@ -68,7 +68,10 @@ fn to_message_info(message: crate::storage::StoredMessage) -> MessageInfo {
     }
 }
 
-fn infer_panes_from_messages(session_id: Uuid, messages: &[MessageInfo]) -> Vec<shared::PaneConfig> {
+fn infer_panes_from_messages(
+    session_id: Uuid,
+    messages: &[MessageInfo],
+) -> Vec<shared::PaneConfig> {
     let mut pane_ids: Vec<u32> = messages.iter().filter_map(|m| m.pane_id).collect();
     pane_ids.sort_unstable();
     pane_ids.dedup();
@@ -911,7 +914,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         if panes_to_send.is_empty() {
                             panes_to_send = infer_panes_from_messages(sid, &messages);
                             if !panes_to_send.is_empty() {
-                                state.sessions.set_session_panes(&sid, panes_to_send.clone());
+                                state
+                                    .sessions
+                                    .set_session_panes(&sid, panes_to_send.clone());
                             }
                         }
                         if !panes_to_send.is_empty() {
@@ -930,10 +935,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         // Request fresh pane list from CLI to correct any stale cached data
                         state
                             .sessions
-                            .route_to_cli(
-                                &sid,
-                                ServerToCli::RequestPaneList { session_id: sid },
-                            )
+                            .route_to_cli(&sid, ServerToCli::RequestPaneList { session_id: sid })
                             .await;
 
                         state

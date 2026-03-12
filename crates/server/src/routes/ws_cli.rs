@@ -493,12 +493,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // Cleanup - mark all sessions for this CLI as inactive and clear cli_client_id
     let session_ids = state.sessions.get_cli_session_ids(&cli_id);
     for session_id in &session_ids {
-        if let Err(e) = state
-            .db
-            .clear_session_cli(&session_id.to_string())
-            .await
-        {
-            tracing::error!("Failed to clear session {} cli_client_id: {}", session_id, e);
+        if let Err(e) = state.db.clear_session_cli(&session_id.to_string()).await {
+            tracing::error!(
+                "Failed to clear session {} cli_client_id: {}",
+                session_id,
+                e
+            );
         }
     }
 
