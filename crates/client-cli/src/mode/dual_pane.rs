@@ -1409,6 +1409,24 @@ fn build_pane_list(
     panes
 }
 
+fn active_usage_providers(pane_metas: &PaneMetas) -> (bool, bool) {
+    let metas = pane_metas.lock().unwrap();
+    let mut has_claude = false;
+    let mut has_codex = false;
+
+    for meta in metas.values() {
+        match meta.provider {
+            Provider::Claude => has_claude = true,
+            Provider::Codex => has_codex = true,
+        }
+        if has_claude && has_codex {
+            break;
+        }
+    }
+
+    (has_claude, has_codex)
+}
+
 /// Kill any OS processes whose command line contains the given session ID.
 /// This ensures the Claude session lock is released before we `--resume`.
 fn kill_processes_using_session(session_id: &str) {
@@ -1473,7 +1491,7 @@ fn build_agent_args(
         }
         Provider::Codex => {
             // Codex uses subcommands: `codex exec --json ...` or `codex exec resume --json ... <session_id> <prompt>`
-            let mut base_flags = vec![
+            let base_flags = vec![
                 "--json".to_string(),
                 "--dangerously-bypass-approvals-and-sandbox".to_string(),
                 "--skip-git-repo-check".to_string(),
@@ -1521,7 +1539,9 @@ fn parse_agent_output(
 
 #[cfg(test)]
 mod tests {
-    use super::build_agent_args;
+    use super::{active_usage_providers, build_agent_args, PaneMeta, PaneMetas};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
     use shared::Provider;
     use uuid::Uuid;
 
@@ -1549,6 +1569,36 @@ mod tests {
         assert_eq!(args.get(0).map(String::as_str), Some("exec"));
         assert_eq!(args.get(1).map(String::as_str), Some("resume"));
         assert_eq!(args.last().map(String::as_str), Some(FULL_PROMPT));
+    }
+
+    #[test]
+    fn active_usage_providers_detects_claude_and_codex() {
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+        let child_process = Arc::new(Mutex::new(None));
+
+        {
+            let mut metas = pane_metas.lock().unwrap();
+            metas.insert(
+                1,
+                PaneMeta {
+                    mode: shared::PaneMode::Interactive,
+                    provider: Provider::Claude,
+                    prompt: None,
+                    child_process: child_process.clone(),
+                },
+            );
+            metas.insert(
+                2,
+                PaneMeta {
+                    mode: shared::PaneMode::Interactive,
+                    provider: Provider::Codex,
+                    prompt: None,
+                    child_process,
+                },
+            );
+        }
+
+        assert_eq!(active_usage_providers(&pane_metas), (true, true));
     }
 }
 
@@ -2761,29 +2811,35 @@ async fn run_server_connection(
                             }
                         }
                         _ = usage_interval.tick() => {
-                            match crate::usage::fetch_claude_usage_limits().await {
-                                Ok(limits) => {
-                                    let usage_msg = CliToServer::UsageLimits { provider: Provider::Claude, limits };
-                                    let msg_text = serde_json::to_string(&usage_msg).unwrap_or_default();
-                                    if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
-                                        tracing::warn!("Failed to send Claude usage limits to server");
+                            let (has_claude, has_codex) = active_usage_providers(&pane_metas);
+
+                            if has_claude {
+                                match crate::usage::fetch_claude_usage_limits().await {
+                                    Ok(limits) => {
+                                        let usage_msg = CliToServer::UsageLimits { provider: Provider::Claude, limits };
+                                        let msg_text = serde_json::to_string(&usage_msg).unwrap_or_default();
+                                        if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
+                                            tracing::warn!("Failed to send Claude usage limits to server");
+                                        }
                                     }
-                                }
-                                Err(e) => {
-                                    tracing::warn!("Failed to fetch Claude usage limits: {}", e);
+                                    Err(e) => {
+                                        tracing::warn!("Failed to fetch Claude usage limits: {}", e);
+                                    }
                                 }
                             }
 
-                            match crate::usage::fetch_codex_usage_limits().await {
-                                Ok(limits) => {
-                                    let usage_msg = CliToServer::UsageLimits { provider: Provider::Codex, limits };
-                                    let msg_text = serde_json::to_string(&usage_msg).unwrap_or_default();
-                                    if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
-                                        tracing::warn!("Failed to send Codex usage limits to server");
+                            if has_codex {
+                                match crate::usage::fetch_codex_usage_limits().await {
+                                    Ok(limits) => {
+                                        let usage_msg = CliToServer::UsageLimits { provider: Provider::Codex, limits };
+                                        let msg_text = serde_json::to_string(&usage_msg).unwrap_or_default();
+                                        if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
+                                            tracing::warn!("Failed to send Codex usage limits to server");
+                                        }
                                     }
-                                }
-                                Err(e) => {
-                                    tracing::debug!("Failed to fetch Codex usage limits: {}", e);
+                                    Err(e) => {
+                                        tracing::debug!("Failed to fetch Codex usage limits: {}", e);
+                                    }
                                 }
                             }
                         }
