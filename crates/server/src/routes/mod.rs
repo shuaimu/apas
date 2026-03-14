@@ -1,5 +1,5 @@
 use axum::{
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
     Router,
 };
 use tower_http::cors::{Any, CorsLayer};
@@ -44,6 +44,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/share/redeem", post(share::redeem_code))
         .route("/share/list/:session_id", get(share::list_shares))
         .route("/share/:session_id/:user_id", delete(share::revoke_access))
+        .route(
+            "/share/:session_id/:user_id/role",
+            patch(share::update_share_role),
+        )
         // WebSocket routes
         .route("/ws/web", get(ws_web::ws_handler))
         .route("/ws/cli", get(ws_cli::ws_handler))

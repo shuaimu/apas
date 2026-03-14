@@ -139,7 +139,7 @@ async fn get_shared_project_access_refs(
         }
     };
 
-    for (session, _) in shared_sessions {
+    for (session, _, _) in shared_sessions {
         let Some(path_raw) = session.working_dir else {
             continue;
         };
@@ -1138,13 +1138,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 created_at: s.created_at,
                                 is_shared: false,
                                 owner_email: None,
+                                share_role: Some("owner".to_string()),
                                 is_active,
                             }
                         })
                         .collect();
 
                     // Add shared sessions with owner email
-                    for (s, owner_email) in shared_sessions {
+                    for (s, owner_email, share_role) in shared_sessions {
                         let session_id = Uuid::parse_str(&s.id).unwrap_or_default();
                         let is_active = state.sessions.is_session_active(&session_id);
                         sessions.push(SessionInfo {
@@ -1156,6 +1157,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             created_at: s.created_at,
                             is_shared: true,
                             owner_email: Some(owner_email),
+                            share_role: Some(share_role),
                             is_active,
                         });
                     }

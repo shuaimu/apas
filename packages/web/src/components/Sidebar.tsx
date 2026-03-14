@@ -48,12 +48,45 @@ interface SidebarProps {
 }
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://apas.mpaxos.com:8080";
+type ProjectRole = "owner" | "admin" | "user";
+
+function parseProjectRole(raw: unknown): ProjectRole {
+  if (typeof raw !== "string") return "user";
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "owner" || normalized === "admin" || normalized === "user") {
+    return normalized;
+  }
+  return "user";
+}
+
+function canManageProject(project: { isShared?: boolean; shareRole?: ProjectRole }): boolean {
+  if (!project.isShared) return true;
+  return project.shareRole === "owner" || project.shareRole === "admin";
+}
+
+function canAdminActOnRole(viewerRole: ProjectRole, targetRole: ProjectRole): boolean {
+  if (viewerRole === "owner") return true;
+  if (viewerRole !== "admin") return false;
+  return targetRole !== "admin";
+}
+
+function roleLabel(role: ProjectRole): string {
+  return role.charAt(0).toUpperCase() + role.slice(1);
+}
 
 interface ShareUser {
   user_id: string;
   user_email: string;
   is_owner: boolean;
+  role: ProjectRole;
   created_at?: string;
+}
+
+interface ShareListState {
+  owner?: ShareUser;
+  shares: ShareUser[];
+  viewerRole: ProjectRole;
+  canManage: boolean;
 }
 
 const ADMIN_USER_ID = "88b6016d-a8b4-400c-bdc9-f0120504a4fc";
@@ -74,9 +107,14 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
   const [shareError, setShareError] = useState<string | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [shareTab, setShareTab] = useState<"invite" | "manage">("invite");
-  const [shareUsers, setShareUsers] = useState<{ owner?: ShareUser; shares: ShareUser[] }>({ shares: [] });
+  const [shareUsers, setShareUsers] = useState<ShareListState>({
+    shares: [],
+    viewerRole: "user",
+    canManage: false,
+  });
   const [manageLoading, setManageLoading] = useState(false);
   const [removingUserId, setRemovingUserId] = useState<string | null>(null);
+  const [updatingRoleUserId, setUpdatingRoleUserId] = useState<string | null>(null);
 
   // Merge CLI clients (active) and sessions (historical) into unified project list
   // Deduplicate by working directory, keeping the most recent session
@@ -90,6 +128,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
       createdAt?: string;
       isShared?: boolean;
       ownerEmail?: string;
+      shareRole?: ProjectRole;
       cliClientId?: string;
     }>();
 
@@ -118,6 +157,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
           createdAt: session.createdAt,
           isShared: session.isShared,
           ownerEmail: session.ownerEmail,
+          shareRole: session.shareRole,
           cliClientId: session.cliClientId,
         });
       }
@@ -171,9 +211,16 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
   const handleShareClick = async (e: React.MouseEvent, projectId: string) => {
     e.stopPropagation();
     setShareSessionId(projectId);
+    setShareTab("invite");
     setShareCode(null);
     setShareUrl(null);
     setShareError(null);
+    setShareUsers({
+      owner: undefined,
+      shares: [],
+      viewerRole: "user",
+      canManage: false,
+    });
     setShareModalOpen(true);
     setShareLoading(true);
 
@@ -235,6 +282,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
 
   const fetchShareUsers = async (sessionId: string) => {
     setManageLoading(true);
+    setShareError(null);
     try {
       const response = await fetch(`${API_URL}/share/list/${sessionId}`, {
         headers: {
@@ -243,13 +291,39 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
       });
 
       if (!response.ok) {
-        throw new Error("Failed to fetch share list");
+        const error = await response.json().catch(() => null);
+        throw new Error(error?.message || "Failed to fetch share list");
       }
 
       const data = await response.json();
-      setShareUsers({ owner: data.owner, shares: data.shares });
+      const owner: ShareUser | undefined = data.owner
+        ? {
+            user_id: data.owner.user_id,
+            user_email: data.owner.user_email,
+            is_owner: true,
+            role: "owner",
+            created_at: data.owner.created_at,
+          }
+        : undefined;
+      const shares: ShareUser[] = Array.isArray(data.shares)
+        ? data.shares.map((u: Record<string, unknown>) => ({
+            user_id: String(u.user_id || ""),
+            user_email: String(u.user_email || ""),
+            is_owner: false,
+            role: parseProjectRole(u.role),
+            created_at: typeof u.created_at === "string" ? u.created_at : undefined,
+          }))
+        : [];
+      setShareUsers({
+        owner,
+        shares,
+        viewerRole: parseProjectRole(data.viewer_role),
+        canManage: Boolean(data.can_manage),
+      });
     } catch (err) {
-      console.error("Failed to fetch shares:", err);
+      const message = err instanceof Error ? err.message : "Failed to fetch share list";
+      console.error("Failed to fetch shares:", message);
+      setShareError(message);
     } finally {
       setManageLoading(false);
     }
@@ -268,15 +342,46 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
       });
 
       if (!response.ok) {
-        throw new Error("Failed to remove user");
+        const error = await response.json().catch(() => null);
+        throw new Error(error?.message || "Failed to remove user");
       }
 
       // Refresh the list
       await fetchShareUsers(shareSessionId);
     } catch (err) {
-      console.error("Failed to remove user:", err);
+      const message = err instanceof Error ? err.message : "Failed to remove user";
+      console.error("Failed to remove user:", message);
+      setShareError(message);
     } finally {
       setRemovingUserId(null);
+    }
+  };
+
+  const handleUpdateUserRole = async (targetUserId: string, role: ProjectRole) => {
+    if (!shareSessionId) return;
+    setUpdatingRoleUserId(targetUserId);
+    try {
+      const response = await fetch(`${API_URL}/share/${shareSessionId}/${targetUserId}/role`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ role }),
+      });
+
+      if (!response.ok) {
+        const error = await response.json().catch(() => null);
+        throw new Error(error?.message || "Failed to update role");
+      }
+
+      await fetchShareUsers(shareSessionId);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to update role";
+      console.error("Failed to update role:", message);
+      setShareError(message);
+    } finally {
+      setUpdatingRoleUserId(null);
     }
   };
 
@@ -371,6 +476,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                         <span className="flex items-center gap-1 text-blue-500">
                           <Users className="w-3 h-3" />
                           Shared by {project.ownerEmail}
+                          {project.shareRole === "admin" && " · Admin"}
                         </span>
                       ) : project.isActive ? (
                         "Active"
@@ -381,7 +487,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                       )}
                     </div>
                   </div>
-                  {!project.isShared && (
+                  {canManageProject(project) && (
                     <button
                       onClick={(e) => handleShareClick(e, project.id)}
                       className="p-1 hover:bg-gray-300 dark:hover:bg-gray-600 rounded opacity-50 hover:opacity-100 flex-shrink-0"
@@ -516,20 +622,34 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                     </div>
                   ) : (
                     <div className="space-y-2">
-                      <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">
+                      <p className="text-sm text-gray-600 dark:text-gray-400 mb-1">
                         Users with access to this session:
                       </p>
+                      <p className="text-xs text-gray-500 mb-3">
+                        Your role: {roleLabel(shareUsers.viewerRole)}
+                      </p>
+                      {shareError && (
+                        <p className="text-sm text-red-500 mb-3">{shareError}</p>
+                      )}
+                      {!shareUsers.canManage && (
+                        <p className="text-xs text-amber-600 dark:text-amber-400 mb-3">
+                          You can view access, but only owner/admin can make changes.
+                        </p>
+                      )}
 
                       {/* Owner */}
                       {shareUsers.owner && (
-                        <div className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700 rounded-lg">
-                          <div className="flex items-center gap-2">
-                            <Crown className="w-4 h-4 text-yellow-500" />
-                            <div>
-                              <div className="font-medium text-sm">{shareUsers.owner.user_email}</div>
+                        <div className="flex items-center justify-between gap-3 p-3 bg-gray-50 dark:bg-gray-700 rounded-lg">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <Crown className="w-4 h-4 text-yellow-500 flex-shrink-0" />
+                            <div className="min-w-0">
+                              <div className="font-medium text-sm truncate">{shareUsers.owner.user_email}</div>
                               <div className="text-xs text-gray-500">Owner</div>
                             </div>
                           </div>
+                          <span className="text-xs px-2 py-1 rounded bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-300">
+                            Owner
+                          </span>
                         </div>
                       )}
 
@@ -539,36 +659,63 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                           No users have been invited yet
                         </div>
                       ) : (
-                        shareUsers.shares.map((user) => (
-                          <div
-                            key={user.user_id}
-                            className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700 rounded-lg"
-                          >
-                            <div className="flex items-center gap-2">
-                              <Users className="w-4 h-4 text-blue-500" />
-                              <div>
-                                <div className="font-medium text-sm">{user.user_email}</div>
-                                <div className="text-xs text-gray-500">
-                                  {user.created_at
-                                    ? `Shared ${new Date(user.created_at).toLocaleDateString()}`
-                                    : "Shared"}
+                        shareUsers.shares.map((user) => {
+                          const canActOnUser = shareUsers.canManage && canAdminActOnRole(shareUsers.viewerRole, user.role);
+                          const canChangeRole = canActOnUser && user.role !== "owner";
+                          const baseRoleOptions: ProjectRole[] =
+                            shareUsers.viewerRole === "owner" ? ["user", "admin"] : ["user"];
+                          const roleOptions = baseRoleOptions.includes(user.role)
+                            ? baseRoleOptions
+                            : [user.role, ...baseRoleOptions];
+                          const roleUpdatePending = updatingRoleUserId === user.user_id;
+                          const removePending = removingUserId === user.user_id;
+
+                          return (
+                            <div
+                              key={user.user_id}
+                              className="flex items-center justify-between gap-3 p-3 bg-gray-50 dark:bg-gray-700 rounded-lg"
+                            >
+                              <div className="flex items-center gap-2 min-w-0">
+                                <Users className="w-4 h-4 text-blue-500 flex-shrink-0" />
+                                <div className="min-w-0">
+                                  <div className="font-medium text-sm truncate">{user.user_email}</div>
+                                  <div className="text-xs text-gray-500">
+                                    {user.created_at
+                                      ? `Shared ${new Date(user.created_at).toLocaleDateString()}`
+                                      : "Shared"}
+                                  </div>
                                 </div>
                               </div>
+                              <div className="flex items-center gap-2">
+                                <select
+                                  value={user.role}
+                                  onChange={(e) => handleUpdateUserRole(user.user_id, parseProjectRole(e.target.value))}
+                                  disabled={!canChangeRole || roleUpdatePending}
+                                  className="text-xs px-2 py-1 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-800 disabled:opacity-60"
+                                  title="User role"
+                                >
+                                  {roleOptions.map((role) => (
+                                    <option key={role} value={role}>
+                                      {roleLabel(role)}
+                                    </option>
+                                  ))}
+                                </select>
+                                <button
+                                  onClick={() => handleRemoveUser(user.user_id)}
+                                  disabled={!canActOnUser || removePending || roleUpdatePending}
+                                  className="p-2 text-red-500 hover:bg-red-100 dark:hover:bg-red-900/30 rounded transition-colors disabled:opacity-50"
+                                  title="Remove access"
+                                >
+                                  {removePending ? (
+                                    <div className="w-4 h-4 border-2 border-red-500 border-t-transparent rounded-full animate-spin" />
+                                  ) : (
+                                    <Trash2 className="w-4 h-4" />
+                                  )}
+                                </button>
+                              </div>
                             </div>
-                            <button
-                              onClick={() => handleRemoveUser(user.user_id)}
-                              disabled={removingUserId === user.user_id}
-                              className="p-2 text-red-500 hover:bg-red-100 dark:hover:bg-red-900/30 rounded transition-colors disabled:opacity-50"
-                              title="Remove access"
-                            >
-                              {removingUserId === user.user_id ? (
-                                <div className="w-4 h-4 border-2 border-red-500 border-t-transparent rounded-full animate-spin" />
-                              ) : (
-                                <Trash2 className="w-4 h-4" />
-                              )}
-                            </button>
-                          </div>
-                        ))
+                          );
+                        })
                       )}
                     </div>
                   )}

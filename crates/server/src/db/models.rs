@@ -49,6 +49,7 @@ pub struct SessionShare {
     pub session_id: String,
     pub user_id: String,
     pub invited_by: String,
+    pub role: String,
     pub created_at: Option<String>,
 }
 

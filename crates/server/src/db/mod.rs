@@ -126,6 +126,7 @@ impl Database {
                 session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                 user_id TEXT NOT NULL REFERENCES users(id),
                 invited_by TEXT NOT NULL REFERENCES users(id),
+                role TEXT NOT NULL DEFAULT 'user',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(session_id, user_id)
             )
@@ -133,6 +134,16 @@ impl Database {
         )
         .execute(&self.pool)
         .await?;
+
+        let _ =
+            sqlx::query("ALTER TABLE session_shares ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
+                .execute(&self.pool)
+                .await;
+        let _ = sqlx::query(
+            "UPDATE session_shares SET role = 'user' WHERE role IS NULL OR trim(role) = ''",
+        )
+        .execute(&self.pool)
+        .await;
 
         sqlx::query(
             r#"
@@ -448,12 +459,24 @@ impl Database {
         user_id: &str,
         invited_by: &str,
     ) -> Result<()> {
+        self.create_session_share_with_role(session_id, user_id, invited_by, "user")
+            .await
+    }
+
+    pub async fn create_session_share_with_role(
+        &self,
+        session_id: &str,
+        user_id: &str,
+        invited_by: &str,
+        role: &str,
+    ) -> Result<()> {
         sqlx::query(
-            "INSERT OR IGNORE INTO session_shares (session_id, user_id, invited_by) VALUES (?, ?, ?)",
+            "INSERT OR IGNORE INTO session_shares (session_id, user_id, invited_by, role) VALUES (?, ?, ?, ?)",
         )
         .bind(session_id)
         .bind(user_id)
         .bind(invited_by)
+        .bind(role)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -462,11 +485,11 @@ impl Database {
     pub async fn get_shared_sessions_for_user(
         &self,
         user_id: &str,
-    ) -> Result<Vec<(Session, String)>> {
-        // Returns sessions shared with this user along with the owner's email
+    ) -> Result<Vec<(Session, String, String)>> {
+        // Returns sessions shared with this user along with the owner's email and share role
         let rows = sqlx::query(
             r#"
-            SELECT s.id, s.user_id, s.cli_client_id, s.working_dir, s.hostname, s.status, s.created_at, s.updated_at, COALESCE(s.is_paused, 0) as is_paused, u.email
+            SELECT s.id, s.user_id, s.cli_client_id, s.working_dir, s.hostname, s.status, s.created_at, s.updated_at, COALESCE(s.is_paused, 0) as is_paused, u.email, COALESCE(ss.role, 'user') AS role
             FROM sessions s
             INNER JOIN session_shares ss ON s.id = ss.session_id
             INNER JOIN users u ON s.user_id = u.id
@@ -494,9 +517,64 @@ impl Database {
                 is_paused: row.get::<i32, _>("is_paused") != 0,
             };
             let email: String = row.get("email");
-            results.push((session, email));
+            let role: String = row.get("role");
+            results.push((session, email, role));
         }
         Ok(results)
+    }
+
+    pub async fn get_session_role_for_user(
+        &self,
+        session_id: &str,
+        user_id: &str,
+    ) -> Result<Option<String>> {
+        let owner = sqlx::query_scalar::<_, String>("SELECT user_id FROM sessions WHERE id = ?")
+            .bind(session_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        if owner.as_deref() == Some(user_id) {
+            return Ok(Some("owner".to_string()));
+        }
+
+        let role = sqlx::query_scalar::<_, String>(
+            "SELECT COALESCE(role, 'user') FROM session_shares WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(role)
+    }
+
+    pub async fn get_session_share_role(
+        &self,
+        session_id: &str,
+        user_id: &str,
+    ) -> Result<Option<String>> {
+        let role = sqlx::query_scalar::<_, String>(
+            "SELECT COALESCE(role, 'user') FROM session_shares WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(role)
+    }
+
+    pub async fn update_session_share_role(
+        &self,
+        session_id: &str,
+        user_id: &str,
+        role: &str,
+    ) -> Result<bool> {
+        let result =
+            sqlx::query("UPDATE session_shares SET role = ? WHERE session_id = ? AND user_id = ?")
+                .bind(role)
+                .bind(session_id)
+                .bind(user_id)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn check_session_access(&self, session_id: &str, user_id: &str) -> Result<bool> {
@@ -563,10 +641,10 @@ impl Database {
     pub async fn get_session_shares_with_emails(
         &self,
         session_id: &str,
-    ) -> Result<Vec<(String, String, Option<String>)>> {
+    ) -> Result<Vec<(String, String, Option<String>, String)>> {
         let rows = sqlx::query(
             r#"
-            SELECT u.id, u.email, ss.created_at
+            SELECT u.id, u.email, ss.created_at, COALESCE(ss.role, 'user') as role
             FROM session_shares ss
             INNER JOIN users u ON ss.user_id = u.id
             WHERE ss.session_id = ?
@@ -581,7 +659,12 @@ impl Database {
             .iter()
             .map(|r| {
                 use sqlx::Row;
-                (r.get("id"), r.get("email"), r.get("created_at"))
+                (
+                    r.get("id"),
+                    r.get("email"),
+                    r.get("created_at"),
+                    r.get("role"),
+                )
             })
             .collect())
     }

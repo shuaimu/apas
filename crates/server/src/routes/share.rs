@@ -13,6 +13,48 @@ use crate::{db::InvitationCode, error::AppError, routes::auth::verify_token, sta
 
 const WEB_UI_URL: &str = "http://apas.mpaxos.com";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectRole {
+    Owner,
+    Admin,
+    User,
+}
+
+impl ProjectRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            ProjectRole::Owner => "owner",
+            ProjectRole::Admin => "admin",
+            ProjectRole::User => "user",
+        }
+    }
+
+    fn can_manage_access(self) -> bool {
+        matches!(self, ProjectRole::Owner | ProjectRole::Admin)
+    }
+}
+
+fn parse_share_role(raw: &str) -> ProjectRole {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "owner" => ProjectRole::Owner,
+        "admin" => ProjectRole::Admin,
+        _ => ProjectRole::User,
+    }
+}
+
+fn parse_assignable_share_role(raw: &str) -> Result<ProjectRole, AppError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "admin" => Ok(ProjectRole::Admin),
+        "user" => Ok(ProjectRole::User),
+        "owner" => Err(AppError::BadRequest(
+            "Role 'owner' is reserved for the project owner".to_string(),
+        )),
+        _ => Err(AppError::BadRequest(
+            "Invalid role. Expected 'admin' or 'user'".to_string(),
+        )),
+    }
+}
+
 // Helper to extract and verify JWT from Authorization header
 async fn extract_user_id(state: &AppState, auth_header: Option<&str>) -> Result<String, AppError> {
     let token = auth_header
@@ -23,6 +65,19 @@ async fn extract_user_id(state: &AppState, auth_header: Option<&str>) -> Result<
 
     let claims = verify_token(token, &state.config.auth.jwt_secret)?;
     Ok(claims.sub)
+}
+
+async fn get_project_role_for_user(
+    state: &AppState,
+    session_id: &str,
+    user_id: &str,
+) -> Result<ProjectRole, AppError> {
+    let role = state
+        .db
+        .get_session_role_for_user(session_id, user_id)
+        .await?;
+    role.map(|raw| parse_share_role(&raw))
+        .ok_or_else(|| AppError::AuthError("You do not have access to this session".to_string()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,16 +104,10 @@ pub async fn generate_code(
         .and_then(|v| v.to_str().ok());
     let user_id = extract_user_id(&state, auth_header).await?;
 
-    // Verify user owns the session
-    let owner = state
-        .db
-        .get_session_owner(&req.session_id)
-        .await?
-        .ok_or_else(|| AppError::BadRequest("Session not found".to_string()))?;
-
-    if owner != user_id {
+    let actor_role = get_project_role_for_user(&state, &req.session_id, &user_id).await?;
+    if !actor_role.can_manage_access() {
         return Err(AppError::AuthError(
-            "You can only share sessions you own".to_string(),
+            "You do not have permission to share this session".to_string(),
         ));
     }
 
@@ -165,7 +214,12 @@ pub async fn redeem_code(
     // Create the share entry
     state
         .db
-        .create_session_share(&invitation.session_id, &user_id, &invitation.created_by)
+        .create_session_share_with_role(
+            &invitation.session_id,
+            &user_id,
+            &invitation.created_by,
+            "user",
+        )
         .await?;
 
     // Delete the used invitation code (no longer needed)
@@ -190,6 +244,7 @@ pub struct ShareInfo {
     pub user_id: String,
     pub user_email: String,
     pub is_owner: bool,
+    pub role: String,
     pub created_at: Option<String>,
 }
 
@@ -197,9 +252,11 @@ pub struct ShareInfo {
 pub struct ShareListResponse {
     pub owner: Option<ShareInfo>,
     pub shares: Vec<ShareInfo>,
+    pub viewer_role: String,
+    pub can_manage: bool,
 }
 
-/// List users who have access to a session (owner only)
+/// List users who have access to a session (owner/admin)
 /// GET /share/list/:session_id
 pub async fn list_shares(
     State(state): State<AppState>,
@@ -211,16 +268,10 @@ pub async fn list_shares(
         .and_then(|v| v.to_str().ok());
     let user_id = extract_user_id(&state, auth_header).await?;
 
-    // Verify user owns the session
-    let owner_id = state
-        .db
-        .get_session_owner(&session_id)
-        .await?
-        .ok_or_else(|| AppError::BadRequest("Session not found".to_string()))?;
-
-    if owner_id != user_id {
+    let actor_role = get_project_role_for_user(&state, &session_id, &user_id).await?;
+    if !actor_role.can_manage_access() {
         return Err(AppError::AuthError(
-            "Only the session owner can view shares".to_string(),
+            "You do not have permission to view shares".to_string(),
         ));
     }
 
@@ -233,6 +284,7 @@ pub async fn list_shares(
             user_id: id,
             user_email: email,
             is_owner: true,
+            role: "owner".to_string(),
             created_at: None,
         });
 
@@ -241,10 +293,11 @@ pub async fn list_shares(
 
     let shares: Vec<ShareInfo> = share_rows
         .into_iter()
-        .map(|(id, email, created_at)| ShareInfo {
+        .map(|(id, email, created_at, role)| ShareInfo {
             user_id: id,
             user_email: email,
             is_owner: false,
+            role,
             created_at,
         })
         .collect();
@@ -252,10 +305,12 @@ pub async fn list_shares(
     Ok(Json(ShareListResponse {
         owner: owner_info,
         shares,
+        viewer_role: actor_role.as_str().to_string(),
+        can_manage: actor_role.can_manage_access(),
     }))
 }
 
-/// Revoke a user's access to a session (owner only)
+/// Revoke a user's access to a session (owner/admin)
 /// DELETE /share/:session_id/:user_id
 pub async fn revoke_access(
     State(state): State<AppState>,
@@ -267,16 +322,38 @@ pub async fn revoke_access(
         .and_then(|v| v.to_str().ok());
     let user_id = extract_user_id(&state, auth_header).await?;
 
-    // Verify user owns the session
+    let actor_role = get_project_role_for_user(&state, &session_id, &user_id).await?;
+    if !actor_role.can_manage_access() {
+        return Err(AppError::AuthError(
+            "You do not have permission to revoke access".to_string(),
+        ));
+    }
+
     let owner = state
         .db
         .get_session_owner(&session_id)
         .await?
         .ok_or_else(|| AppError::BadRequest("Session not found".to_string()))?;
+    if owner == target_user_id {
+        return Err(AppError::BadRequest(
+            "Cannot revoke access for the project owner".to_string(),
+        ));
+    }
 
-    if owner != user_id {
+    let target_role = state
+        .db
+        .get_session_share_role(&session_id, &target_user_id)
+        .await?;
+    let Some(target_role_raw) = target_role else {
+        return Ok(Json(serde_json::json!({
+            "success": false,
+            "message": "Share not found"
+        })));
+    };
+    let target_role = parse_share_role(&target_role_raw);
+    if actor_role == ProjectRole::Admin && target_role == ProjectRole::Admin {
         return Err(AppError::AuthError(
-            "Only the session owner can revoke access".to_string(),
+            "Admins cannot remove other admins".to_string(),
         ));
     }
 
@@ -300,4 +377,77 @@ pub async fn revoke_access(
             "message": "Share not found"
         })))
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateShareRoleRequest {
+    pub role: String,
+}
+
+/// Update a user's access role for a session (owner/admin)
+/// PATCH /share/:session_id/:user_id/role
+pub async fn update_share_role(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path((session_id, target_user_id)): Path<(String, String)>,
+    Json(req): Json<UpdateShareRoleRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let auth_header = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    let user_id = extract_user_id(&state, auth_header).await?;
+
+    let actor_role = get_project_role_for_user(&state, &session_id, &user_id).await?;
+    if !actor_role.can_manage_access() {
+        return Err(AppError::AuthError(
+            "You do not have permission to update roles".to_string(),
+        ));
+    }
+
+    let desired_role = parse_assignable_share_role(&req.role)?;
+    let owner = state
+        .db
+        .get_session_owner(&session_id)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("Session not found".to_string()))?;
+    if owner == target_user_id {
+        return Err(AppError::BadRequest(
+            "Cannot change role for the project owner".to_string(),
+        ));
+    }
+
+    let target_role = state
+        .db
+        .get_session_share_role(&session_id, &target_user_id)
+        .await?;
+    let Some(target_role_raw) = target_role else {
+        return Ok(Json(serde_json::json!({
+            "success": false,
+            "message": "Share not found"
+        })));
+    };
+    let target_role = parse_share_role(&target_role_raw);
+
+    if actor_role == ProjectRole::Admin {
+        if target_role == ProjectRole::Admin {
+            return Err(AppError::AuthError(
+                "Admins cannot modify other admins".to_string(),
+            ));
+        }
+        if desired_role == ProjectRole::Admin {
+            return Err(AppError::AuthError(
+                "Admins cannot assign admin role".to_string(),
+            ));
+        }
+    }
+
+    let _ = state
+        .db
+        .update_session_share_role(&session_id, &target_user_id, desired_role.as_str())
+        .await?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "role": desired_role.as_str(),
+    })))
 }

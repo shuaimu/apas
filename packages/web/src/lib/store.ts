@@ -38,6 +38,7 @@ export interface SessionInfo {
   createdAt?: string;
   isShared?: boolean;
   ownerEmail?: string;
+  shareRole?: "owner" | "admin" | "user";
   isActive?: boolean;
 }
 
@@ -1210,6 +1211,7 @@ function handleServerMessage(
         createdAt: s.created_at as string | undefined,
         isShared: s.is_shared as boolean | undefined,
         ownerEmail: s.owner_email as string | undefined,
+        shareRole: s.share_role as "owner" | "admin" | "user" | undefined,
         isActive: s.is_active as boolean | undefined,
       }));
 
