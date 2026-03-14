@@ -13,12 +13,10 @@ interface AssistantMessageProps {
   message: Message;
 }
 
-interface CommandExecutionEventPreview {
+interface FoldableItemEventPreview {
   eventType: string;
-  command: string | null;
-  status: string | null;
-  exitCode: number | null;
-  aggregatedOutput: string | null;
+  title: string;
+  meta: string | null;
   formattedPayload: string;
 }
 
@@ -36,7 +34,7 @@ function formatTimestamp(date: Date): string {
 
 const FOLDABLE_EVENT_TYPES = ["item.completed", "item.started"];
 
-function parseCommandExecutionEventPreview(content: string): CommandExecutionEventPreview | null {
+function parseFoldableItemEventPreview(content: string): FoldableItemEventPreview | null {
   const trimmed = content.trim();
   if (!trimmed.startsWith("{") || !FOLDABLE_EVENT_TYPES.some(t => trimmed.includes(t))) {
     return null;
@@ -46,29 +44,72 @@ function parseCommandExecutionEventPreview(content: string): CommandExecutionEve
     const parsed = JSON.parse(trimmed) as {
       type?: string;
       item?: {
-        type?: string;
+        id?: unknown;
+        type?: unknown;
         command?: unknown;
         status?: unknown;
         exit_code?: unknown;
         aggregated_output?: unknown;
+        items?: Array<{ text?: unknown; completed?: unknown }>;
       };
     };
 
-    if (!parsed.type || !FOLDABLE_EVENT_TYPES.includes(parsed.type) || parsed.item?.type !== "command_execution") {
+    if (
+      !parsed.type ||
+      !FOLDABLE_EVENT_TYPES.includes(parsed.type) ||
+      !parsed.item ||
+      typeof parsed.item !== "object"
+    ) {
       return null;
     }
 
-    const command = typeof parsed.item.command === "string" ? parsed.item.command : null;
-    const status = typeof parsed.item.status === "string" ? parsed.item.status : null;
-    const exitCode = typeof parsed.item.exit_code === "number" ? parsed.item.exit_code : null;
-    const aggregatedOutput = typeof parsed.item.aggregated_output === "string" ? parsed.item.aggregated_output : null;
+    const itemType = typeof parsed.item.type === "string" ? parsed.item.type : "unknown";
 
+    if (itemType === "command_execution") {
+      const command = typeof parsed.item.command === "string" ? parsed.item.command : null;
+      const status = typeof parsed.item.status === "string" ? parsed.item.status : null;
+      const exitCode = typeof parsed.item.exit_code === "number" ? parsed.item.exit_code : null;
+      const aggregatedOutput = typeof parsed.item.aggregated_output === "string" ? parsed.item.aggregated_output : null;
+      const outputLineCount = aggregatedOutput ? aggregatedOutput.split("\n").length : null;
+      const metaParts = [
+        status ? `status: ${status}` : null,
+        exitCode !== null ? `exit: ${exitCode}` : null,
+        outputLineCount !== null ? `${outputLineCount} output lines` : null,
+      ].filter(Boolean);
+
+      return {
+        eventType: parsed.type,
+        title: command ? truncateValue(command) : "command_execution",
+        meta: metaParts.length > 0 ? metaParts.join(" • ") : null,
+        formattedPayload: JSON.stringify(parsed, null, 2),
+      };
+    }
+
+    if (itemType === "todo_list") {
+      const items = Array.isArray(parsed.item.items) ? parsed.item.items : [];
+      const completed = items.filter((item) => item?.completed === true).length;
+      const firstText = items.find(
+        (item): item is { text: string; completed?: unknown } =>
+          typeof item?.text === "string" && item.text.trim().length > 0,
+      )?.text;
+      const metaParts = [`${completed}/${items.length} completed`];
+      if (firstText) {
+        metaParts.push(`next: ${truncateValue(firstText.replace(/\s+/g, " "), 90)}`);
+      }
+
+      return {
+        eventType: parsed.type,
+        title: "todo_list",
+        meta: metaParts.join(" • "),
+        formattedPayload: JSON.stringify(parsed, null, 2),
+      };
+    }
+
+    const itemId = typeof parsed.item.id === "string" ? parsed.item.id : null;
     return {
       eventType: parsed.type,
-      command,
-      status,
-      exitCode,
-      aggregatedOutput,
+      title: itemType,
+      meta: itemId ? `id: ${itemId}` : null,
       formattedPayload: JSON.stringify(parsed, null, 2),
     };
   } catch {
@@ -85,12 +126,18 @@ function parseCommandExecutionEventPreview(content: string): CommandExecutionEve
     const exitCodeMatch = trimmed.match(/"exit_code":(-?\d+)/);
     const aggregatedOutputMatch = trimmed.match(/"aggregated_output":"([\s\S]*?)","exit_code":/);
 
+    const aggregatedOutput = aggregatedOutputMatch ? aggregatedOutputMatch[1].replace(/\\n/g, "\n") : null;
+    const outputLineCount = aggregatedOutput ? aggregatedOutput.split("\n").length : null;
+    const metaParts = [
+      statusMatch ? `status: ${statusMatch[1]}` : null,
+      exitCodeMatch ? `exit: ${Number(exitCodeMatch[1])}` : null,
+      outputLineCount !== null ? `${outputLineCount} output lines` : null,
+    ].filter(Boolean);
+
     return {
       eventType: eventTypeMatch[1],
-      command: commandMatch ? commandMatch[1] : null,
-      status: statusMatch ? statusMatch[1] : null,
-      exitCode: exitCodeMatch ? Number(exitCodeMatch[1]) : null,
-      aggregatedOutput: aggregatedOutputMatch ? aggregatedOutputMatch[1].replace(/\\n/g, "\n") : null,
+      title: commandMatch ? truncateValue(commandMatch[1]) : "command_execution",
+      meta: metaParts.length > 0 ? metaParts.join(" • ") : null,
       formattedPayload: trimmed,
     };
   }
@@ -199,34 +246,22 @@ function parseRawStreamMessage(content: string): { msgType: string; summary: str
 }
 
 function TextContent({ content }: { content: string }) {
-  const commandExecutionEvent = parseCommandExecutionEventPreview(content);
+  const foldableItemEvent = parseFoldableItemEventPreview(content);
 
-  if (commandExecutionEvent) {
-    const commandLabel = commandExecutionEvent.command
-      ? truncateValue(commandExecutionEvent.command)
-      : "command_execution";
-    const outputLineCount = commandExecutionEvent.aggregatedOutput
-      ? commandExecutionEvent.aggregatedOutput.split("\n").length
-      : null;
-    const metaParts = [
-      commandExecutionEvent.status ? `status: ${commandExecutionEvent.status}` : null,
-      commandExecutionEvent.exitCode !== null ? `exit: ${commandExecutionEvent.exitCode}` : null,
-      outputLineCount !== null ? `${outputLineCount} output lines` : null,
-    ].filter(Boolean);
-
+  if (foldableItemEvent) {
     return (
       <div className="bg-gray-100 dark:bg-gray-800 rounded-2xl rounded-tl-sm px-3 sm:px-4 py-2 max-w-full">
         <details>
           <summary className="cursor-pointer select-none text-sm font-medium text-gray-700 dark:text-gray-200">
             <span className="mr-2 rounded bg-gray-200 dark:bg-gray-700 px-2 py-0.5 text-xs font-semibold text-gray-600 dark:text-gray-300">
-              {commandExecutionEvent.eventType}
+              {foldableItemEvent.eventType}
             </span>
-            <span className="break-all">{commandLabel}</span>
+            <span className="break-all">{foldableItemEvent.title}</span>
           </summary>
-          {metaParts.length > 0 ? (
-            <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">{metaParts.join(" • ")}</div>
+          {foldableItemEvent.meta ? (
+            <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">{foldableItemEvent.meta}</div>
           ) : null}
-          <CodeBlock code={commandExecutionEvent.formattedPayload} language="json" />
+          <CodeBlock code={foldableItemEvent.formattedPayload} language="json" />
         </details>
       </div>
     );
