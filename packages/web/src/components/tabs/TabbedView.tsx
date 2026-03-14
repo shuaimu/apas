@@ -51,6 +51,17 @@ function setProjectLayout(cliClientId: string | null, key: string, value: string
   localStorage.setItem(getProjectLayoutKey(cliClientId, key), value);
 }
 
+function normalizeComparablePath(path: string | undefined): string | null {
+  if (!path) return null;
+  const trimmed = path.trim();
+  if (!trimmed) return null;
+  let normalized = trimmed;
+  while (normalized.length > 1 && normalized.endsWith("/")) {
+    normalized = normalized.slice(0, -1);
+  }
+  return normalized;
+}
+
 // Synthesize PaneConfig entries from observed pane_id keys when no PaneList was received
 function synthesizeConfigs(
   paneMessages: Record<string, Message[]>,
@@ -114,6 +125,8 @@ export function TabbedView() {
   const hasMoreMessages = useStore((s) => s.hasMoreMessages);
   const isLoadingMore = useStore((s) => s.isLoadingMore);
   const cliClientId = useStore((s) => s.cliClientId);
+  const sessions = useStore((s) => s.sessions);
+  const machines = useStore((s) => s.machines);
 
   const sendMessageToPane = useStore((s) => s.sendMessageToPane);
   const loadMoreMessages = useStore((s) => s.loadMoreMessages);
@@ -121,6 +134,7 @@ export function TabbedView() {
   const removePane = useStore((s) => s.removePane);
   const startBot = useStore((s) => s.startBot);
   const stopBot = useStore((s) => s.stopBot);
+  const startMachineProjectCli = useStore((s) => s.startMachineProjectCli);
   const rebootCli = useStore((s) => s.rebootCli);
   const downloadSession = useStore((s) => s.downloadSession);
 
@@ -278,6 +292,50 @@ export function TabbedView() {
     return activeProvider === "codex" ? "Codex Usage" : "Claude Usage";
   }, [activeProvider]);
 
+  const bootTarget = useMemo(() => {
+    if (!sessionId) return null;
+    const session = sessions.find((item) => item.id === sessionId);
+    const sessionPath = normalizeComparablePath(session?.workingDir);
+    if (!sessionPath) return null;
+    const sessionHostname = session?.hostname?.trim().toLowerCase() || null;
+
+    type MachineProjectTarget = { machineId: string; projectId: string; isRunning: boolean };
+    const hostMatches: MachineProjectTarget[] = [];
+    const allMatches: MachineProjectTarget[] = [];
+
+    for (const machineWithProjects of machines) {
+      const machineHostname = machineWithProjects.machine.hostname.trim().toLowerCase();
+      for (const project of machineWithProjects.projects) {
+        const projectPath = normalizeComparablePath(project.path);
+        if (projectPath !== sessionPath) continue;
+        const target = {
+          machineId: machineWithProjects.machine.machineId,
+          projectId: project.projectId,
+          isRunning: project.isRunning,
+        };
+        allMatches.push(target);
+        if (sessionHostname && machineHostname === sessionHostname) {
+          hostMatches.push(target);
+        }
+      }
+    }
+
+    if (sessionHostname) {
+      if (hostMatches.length === 1) return hostMatches[0];
+      if (hostMatches.length > 1) return null;
+    }
+
+    if (allMatches.length === 1) return allMatches[0];
+    return null;
+  }, [machines, sessionId, sessions]);
+
+  const canBootCurrentProject = !isAttached && bootTarget != null && !bootTarget.isRunning;
+
+  const handleBootCli = useCallback(() => {
+    if (!bootTarget) return;
+    startMachineProjectCli(bootTarget.machineId, bootTarget.projectId);
+  }, [bootTarget, startMachineProjectCli]);
+
   const handleLoadMore = useCallback(() => {
     if (activeTabId == null) return;
     if (activeTabId === PANE_ID_MAIN) {
@@ -356,7 +414,9 @@ export function TabbedView() {
         onSelectTab={handleSelectTab}
         onCloseTab={handleCloseTab}
         onAddTab={handleAddTab}
+        onBootCli={handleBootCli}
         onRebootCli={rebootCli}
+        showBootButton={canBootCurrentProject}
         showRebootButton={isAttached}
         paneStatuses={paneStatuses}
         pausedPanes={pausedPanes}

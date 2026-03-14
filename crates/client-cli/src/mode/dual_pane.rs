@@ -936,7 +936,8 @@ fn handle_tui_events(
                     if let Some(meta) = metas.get(&pane_id) {
                         if meta.mode == shared::PaneMode::Deadloop {
                             // Signal old deadloop thread to exit
-                            if let Some(old_flag) = pane_stop_requests.lock().unwrap().get(&pane_id) {
+                            if let Some(old_flag) = pane_stop_requests.lock().unwrap().get(&pane_id)
+                            {
                                 old_flag.store(true, Ordering::SeqCst);
                             }
                         }
@@ -1540,9 +1541,9 @@ fn parse_agent_output(
 #[cfg(test)]
 mod tests {
     use super::{active_usage_providers, build_agent_args, PaneMeta, PaneMetas};
+    use shared::Provider;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
-    use shared::Provider;
     use uuid::Uuid;
 
     const FULL_PROMPT: &str =
@@ -2032,9 +2033,7 @@ fn run_deadloop_session_inner(
                     pane_id: Some(pane_id),
                 });
                 for _ in 0..5 {
-                    if shutdown.load(Ordering::SeqCst)
-                        || stop_requested.load(Ordering::SeqCst)
-                    {
+                    if shutdown.load(Ordering::SeqCst) || stop_requested.load(Ordering::SeqCst) {
                         break;
                     }
                     thread::sleep(Duration::from_secs(1));
@@ -2420,6 +2419,7 @@ async fn run_server_connection(
     use tokio_tungstenite::{connect_async, tungstenite::Message};
 
     const USAGE_FETCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+    const USAGE_CACHE_MAX_AGE_MINUTES: i64 = 45;
 
     let mut reconnect_delay = std::time::Duration::from_secs(1);
     let max_reconnect_delay = std::time::Duration::from_secs(60);
@@ -2812,34 +2812,33 @@ async fn run_server_connection(
                         }
                         _ = usage_interval.tick() => {
                             let (has_claude, has_codex) = active_usage_providers(&pane_metas);
+                            let max_age = chrono::Duration::minutes(USAGE_CACHE_MAX_AGE_MINUTES);
 
                             if has_claude {
-                                match crate::usage::fetch_claude_usage_limits().await {
-                                    Ok(limits) => {
-                                        let usage_msg = CliToServer::UsageLimits { provider: Provider::Claude, limits };
-                                        let msg_text = serde_json::to_string(&usage_msg).unwrap_or_default();
-                                        if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
-                                            tracing::warn!("Failed to send Claude usage limits to server");
-                                        }
+                                if let Some(limits) =
+                                    crate::usage::read_cached_claude_usage_limits(Some(max_age))
+                                {
+                                    let usage_msg = CliToServer::UsageLimits { provider: Provider::Claude, limits };
+                                    let msg_text = serde_json::to_string(&usage_msg).unwrap_or_default();
+                                    if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
+                                        tracing::warn!("Failed to send Claude usage limits to server");
                                     }
-                                    Err(e) => {
-                                        tracing::warn!("Failed to fetch Claude usage limits: {}", e);
-                                    }
+                                } else {
+                                    tracing::debug!("No fresh cached Claude usage limits available");
                                 }
                             }
 
                             if has_codex {
-                                match crate::usage::fetch_codex_usage_limits().await {
-                                    Ok(limits) => {
-                                        let usage_msg = CliToServer::UsageLimits { provider: Provider::Codex, limits };
-                                        let msg_text = serde_json::to_string(&usage_msg).unwrap_or_default();
-                                        if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
-                                            tracing::warn!("Failed to send Codex usage limits to server");
-                                        }
+                                if let Some(limits) =
+                                    crate::usage::read_cached_codex_usage_limits(Some(max_age))
+                                {
+                                    let usage_msg = CliToServer::UsageLimits { provider: Provider::Codex, limits };
+                                    let msg_text = serde_json::to_string(&usage_msg).unwrap_or_default();
+                                    if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
+                                        tracing::warn!("Failed to send Codex usage limits to server");
                                     }
-                                    Err(e) => {
-                                        tracing::debug!("Failed to fetch Codex usage limits: {}", e);
-                                    }
+                                } else {
+                                    tracing::debug!("No fresh cached Codex usage limits available");
                                 }
                             }
                         }

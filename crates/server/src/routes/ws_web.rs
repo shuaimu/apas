@@ -9,6 +9,7 @@ use futures::{SinkExt, StreamExt};
 use shared::{
     MessageInfo, ServerToCli, ServerToDaemon, ServerToWeb, SessionInfo, SessionStatus, WebToServer,
 };
+use std::collections::HashSet;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -103,6 +104,89 @@ fn infer_panes_from_messages(
         .collect()
 }
 
+fn normalize_machine_hostname(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
+}
+
+fn normalize_project_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed == "/" {
+        return "/".to_string();
+    }
+    trimmed.trim_end_matches('/').to_string()
+}
+
+async fn get_shared_project_access_refs(
+    state: &AppState,
+    user_id: &Uuid,
+) -> (HashSet<(String, String)>, HashSet<String>) {
+    let mut host_path_refs = HashSet::new();
+    let mut wildcard_paths = HashSet::new();
+
+    let shared_sessions = match state
+        .db
+        .get_shared_sessions_for_user(&user_id.to_string())
+        .await
+    {
+        Ok(sessions) => sessions,
+        Err(err) => {
+            tracing::warn!(
+                "Failed to load shared sessions for machine access (user {}): {}",
+                user_id,
+                err
+            );
+            Vec::new()
+        }
+    };
+
+    for (session, _) in shared_sessions {
+        let Some(path_raw) = session.working_dir else {
+            continue;
+        };
+        let path_key = normalize_project_path(&path_raw);
+        if path_key.is_empty() {
+            continue;
+        }
+
+        if let Some(host_raw) = session.hostname {
+            let host_key = normalize_machine_hostname(&host_raw);
+            if host_key.is_empty() {
+                wildcard_paths.insert(path_key);
+            } else {
+                host_path_refs.insert((host_key, path_key));
+            }
+        } else {
+            wildcard_paths.insert(path_key);
+        }
+    }
+
+    (host_path_refs, wildcard_paths)
+}
+
+async fn list_accessible_machines_for_user(
+    state: &AppState,
+    user_id: &Uuid,
+) -> Vec<shared::MachineWithProjects> {
+    let mut machines = state.sessions.get_machines_for_user(user_id);
+    let (host_path_refs, wildcard_paths) = get_shared_project_access_refs(state, user_id).await;
+    if host_path_refs.is_empty() && wildcard_paths.is_empty() {
+        return machines;
+    }
+
+    let owner_machine_ids: HashSet<Uuid> = machines.iter().map(|m| m.machine.machine_id).collect();
+    for machine in state
+        .sessions
+        .get_machines_for_project_refs(&host_path_refs, &wildcard_paths)
+    {
+        if owner_machine_ids.contains(&machine.machine.machine_id) {
+            continue;
+        }
+        machines.push(machine);
+    }
+
+    machines
+}
+
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
     let connection_id = Uuid::new_v4();
@@ -189,7 +273,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     }
 
                                     // Send daemon-reported machines for this user.
-                                    let machines = state.sessions.get_machines_for_user(&uid);
+                                    let machines =
+                                        list_accessible_machines_for_user(&state, &uid).await;
                                     state
                                         .sessions
                                         .send_to_web(
@@ -262,7 +347,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         continue;
                     };
 
-                    let machines = state.sessions.get_machines_for_user(&uid);
+                    let machines = list_accessible_machines_for_user(&state, &uid).await;
                     state
                         .sessions
                         .send_to_web(&connection_id, ServerToWeb::Machines { machines })
@@ -515,7 +600,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         .sessions
                         .get_machines_for_user(&uid)
                         .into_iter()
-                        .any(|m| m.machine.machine_id == machine_id);
+                        .any(|m| {
+                            m.machine.machine_id == machine_id
+                                && m.projects.iter().any(|p| p.project_id == project_id)
+                        })
+                        || {
+                            let (host_path_refs, wildcard_paths) =
+                                get_shared_project_access_refs(&state, &uid).await;
+                            state.sessions.machine_project_matches_refs(
+                                &machine_id,
+                                &project_id,
+                                &host_path_refs,
+                                &wildcard_paths,
+                            )
+                        };
 
                     if !allowed {
                         state
@@ -567,7 +665,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         .sessions
                         .get_machines_for_user(&uid)
                         .into_iter()
-                        .any(|m| m.machine.machine_id == machine_id);
+                        .any(|m| {
+                            m.machine.machine_id == machine_id
+                                && m.projects.iter().any(|p| p.project_id == project_id)
+                        })
+                        || {
+                            let (host_path_refs, wildcard_paths) =
+                                get_shared_project_access_refs(&state, &uid).await;
+                            state.sessions.machine_project_matches_refs(
+                                &machine_id,
+                                &project_id,
+                                &host_path_refs,
+                                &wildcard_paths,
+                            )
+                        };
 
                     if !allowed {
                         state

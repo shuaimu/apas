@@ -93,6 +93,41 @@ fn get_cached_usage_limits(provider: UsageProvider) -> Option<UsageLimits> {
     }
 }
 
+fn parse_fetched_at(limits: &UsageLimits) -> Option<DateTime<Utc>> {
+    let raw = limits.fetched_at.as_ref()?;
+    DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn is_cache_fresh(limits: &UsageLimits, max_age: Duration) -> bool {
+    let fetched_at = match parse_fetched_at(limits) {
+        Some(ts) => ts,
+        None => return false,
+    };
+    let age = Utc::now().signed_duration_since(fetched_at);
+    age <= max_age
+}
+
+fn get_cached_usage_limits_with_max_age(
+    provider: UsageProvider,
+    max_age: Option<Duration>,
+) -> Option<UsageLimits> {
+    let cached = get_cached_usage_limits(provider)?;
+    match max_age {
+        Some(max_age) if !is_cache_fresh(&cached, max_age) => None,
+        _ => Some(cached),
+    }
+}
+
+pub fn read_cached_claude_usage_limits(max_age: Option<Duration>) -> Option<UsageLimits> {
+    get_cached_usage_limits_with_max_age(UsageProvider::Claude, max_age)
+}
+
+pub fn read_cached_codex_usage_limits(max_age: Option<Duration>) -> Option<UsageLimits> {
+    get_cached_usage_limits_with_max_age(UsageProvider::Codex, max_age)
+}
+
 /// OAuth credentials from Claude's credentials file
 #[derive(Debug, Deserialize)]
 struct ClaudeCredentials {
@@ -156,15 +191,17 @@ fn read_oauth_token() -> Result<String> {
 }
 
 /// Fetch usage limits from the Anthropic API
+pub async fn refresh_claude_usage_limits() -> Result<UsageLimits> {
+    let limits = fetch_claude_usage_limits_remote().await?;
+    if let Err(e) = cache_usage_limits(UsageProvider::Claude, &limits) {
+        tracing::debug!("Failed to cache Claude usage limits: {}", e);
+    }
+    Ok(limits)
+}
+
 pub async fn fetch_claude_usage_limits() -> Result<UsageLimits> {
-    let fetch_result = fetch_claude_usage_limits_remote().await;
-    match fetch_result {
-        Ok(limits) => {
-            if let Err(e) = cache_usage_limits(UsageProvider::Claude, &limits) {
-                tracing::debug!("Failed to cache Claude usage limits: {}", e);
-            }
-            Ok(limits)
-        }
+    match refresh_claude_usage_limits().await {
+        Ok(limits) => Ok(limits),
         Err(fetch_error) => {
             if let Some(cached) = get_cached_usage_limits(UsageProvider::Claude) {
                 tracing::warn!(
@@ -337,15 +374,17 @@ fn map_codex_window(window: CodexRateLimitWindow, now: &DateTime<Utc>) -> UsageL
 }
 
 /// Fetch usage limits from Codex API endpoint
+pub async fn refresh_codex_usage_limits() -> Result<UsageLimits> {
+    let limits = fetch_codex_usage_limits_remote().await?;
+    if let Err(e) = cache_usage_limits(UsageProvider::Codex, &limits) {
+        tracing::debug!("Failed to cache Codex usage limits: {}", e);
+    }
+    Ok(limits)
+}
+
 pub async fn fetch_codex_usage_limits() -> Result<UsageLimits> {
-    let fetch_result = fetch_codex_usage_limits_remote().await;
-    match fetch_result {
-        Ok(limits) => {
-            if let Err(e) = cache_usage_limits(UsageProvider::Codex, &limits) {
-                tracing::debug!("Failed to cache Codex usage limits: {}", e);
-            }
-            Ok(limits)
-        }
+    match refresh_codex_usage_limits().await {
+        Ok(limits) => Ok(limits),
         Err(fetch_error) => {
             if let Some(cached) = get_cached_usage_limits(UsageProvider::Codex) {
                 tracing::warn!(
@@ -424,5 +463,30 @@ mod tests {
     fn test_credentials_path() {
         // Just test that the function doesn't panic
         let _ = get_credentials_path();
+    }
+
+    #[test]
+    fn cache_freshness_checks_fetched_at() {
+        let fresh = UsageLimits {
+            five_hour: None,
+            seven_day: None,
+            fetched_at: Some(Utc::now().to_rfc3339()),
+        };
+        assert!(is_cache_fresh(&fresh, Duration::minutes(45)));
+        assert!(!is_cache_fresh(&fresh, Duration::seconds(-1)));
+
+        let stale = UsageLimits {
+            five_hour: None,
+            seven_day: None,
+            fetched_at: Some((Utc::now() - Duration::hours(3)).to_rfc3339()),
+        };
+        assert!(!is_cache_fresh(&stale, Duration::minutes(45)));
+
+        let unknown = UsageLimits {
+            five_hour: None,
+            seven_day: None,
+            fetched_at: None,
+        };
+        assert!(!is_cache_fresh(&unknown, Duration::minutes(45)));
     }
 }

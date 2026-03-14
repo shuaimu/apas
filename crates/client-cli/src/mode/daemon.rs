@@ -15,6 +15,7 @@ use uuid::Uuid;
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const VERSION: &str = env!("APAS_VERSION");
 const TMUX_SESSION_PREFIX: &str = "apas";
 
@@ -495,6 +496,11 @@ async fn run_connection(
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut usage_refresh = tokio::time::interval(USAGE_REFRESH_INTERVAL);
+    usage_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    usage_refresh.tick().await;
+
+    refresh_usage_limits_cache().await;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -502,6 +508,9 @@ async fn run_connection(
         }
 
         tokio::select! {
+            _ = usage_refresh.tick() => {
+                refresh_usage_limits_cache().await;
+            }
             _ = heartbeat.tick() => {
                 state.reap_exited_processes();
                 state.refresh_projects();
@@ -570,5 +579,17 @@ async fn run_connection(
                 }
             }
         }
+    }
+}
+
+async fn refresh_usage_limits_cache() {
+    match crate::usage::refresh_claude_usage_limits().await {
+        Ok(_) => tracing::debug!("Refreshed Claude usage limits cache"),
+        Err(err) => tracing::debug!("Failed to refresh Claude usage limits cache: {}", err),
+    }
+
+    match crate::usage::refresh_codex_usage_limits().await {
+        Ok(_) => tracing::debug!("Refreshed Codex usage limits cache"),
+        Err(err) => tracing::debug!("Failed to refresh Codex usage limits cache: {}", err),
     }
 }

@@ -10,7 +10,9 @@ interface TabBarProps {
   onSelectTab: (paneId: number) => void;
   onCloseTab: (paneId: number) => void;
   onAddTab: (provider?: string) => void;
+  onBootCli?: () => void;
   onRebootCli?: () => void;
+  showBootButton?: boolean;
   showRebootButton?: boolean;
   paneStatuses: Record<string, string | null>;
   pausedPanes: number[];
@@ -29,7 +31,9 @@ export function TabBar({
   onSelectTab,
   onCloseTab,
   onAddTab,
+  onBootCli,
   onRebootCli,
+  showBootButton = false,
   showRebootButton = false,
   paneStatuses,
   pausedPanes,
@@ -120,6 +124,17 @@ export function TabBar({
       {/* Global tab-bar actions */}
       <div className="flex items-center gap-1 pr-1">
         <AddTabButton onAddTab={onAddTab} />
+        {showBootButton && onBootCli && (
+          <button
+            onClick={() => {
+              if (confirm("Boot APAS CLI for this project?")) onBootCli();
+            }}
+            className="px-2.5 h-8 my-1 text-xs font-medium rounded transition-colors bg-blue-500 hover:bg-blue-600 text-white"
+            title="Boot CLI"
+          >
+            Boot
+          </button>
+        )}
         {showRebootButton && onRebootCli && (
           <button
             onClick={() => {

@@ -8,6 +8,18 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+fn normalize_machine_hostname(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
+}
+
+fn normalize_project_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed == "/" {
+        return "/".to_string();
+    }
+    trimmed.trim_end_matches('/').to_string()
+}
+
 /// Manages active sessions and routes messages between web and CLI clients
 pub struct SessionManager {
     /// Map of session ID -> session state
@@ -188,9 +200,9 @@ impl SessionManager {
                     (&session.hostname, &session.working_dir)
                 {
                     active_dirs_by_host
-                        .entry(hostname.clone())
+                        .entry(normalize_machine_hostname(hostname))
                         .or_default()
-                        .insert(working_dir.clone());
+                        .insert(normalize_project_path(working_dir));
                 }
             }
         }
@@ -216,9 +228,13 @@ impl SessionManager {
                     .unwrap_or_default();
 
                 // Enrich is_running from active CLI sessions on the same host
-                if let Some(active_dirs) = active_dirs_by_host.get(&machine.hostname) {
+                if let Some(active_dirs) =
+                    active_dirs_by_host.get(&normalize_machine_hostname(&machine.hostname))
+                {
                     for project in &mut projects {
-                        if !project.is_running && active_dirs.contains(&project.path) {
+                        if !project.is_running
+                            && active_dirs.contains(&normalize_project_path(&project.path))
+                        {
                             project.is_running = true;
                         }
                     }
@@ -227,6 +243,93 @@ impl SessionManager {
                 Some(MachineWithProjects { machine, projects })
             })
             .collect()
+    }
+
+    pub fn get_machines_for_project_refs(
+        &self,
+        host_path_refs: &HashSet<(String, String)>,
+        wildcard_paths: &HashSet<String>,
+    ) -> Vec<MachineWithProjects> {
+        if host_path_refs.is_empty() && wildcard_paths.is_empty() {
+            return Vec::new();
+        }
+
+        // Collect working dirs of active CLI sessions grouped by hostname.
+        let mut active_dirs_by_host: HashMap<String, HashSet<String>> = HashMap::new();
+        for session_entry in self.sessions.iter() {
+            let session = session_entry.value();
+            if session.cli_client_id.is_some() {
+                if let (Some(hostname), Some(working_dir)) =
+                    (&session.hostname, &session.working_dir)
+                {
+                    active_dirs_by_host
+                        .entry(normalize_machine_hostname(hostname))
+                        .or_default()
+                        .insert(normalize_project_path(working_dir));
+                }
+            }
+        }
+
+        self.machine_infos
+            .iter()
+            .filter_map(|entry| {
+                let machine_id = *entry.key();
+                let machine = entry.value().clone();
+                let host_key = normalize_machine_hostname(&machine.hostname);
+
+                let mut projects = self
+                    .machine_projects
+                    .get(&machine_id)
+                    .map(|p| p.clone())
+                    .unwrap_or_default();
+
+                // Enrich running status from active sessions.
+                if let Some(active_dirs) = active_dirs_by_host.get(&host_key) {
+                    for project in &mut projects {
+                        if !project.is_running
+                            && active_dirs.contains(&normalize_project_path(&project.path))
+                        {
+                            project.is_running = true;
+                        }
+                    }
+                }
+
+                projects.retain(|project| {
+                    let path_key = normalize_project_path(&project.path);
+                    wildcard_paths.contains(&path_key)
+                        || host_path_refs.contains(&(host_key.clone(), path_key))
+                });
+
+                if projects.is_empty() {
+                    None
+                } else {
+                    Some(MachineWithProjects { machine, projects })
+                }
+            })
+            .collect()
+    }
+
+    pub fn machine_project_matches_refs(
+        &self,
+        machine_id: &Uuid,
+        project_id: &str,
+        host_path_refs: &HashSet<(String, String)>,
+        wildcard_paths: &HashSet<String>,
+    ) -> bool {
+        let Some(machine) = self.machine_infos.get(machine_id) else {
+            return false;
+        };
+        let host_key = normalize_machine_hostname(&machine.hostname);
+
+        let Some(projects) = self.machine_projects.get(machine_id) else {
+            return false;
+        };
+        let Some(project) = projects.iter().find(|p| p.project_id == project_id) else {
+            return false;
+        };
+
+        let path_key = normalize_project_path(&project.path);
+        wildcard_paths.contains(&path_key) || host_path_refs.contains(&(host_key, path_key))
     }
 
     fn broadcast_machines_update_for_user(&self, user_id: &Uuid) {
