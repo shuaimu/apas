@@ -500,6 +500,11 @@ async fn run_inner(
         drop(tui_input_tx);
         tracing::info!("Running in headless mode, waiting for server connection...");
         let _ = server_task.await;
+        // Reboot request from web should also restart daemon-spawned headless CLIs.
+        if reboot_requested.load(Ordering::SeqCst) {
+            crate::update::restart_cli();
+            std::process::exit(1);
+        }
         shutdown.store(true, Ordering::SeqCst);
     } else {
         // Run TUI in main thread.
