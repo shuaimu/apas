@@ -9,6 +9,7 @@ import { UsageLimitsDisplay } from "../UsageLimits";
 
 // Sentinel pane_id for the single-pane fallback (no pane system)
 const PANE_ID_MAIN = 0;
+const DEFAULT_BOT_MIN_INTERVAL_MINUTES = 15;
 const DEFAULT_BOT_LOOP_PROMPT = `Work on tasks defined in TODO.md. Do the following steps. Don't ask me for advice, just pick the best option you think that is honest, complete, and not corner-cutting:
 
 1. Do a git pull to check if there are any remote updates. Pick the top high-priority undone task, choose its first leaf task. If there are no undone TODO items left, sleep a minute and exit.
@@ -143,6 +144,7 @@ export function TabbedView() {
   const [startBotModalOpen, setStartBotModalOpen] = useState(false);
   const [startBotPaneId, setStartBotPaneId] = useState<number | null>(null);
   const [botPromptDraft, setBotPromptDraft] = useState("");
+  const [botMinIntervalDraft, setBotMinIntervalDraft] = useState(String(DEFAULT_BOT_MIN_INTERVAL_MINUTES));
   const [addTabError, setAddTabError] = useState<string | null>(null);
 
   // Determine effective tabs: use paneConfigs from server, or synthesize from observed messages
@@ -369,11 +371,15 @@ export function TabbedView() {
     if (activeTabId == null) return;
     setStartBotPaneId(activeTabId);
     const savedPrompt = activeConfig?.prompt;
+    const savedMinInterval = typeof activeConfig?.min_iteration_interval_minutes === "number"
+      ? activeConfig.min_iteration_interval_minutes
+      : DEFAULT_BOT_MIN_INTERVAL_MINUTES;
     setBotPromptDraft(
       savedPrompt && savedPrompt.trim().length > 0 ? savedPrompt : DEFAULT_BOT_LOOP_PROMPT,
     );
+    setBotMinIntervalDraft(String(savedMinInterval));
     setStartBotModalOpen(true);
-  }, [activeConfig?.prompt, activeTabId]);
+  }, [activeConfig?.min_iteration_interval_minutes, activeConfig?.prompt, activeTabId]);
 
   const handleStopBot = useCallback(() => {
     if (activeTabId == null) return;
@@ -388,10 +394,19 @@ export function TabbedView() {
   const handleConfirmStartBot = useCallback(() => {
     if (startBotPaneId == null) return;
     const trimmed = botPromptDraft.trim();
-    startBot(startBotPaneId, trimmed.length > 0 ? botPromptDraft : DEFAULT_BOT_LOOP_PROMPT);
+    const minutesInput = botMinIntervalDraft.trim();
+    const parsedMinutes = minutesInput === "" ? NaN : Number(minutesInput);
+    const minIntervalMinutes = Number.isFinite(parsedMinutes)
+      ? Math.max(0, Math.floor(parsedMinutes))
+      : DEFAULT_BOT_MIN_INTERVAL_MINUTES;
+    startBot(
+      startBotPaneId,
+      trimmed.length > 0 ? botPromptDraft : DEFAULT_BOT_LOOP_PROMPT,
+      minIntervalMinutes,
+    );
     setStartBotModalOpen(false);
     setStartBotPaneId(null);
-  }, [botPromptDraft, startBot, startBotPaneId]);
+  }, [botMinIntervalDraft, botPromptDraft, startBot, startBotPaneId]);
 
   // No session or no tabs - empty state
   if (!sessionId || effectiveTabs.length === 0) {
@@ -535,8 +550,10 @@ export function TabbedView() {
       <StartBotPromptModal
         open={startBotModalOpen}
         prompt={botPromptDraft}
+        minIntervalMinutes={botMinIntervalDraft}
         tabLabel={startBotTargetConfig?.label || (startBotPaneId != null ? `Tab ${startBotPaneId}` : "Tab")}
         onPromptChange={setBotPromptDraft}
+        onMinIntervalChange={setBotMinIntervalDraft}
         onCancel={handleCancelStartBot}
         onConfirm={handleConfirmStartBot}
       />
@@ -547,8 +564,10 @@ export function TabbedView() {
 interface StartBotPromptModalProps {
   open: boolean;
   prompt: string;
+  minIntervalMinutes: string;
   tabLabel: string;
   onPromptChange: (value: string) => void;
+  onMinIntervalChange: (value: string) => void;
   onCancel: () => void;
   onConfirm: () => void;
 }
@@ -556,8 +575,10 @@ interface StartBotPromptModalProps {
 function StartBotPromptModal({
   open,
   prompt,
+  minIntervalMinutes,
   tabLabel,
   onPromptChange,
+  onMinIntervalChange,
   onCancel,
   onConfirm,
 }: StartBotPromptModalProps) {
@@ -580,7 +601,24 @@ function StartBotPromptModal({
             Edit the loop prompt for this tab. This prompt is saved per tab in `.apas`.
           </p>
         </div>
-        <div className="p-4">
+        <div className="p-4 space-y-4">
+          <div>
+            <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">
+              Minimum Interval Between Iterations (minutes)
+            </label>
+            <input
+              type="number"
+              min={0}
+              step={1}
+              value={minIntervalMinutes}
+              onChange={(e) => onMinIntervalChange(e.target.value)}
+              className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              placeholder={String(DEFAULT_BOT_MIN_INTERVAL_MINUTES)}
+            />
+            <p className="text-[11px] mt-1 text-gray-500 dark:text-gray-400">
+              Default is 15. Next iteration starts no sooner than this interval since the previous iteration started.
+            </p>
+          </div>
           <textarea
             value={prompt}
             onChange={(e) => onPromptChange(e.target.value)}

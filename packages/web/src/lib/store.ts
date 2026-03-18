@@ -107,6 +107,7 @@ export interface PaneConfig {
   is_paused: boolean;
   stop_requested?: boolean;
   prompt?: string;
+  min_iteration_interval_minutes?: number;
   label?: string;
   model?: string;
 }
@@ -297,7 +298,7 @@ interface AppState {
   resumePane: (paneId: number) => void;
   addPane: (provider: string, mode: string, label?: string, prompt?: string) => { success: boolean; error?: string };
   removePane: (paneId: number) => void;
-  startBot: (paneId: number, prompt?: string) => void;
+  startBot: (paneId: number, prompt?: string, minIterationIntervalMinutes?: number) => void;
   stopBot: (paneId: number) => void;
   rebootCli: () => void;
   downloadSession: () => void;
@@ -924,13 +925,16 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  startBot: (paneId: number, prompt?: string) => {
+  startBot: (paneId: number, prompt?: string, minIterationIntervalMinutes?: number) => {
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
         type: "start_bot",
         pane_id: paneId,
         ...(prompt ? { prompt } : {}),
+        ...(typeof minIterationIntervalMinutes === "number" && Number.isFinite(minIterationIntervalMinutes)
+          ? { min_iteration_interval_minutes: Math.max(0, Math.floor(minIterationIntervalMinutes)) }
+          : {}),
       }));
     }
   },

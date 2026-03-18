@@ -97,6 +97,7 @@ fn infer_panes_from_messages(
                 is_paused: false,
                 stop_requested: false,
                 prompt: None,
+                min_iteration_interval_minutes: None,
                 label: Some(label),
                 model: None,
             }
@@ -757,6 +758,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             is_paused: false,
                             stop_requested: false,
                             prompt,
+                            min_iteration_interval_minutes: None,
                             label,
                             model,
                         };
@@ -790,7 +792,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::StartBot { pane_id, prompt }) => {
+                Ok(WebToServer::StartBot {
+                    pane_id,
+                    prompt,
+                    min_iteration_interval_minutes,
+                }) => {
                     if let Some(sid) = session_id {
                         tracing::info!("Starting bot on pane {} for session {}", pane_id, sid);
                         state
@@ -801,6 +807,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     session_id: sid,
                                     pane_id,
                                     prompt: prompt.clone(),
+                                    min_iteration_interval_minutes,
                                 },
                             )
                             .await;
@@ -811,6 +818,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         if let Some(pane) = panes.iter_mut().find(|p| p.pane_id == pane_id) {
                             pane.mode = shared::PaneMode::Deadloop;
                             pane.prompt = prompt;
+                            pane.min_iteration_interval_minutes = min_iteration_interval_minutes
+                                .or(pane.min_iteration_interval_minutes);
                             pane.stop_requested = false;
                             state.sessions.set_session_panes(&sid, panes.clone());
                             let _ = state.storage.save_pane_list(&sid, &panes).await;

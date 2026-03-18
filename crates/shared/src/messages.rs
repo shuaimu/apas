@@ -166,6 +166,8 @@ pub enum ServerToCli {
         pane_id: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min_iteration_interval_minutes: Option<u64>,
     },
 
     /// Stop bot on a pane (revert to interactive)
@@ -312,6 +314,8 @@ pub enum WebToServer {
         pane_id: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min_iteration_interval_minutes: Option<u64>,
     },
 
     /// Stop bot on a pane — converts deadloop pane back to interactive
@@ -579,6 +583,8 @@ pub struct PaneConfig {
     pub stop_requested: bool, // Graceful stop pending (deadloop will stop after current iteration)
     #[serde(default)]
     pub prompt: Option<String>, // Custom prompt for deadloop
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_iteration_interval_minutes: Option<u64>, // Min time between deadloop iteration starts
     #[serde(default)]
     pub label: Option<String>, // User-facing label like "Deadloop" or "Interactive"
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -600,6 +606,7 @@ impl PaneConfig {
             is_paused: false,
             stop_requested: false,
             prompt: None,
+            min_iteration_interval_minutes: None,
             label: Some("Interactive".to_string()),
             model: None,
         }]

@@ -65,6 +65,7 @@ pub enum TuiEvent {
         mode: PaneMode,
         provider: shared::Provider,
         prompt: Option<String>,
+        min_iteration_interval_minutes: Option<u64>,
         model: Option<String>,
     },
     CloseTab(u32),
@@ -72,6 +73,7 @@ pub enum TuiEvent {
     StartBot {
         pane_id: u32,
         prompt: Option<String>,
+        min_iteration_interval_minutes: Option<u64>,
     },
     /// Stop bot on a deadloop pane (revert to interactive)
     StopBot {
