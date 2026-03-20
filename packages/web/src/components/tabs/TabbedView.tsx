@@ -142,6 +142,7 @@ export function TabbedView() {
   // Active tab state, persisted per project
   const [activeTabId, setActiveTabId] = useState<number | null>(null);
   const [startBotModalOpen, setStartBotModalOpen] = useState(false);
+  const [viewBotPromptModalOpen, setViewBotPromptModalOpen] = useState(false);
   const [startBotPaneId, setStartBotPaneId] = useState<number | null>(null);
   const [botPromptDraft, setBotPromptDraft] = useState("");
   const [botMinIntervalDraft, setBotMinIntervalDraft] = useState(String(DEFAULT_BOT_MIN_INTERVAL_MINUTES));
@@ -273,6 +274,12 @@ export function TabbedView() {
   const activeIsBot = activeConfig?.mode === "deadloop";
   const activeStopRequested = activeConfig?.stop_requested === true;
   const activeProvider = activeConfig?.provider;
+  const activeBotPrompt = activeConfig?.prompt && activeConfig.prompt.trim().length > 0
+    ? activeConfig.prompt
+    : DEFAULT_BOT_LOOP_PROMPT;
+  const activeBotMinIntervalMinutes = typeof activeConfig?.min_iteration_interval_minutes === "number"
+    ? activeConfig.min_iteration_interval_minutes
+    : DEFAULT_BOT_MIN_INTERVAL_MINUTES;
   const startBotTargetConfig = useMemo(
     () => effectiveTabs.find((t) => t.pane_id === startBotPaneId),
     [effectiveTabs, startBotPaneId],
@@ -391,6 +398,15 @@ export function TabbedView() {
     setStartBotPaneId(null);
   }, []);
 
+  const handleOpenBotPrompt = useCallback(() => {
+    if (!activeIsBot) return;
+    setViewBotPromptModalOpen(true);
+  }, [activeIsBot]);
+
+  const handleCloseBotPrompt = useCallback(() => {
+    setViewBotPromptModalOpen(false);
+  }, []);
+
   const handleConfirmStartBot = useCallback(() => {
     if (startBotPaneId == null) return;
     const trimmed = botPromptDraft.trim();
@@ -407,6 +423,12 @@ export function TabbedView() {
     setStartBotModalOpen(false);
     setStartBotPaneId(null);
   }, [botMinIntervalDraft, botPromptDraft, startBot, startBotPaneId]);
+
+  useEffect(() => {
+    if (!activeIsBot && viewBotPromptModalOpen) {
+      setViewBotPromptModalOpen(false);
+    }
+  }, [activeIsBot, viewBotPromptModalOpen]);
 
   // No session or no tabs - empty state
   if (!sessionId || effectiveTabs.length === 0) {
@@ -460,25 +482,35 @@ export function TabbedView() {
         {/* Start/Stop Bot */}
         {isAttached && activeTabId != null && activeTabId !== PANE_ID_MAIN && (
           activeIsBot ? (
-            activeStopRequested ? (
+            <>
+              {activeStopRequested ? (
+                <button
+                  onClick={handleStopBot}
+                  className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-amber-600 hover:bg-amber-700 text-white"
+                  title="Force stop immediately — kill the current process"
+                >
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><path d="M6 18L18 6M6 6l12 12" /></svg>
+                  Force Stop
+                </button>
+              ) : (
+                <button
+                  onClick={handleStopBot}
+                  className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-red-500 hover:bg-red-600 text-white"
+                  title="Stop after current work finishes (click again to force stop)"
+                >
+                  <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h12v12H6z" /></svg>
+                  Stop Bot
+                </button>
+              )}
               <button
-                onClick={handleStopBot}
-                className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-amber-600 hover:bg-amber-700 text-white"
-                title="Force stop immediately — kill the current process"
+                onClick={handleOpenBotPrompt}
+                className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-indigo-500 hover:bg-indigo-600 text-white"
+                title="View this tab's current bot prompt"
               >
-                <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><path d="M6 18L18 6M6 6l12 12" /></svg>
-                Force Stop
+                <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M15 12h.01M12 12h.01M9 12h.01M4 6h16v12H4z" /></svg>
+                View Prompt
               </button>
-            ) : (
-              <button
-                onClick={handleStopBot}
-                className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-red-500 hover:bg-red-600 text-white"
-                title="Stop after current work finishes (click again to force stop)"
-              >
-                <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h12v12H6z" /></svg>
-                Stop Bot
-              </button>
-            )
+            </>
           ) : (
             <button
               onClick={handleStartBot}
@@ -557,6 +589,80 @@ export function TabbedView() {
         onCancel={handleCancelStartBot}
         onConfirm={handleConfirmStartBot}
       />
+
+      <ViewBotPromptModal
+        open={viewBotPromptModalOpen}
+        prompt={activeBotPrompt}
+        minIntervalMinutes={activeBotMinIntervalMinutes}
+        tabLabel={activeConfig?.label || (activeTabId != null ? `Tab ${activeTabId}` : "Tab")}
+        onClose={handleCloseBotPrompt}
+      />
+    </div>
+  );
+}
+
+interface ViewBotPromptModalProps {
+  open: boolean;
+  prompt: string;
+  minIntervalMinutes: number;
+  tabLabel: string;
+  onClose: () => void;
+}
+
+function ViewBotPromptModal({
+  open,
+  prompt,
+  minIntervalMinutes,
+  tabLabel,
+  onClose,
+}: ViewBotPromptModalProps) {
+  if (!open) return null;
+
+  return (
+    <div
+      className="fixed inset-0 z-[100] bg-black/50 flex items-center justify-center p-4"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-2xl bg-white dark:bg-gray-900 rounded-xl shadow-xl border border-gray-200 dark:border-gray-700"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
+          <h3 className="text-sm font-semibold text-gray-900 dark:text-gray-100">
+            Bot Prompt for {tabLabel}
+          </h3>
+          <p className="text-xs mt-1 text-gray-500 dark:text-gray-400">
+            This is the active prompt currently used by this bot tab.
+          </p>
+        </div>
+        <div className="p-4 space-y-4">
+          <div>
+            <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">
+              Minimum Interval Between Iterations (minutes)
+            </label>
+            <input
+              type="text"
+              value={String(minIntervalMinutes)}
+              readOnly
+              className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-gray-100 dark:bg-gray-800 px-3 py-2 text-sm"
+            />
+          </div>
+          <textarea
+            value={prompt}
+            readOnly
+            rows={10}
+            className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-gray-100 dark:bg-gray-800 px-3 py-2 text-sm"
+          />
+        </div>
+        <div className="px-4 py-3 border-t border-gray-200 dark:border-gray-700 flex items-center justify-end">
+          <button
+            onClick={onClose}
+            className="px-3 py-1.5 text-xs font-medium rounded bg-indigo-500 hover:bg-indigo-600 text-white"
+          >
+            Close
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
