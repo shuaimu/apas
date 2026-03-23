@@ -1224,6 +1224,11 @@ function handleServerMessage(
         if (state.sessionId) {
           const activeClient = state.cliClients.find((c) => c.activeSession === state.sessionId);
           const currentSession = parsedSessions.find((s) => s.id === state.sessionId);
+          if (currentSession?.isActive != null) {
+            // Keep attachment status aligned with server truth for this session.
+            // This prevents stale "attached" UI state after a CLI crashes.
+            next.isAttached = Boolean(currentSession.isActive);
+          }
           const preferredCliClientId = activeClient?.id ?? currentSession?.cliClientId ?? null;
 
           if (preferredCliClientId && state.cliClientId !== preferredCliClientId) {
