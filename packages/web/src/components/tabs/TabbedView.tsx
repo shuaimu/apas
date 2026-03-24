@@ -329,13 +329,41 @@ export function TabbedView() {
       }
     }
 
+    const chooseTarget = (matches: MachineProjectTarget[]): MachineProjectTarget | null => {
+      if (matches.length === 0) return null;
+
+      // Prefer exact project-id match first when available.
+      const exactMatches = matches.filter((target) => target.projectId === sessionId);
+      if (exactMatches.length === 1) return exactMatches[0];
+      if (exactMatches.length > 1) return null;
+
+      // Daemon may transiently report duplicate project IDs for the same machine/path.
+      // Collapse those duplicates so Boot does not disappear due to ambiguity.
+      const dedupedByMachine = new Map<string, MachineProjectTarget>();
+      for (const target of matches) {
+        const existing = dedupedByMachine.get(target.machineId);
+        if (!existing) {
+          dedupedByMachine.set(target.machineId, target);
+          continue;
+        }
+        if (target.projectId === sessionId) {
+          dedupedByMachine.set(target.machineId, target);
+        }
+      }
+
+      if (dedupedByMachine.size === 1) {
+        return Array.from(dedupedByMachine.values())[0];
+      }
+      return null;
+    };
+
     if (sessionHostname) {
-      if (hostMatches.length === 1) return hostMatches[0];
+      const hostTarget = chooseTarget(hostMatches);
+      if (hostTarget) return hostTarget;
       if (hostMatches.length > 1) return null;
     }
 
-    if (allMatches.length === 1) return allMatches[0];
-    return null;
+    return chooseTarget(allMatches);
   }, [machines, sessionId, sessions]);
 
   const canBootCurrentProject = !isAttached && bootTarget != null && !bootTarget.isRunning;
