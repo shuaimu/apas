@@ -52,6 +52,25 @@ function setProjectLayout(cliClientId: string | null, key: string, value: string
   localStorage.setItem(getProjectLayoutKey(cliClientId, key), value);
 }
 
+function getInputDraftStorageKey(sessionId: string | null, paneId: number): string {
+  return `apas_input_draft_${sessionId || "none"}_${paneId}`;
+}
+
+function loadInputDraft(sessionId: string | null, paneId: number): string {
+  if (typeof window === "undefined") return "";
+  return localStorage.getItem(getInputDraftStorageKey(sessionId, paneId)) ?? "";
+}
+
+function persistInputDraft(sessionId: string | null, paneId: number, value: string): void {
+  if (typeof window === "undefined") return;
+  const key = getInputDraftStorageKey(sessionId, paneId);
+  if (!value.trim()) {
+    localStorage.removeItem(key);
+  } else {
+    localStorage.setItem(key, value);
+  }
+}
+
 function normalizeComparablePath(path: string | undefined): string | null {
   if (!path) return null;
   const trimmed = path.trim();
@@ -146,6 +165,7 @@ export function TabbedView() {
   const [startBotPaneId, setStartBotPaneId] = useState<number | null>(null);
   const [botPromptDraft, setBotPromptDraft] = useState("");
   const [botMinIntervalDraft, setBotMinIntervalDraft] = useState(String(DEFAULT_BOT_MIN_INTERVAL_MINUTES));
+  const [inputDrafts, setInputDrafts] = useState<Record<string, string>>({});
   const [addTabError, setAddTabError] = useState<string | null>(null);
 
   // Determine effective tabs: use paneConfigs from server, or synthesize from observed messages
@@ -265,6 +285,33 @@ export function TabbedView() {
     if (activeTabId === PANE_ID_MAIN) return messages;
     return paneMessages[paneKey(activeTabId)] || [];
   }, [activeTabId, messages, paneMessages]);
+
+  const activeInputPaneId = activeTabId ?? PANE_ID_MAIN;
+  const activeInputDraftKey = useMemo(
+    () => getScrollKey(sessionId, activeInputPaneId),
+    [activeInputPaneId, sessionId],
+  );
+
+  useEffect(() => {
+    setInputDrafts((prev) => {
+      if (Object.prototype.hasOwnProperty.call(prev, activeInputDraftKey)) {
+        return prev;
+      }
+      const restored = loadInputDraft(sessionId, activeInputPaneId);
+      if (!restored) return prev;
+      return { ...prev, [activeInputDraftKey]: restored };
+    });
+  }, [activeInputDraftKey, activeInputPaneId, sessionId]);
+
+  const activeInputDraft = inputDrafts[activeInputDraftKey] ?? "";
+
+  const handleInputDraftChange = useCallback(
+    (value: string) => {
+      setInputDrafts((prev) => ({ ...prev, [activeInputDraftKey]: value }));
+      persistInputDraft(sessionId, activeInputPaneId, value);
+    },
+    [activeInputDraftKey, activeInputPaneId, sessionId],
+  );
 
   const activeConfig = effectiveTabs.find((t) => t.pane_id === activeTabId);
   const activeHasMore = activeTabId === PANE_ID_MAIN ? hasMoreMessages : (activeTabId != null ? paneHasMore[paneKey(activeTabId)] || false : false);
@@ -603,7 +650,11 @@ export function TabbedView() {
                 : "Bot is running autonomously. Click Stop Bot to switch to interactive mode after current work finishes."}
           </div>
         ) : (
-          <InteractiveInput onSend={handleSend} />
+          <InteractiveInput
+            draft={activeInputDraft}
+            onDraftChange={handleInputDraftChange}
+            onSend={handleSend}
+          />
         )}
       </div>
 
@@ -969,22 +1020,34 @@ const MessageComponent = memo(function MessageComponent({ message }: { message: 
 // --- InteractiveInput ---
 
 interface InteractiveInputProps {
+  draft: string;
+  onDraftChange: (value: string) => void;
   onSend: (text: string) => { success: boolean; error?: string };
 }
 
-function InteractiveInput({ onSend }: InteractiveInputProps) {
+function InteractiveInput({ draft, onDraftChange, onSend }: InteractiveInputProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [error, setError] = useState<string | null>(null);
 
+  const resizeTextarea = useCallback(() => {
+    const textarea = textareaRef.current;
+    if (textarea) {
+      textarea.style.height = "auto";
+      textarea.style.height = Math.min(textarea.scrollHeight, 150) + "px";
+    }
+  }, []);
+
+  useEffect(() => {
+    resizeTextarea();
+  }, [draft, resizeTextarea]);
+
   const handleSubmit = () => {
-    const text = textareaRef.current?.value.trim();
+    const text = draft.trim();
     if (text) {
       const result = onSend(text);
       if (result.success) {
-        if (textareaRef.current) {
-          textareaRef.current.value = "";
-          textareaRef.current.style.height = "auto";
-        }
+        onDraftChange("");
+        if (textareaRef.current) textareaRef.current.style.height = "auto";
         setError(null);
       } else {
         setError(result.error || "Failed to send message");
@@ -1000,12 +1063,9 @@ function InteractiveInput({ onSend }: InteractiveInputProps) {
     }
   };
 
-  const handleInput = () => {
-    const textarea = textareaRef.current;
-    if (textarea) {
-      textarea.style.height = "auto";
-      textarea.style.height = Math.min(textarea.scrollHeight, 150) + "px";
-    }
+  const handleInput = (value: string) => {
+    onDraftChange(value);
+    resizeTextarea();
     if (error) setError(null);
   };
 
@@ -1019,11 +1079,12 @@ function InteractiveInput({ onSend }: InteractiveInputProps) {
       <div className="flex gap-2">
         <textarea
           ref={textareaRef}
+          value={draft}
           rows={1}
           placeholder="Type a message..."
           className="flex-1 resize-none rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
           onKeyDown={handleKeyDown}
-          onInput={handleInput}
+          onChange={(e) => handleInput(e.target.value)}
         />
         <button
           onClick={handleSubmit}
