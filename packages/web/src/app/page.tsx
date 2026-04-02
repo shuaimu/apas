@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { createPortal } from "react-dom";
 import { TabbedView } from "@/components/tabs/TabbedView";
@@ -8,12 +8,14 @@ import { Sidebar } from "@/components/Sidebar";
 import { ResizeHandle } from "@/components/ResizeHandle";
 import { useStore } from "@/lib/store";
 import { Settings, Wifi, WifiOff, LogOut, Menu, X, RefreshCw } from "lucide-react";
+import webPackage from "../../package.json";
 
 const MIN_SIDEBAR_WIDTH = 180;
 const MAX_SIDEBAR_WIDTH = 400;
 const DEFAULT_SIDEBAR_WIDTH = 256;
 const REPO_URL = "https://github.com/shuaimu/apas";
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://apas.mpaxos.com:8080";
+const WEB_UI_VERSION = typeof webPackage.version === "string" ? webPackage.version : "dev";
 
 // Helper to get/set per-project layout preferences
 function getProjectLayoutKey(cliClientId: string | null | undefined, key: string): string {
@@ -39,7 +41,7 @@ function setProjectLayout(cliClientId: string | null | undefined, key: string, v
 
 export default function Home() {
   const router = useRouter();
-  const { connected, connect, disconnect, sessionId, isAuthenticated, logout, token, userId, userEmail, cliClientId, setUserEmail } = useStore();
+  const { connected, connect, disconnect, sessionId, isAuthenticated, logout, token, userId, userEmail, cliClientId, cliClients, setUserEmail } = useStore();
   const [isCheckingAuth, setIsCheckingAuth] = useState(true);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -80,6 +82,18 @@ export default function Home() {
       return newValue;
     });
   }, [cliClientId]);
+
+  const currentProjectCliVersion = useMemo(() => {
+    const byClientId = cliClientId
+      ? cliClients.find((client) => client.id === cliClientId)
+      : undefined;
+    if (byClientId?.version) return byClientId.version;
+
+    const bySessionId = sessionId
+      ? cliClients.find((client) => client.activeSession === sessionId)
+      : undefined;
+    return bySessionId?.version ?? null;
+  }, [cliClientId, cliClients, sessionId]);
 
   useEffect(() => {
     // Check for token in localStorage
@@ -235,7 +249,9 @@ export default function Home() {
               <Menu className="w-5 h-5" />
             </button>
             <h1 className="text-xl font-semibold">APAS</h1>
-            <span className="text-sm text-gray-500 hidden sm:inline">Claude Code Remote</span>
+            <span className="text-sm text-gray-500 hidden sm:inline">
+              Claude Code Remote · Web v{WEB_UI_VERSION} · CLI v{currentProjectCliVersion ?? "unknown"}
+            </span>
           </div>
           <div className="flex items-center gap-1 sm:gap-2">
             {/* Connection status with reconnect */}

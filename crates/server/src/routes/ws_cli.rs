@@ -56,6 +56,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // Wait for registration message first
     let cli_id: Uuid;
     let user_id: Uuid;
+    let cli_version: Option<String>;
 
     loop {
         match receiver.next().await {
@@ -64,8 +65,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 match parsed {
                     Ok(CliToServer::Register { token, version }) => {
                         // Check client version
-                        let client_version = version.as_deref().unwrap_or("unknown");
-                        if !is_version_supported(client_version) {
+                        let client_version =
+                            version.clone().unwrap_or_else(|| "unknown".to_string());
+                        if !is_version_supported(&client_version) {
                             tracing::warn!(
                                 "Client version {} is unsupported (min: {})",
                                 client_version,
@@ -87,6 +89,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     Ok(uid) => {
                                         user_id = uid;
                                         cli_id = Uuid::new_v4();
+                                        cli_version = version;
 
                                         // Send registration success
                                         let response = ServerToCli::Registered { cli_id };
@@ -145,7 +148,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let (tx, mut rx) = mpsc::channel::<ServerToCli>(32);
 
     // Register this CLI connection with user association
-    state.sessions.register_cli(cli_id, user_id, tx);
+    state
+        .sessions
+        .register_cli(cli_id, user_id, tx, cli_version);
 
     // Update database - first ensure user exists (dev mode creates random users)
     let dev_user = crate::db::User {

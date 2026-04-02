@@ -34,6 +34,8 @@ pub struct SessionManager {
     cli_sessions: DashMap<Uuid, Vec<Uuid>>,
     /// Map of CLI client ID -> user ID (owner)
     cli_users: DashMap<Uuid, Uuid>,
+    /// Map of CLI client ID -> reported CLI version
+    cli_versions: DashMap<Uuid, String>,
     /// Map of (CLI client ID, provider) -> latest usage limits
     cli_usage_limits: DashMap<(Uuid, Provider), UsageLimits>,
     /// Map of machine ID -> sender to daemon
@@ -71,6 +73,7 @@ impl SessionManager {
             web_users: DashMap::new(),
             cli_sessions: DashMap::new(),
             cli_users: DashMap::new(),
+            cli_versions: DashMap::new(),
             cli_usage_limits: DashMap::new(),
             daemon_senders: DashMap::new(),
             daemon_users: DashMap::new(),
@@ -80,10 +83,21 @@ impl SessionManager {
     }
 
     // CLI client management
-    pub fn register_cli(&self, cli_id: Uuid, user_id: Uuid, sender: mpsc::Sender<ServerToCli>) {
+    pub fn register_cli(
+        &self,
+        cli_id: Uuid,
+        user_id: Uuid,
+        sender: mpsc::Sender<ServerToCli>,
+        version: Option<String>,
+    ) {
         self.cli_senders.insert(cli_id, sender);
         self.cli_sessions.insert(cli_id, Vec::new());
         self.cli_users.insert(cli_id, user_id);
+        if let Some(version) = version.filter(|v| !v.trim().is_empty()) {
+            self.cli_versions.insert(cli_id, version);
+        } else {
+            self.cli_versions.remove(&cli_id);
+        }
         tracing::info!("CLI client registered: {} (user: {})", cli_id, user_id);
         // Broadcast updated client list to all web clients
         self.broadcast_cli_clients_update();
@@ -92,6 +106,7 @@ impl SessionManager {
     pub fn unregister_cli(&self, cli_id: &Uuid) {
         self.cli_senders.remove(cli_id);
         let owner = self.cli_users.remove(cli_id).map(|(_, uid)| uid);
+        self.cli_versions.remove(cli_id);
         let keys_to_remove: Vec<(Uuid, Provider)> = self
             .cli_usage_limits
             .iter()
@@ -697,6 +712,7 @@ impl SessionManager {
                         CliClientStatus::Online
                     },
                     last_seen: Some(chrono::Utc::now()),
+                    version: self.cli_versions.get(&cli_id).map(|v| v.clone()),
                     active_session,
                 }
             })
@@ -729,6 +745,7 @@ impl SessionManager {
                         CliClientStatus::Online
                     },
                     last_seen: Some(chrono::Utc::now()),
+                    version: self.cli_versions.get(&cli_id).map(|v| v.clone()),
                     active_session,
                 }
             })

@@ -267,10 +267,11 @@ export function TabbedView() {
     [removePane, activeTabId, effectiveTabs, handleSelectTab],
   );
 
-  const handleAddTab = useCallback((provider: string = "claude") => {
-    const prefix = provider === "codex" ? "Codex" : "Claude";
+  const handleAddTab = useCallback((provider: string = "claude", model?: string) => {
+    const isMiniMax = provider === "claude" && typeof model === "string" && model.toLowerCase().includes("minimax");
+    const prefix = provider === "codex" ? "Codex" : isMiniMax ? "MiniMax" : "Claude";
     const label = `${prefix} ${effectiveTabs.length + 1}`;
-    const result = addPane(provider, "interactive", label);
+    const result = addPane(provider, "interactive", label, undefined, model);
     if (result.success) {
       setAddTabError(null);
     } else {

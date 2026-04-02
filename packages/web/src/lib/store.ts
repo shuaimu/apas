@@ -25,6 +25,7 @@ export interface CliClient {
   id: string;
   name?: string;
   status: "online" | "offline" | "busy";
+  version?: string;
   lastSeen?: string;
   activeSession?: string;
 }
@@ -296,7 +297,13 @@ interface AppState {
   resumeDeadloop: () => void;
   pausePane: (paneId: number) => void;
   resumePane: (paneId: number) => void;
-  addPane: (provider: string, mode: string, label?: string, prompt?: string) => { success: boolean; error?: string };
+  addPane: (
+    provider: string,
+    mode: string,
+    label?: string,
+    prompt?: string,
+    model?: string
+  ) => { success: boolean; error?: string };
   removePane: (paneId: number) => void;
   startBot: (paneId: number, prompt?: string, minIterationIntervalMinutes?: number) => void;
   stopBot: (paneId: number) => void;
@@ -897,7 +904,13 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  addPane: (provider: string, mode: string, label?: string, prompt?: string) => {
+  addPane: (
+    provider: string,
+    mode: string,
+    label?: string,
+    prompt?: string,
+    model?: string
+  ) => {
     const { ws, sessionId, isAttached } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return { success: false, error: "Not connected to server" };
@@ -914,6 +927,7 @@ export const useStore = create<AppState>((set, get) => ({
       mode,
       label: label || undefined,
       prompt: prompt || undefined,
+      model: model || undefined,
     }));
     return { success: true };
   },
@@ -1060,6 +1074,7 @@ function handleServerMessage(
         id: c.id as string,
         name: c.name as string | undefined,
         status: (c.status as "online" | "offline" | "busy") || "offline",
+        version: c.version as string | undefined,
         lastSeen: c.last_seen as string | undefined,
         activeSession: c.active_session as string | undefined,
       }));

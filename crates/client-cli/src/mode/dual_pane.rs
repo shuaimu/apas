@@ -56,6 +56,44 @@ fn resolve_binary_path(name: &str) -> String {
     name.to_string()
 }
 
+fn is_minimax_model(model: Option<&str>) -> bool {
+    model
+        .map(|m| {
+            let normalized = m.trim().to_ascii_lowercase();
+            !normalized.is_empty()
+                && (normalized.contains("minimax") || normalized.starts_with("m2"))
+        })
+        .unwrap_or(false)
+}
+
+fn resolve_pane_binary_path(
+    provider: Provider,
+    model: Option<&str>,
+    claude_path: &str,
+    claude2_path: &str,
+    codex_path: &str,
+) -> String {
+    match provider {
+        Provider::Claude => {
+            if is_minimax_model(model) {
+                // If claude2 could not be resolved in this environment, fall back
+                // to the default Claude binary instead of hard-failing on spawn.
+                if claude2_path == "claude2"
+                    && claude_path != "claude2"
+                    && (claude_path.starts_with('/') || claude_path.contains('/'))
+                {
+                    claude_path.to_string()
+                } else {
+                    claude2_path.to_string()
+                }
+            } else {
+                claude_path.to_string()
+            }
+        }
+        Provider::Codex => codex_path.to_string(),
+    }
+}
+
 type PaneInput = (String, bool);
 
 /// Per-pane input channel registry.
@@ -74,6 +112,7 @@ struct PaneMeta {
     mode: shared::PaneMode,
     provider: shared::Provider,
     prompt: Option<String>,
+    model: Option<String>,
     min_iteration_interval_minutes: Option<u64>,
     child_process: Arc<Mutex<Option<std::process::Child>>>,
 }
@@ -107,6 +146,7 @@ async fn run_inner(
     // Resolve binary paths to absolute paths at startup (while PATH is correct).
     // Systemd-run environments may have a minimal PATH that misses nvm/cargo bins.
     let claude_path = resolve_binary_path(&config.local.claude_path);
+    let claude2_path = resolve_binary_path("claude2");
     let codex_path = resolve_binary_path(&config.local.codex_path);
 
     // Load or create project metadata
@@ -132,6 +172,7 @@ async fn run_inner(
         String,
         shared::PaneMode,
         Provider,
+        Option<String>,
         Option<String>,
         Option<u64>,
         bool,
@@ -168,6 +209,7 @@ async fn run_inner(
                 mode,
                 pane.provider,
                 pane.prompt.clone(),
+                pane.model.clone(),
                 pane.min_iteration_interval_minutes,
                 is_paused,
             )
@@ -211,6 +253,7 @@ async fn run_inner(
         Uuid,
         Provider,
         String,
+        Option<String>,
         u64,
         Arc<AtomicBool>,
         Arc<AtomicBool>,
@@ -220,6 +263,7 @@ async fn run_inner(
         u32,
         Uuid,
         Provider,
+        Option<String>,
         mpsc::Receiver<PaneInput>,
         Arc<Mutex<Option<std::process::Child>>>,
     )> = Vec::new();
@@ -237,6 +281,7 @@ async fn run_inner(
             mode,
             provider,
             tab_prompt,
+            tab_model,
             min_interval_minutes,
             is_paused,
         ) in &tabs_to_restore
@@ -248,6 +293,7 @@ async fn run_inner(
                     mode: mode.clone(),
                     provider: *provider,
                     prompt: tab_prompt.clone(),
+                    model: tab_model.clone(),
                     min_iteration_interval_minutes: *min_interval_minutes,
                     child_process: child_proc.clone(),
                 },
@@ -270,6 +316,7 @@ async fn run_inner(
                     *pane_session_id,
                     *provider,
                     dl_prompt,
+                    tab_model.clone(),
                     resolved_min_interval_minutes,
                     pause_flag,
                     stop_flag,
@@ -282,6 +329,7 @@ async fn run_inner(
                     *pane_id,
                     *pane_session_id,
                     *provider,
+                    tab_model.clone(),
                     input_rx,
                     child_proc,
                 ));
@@ -351,7 +399,7 @@ async fn run_inner(
     };
 
     // Send initial messages for restored panes.
-    for (pane_id, _, label, mode, _, _, _, is_paused) in &tabs_to_restore {
+    for (pane_id, _, label, mode, _, _, _, _, is_paused) in &tabs_to_restore {
         let init_text = if *pane_id == shared::PANE_ID_DEADLOOP
             && *mode == shared::PaneMode::Deadloop
         {
@@ -391,6 +439,7 @@ async fn run_inner(
         pane_session_id,
         provider,
         dl_prompt,
+        model,
         min_interval_minutes,
         pause_flag,
         stop_flag,
@@ -403,10 +452,13 @@ async fn run_inner(
         let event_tx = event_tx.clone();
         let working_dir = working_dir_str.clone();
         let sid = session_id;
-        let binary_path = match provider {
-            Provider::Claude => claude_path.clone(),
-            Provider::Codex => codex_path.clone(),
-        };
+        let binary_path = resolve_pane_binary_path(
+            provider,
+            model.as_deref(),
+            &claude_path,
+            &claude2_path,
+            &codex_path,
+        );
         pane_threads.push(thread::spawn(move || {
             run_deadloop_session(
                 &binary_path,
@@ -415,6 +467,7 @@ async fn run_inner(
                 pane_session_id,
                 pane_id,
                 &dl_prompt,
+                model.clone(),
                 min_interval_minutes,
                 &provider,
                 output_tx,
@@ -428,16 +481,19 @@ async fn run_inner(
         }));
     }
 
-    for (pane_id, pane_session_id, provider, input_rx, child_proc) in interactive_startups {
+    for (pane_id, pane_session_id, provider, model, input_rx, child_proc) in interactive_startups {
         let output_tx = output_tx.clone();
         let server_tx = server_tx.clone();
         let shutdown = shutdown.clone();
         let working_dir = working_dir_str.clone();
         let sid = session_id;
-        let binary_path = match provider {
-            Provider::Claude => claude_path.clone(),
-            Provider::Codex => codex_path.clone(),
-        };
+        let binary_path = resolve_pane_binary_path(
+            provider,
+            model.as_deref(),
+            &claude_path,
+            &claude2_path,
+            &codex_path,
+        );
         pane_threads.push(thread::spawn(move || {
             run_pane_session(
                 &binary_path,
@@ -446,6 +502,7 @@ async fn run_inner(
                 pane_session_id,
                 pane_id,
                 &provider,
+                model.clone(),
                 input_rx,
                 output_tx,
                 server_tx,
@@ -464,6 +521,7 @@ async fn run_inner(
         let input_channels_event = input_channels.clone();
         let working_dir_event = working_dir_str.clone();
         let claude_path_event = claude_path.clone();
+        let claude2_path_event = claude2_path.clone();
         let codex_path_event = codex_path.clone();
         let pane_sessions_event = pane_sessions.clone();
         let pane_pauses_event = pane_pauses.clone();
@@ -481,6 +539,7 @@ async fn run_inner(
                 input_channels_event,
                 session_id,
                 &claude_path_event,
+                &claude2_path_event,
                 &codex_path_event,
                 &working_dir_event,
                 command_tx,
@@ -597,12 +656,13 @@ fn save_pane_configs(
         let mut panes: Vec<shared::PaneConfig> = pane_sessions
             .iter()
             .map(|(&pane_id, &claude_sid)| {
-                let (mode, provider, prompt, min_iteration_interval_minutes) =
+                let (mode, provider, prompt, model, min_iteration_interval_minutes) =
                     if let Some(meta) = pane_metas.get(&pane_id) {
                         (
                             meta.mode.clone(),
                             meta.provider.clone(),
                             meta.prompt.clone(),
+                            meta.model.clone(),
                             meta.min_iteration_interval_minutes,
                         )
                     } else if pane_id == shared::PANE_ID_DEADLOOP {
@@ -610,10 +670,17 @@ fn save_pane_configs(
                             shared::PaneMode::Deadloop,
                             Provider::Claude,
                             None,
+                            None,
                             Some(DEFAULT_MIN_ITERATION_INTERVAL_MINUTES),
                         )
                     } else {
-                        (shared::PaneMode::Interactive, Provider::Claude, None, None)
+                        (
+                            shared::PaneMode::Interactive,
+                            Provider::Claude,
+                            None,
+                            None,
+                            None,
+                        )
                     };
                 let label = match pane_id {
                     shared::PANE_ID_DEADLOOP => "Deadloop".to_string(),
@@ -630,7 +697,7 @@ fn save_pane_configs(
                     prompt,
                     min_iteration_interval_minutes,
                     label: Some(label),
-                    model: None,
+                    model,
                 }
             })
             .collect();
@@ -650,6 +717,7 @@ fn handle_tui_events(
     input_channels: InputChannels,
     session_id: Uuid,
     claude_path: &str,
+    claude2_path: &str,
     codex_path: &str,
     working_dir: &str,
     command_tx: mpsc::Sender<TuiCommand>,
@@ -691,6 +759,7 @@ fn handle_tui_events(
                             mode: mode.clone(),
                             provider: provider.clone(),
                             prompt: None,
+                            model: None,
                             min_iteration_interval_minutes: None,
                             child_process: child_proc.clone(),
                         },
@@ -714,16 +783,23 @@ fn handle_tui_events(
                     let output_tx = output_tx.clone();
                     let server_tx = server_tx.clone();
                     let shutdown = shutdown.clone();
-                    let claude_path = claude_path.to_string();
+                    let binary_path = resolve_pane_binary_path(
+                        Provider::Claude,
+                        None,
+                        claude_path,
+                        claude2_path,
+                        codex_path,
+                    );
                     let working_dir = working_dir.to_string();
                     thread::spawn(move || {
                         run_pane_session(
-                            &claude_path,
+                            &binary_path,
                             &working_dir,
                             session_id,
                             claude_session_id,
                             pane_id,
                             &Provider::Claude,
+                            None,
                             input_rx,
                             output_tx,
                             server_tx,
@@ -763,7 +839,7 @@ fn handle_tui_events(
                 provider,
                 prompt,
                 min_iteration_interval_minutes,
-                model: _,
+                model,
             }) => {
                 // Track claude session and metadata for this pane
                 {
@@ -781,15 +857,19 @@ fn handle_tui_events(
                             mode: mode.clone(),
                             provider: provider.clone(),
                             prompt: prompt.clone(),
+                            model: model.clone(),
                             min_iteration_interval_minutes,
                             child_process: child_proc.clone(),
                         },
                     );
                 }
-                let binary_path = match &provider {
-                    Provider::Claude => claude_path.to_string(),
-                    Provider::Codex => codex_path.to_string(),
-                };
+                let binary_path = resolve_pane_binary_path(
+                    provider,
+                    model.as_deref(),
+                    claude_path,
+                    claude2_path,
+                    codex_path,
+                );
 
                 // Notify TUI to add the tab visually
                 let _ = command_tx.send(TuiCommand::AddTab {
@@ -831,6 +911,7 @@ fn handle_tui_events(
                             claude_session_id,
                             pane_id,
                             &dl_prompt,
+                            model.clone(),
                             resolved_min_interval_minutes,
                             &provider,
                             output_tx,
@@ -861,6 +942,7 @@ fn handle_tui_events(
                             claude_session_id,
                             pane_id,
                             &provider,
+                            model.clone(),
                             input_rx,
                             output_tx,
                             server_tx,
@@ -966,16 +1048,17 @@ fn handle_tui_events(
                 prompt,
                 min_iteration_interval_minutes,
             }) => {
-                // Preserve provider and any existing per-pane prompt across mode switches.
-                let (provider, existing_prompt, existing_min_interval_minutes) = {
+                // Preserve provider/model and any existing per-pane prompt across mode switches.
+                let (provider, existing_prompt, existing_model, existing_min_interval_minutes) = {
                     let metas = pane_metas.lock().unwrap();
                     match metas.get(&pane_id) {
                         Some(meta) => (
                             meta.provider,
                             meta.prompt.clone(),
+                            meta.model.clone(),
                             meta.min_iteration_interval_minutes,
                         ),
-                        None => (Provider::Claude, None, None),
+                        None => (Provider::Claude, None, None, None),
                     }
                 };
                 let resolved_prompt = prompt.filter(|p| !p.trim().is_empty()).or(existing_prompt);
@@ -1037,6 +1120,7 @@ fn handle_tui_events(
                             mode: shared::PaneMode::Deadloop,
                             provider,
                             prompt: resolved_prompt.clone(),
+                            model: existing_model.clone(),
                             min_iteration_interval_minutes: Some(resolved_min_interval_minutes),
                             child_process: child_proc.clone(),
                         },
@@ -1062,10 +1146,13 @@ fn handle_tui_events(
 
                 // 5. Spawn deadloop session
                 let dl_prompt = resolved_prompt.unwrap_or_else(|| default_prompt.to_string());
-                let binary_path = match &provider {
-                    Provider::Claude => claude_path.to_string(),
-                    Provider::Codex => codex_path.to_string(),
-                };
+                let binary_path = resolve_pane_binary_path(
+                    provider,
+                    existing_model.as_deref(),
+                    claude_path,
+                    claude2_path,
+                    codex_path,
+                );
                 {
                     let output_tx = output_tx.clone();
                     let server_tx = server_tx.clone();
@@ -1080,6 +1167,7 @@ fn handle_tui_events(
                             claude_session_id,
                             pane_id,
                             &dl_prompt,
+                            existing_model.clone(),
                             resolved_min_interval_minutes,
                             &provider,
                             output_tx,
@@ -1271,7 +1359,7 @@ fn handle_tui_events(
                     // (e.g. pane was removed). Still safe to proceed.
                 }
 
-                let (provider, saved_prompt, saved_min_interval_minutes) = {
+                let (provider, saved_prompt, saved_model, saved_min_interval_minutes) = {
                     let metas = pane_metas.lock().unwrap();
                     let Some(meta) = metas.get(&pane_id) else {
                         continue;
@@ -1282,6 +1370,7 @@ fn handle_tui_events(
                     (
                         meta.provider,
                         meta.prompt.clone(),
+                        meta.model.clone(),
                         meta.min_iteration_interval_minutes,
                     )
                 };
@@ -1314,6 +1403,7 @@ fn handle_tui_events(
                             mode: shared::PaneMode::Interactive,
                             provider,
                             prompt: saved_prompt,
+                            model: saved_model.clone(),
                             min_iteration_interval_minutes: saved_min_interval_minutes,
                             child_process: child_proc.clone(),
                         },
@@ -1354,10 +1444,13 @@ fn handle_tui_events(
                 };
 
                 // Spawn interactive session.
-                let binary_path = match &provider {
-                    Provider::Claude => claude_path.to_string(),
-                    Provider::Codex => codex_path.to_string(),
-                };
+                let binary_path = resolve_pane_binary_path(
+                    provider,
+                    saved_model.as_deref(),
+                    claude_path,
+                    claude2_path,
+                    codex_path,
+                );
                 {
                     let output_tx = output_tx.clone();
                     let server_tx = server_tx.clone();
@@ -1371,6 +1464,7 @@ fn handle_tui_events(
                             claude_session_id,
                             pane_id,
                             &provider,
+                            saved_model.clone(),
                             input_rx,
                             output_tx,
                             server_tx,
@@ -1449,7 +1543,7 @@ fn build_pane_list(
             prompt: meta.prompt.clone(),
             min_iteration_interval_minutes: meta.min_iteration_interval_minutes,
             label: Some(label),
-            model: None,
+            model: meta.model.clone(),
         });
     }
 
@@ -1518,18 +1612,25 @@ fn build_agent_args(
     provider: &Provider,
     session_id: &Uuid,
     prompt: &str,
+    model: Option<&str>,
     first_message: bool,
     try_resume: bool,
 ) -> (Vec<String>, bool) {
     match provider {
         Provider::Claude => {
-            let base = vec![
+            let mut base = vec![
                 "--print".to_string(),
                 "--output-format".to_string(),
                 "stream-json".to_string(),
                 "--verbose".to_string(),
                 "--dangerously-skip-permissions".to_string(),
             ];
+            if let Some(model) = model {
+                let trimmed = model.trim();
+                if !trimmed.is_empty() {
+                    base.extend_from_slice(&["--model".to_string(), trimmed.to_string()]);
+                }
+            }
             if first_message && try_resume {
                 let mut args = base;
                 args.extend_from_slice(&[
@@ -1606,7 +1707,9 @@ fn parse_agent_output(
 
 #[cfg(test)]
 mod tests {
-    use super::{active_usage_providers, build_agent_args, PaneMeta, PaneMetas};
+    use super::{
+        active_usage_providers, build_agent_args, resolve_pane_binary_path, PaneMeta, PaneMetas,
+    };
     use shared::Provider;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -1618,8 +1721,14 @@ mod tests {
     #[test]
     fn build_agent_args_claude_resume_keeps_full_prompt() {
         let session_id = Uuid::new_v4();
-        let (args, using_resume) =
-            build_agent_args(&Provider::Claude, &session_id, FULL_PROMPT, false, true);
+        let (args, using_resume) = build_agent_args(
+            &Provider::Claude,
+            &session_id,
+            FULL_PROMPT,
+            None,
+            false,
+            true,
+        );
 
         assert!(using_resume);
         assert!(args.iter().any(|arg| arg == "--resume"));
@@ -1629,13 +1738,77 @@ mod tests {
     #[test]
     fn build_agent_args_codex_resume_keeps_full_prompt() {
         let session_id = Uuid::new_v4();
-        let (args, using_resume) =
-            build_agent_args(&Provider::Codex, &session_id, FULL_PROMPT, false, true);
+        let (args, using_resume) = build_agent_args(
+            &Provider::Codex,
+            &session_id,
+            FULL_PROMPT,
+            None,
+            false,
+            true,
+        );
 
         assert!(using_resume);
         assert_eq!(args.get(0).map(String::as_str), Some("exec"));
         assert_eq!(args.get(1).map(String::as_str), Some("resume"));
         assert_eq!(args.last().map(String::as_str), Some(FULL_PROMPT));
+    }
+
+    #[test]
+    fn build_agent_args_claude_with_model_includes_model_flag() {
+        let session_id = Uuid::new_v4();
+        let (args, _) = build_agent_args(
+            &Provider::Claude,
+            &session_id,
+            FULL_PROMPT,
+            Some("MiniMax-M2.7"),
+            true,
+            false,
+        );
+
+        assert!(args.windows(2).any(|w| w == ["--model", "MiniMax-M2.7"]));
+    }
+
+    #[test]
+    fn resolve_pane_binary_path_uses_claude2_for_minimax_model() {
+        let path = resolve_pane_binary_path(
+            Provider::Claude,
+            Some("MiniMax-M2.7"),
+            "claude",
+            "claude2",
+            "codex",
+        );
+        assert_eq!(path, "claude2");
+    }
+
+    #[test]
+    fn resolve_pane_binary_path_uses_claude2_for_m2_alias_model() {
+        let path =
+            resolve_pane_binary_path(Provider::Claude, Some("m2.7"), "claude", "claude2", "codex");
+        assert_eq!(path, "claude2");
+    }
+
+    #[test]
+    fn resolve_pane_binary_path_uses_default_claude_for_non_minimax_model() {
+        let path = resolve_pane_binary_path(
+            Provider::Claude,
+            Some("sonnet"),
+            "claude",
+            "claude2",
+            "codex",
+        );
+        assert_eq!(path, "claude");
+    }
+
+    #[test]
+    fn resolve_pane_binary_path_falls_back_when_claude2_unresolved() {
+        let path = resolve_pane_binary_path(
+            Provider::Claude,
+            Some("MiniMax-M2.7"),
+            "/opt/bin/claude",
+            "claude2",
+            "codex",
+        );
+        assert_eq!(path, "/opt/bin/claude");
     }
 
     #[test]
@@ -1651,6 +1824,7 @@ mod tests {
                     mode: shared::PaneMode::Interactive,
                     provider: Provider::Claude,
                     prompt: None,
+                    model: None,
                     min_iteration_interval_minutes: None,
                     child_process: child_process.clone(),
                 },
@@ -1661,6 +1835,7 @@ mod tests {
                     mode: shared::PaneMode::Interactive,
                     provider: Provider::Codex,
                     prompt: None,
+                    model: None,
                     min_iteration_interval_minutes: None,
                     child_process,
                 },
@@ -1679,6 +1854,7 @@ fn run_deadloop_session(
     claude_session_id: Uuid,
     pane_id: u32,
     prompt: &str,
+    model: Option<String>,
     min_iteration_interval_minutes: u64,
     provider: &Provider,
     output_tx: mpsc::Sender<PaneOutput>,
@@ -1697,6 +1873,7 @@ fn run_deadloop_session(
             claude_session_id,
             pane_id,
             prompt,
+            model,
             min_iteration_interval_minutes,
             provider,
             output_tx.clone(),
@@ -1731,6 +1908,7 @@ fn run_deadloop_session_inner(
     claude_session_id: Uuid,
     pane_id: u32,
     prompt: &str,
+    model: Option<String>,
     min_iteration_interval_minutes: u64,
     provider: &Provider,
     output_tx: mpsc::Sender<PaneOutput>,
@@ -1859,6 +2037,7 @@ fn run_deadloop_session_inner(
             provider,
             &claude_session_id,
             iteration_prompt,
+            model.as_deref(),
             first_message,
             try_resume_first,
         );
@@ -2168,6 +2347,7 @@ fn run_pane_session(
     claude_session_id: Uuid,
     pane_id: u32,
     provider: &Provider,
+    model: Option<String>,
     input_rx: mpsc::Receiver<PaneInput>,
     output_tx: mpsc::Sender<PaneOutput>,
     server_tx: tokio_mpsc::Sender<CliToServer>,
@@ -2233,6 +2413,7 @@ fn run_pane_session(
             provider,
             &claude_session_id,
             &prompt,
+            model.as_deref(),
             first_message,
             try_resume_first,
         );

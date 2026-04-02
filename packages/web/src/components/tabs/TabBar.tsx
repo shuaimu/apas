@@ -9,7 +9,7 @@ interface TabBarProps {
   activeTabId: number | null;
   onSelectTab: (paneId: number) => void;
   onCloseTab: (paneId: number) => void;
-  onAddTab: (provider?: string) => void;
+  onAddTab: (provider?: string, model?: string) => void;
   onBootCli?: () => void;
   onRebootCli?: () => void;
   showBootButton?: boolean;
@@ -151,7 +151,7 @@ export function TabBar({
   );
 }
 
-function AddTabButton({ onAddTab }: { onAddTab: (provider?: string) => void }) {
+function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: string) => void }) {
   const [showMenu, setShowMenu] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -187,6 +187,21 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string) => void }) {
               <ProviderIcon provider="claude" className="w-4 h-4" />
             </span>
             Claude Tab
+          </button>
+          <button
+            onClick={() => {
+              const selected = window.prompt("MiniMax backend version", "MiniMax-M2.7");
+              if (selected && selected.trim()) {
+                onAddTab("claude", selected.trim());
+              }
+              setShowMenu(false);
+            }}
+            className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
+          >
+            <span className="text-cyan-500 flex-shrink-0">
+              <ProviderIcon provider="claude" className="w-4 h-4" />
+            </span>
+            MiniMax Tab...
           </button>
           <div className="border-t border-gray-100 dark:border-gray-700 my-0.5" />
           <button

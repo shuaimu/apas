@@ -588,7 +588,7 @@ pub struct PaneConfig {
     #[serde(default)]
     pub label: Option<String>, // User-facing label like "Deadloop" or "Interactive"
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>, // Model override (e.g., "o3", "o4-mini") — Codex only
+    pub model: Option<String>, // Optional model/backend override (e.g., "o3", "MiniMax-M2.7")
 }
 
 /// Legacy pane_id constants
@@ -677,6 +677,8 @@ pub struct CliClientInfo {
     pub name: Option<String>,
     pub status: CliClientStatus,
     pub last_seen: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     /// Active session ID if the CLI has a local session running
     pub active_session: Option<Uuid>,
 }
@@ -1309,15 +1311,18 @@ mod tests {
             name: Some("my-laptop".to_string()),
             status: CliClientStatus::Online,
             last_seen: Some(chrono::Utc::now()),
+            version: Some("26.04.123".to_string()),
             active_session: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("\"name\":\"my-laptop\""));
         assert!(json.contains("\"status\":\"online\""));
+        assert!(json.contains("\"version\":\"26.04.123\""));
 
         let deserialized: CliClientInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.name, Some("my-laptop".to_string()));
         assert_eq!(deserialized.status, CliClientStatus::Online);
+        assert_eq!(deserialized.version, Some("26.04.123".to_string()));
     }
 
     #[test]
