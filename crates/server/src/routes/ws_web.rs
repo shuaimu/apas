@@ -751,6 +751,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         continue;
                     }
 
+                    let req_api_base_url = api_base_url.clone();
+                    let req_api_key = api_key.clone();
                     if !state
                         .sessions
                         .send_to_daemon(
@@ -772,6 +774,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 },
                             )
                             .await;
+                    } else {
+                        // Optimistically reflect updated config in machine snapshot for web UI.
+                        state.sessions.apply_web_minimax_config(
+                            &machine_id,
+                            req_api_base_url,
+                            req_api_key,
+                            clear_api_key,
+                        );
                     }
                 }
                 Ok(WebToServer::PausePane { pane_id }) => {

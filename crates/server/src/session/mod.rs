@@ -1,7 +1,8 @@
 use dashmap::DashMap;
 use shared::{
     CliClientInfo, CliClientStatus, MachineInfo, MachineProjectInfo, MachineWithProjects,
-    PaneConfig, Provider, ServerToCli, ServerToDaemon, ServerToWeb, UsageLimits,
+    MiniMaxBackendInfo, PaneConfig, Provider, ServerToCli, ServerToDaemon, ServerToWeb,
+    UsageLimits,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -18,6 +19,48 @@ fn normalize_project_path(raw: &str) -> String {
         return "/".to_string();
     }
     trimmed.trim_end_matches('/').to_string()
+}
+
+fn normalize_optional_string(raw: Option<String>) -> Option<String> {
+    raw.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn merge_minimax_backend(
+    existing: Option<MiniMaxBackendInfo>,
+    incoming: Option<MiniMaxBackendInfo>,
+) -> Option<MiniMaxBackendInfo> {
+    match (existing, incoming) {
+        (None, None) => None,
+        (Some(existing), None) => Some(existing),
+        (None, Some(mut incoming)) => {
+            incoming.api_base_url = normalize_optional_string(incoming.api_base_url);
+            incoming.api_key = normalize_optional_string(incoming.api_key);
+            incoming.api_key_configured = incoming.api_key.is_some() || incoming.api_key_configured;
+            Some(incoming)
+        }
+        (Some(existing), Some(mut incoming)) => {
+            incoming.api_base_url = normalize_optional_string(incoming.api_base_url)
+                .or_else(|| normalize_optional_string(existing.api_base_url));
+
+            let incoming_key = normalize_optional_string(incoming.api_key);
+            incoming.api_key = incoming_key.or_else(|| {
+                if incoming.api_key_configured {
+                    normalize_optional_string(existing.api_key)
+                } else {
+                    None
+                }
+            });
+            incoming.api_key_configured = incoming.api_key.is_some() || incoming.api_key_configured;
+            Some(incoming)
+        }
+    }
 }
 
 /// Manages active sessions and routes messages between web and CLI clients
@@ -150,8 +193,13 @@ impl SessionManager {
         mut machine: MachineInfo,
         projects: Vec<MachineProjectInfo>,
     ) {
+        let existing_minimax = self
+            .machine_infos
+            .get(&machine_id)
+            .and_then(|m| m.minimax_backend.clone());
         machine.machine_id = machine_id;
         machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
+        machine.minimax_backend = merge_minimax_backend(existing_minimax, machine.minimax_backend);
         self.daemon_senders.insert(machine_id, sender);
         self.daemon_users.insert(machine_id, user_id);
         self.machine_infos.insert(machine_id, machine);
@@ -163,9 +211,10 @@ impl SessionManager {
     pub fn unregister_daemon(&self, machine_id: &Uuid) {
         let owner = self.daemon_users.get(machine_id).map(|entry| *entry);
         self.daemon_senders.remove(machine_id);
-        self.daemon_users.remove(machine_id);
-        self.machine_infos.remove(machine_id);
-        self.machine_projects.remove(machine_id);
+        // Keep machine metadata/project snapshot to avoid UI flicker during transient daemon reconnects.
+        if let Some(mut machine) = self.machine_infos.get_mut(machine_id) {
+            machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
+        }
 
         if let Some(user_id) = owner {
             self.broadcast_machines_update_for_user(&user_id);
@@ -194,11 +243,54 @@ impl SessionManager {
     }
 
     pub fn update_daemon_machine_info(&self, machine_id: &Uuid, mut machine: MachineInfo) {
+        let existing_minimax = self
+            .machine_infos
+            .get(machine_id)
+            .and_then(|m| m.minimax_backend.clone());
         machine.machine_id = *machine_id;
         machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
+        machine.minimax_backend = merge_minimax_backend(existing_minimax, machine.minimax_backend);
         self.machine_infos.insert(*machine_id, machine);
         if let Some(owner) = self.daemon_users.get(machine_id).map(|entry| *entry) {
             self.broadcast_machines_update_for_user(&owner);
+        }
+    }
+
+    pub fn apply_web_minimax_config(
+        &self,
+        machine_id: &Uuid,
+        api_base_url: Option<String>,
+        api_key: Option<String>,
+        clear_api_key: bool,
+    ) {
+        let owner = self.daemon_users.get(machine_id).map(|entry| *entry);
+        if let Some(mut machine) = self.machine_infos.get_mut(machine_id) {
+            let mut backend = machine.minimax_backend.clone().unwrap_or(MiniMaxBackendInfo {
+                api_base_url: None,
+                api_key: None,
+                api_key_configured: false,
+            });
+
+            if let Some(url) = normalize_optional_string(api_base_url) {
+                backend.api_base_url = Some(url);
+            }
+
+            if clear_api_key {
+                backend.api_key = None;
+                backend.api_key_configured = false;
+            } else if let Some(key) = normalize_optional_string(api_key) {
+                backend.api_key = Some(key);
+                backend.api_key_configured = true;
+            } else {
+                backend.api_key_configured = backend.api_key.is_some();
+            }
+
+            machine.minimax_backend = Some(backend);
+            machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
+        }
+
+        if let Some(user_id) = owner {
+            self.broadcast_machines_update_for_user(&user_id);
         }
     }
 
