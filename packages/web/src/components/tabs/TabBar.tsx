@@ -20,9 +20,15 @@ interface TabBarProps {
 
 const MINIMAX_DEFAULT_MODEL = "MiniMax-M2.7";
 
+function isMiniMaxModel(model?: string): boolean {
+  if (typeof model !== "string") return false;
+  const normalized = model.trim().toLowerCase();
+  return normalized.includes("minimax") || normalized.startsWith("m2");
+}
+
 function isMiniMaxTab(provider: string, model?: string, label?: string): boolean {
   if (provider !== "claude") return false;
-  if (typeof model === "string" && model.toLowerCase().includes("minimax")) return true;
+  if (isMiniMaxModel(model)) return true;
   return typeof label === "string" && label.toLowerCase().includes("minimax");
 }
 

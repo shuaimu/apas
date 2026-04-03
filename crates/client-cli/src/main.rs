@@ -719,6 +719,7 @@ async fn handle_config_command(action: ConfigAction) -> Result<()> {
                 "server" => config.remote.server = Some(value),
                 "token" => config.remote.token = Some(value),
                 "claude_path" => config.local.claude_path = value,
+                "minimax_path" => config.local.minimax_path = value,
                 "codex_path" => config.local.codex_path = value,
                 "daemon_machine_id" => config.daemon.machine_id = Some(value),
                 "daemon_roots" => {
@@ -729,7 +730,7 @@ async fn handle_config_command(action: ConfigAction) -> Result<()> {
                         .collect();
                 }
                 _ => anyhow::bail!(
-                    "Unknown config key: {}. Valid keys: server, token, claude_path, codex_path, daemon_machine_id, daemon_roots",
+                    "Unknown config key: {}. Valid keys: server, token, claude_path, minimax_path, codex_path, daemon_machine_id, daemon_roots",
                     key
                 ),
             }
@@ -747,11 +748,12 @@ async fn handle_config_command(action: ConfigAction) -> Result<()> {
                     .unwrap_or_default()
                     .to_string(),
                 "claude_path" => config.local.claude_path,
+                "minimax_path" => config.local.minimax_path,
                 "codex_path" => config.local.codex_path,
                 "daemon_machine_id" => config.daemon.machine_id.unwrap_or_default(),
                 "daemon_roots" => config.daemon.project_roots.join(","),
                 _ => anyhow::bail!(
-                    "Unknown config key: {}. Valid keys: server, token, claude_path, codex_path, daemon_machine_id, daemon_roots",
+                    "Unknown config key: {}. Valid keys: server, token, claude_path, minimax_path, codex_path, daemon_machine_id, daemon_roots",
                     key
                 ),
             };
@@ -765,6 +767,7 @@ async fn handle_config_command(action: ConfigAction) -> Result<()> {
                 config.remote.token.map(|_| "****").unwrap_or_default()
             );
             println!("claude_path: {}", config.local.claude_path);
+            println!("minimax_path: {}", config.local.minimax_path);
             println!("codex_path: {}", config.local.codex_path);
             println!(
                 "daemon_machine_id: {}",

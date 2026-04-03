@@ -70,22 +70,13 @@ fn resolve_pane_binary_path(
     provider: Provider,
     model: Option<&str>,
     claude_path: &str,
-    claude2_path: &str,
+    minimax_path: &str,
     codex_path: &str,
 ) -> String {
     match provider {
         Provider::Claude => {
             if is_minimax_model(model) {
-                // If claude2 could not be resolved in this environment, fall back
-                // to the default Claude binary instead of hard-failing on spawn.
-                if claude2_path == "claude2"
-                    && claude_path != "claude2"
-                    && (claude_path.starts_with('/') || claude_path.contains('/'))
-                {
-                    claude_path.to_string()
-                } else {
-                    claude2_path.to_string()
-                }
+                minimax_path.to_string()
             } else {
                 claude_path.to_string()
             }
@@ -146,7 +137,7 @@ async fn run_inner(
     // Resolve binary paths to absolute paths at startup (while PATH is correct).
     // Systemd-run environments may have a minimal PATH that misses nvm/cargo bins.
     let claude_path = resolve_binary_path(&config.local.claude_path);
-    let claude2_path = resolve_binary_path("claude2");
+    let minimax_path = resolve_binary_path(&config.local.minimax_path);
     let codex_path = resolve_binary_path(&config.local.codex_path);
 
     // Load or create project metadata
@@ -456,7 +447,7 @@ async fn run_inner(
             provider,
             model.as_deref(),
             &claude_path,
-            &claude2_path,
+            &minimax_path,
             &codex_path,
         );
         pane_threads.push(thread::spawn(move || {
@@ -491,7 +482,7 @@ async fn run_inner(
             provider,
             model.as_deref(),
             &claude_path,
-            &claude2_path,
+            &minimax_path,
             &codex_path,
         );
         pane_threads.push(thread::spawn(move || {
@@ -521,7 +512,7 @@ async fn run_inner(
         let input_channels_event = input_channels.clone();
         let working_dir_event = working_dir_str.clone();
         let claude_path_event = claude_path.clone();
-        let claude2_path_event = claude2_path.clone();
+        let minimax_path_event = minimax_path.clone();
         let codex_path_event = codex_path.clone();
         let pane_sessions_event = pane_sessions.clone();
         let pane_pauses_event = pane_pauses.clone();
@@ -539,7 +530,7 @@ async fn run_inner(
                 input_channels_event,
                 session_id,
                 &claude_path_event,
-                &claude2_path_event,
+                &minimax_path_event,
                 &codex_path_event,
                 &working_dir_event,
                 command_tx,
@@ -717,7 +708,7 @@ fn handle_tui_events(
     input_channels: InputChannels,
     session_id: Uuid,
     claude_path: &str,
-    claude2_path: &str,
+    minimax_path: &str,
     codex_path: &str,
     working_dir: &str,
     command_tx: mpsc::Sender<TuiCommand>,
@@ -787,7 +778,7 @@ fn handle_tui_events(
                         Provider::Claude,
                         None,
                         claude_path,
-                        claude2_path,
+                        minimax_path,
                         codex_path,
                     );
                     let working_dir = working_dir.to_string();
@@ -867,7 +858,7 @@ fn handle_tui_events(
                     provider,
                     model.as_deref(),
                     claude_path,
-                    claude2_path,
+                    minimax_path,
                     codex_path,
                 );
 
@@ -1150,7 +1141,7 @@ fn handle_tui_events(
                     provider,
                     existing_model.as_deref(),
                     claude_path,
-                    claude2_path,
+                    minimax_path,
                     codex_path,
                 );
                 {
@@ -1448,7 +1439,7 @@ fn handle_tui_events(
                     provider,
                     saved_model.as_deref(),
                     claude_path,
-                    claude2_path,
+                    minimax_path,
                     codex_path,
                 );
                 {
@@ -1817,7 +1808,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_pane_binary_path_falls_back_when_claude2_unresolved() {
+    fn resolve_pane_binary_path_keeps_minimax_binary_when_unresolved() {
         let path = resolve_pane_binary_path(
             Provider::Claude,
             Some("MiniMax-M2.7"),
@@ -1825,7 +1816,7 @@ mod tests {
             "claude2",
             "codex",
         );
-        assert_eq!(path, "/opt/bin/claude");
+        assert_eq!(path, "claude2");
     }
 
     #[test]

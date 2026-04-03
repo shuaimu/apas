@@ -22,6 +22,8 @@ pub struct RemoteConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalConfig {
     pub claude_path: String,
+    #[serde(default = "default_minimax_path")]
+    pub minimax_path: String,
     #[serde(default = "default_codex_path")]
     pub codex_path: String,
 }
@@ -34,6 +36,10 @@ pub struct DaemonConfig {
     pub project_roots: Vec<String>,
 }
 
+fn default_minimax_path() -> String {
+    "claude2".to_string()
+}
+
 fn default_codex_path() -> String {
     "codex".to_string()
 }
@@ -42,6 +48,7 @@ impl Default for LocalConfig {
     fn default() -> Self {
         Self {
             claude_path: "claude".to_string(),
+            minimax_path: default_minimax_path(),
             codex_path: default_codex_path(),
         }
     }
