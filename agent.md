@@ -207,31 +207,22 @@ ssh root@apas.mpaxos.com "systemctl restart apas-server"
 
 # For web updates
 rsync -av --exclude 'node_modules' --exclude '.next' packages/web/ root@apas.mpaxos.com:/opt/apas/web/
-ssh root@apas.mpaxos.com "cd /opt/apas/web && npm install && npm run build && systemctl restart apas-web"
-```
-
-## Versioning Rule (Mandatory, No Exceptions)
-
-Before every git commit, recalculate `packages/web/.apas-version` right before creating the commit.
-
-- This applies to every commit type (feature, bugfix, docs-only, housekeeping, etc.).
-- Never keep the old value from a previous commit.
-- A commit is not complete unless `packages/web/.apas-version` is committed in the same changeset.
-
-- Required format: `YY.MM.N`
-- `YY.MM` is current year/month
-- `N` is `(number of commits in current month) + 1` for the commit being created
-
-Use:
-
-```bash
 month_start="$(date +%Y-%m-01) 00:00:00"
-month_count="$(git rev-list --count --since="$month_start" --until="now" HEAD)"
-next_index="$((month_count + 1))"
-printf "%s.%s\n" "$(date +%y.%m)" "$next_index" > packages/web/.apas-version
+web_version="$(date +%y.%m).$(git rev-list --count --since="$month_start" HEAD)"
+ssh root@apas.mpaxos.com "cd /opt/apas/web && npm install && NEXT_PUBLIC_WEB_UI_VERSION=${web_version} npm run build && systemctl restart apas-web"
 ```
 
-Stage and commit `packages/web/.apas-version` together with the related changes.
+## Versioning Rule
+
+Version is computed at build time using the format `YY.MM.N`.
+
+- `YY.MM` is the current year/month.
+- `N` is `git rev-list --count --since="<YYYY-MM-01 00:00:00>" HEAD`.
+- Web version is resolved in `packages/web/next.config.ts`.
+- CLI and server versions are resolved in Rust `build.rs` files.
+- Do not manage `packages/web/.apas-version`; it is no longer used.
+
+If building web in a directory without `.git` (for example `/opt/apas/web` on production), pass `NEXT_PUBLIC_WEB_UI_VERSION` explicitly using the deploy command above.
 
 ## Key Concepts
 
