@@ -293,7 +293,6 @@ interface AppState {
   stopMachineProjectCli: (machineId: string, projectId: string) => void;
   setMachineMiniMaxConfig: (
     machineId: string,
-    apiBaseUrl?: string,
     apiKey?: string,
     clearApiKey?: boolean,
   ) => void;
@@ -324,6 +323,7 @@ interface AppState {
 }
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://apas.mpaxos.com:8080";
+const MINIMAX_API_BASE_URL = "https://api.minimax.io/anthropic";
 
 export const useStore = create<AppState>((set, get) => ({
   // Auth state - initialize from localStorage if available
@@ -672,7 +672,6 @@ export const useStore = create<AppState>((set, get) => ({
 
   setMachineMiniMaxConfig: (
     machineId: string,
-    apiBaseUrl?: string,
     apiKey?: string,
     clearApiKey: boolean = false,
   ) => {
@@ -683,7 +682,7 @@ export const useStore = create<AppState>((set, get) => ({
     ws.send(JSON.stringify({
       type: "set_machine_mini_max_config",
       machine_id: machineId,
-      api_base_url: apiBaseUrl != null ? apiBaseUrl : undefined,
+      api_base_url: MINIMAX_API_BASE_URL,
       api_key: apiKey && apiKey.trim().length > 0 ? apiKey : undefined,
       clear_api_key: clearApiKey,
     }));

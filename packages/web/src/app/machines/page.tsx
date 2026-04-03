@@ -6,6 +6,8 @@ import { useRouter } from "next/navigation";
 import { ArrowLeft, Play, RefreshCw, Square } from "lucide-react";
 import { useStore } from "@/lib/store";
 
+const MINIMAX_API_BASE_URL = "https://api.minimax.io/anthropic";
+
 export default function MachinesPage() {
   const router = useRouter();
   const {
@@ -18,7 +20,7 @@ export default function MachinesPage() {
     stopMachineProjectCli,
     setMachineMiniMaxConfig,
   } = useStore();
-  const [minimaxDrafts, setMinimaxDrafts] = useState<Record<string, { apiBaseUrl: string; apiKey: string }>>({});
+  const [minimaxDrafts, setMinimaxDrafts] = useState<Record<string, { apiKey: string }>>({});
 
   useEffect(() => {
     const storedToken = localStorage.getItem("apas_token");
@@ -77,23 +79,10 @@ export default function MachinesPage() {
 
             <div className="border-b border-gray-200 px-4 py-3 dark:border-gray-800">
               <div className="mb-2 text-sm font-medium">MiniMax Backend (Claude Runtime)</div>
-              <div className="grid gap-2 md:grid-cols-[1fr_1fr_auto_auto]">
-                <input
-                  type="text"
-                  value={minimaxDrafts[machine.machineId]?.apiBaseUrl ?? machine.minimaxBackend?.apiBaseUrl ?? ""}
-                  onChange={(e) => {
-                    const nextBaseUrl = e.target.value;
-                    setMinimaxDrafts((prev) => ({
-                      ...prev,
-                      [machine.machineId]: {
-                        apiBaseUrl: nextBaseUrl,
-                        apiKey: prev[machine.machineId]?.apiKey ?? machine.minimaxBackend?.apiKey ?? "",
-                      },
-                    }));
-                  }}
-                  placeholder="https://your-minimax-endpoint/anthropic"
-                  className="rounded border border-gray-300 px-3 py-2 text-sm dark:border-gray-700 dark:bg-gray-950"
-                />
+              <div className="mb-2 text-xs text-gray-500">
+                Backend URL: <span className="font-mono">{MINIMAX_API_BASE_URL}</span>
+              </div>
+              <div className="grid gap-2 md:grid-cols-[1fr_auto_auto]">
                 <input
                   type="text"
                   value={minimaxDrafts[machine.machineId]?.apiKey ?? machine.minimaxBackend?.apiKey ?? ""}
@@ -102,30 +91,25 @@ export default function MachinesPage() {
                     setMinimaxDrafts((prev) => ({
                       ...prev,
                       [machine.machineId]: {
-                        apiBaseUrl:
-                          prev[machine.machineId]?.apiBaseUrl ?? machine.minimaxBackend?.apiBaseUrl ?? "",
                         apiKey: nextApiKey,
                       },
                     }));
                   }}
-                  placeholder="API key (leave blank to keep current)"
+                  placeholder="MiniMax API key"
                   className="rounded border border-gray-300 px-3 py-2 text-sm dark:border-gray-700 dark:bg-gray-950"
                 />
                 <button
                   onClick={() => {
                     const draft = minimaxDrafts[machine.machineId];
-                    const baseUrl = draft?.apiBaseUrl ?? machine.minimaxBackend?.apiBaseUrl ?? "";
                     const apiKey = draft?.apiKey ?? machine.minimaxBackend?.apiKey ?? "";
                     setMachineMiniMaxConfig(
                       machine.machineId,
-                      baseUrl,
                       apiKey.trim().length > 0 ? apiKey : undefined,
                       false,
                     );
                     setMinimaxDrafts((prev) => ({
                       ...prev,
                       [machine.machineId]: {
-                        apiBaseUrl: baseUrl,
                         apiKey,
                       },
                     }));
@@ -136,13 +120,10 @@ export default function MachinesPage() {
                 </button>
                 <button
                   onClick={() => {
-                    const draft = minimaxDrafts[machine.machineId];
-                    const baseUrl = draft?.apiBaseUrl ?? machine.minimaxBackend?.apiBaseUrl ?? "";
-                    setMachineMiniMaxConfig(machine.machineId, baseUrl, undefined, true);
+                    setMachineMiniMaxConfig(machine.machineId, undefined, true);
                     setMinimaxDrafts((prev) => ({
                       ...prev,
                       [machine.machineId]: {
-                        apiBaseUrl: baseUrl,
                         apiKey: "",
                       },
                     }));

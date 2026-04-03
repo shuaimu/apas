@@ -95,6 +95,8 @@ fn provider_config_key(provider: &Provider, model: Option<&str>) -> &'static str
     }
 }
 
+const MINIMAX_API_BASE_URL: &str = "https://api.minimax.io/anthropic";
+
 fn trim_to_option(raw: Option<String>) -> Option<String> {
     raw.and_then(|value| {
         let trimmed = value.trim();
@@ -108,14 +110,12 @@ fn trim_to_option(raw: Option<String>) -> Option<String> {
 
 #[derive(Debug, Clone, Default)]
 struct MiniMaxBackendRuntimeConfig {
-    api_base_url: Option<String>,
     api_key: Option<String>,
 }
 
 fn load_minimax_backend_runtime_config() -> MiniMaxBackendRuntimeConfig {
     let config = crate::config::Config::load().unwrap_or_default();
     MiniMaxBackendRuntimeConfig {
-        api_base_url: trim_to_option(config.local.minimax_api_base_url),
         api_key: trim_to_option(config.local.minimax_api_key),
     }
 }
@@ -129,15 +129,15 @@ fn build_pane_env_overrides(
     }
 
     let runtime = load_minimax_backend_runtime_config();
-    let api_base_url = runtime.api_base_url.ok_or_else(|| {
-        "MiniMax backend is not configured (missing minimax_api_base_url). Update it on the Machines page or run: apas config set minimax_api_base_url <url>.".to_string()
-    })?;
     let api_key = runtime.api_key.ok_or_else(|| {
         "MiniMax backend is not configured (missing minimax_api_key). Update it on the Machines page or run: apas config set minimax_api_key <key>.".to_string()
     })?;
 
     let mut env = vec![
-        ("ANTHROPIC_BASE_URL".to_string(), api_base_url),
+        (
+            "ANTHROPIC_BASE_URL".to_string(),
+            MINIMAX_API_BASE_URL.to_string(),
+        ),
         // Keep both names for compatibility across Claude CLI versions/wrappers.
         ("ANTHROPIC_AUTH_TOKEN".to_string(), api_key.clone()),
         ("ANTHROPIC_API_KEY".to_string(), api_key),

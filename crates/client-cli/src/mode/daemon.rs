@@ -18,6 +18,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const VERSION: &str = env!("APAS_VERSION");
 const TMUX_SESSION_PREFIX: &str = "apas";
+const MINIMAX_API_BASE_URL: &str = "https://api.minimax.io/anthropic";
 
 fn resolve_user_shell_path() -> Option<String> {
     let shell = std::env::var("SHELL")
@@ -63,30 +64,23 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
 }
 
 fn minimax_backend_info_from_config(config: &crate::config::Config) -> Option<MiniMaxBackendInfo> {
-    let api_base_url = normalize_optional_string(config.local.minimax_api_base_url.clone());
+    let api_base_url = Some(MINIMAX_API_BASE_URL.to_string());
     let api_key = normalize_optional_string(config.local.minimax_api_key.clone());
     let api_key_configured = api_key.is_some();
-    if api_base_url.is_none() && api_key.is_none() {
-        None
-    } else {
-        Some(MiniMaxBackendInfo {
-            api_base_url,
-            api_key,
-            api_key_configured,
-        })
-    }
+    Some(MiniMaxBackendInfo {
+        api_base_url,
+        api_key,
+        api_key_configured,
+    })
 }
 
 fn update_local_minimax_backend_config(
-    api_base_url: Option<String>,
+    _api_base_url: Option<String>,
     api_key: Option<String>,
     clear_api_key: bool,
 ) -> Result<Option<MiniMaxBackendInfo>> {
     let mut config = crate::config::Config::load().unwrap_or_default();
-
-    if let Some(url) = api_base_url {
-        config.local.minimax_api_base_url = normalize_optional_string(Some(url));
-    }
+    config.local.minimax_api_base_url = Some(MINIMAX_API_BASE_URL.to_string());
 
     if clear_api_key {
         config.local.minimax_api_key = None;
