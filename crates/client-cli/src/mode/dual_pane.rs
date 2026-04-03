@@ -1627,7 +1627,9 @@ fn build_agent_args(
             ];
             if let Some(model) = model {
                 let trimmed = model.trim();
-                if !trimmed.is_empty() {
+                // MiniMax panes run with the claude2 binary and should not pass
+                // `--model MiniMax-*` because that model flag is rejected there.
+                if !trimmed.is_empty() && !is_minimax_model(Some(trimmed)) {
                     base.extend_from_slice(&["--model".to_string(), trimmed.to_string()]);
                 }
             }
@@ -1754,7 +1756,22 @@ mod tests {
     }
 
     #[test]
-    fn build_agent_args_claude_with_model_includes_model_flag() {
+    fn build_agent_args_claude_with_non_minimax_model_includes_model_flag() {
+        let session_id = Uuid::new_v4();
+        let (args, _) = build_agent_args(
+            &Provider::Claude,
+            &session_id,
+            FULL_PROMPT,
+            Some("sonnet"),
+            true,
+            false,
+        );
+
+        assert!(args.windows(2).any(|w| w == ["--model", "sonnet"]));
+    }
+
+    #[test]
+    fn build_agent_args_claude_with_minimax_model_omits_model_flag() {
         let session_id = Uuid::new_v4();
         let (args, _) = build_agent_args(
             &Provider::Claude,
@@ -1765,7 +1782,7 @@ mod tests {
             false,
         );
 
-        assert!(args.windows(2).any(|w| w == ["--model", "MiniMax-M2.7"]));
+        assert!(!args.iter().any(|arg| arg == "--model"));
     }
 
     #[test]
