@@ -210,9 +210,13 @@ rsync -av --exclude 'node_modules' --exclude '.next' packages/web/ root@apas.mpa
 ssh root@apas.mpaxos.com "cd /opt/apas/web && npm install && npm run build && systemctl restart apas-web"
 ```
 
-## Versioning Rule (Mandatory)
+## Versioning Rule (Mandatory, No Exceptions)
 
-Before every git commit, update `packages/web/.apas-version`.
+Before every git commit, recalculate `packages/web/.apas-version` right before creating the commit.
+
+- This applies to every commit type (feature, bugfix, docs-only, housekeeping, etc.).
+- Never keep the old value from a previous commit.
+- A commit is not complete unless `packages/web/.apas-version` is committed in the same changeset.
 
 - Required format: `YY.MM.N`
 - `YY.MM` is current year/month
@@ -227,7 +231,7 @@ next_index="$((month_count + 1))"
 printf "%s.%s\n" "$(date +%y.%m)" "$next_index" > packages/web/.apas-version
 ```
 
-Commit `packages/web/.apas-version` together with the related changes.
+Stage and commit `packages/web/.apas-version` together with the related changes.
 
 ## Key Concepts
 
