@@ -16,6 +16,8 @@ use uuid::Uuid;
 use crate::routes::auth::verify_token;
 use crate::state::AppState;
 
+const SERVER_VERSION: &str = env!("APAS_SERVER_VERSION");
+
 pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
@@ -252,6 +254,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                             ServerToWeb::Authenticated {
                                                 user_id: uid,
                                                 user_email,
+                                                server_version: Some(SERVER_VERSION.to_string()),
                                             },
                                         )
                                         .await;

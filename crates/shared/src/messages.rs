@@ -349,6 +349,8 @@ pub enum ServerToWeb {
         user_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         user_email: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server_version: Option<String>,
     },
 
     /// Authentication failed

@@ -217,6 +217,7 @@ interface AppState {
   token: string | null;
   userId: string | null;
   userEmail: string | null;
+  serverVersion: string | null;
   isAuthenticated: boolean;
 
   // Connection state
@@ -318,6 +319,7 @@ export const useStore = create<AppState>((set, get) => ({
   token: typeof window !== 'undefined' ? localStorage.getItem("apas_token") : null,
   userId: typeof window !== 'undefined' ? localStorage.getItem("apas_user_id") : null,
   userEmail: typeof window !== 'undefined' ? localStorage.getItem("apas_user_email") : null,
+  serverVersion: null,
   isAuthenticated: false,
 
   connected: false,
@@ -395,6 +397,7 @@ export const useStore = create<AppState>((set, get) => ({
       connected: false,
       ws: null,
       sessionId: null,
+      serverVersion: null,
       cliClients: [],
       sessions: [],
       machines: [],
@@ -518,6 +521,7 @@ export const useStore = create<AppState>((set, get) => ({
       connected: false,
       ws: null,
       sessionId: null,
+      serverVersion: null,
       cliClients: [],
       machines: [],
       paneModes: {},
@@ -1036,6 +1040,7 @@ function handleServerMessage(
         isAuthenticated: true,
         userId: data.user_id as string,
         userEmail: (data.user_email as string | undefined) ?? get().userEmail,
+        serverVersion: (data.server_version as string | undefined) ?? null,
       });
       if (data.user_email) {
         localStorage.setItem("apas_user_email", data.user_email as string);
@@ -1065,6 +1070,7 @@ function handleServerMessage(
         token: null,
         userId: null,
         userEmail: null,
+        serverVersion: null,
       });
       break;
 

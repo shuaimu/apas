@@ -40,7 +40,7 @@ function setProjectLayout(cliClientId: string | null | undefined, key: string, v
 
 export default function Home() {
   const router = useRouter();
-  const { connected, connect, disconnect, sessionId, isAuthenticated, logout, token, userId, userEmail, cliClientId, cliClients, setUserEmail } = useStore();
+  const { connected, connect, disconnect, sessionId, isAuthenticated, logout, token, userId, userEmail, serverVersion, cliClientId, cliClients, setUserEmail } = useStore();
   const [isCheckingAuth, setIsCheckingAuth] = useState(true);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -249,7 +249,7 @@ export default function Home() {
             </button>
             <h1 className="text-xl font-semibold">APAS</h1>
             <span className="text-sm text-gray-500 hidden sm:inline">
-              Claude Code Remote · Web v{WEB_UI_VERSION} · CLI v{currentProjectCliVersion ?? "unknown"}
+              Claude Code Remote · Web v{WEB_UI_VERSION} · Server v{serverVersion ?? "unknown"} · CLI v{currentProjectCliVersion ?? "unknown"}
             </span>
           </div>
           <div className="flex items-center gap-1 sm:gap-2">
