@@ -427,7 +427,7 @@ pub async fn run(
 
     let registry = crate::project::project_registry_path()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "~/.apas/projects.json".to_string());
+        .unwrap_or_else(|_| "~/.config/apas/projects.json".to_string());
     tracing::info!(
         "Starting daemon for machine {} using project registry {}",
         machine_id,

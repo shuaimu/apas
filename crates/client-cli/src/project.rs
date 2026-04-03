@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 const APAS_FILE: &str = ".apas";
-const USER_REGISTRY_DIR: &str = ".apas";
 const USER_PROJECTS_FILE: &str = "projects.json";
+const LEGACY_USER_REGISTRY_DIR: &str = ".apas";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisteredProject {
@@ -168,22 +168,20 @@ impl ProjectMetadata {
 }
 
 pub fn project_registry_path() -> Result<PathBuf> {
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-    let registry_dir = home.join(USER_REGISTRY_DIR);
-    std::fs::create_dir_all(&registry_dir)?;
-    Ok(registry_dir.join(USER_PROJECTS_FILE))
+    let path = crate::config::Config::config_dir()?.join(USER_PROJECTS_FILE);
+    maybe_migrate_legacy_project_registry(&path);
+    Ok(path)
 }
 
 pub fn list_registered_projects() -> Result<Vec<RegisteredProject>> {
     let path = project_registry_path()?;
-    let registry = read_project_registry(&path)?;
+    let registry = read_existing_project_registry(&path)?;
     Ok(registry.projects)
 }
 
 pub fn register_project(dir: &Path, metadata: &ProjectMetadata) -> Result<()> {
     let path = project_registry_path()?;
-    let mut registry = match read_project_registry(&path) {
+    let mut registry = match read_existing_project_registry(&path) {
         Ok(registry) => registry,
         Err(err) => {
             tracing::warn!(
@@ -234,12 +232,130 @@ fn read_project_registry(path: &Path) -> Result<ProjectRegistry> {
     anyhow::bail!("Failed to parse project registry at {:?}", path)
 }
 
+fn read_existing_project_registry(preferred_path: &Path) -> Result<ProjectRegistry> {
+    if preferred_path.exists() {
+        return read_project_registry(preferred_path);
+    }
+
+    if let Ok(legacy_path) = legacy_project_registry_path() {
+        if legacy_path.exists() {
+            return read_project_registry(&legacy_path);
+        }
+    }
+
+    Ok(ProjectRegistry::default())
+}
+
+fn legacy_project_registry_path() -> Result<PathBuf> {
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+    Ok(home.join(LEGACY_USER_REGISTRY_DIR).join(USER_PROJECTS_FILE))
+}
+
+fn maybe_migrate_legacy_project_registry(preferred_path: &Path) {
+    if preferred_path.exists() {
+        return;
+    }
+
+    let legacy_path = match legacy_project_registry_path() {
+        Ok(path) => path,
+        Err(err) => {
+            tracing::debug!("Skipping legacy project registry migration: {}", err);
+            return;
+        }
+    };
+
+    if !legacy_path.exists() {
+        return;
+    }
+
+    if let Some(parent) = preferred_path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            tracing::warn!(
+                "Failed to create project registry directory {:?}: {}",
+                parent,
+                err
+            );
+            return;
+        }
+    }
+
+    match std::fs::rename(&legacy_path, preferred_path) {
+        Ok(()) => {
+            tracing::info!(
+                "Migrated project registry from {:?} to {:?}",
+                legacy_path,
+                preferred_path
+            );
+        }
+        Err(rename_err) => {
+            tracing::warn!(
+                "Failed to move legacy project registry from {:?} to {:?}: {}. Falling back to copy.",
+                legacy_path,
+                preferred_path,
+                rename_err
+            );
+            match std::fs::copy(&legacy_path, preferred_path) {
+                Ok(_) => {
+                    if let Err(err) = std::fs::remove_file(&legacy_path) {
+                        tracing::warn!(
+                            "Copied legacy project registry to {:?}, but failed to remove {:?}: {}",
+                            preferred_path,
+                            legacy_path,
+                            err
+                        );
+                    } else {
+                        tracing::info!(
+                            "Migrated project registry from {:?} to {:?}",
+                            legacy_path,
+                            preferred_path
+                        );
+                    }
+                }
+                Err(copy_err) => {
+                    tracing::warn!(
+                        "Failed to copy legacy project registry from {:?} to {:?}: {}",
+                        legacy_path,
+                        preferred_path,
+                        copy_err
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn write_project_registry(path: &Path, registry: &ProjectRegistry) -> Result<()> {
     let content = serde_json::to_string_pretty(registry)?;
     let tmp_path = path.with_extension("json.tmp");
     std::fs::write(&tmp_path, content)?;
     std::fs::rename(tmp_path, path)?;
     Ok(())
+}
+
+fn normalize_project_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn find_registered_project_by_path_in_registry(
+    registry: &ProjectRegistry,
+    dir: &Path,
+) -> Option<RegisteredProject> {
+    let normalized_dir = normalize_project_path(dir);
+    registry.projects.iter().find_map(|entry| {
+        let entry_path = PathBuf::from(&entry.path);
+        if normalize_project_path(&entry_path) == normalized_dir {
+            Some(entry.clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn find_registered_project_by_path(dir: &Path) -> Option<RegisteredProject> {
+    let path = project_registry_path().ok()?;
+    let registry = read_existing_project_registry(&path).ok()?;
+    find_registered_project_by_path_in_registry(&registry, dir)
 }
 
 /// Get or create the .apas metadata file for a directory
@@ -257,11 +373,40 @@ pub fn get_or_create_project(dir: &Path) -> Result<ProjectMetadata> {
         }
         Ok(metadata)
     } else {
-        // Create new metadata with directory name as project name
-        let name = dir.file_name().and_then(|n| n.to_str()).map(String::from);
+        // Create new metadata with directory name as project name.
+        // If this project was previously registered, preserve its session ID.
+        let default_name = dir.file_name().and_then(|n| n.to_str()).map(String::from);
+        let mut recovered_name: Option<String> = None;
+        let id = if let Some(project) = find_registered_project_by_path(dir) {
+            recovered_name = project.name;
+            match Uuid::parse_str(&project.project_id) {
+                Ok(existing_id) => {
+                    tracing::warn!(
+                        "Project metadata {:?} is missing; recovering existing project id {} from registry",
+                        apas_path,
+                        existing_id
+                    );
+                    existing_id
+                }
+                Err(err) => {
+                    let new_id = Uuid::new_v4();
+                    tracing::warn!(
+                        "Project metadata {:?} is missing; registry project id {:?} is invalid ({}), generating new id {}",
+                        apas_path,
+                        project.project_id,
+                        err,
+                        new_id
+                    );
+                    new_id
+                }
+            }
+        } else {
+            Uuid::new_v4()
+        };
+        let name = recovered_name.or(default_name);
 
         let metadata = ProjectMetadata {
-            id: Uuid::new_v4(),
+            id,
             name,
             created_at: chrono::Utc::now().to_rfc3339(),
             prompt: None,
@@ -303,4 +448,67 @@ pub fn get_apas_path(dir: &Path) -> PathBuf {
 /// Check if a directory has been initialized as an apas project
 pub fn is_project(dir: &Path) -> bool {
     dir.join(APAS_FILE).exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "apas-project-{}-{}-{}",
+            label,
+            std::process::id(),
+            stamp
+        ))
+    }
+
+    #[test]
+    fn finds_registered_project_by_path() {
+        let dir = unique_temp_dir("match");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        let expected = RegisteredProject {
+            project_id: Uuid::new_v4().to_string(),
+            name: Some("demo".to_string()),
+            path: dir.to_string_lossy().to_string(),
+        };
+        let registry = ProjectRegistry {
+            projects: vec![expected.clone()],
+        };
+
+        let found = find_registered_project_by_path_in_registry(&registry, &dir);
+        assert_eq!(
+            found.expect("project should be found").project_id,
+            expected.project_id
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn does_not_match_other_paths() {
+        let existing_dir = unique_temp_dir("existing");
+        let target_dir = unique_temp_dir("target");
+        std::fs::create_dir_all(&existing_dir).expect("create temp dir");
+        std::fs::create_dir_all(&target_dir).expect("create temp dir");
+
+        let registry = ProjectRegistry {
+            projects: vec![RegisteredProject {
+                project_id: Uuid::new_v4().to_string(),
+                name: Some("other".to_string()),
+                path: existing_dir.to_string_lossy().to_string(),
+            }],
+        };
+
+        assert!(find_registered_project_by_path_in_registry(&registry, &target_dir).is_none());
+
+        let _ = std::fs::remove_dir_all(&existing_dir);
+        let _ = std::fs::remove_dir_all(&target_dir);
+    }
 }

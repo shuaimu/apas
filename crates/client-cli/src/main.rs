@@ -115,7 +115,7 @@ enum Commands {
     Whoami,
     /// Run per-machine daemon for machine/project control in web UI
     Daemon {
-        /// Legacy option (ignored): daemon now reads ~/.apas/projects.json
+        /// Legacy option (ignored): daemon now reads ~/.config/apas/projects.json
         #[arg(long = "root", short = 'r')]
         roots: Vec<PathBuf>,
     },
@@ -257,7 +257,7 @@ async fn main() -> Result<()> {
 
                 let project_roots = if !roots.is_empty() {
                     tracing::warn!(
-                        "--root is deprecated and ignored; daemon now uses ~/.apas/projects.json"
+                        "--root is deprecated and ignored; daemon now uses ~/.config/apas/projects.json"
                     );
                     config.daemon.project_roots = roots
                         .iter()
