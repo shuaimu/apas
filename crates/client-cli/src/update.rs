@@ -3,7 +3,7 @@
 use anyhow::Result;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const REPO_URL: &str = "https://github.com/shuaimu/apas.git";
@@ -18,8 +18,8 @@ fn source_dir() -> PathBuf {
     dir
 }
 
-/// Parse version string (YY.MM.COMMIT) into comparable number
-fn parse_version(v: &str) -> Option<u64> {
+/// Parse version string (YY.MM.COMMIT) into comparable tuple
+fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
     // Format: YY.MM.COMMIT (e.g., 26.01.42)
     let parts: Vec<&str> = v.split('.').collect();
     if parts.len() != 3 {
@@ -28,13 +28,85 @@ fn parse_version(v: &str) -> Option<u64> {
     let yy: u64 = parts[0].parse().ok()?;
     let mm: u64 = parts[1].parse().ok()?;
     let commit: u64 = parts[2].parse().ok()?;
-    // Create comparable number: YYMM * 10000 + commit
-    Some(yy * 1_000_000 + mm * 10_000 + commit)
+    Some((yy, mm, commit))
 }
 
-/// Get the path to the current executable
+/// Get the path to the current executable as reported by the OS.
 fn get_current_exe() -> Option<PathBuf> {
     env::current_exe().ok()
+}
+
+fn is_proc_self_exe(path: &Path) -> bool {
+    path == Path::new("/proc/self/exe")
+}
+
+fn is_deleted_path(path: &Path) -> bool {
+    path.to_string_lossy().contains(" (deleted)")
+}
+
+/// Return a usable on-disk executable for the current process.
+/// This intentionally excludes /proc/self/exe and deleted inode paths.
+fn get_current_on_disk_exe() -> Option<PathBuf> {
+    let path = get_current_exe()?;
+    if is_proc_self_exe(&path) || is_deleted_path(&path) || !path.exists() {
+        return None;
+    }
+    Some(path)
+}
+
+fn home_installed_exe() -> Option<PathBuf> {
+    dirs::home_dir()
+        .map(|home| home.join(".local/bin/apas"))
+        .filter(|path| path.exists())
+}
+
+fn path_installed_exe() -> Option<PathBuf> {
+    let path_var = env::var_os("PATH")?;
+    for dir in env::split_paths(&path_var) {
+        let candidate = dir.join("apas");
+        if !candidate.exists() {
+            continue;
+        }
+        if is_proc_self_exe(&candidate) || is_deleted_path(&candidate) {
+            continue;
+        }
+        return Some(candidate);
+    }
+    None
+}
+
+fn argv0_exe() -> Option<PathBuf> {
+    let argv0 = env::args().next()?;
+    let path = PathBuf::from(argv0);
+    if !path.is_absolute() || !path.exists() {
+        return None;
+    }
+    if is_proc_self_exe(&path) || is_deleted_path(&path) {
+        return None;
+    }
+    Some(path)
+}
+
+fn default_install_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".local/bin/apas"))
+}
+
+fn resolve_install_target_exe() -> Option<PathBuf> {
+    get_current_on_disk_exe()
+        .or_else(home_installed_exe)
+        .or_else(path_installed_exe)
+        .or_else(argv0_exe)
+        .or_else(default_install_path)
+}
+
+/// Resolve the executable path we should restart/spawn.
+/// Priority is always real on-disk binaries, never /proc/self/exe.
+pub fn resolve_preferred_apas_executable() -> PathBuf {
+    get_current_on_disk_exe()
+        .or_else(home_installed_exe)
+        .or_else(path_installed_exe)
+        .or_else(argv0_exe)
+        .unwrap_or_else(|| PathBuf::from("apas"))
 }
 
 /// Ensure the source repo exists (clone if not, fetch if exists)
@@ -92,19 +164,28 @@ fn sync_source_repo() -> Option<bool> {
 fn get_source_version() -> Option<String> {
     let src_dir = source_dir();
 
-    // Get commit count
+    // Get date in YY.MM format
+    let output = Command::new("date").args(["+%y.%m"]).output().ok()?;
+    let date = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    // Get month start timestamp for current month (YYYY-MM-01 00:00:00)
+    let output = Command::new("date")
+        .args(["+%Y-%m-01 00:00:00"])
+        .output()
+        .ok()?;
+    let month_start = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    // Get commit count since month start
     let output = Command::new("git")
-        .args(["rev-list", "--count", "origin/master"])
+        .arg("rev-list")
+        .arg("--count")
+        .arg(format!("--since={month_start}"))
+        .arg("origin/master")
         .current_dir(&src_dir)
         .output()
         .ok()?;
 
     let commit_count = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-    // Get date in YY.MM format
-    let output = Command::new("date").args(["+%y.%m"]).output().ok()?;
-
-    let date = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
     Some(format!("{}.{}", date, commit_count))
 }
@@ -148,21 +229,32 @@ fn pull_and_build() -> Result<PathBuf> {
 
 /// Install a new binary by replacing the current one
 fn install_binary(new_binary: &PathBuf) -> Result<()> {
-    let current_exe =
-        get_current_exe().ok_or_else(|| anyhow::anyhow!("Cannot determine executable path"))?;
+    let install_path = resolve_install_target_exe()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine install target path"))?;
+
+    if let Some(parent) = install_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
 
     // Backup and replace
-    let backup_path = current_exe.with_extension("old");
-    fs::rename(&current_exe, &backup_path).ok();
+    let backup_path = install_path.with_extension("old");
+    let had_existing = install_path.exists();
+    if had_existing {
+        let _ = fs::rename(&install_path, &backup_path);
+    }
 
-    if let Err(e) = fs::copy(new_binary, &current_exe) {
+    if let Err(e) = fs::copy(new_binary, &install_path) {
         // Restore backup
-        fs::rename(&backup_path, &current_exe).ok();
+        if had_existing {
+            let _ = fs::rename(&backup_path, &install_path);
+        }
         anyhow::bail!("Failed to install: {}", e);
     }
 
     // Cleanup backup
-    fs::remove_file(&backup_path).ok();
+    if had_existing {
+        let _ = fs::remove_file(&backup_path);
+    }
 
     Ok(())
 }
@@ -199,7 +291,7 @@ pub async fn check_and_update() -> Result<()> {
     install_binary(&new_binary)?;
 
     // Get new version
-    let current_exe = get_current_exe().unwrap();
+    let current_exe = resolve_preferred_apas_executable();
     let output = Command::new(&current_exe).args(["--version"]).output();
 
     let new_version = output
@@ -304,18 +396,14 @@ pub fn check_and_upgrade_on_boot() {
     restart_self();
 }
 
-/// Restart using the newly installed binary (for auto-update)
-/// This uses get_current_exe() to find the actual installed binary path,
-/// NOT /proc/self/exe which would run the old binary still in memory.
+/// Restart using the preferred on-disk binary (for auto-update).
 #[cfg(unix)]
 fn restart_self() {
     use std::os::unix::process::CommandExt;
 
     let args: Vec<String> = env::args().collect();
 
-    // Use the actual installed binary path, not /proc/self/exe
-    // because /proc/self/exe points to the OLD binary in memory
-    let exe = get_current_exe().unwrap_or_else(|| PathBuf::from("apas"));
+    let exe = resolve_preferred_apas_executable();
 
     eprintln!("[Auto-update] Restarting with new binary: {:?}", exe);
 
@@ -341,31 +429,25 @@ pub fn restart_cli() {
 
     let args: Vec<String> = env::args().collect();
 
-    // On Linux, /proc/self/exe always points to the current executable
-    // even if the file was deleted/replaced
-    let proc_self_exe = PathBuf::from("/proc/self/exe");
-    let current_exe = get_current_exe();
-    let argv0 = args.first().map(PathBuf::from);
-
-    // Try paths in order of preference
-    let exe = if proc_self_exe.exists() {
-        // /proc/self/exe is most reliable on Linux
-        proc_self_exe
-    } else if let Some(ref path) = current_exe {
-        if path.exists() {
-            path.clone()
-        } else if let Some(ref a0) = argv0 {
-            if a0.exists() {
-                a0.clone()
-            } else {
-                PathBuf::from("apas")
+    if let Some(newer) = check_for_update_available() {
+        eprintln!(
+            "[Restart] Newer git version detected ({} > {}), updating before reboot...",
+            newer, CURRENT_VERSION
+        );
+        match pull_and_build().and_then(|binary| install_binary(&binary)) {
+            Ok(()) => {
+                eprintln!("[Restart] Update installed, rebooting into {}", newer);
             }
-        } else {
-            PathBuf::from("apas")
+            Err(err) => {
+                eprintln!(
+                    "[Restart] Update before reboot failed ({}), continuing with installed binary",
+                    err
+                );
+            }
         }
-    } else {
-        PathBuf::from("apas")
-    };
+    }
+
+    let exe = resolve_preferred_apas_executable();
 
     // Clear terminal screen and show countdown
     print!("\x1B[2J\x1B[H");

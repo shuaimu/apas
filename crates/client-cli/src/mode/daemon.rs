@@ -284,18 +284,8 @@ impl DaemonState {
             return Ok(());
         }
 
-        // Prefer the on-disk path, falling back to current_exe().
-        // current_exe() can return a "(deleted)" path if the binary was
-        // replaced while the daemon is still running.
-        let executable = std::env::current_exe()
-            .ok()
-            .filter(|p| p.exists())
-            .or_else(|| {
-                dirs::home_dir()
-                    .map(|h| h.join(".local/bin/apas"))
-                    .filter(|p| p.exists())
-            })
-            .unwrap_or_else(|| PathBuf::from("apas"));
+        // Prefer a real on-disk installed binary, never /proc/self/exe.
+        let executable = crate::update::resolve_preferred_apas_executable();
         let child_path = launch_path();
         if tmux_has_session(&session_name) {
             tmux_kill_session(&session_name)?;

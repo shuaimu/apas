@@ -562,15 +562,7 @@ fn stop_daemon_process(pid: u32) -> Result<()> {
 }
 
 fn resolve_apas_executable() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .filter(|path| path.exists())
-        .or_else(|| {
-            dirs::home_dir()
-                .map(|home| home.join(".local/bin/apas"))
-                .filter(|path| path.exists())
-        })
-        .unwrap_or_else(|| PathBuf::from("apas"))
+    update::resolve_preferred_apas_executable()
 }
 
 fn start_daemon_with_systemd(server: &str, roots: &[String]) -> Result<Option<u32>> {
