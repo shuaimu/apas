@@ -8,14 +8,13 @@ import { Sidebar } from "@/components/Sidebar";
 import { ResizeHandle } from "@/components/ResizeHandle";
 import { useStore } from "@/lib/store";
 import { Settings, Wifi, WifiOff, LogOut, Menu, X, RefreshCw } from "lucide-react";
-import webPackage from "../../package.json";
 
 const MIN_SIDEBAR_WIDTH = 180;
 const MAX_SIDEBAR_WIDTH = 400;
 const DEFAULT_SIDEBAR_WIDTH = 256;
 const REPO_URL = "https://github.com/shuaimu/apas";
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://apas.mpaxos.com:8080";
-const WEB_UI_VERSION = typeof webPackage.version === "string" ? webPackage.version : "dev";
+const WEB_UI_VERSION = process.env.NEXT_PUBLIC_WEB_UI_VERSION || "00.00.0";
 
 // Helper to get/set per-project layout preferences
 function getProjectLayoutKey(cliClientId: string | null | undefined, key: string): string {

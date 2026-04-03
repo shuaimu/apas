@@ -6,6 +6,7 @@
 node_modules/
 packages/web/.next/
 packages/web/out/
+packages/web/.apas-version
 
 # IDE
 .idea/
