@@ -23,3 +23,22 @@ ssh root@apas.mpaxos.com "cd /opt/apas/web && npm install && npm run build && sy
 ## Web UI
 
 - **URL:** http://apas.mpaxos.com
+
+## Versioning Rule (Mandatory)
+
+When making a git commit, always update `packages/web/.apas-version` before committing.
+
+- Format must be: `YY.MM.N`
+- `YY.MM` = current year/month
+- `N` = number of commits in the current month + 1 (the next commit index)
+
+Use this command sequence:
+
+```bash
+month_start="$(date +%Y-%m-01) 00:00:00"
+month_count="$(git rev-list --count --since="$month_start" --until="now" HEAD)"
+next_index="$((month_count + 1))"
+printf "%s.%s\n" "$(date +%y.%m)" "$next_index" > packages/web/.apas-version
+```
+
+Then include `packages/web/.apas-version` in the same commit.

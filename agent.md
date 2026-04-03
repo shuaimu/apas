@@ -210,6 +210,25 @@ rsync -av --exclude 'node_modules' --exclude '.next' packages/web/ root@apas.mpa
 ssh root@apas.mpaxos.com "cd /opt/apas/web && npm install && npm run build && systemctl restart apas-web"
 ```
 
+## Versioning Rule (Mandatory)
+
+Before every git commit, update `packages/web/.apas-version`.
+
+- Required format: `YY.MM.N`
+- `YY.MM` is current year/month
+- `N` is `(number of commits in current month) + 1` for the commit being created
+
+Use:
+
+```bash
+month_start="$(date +%Y-%m-01) 00:00:00"
+month_count="$(git rev-list --count --since="$month_start" --until="now" HEAD)"
+next_index="$((month_count + 1))"
+printf "%s.%s\n" "$(date +%y.%m)" "$next_index" > packages/web/.apas-version
+```
+
+Commit `packages/web/.apas-version` together with the related changes.
+
 ## Key Concepts
 
 1. **Dual-Pane Mode** (default): Split TUI with deadloop (left) and interactive (right) panes
