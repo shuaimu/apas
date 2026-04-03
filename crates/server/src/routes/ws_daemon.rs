@@ -69,6 +69,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     Ok(DaemonToServer::Heartbeat { .. }) => {
                         tracing::warn!("Daemon sent heartbeat before register");
                     }
+                    Ok(DaemonToServer::MachineInfoUpdate { .. }) => {
+                        tracing::warn!("Daemon sent machine info update before register");
+                    }
                     Err(err) => {
                         tracing::warn!("Failed to parse daemon registration message: {}", err);
                     }
@@ -130,9 +133,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             Ok(DaemonToServer::Heartbeat { projects }) => {
                                 state.sessions.update_daemon_projects(&machine_id, projects);
                             }
-                            Ok(DaemonToServer::Register { projects, .. }) => {
-                                // Ignore token re-auth, but accept project refresh payload.
+                            Ok(DaemonToServer::Register {
+                                machine, projects, ..
+                            }) => {
+                                // Ignore token re-auth, but accept machine/project refresh payload.
+                                state.sessions.update_daemon_machine_info(&machine_id, machine);
                                 state.sessions.update_daemon_projects(&machine_id, projects);
+                            }
+                            Ok(DaemonToServer::MachineInfoUpdate { machine }) => {
+                                state.sessions.update_daemon_machine_info(&machine_id, machine);
                             }
                             Err(err) => {
                                 tracing::warn!("Failed to parse daemon message: {}", err);

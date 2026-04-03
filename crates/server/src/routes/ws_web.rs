@@ -713,6 +713,67 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
+                Ok(WebToServer::SetMachineMiniMaxConfig {
+                    machine_id,
+                    api_base_url,
+                    api_key,
+                    clear_api_key,
+                }) => {
+                    let Some(uid) = user_id else {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Not authenticated".to_string(),
+                                },
+                            )
+                            .await;
+                        continue;
+                    };
+
+                    let owned = state
+                        .sessions
+                        .get_machines_for_user(&uid)
+                        .into_iter()
+                        .any(|m| m.machine.machine_id == machine_id);
+
+                    if !owned {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Machine not found".to_string(),
+                                },
+                            )
+                            .await;
+                        continue;
+                    }
+
+                    if !state
+                        .sessions
+                        .send_to_daemon(
+                            &machine_id,
+                            ServerToDaemon::SetMiniMaxConfig {
+                                api_base_url,
+                                api_key,
+                                clear_api_key,
+                            },
+                        )
+                        .await
+                    {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Daemon is offline".to_string(),
+                                },
+                            )
+                            .await;
+                    }
+                }
                 Ok(WebToServer::PausePane { pane_id }) => {
                     if let Some(sid) = session_id {
                         tracing::info!("Pausing pane {} for session {}", pane_id, sid);

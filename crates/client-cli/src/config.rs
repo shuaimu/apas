@@ -26,6 +26,10 @@ pub struct LocalConfig {
     pub minimax_path: String,
     #[serde(default = "default_codex_path")]
     pub codex_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimax_api_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimax_api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -50,6 +54,8 @@ impl Default for LocalConfig {
             claude_path: "claude".to_string(),
             minimax_path: default_minimax_path(),
             codex_path: default_codex_path(),
+            minimax_api_base_url: None,
+            minimax_api_key: None,
         }
     }
 }

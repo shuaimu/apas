@@ -68,20 +68,104 @@ fn is_minimax_model(model: Option<&str>) -> bool {
 
 fn resolve_pane_binary_path(
     provider: Provider,
-    model: Option<&str>,
+    _model: Option<&str>,
     claude_path: &str,
-    minimax_path: &str,
+    _minimax_path: &str,
     codex_path: &str,
 ) -> String {
     match provider {
-        Provider::Claude => {
-            if is_minimax_model(model) {
-                minimax_path.to_string()
-            } else {
-                claude_path.to_string()
-            }
-        }
+        Provider::Claude => claude_path.to_string(),
         Provider::Codex => codex_path.to_string(),
+    }
+}
+
+fn provider_display_name(provider: &Provider, model: Option<&str>) -> &'static str {
+    match provider {
+        Provider::Claude if is_minimax_model(model) => "MiniMax",
+        Provider::Claude => "Claude",
+        Provider::Codex => "Codex",
+    }
+}
+
+fn provider_config_key(provider: &Provider, model: Option<&str>) -> &'static str {
+    match provider {
+        Provider::Claude if is_minimax_model(model) => "claude_path",
+        Provider::Claude => "claude_path",
+        Provider::Codex => "codex_path",
+    }
+}
+
+fn trim_to_option(raw: Option<String>) -> Option<String> {
+    raw.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+#[derive(Debug, Clone, Default)]
+struct MiniMaxBackendRuntimeConfig {
+    api_base_url: Option<String>,
+    api_key: Option<String>,
+}
+
+fn load_minimax_backend_runtime_config() -> MiniMaxBackendRuntimeConfig {
+    let config = crate::config::Config::load().unwrap_or_default();
+    MiniMaxBackendRuntimeConfig {
+        api_base_url: trim_to_option(config.local.minimax_api_base_url),
+        api_key: trim_to_option(config.local.minimax_api_key),
+    }
+}
+
+fn build_pane_env_overrides(
+    provider: &Provider,
+    model: Option<&str>,
+) -> Result<Vec<(String, String)>, String> {
+    if !matches!(provider, Provider::Claude) || !is_minimax_model(model) {
+        return Ok(Vec::new());
+    }
+
+    let runtime = load_minimax_backend_runtime_config();
+    let api_base_url = runtime.api_base_url.ok_or_else(|| {
+        "MiniMax backend is not configured (missing minimax_api_base_url). Update it on the Machines page or run: apas config set minimax_api_base_url <url>.".to_string()
+    })?;
+    let api_key = runtime.api_key.ok_or_else(|| {
+        "MiniMax backend is not configured (missing minimax_api_key). Update it on the Machines page or run: apas config set minimax_api_key <key>.".to_string()
+    })?;
+
+    let mut env = vec![
+        ("ANTHROPIC_BASE_URL".to_string(), api_base_url),
+        // Keep both names for compatibility across Claude CLI versions/wrappers.
+        ("ANTHROPIC_AUTH_TOKEN".to_string(), api_key.clone()),
+        ("ANTHROPIC_API_KEY".to_string(), api_key),
+    ];
+    if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        env.push(("ANTHROPIC_MODEL".to_string(), model.to_string()));
+    }
+    Ok(env)
+}
+
+fn format_spawn_error(
+    provider: &Provider,
+    model: Option<&str>,
+    binary_path: &str,
+    err: &std::io::Error,
+) -> String {
+    let display_name = provider_display_name(provider, model);
+    if err.kind() == std::io::ErrorKind::NotFound {
+        let config_key = provider_config_key(provider, model);
+        format!(
+            "[Error spawning {} binary '{}': {}. Configure with: apas config set {} <path>]",
+            display_name, binary_path, err, config_key
+        )
+    } else {
+        format!(
+            "[Error spawning {} binary '{}': {}]",
+            display_name, binary_path, err
+        )
     }
 }
 
@@ -137,6 +221,7 @@ async fn run_inner(
     // Resolve binary paths to absolute paths at startup (while PATH is correct).
     // Systemd-run environments may have a minimal PATH that misses nvm/cargo bins.
     let claude_path = resolve_binary_path(&config.local.claude_path);
+    // Legacy compatibility only: MiniMax now uses claude_path + backend env config.
     let minimax_path = resolve_binary_path(&config.local.minimax_path);
     let codex_path = resolve_binary_path(&config.local.codex_path);
 
@@ -1618,8 +1703,8 @@ fn build_agent_args(
             ];
             if let Some(model) = model {
                 let trimmed = model.trim();
-                // MiniMax panes run with the claude2 binary and should not pass
-                // `--model MiniMax-*` because that model flag is rejected there.
+                // MiniMax panes use a dedicated backend env configuration.
+                // Keep model selection in env (ANTHROPIC_MODEL), not CLI flags.
                 if !trimmed.is_empty() && !is_minimax_model(Some(trimmed)) {
                     base.extend_from_slice(&["--model".to_string(), trimmed.to_string()]);
                 }
@@ -1777,7 +1862,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_pane_binary_path_uses_claude2_for_minimax_model() {
+    fn resolve_pane_binary_path_uses_claude_for_minimax_model() {
         let path = resolve_pane_binary_path(
             Provider::Claude,
             Some("MiniMax-M2.7"),
@@ -1785,14 +1870,14 @@ mod tests {
             "claude2",
             "codex",
         );
-        assert_eq!(path, "claude2");
+        assert_eq!(path, "claude");
     }
 
     #[test]
-    fn resolve_pane_binary_path_uses_claude2_for_m2_alias_model() {
+    fn resolve_pane_binary_path_uses_claude_for_m2_alias_model() {
         let path =
             resolve_pane_binary_path(Provider::Claude, Some("m2.7"), "claude", "claude2", "codex");
-        assert_eq!(path, "claude2");
+        assert_eq!(path, "claude");
     }
 
     #[test]
@@ -1808,7 +1893,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_pane_binary_path_keeps_minimax_binary_when_unresolved() {
+    fn resolve_pane_binary_path_keeps_absolute_claude_path_for_minimax_model() {
         let path = resolve_pane_binary_path(
             Provider::Claude,
             Some("MiniMax-M2.7"),
@@ -1816,7 +1901,7 @@ mod tests {
             "claude2",
             "codex",
         );
-        assert_eq!(path, "claude2");
+        assert_eq!(path, "/opt/bin/claude");
     }
 
     #[test]
@@ -2057,16 +2142,47 @@ fn run_deadloop_session_inner(
         // This can happen after Stop→Start when the old process wasn't fully reaped.
         kill_processes_using_session(&claude_session_id.to_string());
 
-        match Command::new(binary_path)
+        let pane_env = match build_pane_env_overrides(provider, model.as_deref()) {
+            Ok(env) => env,
+            Err(err) => {
+                let err_msg = format!("[{}]", err);
+                let _ = output_tx.send(PaneOutput {
+                    text: err_msg.clone(),
+                    pane_id,
+                });
+                let _ = server_tx.try_send(CliToServer::StreamMessage {
+                    session_id,
+                    message: shared::ClaudeStreamMessage::Result {
+                        subtype: "text".to_string(),
+                        result: err_msg,
+                        is_error: true,
+                        total_cost_usd: 0.0,
+                        duration_ms: 0,
+                        session_id: session_id.to_string(),
+                        extra: serde_json::Value::Null,
+                    },
+                    pane_type: Some(PaneType::Deadloop),
+                    pane_id: Some(pane_id),
+                });
+                thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+        };
+
+        let mut command = Command::new(binary_path);
+        command
             .args(&args)
             .current_dir(working_dir)
             // Clear CLAUDECODE so Claude CLI doesn't refuse to start (nesting detection)
             .env_remove("CLAUDECODE")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
+            .stderr(Stdio::piped());
+        for (key, value) in &pane_env {
+            command.env(key, value);
+        }
+
+        match command.spawn() {
             Ok(mut child) => {
                 let child_pid = child.id();
                 let stdout = match child.stdout.take() {
@@ -2309,7 +2425,7 @@ fn run_deadloop_session_inner(
                 }
             }
             Err(e) => {
-                let err_msg = format!("[Error starting agent: {}]", e);
+                let err_msg = format_spawn_error(provider, model.as_deref(), binary_path, &e);
                 let _ = output_tx.send(PaneOutput {
                     text: err_msg.clone(),
                     pane_id,
@@ -2429,16 +2545,39 @@ fn run_pane_session(
             first_message = false;
         }
 
-        match Command::new(binary_path)
+        let pane_env = match build_pane_env_overrides(provider, model.as_deref()) {
+            Ok(env) => env,
+            Err(err) => {
+                let error_text = format!("[{}]", err);
+                let _ = output_tx.send(PaneOutput {
+                    text: error_text.clone(),
+                    pane_id,
+                });
+                let _ = server_tx.blocking_send(CliToServer::Output {
+                    session_id,
+                    data: error_text,
+                    output_type: shared::OutputType::Text,
+                    pane_type: Some(PaneType::Interactive),
+                    pane_id: Some(pane_id),
+                });
+                continue;
+            }
+        };
+
+        let mut command = Command::new(binary_path);
+        command
             .args(&args)
             .current_dir(working_dir)
             // Clear CLAUDECODE so Claude CLI doesn't refuse to start (nesting detection)
             .env_remove("CLAUDECODE")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
+            .stderr(Stdio::piped());
+        for (key, value) in &pane_env {
+            command.env(key, value);
+        }
+
+        match command.spawn() {
             Ok(mut child) => {
                 let stdout = child.stdout.take().unwrap();
                 let stderr = child.stderr.take().unwrap();
@@ -2586,7 +2725,11 @@ fn run_pane_session(
                         try_resume_first = false;
                         format!("[Session resume failed ({}), will create new session on next message...]", exit_msg)
                     } else {
-                        format!("[Claude process failed: {}]", exit_msg)
+                        format!(
+                            "[{} process failed: {}]",
+                            provider_display_name(provider, model.as_deref()),
+                            exit_msg
+                        )
                     };
                     let _ = output_tx.send(PaneOutput {
                         text: error_text.clone(),
@@ -2605,7 +2748,7 @@ fn run_pane_session(
                 }
             }
             Err(e) => {
-                let error_text = format!("[Error spawning claude: {}]", e);
+                let error_text = format_spawn_error(provider, model.as_deref(), binary_path, &e);
                 let _ = output_tx.send(PaneOutput {
                     text: error_text.clone(),
                     pane_id,

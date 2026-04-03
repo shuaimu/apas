@@ -197,6 +197,9 @@ pub enum DaemonToServer {
 
     /// Periodic heartbeat with latest project states
     Heartbeat { projects: Vec<MachineProjectInfo> },
+
+    /// Update machine metadata (for config changes without reconnect)
+    MachineInfoUpdate { machine: MachineInfo },
 }
 
 /// Messages sent from server to machine daemon
@@ -217,6 +220,16 @@ pub enum ServerToDaemon {
 
     /// Request a fresh project scan/update push
     RefreshProjects,
+
+    /// Update machine-level MiniMax backend API configuration
+    SetMiniMaxConfig {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<String>,
+        #[serde(default)]
+        clear_api_key: bool,
+    },
 
     /// Heartbeat response
     Heartbeat,
@@ -334,6 +347,17 @@ pub enum WebToServer {
     StopMachineProjectCli {
         machine_id: Uuid,
         project_id: String,
+    },
+
+    /// Update machine-level MiniMax backend API configuration
+    SetMachineMiniMaxConfig {
+        machine_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<String>,
+        #[serde(default)]
+        clear_api_key: bool,
     },
 
     /// Download all session data
@@ -509,6 +533,15 @@ pub struct MessageInfo {
 // Shared Types
 // ============================================================================
 
+/// Machine-level MiniMax backend status safe to expose to web UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MiniMaxBackendInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base_url: Option<String>,
+    #[serde(default)]
+    pub api_key_configured: bool,
+}
+
 /// Information about a machine reported by a daemon
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MachineInfo {
@@ -518,6 +551,8 @@ pub struct MachineInfo {
     pub arch: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimax_backend: Option<MiniMaxBackendInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<String>,
 }

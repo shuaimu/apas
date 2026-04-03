@@ -69,6 +69,10 @@ export interface MachineInfo {
   os: string;
   arch: string;
   daemonVersion?: string;
+  minimaxBackend?: {
+    apiBaseUrl?: string;
+    apiKeyConfigured: boolean;
+  };
   lastSeen?: string;
 }
 
@@ -286,6 +290,12 @@ interface AppState {
   listMachines: () => void;
   startMachineProjectCli: (machineId: string, projectId: string) => void;
   stopMachineProjectCli: (machineId: string, projectId: string) => void;
+  setMachineMiniMaxConfig: (
+    machineId: string,
+    apiBaseUrl?: string,
+    apiKey?: string,
+    clearApiKey?: boolean,
+  ) => void;
   listSessions: () => void;
   loadSessionMessages: (sessionId: string) => void;
   loadMoreMessages: (pane?: PaneType | number) => void;
@@ -656,6 +666,25 @@ export const useStore = create<AppState>((set, get) => ({
       type: "stop_machine_project_cli",
       machine_id: machineId,
       project_id: projectId,
+    }));
+  },
+
+  setMachineMiniMaxConfig: (
+    machineId: string,
+    apiBaseUrl?: string,
+    apiKey?: string,
+    clearApiKey: boolean = false,
+  ) => {
+    const { ws } = get();
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    ws.send(JSON.stringify({
+      type: "set_machine_minimax_config",
+      machine_id: machineId,
+      api_base_url: apiBaseUrl != null ? apiBaseUrl : undefined,
+      api_key: apiKey && apiKey.trim().length > 0 ? apiKey : undefined,
+      clear_api_key: clearApiKey,
     }));
   },
 
@@ -1123,6 +1152,14 @@ function handleServerMessage(
             os: machine.os as string,
             arch: machine.arch as string,
             daemonVersion: machine.daemon_version as string | undefined,
+            minimaxBackend: machine.minimax_backend
+              ? {
+                  apiBaseUrl: ((machine.minimax_backend as Record<string, unknown>).api_base_url as string | undefined),
+                  apiKeyConfigured: Boolean(
+                    (machine.minimax_backend as Record<string, unknown>).api_key_configured
+                  ),
+                }
+              : undefined,
             lastSeen: machine.last_seen as string | undefined,
           },
           projects: projects.map((project) => ({

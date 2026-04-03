@@ -1,6 +1,6 @@
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
-use shared::{DaemonToServer, MachineInfo, MachineProjectInfo, ServerToDaemon};
+use shared::{DaemonToServer, MachineInfo, MachineProjectInfo, MiniMaxBackendInfo, ServerToDaemon};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -49,6 +49,52 @@ fn launch_path() -> String {
     resolve_user_shell_path()
         .or_else(|| std::env::var("PATH").ok())
         .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".to_string())
+}
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value.and_then(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn minimax_backend_info_from_config(config: &crate::config::Config) -> Option<MiniMaxBackendInfo> {
+    let api_base_url = normalize_optional_string(config.local.minimax_api_base_url.clone());
+    let api_key_configured =
+        normalize_optional_string(config.local.minimax_api_key.clone()).is_some();
+    if api_base_url.is_none() && !api_key_configured {
+        None
+    } else {
+        Some(MiniMaxBackendInfo {
+            api_base_url,
+            api_key_configured,
+        })
+    }
+}
+
+fn update_local_minimax_backend_config(
+    api_base_url: Option<String>,
+    api_key: Option<String>,
+    clear_api_key: bool,
+) -> Result<Option<MiniMaxBackendInfo>> {
+    let mut config = crate::config::Config::load().unwrap_or_default();
+
+    if let Some(url) = api_base_url {
+        config.local.minimax_api_base_url = normalize_optional_string(Some(url));
+    }
+
+    if clear_api_key {
+        config.local.minimax_api_key = None;
+    } else if let Some(key) = api_key {
+        config.local.minimax_api_key = normalize_optional_string(Some(key));
+    }
+
+    config.save()?;
+    Ok(minimax_backend_info_from_config(&config))
 }
 
 fn headless_pids_for(project_path: &Path) -> Vec<u32> {
@@ -373,12 +419,14 @@ pub async fn run(
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
 
+    let config = crate::config::Config::load().unwrap_or_default();
     let machine_info = MachineInfo {
         machine_id,
         hostname,
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         daemon_version: Some(VERSION.to_string()),
+        minimax_backend: minimax_backend_info_from_config(&config),
         last_seen: None,
     };
 
@@ -547,6 +595,32 @@ async fn run_connection(
                                 };
                                 let text = serde_json::to_string(&refresh_msg)?;
                                 ws_sender.send(Message::Text(text.into())).await?;
+                            }
+                            ServerToDaemon::SetMiniMaxConfig {
+                                api_base_url,
+                                api_key,
+                                clear_api_key,
+                            } => {
+                                match update_local_minimax_backend_config(
+                                    api_base_url,
+                                    api_key,
+                                    clear_api_key,
+                                ) {
+                                    Ok(minimax_backend) => {
+                                        state.machine_info.minimax_backend = minimax_backend;
+                                        let update = DaemonToServer::MachineInfoUpdate {
+                                            machine: state.machine_info.clone(),
+                                        };
+                                        let text = serde_json::to_string(&update)?;
+                                        ws_sender.send(Message::Text(text.into())).await?;
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            "Failed to update MiniMax backend config: {}",
+                                            err
+                                        );
+                                    }
+                                }
                             }
                             ServerToDaemon::Heartbeat => {
                                 let pong = DaemonToServer::Heartbeat {

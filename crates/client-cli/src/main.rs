@@ -721,6 +721,20 @@ async fn handle_config_command(action: ConfigAction) -> Result<()> {
                 "claude_path" => config.local.claude_path = value,
                 "minimax_path" => config.local.minimax_path = value,
                 "codex_path" => config.local.codex_path = value,
+                "minimax_api_base_url" => {
+                    config.local.minimax_api_base_url = if value.trim().is_empty() {
+                        None
+                    } else {
+                        Some(value)
+                    };
+                }
+                "minimax_api_key" => {
+                    config.local.minimax_api_key = if value.trim().is_empty() {
+                        None
+                    } else {
+                        Some(value)
+                    };
+                }
                 "daemon_machine_id" => config.daemon.machine_id = Some(value),
                 "daemon_roots" => {
                     config.daemon.project_roots = value
@@ -730,7 +744,7 @@ async fn handle_config_command(action: ConfigAction) -> Result<()> {
                         .collect();
                 }
                 _ => anyhow::bail!(
-                    "Unknown config key: {}. Valid keys: server, token, claude_path, minimax_path, codex_path, daemon_machine_id, daemon_roots",
+                    "Unknown config key: {}. Valid keys: server, token, claude_path, minimax_path, codex_path, minimax_api_base_url, minimax_api_key, daemon_machine_id, daemon_roots",
                     key
                 ),
             }
@@ -750,10 +764,16 @@ async fn handle_config_command(action: ConfigAction) -> Result<()> {
                 "claude_path" => config.local.claude_path,
                 "minimax_path" => config.local.minimax_path,
                 "codex_path" => config.local.codex_path,
+                "minimax_api_base_url" => config.local.minimax_api_base_url.unwrap_or_default(),
+                "minimax_api_key" => config
+                    .local
+                    .minimax_api_key
+                    .map(|_| "****".to_string())
+                    .unwrap_or_default(),
                 "daemon_machine_id" => config.daemon.machine_id.unwrap_or_default(),
                 "daemon_roots" => config.daemon.project_roots.join(","),
                 _ => anyhow::bail!(
-                    "Unknown config key: {}. Valid keys: server, token, claude_path, minimax_path, codex_path, daemon_machine_id, daemon_roots",
+                    "Unknown config key: {}. Valid keys: server, token, claude_path, minimax_path, codex_path, minimax_api_base_url, minimax_api_key, daemon_machine_id, daemon_roots",
                     key
                 ),
             };
@@ -769,6 +789,19 @@ async fn handle_config_command(action: ConfigAction) -> Result<()> {
             println!("claude_path: {}", config.local.claude_path);
             println!("minimax_path: {}", config.local.minimax_path);
             println!("codex_path: {}", config.local.codex_path);
+            println!(
+                "minimax_api_base_url: {}",
+                config.local.minimax_api_base_url.unwrap_or_default()
+            );
+            println!(
+                "minimax_api_key: {}",
+                config
+                    .local
+                    .minimax_api_key
+                    .as_ref()
+                    .map(|_| "****")
+                    .unwrap_or("")
+            );
             println!(
                 "daemon_machine_id: {}",
                 config.daemon.machine_id.unwrap_or_default()

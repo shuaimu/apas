@@ -193,6 +193,15 @@ impl SessionManager {
         }
     }
 
+    pub fn update_daemon_machine_info(&self, machine_id: &Uuid, mut machine: MachineInfo) {
+        machine.machine_id = *machine_id;
+        machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
+        self.machine_infos.insert(*machine_id, machine);
+        if let Some(owner) = self.daemon_users.get(machine_id).map(|entry| *entry) {
+            self.broadcast_machines_update_for_user(&owner);
+        }
+    }
+
     pub async fn send_to_daemon(&self, machine_id: &Uuid, msg: ServerToDaemon) -> bool {
         let sender = self.daemon_senders.get(machine_id).map(|s| s.clone());
         if let Some(sender) = sender {
