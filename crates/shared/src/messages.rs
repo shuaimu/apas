@@ -538,6 +538,8 @@ pub struct MessageInfo {
 pub struct MiniMaxBackendInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
     #[serde(default)]
     pub api_key_configured: bool,
 }

@@ -64,13 +64,14 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
 
 fn minimax_backend_info_from_config(config: &crate::config::Config) -> Option<MiniMaxBackendInfo> {
     let api_base_url = normalize_optional_string(config.local.minimax_api_base_url.clone());
-    let api_key_configured =
-        normalize_optional_string(config.local.minimax_api_key.clone()).is_some();
-    if api_base_url.is_none() && !api_key_configured {
+    let api_key = normalize_optional_string(config.local.minimax_api_key.clone());
+    let api_key_configured = api_key.is_some();
+    if api_base_url.is_none() && api_key.is_none() {
         None
     } else {
         Some(MiniMaxBackendInfo {
             api_base_url,
+            api_key,
             api_key_configured,
         })
     }

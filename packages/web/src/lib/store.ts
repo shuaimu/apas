@@ -71,6 +71,7 @@ export interface MachineInfo {
   daemonVersion?: string;
   minimaxBackend?: {
     apiBaseUrl?: string;
+    apiKey?: string;
     apiKeyConfigured: boolean;
   };
   lastSeen?: string;
@@ -1155,6 +1156,7 @@ function handleServerMessage(
             minimaxBackend: machine.minimax_backend
               ? {
                   apiBaseUrl: ((machine.minimax_backend as Record<string, unknown>).api_base_url as string | undefined),
+                  apiKey: ((machine.minimax_backend as Record<string, unknown>).api_key as string | undefined),
                   apiKeyConfigured: Boolean(
                     (machine.minimax_backend as Record<string, unknown>).api_key_configured
                   ),

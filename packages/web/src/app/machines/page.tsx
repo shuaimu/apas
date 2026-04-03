@@ -87,7 +87,7 @@ export default function MachinesPage() {
                       ...prev,
                       [machine.machineId]: {
                         apiBaseUrl: nextBaseUrl,
-                        apiKey: prev[machine.machineId]?.apiKey ?? "",
+                        apiKey: prev[machine.machineId]?.apiKey ?? machine.minimaxBackend?.apiKey ?? "",
                       },
                     }));
                   }}
@@ -95,8 +95,8 @@ export default function MachinesPage() {
                   className="rounded border border-gray-300 px-3 py-2 text-sm dark:border-gray-700 dark:bg-gray-950"
                 />
                 <input
-                  type="password"
-                  value={minimaxDrafts[machine.machineId]?.apiKey ?? ""}
+                  type="text"
+                  value={minimaxDrafts[machine.machineId]?.apiKey ?? machine.minimaxBackend?.apiKey ?? ""}
                   onChange={(e) => {
                     const nextApiKey = e.target.value;
                     setMinimaxDrafts((prev) => ({
@@ -115,7 +115,7 @@ export default function MachinesPage() {
                   onClick={() => {
                     const draft = minimaxDrafts[machine.machineId];
                     const baseUrl = draft?.apiBaseUrl ?? machine.minimaxBackend?.apiBaseUrl ?? "";
-                    const apiKey = draft?.apiKey ?? "";
+                    const apiKey = draft?.apiKey ?? machine.minimaxBackend?.apiKey ?? "";
                     setMachineMiniMaxConfig(
                       machine.machineId,
                       baseUrl,
@@ -126,7 +126,7 @@ export default function MachinesPage() {
                       ...prev,
                       [machine.machineId]: {
                         apiBaseUrl: baseUrl,
-                        apiKey: "",
+                        apiKey,
                       },
                     }));
                   }}
