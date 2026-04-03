@@ -680,7 +680,7 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
     ws.send(JSON.stringify({
-      type: "set_machine_minimax_config",
+      type: "set_machine_mini_max_config",
       machine_id: machineId,
       api_base_url: apiBaseUrl != null ? apiBaseUrl : undefined,
       api_key: apiKey && apiKey.trim().length > 0 ? apiKey : undefined,
