@@ -1,6 +1,9 @@
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
-use shared::{DaemonToServer, MachineInfo, MachineProjectInfo, MiniMaxBackendInfo, ServerToDaemon};
+use shared::{
+    DaemonToServer, GlmBackendInfo, MachineInfo, MachineProjectInfo, MiniMaxBackendInfo,
+    ServerToDaemon,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -19,6 +22,7 @@ const USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const VERSION: &str = env!("APAS_VERSION");
 const TMUX_SESSION_PREFIX: &str = "apas";
 const MINIMAX_API_BASE_URL: &str = "https://api.minimax.io/anthropic";
+const GLM_API_BASE_URL: &str = "https://api.z.ai/api/anthropic";
 
 fn resolve_user_shell_path() -> Option<String> {
     let shell = std::env::var("SHELL")
@@ -90,6 +94,35 @@ fn update_local_minimax_backend_config(
 
     config.save()?;
     Ok(minimax_backend_info_from_config(&config))
+}
+
+fn glm_backend_info_from_config(config: &crate::config::Config) -> Option<GlmBackendInfo> {
+    let api_base_url = Some(GLM_API_BASE_URL.to_string());
+    let api_key = normalize_optional_string(config.local.glm_api_key.clone());
+    let api_key_configured = api_key.is_some();
+    Some(GlmBackendInfo {
+        api_base_url,
+        api_key,
+        api_key_configured,
+    })
+}
+
+fn update_local_glm_backend_config(
+    _api_base_url: Option<String>,
+    api_key: Option<String>,
+    clear_api_key: bool,
+) -> Result<Option<GlmBackendInfo>> {
+    let mut config = crate::config::Config::load().unwrap_or_default();
+    config.local.glm_api_base_url = Some(GLM_API_BASE_URL.to_string());
+
+    if clear_api_key {
+        config.local.glm_api_key = None;
+    } else if let Some(key) = api_key {
+        config.local.glm_api_key = normalize_optional_string(Some(key));
+    }
+
+    config.save()?;
+    Ok(glm_backend_info_from_config(&config))
 }
 
 fn headless_pids_for(project_path: &Path) -> Vec<u32> {
@@ -422,6 +455,7 @@ pub async fn run(
         arch: std::env::consts::ARCH.to_string(),
         daemon_version: Some(VERSION.to_string()),
         minimax_backend: minimax_backend_info_from_config(&config),
+        glm_backend: glm_backend_info_from_config(&config),
         last_seen: None,
     };
 
@@ -612,6 +646,32 @@ async fn run_connection(
                                     Err(err) => {
                                         tracing::warn!(
                                             "Failed to update MiniMax backend config: {}",
+                                            err
+                                        );
+                                    }
+                                }
+                            }
+                            ServerToDaemon::SetGlmConfig {
+                                api_base_url,
+                                api_key,
+                                clear_api_key,
+                            } => {
+                                match update_local_glm_backend_config(
+                                    api_base_url,
+                                    api_key,
+                                    clear_api_key,
+                                ) {
+                                    Ok(glm_backend) => {
+                                        state.machine_info.glm_backend = glm_backend;
+                                        let update = DaemonToServer::MachineInfoUpdate {
+                                            machine: state.machine_info.clone(),
+                                        };
+                                        let text = serde_json::to_string(&update)?;
+                                        ws_sender.send(Message::Text(text.into())).await?;
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            "Failed to update GLM backend config: {}",
                                             err
                                         );
                                     }

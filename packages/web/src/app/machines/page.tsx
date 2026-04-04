@@ -7,6 +7,7 @@ import { ArrowLeft, Play, RefreshCw, Square } from "lucide-react";
 import { useStore } from "@/lib/store";
 
 const MINIMAX_API_BASE_URL = "https://api.minimax.io/anthropic";
+const GLM_API_BASE_URL = "https://api.z.ai/api/anthropic";
 
 export default function MachinesPage() {
   const router = useRouter();
@@ -19,9 +20,12 @@ export default function MachinesPage() {
     startMachineProjectCli,
     stopMachineProjectCli,
     setMachineMiniMaxConfig,
+    setMachineGlmConfig,
   } = useStore();
   const [minimaxDrafts, setMinimaxDrafts] = useState<Record<string, { apiKey: string }>>({});
   const [minimaxSaved, setMinimaxSaved] = useState<Record<string, boolean>>({});
+  const [glmDrafts, setGlmDrafts] = useState<Record<string, { apiKey: string }>>({});
+  const [glmSaved, setGlmSaved] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     const storedToken = localStorage.getItem("apas_token");
@@ -148,6 +152,79 @@ export default function MachinesPage() {
               </div>
               <div className="mt-2 text-xs text-gray-500">
                 {machine.minimaxBackend?.apiKeyConfigured ? "API key configured" : "API key not configured"}
+              </div>
+            </div>
+
+            <div className="border-b border-gray-200 px-4 py-3 dark:border-gray-800">
+              <div className="mb-2 text-sm font-medium">GLM Backend (Claude Runtime)</div>
+              <div className="mb-2 text-xs text-gray-500">
+                Backend URL: <span className="font-mono">{GLM_API_BASE_URL}</span>
+              </div>
+              <div className="grid gap-2 md:grid-cols-[1fr_auto_auto]">
+                <input
+                  type="text"
+                  value={glmDrafts[machine.machineId]?.apiKey ?? machine.glmBackend?.apiKey ?? ""}
+                  onChange={(e) => {
+                    const nextApiKey = e.target.value;
+                    setGlmDrafts((prev) => ({
+                      ...prev,
+                      [machine.machineId]: {
+                        apiKey: nextApiKey,
+                      },
+                    }));
+                    setGlmSaved((prev) => ({
+                      ...prev,
+                      [machine.machineId]: false,
+                    }));
+                  }}
+                  placeholder="GLM API key"
+                  className="rounded border border-gray-300 px-3 py-2 text-sm dark:border-gray-700 dark:bg-gray-950"
+                />
+                <button
+                  onClick={() => {
+                    const draft = glmDrafts[machine.machineId];
+                    const apiKey = draft?.apiKey ?? machine.glmBackend?.apiKey ?? "";
+                    setMachineGlmConfig(
+                      machine.machineId,
+                      apiKey.trim().length > 0 ? apiKey : undefined,
+                      false,
+                    );
+                    setGlmDrafts((prev) => ({
+                      ...prev,
+                      [machine.machineId]: {
+                        apiKey,
+                      },
+                    }));
+                    setGlmSaved((prev) => ({
+                      ...prev,
+                      [machine.machineId]: true,
+                    }));
+                  }}
+                  className="rounded bg-emerald-600 px-3 py-2 text-sm text-white hover:bg-emerald-700"
+                >
+                  {glmSaved[machine.machineId] ? "Saved" : "Save"}
+                </button>
+                <button
+                  onClick={() => {
+                    setMachineGlmConfig(machine.machineId, undefined, true);
+                    setGlmDrafts((prev) => ({
+                      ...prev,
+                      [machine.machineId]: {
+                        apiKey: "",
+                      },
+                    }));
+                    setGlmSaved((prev) => ({
+                      ...prev,
+                      [machine.machineId]: false,
+                    }));
+                  }}
+                  className="rounded border border-gray-300 px-3 py-2 text-sm hover:bg-gray-100 dark:border-gray-700 dark:hover:bg-gray-800"
+                >
+                  Clear Key
+                </button>
+              </div>
+              <div className="mt-2 text-xs text-gray-500">
+                {machine.glmBackend?.apiKeyConfigured ? "API key configured" : "API key not configured"}
               </div>
             </div>
 

@@ -19,6 +19,7 @@ interface TabBarProps {
 }
 
 const MINIMAX_DEFAULT_MODEL = "MiniMax-M2.7";
+const GLM_DEFAULT_MODEL = "glm-5.1";
 
 function isMiniMaxModel(model?: string): boolean {
   if (typeof model !== "string") return false;
@@ -26,11 +27,25 @@ function isMiniMaxModel(model?: string): boolean {
   return normalized.includes("minimax") || normalized.startsWith("m2");
 }
 
+function isGlmModel(model?: string): boolean {
+  if (typeof model !== "string") return false;
+  const normalized = model.trim().toLowerCase();
+  return normalized.startsWith("glm") || normalized.includes("glm-");
+}
+
 function isMiniMaxTab(provider: string, model?: string, label?: string): boolean {
   if (provider === "minimax") return true;
   if (provider !== "claude") return false;
   if (isMiniMaxModel(model)) return true;
   return typeof label === "string" && label.toLowerCase().includes("minimax");
+}
+
+function isGlmTab(provider: string, model?: string, label?: string): boolean {
+  if (provider === "glm") return true;
+  if (provider !== "claude") return false;
+  if (isMiniMaxModel(model)) return false;
+  if (isGlmModel(model)) return true;
+  return typeof label === "string" && label.toLowerCase().includes("glm");
 }
 
 function ProviderIcon({
@@ -49,6 +64,9 @@ function ProviderIcon({
   }
   if (isMiniMaxTab(provider, model, label)) {
     return <Bot className={className} aria-label="MiniMax" />;
+  }
+  if (isGlmTab(provider, model, label)) {
+    return <Bot className={className} aria-label="GLM" />;
   }
   return <Sparkles className={className} aria-label="Claude" />;
 }
@@ -87,6 +105,7 @@ export function TabBar({
           const isActive = tab.pane_id === activeTabId;
           const isBot = tab.mode === "deadloop";
           const isMiniMax = isMiniMaxTab(tab.provider, tab.model, tab.label);
+          const isGlm = isGlmTab(tab.provider, tab.model, tab.label);
           const isPaused = pausedPanes.includes(tab.pane_id);
           const status = paneStatuses[paneKey(tab.pane_id)];
           const hasActivity = !!status;
@@ -107,9 +126,15 @@ export function TabBar({
               {/* Provider icon + status badge */}
               <span
                 className={`relative inline-flex items-center justify-center flex-shrink-0 ${
-                  tab.provider === "codex" ? "text-green-500" : isMiniMax ? "text-cyan-500" : "text-blue-500"
+                  tab.provider === "codex"
+                    ? "text-green-500"
+                    : isMiniMax
+                      ? "text-cyan-500"
+                      : isGlm
+                        ? "text-emerald-500"
+                        : "text-blue-500"
                 }`}
-                title={tab.provider === "codex" ? "Codex" : isMiniMax ? "MiniMax" : "Claude"}
+                title={tab.provider === "codex" ? "Codex" : isMiniMax ? "MiniMax" : isGlm ? "GLM" : "Claude"}
               >
                 <ProviderIcon provider={tab.provider} model={tab.model} label={tab.label} />
                 {hasActivity && !isPaused && (
@@ -228,6 +253,18 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
               <ProviderIcon provider="claude" model={MINIMAX_DEFAULT_MODEL} className="w-4 h-4" />
             </span>
             MiniMax 2.7 Tab
+          </button>
+          <button
+            onClick={() => {
+              onAddTab("claude", GLM_DEFAULT_MODEL);
+              setShowMenu(false);
+            }}
+            className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
+          >
+            <span className="text-emerald-500 flex-shrink-0">
+              <ProviderIcon provider="claude" model={GLM_DEFAULT_MODEL} className="w-4 h-4" />
+            </span>
+            GLM 5.1 Tab
           </button>
           <div className="border-t border-gray-100 dark:border-gray-700 my-0.5" />
           <button

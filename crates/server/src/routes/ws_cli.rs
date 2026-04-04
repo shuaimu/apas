@@ -56,19 +56,36 @@ fn is_minimax_model(model: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
-fn normalize_minimax_pane_labels(panes: &mut [shared::PaneConfig]) {
+fn is_glm_model(model: Option<&str>) -> bool {
+    model
+        .map(|raw| {
+            let normalized = raw.trim().to_ascii_lowercase();
+            !normalized.is_empty() && (normalized.starts_with("glm") || normalized.contains("glm-"))
+        })
+        .unwrap_or(false)
+}
+
+fn normalize_backend_pane_labels(panes: &mut [shared::PaneConfig]) {
     for pane in panes.iter_mut() {
         if pane.provider != shared::Provider::Claude {
             continue;
         }
-        if !is_minimax_model(pane.model.as_deref()) {
+        let model = pane.model.as_deref();
+        let backend_label = if is_minimax_model(model) {
+            Some("MiniMax")
+        } else if is_glm_model(model) {
+            Some("GLM")
+        } else {
+            None
+        };
+        let Some(backend_label) = backend_label else {
             continue;
-        }
+        };
 
         let tab_label = format!("Tab {}", pane.pane_id);
         let current_label = pane.label.as_deref().map(str::trim).unwrap_or("");
         if current_label.is_empty() || current_label.eq_ignore_ascii_case(&tab_label) {
-            pane.label = Some(format!("MiniMax {}", pane.pane_id));
+            pane.label = Some(format!("{} {}", backend_label, pane.pane_id));
         }
     }
 }
@@ -263,7 +280,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 if let Some(pane_list) = &panes {
                                     if !pane_list.is_empty() {
                                         let mut normalized_panes = pane_list.clone();
-                                        normalize_minimax_pane_labels(&mut normalized_panes);
+                                        normalize_backend_pane_labels(&mut normalized_panes);
                                         state
                                             .sessions
                                             .set_session_panes(&session_id, normalized_panes.clone());
@@ -538,7 +555,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             Ok(CliToServer::PaneList { session_id, mut panes }) => {
                                 // Cache pane list and forward to attached web clients
                                 tracing::info!("CLI {} sent pane list for session {}: {} panes", cli_id, session_id, panes.len());
-                                normalize_minimax_pane_labels(&mut panes);
+                                normalize_backend_pane_labels(&mut panes);
                                 state.sessions.set_session_panes(&session_id, panes.clone());
                                 if let Err(e) = state.storage.save_pane_list(&session_id, &panes).await {
                                     tracing::warn!(

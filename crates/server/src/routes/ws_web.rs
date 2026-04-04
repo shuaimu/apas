@@ -784,6 +784,76 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         );
                     }
                 }
+                Ok(WebToServer::SetMachineGlmConfig {
+                    machine_id,
+                    api_base_url,
+                    api_key,
+                    clear_api_key,
+                }) => {
+                    let Some(uid) = user_id else {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Not authenticated".to_string(),
+                                },
+                            )
+                            .await;
+                        continue;
+                    };
+
+                    let owned = state
+                        .sessions
+                        .get_machines_for_user(&uid)
+                        .into_iter()
+                        .any(|m| m.machine.machine_id == machine_id);
+
+                    if !owned {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Machine not found".to_string(),
+                                },
+                            )
+                            .await;
+                        continue;
+                    }
+
+                    let req_api_base_url = api_base_url.clone();
+                    let req_api_key = api_key.clone();
+                    if !state
+                        .sessions
+                        .send_to_daemon(
+                            &machine_id,
+                            ServerToDaemon::SetGlmConfig {
+                                api_base_url,
+                                api_key,
+                                clear_api_key,
+                            },
+                        )
+                        .await
+                    {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Daemon is offline".to_string(),
+                                },
+                            )
+                            .await;
+                    } else {
+                        state.sessions.apply_web_glm_config(
+                            &machine_id,
+                            req_api_base_url,
+                            req_api_key,
+                            clear_api_key,
+                        );
+                    }
+                }
                 Ok(WebToServer::PausePane { pane_id }) => {
                     if let Some(sid) = session_id {
                         tracing::info!("Pausing pane {} for session {}", pane_id, sid);

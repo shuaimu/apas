@@ -231,6 +231,16 @@ pub enum ServerToDaemon {
         clear_api_key: bool,
     },
 
+    /// Update machine-level GLM backend API configuration
+    SetGlmConfig {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<String>,
+        #[serde(default)]
+        clear_api_key: bool,
+    },
+
     /// Heartbeat response
     Heartbeat,
 }
@@ -351,6 +361,17 @@ pub enum WebToServer {
 
     /// Update machine-level MiniMax backend API configuration
     SetMachineMiniMaxConfig {
+        machine_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<String>,
+        #[serde(default)]
+        clear_api_key: bool,
+    },
+
+    /// Update machine-level GLM backend API configuration
+    SetMachineGlmConfig {
         machine_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         api_base_url: Option<String>,
@@ -544,6 +565,17 @@ pub struct MiniMaxBackendInfo {
     pub api_key_configured: bool,
 }
 
+/// Machine-level GLM backend status safe to expose to web UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlmBackendInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub api_key_configured: bool,
+}
+
 /// Information about a machine reported by a daemon
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MachineInfo {
@@ -555,6 +587,8 @@ pub struct MachineInfo {
     pub daemon_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minimax_backend: Option<MiniMaxBackendInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glm_backend: Option<GlmBackendInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<String>,
 }

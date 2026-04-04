@@ -66,11 +66,21 @@ fn is_minimax_model(model: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+fn is_glm_model(model: Option<&str>) -> bool {
+    model
+        .map(|m| {
+            let normalized = m.trim().to_ascii_lowercase();
+            !normalized.is_empty() && (normalized.starts_with("glm") || normalized.contains("glm-"))
+        })
+        .unwrap_or(false)
+}
+
 fn default_pane_label(pane_id: u32, model: Option<&str>) -> String {
     match pane_id {
         shared::PANE_ID_DEADLOOP => "Deadloop".to_string(),
         shared::PANE_ID_INTERACTIVE => "Interactive".to_string(),
         _ if is_minimax_model(model) => format!("MiniMax {}", pane_id),
+        _ if is_glm_model(model) => format!("GLM {}", pane_id),
         _ => format!("Tab {}", pane_id),
     }
 }
@@ -93,6 +103,9 @@ fn pane_label_or_default(raw_label: Option<&str>, pane_id: u32, model: Option<&s
     if is_minimax_model(model) && is_generic_tab_label(trimmed, pane_id) {
         return default;
     }
+    if is_glm_model(model) && is_generic_tab_label(trimmed, pane_id) {
+        return default;
+    }
     trimmed.to_string()
 }
 
@@ -112,6 +125,7 @@ fn resolve_pane_binary_path(
 fn provider_display_name(provider: &Provider, model: Option<&str>) -> &'static str {
     match provider {
         Provider::Claude if is_minimax_model(model) => "MiniMax",
+        Provider::Claude if is_glm_model(model) => "GLM",
         Provider::Claude => "Claude",
         Provider::Codex => "Codex",
         Provider::Minimax => "MiniMax",
@@ -128,6 +142,7 @@ fn provider_config_key(provider: &Provider, model: Option<&str>) -> &'static str
 }
 
 const MINIMAX_API_BASE_URL: &str = "https://api.minimax.io/anthropic";
+const GLM_API_BASE_URL: &str = "https://api.z.ai/api/anthropic";
 
 fn trim_to_option(raw: Option<String>) -> Option<String> {
     raw.and_then(|value| {
@@ -152,24 +167,50 @@ fn load_minimax_backend_runtime_config() -> MiniMaxBackendRuntimeConfig {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct GlmBackendRuntimeConfig {
+    api_key: Option<String>,
+}
+
+fn load_glm_backend_runtime_config() -> GlmBackendRuntimeConfig {
+    let config = crate::config::Config::load().unwrap_or_default();
+    GlmBackendRuntimeConfig {
+        api_key: trim_to_option(config.local.glm_api_key),
+    }
+}
+
 fn build_pane_env_overrides(
     provider: &Provider,
     model: Option<&str>,
 ) -> Result<Vec<(String, String)>, String> {
-    if !matches!(provider, Provider::Claude | Provider::Minimax) || !is_minimax_model(model) {
+    if !matches!(provider, Provider::Claude | Provider::Minimax) {
+        return Ok(Vec::new());
+    }
+    let is_minimax = is_minimax_model(model);
+    let is_glm = is_glm_model(model);
+    if !is_minimax && !is_glm {
         return Ok(Vec::new());
     }
 
-    let runtime = load_minimax_backend_runtime_config();
-    let api_key = runtime.api_key.ok_or_else(|| {
-        "MiniMax backend is not configured (missing minimax_api_key). Update it on the Machines page or run: apas config set minimax_api_key <key>.".to_string()
-    })?;
+    let (api_base_url, api_key, missing_key_message) = if is_minimax {
+        let runtime = load_minimax_backend_runtime_config();
+        (
+            MINIMAX_API_BASE_URL.to_string(),
+            runtime.api_key,
+            "MiniMax backend is not configured (missing minimax_api_key). Update it on the Machines page or run: apas config set minimax_api_key <key>.".to_string(),
+        )
+    } else {
+        let runtime = load_glm_backend_runtime_config();
+        (
+            GLM_API_BASE_URL.to_string(),
+            runtime.api_key,
+            "GLM backend is not configured (missing glm_api_key). Update it on the Machines page or run: apas config set glm_api_key <key>.".to_string(),
+        )
+    };
+    let api_key = api_key.ok_or(missing_key_message)?;
 
     let mut env = vec![
-        (
-            "ANTHROPIC_BASE_URL".to_string(),
-            MINIMAX_API_BASE_URL.to_string(),
-        ),
+        ("ANTHROPIC_BASE_URL".to_string(), api_base_url),
         // Keep both names for compatibility across Claude CLI versions/wrappers.
         ("ANTHROPIC_AUTH_TOKEN".to_string(), api_key.clone()),
         ("ANTHROPIC_API_KEY".to_string(), api_key),
@@ -1705,8 +1746,11 @@ fn active_usage_providers(pane_metas: &PaneMetas) -> (bool, bool, bool) {
         match meta.provider {
             // MiniMax tabs run through Claude CLI transport, but Anthropic usage
             // limits are not meaningful for them.
-            Provider::Claude if !is_minimax_model(meta.model.as_deref()) => has_claude = true,
-            Provider::Claude => has_minimax = true,
+            Provider::Claude if is_minimax_model(meta.model.as_deref()) => has_minimax = true,
+            // GLM tabs also run through Claude transport and should not map to
+            // Anthropic usage limits.
+            Provider::Claude if is_glm_model(meta.model.as_deref()) => {}
+            Provider::Claude => has_claude = true,
             Provider::Codex => has_codex = true,
             Provider::Minimax => has_minimax = true,
         }
@@ -1757,9 +1801,12 @@ fn build_agent_args(
             ];
             if let Some(model) = model {
                 let trimmed = model.trim();
-                // MiniMax panes use a dedicated backend env configuration.
+                // MiniMax/GLM panes use dedicated backend env configuration.
                 // Keep model selection in env (ANTHROPIC_MODEL), not CLI flags.
-                if !trimmed.is_empty() && !is_minimax_model(Some(trimmed)) {
+                if !trimmed.is_empty()
+                    && !is_minimax_model(Some(trimmed))
+                    && !is_glm_model(Some(trimmed))
+                {
                     base.extend_from_slice(&["--model".to_string(), trimmed.to_string()]);
                 }
             }
@@ -1919,6 +1966,21 @@ mod tests {
     }
 
     #[test]
+    fn build_agent_args_claude_with_glm_model_omits_model_flag() {
+        let session_id = Uuid::new_v4();
+        let (args, _) = build_agent_args(
+            &Provider::Claude,
+            &session_id,
+            FULL_PROMPT,
+            Some("glm-5.1"),
+            true,
+            false,
+        );
+
+        assert!(!args.iter().any(|arg| arg == "--model"));
+    }
+
+    #[test]
     fn resolve_pane_binary_path_uses_claude_for_minimax_model() {
         let path = resolve_pane_binary_path(
             Provider::Claude,
@@ -1971,6 +2033,12 @@ mod tests {
     fn pane_label_or_default_preserves_custom_label() {
         let label = pane_label_or_default(Some("Research"), 42, Some("MiniMax-M2.7"));
         assert_eq!(label, "Research");
+    }
+
+    #[test]
+    fn pane_label_or_default_rebrands_generic_glm_tab_label() {
+        let label = pane_label_or_default(Some("Tab 11"), 11, Some("glm-5.1"));
+        assert_eq!(label, "GLM 11");
     }
 
     #[test]
@@ -2091,6 +2159,30 @@ mod tests {
         }
 
         assert_eq!(active_usage_providers(&pane_metas), (false, false, true));
+    }
+
+    #[test]
+    fn active_usage_providers_ignores_glm_only_claude() {
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+        let child_process = Arc::new(Mutex::new(None));
+
+        {
+            let mut metas = pane_metas.lock().unwrap();
+            metas.insert(
+                9,
+                PaneMeta {
+                    mode: shared::PaneMode::Interactive,
+                    provider: Provider::Claude,
+                    label: "GLM 9".to_string(),
+                    prompt: None,
+                    model: Some("glm-5.1".to_string()),
+                    min_iteration_interval_minutes: None,
+                    child_process,
+                },
+            );
+        }
+
+        assert_eq!(active_usage_providers(&pane_metas), (false, false, false));
     }
 }
 

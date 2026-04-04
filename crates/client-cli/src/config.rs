@@ -30,6 +30,10 @@ pub struct LocalConfig {
     pub minimax_api_base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minimax_api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glm_api_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glm_api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -56,6 +60,8 @@ impl Default for LocalConfig {
             codex_path: default_codex_path(),
             minimax_api_base_url: None,
             minimax_api_key: None,
+            glm_api_base_url: None,
+            glm_api_key: None,
         }
     }
 }

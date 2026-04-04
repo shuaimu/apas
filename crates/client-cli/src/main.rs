@@ -735,6 +735,20 @@ async fn handle_config_command(action: ConfigAction) -> Result<()> {
                         Some(value)
                     };
                 }
+                "glm_api_base_url" => {
+                    config.local.glm_api_base_url = if value.trim().is_empty() {
+                        None
+                    } else {
+                        Some(value)
+                    };
+                }
+                "glm_api_key" => {
+                    config.local.glm_api_key = if value.trim().is_empty() {
+                        None
+                    } else {
+                        Some(value)
+                    };
+                }
                 "daemon_machine_id" => config.daemon.machine_id = Some(value),
                 "daemon_roots" => {
                     config.daemon.project_roots = value
@@ -744,7 +758,7 @@ async fn handle_config_command(action: ConfigAction) -> Result<()> {
                         .collect();
                 }
                 _ => anyhow::bail!(
-                    "Unknown config key: {}. Valid keys: server, token, claude_path, minimax_path, codex_path, minimax_api_base_url, minimax_api_key, daemon_machine_id, daemon_roots",
+                    "Unknown config key: {}. Valid keys: server, token, claude_path, minimax_path, codex_path, minimax_api_base_url, minimax_api_key, glm_api_base_url, glm_api_key, daemon_machine_id, daemon_roots",
                     key
                 ),
             }
@@ -770,10 +784,16 @@ async fn handle_config_command(action: ConfigAction) -> Result<()> {
                     .minimax_api_key
                     .map(|_| "****".to_string())
                     .unwrap_or_default(),
+                "glm_api_base_url" => config.local.glm_api_base_url.unwrap_or_default(),
+                "glm_api_key" => config
+                    .local
+                    .glm_api_key
+                    .map(|_| "****".to_string())
+                    .unwrap_or_default(),
                 "daemon_machine_id" => config.daemon.machine_id.unwrap_or_default(),
                 "daemon_roots" => config.daemon.project_roots.join(","),
                 _ => anyhow::bail!(
-                    "Unknown config key: {}. Valid keys: server, token, claude_path, minimax_path, codex_path, minimax_api_base_url, minimax_api_key, daemon_machine_id, daemon_roots",
+                    "Unknown config key: {}. Valid keys: server, token, claude_path, minimax_path, codex_path, minimax_api_base_url, minimax_api_key, glm_api_base_url, glm_api_key, daemon_machine_id, daemon_roots",
                     key
                 ),
             };
@@ -798,6 +818,19 @@ async fn handle_config_command(action: ConfigAction) -> Result<()> {
                 config
                     .local
                     .minimax_api_key
+                    .as_ref()
+                    .map(|_| "****")
+                    .unwrap_or("")
+            );
+            println!(
+                "glm_api_base_url: {}",
+                config.local.glm_api_base_url.unwrap_or_default()
+            );
+            println!(
+                "glm_api_key: {}",
+                config
+                    .local
+                    .glm_api_key
                     .as_ref()
                     .map(|_| "****")
                     .unwrap_or("")

@@ -74,6 +74,11 @@ export interface MachineInfo {
     apiKey?: string;
     apiKeyConfigured: boolean;
   };
+  glmBackend?: {
+    apiBaseUrl?: string;
+    apiKey?: string;
+    apiKeyConfigured: boolean;
+  };
   lastSeen?: string;
 }
 
@@ -305,6 +310,11 @@ interface AppState {
     apiKey?: string,
     clearApiKey?: boolean,
   ) => void;
+  setMachineGlmConfig: (
+    machineId: string,
+    apiKey?: string,
+    clearApiKey?: boolean,
+  ) => void;
   listSessions: () => void;
   loadSessionMessages: (sessionId: string) => void;
   loadMoreMessages: (pane?: PaneType | number) => void;
@@ -333,6 +343,7 @@ interface AppState {
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://apas.mpaxos.com:8080";
 const MINIMAX_API_BASE_URL = "https://api.minimax.io/anthropic";
+const GLM_API_BASE_URL = "https://api.z.ai/api/anthropic";
 
 export const useStore = create<AppState>((set, get) => ({
   // Auth state - initialize from localStorage if available
@@ -717,6 +728,48 @@ export const useStore = create<AppState>((set, get) => ({
       type: "set_machine_mini_max_config",
       machine_id: machineId,
       api_base_url: MINIMAX_API_BASE_URL,
+      api_key: normalizedApiKey,
+      clear_api_key: clearApiKey,
+    }));
+  },
+
+  setMachineGlmConfig: (
+    machineId: string,
+    apiKey?: string,
+    clearApiKey: boolean = false,
+  ) => {
+    const { ws } = get();
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    const normalizedApiKey =
+      apiKey && apiKey.trim().length > 0 ? apiKey.trim() : undefined;
+
+    set((state) => ({
+      machines: state.machines.map((entry) => {
+        if (entry.machine.machineId !== machineId) return entry;
+        const existingBackend = entry.machine.glmBackend;
+        const nextApiKey = clearApiKey
+          ? undefined
+          : (normalizedApiKey ?? existingBackend?.apiKey);
+        return {
+          ...entry,
+          machine: {
+            ...entry.machine,
+            glmBackend: {
+              apiBaseUrl: GLM_API_BASE_URL,
+              apiKey: nextApiKey,
+              apiKeyConfigured: Boolean(nextApiKey),
+            },
+          },
+        };
+      }),
+    }));
+
+    ws.send(JSON.stringify({
+      type: "set_machine_glm_config",
+      machine_id: machineId,
+      api_base_url: GLM_API_BASE_URL,
       api_key: normalizedApiKey,
       clear_api_key: clearApiKey,
     }));
@@ -1195,6 +1248,15 @@ function handleServerMessage(
                   ),
                 }
               : undefined,
+            glmBackend: machine.glm_backend
+              ? {
+                  apiBaseUrl: ((machine.glm_backend as Record<string, unknown>).api_base_url as string | undefined),
+                  apiKey: ((machine.glm_backend as Record<string, unknown>).api_key as string | undefined),
+                  apiKeyConfigured: Boolean(
+                    (machine.glm_backend as Record<string, unknown>).api_key_configured
+                  ),
+                }
+              : undefined,
             lastSeen: machine.last_seen as string | undefined,
           },
           projects: projects.map((project) => ({
@@ -1213,23 +1275,39 @@ function handleServerMessage(
           state.machines.map((entry) => [entry.machine.machineId, entry])
         );
         const merged = parsed.map((entry) => {
-          const backend = entry.machine.minimaxBackend;
           const previous = previousById.get(entry.machine.machineId);
-          const previousKey = previous?.machine.minimaxBackend?.apiKey;
-          if (!backend || backend.apiKey !== undefined || !backend.apiKeyConfigured || !previousKey) {
-            return entry;
-          }
+          const minimaxBackend = entry.machine.minimaxBackend;
+          const previousMiniMaxKey = previous?.machine.minimaxBackend?.apiKey;
+          const mergedMiniMax =
+            minimaxBackend &&
+            minimaxBackend.apiKey === undefined &&
+            minimaxBackend.apiKeyConfigured &&
+            previousMiniMaxKey
+              ? {
+                  ...minimaxBackend,
+                  apiKey: previousMiniMaxKey,
+                }
+              : minimaxBackend;
 
-          // Some server snapshots only send api_key_configured without api_key.
-          // Keep the known key locally so the Machines input remains visible.
+          const glmBackend = entry.machine.glmBackend;
+          const previousGlmKey = previous?.machine.glmBackend?.apiKey;
+          const mergedGlm =
+            glmBackend &&
+            glmBackend.apiKey === undefined &&
+            glmBackend.apiKeyConfigured &&
+            previousGlmKey
+              ? {
+                  ...glmBackend,
+                  apiKey: previousGlmKey,
+                }
+              : glmBackend;
+
           return {
             ...entry,
             machine: {
               ...entry.machine,
-              minimaxBackend: {
-                ...backend,
-                apiKey: previousKey,
-              },
+              minimaxBackend: mergedMiniMax,
+              glmBackend: mergedGlm,
             },
           };
         });

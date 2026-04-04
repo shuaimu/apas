@@ -88,6 +88,12 @@ function isMiniMaxModel(model?: string): boolean {
   return normalized.includes("minimax") || normalized.startsWith("m2");
 }
 
+function isGlmModel(model?: string): boolean {
+  if (typeof model !== "string") return false;
+  const normalized = model.trim().toLowerCase();
+  return normalized.startsWith("glm") || normalized.includes("glm-");
+}
+
 // Synthesize PaneConfig entries from observed pane_id keys when no PaneList was received
 function synthesizeConfigs(
   paneMessages: Record<string, Message[]>,
@@ -275,7 +281,8 @@ export function TabbedView() {
 
   const handleAddTab = useCallback((provider: string = "claude", model?: string) => {
     const isMiniMax = provider === "minimax" || (provider === "claude" && isMiniMaxModel(model));
-    const prefix = provider === "codex" ? "Codex" : isMiniMax ? "MiniMax" : "Claude";
+    const isGlm = provider === "glm" || (provider === "claude" && isGlmModel(model));
+    const prefix = provider === "codex" ? "Codex" : isMiniMax ? "MiniMax" : isGlm ? "GLM" : "Claude";
     const label = `${prefix} ${effectiveTabs.length + 1}`;
     const result = addPane(provider, "interactive", label, undefined, model);
     if (result.success) {
@@ -334,7 +341,11 @@ export function TabbedView() {
       (typeof activeConfig?.label === "string" && activeConfig.label.toLowerCase().includes("minimax"))
     )
   );
-  const activeUsageProvider = activeIsMiniMax ? "minimax" : activeProvider;
+  const activeIsGlm = activeProvider === "claude" && (
+    isGlmModel(activeConfig?.model) ||
+    (typeof activeConfig?.label === "string" && activeConfig.label.toLowerCase().includes("glm"))
+  );
+  const activeUsageProvider = activeIsMiniMax ? "minimax" : activeIsGlm ? undefined : activeProvider;
   const activeBotPrompt = activeConfig?.prompt && activeConfig.prompt.trim().length > 0
     ? activeConfig.prompt
     : DEFAULT_BOT_LOOP_PROMPT;

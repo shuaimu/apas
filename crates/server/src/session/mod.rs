@@ -1,8 +1,8 @@
 use dashmap::DashMap;
 use shared::{
-    CliClientInfo, CliClientStatus, MachineInfo, MachineProjectInfo, MachineWithProjects,
-    MiniMaxBackendInfo, PaneConfig, Provider, ServerToCli, ServerToDaemon, ServerToWeb,
-    UsageLimits,
+    CliClientInfo, CliClientStatus, GlmBackendInfo, MachineInfo, MachineProjectInfo,
+    MachineWithProjects, MiniMaxBackendInfo, PaneConfig, Provider, ServerToCli, ServerToDaemon,
+    ServerToWeb, UsageLimits,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -36,6 +36,37 @@ fn merge_minimax_backend(
     existing: Option<MiniMaxBackendInfo>,
     incoming: Option<MiniMaxBackendInfo>,
 ) -> Option<MiniMaxBackendInfo> {
+    match (existing, incoming) {
+        (None, None) => None,
+        (Some(existing), None) => Some(existing),
+        (None, Some(mut incoming)) => {
+            incoming.api_base_url = normalize_optional_string(incoming.api_base_url);
+            incoming.api_key = normalize_optional_string(incoming.api_key);
+            incoming.api_key_configured = incoming.api_key.is_some() || incoming.api_key_configured;
+            Some(incoming)
+        }
+        (Some(existing), Some(mut incoming)) => {
+            incoming.api_base_url = normalize_optional_string(incoming.api_base_url)
+                .or_else(|| normalize_optional_string(existing.api_base_url));
+
+            let incoming_key = normalize_optional_string(incoming.api_key);
+            incoming.api_key = incoming_key.or_else(|| {
+                if incoming.api_key_configured {
+                    normalize_optional_string(existing.api_key)
+                } else {
+                    None
+                }
+            });
+            incoming.api_key_configured = incoming.api_key.is_some() || incoming.api_key_configured;
+            Some(incoming)
+        }
+    }
+}
+
+fn merge_glm_backend(
+    existing: Option<GlmBackendInfo>,
+    incoming: Option<GlmBackendInfo>,
+) -> Option<GlmBackendInfo> {
     match (existing, incoming) {
         (None, None) => None,
         (Some(existing), None) => Some(existing),
@@ -197,9 +228,14 @@ impl SessionManager {
             .machine_infos
             .get(&machine_id)
             .and_then(|m| m.minimax_backend.clone());
+        let existing_glm = self
+            .machine_infos
+            .get(&machine_id)
+            .and_then(|m| m.glm_backend.clone());
         machine.machine_id = machine_id;
         machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
         machine.minimax_backend = merge_minimax_backend(existing_minimax, machine.minimax_backend);
+        machine.glm_backend = merge_glm_backend(existing_glm, machine.glm_backend);
         self.daemon_senders.insert(machine_id, sender);
         self.daemon_users.insert(machine_id, user_id);
         self.machine_infos.insert(machine_id, machine);
@@ -247,9 +283,14 @@ impl SessionManager {
             .machine_infos
             .get(machine_id)
             .and_then(|m| m.minimax_backend.clone());
+        let existing_glm = self
+            .machine_infos
+            .get(machine_id)
+            .and_then(|m| m.glm_backend.clone());
         machine.machine_id = *machine_id;
         machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
         machine.minimax_backend = merge_minimax_backend(existing_minimax, machine.minimax_backend);
+        machine.glm_backend = merge_glm_backend(existing_glm, machine.glm_backend);
         self.machine_infos.insert(*machine_id, machine);
         if let Some(owner) = self.daemon_users.get(machine_id).map(|entry| *entry) {
             self.broadcast_machines_update_for_user(&owner);
@@ -289,6 +330,44 @@ impl SessionManager {
             }
 
             machine.minimax_backend = Some(backend);
+            machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
+        }
+
+        if let Some(user_id) = owner {
+            self.broadcast_machines_update_for_user(&user_id);
+        }
+    }
+
+    pub fn apply_web_glm_config(
+        &self,
+        machine_id: &Uuid,
+        api_base_url: Option<String>,
+        api_key: Option<String>,
+        clear_api_key: bool,
+    ) {
+        let owner = self.daemon_users.get(machine_id).map(|entry| *entry);
+        if let Some(mut machine) = self.machine_infos.get_mut(machine_id) {
+            let mut backend = machine.glm_backend.clone().unwrap_or(GlmBackendInfo {
+                api_base_url: None,
+                api_key: None,
+                api_key_configured: false,
+            });
+
+            if let Some(url) = normalize_optional_string(api_base_url) {
+                backend.api_base_url = Some(url);
+            }
+
+            if clear_api_key {
+                backend.api_key = None;
+                backend.api_key_configured = false;
+            } else if let Some(key) = normalize_optional_string(api_key) {
+                backend.api_key = Some(key);
+                backend.api_key_configured = true;
+            } else {
+                backend.api_key_configured = backend.api_key.is_some();
+            }
+
+            machine.glm_backend = Some(backend);
             machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
         }
 
