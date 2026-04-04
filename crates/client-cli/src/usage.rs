@@ -13,6 +13,7 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use shared::{UsageLimitWindow, UsageLimits};
+use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -565,9 +566,47 @@ fn first_rfc3339_from_objects(
     None
 }
 
+fn utilization_from_counts(
+    objects: &[&serde_json::Map<String, Value>],
+    total_keys: &[&str],
+    used_keys: &[&str],
+    remaining_keys: &[&str],
+) -> Option<f64> {
+    let total = first_number_from_objects(objects, total_keys)?;
+    if total <= 0.0 {
+        return None;
+    }
+
+    if let Some(used) = first_number_from_objects(objects, used_keys) {
+        return Some((used / total).clamp(0.0, 1.5));
+    }
+
+    if let Some(remaining) = first_number_from_objects(objects, remaining_keys) {
+        let used = (total - remaining).max(0.0);
+        return Some((used / total).clamp(0.0, 1.5));
+    }
+
+    None
+}
+
 fn is_minimax_model_name(raw: &str) -> bool {
     let normalized = raw.trim().to_ascii_lowercase();
     !normalized.is_empty() && (normalized.contains("minimax") || normalized.starts_with("m2"))
+}
+
+fn minimax_model_remains_score(entry: &serde_json::Map<String, Value>) -> f64 {
+    let weekly_total = first_number_from_objects(
+        &[entry],
+        &["current_weekly_total_count", "weekly_total_count"],
+    )
+    .unwrap_or(0.0);
+    let interval_total = first_number_from_objects(
+        &[entry],
+        &["current_interval_total_count", "interval_total_count"],
+    )
+    .unwrap_or(0.0);
+    // Prefer entries that expose useful quota windows (weekly weighted higher).
+    (weekly_total * 10.0) + interval_total
 }
 
 fn parse_minimax_usage_limits(payload: &Value) -> Result<UsageLimits> {
@@ -612,6 +651,8 @@ fn parse_minimax_usage_limits(payload: &Value) -> Result<UsageLimits> {
         objects.push(data);
     }
 
+    let mut selected_model_entry: Option<&serde_json::Map<String, Value>> = None;
+
     // Prefer model-specific remains entry for MiniMax models if present.
     for source in objects.clone() {
         let model_remains = source
@@ -625,7 +666,7 @@ fn parse_minimax_usage_limits(payload: &Value) -> Result<UsageLimits> {
         let preferred = entries
             .iter()
             .filter_map(Value::as_object)
-            .find(|entry| {
+            .filter(|entry| {
                 entry
                     .get("model_name")
                     .or_else(|| entry.get("model"))
@@ -633,102 +674,228 @@ fn parse_minimax_usage_limits(payload: &Value) -> Result<UsageLimits> {
                     .map(is_minimax_model_name)
                     .unwrap_or(false)
             })
+            .max_by(|left, right| {
+                minimax_model_remains_score(left)
+                    .partial_cmp(&minimax_model_remains_score(right))
+                    .unwrap_or(Ordering::Equal)
+            })
             .or_else(|| entries.iter().filter_map(Value::as_object).next());
 
         if let Some(entry) = preferred {
+            selected_model_entry = Some(entry);
             objects.insert(0, entry);
             break;
         }
     }
 
-    let utilization = {
-        let explicit = first_number_from_objects(
-            &objects,
-            &[
-                "utilization",
-                "usage_rate",
-                "used_rate",
-                "usage_percentage",
-                "used_percent",
-                "percent",
-            ],
-        );
-        if let Some(rate) = explicit {
-            Some(if rate > 1.0 { rate / 100.0 } else { rate })
-        } else {
-            let total = first_number_from_objects(
-                &objects,
-                &[
-                    "current_interval_total_count",
-                    "interval_total_count",
-                    "total_count",
-                    "quota_total",
-                ],
-            );
-            let remaining = first_number_from_objects(
-                &objects,
-                &[
-                    "current_interval_usage_count",
-                    "interval_usage_count",
-                    "remaining_count",
-                    "remain_count",
-                    "remaining",
-                    "remain",
-                ],
-            );
-            let used = first_number_from_objects(
-                &objects,
-                &[
-                    "current_interval_used_count",
-                    "used_count",
-                    "usage_count",
-                    "consumed_count",
-                ],
-            );
-
-            if let (Some(total), Some(remaining)) = (total, remaining) {
-                if total > 0.0 {
-                    // MiniMax remains API reports remaining quota. Convert to utilization.
-                    let consumed = (total - remaining).max(0.0);
-                    Some(consumed / total)
-                } else {
-                    None
-                }
-            } else if let (Some(total), Some(used)) = (total, used) {
-                if total > 0.0 {
-                    Some(used / total)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        }
-    }
-    .map(|value| value.clamp(0.0, 1.5))
-    .ok_or_else(|| anyhow::anyhow!("MiniMax usage response missing utilization data"))?;
-
-    let resets_at = first_rfc3339_from_objects(
+    let explicit_utilization = first_number_from_objects(
         &objects,
         &[
-            "next_interval_time",
-            "next_reset_time",
-            "next_reset_at",
-            "current_interval_end_time",
-            "end_time",
-            "reset_at",
-            "resets_at",
+            "utilization",
+            "usage_rate",
+            "used_rate",
+            "usage_percentage",
+            "used_percent",
+            "percent",
         ],
-    );
+    )
+    .map(|rate| if rate > 1.0 { rate / 100.0 } else { rate })
+    .map(|value| value.clamp(0.0, 1.5));
+
+    let mut five_hour = None;
+    let mut seven_day = None;
+
+    if let Some(model_entry) = selected_model_entry {
+        let model_objects = [model_entry];
+
+        if let Some(utilization) = utilization_from_counts(
+            &model_objects,
+            &["current_interval_total_count", "interval_total_count"],
+            &[
+                "current_interval_usage_count",
+                "interval_usage_count",
+                "current_interval_used_count",
+                "used_count",
+                "usage_count",
+                "consumed_count",
+            ],
+            &[
+                "current_interval_remaining_count",
+                "interval_remaining_count",
+                "remaining_count",
+                "remain_count",
+                "remaining",
+                "remain",
+            ],
+        ) {
+            let resets_at = first_rfc3339_from_objects(
+                &model_objects,
+                &[
+                    "end_time",
+                    "current_interval_end_time",
+                    "next_interval_time",
+                    "next_reset_time",
+                    "next_reset_at",
+                    "reset_at",
+                    "resets_at",
+                ],
+            );
+            five_hour = Some(UsageLimitWindow {
+                utilization,
+                resets_at,
+            });
+        }
+
+        if let Some(utilization) = utilization_from_counts(
+            &model_objects,
+            &["current_weekly_total_count", "weekly_total_count"],
+            &[
+                "current_weekly_usage_count",
+                "weekly_usage_count",
+                "used_count",
+                "usage_count",
+                "consumed_count",
+            ],
+            &[
+                "current_weekly_remaining_count",
+                "weekly_remaining_count",
+                "remaining_count",
+                "remain_count",
+                "remaining",
+                "remain",
+            ],
+        ) {
+            let resets_at = first_rfc3339_from_objects(
+                &model_objects,
+                &[
+                    "weekly_end_time",
+                    "current_weekly_end_time",
+                    "next_weekly_time",
+                    "next_reset_time",
+                    "next_reset_at",
+                    "reset_at",
+                    "resets_at",
+                ],
+            );
+            seven_day = Some(UsageLimitWindow {
+                utilization,
+                resets_at,
+            });
+        }
+    }
+
+    if five_hour.is_none() {
+        if let Some(utilization) = utilization_from_counts(
+            &objects,
+            &[
+                "current_interval_total_count",
+                "interval_total_count",
+                "total_count",
+                "quota_total",
+            ],
+            &[
+                "current_interval_usage_count",
+                "interval_usage_count",
+                "current_interval_used_count",
+                "used_count",
+                "usage_count",
+                "consumed_count",
+            ],
+            &[
+                "current_interval_remaining_count",
+                "interval_remaining_count",
+                "remaining_count",
+                "remain_count",
+                "remaining",
+                "remain",
+            ],
+        ) {
+            let resets_at = first_rfc3339_from_objects(
+                &objects,
+                &[
+                    "end_time",
+                    "current_interval_end_time",
+                    "next_interval_time",
+                    "next_reset_time",
+                    "next_reset_at",
+                    "reset_at",
+                    "resets_at",
+                ],
+            );
+            five_hour = Some(UsageLimitWindow {
+                utilization,
+                resets_at,
+            });
+        }
+    }
+
+    if seven_day.is_none() {
+        let fallback_utilization = utilization_from_counts(
+            &objects,
+            &[
+                "current_weekly_total_count",
+                "weekly_total_count",
+                "seven_day_total_count",
+                "total_count",
+                "quota_total",
+            ],
+            &[
+                "current_weekly_usage_count",
+                "weekly_usage_count",
+                "seven_day_usage_count",
+                "current_interval_usage_count",
+                "interval_usage_count",
+                "used_count",
+                "usage_count",
+                "consumed_count",
+            ],
+            &[
+                "current_weekly_remaining_count",
+                "weekly_remaining_count",
+                "seven_day_remaining_count",
+                "current_interval_remaining_count",
+                "interval_remaining_count",
+                "remaining_count",
+                "remain_count",
+                "remaining",
+                "remain",
+            ],
+        )
+        .or(explicit_utilization);
+
+        if let Some(utilization) = fallback_utilization {
+            let resets_at = first_rfc3339_from_objects(
+                &objects,
+                &[
+                    "weekly_end_time",
+                    "current_weekly_end_time",
+                    "next_weekly_time",
+                    "next_reset_time",
+                    "next_reset_at",
+                    "end_time",
+                    "current_interval_end_time",
+                    "next_interval_time",
+                    "reset_at",
+                    "resets_at",
+                ],
+            );
+            seven_day = Some(UsageLimitWindow {
+                utilization,
+                resets_at,
+            });
+        }
+    }
+
+    if five_hour.is_none() && seven_day.is_none() {
+        return Err(anyhow::anyhow!(
+            "MiniMax usage response missing utilization data"
+        ));
+    }
 
     let now = Utc::now().to_rfc3339();
     Ok(UsageLimits {
-        // MiniMax remains API is plan-wide quota; map it to the weekly slot.
-        five_hour: None,
-        seven_day: Some(UsageLimitWindow {
-            utilization,
-            resets_at,
-        }),
+        five_hour,
+        seven_day,
         fetched_at: Some(now),
     })
 }
@@ -866,17 +1033,21 @@ mod tests {
                     "model_name": "MiniMax-M2.7",
                     "current_interval_total_count": 100,
                     "current_interval_usage_count": 30,
-                    "next_interval_time": 1743974400000i64
+                    "end_time": 1743974400000i64,
+                    "current_weekly_total_count": 1000,
+                    "current_weekly_usage_count": 500,
+                    "weekly_end_time": 1744492800000i64
                 }
             ]
         });
 
         let parsed = parse_minimax_usage_limits(&payload).expect("parses minimax payload");
         let weekly = parsed.seven_day.expect("weekly window exists");
-        // usage_count is remaining count -> utilization = (100 - 30) / 100 = 0.7
-        assert!((weekly.utilization - 0.7).abs() < 0.0001);
+        assert!((weekly.utilization - 0.5).abs() < 0.0001);
         assert!(weekly.resets_at.is_some());
-        assert!(parsed.five_hour.is_none());
+        let five_hour = parsed.five_hour.expect("5h window exists");
+        assert!((five_hour.utilization - 0.3).abs() < 0.0001);
+        assert!(five_hour.resets_at.is_some());
     }
 
     #[test]
@@ -891,5 +1062,38 @@ mod tests {
         let parsed = parse_minimax_usage_limits(&payload).expect("parses percentage payload");
         let weekly = parsed.seven_day.expect("weekly window exists");
         assert!((weekly.utilization - 0.45).abs() < 0.0001);
+    }
+
+    #[test]
+    fn parse_minimax_usage_limits_from_live_shape() {
+        let payload = serde_json::json!({
+            "model_remains": [
+                {
+                    "start_time": 1775260800000i64,
+                    "end_time": 1775278800000i64,
+                    "remains_time": 7362522,
+                    "current_interval_total_count": 1500,
+                    "current_interval_usage_count": 1456,
+                    "model_name": "MiniMax-M*",
+                    "current_weekly_total_count": 15000,
+                    "current_weekly_usage_count": 14954,
+                    "weekly_start_time": 1774828800000i64,
+                    "weekly_end_time": 1775433600000i64,
+                    "weekly_remains_time": 162162522
+                }
+            ],
+            "base_resp": {
+                "status_code": 0,
+                "status_msg": "success"
+            }
+        });
+
+        let parsed = parse_minimax_usage_limits(&payload).expect("parses live minimax payload");
+        let five_hour = parsed.five_hour.expect("5h window exists");
+        let weekly = parsed.seven_day.expect("weekly window exists");
+        assert!((five_hour.utilization - (1456.0 / 1500.0)).abs() < 0.0001);
+        assert!((weekly.utilization - (14954.0 / 15000.0)).abs() < 0.0001);
+        assert!(five_hour.resets_at.is_some());
+        assert!(weekly.resets_at.is_some());
     }
 }
