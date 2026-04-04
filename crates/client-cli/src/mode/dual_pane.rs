@@ -143,6 +143,7 @@ fn provider_config_key(provider: &Provider, model: Option<&str>) -> &'static str
 
 const MINIMAX_API_BASE_URL: &str = "https://api.minimax.io/anthropic";
 const GLM_API_BASE_URL: &str = "https://api.z.ai/api/anthropic";
+const GLM_DEFAULT_HAIKU_MODEL: &str = "glm-4.5-air";
 
 fn trim_to_option(raw: Option<String>) -> Option<String> {
     raw.and_then(|value| {
@@ -216,7 +217,18 @@ fn build_pane_env_overrides(
         ("ANTHROPIC_API_KEY".to_string(), api_key),
     ];
     if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
-        env.push(("ANTHROPIC_MODEL".to_string(), model.to_string()));
+        if is_minimax {
+            env.push(("ANTHROPIC_MODEL".to_string(), model.to_string()));
+        } else if is_glm {
+            // Z.AI's Claude bridge expects model switching via default model
+            // mapping variables instead of ANTHROPIC_MODEL for GLM-5.x.
+            env.push(("ANTHROPIC_DEFAULT_SONNET_MODEL".to_string(), model.to_string()));
+            env.push(("ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(), model.to_string()));
+            env.push((
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
+                GLM_DEFAULT_HAIKU_MODEL.to_string(),
+            ));
+        }
     }
     Ok(env)
 }
