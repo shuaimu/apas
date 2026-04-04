@@ -708,18 +708,20 @@ fn parse_minimax_usage_limits(payload: &Value) -> Result<UsageLimits> {
     if let Some(model_entry) = selected_model_entry {
         let model_objects = [model_entry];
 
+        // MiniMax remains endpoint reports `*_usage_count` as remaining quota
+        // for the current window, not consumed usage.
         if let Some(utilization) = utilization_from_counts(
             &model_objects,
             &["current_interval_total_count", "interval_total_count"],
             &[
-                "current_interval_usage_count",
-                "interval_usage_count",
                 "current_interval_used_count",
                 "used_count",
-                "usage_count",
                 "consumed_count",
             ],
             &[
+                "current_interval_usage_count",
+                "interval_usage_count",
+                "usage_count",
                 "current_interval_remaining_count",
                 "interval_remaining_count",
                 "remaining_count",
@@ -750,13 +752,15 @@ fn parse_minimax_usage_limits(payload: &Value) -> Result<UsageLimits> {
             &model_objects,
             &["current_weekly_total_count", "weekly_total_count"],
             &[
-                "current_weekly_usage_count",
-                "weekly_usage_count",
+                "current_weekly_used_count",
+                "weekly_used_count",
                 "used_count",
-                "usage_count",
                 "consumed_count",
             ],
             &[
+                "current_weekly_usage_count",
+                "weekly_usage_count",
+                "usage_count",
                 "current_weekly_remaining_count",
                 "weekly_remaining_count",
                 "remaining_count",
@@ -794,14 +798,14 @@ fn parse_minimax_usage_limits(payload: &Value) -> Result<UsageLimits> {
                 "quota_total",
             ],
             &[
-                "current_interval_usage_count",
-                "interval_usage_count",
                 "current_interval_used_count",
                 "used_count",
-                "usage_count",
                 "consumed_count",
             ],
             &[
+                "current_interval_usage_count",
+                "interval_usage_count",
+                "usage_count",
                 "current_interval_remaining_count",
                 "interval_remaining_count",
                 "remaining_count",
@@ -840,16 +844,20 @@ fn parse_minimax_usage_limits(payload: &Value) -> Result<UsageLimits> {
                 "quota_total",
             ],
             &[
+                "current_weekly_used_count",
+                "weekly_used_count",
+                "seven_day_used_count",
+                "current_interval_used_count",
+                "used_count",
+                "consumed_count",
+            ],
+            &[
                 "current_weekly_usage_count",
                 "weekly_usage_count",
                 "seven_day_usage_count",
                 "current_interval_usage_count",
                 "interval_usage_count",
-                "used_count",
                 "usage_count",
-                "consumed_count",
-            ],
-            &[
                 "current_weekly_remaining_count",
                 "weekly_remaining_count",
                 "seven_day_remaining_count",
@@ -1046,7 +1054,7 @@ mod tests {
         assert!((weekly.utilization - 0.5).abs() < 0.0001);
         assert!(weekly.resets_at.is_some());
         let five_hour = parsed.five_hour.expect("5h window exists");
-        assert!((five_hour.utilization - 0.3).abs() < 0.0001);
+        assert!((five_hour.utilization - 0.7).abs() < 0.0001);
         assert!(five_hour.resets_at.is_some());
     }
 
@@ -1091,8 +1099,8 @@ mod tests {
         let parsed = parse_minimax_usage_limits(&payload).expect("parses live minimax payload");
         let five_hour = parsed.five_hour.expect("5h window exists");
         let weekly = parsed.seven_day.expect("weekly window exists");
-        assert!((five_hour.utilization - (1456.0 / 1500.0)).abs() < 0.0001);
-        assert!((weekly.utilization - (14954.0 / 15000.0)).abs() < 0.0001);
+        assert!((five_hour.utilization - ((1500.0 - 1456.0) / 1500.0)).abs() < 0.0001);
+        assert!((weekly.utilization - ((15000.0 - 14954.0) / 15000.0)).abs() < 0.0001);
         assert!(five_hour.resets_at.is_some());
         assert!(weekly.resets_at.is_some());
     }

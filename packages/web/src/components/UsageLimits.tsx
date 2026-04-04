@@ -87,6 +87,22 @@ function getTextColor(utilization: number): string {
   return "text-green-600 dark:text-green-400";
 }
 
+function formatUtilizationPercent(utilization: number): string {
+  if (!Number.isFinite(utilization)) return "0";
+
+  const rawPercent = Math.max(0, utilization * 100);
+  // Avoid showing "100%" for sub-100 utilization due to rounding.
+  const displayPercent = utilization < 1.0 ? Math.min(rawPercent, 99.9) : rawPercent;
+
+  if (displayPercent >= 100) {
+    return displayPercent.toFixed(0);
+  }
+  if (displayPercent >= 99) {
+    return displayPercent.toFixed(1).replace(/\.0$/, "");
+  }
+  return displayPercent.toFixed(0);
+}
+
 interface UsageBarProps {
   label: string;
   utilization: number;
@@ -95,7 +111,7 @@ interface UsageBarProps {
 
 function UsageBar({ label, utilization, resetsAt }: UsageBarProps) {
   const percentage = Math.min(utilization * 100, 100);
-  const displayPercentage = (utilization * 100).toFixed(0);
+  const displayPercentage = formatUtilizationPercent(utilization);
   const resetMeta = formatResetMeta(resetsAt);
 
   return (
@@ -155,7 +171,7 @@ export function UsageLimitsDisplay({ limits, compact = false }: UsageLimitsDispl
 
     if (!primary) return null;
 
-    const percentage = (primary.utilization * 100).toFixed(0);
+    const percentage = formatUtilizationPercent(primary.utilization);
     const resetMeta = formatResetMeta(primary.resetsAt);
 
     return (
