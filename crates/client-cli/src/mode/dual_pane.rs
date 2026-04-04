@@ -66,6 +66,36 @@ fn is_minimax_model(model: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+fn default_pane_label(pane_id: u32, model: Option<&str>) -> String {
+    match pane_id {
+        shared::PANE_ID_DEADLOOP => "Deadloop".to_string(),
+        shared::PANE_ID_INTERACTIVE => "Interactive".to_string(),
+        _ if is_minimax_model(model) => format!("MiniMax {}", pane_id),
+        _ => format!("Tab {}", pane_id),
+    }
+}
+
+fn is_generic_tab_label(label: &str, pane_id: u32) -> bool {
+    label
+        .trim()
+        .eq_ignore_ascii_case(&format!("Tab {}", pane_id))
+}
+
+fn pane_label_or_default(raw_label: Option<&str>, pane_id: u32, model: Option<&str>) -> String {
+    let default = default_pane_label(pane_id, model);
+    let Some(label) = raw_label else {
+        return default;
+    };
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return default;
+    }
+    if is_minimax_model(model) && is_generic_tab_label(trimmed, pane_id) {
+        return default;
+    }
+    trimmed.to_string()
+}
+
 fn resolve_pane_binary_path(
     provider: Provider,
     _model: Option<&str>,
@@ -186,6 +216,7 @@ type PaneStopRequests = Arc<Mutex<HashMap<u32, Arc<AtomicBool>>>>;
 struct PaneMeta {
     mode: shared::PaneMode,
     provider: shared::Provider,
+    label: String,
     prompt: Option<String>,
     model: Option<String>,
     min_iteration_interval_minutes: Option<u64>,
@@ -263,11 +294,8 @@ async fn run_inner(
             } else {
                 pane.mode.clone()
             };
-            let label = pane.label.clone().unwrap_or_else(|| match pane.pane_id {
-                shared::PANE_ID_DEADLOOP => "Deadloop".to_string(),
-                shared::PANE_ID_INTERACTIVE => "Interactive".to_string(),
-                _ => format!("Tab {}", pane.pane_id),
-            });
+            let label =
+                pane_label_or_default(pane.label.as_deref(), pane.pane_id, pane.model.as_deref());
             let is_paused = if mode == shared::PaneMode::Deadloop {
                 if pane.pane_id == shared::PANE_ID_DEADLOOP {
                     pane.is_paused || metadata.is_paused
@@ -353,7 +381,7 @@ async fn run_inner(
         for (
             pane_id,
             pane_session_id,
-            _,
+            tab_label,
             mode,
             provider,
             tab_prompt,
@@ -368,6 +396,7 @@ async fn run_inner(
                 PaneMeta {
                     mode: mode.clone(),
                     provider: *provider,
+                    label: tab_label.clone(),
                     prompt: tab_prompt.clone(),
                     model: tab_model.clone(),
                     min_iteration_interval_minutes: *min_interval_minutes,
@@ -732,11 +761,12 @@ fn save_pane_configs(
         let mut panes: Vec<shared::PaneConfig> = pane_sessions
             .iter()
             .map(|(&pane_id, &claude_sid)| {
-                let (mode, provider, prompt, model, min_iteration_interval_minutes) =
+                let (mode, provider, label, prompt, model, min_iteration_interval_minutes) =
                     if let Some(meta) = pane_metas.get(&pane_id) {
                         (
                             meta.mode.clone(),
                             meta.provider.clone(),
+                            meta.label.clone(),
                             meta.prompt.clone(),
                             meta.model.clone(),
                             meta.min_iteration_interval_minutes,
@@ -745,6 +775,7 @@ fn save_pane_configs(
                         (
                             shared::PaneMode::Deadloop,
                             Provider::Claude,
+                            default_pane_label(pane_id, None),
                             None,
                             None,
                             Some(DEFAULT_MIN_ITERATION_INTERVAL_MINUTES),
@@ -753,16 +784,12 @@ fn save_pane_configs(
                         (
                             shared::PaneMode::Interactive,
                             Provider::Claude,
+                            default_pane_label(pane_id, None),
                             None,
                             None,
                             None,
                         )
                     };
-                let label = match pane_id {
-                    shared::PANE_ID_DEADLOOP => "Deadloop".to_string(),
-                    shared::PANE_ID_INTERACTIVE => "Interactive".to_string(),
-                    _ => format!("Tab {}", pane_id),
-                };
                 shared::PaneConfig {
                     pane_id,
                     provider,
@@ -772,7 +799,11 @@ fn save_pane_configs(
                     stop_requested: stop_requested.get(&pane_id).copied().unwrap_or(false),
                     prompt,
                     min_iteration_interval_minutes,
-                    label: Some(label),
+                    label: Some(pane_label_or_default(
+                        Some(&label),
+                        pane_id,
+                        model.as_deref(),
+                    )),
                     model,
                 }
             })
@@ -834,6 +865,7 @@ fn handle_tui_events(
                         PaneMeta {
                             mode: mode.clone(),
                             provider: provider.clone(),
+                            label: label.clone(),
                             prompt: None,
                             model: None,
                             min_iteration_interval_minutes: None,
@@ -909,7 +941,7 @@ fn handle_tui_events(
             }
             Ok(TuiEvent::AddTabWithConfig {
                 pane_id,
-                label,
+                label: requested_label,
                 claude_session_id,
                 mode,
                 provider,
@@ -917,6 +949,8 @@ fn handle_tui_events(
                 min_iteration_interval_minutes,
                 model,
             }) => {
+                let label =
+                    pane_label_or_default(Some(&requested_label), pane_id, model.as_deref());
                 // Track claude session and metadata for this pane
                 {
                     let mut ps = pane_sessions.lock().unwrap();
@@ -932,6 +966,7 @@ fn handle_tui_events(
                         PaneMeta {
                             mode: mode.clone(),
                             provider: provider.clone(),
+                            label: label.clone(),
                             prompt: prompt.clone(),
                             model: model.clone(),
                             min_iteration_interval_minutes,
@@ -1125,16 +1160,29 @@ fn handle_tui_events(
                 min_iteration_interval_minutes,
             }) => {
                 // Preserve provider/model and any existing per-pane prompt across mode switches.
-                let (provider, existing_prompt, existing_model, existing_min_interval_minutes) = {
+                let (
+                    provider,
+                    existing_label,
+                    existing_prompt,
+                    existing_model,
+                    existing_min_interval_minutes,
+                ) = {
                     let metas = pane_metas.lock().unwrap();
                     match metas.get(&pane_id) {
                         Some(meta) => (
                             meta.provider,
+                            meta.label.clone(),
                             meta.prompt.clone(),
                             meta.model.clone(),
                             meta.min_iteration_interval_minutes,
                         ),
-                        None => (Provider::Claude, None, None, None),
+                        None => (
+                            Provider::Claude,
+                            default_pane_label(pane_id, None),
+                            None,
+                            None,
+                            None,
+                        ),
                     }
                 };
                 let resolved_prompt = prompt.filter(|p| !p.trim().is_empty()).or(existing_prompt);
@@ -1195,6 +1243,7 @@ fn handle_tui_events(
                         PaneMeta {
                             mode: shared::PaneMode::Deadloop,
                             provider,
+                            label: existing_label,
                             prompt: resolved_prompt.clone(),
                             model: existing_model.clone(),
                             min_iteration_interval_minutes: Some(resolved_min_interval_minutes),
@@ -1435,7 +1484,7 @@ fn handle_tui_events(
                     // (e.g. pane was removed). Still safe to proceed.
                 }
 
-                let (provider, saved_prompt, saved_model, saved_min_interval_minutes) = {
+                let (provider, saved_label, saved_prompt, saved_model, saved_min_interval_minutes) = {
                     let metas = pane_metas.lock().unwrap();
                     let Some(meta) = metas.get(&pane_id) else {
                         continue;
@@ -1445,6 +1494,7 @@ fn handle_tui_events(
                     }
                     (
                         meta.provider,
+                        meta.label.clone(),
                         meta.prompt.clone(),
                         meta.model.clone(),
                         meta.min_iteration_interval_minutes,
@@ -1478,6 +1528,7 @@ fn handle_tui_events(
                         PaneMeta {
                             mode: shared::PaneMode::Interactive,
                             provider,
+                            label: saved_label,
                             prompt: saved_prompt,
                             model: saved_model.clone(),
                             min_iteration_interval_minutes: saved_min_interval_minutes,
@@ -1596,11 +1647,7 @@ fn build_pane_list(
     // Build from metas (covers deadloop panes which don't have input channels)
     for (&pane_id, meta) in metas.iter() {
         let claude_sid = ps.get(&pane_id).copied().unwrap_or(session_id);
-        let label = match pane_id {
-            shared::PANE_ID_DEADLOOP => "Deadloop".to_string(),
-            shared::PANE_ID_INTERACTIVE => "Interactive".to_string(),
-            _ => format!("Tab {}", pane_id),
-        };
+        let label = pane_label_or_default(Some(&meta.label), pane_id, meta.model.as_deref());
         let is_paused = pauses
             .get(&pane_id)
             .map(|f| f.load(Ordering::SeqCst))
@@ -1636,7 +1683,7 @@ fn build_pane_list(
                 stop_requested: false,
                 prompt: None,
                 min_iteration_interval_minutes: None,
-                label: Some(format!("Tab {}", pane_id)),
+                label: Some(default_pane_label(pane_id, None)),
                 model: None,
             });
         }
@@ -1789,7 +1836,8 @@ fn parse_agent_output(
 #[cfg(test)]
 mod tests {
     use super::{
-        active_usage_providers, build_agent_args, resolve_pane_binary_path, PaneMeta, PaneMetas,
+        active_usage_providers, build_agent_args, pane_label_or_default, resolve_pane_binary_path,
+        PaneMeta, PaneMetas,
     };
     use shared::Provider;
     use std::collections::HashMap;
@@ -1908,6 +1956,18 @@ mod tests {
     }
 
     #[test]
+    fn pane_label_or_default_rebrands_generic_minimax_tab_label() {
+        let label = pane_label_or_default(Some("Tab 42"), 42, Some("MiniMax-M2.7"));
+        assert_eq!(label, "MiniMax 42");
+    }
+
+    #[test]
+    fn pane_label_or_default_preserves_custom_label() {
+        let label = pane_label_or_default(Some("Research"), 42, Some("MiniMax-M2.7"));
+        assert_eq!(label, "Research");
+    }
+
+    #[test]
     fn active_usage_providers_detects_claude_and_codex() {
         let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
         let child_process = Arc::new(Mutex::new(None));
@@ -1919,6 +1979,7 @@ mod tests {
                 PaneMeta {
                     mode: shared::PaneMode::Interactive,
                     provider: Provider::Claude,
+                    label: "Interactive".to_string(),
                     prompt: None,
                     model: None,
                     min_iteration_interval_minutes: None,
@@ -1930,6 +1991,7 @@ mod tests {
                 PaneMeta {
                     mode: shared::PaneMode::Interactive,
                     provider: Provider::Codex,
+                    label: "Tab 2".to_string(),
                     prompt: None,
                     model: None,
                     min_iteration_interval_minutes: None,
@@ -1953,6 +2015,7 @@ mod tests {
                 PaneMeta {
                     mode: shared::PaneMode::Interactive,
                     provider: Provider::Claude,
+                    label: "MiniMax 1".to_string(),
                     prompt: None,
                     model: Some("MiniMax-M2.7".to_string()),
                     min_iteration_interval_minutes: None,
@@ -1976,6 +2039,7 @@ mod tests {
                 PaneMeta {
                     mode: shared::PaneMode::Interactive,
                     provider: Provider::Claude,
+                    label: "MiniMax 1".to_string(),
                     prompt: None,
                     model: Some("m2.7".to_string()),
                     min_iteration_interval_minutes: None,
@@ -1987,6 +2051,7 @@ mod tests {
                 PaneMeta {
                     mode: shared::PaneMode::Interactive,
                     provider: Provider::Codex,
+                    label: "Tab 2".to_string(),
                     prompt: None,
                     model: None,
                     min_iteration_interval_minutes: None,
