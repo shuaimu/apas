@@ -1653,7 +1653,10 @@ fn active_usage_providers(pane_metas: &PaneMetas) -> (bool, bool) {
 
     for meta in metas.values() {
         match meta.provider {
-            Provider::Claude => has_claude = true,
+            // MiniMax tabs run through Claude CLI transport, but Anthropic usage
+            // limits are not meaningful for them.
+            Provider::Claude if !is_minimax_model(meta.model.as_deref()) => has_claude = true,
+            Provider::Claude => {}
             Provider::Codex => has_codex = true,
         }
         if has_claude && has_codex {
@@ -1936,6 +1939,63 @@ mod tests {
         }
 
         assert_eq!(active_usage_providers(&pane_metas), (true, true));
+    }
+
+    #[test]
+    fn active_usage_providers_ignores_minimax_only_claude() {
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+        let child_process = Arc::new(Mutex::new(None));
+
+        {
+            let mut metas = pane_metas.lock().unwrap();
+            metas.insert(
+                1,
+                PaneMeta {
+                    mode: shared::PaneMode::Interactive,
+                    provider: Provider::Claude,
+                    prompt: None,
+                    model: Some("MiniMax-M2.7".to_string()),
+                    min_iteration_interval_minutes: None,
+                    child_process,
+                },
+            );
+        }
+
+        assert_eq!(active_usage_providers(&pane_metas), (false, false));
+    }
+
+    #[test]
+    fn active_usage_providers_keeps_codex_when_mixed_with_minimax() {
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+        let child_process = Arc::new(Mutex::new(None));
+
+        {
+            let mut metas = pane_metas.lock().unwrap();
+            metas.insert(
+                1,
+                PaneMeta {
+                    mode: shared::PaneMode::Interactive,
+                    provider: Provider::Claude,
+                    prompt: None,
+                    model: Some("m2.7".to_string()),
+                    min_iteration_interval_minutes: None,
+                    child_process: child_process.clone(),
+                },
+            );
+            metas.insert(
+                2,
+                PaneMeta {
+                    mode: shared::PaneMode::Interactive,
+                    provider: Provider::Codex,
+                    prompt: None,
+                    model: None,
+                    min_iteration_interval_minutes: None,
+                    child_process,
+                },
+            );
+        }
+
+        assert_eq!(active_usage_providers(&pane_metas), (false, true));
     }
 }
 

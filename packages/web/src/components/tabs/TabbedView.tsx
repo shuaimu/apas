@@ -348,17 +348,18 @@ export function TabbedView() {
     useCallback(
       (s) => {
         if (!cliClientId || !activeProvider) return null;
+        if (activeIsMiniMax) return null;
         return s.usageLimits.get(cliClientId)?.[activeProvider] ?? null;
       },
-      [cliClientId, activeProvider],
+      [cliClientId, activeProvider, activeIsMiniMax],
     ),
   );
 
   const usageLabel = useMemo(() => {
     if (!activeProvider) return "Usage";
     if (activeProvider === "codex") return "Codex Usage";
-    return activeIsMiniMax ? "MiniMax Usage" : "Claude Usage";
-  }, [activeProvider, activeIsMiniMax]);
+    return "Claude Usage";
+  }, [activeProvider]);
 
   const bootTarget = useMemo(() => {
     if (!sessionId) return null;
@@ -610,7 +611,11 @@ export function TabbedView() {
           )
         )}
 
-        {activeProvider && currentUsageLimits && (
+        {activeIsMiniMax ? (
+          <div className="ml-1 text-[11px] text-gray-500 dark:text-gray-400">
+            MiniMax usage is currently unavailable.
+          </div>
+        ) : activeProvider && currentUsageLimits && (
           <div className="ml-1">
             <div className="text-[10px] uppercase tracking-wide text-gray-400 dark:text-gray-500 mb-0.5">
               {usageLabel}
