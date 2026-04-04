@@ -27,6 +27,7 @@ function isMiniMaxModel(model?: string): boolean {
 }
 
 function isMiniMaxTab(provider: string, model?: string, label?: string): boolean {
+  if (provider === "minimax") return true;
   if (provider !== "claude") return false;
   if (isMiniMaxModel(model)) return true;
   return typeof label === "string" && label.toLowerCase().includes("minimax");

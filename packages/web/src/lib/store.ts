@@ -54,7 +54,7 @@ export interface UsageLimits {
   fetchedAt?: string;
 }
 
-export type Provider = "claude" | "codex";
+export type Provider = "claude" | "codex" | "minimax";
 
 export type UsageLimitsByProvider = Partial<Record<Provider, UsageLimits>>;
 
@@ -107,7 +107,7 @@ export type PaneType = "deadloop" | "interactive";
 
 export interface PaneConfig {
   pane_id: number;
-  provider: "claude" | "codex";
+  provider: Provider;
   mode: "deadloop" | "interactive";
   session_id: string;
   is_paused: boolean;
@@ -126,6 +126,7 @@ const usageProviderHints = new Map<string, Provider>();
 function normalizeProvider(raw: unknown): Provider | null {
   if (typeof raw === "string") {
     const normalized = raw.trim().toLowerCase();
+    if (normalized === "minimax" || normalized === "mini_max") return "minimax";
     if (normalized === "claude" || normalized === "anthropic") return "claude";
     if (normalized === "codex" || normalized === "openai" || normalized === "chatgpt") return "codex";
   }
@@ -210,11 +211,19 @@ function inferUsageProvider(
   // Legacy servers may omit provider; in mixed-provider sessions those payloads
   // are typically Codex (last-write from periodic usage polling), so prefer Codex.
   if (seenProviders.size > 1) {
-    usageProviderHints.set(cliClientId, "codex");
-    return "codex";
+    if (seenProviders.has("codex")) {
+      usageProviderHints.set(cliClientId, "codex");
+      return "codex";
+    }
+    if (seenProviders.has("minimax")) {
+      usageProviderHints.set(cliClientId, "minimax");
+      return "minimax";
+    }
+    usageProviderHints.set(cliClientId, "claude");
+    return "claude";
   }
 
-  return "codex";
+  return "claude";
 }
 
 interface AppState {

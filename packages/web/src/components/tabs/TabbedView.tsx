@@ -274,7 +274,7 @@ export function TabbedView() {
   );
 
   const handleAddTab = useCallback((provider: string = "claude", model?: string) => {
-    const isMiniMax = provider === "claude" && isMiniMaxModel(model);
+    const isMiniMax = provider === "minimax" || (provider === "claude" && isMiniMaxModel(model));
     const prefix = provider === "codex" ? "Codex" : isMiniMax ? "MiniMax" : "Claude";
     const label = `${prefix} ${effectiveTabs.length + 1}`;
     const result = addPane(provider, "interactive", label, undefined, model);
@@ -328,10 +328,13 @@ export function TabbedView() {
   const activeIsBot = activeConfig?.mode === "deadloop";
   const activeStopRequested = activeConfig?.stop_requested === true;
   const activeProvider = activeConfig?.provider;
-  const activeIsMiniMax = activeProvider === "claude" && (
-    isMiniMaxModel(activeConfig?.model) ||
-    (typeof activeConfig?.label === "string" && activeConfig.label.toLowerCase().includes("minimax"))
+  const activeIsMiniMax = activeProvider === "minimax" || (
+    activeProvider === "claude" && (
+      isMiniMaxModel(activeConfig?.model) ||
+      (typeof activeConfig?.label === "string" && activeConfig.label.toLowerCase().includes("minimax"))
+    )
   );
+  const activeUsageProvider = activeIsMiniMax ? "minimax" : activeProvider;
   const activeBotPrompt = activeConfig?.prompt && activeConfig.prompt.trim().length > 0
     ? activeConfig.prompt
     : DEFAULT_BOT_LOOP_PROMPT;
@@ -347,19 +350,19 @@ export function TabbedView() {
   const currentUsageLimits = useStore(
     useCallback(
       (s) => {
-        if (!cliClientId || !activeProvider) return null;
-        if (activeIsMiniMax) return null;
-        return s.usageLimits.get(cliClientId)?.[activeProvider] ?? null;
+        if (!cliClientId || !activeUsageProvider) return null;
+        return s.usageLimits.get(cliClientId)?.[activeUsageProvider] ?? null;
       },
-      [cliClientId, activeProvider, activeIsMiniMax],
+      [cliClientId, activeUsageProvider],
     ),
   );
 
   const usageLabel = useMemo(() => {
-    if (!activeProvider) return "Usage";
-    if (activeProvider === "codex") return "Codex Usage";
+    if (!activeUsageProvider) return "Usage";
+    if (activeUsageProvider === "codex") return "Codex Usage";
+    if (activeUsageProvider === "minimax") return "MiniMax Usage";
     return "Claude Usage";
-  }, [activeProvider]);
+  }, [activeUsageProvider]);
 
   const bootTarget = useMemo(() => {
     if (!sessionId) return null;
@@ -611,11 +614,7 @@ export function TabbedView() {
           )
         )}
 
-        {activeIsMiniMax ? (
-          <div className="ml-1 text-[11px] text-gray-500 dark:text-gray-400">
-            MiniMax usage is currently unavailable.
-          </div>
-        ) : activeProvider && currentUsageLimits && (
+        {activeUsageProvider && currentUsageLimits && (
           <div className="ml-1">
             <div className="text-[10px] uppercase tracking-wide text-gray-400 dark:text-gray-500 mb-0.5">
               {usageLabel}

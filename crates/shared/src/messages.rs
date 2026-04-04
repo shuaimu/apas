@@ -599,6 +599,7 @@ pub enum Provider {
     #[default]
     Claude,
     Codex,
+    Minimax,
 }
 
 /// Mode for a pane

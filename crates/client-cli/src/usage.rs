@@ -1,14 +1,17 @@
-//! Usage limits fetching for Claude and Codex
+//! Usage limits fetching for Claude, Codex, and MiniMax
 //!
 //! Claude: Fetches usage data from the OAuth usage endpoint to determine
 //! how close the user is to their weekly/hourly limits.
 //!
 //! Codex: Fetches usage data from the ChatGPT backend usage endpoint.
+//!
+//! MiniMax: Fetches coding-plan remaining quota from the MiniMax remains endpoint.
 
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use shared::{UsageLimitWindow, UsageLimits};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,6 +20,11 @@ use std::path::{Path, PathBuf};
 const USAGE_API_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 /// Codex/ChatGPT usage API endpoint
 const CODEX_USAGE_API_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+/// MiniMax coding plan remains endpoints (primary + compatibility fallback)
+const MINIMAX_USAGE_API_URLS: [&str; 2] = [
+    "https://www.minimax.io/v1/api/openplatform/coding_plan/remains",
+    "https://www.minimaxi.com/v1/api/openplatform/coding_plan/remains",
+];
 const USAGE_CACHE_FILE: &str = "usage_limits_cache.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -25,12 +33,15 @@ struct UsageCacheFile {
     claude: Option<UsageLimits>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     codex: Option<UsageLimits>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    minimax: Option<UsageLimits>,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum UsageProvider {
     Claude,
     Codex,
+    Minimax,
 }
 
 fn usage_cache_dir() -> PathBuf {
@@ -81,6 +92,7 @@ fn cache_usage_limits(provider: UsageProvider, limits: &UsageLimits) -> Result<(
     match provider {
         UsageProvider::Claude => cache.claude = Some(limits.clone()),
         UsageProvider::Codex => cache.codex = Some(limits.clone()),
+        UsageProvider::Minimax => cache.minimax = Some(limits.clone()),
     }
     write_usage_cache(&cache)
 }
@@ -90,6 +102,7 @@ fn get_cached_usage_limits(provider: UsageProvider) -> Option<UsageLimits> {
     match provider {
         UsageProvider::Claude => cache.claude,
         UsageProvider::Codex => cache.codex,
+        UsageProvider::Minimax => cache.minimax,
     }
 }
 
@@ -126,6 +139,10 @@ pub fn read_cached_claude_usage_limits(max_age: Option<Duration>) -> Option<Usag
 
 pub fn read_cached_codex_usage_limits(max_age: Option<Duration>) -> Option<UsageLimits> {
     get_cached_usage_limits_with_max_age(UsageProvider::Codex, max_age)
+}
+
+pub fn read_cached_minimax_usage_limits(max_age: Option<Duration>) -> Option<UsageLimits> {
+    get_cached_usage_limits_with_max_age(UsageProvider::Minimax, max_age)
 }
 
 /// OAuth credentials from Claude's credentials file
@@ -455,6 +472,356 @@ async fn fetch_codex_usage_limits_remote() -> Result<UsageLimits> {
     })
 }
 
+// ----------------------- MiniMax usage limits -----------------------
+
+fn trim_non_empty(raw: Option<String>) -> Option<String> {
+    raw.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn read_minimax_api_key() -> Result<String> {
+    for env_key in ["MINIMAX_API_KEY", "MINIMAX_API_TOKEN"] {
+        if let Some(value) = trim_non_empty(std::env::var(env_key).ok()) {
+            return Ok(value);
+        }
+    }
+
+    let config = crate::config::Config::load().unwrap_or_default();
+    if let Some(value) = trim_non_empty(config.local.minimax_api_key) {
+        return Ok(value);
+    }
+
+    Err(anyhow::anyhow!(
+        "MiniMax API key is not configured. Set minimax_api_key in apas config or MINIMAX_API_KEY."
+    ))
+}
+
+fn value_as_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn value_as_rfc3339(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            if DateTime::parse_from_rfc3339(trimmed).is_ok() {
+                return Some(trimmed.to_string());
+            }
+            trimmed.parse::<i64>().ok().and_then(unix_epoch_to_rfc3339)
+        }
+        Value::Number(number) => number.as_i64().and_then(unix_epoch_to_rfc3339),
+        _ => None,
+    }
+}
+
+fn unix_epoch_to_rfc3339(epoch: i64) -> Option<String> {
+    // MiniMax APIs sometimes return milliseconds.
+    let seconds = if epoch > 10_000_000_000 {
+        epoch / 1000
+    } else {
+        epoch
+    };
+    DateTime::<Utc>::from_timestamp(seconds, 0).map(|dt| dt.to_rfc3339())
+}
+
+fn first_number_from_objects(
+    objects: &[&serde_json::Map<String, Value>],
+    keys: &[&str],
+) -> Option<f64> {
+    for object in objects {
+        for key in keys {
+            if let Some(value) = object.get(*key).and_then(value_as_f64) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn first_rfc3339_from_objects(
+    objects: &[&serde_json::Map<String, Value>],
+    keys: &[&str],
+) -> Option<String> {
+    for object in objects {
+        for key in keys {
+            if let Some(value) = object.get(*key).and_then(value_as_rfc3339) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn is_minimax_model_name(raw: &str) -> bool {
+    let normalized = raw.trim().to_ascii_lowercase();
+    !normalized.is_empty() && (normalized.contains("minimax") || normalized.starts_with("m2"))
+}
+
+fn parse_minimax_usage_limits(payload: &Value) -> Result<UsageLimits> {
+    // Best-effort API-level error extraction.
+    if let Some(root) = payload.as_object() {
+        if let Some(code) = root.get("code").and_then(value_as_f64) {
+            if code != 0.0 {
+                let msg = root
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .or_else(|| root.get("msg").and_then(Value::as_str))
+                    .unwrap_or("unknown error");
+                return Err(anyhow::anyhow!(
+                    "MiniMax usage API returned code {}: {}",
+                    code,
+                    msg
+                ));
+            }
+        }
+        if let Some(base_resp) = root.get("base_resp").and_then(Value::as_object) {
+            if let Some(code) = base_resp.get("status_code").and_then(value_as_f64) {
+                if code != 0.0 {
+                    let msg = base_resp
+                        .get("status_message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown error");
+                    return Err(anyhow::anyhow!(
+                        "MiniMax usage API returned status_code {}: {}",
+                        code,
+                        msg
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut objects: Vec<&serde_json::Map<String, Value>> = Vec::new();
+    if let Some(root) = payload.as_object() {
+        objects.push(root);
+    }
+    if let Some(data) = payload.get("data").and_then(Value::as_object) {
+        objects.push(data);
+    }
+
+    // Prefer model-specific remains entry for MiniMax models if present.
+    for source in objects.clone() {
+        let model_remains = source
+            .get("model_remains")
+            .or_else(|| source.get("modelRemains"))
+            .and_then(Value::as_array);
+        let Some(entries) = model_remains else {
+            continue;
+        };
+
+        let preferred = entries
+            .iter()
+            .filter_map(Value::as_object)
+            .find(|entry| {
+                entry
+                    .get("model_name")
+                    .or_else(|| entry.get("model"))
+                    .and_then(Value::as_str)
+                    .map(is_minimax_model_name)
+                    .unwrap_or(false)
+            })
+            .or_else(|| entries.iter().filter_map(Value::as_object).next());
+
+        if let Some(entry) = preferred {
+            objects.insert(0, entry);
+            break;
+        }
+    }
+
+    let utilization = {
+        let explicit = first_number_from_objects(
+            &objects,
+            &[
+                "utilization",
+                "usage_rate",
+                "used_rate",
+                "usage_percentage",
+                "used_percent",
+                "percent",
+            ],
+        );
+        if let Some(rate) = explicit {
+            Some(if rate > 1.0 { rate / 100.0 } else { rate })
+        } else {
+            let total = first_number_from_objects(
+                &objects,
+                &[
+                    "current_interval_total_count",
+                    "interval_total_count",
+                    "total_count",
+                    "quota_total",
+                ],
+            );
+            let remaining = first_number_from_objects(
+                &objects,
+                &[
+                    "current_interval_usage_count",
+                    "interval_usage_count",
+                    "remaining_count",
+                    "remain_count",
+                    "remaining",
+                    "remain",
+                ],
+            );
+            let used = first_number_from_objects(
+                &objects,
+                &[
+                    "current_interval_used_count",
+                    "used_count",
+                    "usage_count",
+                    "consumed_count",
+                ],
+            );
+
+            if let (Some(total), Some(remaining)) = (total, remaining) {
+                if total > 0.0 {
+                    // MiniMax remains API reports remaining quota. Convert to utilization.
+                    let consumed = (total - remaining).max(0.0);
+                    Some(consumed / total)
+                } else {
+                    None
+                }
+            } else if let (Some(total), Some(used)) = (total, used) {
+                if total > 0.0 {
+                    Some(used / total)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+    }
+    .map(|value| value.clamp(0.0, 1.5))
+    .ok_or_else(|| anyhow::anyhow!("MiniMax usage response missing utilization data"))?;
+
+    let resets_at = first_rfc3339_from_objects(
+        &objects,
+        &[
+            "next_interval_time",
+            "next_reset_time",
+            "next_reset_at",
+            "current_interval_end_time",
+            "end_time",
+            "reset_at",
+            "resets_at",
+        ],
+    );
+
+    let now = Utc::now().to_rfc3339();
+    Ok(UsageLimits {
+        // MiniMax remains API is plan-wide quota; map it to the weekly slot.
+        five_hour: None,
+        seven_day: Some(UsageLimitWindow {
+            utilization,
+            resets_at,
+        }),
+        fetched_at: Some(now),
+    })
+}
+
+/// Fetch usage limits from MiniMax remains endpoint
+pub async fn refresh_minimax_usage_limits() -> Result<UsageLimits> {
+    let limits = fetch_minimax_usage_limits_remote().await?;
+    if let Err(e) = cache_usage_limits(UsageProvider::Minimax, &limits) {
+        tracing::debug!("Failed to cache MiniMax usage limits: {}", e);
+    }
+    Ok(limits)
+}
+
+pub async fn fetch_minimax_usage_limits() -> Result<UsageLimits> {
+    match refresh_minimax_usage_limits().await {
+        Ok(limits) => Ok(limits),
+        Err(fetch_error) => {
+            if let Some(cached) = get_cached_usage_limits(UsageProvider::Minimax) {
+                tracing::warn!(
+                    "Using cached MiniMax usage limits after fetch failure: {}",
+                    fetch_error
+                );
+                Ok(cached)
+            } else {
+                Err(fetch_error)
+            }
+        }
+    }
+}
+
+async fn fetch_minimax_usage_limits_remote() -> Result<UsageLimits> {
+    let api_key = read_minimax_api_key()?;
+    let client = reqwest::Client::new();
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for url in MINIMAX_USAGE_API_URLS {
+        let response = match client
+            .get(url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                last_error = Some(anyhow::anyhow!(
+                    "Failed to fetch MiniMax usage from {}: {}",
+                    url,
+                    err
+                ));
+                continue;
+            }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            last_error = Some(anyhow::anyhow!(
+                "MiniMax usage API {} returned {}: {}",
+                url,
+                status,
+                body
+            ));
+            continue;
+        }
+
+        let payload = match response.json::<Value>().await {
+            Ok(value) => value,
+            Err(err) => {
+                last_error = Some(anyhow::anyhow!(
+                    "Failed to parse MiniMax usage response from {}: {}",
+                    url,
+                    err
+                ));
+                continue;
+            }
+        };
+
+        match parse_minimax_usage_limits(&payload) {
+            Ok(limits) => return Ok(limits),
+            Err(err) => {
+                last_error = Some(anyhow::anyhow!(
+                    "Failed to interpret MiniMax usage response from {}: {}",
+                    url,
+                    err
+                ));
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("MiniMax usage API request failed")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,5 +855,41 @@ mod tests {
             fetched_at: None,
         };
         assert!(!is_cache_fresh(&unknown, Duration::minutes(45)));
+    }
+
+    #[test]
+    fn parse_minimax_usage_limits_from_model_remains() {
+        let payload = serde_json::json!({
+            "code": 0,
+            "model_remains": [
+                {
+                    "model_name": "MiniMax-M2.7",
+                    "current_interval_total_count": 100,
+                    "current_interval_usage_count": 30,
+                    "next_interval_time": 1743974400000i64
+                }
+            ]
+        });
+
+        let parsed = parse_minimax_usage_limits(&payload).expect("parses minimax payload");
+        let weekly = parsed.seven_day.expect("weekly window exists");
+        // usage_count is remaining count -> utilization = (100 - 30) / 100 = 0.7
+        assert!((weekly.utilization - 0.7).abs() < 0.0001);
+        assert!(weekly.resets_at.is_some());
+        assert!(parsed.five_hour.is_none());
+    }
+
+    #[test]
+    fn parse_minimax_usage_limits_from_percentage() {
+        let payload = serde_json::json!({
+            "code": 0,
+            "data": {
+                "used_percent": 45
+            }
+        });
+
+        let parsed = parse_minimax_usage_limits(&payload).expect("parses percentage payload");
+        let weekly = parsed.seven_day.expect("weekly window exists");
+        assert!((weekly.utilization - 0.45).abs() < 0.0001);
     }
 }

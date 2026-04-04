@@ -651,4 +651,9 @@ async fn refresh_usage_limits_cache() {
         Ok(_) => tracing::debug!("Refreshed Codex usage limits cache"),
         Err(err) => tracing::debug!("Failed to refresh Codex usage limits cache: {}", err),
     }
+
+    match crate::usage::refresh_minimax_usage_limits().await {
+        Ok(_) => tracing::debug!("Refreshed MiniMax usage limits cache"),
+        Err(err) => tracing::debug!("Failed to refresh MiniMax usage limits cache: {}", err),
+    }
 }

@@ -104,7 +104,7 @@ fn resolve_pane_binary_path(
     codex_path: &str,
 ) -> String {
     match provider {
-        Provider::Claude => claude_path.to_string(),
+        Provider::Claude | Provider::Minimax => claude_path.to_string(),
         Provider::Codex => codex_path.to_string(),
     }
 }
@@ -114,6 +114,7 @@ fn provider_display_name(provider: &Provider, model: Option<&str>) -> &'static s
         Provider::Claude if is_minimax_model(model) => "MiniMax",
         Provider::Claude => "Claude",
         Provider::Codex => "Codex",
+        Provider::Minimax => "MiniMax",
     }
 }
 
@@ -122,6 +123,7 @@ fn provider_config_key(provider: &Provider, model: Option<&str>) -> &'static str
         Provider::Claude if is_minimax_model(model) => "claude_path",
         Provider::Claude => "claude_path",
         Provider::Codex => "codex_path",
+        Provider::Minimax => "claude_path",
     }
 }
 
@@ -154,7 +156,7 @@ fn build_pane_env_overrides(
     provider: &Provider,
     model: Option<&str>,
 ) -> Result<Vec<(String, String)>, String> {
-    if !matches!(provider, Provider::Claude) || !is_minimax_model(model) {
+    if !matches!(provider, Provider::Claude | Provider::Minimax) || !is_minimax_model(model) {
         return Ok(Vec::new());
     }
 
@@ -1693,25 +1695,27 @@ fn build_pane_list(
     panes
 }
 
-fn active_usage_providers(pane_metas: &PaneMetas) -> (bool, bool) {
+fn active_usage_providers(pane_metas: &PaneMetas) -> (bool, bool, bool) {
     let metas = pane_metas.lock().unwrap();
     let mut has_claude = false;
     let mut has_codex = false;
+    let mut has_minimax = false;
 
     for meta in metas.values() {
         match meta.provider {
             // MiniMax tabs run through Claude CLI transport, but Anthropic usage
             // limits are not meaningful for them.
             Provider::Claude if !is_minimax_model(meta.model.as_deref()) => has_claude = true,
-            Provider::Claude => {}
+            Provider::Claude => has_minimax = true,
             Provider::Codex => has_codex = true,
+            Provider::Minimax => has_minimax = true,
         }
-        if has_claude && has_codex {
+        if has_claude && has_codex && has_minimax {
             break;
         }
     }
 
-    (has_claude, has_codex)
+    (has_claude, has_codex, has_minimax)
 }
 
 /// Kill any OS processes whose command line contains the given session ID.
@@ -1743,7 +1747,7 @@ fn build_agent_args(
     try_resume: bool,
 ) -> (Vec<String>, bool) {
     match provider {
-        Provider::Claude => {
+        Provider::Claude | Provider::Minimax => {
             let mut base = vec![
                 "--print".to_string(),
                 "--output-format".to_string(),
@@ -1825,7 +1829,9 @@ fn parse_agent_output(
     session_id_str: &str,
 ) -> Option<ClaudeStreamMessage> {
     match provider {
-        Provider::Claude => serde_json::from_str::<ClaudeStreamMessage>(line).ok(),
+        Provider::Claude | Provider::Minimax => {
+            serde_json::from_str::<ClaudeStreamMessage>(line).ok()
+        }
         Provider::Codex => match serde_json::from_str::<CodexStreamMessage>(line) {
             Ok(codex_msg) => shared::convert_codex_to_claude(&codex_msg, session_id_str),
             Err(_) => None,
@@ -2000,7 +2006,7 @@ mod tests {
             );
         }
 
-        assert_eq!(active_usage_providers(&pane_metas), (true, true));
+        assert_eq!(active_usage_providers(&pane_metas), (true, true, false));
     }
 
     #[test]
@@ -2024,7 +2030,7 @@ mod tests {
             );
         }
 
-        assert_eq!(active_usage_providers(&pane_metas), (false, false));
+        assert_eq!(active_usage_providers(&pane_metas), (false, false, true));
     }
 
     #[test]
@@ -2060,7 +2066,31 @@ mod tests {
             );
         }
 
-        assert_eq!(active_usage_providers(&pane_metas), (false, true));
+        assert_eq!(active_usage_providers(&pane_metas), (false, true, true));
+    }
+
+    #[test]
+    fn active_usage_providers_detects_explicit_minimax_provider() {
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+        let child_process = Arc::new(Mutex::new(None));
+
+        {
+            let mut metas = pane_metas.lock().unwrap();
+            metas.insert(
+                7,
+                PaneMeta {
+                    mode: shared::PaneMode::Interactive,
+                    provider: Provider::Minimax,
+                    label: "MiniMax 7".to_string(),
+                    prompt: None,
+                    model: Some("MiniMax-M2.7".to_string()),
+                    min_iteration_interval_minutes: None,
+                    child_process,
+                },
+            );
+        }
+
+        assert_eq!(active_usage_providers(&pane_metas), (false, false, true));
     }
 }
 
@@ -3391,7 +3421,7 @@ async fn run_server_connection(
                             }
                         }
                         _ = usage_interval.tick() => {
-                            let (has_claude, has_codex) = active_usage_providers(&pane_metas);
+                            let (has_claude, has_codex, has_minimax) = active_usage_providers(&pane_metas);
                             let max_age = chrono::Duration::minutes(USAGE_CACHE_MAX_AGE_MINUTES);
 
                             if has_claude {
@@ -3419,6 +3449,20 @@ async fn run_server_connection(
                                     }
                                 } else {
                                     tracing::debug!("No fresh cached Codex usage limits available");
+                                }
+                            }
+
+                            if has_minimax {
+                                if let Some(limits) =
+                                    crate::usage::read_cached_minimax_usage_limits(Some(max_age))
+                                {
+                                    let usage_msg = CliToServer::UsageLimits { provider: Provider::Minimax, limits };
+                                    let msg_text = serde_json::to_string(&usage_msg).unwrap_or_default();
+                                    if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
+                                        tracing::warn!("Failed to send MiniMax usage limits to server");
+                                    }
+                                } else {
+                                    tracing::debug!("No fresh cached MiniMax usage limits available");
                                 }
                             }
                         }
