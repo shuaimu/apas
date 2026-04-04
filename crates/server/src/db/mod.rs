@@ -364,6 +364,35 @@ impl Database {
         Ok(session)
     }
 
+    /// Find the most recently updated different session for the same user/project path/host.
+    pub async fn get_latest_project_session_id(
+        &self,
+        user_id: &str,
+        working_dir: Option<&str>,
+        hostname: Option<&str>,
+        exclude_session_id: &str,
+    ) -> Result<Option<String>> {
+        let sid = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT id
+            FROM sessions
+            WHERE user_id = ?
+              AND COALESCE(working_dir, '') = COALESCE(?, '')
+              AND COALESCE(hostname, '') = COALESCE(?, '')
+              AND id != ?
+            ORDER BY updated_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(user_id)
+        .bind(working_dir)
+        .bind(hostname)
+        .bind(exclude_session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(sid)
+    }
+
     pub async fn get_all_sessions(&self) -> Result<Vec<Session>> {
         let sessions = sqlx::query_as::<_, Session>(
             "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at, COALESCE(is_paused, 0) as is_paused FROM sessions ORDER BY created_at DESC LIMIT 50",

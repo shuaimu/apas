@@ -92,6 +92,47 @@ impl FileStorage {
         Ok(panes)
     }
 
+    /// Copy historical artifacts from `source_session_id` into `target_session_id`
+    /// when the target has no message history yet.
+    /// Returns true when a copy happened.
+    pub async fn seed_history_if_missing(
+        &self,
+        source_session_id: &Uuid,
+        target_session_id: &Uuid,
+    ) -> Result<bool> {
+        if source_session_id == target_session_id {
+            return Ok(false);
+        }
+
+        let source_messages = self.messages_file(source_session_id);
+        if !source_messages.exists() {
+            return Ok(false);
+        }
+        let source_meta = fs::metadata(&source_messages).await?;
+        if source_meta.len() == 0 {
+            return Ok(false);
+        }
+
+        let target_messages = self.messages_file(target_session_id);
+        if target_messages.exists() {
+            let target_meta = fs::metadata(&target_messages).await?;
+            if target_meta.len() > 0 {
+                return Ok(false);
+            }
+        }
+
+        self.ensure_session_dir(target_session_id).await?;
+        fs::copy(&source_messages, &target_messages).await?;
+
+        let source_panes = self.panes_file(source_session_id);
+        let target_panes = self.panes_file(target_session_id);
+        if source_panes.exists() && !target_panes.exists() {
+            fs::copy(&source_panes, &target_panes).await?;
+        }
+
+        Ok(true)
+    }
+
     /// Read ALL messages for a session (no limit)
     pub async fn get_messages(&self, session_id: &Uuid) -> Result<Vec<StoredMessage>> {
         let file_path = self.messages_file(session_id);

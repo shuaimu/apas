@@ -21,6 +21,7 @@ export default function MachinesPage() {
     setMachineMiniMaxConfig,
   } = useStore();
   const [minimaxDrafts, setMinimaxDrafts] = useState<Record<string, { apiKey: string }>>({});
+  const [minimaxSaved, setMinimaxSaved] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     const storedToken = localStorage.getItem("apas_token");
@@ -94,6 +95,10 @@ export default function MachinesPage() {
                         apiKey: nextApiKey,
                       },
                     }));
+                    setMinimaxSaved((prev) => ({
+                      ...prev,
+                      [machine.machineId]: false,
+                    }));
                   }}
                   placeholder="MiniMax API key"
                   className="rounded border border-gray-300 px-3 py-2 text-sm dark:border-gray-700 dark:bg-gray-950"
@@ -113,10 +118,14 @@ export default function MachinesPage() {
                         apiKey,
                       },
                     }));
+                    setMinimaxSaved((prev) => ({
+                      ...prev,
+                      [machine.machineId]: true,
+                    }));
                   }}
                   className="rounded bg-cyan-600 px-3 py-2 text-sm text-white hover:bg-cyan-700"
                 >
-                  Save
+                  {minimaxSaved[machine.machineId] ? "Saved" : "Save"}
                 </button>
                 <button
                   onClick={() => {
@@ -126,6 +135,10 @@ export default function MachinesPage() {
                       [machine.machineId]: {
                         apiKey: "",
                       },
+                    }));
+                    setMinimaxSaved((prev) => ({
+                      ...prev,
+                      [machine.machineId]: false,
                     }));
                   }}
                   className="rounded border border-gray-300 px-3 py-2 text-sm hover:bg-gray-100 dark:border-gray-700 dark:hover:bg-gray-800"

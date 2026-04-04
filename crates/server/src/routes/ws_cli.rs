@@ -308,6 +308,64 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     tracing::error!("Failed to persist session to database: {}", e);
                                 }
 
+                                // If this project got a regenerated session ID, carry over history
+                                // from the latest prior project session into this new session ID.
+                                match state
+                                    .db
+                                    .get_latest_project_session_id(
+                                        &user_id.to_string(),
+                                        session.working_dir.as_deref(),
+                                        session.hostname.as_deref(),
+                                        &session_id.to_string(),
+                                    )
+                                    .await
+                                {
+                                    Ok(Some(previous_sid)) => {
+                                        match Uuid::parse_str(&previous_sid) {
+                                            Ok(previous_uuid) => {
+                                                match state
+                                                    .storage
+                                                    .seed_history_if_missing(&previous_uuid, &session_id)
+                                                    .await
+                                                {
+                                                    Ok(true) => {
+                                                        tracing::info!(
+                                                            "Seeded history for regenerated project session {} from {}",
+                                                            session_id,
+                                                            previous_sid
+                                                        );
+                                                    }
+                                                    Ok(false) => {}
+                                                    Err(err) => {
+                                                        tracing::warn!(
+                                                            "Failed to seed history for session {} from {}: {}",
+                                                            session_id,
+                                                            previous_sid,
+                                                            err
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(err) => {
+                                                tracing::warn!(
+                                                    "Invalid previous session id {} while seeding history for {}: {}",
+                                                    previous_sid,
+                                                    session_id,
+                                                    err
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            "Failed to look up previous project session for {}: {}",
+                                            session_id,
+                                            err
+                                        );
+                                    }
+                                }
+
                                 // Notify any already-attached web clients that CLI is (re)connected
                                 state.sessions.route_to_web(
                                     &session_id,

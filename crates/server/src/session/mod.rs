@@ -265,11 +265,14 @@ impl SessionManager {
     ) {
         let owner = self.daemon_users.get(machine_id).map(|entry| *entry);
         if let Some(mut machine) = self.machine_infos.get_mut(machine_id) {
-            let mut backend = machine.minimax_backend.clone().unwrap_or(MiniMaxBackendInfo {
-                api_base_url: None,
-                api_key: None,
-                api_key_configured: false,
-            });
+            let mut backend = machine
+                .minimax_backend
+                .clone()
+                .unwrap_or(MiniMaxBackendInfo {
+                    api_base_url: None,
+                    api_key: None,
+                    api_key_configured: false,
+                });
 
             if let Some(url) = normalize_optional_string(api_base_url) {
                 backend.api_base_url = Some(url);

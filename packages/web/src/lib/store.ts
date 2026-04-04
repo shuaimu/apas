@@ -688,11 +688,36 @@ export const useStore = create<AppState>((set, get) => ({
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return;
     }
+    const normalizedApiKey =
+      apiKey && apiKey.trim().length > 0 ? apiKey.trim() : undefined;
+
+    // Reflect the key change in UI immediately so users can verify what was saved.
+    set((state) => ({
+      machines: state.machines.map((entry) => {
+        if (entry.machine.machineId !== machineId) return entry;
+        const existingBackend = entry.machine.minimaxBackend;
+        const nextApiKey = clearApiKey
+          ? undefined
+          : (normalizedApiKey ?? existingBackend?.apiKey);
+        return {
+          ...entry,
+          machine: {
+            ...entry.machine,
+            minimaxBackend: {
+              apiBaseUrl: MINIMAX_API_BASE_URL,
+              apiKey: nextApiKey,
+              apiKeyConfigured: Boolean(nextApiKey),
+            },
+          },
+        };
+      }),
+    }));
+
     ws.send(JSON.stringify({
       type: "set_machine_mini_max_config",
       machine_id: machineId,
       api_base_url: MINIMAX_API_BASE_URL,
-      api_key: apiKey && apiKey.trim().length > 0 ? apiKey : undefined,
+      api_key: normalizedApiKey,
       clear_api_key: clearApiKey,
     }));
   },
@@ -1183,7 +1208,33 @@ function handleServerMessage(
         };
       });
 
-      set({ machines: parsed });
+      set((state) => {
+        const previousById = new Map(
+          state.machines.map((entry) => [entry.machine.machineId, entry])
+        );
+        const merged = parsed.map((entry) => {
+          const backend = entry.machine.minimaxBackend;
+          const previous = previousById.get(entry.machine.machineId);
+          const previousKey = previous?.machine.minimaxBackend?.apiKey;
+          if (!backend || backend.apiKey !== undefined || !backend.apiKeyConfigured || !previousKey) {
+            return entry;
+          }
+
+          // Some server snapshots only send api_key_configured without api_key.
+          // Keep the known key locally so the Machines input remains visible.
+          return {
+            ...entry,
+            machine: {
+              ...entry.machine,
+              minimaxBackend: {
+                ...backend,
+                apiKey: previousKey,
+              },
+            },
+          };
+        });
+        return { machines: merged };
+      });
       break;
     }
 
@@ -1568,10 +1619,37 @@ function handleServerMessage(
           }
         }
       } else if (msgType === "result") {
+        const subtype = msg.subtype as string || "result";
+        const resultContent = msg.result as string | undefined;
+        const cost = (msg.total_cost_usd as number || 0).toFixed(4);
+        const duration = msg.duration_ms;
+
+        // Threshold for "substantial" content that shouldn't be crammed into system metadata.
+        // Multi-line content or content > 150 chars is treated as actual response content
+        // (MiniMax sends full responses in the result field instead of via Assistant messages).
+        const isSubstantialContent = resultContent && (
+          resultContent.includes("\n") ||
+          resultContent.length > 150
+        );
+
+        if (isSubstantialContent) {
+          // Create assistant message with the substantial content
+          const assistantMessage: Message = {
+            id: generateId(),
+            role: "assistant",
+            content: resultContent,
+            timestamp: new Date(),
+            outputType: { type: "text" },
+          };
+          addMessageWithPaneRouting(set, get, assistantMessage, paneType, paneId);
+        }
+
+        // Always add a brief system message with metadata
+        const systemMeta = `${subtype} - Cost: $${cost}, Duration: ${duration}ms`;
         const resultMessage: Message = {
           id: generateId(),
           role: "system",
-          content: `${msg.subtype}${msg.result ? ': ' + msg.result : ''} - Cost: $${(msg.total_cost_usd as number || 0).toFixed(4)}, Duration: ${msg.duration_ms}ms`,
+          content: systemMeta,
           timestamp: new Date(),
           outputType: { type: "system" },
         };
