@@ -46,6 +46,33 @@ fn is_version_supported(client_version: &str) -> bool {
     }
 }
 
+fn is_minimax_model(model: Option<&str>) -> bool {
+    model
+        .map(|raw| {
+            let normalized = raw.trim().to_ascii_lowercase();
+            !normalized.is_empty()
+                && (normalized.contains("minimax") || normalized.starts_with("m2"))
+        })
+        .unwrap_or(false)
+}
+
+fn normalize_minimax_pane_labels(panes: &mut [shared::PaneConfig]) {
+    for pane in panes.iter_mut() {
+        if pane.provider != shared::Provider::Claude {
+            continue;
+        }
+        if !is_minimax_model(pane.model.as_deref()) {
+            continue;
+        }
+
+        let tab_label = format!("Tab {}", pane.pane_id);
+        let current_label = pane.label.as_deref().map(str::trim).unwrap_or("");
+        if current_label.is_empty() || current_label.eq_ignore_ascii_case(&tab_label) {
+            pane.label = Some(format!("MiniMax {}", pane.pane_id));
+        }
+    }
+}
+
 pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
@@ -235,8 +262,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 // Cache initial pane list if provided
                                 if let Some(pane_list) = &panes {
                                     if !pane_list.is_empty() {
-                                        state.sessions.set_session_panes(&session_id, pane_list.clone());
-                                        if let Err(e) = state.storage.save_pane_list(&session_id, pane_list).await {
+                                        let mut normalized_panes = pane_list.clone();
+                                        normalize_minimax_pane_labels(&mut normalized_panes);
+                                        state
+                                            .sessions
+                                            .set_session_panes(&session_id, normalized_panes.clone());
+                                        if let Err(e) = state
+                                            .storage
+                                            .save_pane_list(&session_id, &normalized_panes)
+                                            .await
+                                        {
                                             tracing::warn!(
                                                 "Failed to persist initial pane list for session {}: {}",
                                                 session_id,
@@ -244,13 +279,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                             );
                                         }
                                         // Forward to any already-attached web clients
-                                        state.sessions.route_to_web(
-                                            &session_id,
-                                            ServerToWeb::PaneList {
-                                                session_id,
-                                                panes: pane_list.clone(),
-                                            },
-                                        ).await;
+                                        state
+                                            .sessions
+                                            .route_to_web(
+                                                &session_id,
+                                                ServerToWeb::PaneList {
+                                                    session_id,
+                                                    panes: normalized_panes,
+                                                },
+                                            )
+                                            .await;
                                     }
                                 }
 
@@ -439,9 +477,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 );
                                 state.sessions.update_usage_limits(cli_id, provider, limits);
                             }
-                            Ok(CliToServer::PaneList { session_id, panes }) => {
+                            Ok(CliToServer::PaneList { session_id, mut panes }) => {
                                 // Cache pane list and forward to attached web clients
                                 tracing::info!("CLI {} sent pane list for session {}: {} panes", cli_id, session_id, panes.len());
+                                normalize_minimax_pane_labels(&mut panes);
                                 state.sessions.set_session_panes(&session_id, panes.clone());
                                 if let Err(e) = state.storage.save_pane_list(&session_id, &panes).await {
                                     tracing::warn!(
