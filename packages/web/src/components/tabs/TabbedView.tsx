@@ -230,6 +230,11 @@ export function TabbedView() {
     [effectiveTabs],
   );
 
+  // Reset active tab when switching sessions so localStorage preference is re-evaluated
+  useEffect(() => {
+    setActiveTabId(null);
+  }, [sessionId]);
+
   // Load saved active tab when project or available tabs change
   useEffect(() => {
     const ids = tabIds.split(",").filter(Boolean).map(Number);
