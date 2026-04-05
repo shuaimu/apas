@@ -3646,21 +3646,22 @@ async fn run_server_connection(
                                 }
                             }
 
-                            if has_glm {
-                                if let Some(limits) =
-                                    crate::usage::read_cached_glm_usage_limits(Some(max_age))
-                                {
-                                    let usage_msg = CliToServer::UsageLimits {
-                                        provider: Provider::Glm,
-                                        limits,
-                                    };
-                                    let msg_text = serde_json::to_string(&usage_msg).unwrap_or_default();
-                                    if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
-                                        tracing::warn!("Failed to send GLM usage limits to server");
-                                    }
-                                } else {
-                                    tracing::debug!("No fresh cached GLM usage limits available");
+                            // Always publish fresh cached GLM usage when available.
+                            // GLM usage comes from daemon-level polling and should be visible
+                            // on Machines page even if current pane metadata is legacy/missing.
+                            if let Some(limits) =
+                                crate::usage::read_cached_glm_usage_limits(Some(max_age))
+                            {
+                                let usage_msg = CliToServer::UsageLimits {
+                                    provider: Provider::Glm,
+                                    limits,
+                                };
+                                let msg_text = serde_json::to_string(&usage_msg).unwrap_or_default();
+                                if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
+                                    tracing::warn!("Failed to send GLM usage limits to server");
                                 }
+                            } else if has_glm {
+                                tracing::debug!("No fresh cached GLM usage limits available");
                             }
                         }
                     }
