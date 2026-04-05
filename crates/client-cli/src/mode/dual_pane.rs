@@ -117,7 +117,7 @@ fn resolve_pane_binary_path(
     codex_path: &str,
 ) -> String {
     match provider {
-        Provider::Claude | Provider::Minimax => claude_path.to_string(),
+        Provider::Claude | Provider::Minimax | Provider::Glm => claude_path.to_string(),
         Provider::Codex => codex_path.to_string(),
     }
 }
@@ -129,6 +129,7 @@ fn provider_display_name(provider: &Provider, model: Option<&str>) -> &'static s
         Provider::Claude => "Claude",
         Provider::Codex => "Codex",
         Provider::Minimax => "MiniMax",
+        Provider::Glm => "GLM",
     }
 }
 
@@ -138,6 +139,7 @@ fn provider_config_key(provider: &Provider, model: Option<&str>) -> &'static str
         Provider::Claude => "claude_path",
         Provider::Codex => "codex_path",
         Provider::Minimax => "claude_path",
+        Provider::Glm => "claude_path",
     }
 }
 
@@ -184,11 +186,14 @@ fn build_pane_env_overrides(
     provider: &Provider,
     model: Option<&str>,
 ) -> Result<Vec<(String, String)>, String> {
-    if !matches!(provider, Provider::Claude | Provider::Minimax) {
+    if !matches!(
+        provider,
+        Provider::Claude | Provider::Minimax | Provider::Glm
+    ) {
         return Ok(Vec::new());
     }
-    let is_minimax = is_minimax_model(model);
-    let is_glm = is_glm_model(model);
+    let is_minimax = matches!(provider, Provider::Minimax) || is_minimax_model(model);
+    let is_glm = !is_minimax && (matches!(provider, Provider::Glm) || is_glm_model(model));
     if !is_minimax && !is_glm {
         return Ok(Vec::new());
     }
@@ -222,8 +227,14 @@ fn build_pane_env_overrides(
         } else if is_glm {
             // Z.AI's Claude bridge expects model switching via default model
             // mapping variables instead of ANTHROPIC_MODEL for GLM-5.x.
-            env.push(("ANTHROPIC_DEFAULT_SONNET_MODEL".to_string(), model.to_string()));
-            env.push(("ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(), model.to_string()));
+            env.push((
+                "ANTHROPIC_DEFAULT_SONNET_MODEL".to_string(),
+                model.to_string(),
+            ));
+            env.push((
+                "ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(),
+                model.to_string(),
+            ));
             env.push((
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
                 GLM_DEFAULT_HAIKU_MODEL.to_string(),
@@ -1748,11 +1759,12 @@ fn build_pane_list(
     panes
 }
 
-fn active_usage_providers(pane_metas: &PaneMetas) -> (bool, bool, bool) {
+fn active_usage_providers(pane_metas: &PaneMetas) -> (bool, bool, bool, bool) {
     let metas = pane_metas.lock().unwrap();
     let mut has_claude = false;
     let mut has_codex = false;
     let mut has_minimax = false;
+    let mut has_glm = false;
 
     for meta in metas.values() {
         match meta.provider {
@@ -1761,17 +1773,18 @@ fn active_usage_providers(pane_metas: &PaneMetas) -> (bool, bool, bool) {
             Provider::Claude if is_minimax_model(meta.model.as_deref()) => has_minimax = true,
             // GLM tabs also run through Claude transport and should not map to
             // Anthropic usage limits.
-            Provider::Claude if is_glm_model(meta.model.as_deref()) => {}
+            Provider::Claude if is_glm_model(meta.model.as_deref()) => has_glm = true,
             Provider::Claude => has_claude = true,
             Provider::Codex => has_codex = true,
             Provider::Minimax => has_minimax = true,
+            Provider::Glm => has_glm = true,
         }
-        if has_claude && has_codex && has_minimax {
+        if has_claude && has_codex && has_minimax && has_glm {
             break;
         }
     }
 
-    (has_claude, has_codex, has_minimax)
+    (has_claude, has_codex, has_minimax, has_glm)
 }
 
 /// Kill any OS processes whose command line contains the given session ID.
@@ -1803,7 +1816,7 @@ fn build_agent_args(
     try_resume: bool,
 ) -> (Vec<String>, bool) {
     match provider {
-        Provider::Claude | Provider::Minimax => {
+        Provider::Claude | Provider::Minimax | Provider::Glm => {
             let mut base = vec![
                 "--print".to_string(),
                 "--output-format".to_string(),
@@ -1888,7 +1901,7 @@ fn parse_agent_output(
     session_id_str: &str,
 ) -> Option<ClaudeStreamMessage> {
     match provider {
-        Provider::Claude | Provider::Minimax => {
+        Provider::Claude | Provider::Minimax | Provider::Glm => {
             serde_json::from_str::<ClaudeStreamMessage>(line).ok()
         }
         Provider::Codex => match serde_json::from_str::<CodexStreamMessage>(line) {
@@ -2086,7 +2099,10 @@ mod tests {
             );
         }
 
-        assert_eq!(active_usage_providers(&pane_metas), (true, true, false));
+        assert_eq!(
+            active_usage_providers(&pane_metas),
+            (true, true, false, false)
+        );
     }
 
     #[test]
@@ -2110,7 +2126,10 @@ mod tests {
             );
         }
 
-        assert_eq!(active_usage_providers(&pane_metas), (false, false, true));
+        assert_eq!(
+            active_usage_providers(&pane_metas),
+            (false, false, true, false)
+        );
     }
 
     #[test]
@@ -2146,7 +2165,10 @@ mod tests {
             );
         }
 
-        assert_eq!(active_usage_providers(&pane_metas), (false, true, true));
+        assert_eq!(
+            active_usage_providers(&pane_metas),
+            (false, true, true, false)
+        );
     }
 
     #[test]
@@ -2170,11 +2192,14 @@ mod tests {
             );
         }
 
-        assert_eq!(active_usage_providers(&pane_metas), (false, false, true));
+        assert_eq!(
+            active_usage_providers(&pane_metas),
+            (false, false, true, false)
+        );
     }
 
     #[test]
-    fn active_usage_providers_ignores_glm_only_claude() {
+    fn active_usage_providers_detects_glm_only_claude() {
         let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
         let child_process = Arc::new(Mutex::new(None));
 
@@ -2194,7 +2219,10 @@ mod tests {
             );
         }
 
-        assert_eq!(active_usage_providers(&pane_metas), (false, false, false));
+        assert_eq!(
+            active_usage_providers(&pane_metas),
+            (false, false, false, true)
+        );
     }
 }
 
@@ -3525,7 +3553,8 @@ async fn run_server_connection(
                             }
                         }
                         _ = usage_interval.tick() => {
-                            let (has_claude, has_codex, has_minimax) = active_usage_providers(&pane_metas);
+                            let (has_claude, has_codex, has_minimax, has_glm) =
+                                active_usage_providers(&pane_metas);
                             let max_age = chrono::Duration::minutes(USAGE_CACHE_MAX_AGE_MINUTES);
 
                             if has_claude {
@@ -3567,6 +3596,23 @@ async fn run_server_connection(
                                     }
                                 } else {
                                     tracing::debug!("No fresh cached MiniMax usage limits available");
+                                }
+                            }
+
+                            if has_glm {
+                                if let Some(limits) =
+                                    crate::usage::read_cached_glm_usage_limits(Some(max_age))
+                                {
+                                    let usage_msg = CliToServer::UsageLimits {
+                                        provider: Provider::Glm,
+                                        limits,
+                                    };
+                                    let msg_text = serde_json::to_string(&usage_msg).unwrap_or_default();
+                                    if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
+                                        tracing::warn!("Failed to send GLM usage limits to server");
+                                    }
+                                } else {
+                                    tracing::debug!("No fresh cached GLM usage limits available");
                                 }
                             }
                         }

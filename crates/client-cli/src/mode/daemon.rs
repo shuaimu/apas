@@ -716,4 +716,9 @@ async fn refresh_usage_limits_cache() {
         Ok(_) => tracing::debug!("Refreshed MiniMax usage limits cache"),
         Err(err) => tracing::debug!("Failed to refresh MiniMax usage limits cache: {}", err),
     }
+
+    match crate::usage::refresh_glm_usage_limits().await {
+        Ok(_) => tracing::debug!("Refreshed GLM usage limits cache"),
+        Err(err) => tracing::debug!("Failed to refresh GLM usage limits cache: {}", err),
+    }
 }

@@ -341,11 +341,13 @@ export function TabbedView() {
       (typeof activeConfig?.label === "string" && activeConfig.label.toLowerCase().includes("minimax"))
     )
   );
-  const activeIsGlm = activeProvider === "claude" && (
-    isGlmModel(activeConfig?.model) ||
-    (typeof activeConfig?.label === "string" && activeConfig.label.toLowerCase().includes("glm"))
+  const activeIsGlm = activeProvider === "glm" || (
+    activeProvider === "claude" && (
+      isGlmModel(activeConfig?.model) ||
+      (typeof activeConfig?.label === "string" && activeConfig.label.toLowerCase().includes("glm"))
+    )
   );
-  const activeUsageProvider = activeIsMiniMax ? "minimax" : activeIsGlm ? undefined : activeProvider;
+  const activeUsageProvider = activeIsMiniMax ? "minimax" : activeIsGlm ? "glm" : activeProvider;
   const activeBotPrompt = activeConfig?.prompt && activeConfig.prompt.trim().length > 0
     ? activeConfig.prompt
     : DEFAULT_BOT_LOOP_PROMPT;
@@ -372,6 +374,7 @@ export function TabbedView() {
     if (!activeUsageProvider) return "Usage";
     if (activeUsageProvider === "codex") return "Codex Usage";
     if (activeUsageProvider === "minimax") return "MiniMax Usage";
+    if (activeUsageProvider === "glm") return "GLM Usage";
     return "Claude Usage";
   }, [activeUsageProvider]);
 

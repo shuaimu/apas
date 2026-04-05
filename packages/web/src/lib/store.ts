@@ -54,7 +54,7 @@ export interface UsageLimits {
   fetchedAt?: string;
 }
 
-export type Provider = "claude" | "codex" | "minimax";
+export type Provider = "claude" | "codex" | "minimax" | "glm";
 
 export type UsageLimitsByProvider = Partial<Record<Provider, UsageLimits>>;
 
@@ -134,6 +134,7 @@ function normalizeProvider(raw: unknown): Provider | null {
     if (normalized === "minimax" || normalized === "mini_max") return "minimax";
     if (normalized === "claude" || normalized === "anthropic") return "claude";
     if (normalized === "codex" || normalized === "openai" || normalized === "chatgpt") return "codex";
+    if (normalized === "glm" || normalized === "zai" || normalized === "z.ai" || normalized === "zhipu") return "glm";
   }
   return null;
 }
@@ -223,6 +224,10 @@ function inferUsageProvider(
     if (seenProviders.has("minimax")) {
       usageProviderHints.set(cliClientId, "minimax");
       return "minimax";
+    }
+    if (seenProviders.has("glm")) {
+      usageProviderHints.set(cliClientId, "glm");
+      return "glm";
     }
     usageProviderHints.set(cliClientId, "claude");
     return "claude";

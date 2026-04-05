@@ -92,7 +92,7 @@ interface ShareListState {
 const ADMIN_USER_ID = "88b6016d-a8b4-400c-bdc9-f0120504a4fc";
 
 export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
-  const { cliClients, sessions, attachSession, loadSessionMessages, refreshCliClients, listSessions, sessionId, connected, token, userId } = useStore();
+  const { cliClients, sessions, machines, attachSession, loadSessionMessages, refreshCliClients, listSessions, sessionId, connected, token, userId } = useStore();
   const [shareModalOpen, setShareModalOpen] = useState(false);
   const [mounted, setMounted] = useState(false);
 
@@ -141,18 +141,18 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
     });
 
     // Add sessions, deduplicating by working directory
+    // Active sessions take precedence over inactive ones for the same directory
     for (const session of sortedSessions) {
       const workingDir = session.workingDir || session.id;
       const name = session.workingDir?.split('/').pop() || `Project ${session.id.slice(0, 8)}`;
 
-      // Only add if we haven't seen this directory yet
-      if (!projectMap.has(workingDir)) {
+      const existing = projectMap.get(workingDir);
+      if (!existing || (session.isActive && !existing.isActive)) {
         projectMap.set(workingDir, {
           id: session.id,
           name,
           workingDir,
           hostname: session.hostname,
-          // Use server-provided isActive status (works for shared sessions too)
           isActive: session.isActive || false,
           createdAt: session.createdAt,
           isShared: session.isShared,
@@ -177,6 +177,21 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
       }
     }
 
+    // Also mark projects as active if daemon reports them as running
+    // (handles case where CLI process is up but hasn't connected via WebSocket yet)
+    for (const machine of machines) {
+      for (const mp of machine.projects) {
+        if (mp.isRunning) {
+          for (const project of projectMap.values()) {
+            if (project.workingDir === mp.path) {
+              project.isActive = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+
     // Sort: active first, then by creation date (newest first)
     return Array.from(projectMap.values()).sort((a, b) => {
       if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
@@ -185,7 +200,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
       }
       return 0;
     });
-  }, [cliClients, sessions]);
+  }, [cliClients, sessions, machines]);
 
   const handleRefresh = () => {
     if (isRefreshing) return;
