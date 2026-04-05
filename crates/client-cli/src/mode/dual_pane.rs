@@ -1766,14 +1766,34 @@ fn active_usage_providers(pane_metas: &PaneMetas) -> (bool, bool, bool, bool) {
     let mut has_minimax = false;
     let mut has_glm = false;
 
+    let looks_like_minimax_label = |label: &str| {
+        let normalized = label.trim().to_ascii_lowercase();
+        normalized.contains("minimax") || normalized.contains("mini max")
+    };
+    let looks_like_glm_label = |label: &str| {
+        let normalized = label.trim().to_ascii_lowercase();
+        normalized.contains("glm")
+            || normalized.contains("z.ai")
+            || normalized.contains("zai")
+            || normalized.contains("zhipu")
+    };
+
     for meta in metas.values() {
         match meta.provider {
             // MiniMax tabs run through Claude CLI transport, but Anthropic usage
             // limits are not meaningful for them.
-            Provider::Claude if is_minimax_model(meta.model.as_deref()) => has_minimax = true,
+            Provider::Claude
+                if is_minimax_model(meta.model.as_deref()) || looks_like_minimax_label(&meta.label) =>
+            {
+                has_minimax = true
+            }
             // GLM tabs also run through Claude transport and should not map to
             // Anthropic usage limits.
-            Provider::Claude if is_glm_model(meta.model.as_deref()) => has_glm = true,
+            Provider::Claude
+                if is_glm_model(meta.model.as_deref()) || looks_like_glm_label(&meta.label) =>
+            {
+                has_glm = true
+            }
             Provider::Claude => has_claude = true,
             Provider::Codex => has_codex = true,
             Provider::Minimax => has_minimax = true,
@@ -2213,6 +2233,33 @@ mod tests {
                     label: "GLM 9".to_string(),
                     prompt: None,
                     model: Some("glm-5.1".to_string()),
+                    min_iteration_interval_minutes: None,
+                    child_process,
+                },
+            );
+        }
+
+        assert_eq!(
+            active_usage_providers(&pane_metas),
+            (false, false, false, true)
+        );
+    }
+
+    #[test]
+    fn active_usage_providers_detects_glm_label_without_model() {
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+        let child_process = Arc::new(Mutex::new(None));
+
+        {
+            let mut metas = pane_metas.lock().unwrap();
+            metas.insert(
+                10,
+                PaneMeta {
+                    mode: shared::PaneMode::Interactive,
+                    provider: Provider::Claude,
+                    label: "GLM Experimental".to_string(),
+                    prompt: None,
+                    model: None,
                     min_iteration_interval_minutes: None,
                     child_process,
                 },
