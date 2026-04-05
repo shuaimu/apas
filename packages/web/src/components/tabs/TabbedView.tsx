@@ -172,6 +172,13 @@ export function TabbedView() {
 
   // Active tab state, persisted per project
   const [activeTabId, setActiveTabId] = useState<number | null>(null);
+  const [customLabels, setCustomLabels] = useState<Record<number, string>>(() => {
+    if (typeof window === "undefined") return {};
+    try {
+      const raw = localStorage.getItem("apas_custom_tab_labels");
+      return raw ? JSON.parse(raw) : {};
+    } catch { return {}; }
+  });
   const [startBotModalOpen, setStartBotModalOpen] = useState(false);
   const [viewBotPromptModalOpen, setViewBotPromptModalOpen] = useState(false);
   const [startBotPaneId, setStartBotPaneId] = useState<number | null>(null);
@@ -297,6 +304,17 @@ export function TabbedView() {
       setTimeout(() => setAddTabError(null), 4000);
     }
   }, [addPane, effectiveTabs.length]);
+
+  const handleRenameTab = useCallback(
+    (paneId: number, newLabel: string) => {
+      setCustomLabels((prev) => {
+        const next = { ...prev, [paneId]: newLabel };
+        try { localStorage.setItem("apas_custom_tab_labels", JSON.stringify(next)); } catch {}
+        return next;
+      });
+    },
+    [],
+  );
 
   // Get messages for active tab
   const activeMessages = useMemo(() => {
@@ -561,6 +579,8 @@ export function TabbedView() {
         onSelectTab={handleSelectTab}
         onCloseTab={handleCloseTab}
         onAddTab={handleAddTab}
+        onRenameTab={handleRenameTab}
+        customLabels={customLabels}
         onBootCli={handleBootCli}
         onRebootCli={rebootCli}
         showBootButton={canBootCurrentProject}

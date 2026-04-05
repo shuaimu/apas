@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useEffect, useState } from "react";
+import { useCallback, useRef, useEffect, useState } from "react";
 import { Bot, Code2, Sparkles } from "lucide-react";
 import { PaneConfig, paneKey } from "@/lib/store";
 
@@ -10,6 +10,8 @@ interface TabBarProps {
   onSelectTab: (paneId: number) => void;
   onCloseTab: (paneId: number) => void;
   onAddTab: (provider?: string, model?: string) => void;
+  onRenameTab?: (paneId: number, newLabel: string) => void;
+  customLabels?: Record<number, string>;
   onBootCli?: () => void;
   onRebootCli?: () => void;
   showBootButton?: boolean;
@@ -77,6 +79,8 @@ export function TabBar({
   onSelectTab,
   onCloseTab,
   onAddTab,
+  onRenameTab,
+  customLabels,
   onBootCli,
   onRebootCli,
   showBootButton = false,
@@ -85,6 +89,11 @@ export function TabBar({
   pausedPanes,
 }: TabBarProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const [contextMenu, setContextMenu] = useState<{ paneId: number; x: number; y: number } | null>(null);
+  const [renamingPaneId, setRenamingPaneId] = useState<number | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
+  const renameInputRef = useRef<HTMLInputElement>(null);
+  const contextMenuRef = useRef<HTMLDivElement>(null);
 
   // Scroll active tab into view when it changes
   useEffect(() => {
@@ -94,6 +103,63 @@ export function TabBar({
       activeEl.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
     }
   }, [activeTabId]);
+
+  // Dismiss context menu on outside click
+  useEffect(() => {
+    if (!contextMenu) return;
+    const handleClick = (e: MouseEvent) => {
+      if (contextMenuRef.current && !contextMenuRef.current.contains(e.target as Node)) {
+        setContextMenu(null);
+      }
+    };
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [contextMenu]);
+
+  // Auto-focus rename input
+  useEffect(() => {
+    if (renamingPaneId != null && renameInputRef.current) {
+      renameInputRef.current.focus();
+      renameInputRef.current.select();
+    }
+  }, [renamingPaneId]);
+
+  const handleContextMenu = useCallback((e: React.MouseEvent, paneId: number) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setContextMenu({ paneId, x: e.clientX, y: e.clientY });
+  }, []);
+
+  const handleStartRename = useCallback(() => {
+    if (contextMenu == null) return;
+    const paneId = contextMenu.paneId;
+    const tab = tabs.find((t) => t.pane_id === paneId);
+    const label = customLabels?.[paneId] ?? tab?.label ?? "";
+    setRenameDraft(label);
+    setRenamingPaneId(paneId);
+    setContextMenu(null);
+  }, [contextMenu, tabs, customLabels]);
+
+  const handleFinishRename = useCallback(() => {
+    if (renamingPaneId == null) return;
+    const trimmed = renameDraft.trim();
+    if (trimmed && onRenameTab) {
+      onRenameTab(renamingPaneId, trimmed);
+    }
+    setRenamingPaneId(null);
+    setRenameDraft("");
+  }, [renamingPaneId, renameDraft, onRenameTab]);
+
+  const handleRenameKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      handleFinishRename();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      setRenamingPaneId(null);
+      setRenameDraft("");
+    }
+  }, [handleFinishRename]);
 
   return (
     <div className="flex items-end border-b border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-800/50 flex-shrink-0 min-h-[40px]">
@@ -109,13 +175,15 @@ export function TabBar({
           const isPaused = pausedPanes.includes(tab.pane_id);
           const status = paneStatuses[paneKey(tab.pane_id)];
           const hasActivity = !!status;
-          const label = tab.label || `Tab ${index + 1}`;
+          const label = customLabels?.[tab.pane_id] ?? (tab.label || `Tab ${index + 1}`);
+          const isRenaming = renamingPaneId === tab.pane_id;
 
           return (
             <button
               key={tab.pane_id}
               data-tab-id={tab.pane_id}
-              onClick={() => onSelectTab(tab.pane_id)}
+              onClick={() => { if (!isRenaming) onSelectTab(tab.pane_id); }}
+              onContextMenu={(e) => handleContextMenu(e, tab.pane_id)}
               className={`group relative flex items-center gap-1.5 px-3 py-2 text-sm font-medium transition-colors flex-shrink-0 border-r border-gray-200 dark:border-gray-700 max-w-[200px] ${
                 isActive
                   ? "bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 border-b-2 border-b-blue-500 -mb-px"
@@ -146,10 +214,22 @@ export function TabBar({
               </span>
 
               {/* Label */}
-              <span className="truncate">
-                {label}
-                {isBot && " (Bot)"}
-              </span>
+              {isRenaming ? (
+                <input
+                  ref={renameInputRef}
+                  value={renameDraft}
+                  onChange={(e) => setRenameDraft(e.target.value)}
+                  onBlur={handleFinishRename}
+                  onKeyDown={handleRenameKeyDown}
+                  onClick={(e) => e.stopPropagation()}
+                  className="w-full min-w-[60px] max-w-[140px] px-1 py-0 text-sm bg-white dark:bg-gray-800 border border-blue-400 rounded outline-none"
+                />
+              ) : (
+                <span className="truncate">
+                  {label}
+                  {isBot && " (Bot)"}
+                </span>
+              )}
 
               {/* Close button - visible on hover or when active */}
               {tabs.length > 1 && (
@@ -174,6 +254,33 @@ export function TabBar({
           );
         })}
       </div>
+
+      {/* Right-click context menu */}
+      {contextMenu && (
+        <div
+          ref={contextMenuRef}
+          className="fixed bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-lg py-1 z-50 min-w-[120px]"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+        >
+          {onRenameTab && (
+            <button
+              onClick={handleStartRename}
+              className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700"
+            >
+              Rename
+            </button>
+          )}
+          <button
+            onClick={() => {
+              if (contextMenu) onCloseTab(contextMenu.paneId);
+              setContextMenu(null);
+            }}
+            className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 text-red-600 dark:text-red-400"
+          >
+            Close
+          </button>
+        </div>
+      )}
 
       {/* Global tab-bar actions */}
       <div className="flex items-center gap-1 pr-1">
