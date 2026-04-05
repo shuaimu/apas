@@ -597,7 +597,18 @@ fn parse_glm_api_error(payload: &Value) -> Option<GlmApiError> {
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| "unknown error".to_string());
 
-    let has_error = matches!(success, Some(false)) || code.map_or(false, |value| value != 0);
+    // Z.ai monitor APIs commonly return:
+    // - success body: { code: 200, success: true, ... }
+    // - auth failure: { code: 401|1001, success: false, ... }
+    let has_error = match success {
+        Some(true) => false,
+        Some(false) => true,
+        None => match code {
+            Some(0 | 200) => false,
+            Some(_) => true,
+            None => false,
+        },
+    };
     if !has_error {
         return None;
     }
@@ -1610,5 +1621,17 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("code 401"));
         assert!(text.contains("token expired or incorrect"));
+    }
+
+    #[test]
+    fn parse_glm_api_error_ignores_successful_code_200_payload() {
+        let payload = serde_json::json!({
+            "code": 200,
+            "msg": "Operation successful",
+            "success": true,
+            "data": { "limits": [] }
+        });
+
+        assert!(parse_glm_api_error(&payload).is_none());
     }
 }
