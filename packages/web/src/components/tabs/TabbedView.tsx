@@ -179,6 +179,13 @@ export function TabbedView() {
       return raw ? JSON.parse(raw) : {};
     } catch { return {}; }
   });
+  const [customTabOrder, setCustomTabOrder] = useState<number[]>(() => {
+    if (typeof window === "undefined") return [];
+    try {
+      const raw = localStorage.getItem("apas_custom_tab_order");
+      return raw ? JSON.parse(raw) : [];
+    } catch { return []; }
+  });
   const [startBotModalOpen, setStartBotModalOpen] = useState(false);
   const [viewBotPromptModalOpen, setViewBotPromptModalOpen] = useState(false);
   const [startBotPaneId, setStartBotPaneId] = useState<number | null>(null);
@@ -231,10 +238,27 @@ export function TabbedView() {
     messages.length,
   ]);
 
+  // Apply custom tab order on top of server-provided order
+  const sortedEffectiveTabs = useMemo(() => {
+    if (customTabOrder.length === 0) return effectiveTabs;
+    const orderMap = new Map(customTabOrder.map((id, i) => [id, i]));
+    const ordered: PaneConfig[] = [];
+    const remaining: PaneConfig[] = [];
+    for (const tab of effectiveTabs) {
+      if (orderMap.has(tab.pane_id)) {
+        ordered.push(tab);
+      } else {
+        remaining.push(tab);
+      }
+    }
+    ordered.sort((a, b) => (orderMap.get(a.pane_id) ?? 0) - (orderMap.get(b.pane_id) ?? 0));
+    return [...ordered, ...remaining];
+  }, [effectiveTabs, customTabOrder]);
+
   // Stable list of tab IDs (avoids re-running effects on every message)
   const tabIds = useMemo(
-    () => effectiveTabs.map((t) => t.pane_id).join(","),
-    [effectiveTabs],
+    () => sortedEffectiveTabs.map((t) => t.pane_id).join(","),
+    [sortedEffectiveTabs],
   );
 
   // Reset active tab when switching sessions so localStorage preference is re-evaluated
@@ -312,6 +336,15 @@ export function TabbedView() {
         try { localStorage.setItem("apas_custom_tab_labels", JSON.stringify(next)); } catch {}
         return next;
       });
+    },
+    [],
+  );
+
+  // Handle tab drag reorder
+  const handleReorderTabs = useCallback(
+    (orderedIds: number[]) => {
+      setCustomTabOrder(orderedIds);
+      try { localStorage.setItem("apas_custom_tab_order", JSON.stringify(orderedIds)); } catch {}
     },
     [],
   );
@@ -559,7 +592,7 @@ export function TabbedView() {
   }, [activeIsBot, viewBotPromptModalOpen]);
 
   // No session or no tabs - empty state
-  if (!sessionId || effectiveTabs.length === 0) {
+  if (!sessionId || sortedEffectiveTabs.length === 0) {
     return (
       <div className="flex-1 flex items-center justify-center text-gray-400">
         <div className="text-center">
@@ -574,13 +607,14 @@ export function TabbedView() {
     <div className="flex flex-col h-full overflow-hidden">
       {/* Tab bar */}
       <TabBar
-        tabs={effectiveTabs}
+        tabs={sortedEffectiveTabs}
         activeTabId={activeTabId}
         onSelectTab={handleSelectTab}
         onCloseTab={handleCloseTab}
         onAddTab={handleAddTab}
         onRenameTab={handleRenameTab}
         customLabels={customLabels}
+        onReorderTabs={handleReorderTabs}
         onBootCli={handleBootCli}
         onRebootCli={rebootCli}
         showBootButton={canBootCurrentProject}

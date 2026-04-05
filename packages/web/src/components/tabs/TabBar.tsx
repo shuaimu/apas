@@ -12,6 +12,7 @@ interface TabBarProps {
   onAddTab: (provider?: string, model?: string) => void;
   onRenameTab?: (paneId: number, newLabel: string) => void;
   customLabels?: Record<number, string>;
+  onReorderTabs?: (orderedIds: number[]) => void;
   onBootCli?: () => void;
   onRebootCli?: () => void;
   showBootButton?: boolean;
@@ -81,6 +82,7 @@ export function TabBar({
   onAddTab,
   onRenameTab,
   customLabels,
+  onReorderTabs,
   onBootCli,
   onRebootCli,
   showBootButton = false,
@@ -94,6 +96,11 @@ export function TabBar({
   const [renameDraft, setRenameDraft] = useState("");
   const renameInputRef = useRef<HTMLInputElement>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
+
+  // Drag-and-drop state
+  const [draggedPaneId, setDraggedPaneId] = useState<number | null>(null);
+  const [dropTargetId, setDropTargetId] = useState<number | null>(null);
+  const [dropSide, setDropSide] = useState<"left" | "right" | null>(null);
 
   // Scroll active tab into view when it changes
   useEffect(() => {
@@ -161,6 +168,53 @@ export function TabBar({
     }
   }, [handleFinishRename]);
 
+  // Drag handlers
+  const handleDragStart = useCallback((e: React.DragEvent, paneId: number) => {
+    setDraggedPaneId(paneId);
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", String(paneId));
+  }, []);
+
+  const handleDragOver = useCallback((e: React.DragEvent, paneId: number) => {
+    if (draggedPaneId == null || draggedPaneId === paneId) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const midX = rect.left + rect.width / 2;
+    setDropTargetId(paneId);
+    setDropSide(e.clientX < midX ? "left" : "right");
+  }, [draggedPaneId]);
+
+  const handleDrop = useCallback((e: React.DragEvent, targetPaneId: number) => {
+    e.preventDefault();
+    if (draggedPaneId == null || draggedPaneId === targetPaneId || !onReorderTabs) {
+      setDraggedPaneId(null);
+      setDropTargetId(null);
+      setDropSide(null);
+      return;
+    }
+    const currentOrder = tabs.map((t) => t.pane_id);
+    const fromIndex = currentOrder.indexOf(draggedPaneId);
+    let toIndex = currentOrder.indexOf(targetPaneId);
+    if (fromIndex === -1 || toIndex === -1) return;
+
+    const newOrder = currentOrder.filter((id) => id !== draggedPaneId);
+    toIndex = newOrder.indexOf(targetPaneId);
+    const insertAt = dropSide === "right" ? toIndex + 1 : toIndex;
+    newOrder.splice(insertAt, 0, draggedPaneId);
+
+    onReorderTabs(newOrder);
+    setDraggedPaneId(null);
+    setDropTargetId(null);
+    setDropSide(null);
+  }, [draggedPaneId, dropSide, tabs, onReorderTabs]);
+
+  const handleDragEnd = useCallback(() => {
+    setDraggedPaneId(null);
+    setDropTargetId(null);
+    setDropSide(null);
+  }, []);
+
   return (
     <div className="flex items-end border-b border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-800/50 flex-shrink-0 min-h-[40px]">
       <div
@@ -182,15 +236,28 @@ export function TabBar({
             <button
               key={tab.pane_id}
               data-tab-id={tab.pane_id}
+              draggable={!isRenaming}
+              onDragStart={(e) => handleDragStart(e, tab.pane_id)}
+              onDragOver={(e) => handleDragOver(e, tab.pane_id)}
+              onDrop={(e) => handleDrop(e, tab.pane_id)}
+              onDragEnd={handleDragEnd}
               onClick={() => { if (!isRenaming) onSelectTab(tab.pane_id); }}
               onContextMenu={(e) => handleContextMenu(e, tab.pane_id)}
               className={`group relative flex items-center gap-1.5 px-3 py-2 text-sm font-medium transition-colors flex-shrink-0 border-r border-gray-200 dark:border-gray-700 max-w-[200px] ${
                 isActive
                   ? "bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 border-b-2 border-b-blue-500 -mb-px"
                   : "text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700/50 hover:text-gray-700 dark:hover:text-gray-300"
-              }`}
+              } ${draggedPaneId === tab.pane_id ? "opacity-40" : ""}`}
               style={{ scrollSnapAlign: "start" }}
             >
+              {/* Drop indicator */}
+              {dropTargetId === tab.pane_id && dropSide === "left" && (
+                <div className="absolute left-0 top-0 bottom-0 w-0.5 bg-blue-500 -translate-x-1/2 z-10" />
+              )}
+              {dropTargetId === tab.pane_id && dropSide === "right" && (
+                <div className="absolute right-0 top-0 bottom-0 w-0.5 bg-blue-500 translate-x-1/2 z-10" />
+              )}
+
               {/* Provider icon + status badge */}
               <span
                 className={`relative inline-flex items-center justify-center flex-shrink-0 ${
