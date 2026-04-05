@@ -712,6 +712,7 @@ async fn fetch_glm_usage_payload(
 
 fn parse_glm_usage_limits(payloads: &[Value]) -> Result<UsageLimits> {
     let mut five_hour: Option<UsageLimitWindow> = None;
+    let mut seven_day: Option<UsageLimitWindow> = None;
     let mut last_api_error: Option<GlmApiError> = None;
 
     for payload in payloads {
@@ -735,8 +736,9 @@ fn parse_glm_usage_limits(payloads: &[Value]) -> Result<UsageLimits> {
             };
 
             let mut fallback_rate: Option<(f64, Option<String>)> = None;
+            let mut token_windows: Vec<GlmTokenWindowCandidate> = Vec::new();
 
-            for entry in entries.iter().filter_map(Value::as_object) {
+            for (entry_index, entry) in entries.iter().filter_map(Value::as_object).enumerate() {
                 let utilization = first_number_from_objects(
                     &[entry],
                     &[
@@ -760,9 +762,16 @@ fn parse_glm_usage_limits(payloads: &[Value]) -> Result<UsageLimits> {
                         "resets_at",
                         "next_reset_at",
                         "next_reset_time",
+                        "resetAt",
+                        "resetsAt",
+                        "nextResetAt",
+                        "nextResetTime",
                         "reset_time",
+                        "resetTime",
                         "expires_at",
                         "expire_at",
+                        "expiresAt",
+                        "expireAt",
                     ],
                 );
 
@@ -773,11 +782,23 @@ fn parse_glm_usage_limits(payloads: &[Value]) -> Result<UsageLimits> {
                     .to_ascii_uppercase();
 
                 if limit_type.contains("TOKEN") {
-                    five_hour = Some(UsageLimitWindow {
-                        utilization,
-                        resets_at,
+                    token_windows.push(GlmTokenWindowCandidate {
+                        index: entry_index,
+                        reset_unix_seconds: parse_rfc3339_unix_seconds(resets_at.as_deref()),
+                        unit: first_number_from_objects(
+                            &[entry],
+                            &["unit", "interval_unit", "window_unit"],
+                        ),
+                        number: first_number_from_objects(
+                            &[entry],
+                            &["number", "interval_number", "window_number"],
+                        ),
+                        window: UsageLimitWindow {
+                            utilization,
+                            resets_at,
+                        },
                     });
-                    break;
+                    continue;
                 }
 
                 if fallback_rate.is_none() {
@@ -785,7 +806,17 @@ fn parse_glm_usage_limits(payloads: &[Value]) -> Result<UsageLimits> {
                 }
             }
 
-            if five_hour.is_none() {
+            if !token_windows.is_empty() {
+                token_windows.sort_by(compare_glm_token_windows);
+                if five_hour.is_none() {
+                    five_hour = Some(token_windows[0].window.clone());
+                }
+                if seven_day.is_none() && token_windows.len() > 1 {
+                    seven_day = token_windows
+                        .last()
+                        .map(|candidate| candidate.window.clone());
+                }
+            } else if five_hour.is_none() {
                 if let Some((utilization, resets_at)) = fallback_rate {
                     five_hour = Some(UsageLimitWindow {
                         utilization,
@@ -794,7 +825,7 @@ fn parse_glm_usage_limits(payloads: &[Value]) -> Result<UsageLimits> {
                 }
             }
 
-            if five_hour.is_some() {
+            if five_hour.is_some() && seven_day.is_some() {
                 break;
             }
         }
@@ -819,9 +850,16 @@ fn parse_glm_usage_limits(payloads: &[Value]) -> Result<UsageLimits> {
                         "resets_at",
                         "next_reset_at",
                         "next_reset_time",
+                        "resetAt",
+                        "resetsAt",
+                        "nextResetAt",
+                        "nextResetTime",
                         "reset_time",
+                        "resetTime",
                         "expires_at",
                         "expire_at",
+                        "expiresAt",
+                        "expireAt",
                     ],
                 );
                 five_hour = Some(UsageLimitWindow {
@@ -831,7 +869,7 @@ fn parse_glm_usage_limits(payloads: &[Value]) -> Result<UsageLimits> {
             }
         }
 
-        if five_hour.is_some() {
+        if five_hour.is_some() && seven_day.is_some() {
             break;
         }
     }
@@ -856,9 +894,61 @@ fn parse_glm_usage_limits(payloads: &[Value]) -> Result<UsageLimits> {
 
     Ok(UsageLimits {
         five_hour,
-        seven_day: None,
+        seven_day,
         fetched_at: Some(Utc::now().to_rfc3339()),
     })
+}
+
+#[derive(Debug, Clone)]
+struct GlmTokenWindowCandidate {
+    index: usize,
+    window: UsageLimitWindow,
+    reset_unix_seconds: Option<i64>,
+    unit: Option<f64>,
+    number: Option<f64>,
+}
+
+fn parse_rfc3339_unix_seconds(raw: Option<&str>) -> Option<i64> {
+    let text = raw?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|dt| dt.timestamp())
+}
+
+fn compare_optional_f64(left: Option<f64>, right: Option<f64>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn compare_glm_token_windows(
+    left: &GlmTokenWindowCandidate,
+    right: &GlmTokenWindowCandidate,
+) -> Ordering {
+    match (left.reset_unix_seconds, right.reset_unix_seconds) {
+        (Some(left), Some(right)) if left != right => return left.cmp(&right),
+        (Some(_), None) => return Ordering::Less,
+        (None, Some(_)) => return Ordering::Greater,
+        _ => {}
+    }
+
+    let by_unit = compare_optional_f64(left.unit, right.unit);
+    if by_unit != Ordering::Equal {
+        return by_unit;
+    }
+
+    let by_number = compare_optional_f64(left.number, right.number);
+    if by_number != Ordering::Equal {
+        return by_number;
+    }
+
+    left.index.cmp(&right.index)
 }
 
 /// Fetch usage limits from GLM monitor usage endpoints.
@@ -1581,6 +1671,39 @@ mod tests {
         assert!((five_hour.utilization - 0.42).abs() < 0.0001);
         assert!(five_hour.resets_at.is_some());
         assert!(parsed.seven_day.is_none());
+    }
+
+    #[test]
+    fn parse_glm_usage_limits_extracts_weekly_from_multi_token_windows() {
+        let payload = serde_json::json!({
+            "data": {
+                "limits": [
+                    {
+                        "type": "TOKENS_LIMIT",
+                        "unit": 6,
+                        "number": 1,
+                        "percentage": 5,
+                        "nextResetTime": 1775856469998i64
+                    },
+                    {
+                        "type": "TOKENS_LIMIT",
+                        "unit": 3,
+                        "number": 5,
+                        "percentage": 24,
+                        "nextResetTime": 1775373994522i64
+                    }
+                ]
+            }
+        });
+
+        let parsed =
+            parse_glm_usage_limits(&vec![payload]).expect("parses glm multi-window payload");
+        let five_hour = parsed.five_hour.expect("5h window exists");
+        let weekly = parsed.seven_day.expect("weekly window exists");
+        assert!((five_hour.utilization - 0.24).abs() < 0.0001);
+        assert!(five_hour.resets_at.is_some());
+        assert!((weekly.utilization - 0.05).abs() < 0.0001);
+        assert!(weekly.resets_at.is_some());
     }
 
     #[test]
