@@ -5,6 +5,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, Play, RefreshCw, Square } from "lucide-react";
 import { useStore } from "@/lib/store";
+import { AllProvidersUsage } from "@/components/UsageLimits";
 
 const MINIMAX_API_BASE_URL = "https://api.minimax.io/anthropic";
 const GLM_API_BASE_URL = "https://api.z.ai/api/anthropic";
@@ -68,6 +69,11 @@ export default function MachinesPage() {
             No machines reported yet. Start `apas daemon` on a machine first.
           </div>
         )}
+
+        <section className="rounded-lg border border-gray-200 bg-white p-4 shadow-sm dark:border-gray-800 dark:bg-gray-900">
+          <h2 className="mb-3 text-sm font-semibold text-gray-700 dark:text-gray-300">Usage</h2>
+          <AllProvidersUsage />
+        </section>
 
         {machines.map(({ machine, projects }) => (
           <section

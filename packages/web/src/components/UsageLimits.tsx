@@ -207,6 +207,71 @@ export function UsageLimitsDisplay({ limits, compact = false }: UsageLimitsDispl
   );
 }
 
+const PROVIDER_LABELS: Record<string, string> = {
+  claude: "Claude",
+  codex: "Codex",
+  minimax: "MiniMax",
+  glm: "GLM",
+};
+
+const PROVIDER_COLORS: Record<string, string> = {
+  claude: "border-l-amber-500",
+  codex: "border-l-blue-500",
+  minimax: "border-l-cyan-500",
+  glm: "border-l-emerald-500",
+};
+
+export function AllProvidersUsage() {
+  const usageLimits = useStore((s) => s.usageLimits);
+
+  // Aggregate usage across all CLI clients — take the most recently fetched entry per provider.
+  const aggregated = useMemo(() => {
+    const latest: Partial<Record<string, { limits: UsageLimitsType; fetchedAt?: string }>> = {};
+
+    for (const [, byProvider] of usageLimits) {
+      for (const [provider, limits] of Object.entries(byProvider)) {
+        const existing = latest[provider];
+        if (!limits.fiveHour && !limits.sevenDay) continue;
+        if (
+          !existing ||
+          (limits.fetchedAt && (!existing.fetchedAt || limits.fetchedAt > existing.fetchedAt))
+        ) {
+          latest[provider] = { limits, fetchedAt: limits.fetchedAt };
+        }
+      }
+    }
+    return latest;
+  }, [usageLimits]);
+
+  const providers = Object.entries(aggregated);
+  if (providers.length === 0) {
+    return (
+      <div className="text-xs text-gray-500">
+        No usage data available. Start a session to see usage limits.
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      {providers.map(([provider, entry]) => {
+        if (!entry) return null;
+        return (
+          <div
+            key={provider}
+            className={`border-l-4 ${PROVIDER_COLORS[provider] || "border-l-gray-400"} pl-3`}
+          >
+            <div className="mb-1 text-sm font-medium">
+              {PROVIDER_LABELS[provider] || provider}
+            </div>
+            <UsageLimitsDisplay limits={entry.limits} />
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export function UsageLimitsPanel() {
   const { usageLimits, cliClients, sessionId, sessions } = useStore();
 
@@ -224,19 +289,34 @@ export function UsageLimitsPanel() {
   }, [sessionId, cliClients, sessions]);
 
   // Get usage limits for the current session's CLI client
-  const currentLimits = useMemo(() => {
+  const currentUsage = useMemo(() => {
     if (!currentCliClientId) return null;
-    return usageLimits.get(currentCliClientId)?.claude ?? null;
+    const limitsByProvider = usageLimits.get(currentCliClientId);
+    if (!limitsByProvider) return null;
+
+    if (limitsByProvider.glm) {
+      return { label: "GLM Usage", limits: limitsByProvider.glm };
+    }
+    if (limitsByProvider.minimax) {
+      return { label: "MiniMax Usage", limits: limitsByProvider.minimax };
+    }
+    if (limitsByProvider.codex) {
+      return { label: "Codex Usage", limits: limitsByProvider.codex };
+    }
+    if (limitsByProvider.claude) {
+      return { label: "Claude Usage", limits: limitsByProvider.claude };
+    }
+    return null;
   }, [currentCliClientId, usageLimits]);
 
-  if (!currentLimits) {
+  if (!currentUsage) {
     return null;
   }
 
   return (
     <div className="border-t border-gray-200 dark:border-gray-800 p-3">
-      <div className="text-xs font-medium text-gray-500 mb-2">Claude Usage</div>
-      <UsageLimitsDisplay limits={currentLimits} />
+      <div className="text-xs font-medium text-gray-500 mb-2">{currentUsage.label}</div>
+      <UsageLimitsDisplay limits={currentUsage.limits} />
     </div>
   );
 }
