@@ -936,6 +936,58 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
+                Ok(WebToServer::UpdatePaneLabel { pane_id, label }) => {
+                    if let Some(sid) = session_id {
+                        tracing::info!("Updating pane {} label in session {}", pane_id, sid);
+                        let mut panes = state.sessions.get_session_panes(&sid);
+                        if let Some(pane) = panes.iter_mut().find(|p| p.pane_id == pane_id) {
+                            pane.label = Some(label);
+                            state.sessions.set_session_panes(&sid, panes.clone());
+                            let _ = state.storage.save_pane_list(&sid, &panes).await;
+                            state
+                                .sessions
+                                .route_to_web(
+                                    &sid,
+                                    ServerToWeb::PaneList {
+                                        session_id: sid,
+                                        panes,
+                                    },
+                                )
+                                .await;
+                        }
+                    }
+                }
+                Ok(WebToServer::ReorderPanes { pane_ids }) => {
+                    if let Some(sid) = session_id {
+                        tracing::info!("Reordering panes in session {}", sid);
+                        let panes = state.sessions.get_session_panes(&sid);
+                        let order_map: std::collections::HashMap<u32, usize> =
+                            pane_ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+                        let mut ordered: Vec<shared::PaneConfig> = Vec::new();
+                        let mut remaining: Vec<shared::PaneConfig> = Vec::new();
+                        for pane in panes {
+                            if let Some(&pos) = order_map.get(&pane.pane_id) {
+                                ordered.push(pane);
+                            } else {
+                                remaining.push(pane);
+                            }
+                        }
+                        ordered.sort_by_key(|p| order_map.get(&p.pane_id).copied().unwrap_or(usize::MAX));
+                        let new_panes = [ordered, remaining].concat();
+                        state.sessions.set_session_panes(&sid, new_panes.clone());
+                        let _ = state.storage.save_pane_list(&sid, &new_panes).await;
+                        state
+                            .sessions
+                            .route_to_web(
+                                &sid,
+                                ServerToWeb::PaneList {
+                                    session_id: sid,
+                                    panes: new_panes,
+                                },
+                            )
+                            .await;
+                    }
+                }
                 Ok(WebToServer::StartBot {
                     pane_id,
                     prompt,

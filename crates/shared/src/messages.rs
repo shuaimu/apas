@@ -332,6 +332,15 @@ pub enum WebToServer {
     /// Remove a pane
     RemovePane { pane_id: u32 },
 
+    /// Update a pane's custom label
+    UpdatePaneLabel {
+        pane_id: u32,
+        label: String,
+    },
+
+    /// Reorder panes (array of pane_ids in desired order)
+    ReorderPanes { pane_ids: Vec<u32> },
+
     /// Start bot (deadloop) on a pane — converts interactive pane to deadloop
     StartBot {
         pane_id: u32,

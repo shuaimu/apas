@@ -340,6 +340,8 @@ interface AppState {
     model?: string
   ) => { success: boolean; error?: string };
   removePane: (paneId: number) => void;
+  updatePaneLabel: (paneId: number, label: string) => void;
+  reorderPanes: (paneIds: number[]) => void;
   startBot: (paneId: number, prompt?: string, minIterationIntervalMinutes?: number) => void;
   stopBot: (paneId: number) => void;
   rebootCli: () => void;
@@ -1061,6 +1063,20 @@ export const useStore = create<AppState>((set, get) => ({
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "remove_pane", pane_id: paneId }));
+    }
+  },
+
+  updatePaneLabel: (paneId: number, label: string) => {
+    const { ws } = get();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "update_pane_label", pane_id: paneId, label }));
+    }
+  },
+
+  reorderPanes: (paneIds: number[]) => {
+    const { ws } = get();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "reorder_panes", pane_ids: paneIds }));
     }
   },
 

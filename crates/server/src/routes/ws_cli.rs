@@ -556,6 +556,37 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 // Cache pane list and forward to attached web clients
                                 tracing::info!("CLI {} sent pane list for session {}: {} panes", cli_id, session_id, panes.len());
                                 normalize_backend_pane_labels(&mut panes);
+                                // Preserve web-side custom labels and order from existing cache
+                                let existing = state.sessions.get_session_panes(&session_id);
+                                if !existing.is_empty() {
+                                    let label_map: std::collections::HashMap<u32, String> = existing
+                                        .iter()
+                                        .filter_map(|p| p.label.as_ref().map(|l| (p.pane_id, l.clone())))
+                                        .collect();
+                                    for pane in &mut panes {
+                                        if let Some(label) = label_map.get(&pane.pane_id) {
+                                            pane.label = Some(label.clone());
+                                        }
+                                    }
+                                    // Reorder to match existing cached order; new panes appended at end
+                                    let existing_order: Vec<u32> = existing.iter().map(|p| p.pane_id).collect();
+                                    let new_ids: std::collections::HashSet<u32> = panes.iter().map(|p| p.pane_id).collect();
+                                    let mut reordered: Vec<shared::PaneConfig> = Vec::new();
+                                    for &id in &existing_order {
+                                        if let Some(p) = panes.iter().find(|p| p.pane_id == id) {
+                                            reordered.push(p.clone());
+                                        }
+                                    }
+                                    for p in &panes {
+                                        if !existing_order.contains(&p.pane_id) {
+                                            reordered.push(p.clone());
+                                        }
+                                    }
+                                    // Only apply reorder if all incoming panes are accounted for
+                                    if reordered.len() == panes.len() {
+                                        panes = reordered;
+                                    }
+                                }
                                 state.sessions.set_session_panes(&session_id, panes.clone());
                                 if let Err(e) = state.storage.save_pane_list(&session_id, &panes).await {
                                     tracing::warn!(
