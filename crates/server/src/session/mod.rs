@@ -935,32 +935,47 @@ impl SessionManager {
             .collect()
     }
 
-    /// Broadcast CLI clients list to all connected web clients
+    /// Broadcast CLI clients list to all connected web clients (filtered per user)
     fn broadcast_cli_clients_update(&self) {
-        let clients = self.get_cli_clients_info();
-        let msg = ServerToWeb::CliClients { clients };
+        // Build a per-user cache to avoid recomputing for each web connection
+        let mut user_msgs: std::collections::HashMap<Uuid, ServerToWeb> =
+            std::collections::HashMap::new();
 
-        for entry in self.web_senders.iter() {
-            // Use try_send to avoid blocking and unbounded task spawning.
-            let _ = entry.value().try_send(msg.clone());
+        for web_entry in self.web_users.iter() {
+            let connection_id = *web_entry.key();
+            let user_id = *web_entry.value();
+            let msg = user_msgs.entry(user_id).or_insert_with(|| {
+                let clients = self.get_cli_clients_info_for_user(&user_id);
+                ServerToWeb::CliClients { clients }
+            });
+            if let Some(sender) = self.web_senders.get(&connection_id) {
+                let _ = sender.try_send(msg.clone());
+            }
         }
     }
 
-    /// Update usage limits for a CLI client and broadcast to web clients
+    /// Update usage limits for a CLI client and broadcast to the owning user's web clients
     pub fn update_usage_limits(&self, cli_id: Uuid, provider: Provider, limits: UsageLimits) {
         self.cli_usage_limits
             .insert((cli_id, provider.clone()), limits.clone());
 
-        // Broadcast to all web clients
+        // Only send to web clients belonging to the CLI's owner
+        let owner = self.cli_users.get(&cli_id).map(|e| *e);
         let msg = ServerToWeb::UsageLimits {
             cli_client_id: cli_id,
             provider,
             limits,
         };
 
-        for entry in self.web_senders.iter() {
-            // Use try_send to avoid blocking and unbounded task spawning.
-            let _ = entry.value().try_send(msg.clone());
+        if let Some(user_id) = owner {
+            for web_entry in self.web_users.iter() {
+                if *web_entry.value() != user_id {
+                    continue;
+                }
+                if let Some(sender) = self.web_senders.get(web_entry.key()) {
+                    let _ = sender.try_send(msg.clone());
+                }
+            }
         }
     }
 
