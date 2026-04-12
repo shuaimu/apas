@@ -276,11 +276,41 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     hostname.clone(),
                                 );
 
-                                // Cache initial pane list if provided
+                                // Cache initial pane list if provided, preserving persisted labels/order
                                 if let Some(pane_list) = &panes {
                                     if !pane_list.is_empty() {
                                         let mut normalized_panes = pane_list.clone();
                                         normalize_backend_pane_labels(&mut normalized_panes);
+                                        // Recover custom labels/order from persisted file
+                                        if let Ok(stored) = state.storage.load_pane_list(&session_id).await {
+                                            if !stored.is_empty() {
+                                                let label_map: std::collections::HashMap<u32, String> = stored
+                                                    .iter()
+                                                    .filter_map(|p| p.label.as_ref().map(|l| (p.pane_id, l.clone())))
+                                                    .collect();
+                                                for pane in &mut normalized_panes {
+                                                    if let Some(label) = label_map.get(&pane.pane_id) {
+                                                        pane.label = Some(label.clone());
+                                                    }
+                                                }
+                                                // Reorder to match persisted order; new panes appended
+                                                let existing_order: Vec<u32> = stored.iter().map(|p| p.pane_id).collect();
+                                                let mut reordered: Vec<shared::PaneConfig> = Vec::new();
+                                                for &id in &existing_order {
+                                                    if let Some(p) = normalized_panes.iter().find(|p| p.pane_id == id) {
+                                                        reordered.push(p.clone());
+                                                    }
+                                                }
+                                                for p in &normalized_panes {
+                                                    if !existing_order.contains(&p.pane_id) {
+                                                        reordered.push(p.clone());
+                                                    }
+                                                }
+                                                if reordered.len() == normalized_panes.len() {
+                                                    normalized_panes = reordered;
+                                                }
+                                            }
+                                        }
                                         state
                                             .sessions
                                             .set_session_panes(&session_id, normalized_panes.clone());
@@ -556,8 +586,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 // Cache pane list and forward to attached web clients
                                 tracing::info!("CLI {} sent pane list for session {}: {} panes", cli_id, session_id, panes.len());
                                 normalize_backend_pane_labels(&mut panes);
-                                // Preserve web-side custom labels and order from existing cache
-                                let existing = state.sessions.get_session_panes(&session_id);
+                                // Preserve web-side custom labels and order from cache or persisted file
+                                let mut existing = state.sessions.get_session_panes(&session_id);
+                                if existing.is_empty() {
+                                    // After server restart the in-memory cache is empty;
+                                    // fall back to the persisted panes.json to recover labels/order.
+                                    if let Ok(stored) = state.storage.load_pane_list(&session_id).await {
+                                        if !stored.is_empty() {
+                                            existing = stored;
+                                        }
+                                    }
+                                }
                                 if !existing.is_empty() {
                                     let label_map: std::collections::HashMap<u32, String> = existing
                                         .iter()

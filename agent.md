@@ -197,16 +197,26 @@ journalctl -u apas-web -f
 
 ```bash
 # Build locally
-cargo build -p apas-server --release
+# cargo build -p apas-server --release
+cargo build --release
+
+# Stop server
+ssh root@apas.mpaxos.com "systemctl stop apas-server"
 
 # Copy binary to server
 scp target/release/apas-server root@apas.mpaxos.com:/opt/apas/
 
+sleep 1
+
 # Restart server
 ssh root@apas.mpaxos.com "systemctl restart apas-server"
 
+sleep 1
+
 # For web updates
 rsync -av --exclude 'node_modules' --exclude '.next' packages/web/ root@apas.mpaxos.com:/opt/apas/web/
+
+# Restart apas-web (compute version locally since server lacks git history)
 month_start="$(date +%Y-%m-01) 00:00:00"
 web_version="$(date +%y.%m).$(git rev-list --count --since="$month_start" HEAD)"
 ssh root@apas.mpaxos.com "cd /opt/apas/web && npm install && NEXT_PUBLIC_WEB_UI_VERSION=${web_version} npm run build && systemctl restart apas-web"
