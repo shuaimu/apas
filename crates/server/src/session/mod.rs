@@ -239,6 +239,12 @@ impl SessionManager {
         self.daemon_senders.insert(machine_id, sender);
         self.daemon_users.insert(machine_id, user_id);
         self.machine_infos.insert(machine_id, machine);
+        tracing::info!(
+            "Daemon {} register: {} projects: {:?}",
+            machine_id,
+            projects.len(),
+            projects.iter().map(|p| (p.project_id.clone(), p.path.clone(), p.is_running)).collect::<Vec<_>>()
+        );
         self.machine_projects.insert(machine_id, projects);
         self.broadcast_machines_update_for_user(&user_id);
         tracing::info!("Daemon registered: {} (user: {})", machine_id, user_id);
@@ -261,12 +267,18 @@ impl SessionManager {
 
     pub fn update_daemon_projects(&self, machine_id: &Uuid, projects: Vec<MachineProjectInfo>) {
         let running_count = projects.iter().filter(|p| p.is_running).count();
-        if running_count > 0 {
-            tracing::debug!(
-                "Daemon {} heartbeat: {}/{} projects running",
+        // Log once when project count changes, not every heartbeat
+        let prev_count = self
+            .machine_projects
+            .get(machine_id)
+            .map(|p| p.len());
+        if prev_count != Some(projects.len()) {
+            tracing::info!(
+                "Daemon {} projects changed: {} projects ({} running). Paths: {:?}",
                 machine_id,
+                projects.len(),
                 running_count,
-                projects.len()
+                projects.iter().map(|p| (p.project_id.clone(), p.path.clone(), p.is_running)).collect::<Vec<_>>()
             );
         }
         self.machine_projects.insert(*machine_id, projects);

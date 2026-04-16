@@ -365,7 +365,19 @@ pub fn get_or_create_project(dir: &Path) -> Result<ProjectMetadata> {
     if apas_path.exists() {
         // Read existing metadata
         let content = std::fs::read_to_string(&apas_path)?;
-        let mut metadata: ProjectMetadata = serde_json::from_str(&content)?;
+        let mut metadata: ProjectMetadata = match serde_json::from_str(&content) {
+            Ok(m) => m,
+            Err(err) => {
+                tracing::warn!(
+                    "Corrupt .apas file {:?}: {}. Regenerating.",
+                    apas_path,
+                    err
+                );
+                // Fall through to recreate — remove the corrupt file and regenerate
+                let _ = std::fs::remove_file(&apas_path);
+                return get_or_create_project(dir);
+            }
+        };
         // Migrate legacy pane config if needed
         metadata.migrate_legacy();
         if let Err(err) = register_project(dir, &metadata) {
@@ -432,7 +444,9 @@ pub fn get_or_create_project(dir: &Path) -> Result<ProjectMetadata> {
 pub fn save_project(dir: &Path, metadata: &ProjectMetadata) -> Result<()> {
     let apas_path = dir.join(APAS_FILE);
     let content = serde_json::to_string_pretty(metadata)?;
-    std::fs::write(&apas_path, content)?;
+    let tmp_path = apas_path.with_extension("apas.tmp");
+    std::fs::write(&tmp_path, &content)?;
+    std::fs::rename(&tmp_path, &apas_path)?;
     if let Err(err) = register_project(dir, metadata) {
         tracing::warn!("Failed to register project in user registry: {}", err);
     }
