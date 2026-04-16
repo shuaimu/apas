@@ -3510,17 +3510,127 @@ async fn run_server_connection(
                                 Some(Ok(Message::Text(text))) => {
                                     if let Ok(server_msg) = serde_json::from_str::<ServerToCli>(&text) {
                                         match server_msg {
+                                            ServerToCli::SessionRejected { session_id: rejected_id, reason } => {
+                                                eprintln!(
+                                                    "\n[APAS] Server rejected session {}: {}\n",
+                                                    rejected_id, reason
+                                                );
+                                                tracing::error!(
+                                                    "Server rejected session {}: {}",
+                                                    rejected_id, reason
+                                                );
+                                                // Exit cleanly so systemd-run / the TUI surfaces the error.
+                                                std::process::exit(2);
+                                            }
                                             ServerToCli::Input { session_id: _, data, pane_id } => {
                                                 // Route to the correct pane (from_tui=false: web-originated)
                                                 let target_pane = pane_id.unwrap_or(shared::PANE_ID_INTERACTIVE);
-                                                let channels = input_channels.lock().unwrap();
-                                                if let Some(tx) = channels.get(&target_pane) {
-                                                    let _ = tx.send((data, false));
-                                                } else {
-                                                    // Fallback to interactive
-                                                    if let Some(tx) = channels.get(&shared::PANE_ID_INTERACTIVE) {
-                                                        let _ = tx.send((data, false));
+                                                let target_tx = {
+                                                    let channels = input_channels.lock().unwrap();
+                                                    channels.get(&target_pane).cloned()
+                                                };
+
+                                                if let Some(tx) = target_tx {
+                                                    if tx.send((data, false)).is_err() {
+                                                        tracing::warn!(
+                                                            pane_id = target_pane,
+                                                            "Input channel disconnected for pane"
+                                                        );
+                                                        let _ = status_tx.send(PaneOutput {
+                                                            text: "[Pane input channel disconnected. Restarting pane worker...]".to_string(),
+                                                            pane_id: target_pane,
+                                                        });
                                                     }
+                                                    continue;
+                                                }
+
+                                                // If web explicitly targeted a pane and it is missing, do not silently
+                                                // fallback to another pane. Surface the issue and try to recreate it.
+                                                if pane_id.is_some() {
+                                                    let pane_meta = {
+                                                        let metas = pane_metas.lock().unwrap();
+                                                        metas.get(&target_pane).cloned()
+                                                    };
+                                                    let pane_session_id = {
+                                                        let sessions = pane_sessions.lock().unwrap();
+                                                        sessions.get(&target_pane).copied()
+                                                    };
+
+                                                    if let (Some(meta), Some(claude_session_id)) =
+                                                        (pane_meta, pane_session_id)
+                                                    {
+                                                        tracing::warn!(
+                                                            pane_id = target_pane,
+                                                            "Missing input channel for pane; requesting pane worker recreation"
+                                                        );
+                                                        let _ = tui_event_tx.send(TuiEvent::AddTabWithConfig {
+                                                            pane_id: target_pane,
+                                                            label: meta.label,
+                                                            claude_session_id,
+                                                            mode: meta.mode,
+                                                            provider: meta.provider,
+                                                            prompt: meta.prompt,
+                                                            min_iteration_interval_minutes: meta
+                                                                .min_iteration_interval_minutes,
+                                                            model: meta.model,
+                                                        });
+                                                    } else {
+                                                        tracing::warn!(
+                                                            pane_id = target_pane,
+                                                            "Missing input channel for pane and no pane metadata found"
+                                                        );
+                                                    }
+
+                                                    let unavailable_status = format!(
+                                                        "[Pane {} is unavailable. Restarting pane worker; please resend your message.]",
+                                                        target_pane
+                                                    );
+                                                    let _ = status_tx.send(PaneOutput {
+                                                        text: unavailable_status.clone(),
+                                                        pane_id: target_pane,
+                                                    });
+                                                    let _ = status_tx.send(PaneOutput {
+                                                        text: unavailable_status.clone(),
+                                                        pane_id: shared::PANE_ID_DEADLOOP,
+                                                    });
+
+                                                    let pane_status_msg = CliToServer::PaneStatus {
+                                                        session_id,
+                                                        pane_type: shared::PaneType::Interactive,
+                                                        pane_id: Some(target_pane),
+                                                        status: Some(
+                                                            "Pane worker unavailable; restart requested. Please resend."
+                                                                .to_string(),
+                                                        ),
+                                                    };
+                                                    if let Ok(msg_text) =
+                                                        serde_json::to_string(&pane_status_msg)
+                                                    {
+                                                        let _ = ws_sender
+                                                            .send(Message::Text(msg_text.into()))
+                                                            .await;
+                                                    }
+                                                    continue;
+                                                }
+
+                                                // Legacy input without explicit pane id: best-effort fallback to
+                                                // interactive pane.
+                                                let fallback_tx = {
+                                                    let channels = input_channels.lock().unwrap();
+                                                    channels
+                                                        .get(&shared::PANE_ID_INTERACTIVE)
+                                                        .cloned()
+                                                };
+                                                if let Some(tx) = fallback_tx {
+                                                    if tx.send((data, false)).is_err() {
+                                                        tracing::warn!(
+                                                            "Fallback interactive pane input channel disconnected"
+                                                        );
+                                                    }
+                                                } else {
+                                                    tracing::warn!(
+                                                        "No interactive pane channel available for legacy input routing"
+                                                    );
                                                 }
                                             }
                                             ServerToCli::Heartbeat => {}

@@ -239,11 +239,12 @@ impl SessionManager {
         self.daemon_senders.insert(machine_id, sender);
         self.daemon_users.insert(machine_id, user_id);
         self.machine_infos.insert(machine_id, machine);
+        let running_count = projects.iter().filter(|p| p.is_running).count();
         tracing::info!(
-            "Daemon {} register: {} projects: {:?}",
+            "Daemon {} register: {} projects ({} running)",
             machine_id,
             projects.len(),
-            projects.iter().map(|p| (p.project_id.clone(), p.path.clone(), p.is_running)).collect::<Vec<_>>()
+            running_count,
         );
         self.machine_projects.insert(machine_id, projects);
         self.broadcast_machines_update_for_user(&user_id);
@@ -267,18 +268,20 @@ impl SessionManager {
 
     pub fn update_daemon_projects(&self, machine_id: &Uuid, projects: Vec<MachineProjectInfo>) {
         let running_count = projects.iter().filter(|p| p.is_running).count();
-        // Log once when project count changes, not every heartbeat
-        let prev_count = self
-            .machine_projects
-            .get(machine_id)
-            .map(|p| p.len());
-        if prev_count != Some(projects.len()) {
+        // Log when project count or running set changes (not every heartbeat)
+        let prev = self.machine_projects.get(machine_id).map(|p| {
+            (
+                p.len(),
+                p.iter().filter(|pp| pp.is_running).count(),
+            )
+        });
+        let current = (projects.len(), running_count);
+        if prev != Some(current) {
             tracing::info!(
-                "Daemon {} projects changed: {} projects ({} running). Paths: {:?}",
+                "Daemon {} project state: {} projects ({} running)",
                 machine_id,
                 projects.len(),
                 running_count,
-                projects.iter().map(|p| (p.project_id.clone(), p.path.clone(), p.is_running)).collect::<Vec<_>>()
             );
         }
         self.machine_projects.insert(*machine_id, projects);

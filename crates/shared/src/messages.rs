@@ -116,6 +116,11 @@ pub enum ServerToCli {
         min_version: String,
     },
 
+    /// Server refused to start the session (e.g. session_id already owned by
+    /// a different user — typically caused by a shared .apas file). The CLI
+    /// should surface the reason and exit.
+    SessionRejected { session_id: Uuid, reason: String },
+
     /// New session assigned to this CLI
     SessionAssigned {
         session_id: Uuid,

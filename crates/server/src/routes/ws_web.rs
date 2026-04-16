@@ -604,17 +604,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         "StartMachineProjectCli: user={} machine={} project={}",
                         uid, machine_id, project_id
                     );
-                    let user_machines = state.sessions.get_machines_for_user(&uid);
-                    tracing::info!(
-                        "User {} has {} machines: {:?}",
-                        uid,
-                        user_machines.len(),
-                        user_machines
-                            .iter()
-                            .map(|m| (m.machine.machine_id, m.machine.hostname.clone(), m.projects.len()))
-                            .collect::<Vec<_>>()
-                    );
-                    let allowed = user_machines
+                    let allowed = state
+                        .sessions
+                        .get_machines_for_user(&uid)
                         .into_iter()
                         .any(|m| {
                             m.machine.machine_id == machine_id

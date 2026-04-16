@@ -268,6 +268,45 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 pane_type: _,
                                 panes,
                             }) => {
+                                // Reject if this session_id is already owned by a different user
+                                // (typically caused by .apas files copied/shared between users).
+                                if let Ok(Some(existing)) =
+                                    state.db.get_session(&session_id.to_string()).await
+                                {
+                                    if existing.user_id != user_id.to_string() {
+                                        let owner_email = state
+                                            .db
+                                            .get_session_owner_info(&session_id.to_string())
+                                            .await
+                                            .ok()
+                                            .flatten()
+                                            .map(|(_, email)| email)
+                                            .unwrap_or_else(|| existing.user_id.clone());
+                                        let reason = format!(
+                                            "Session {} is already owned by another user ({}). \
+                                             This usually means the .apas file was copied from \
+                                             another user. Delete the .apas file in your project \
+                                             directory so a fresh one is generated.",
+                                            session_id, owner_email
+                                        );
+                                        tracing::warn!(
+                                            "Rejecting SessionStart from CLI {} (user {}): {}",
+                                            cli_id, user_id, reason
+                                        );
+                                        state
+                                            .sessions
+                                            .send_to_cli(
+                                                &cli_id,
+                                                ServerToCli::SessionRejected {
+                                                    session_id,
+                                                    reason,
+                                                },
+                                            )
+                                            .await;
+                                        continue;
+                                    }
+                                }
+
                                 // CLI is starting a local session (hybrid mode)
                                 state.sessions.create_cli_session(
                                     session_id,

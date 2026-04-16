@@ -305,6 +305,20 @@ async fn run_connection(
                         tracing::info!("Reboot command received, restarting...");
                         crate::update::restart_cli();
                     }
+                    Ok(ServerToCli::SessionRejected {
+                        session_id: rejected_id,
+                        reason,
+                    }) => {
+                        eprintln!(
+                            "\n[APAS] Server rejected session {}: {}\n",
+                            rejected_id, reason
+                        );
+                        tracing::error!(
+                            "Server rejected session {}: {}",
+                            rejected_id, reason
+                        );
+                        std::process::exit(2);
+                    }
                     Err(e) => {
                         tracing::warn!("Failed to parse server message: {}", e);
                     }
