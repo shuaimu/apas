@@ -85,6 +85,22 @@ function ProviderIcon({
       </svg>
     );
   }
+  if (provider === "opencode") {
+    // OpenCode logo — code brackets < />
+    return (
+      <svg className={className} viewBox="0 0 24 24" fill="currentColor" aria-label="OpenCode">
+        <path d="M8 3L2 12l6 9 2-1.5L5.5 12 10 4.5 8 3zm8 0l-2 1.5L18.5 12 14 19.5 16 21l6-9-6-9z" />
+      </svg>
+    );
+  }
+  if (provider === "cursor-agent") {
+    // Cursor logo — upward arrow/cursor silhouette
+    return (
+      <svg className={className} viewBox="0 0 24 24" fill="currentColor" aria-label="Cursor">
+        <path d="M3 2l9 20 3-8 8-3L3 2z" />
+      </svg>
+    );
+  }
   // Claude / Anthropic logo — starburst (from docs.anthropic.com)
   return (
     <svg className={className} viewBox="1 0 50 50" fill="currentColor" aria-label="Claude">
@@ -281,13 +297,29 @@ export function TabBar({
                 className={`relative inline-flex items-center justify-center flex-shrink-0 ${
                   tab.provider === "codex"
                     ? "text-green-500"
-                    : isMiniMax
-                      ? "text-cyan-500"
-                      : isGlm
-                        ? "text-emerald-500"
-                        : "text-blue-500"
+                    : tab.provider === "cursor-agent"
+                      ? "text-sky-500"
+                      : tab.provider === "opencode"
+                        ? "text-orange-500"
+                        : isMiniMax
+                          ? "text-cyan-500"
+                          : isGlm
+                            ? "text-emerald-500"
+                            : "text-blue-500"
                 }`}
-                title={tab.provider === "codex" ? "Codex" : isMiniMax ? "MiniMax" : isGlm ? "GLM" : "Claude"}
+                title={
+                  tab.provider === "codex"
+                    ? "Codex"
+                    : tab.provider === "cursor-agent"
+                      ? "Cursor"
+                      : tab.provider === "opencode"
+                        ? "OpenCode"
+                        : isMiniMax
+                          ? "MiniMax"
+                          : isGlm
+                            ? "GLM"
+                            : "Claude"
+                }
               >
                 <ProviderIcon provider={tab.provider} model={tab.model} label={tab.label} />
                 {hasActivity && !isPaused && (
@@ -467,6 +499,26 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
               <ProviderIcon provider="codex" className="w-4 h-4" />
             </span>
             Codex Tab
+          </button>
+          <div className="border-t border-gray-100 dark:border-gray-700 my-0.5" />
+          <button
+            onClick={() => { onAddTab("opencode"); setShowMenu(false); }}
+            className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
+          >
+            <span className="text-orange-500 flex-shrink-0">
+              <ProviderIcon provider="opencode" className="w-4 h-4" />
+            </span>
+            OpenCode Tab
+          </button>
+          <div className="border-t border-gray-100 dark:border-gray-700 my-0.5" />
+          <button
+            onClick={() => { onAddTab("cursor-agent"); setShowMenu(false); }}
+            className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
+          >
+            <span className="text-sky-500 flex-shrink-0">
+              <ProviderIcon provider="cursor-agent" className="w-4 h-4" />
+            </span>
+            Cursor Tab
           </button>
         </div>
       )}

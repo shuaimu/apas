@@ -644,6 +644,9 @@ pub enum Provider {
     Codex,
     Minimax,
     Glm,
+    Opencode,
+    #[serde(rename = "cursor-agent")]
+    CursorAgent,
 }
 
 /// Mode for a pane

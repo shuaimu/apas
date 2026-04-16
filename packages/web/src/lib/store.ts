@@ -54,7 +54,7 @@ export interface UsageLimits {
   fetchedAt?: string;
 }
 
-export type Provider = "claude" | "codex" | "minimax" | "glm";
+export type Provider = "claude" | "codex" | "minimax" | "glm" | "opencode" | "cursor-agent";
 
 export type UsageLimitsByProvider = Partial<Record<Provider, UsageLimits>>;
 
@@ -135,6 +135,8 @@ function normalizeProvider(raw: unknown): Provider | null {
     if (normalized === "claude" || normalized === "anthropic") return "claude";
     if (normalized === "codex" || normalized === "openai" || normalized === "chatgpt") return "codex";
     if (normalized === "glm" || normalized === "zai" || normalized === "z.ai" || normalized === "zhipu") return "glm";
+    if (normalized === "opencode") return "opencode";
+    if (normalized === "cursor-agent" || normalized === "cursor_agent" || normalized === "cursor") return "cursor-agent";
   }
   return null;
 }
@@ -1732,15 +1734,31 @@ function handleServerMessage(
         );
 
         if (isSubstantialContent) {
-          // Create assistant message with the substantial content
-          const assistantMessage: Message = {
-            id: generateId(),
-            role: "assistant",
-            content: resultContent,
-            timestamp: new Date(),
-            outputType: { type: "text" },
-          };
-          addMessageWithPaneRouting(set, get, assistantMessage, paneType, paneId);
+          // Only create an assistant message if the text wasn't already streamed
+          // via an earlier "assistant" event (Claude/Codex stream text blocks first,
+          // but MiniMax only puts the full response in the result field).
+          const normalizedPaneId = normalizePaneId(paneType, normalizeRawPaneId(paneId));
+          const existing = normalizedPaneId
+            ? (get().paneMessages[paneKey(normalizedPaneId)] || [])
+            : get().messages;
+          // Check recent messages (not just last — tool calls may interleave)
+          const recentSlice = existing.slice(-10);
+          const alreadyStreamed = recentSlice.some(
+            (m) => m.role === "assistant"
+              && m.outputType?.type === "text"
+              && m.content === resultContent
+          );
+
+          if (!alreadyStreamed) {
+            const assistantMessage: Message = {
+              id: generateId(),
+              role: "assistant",
+              content: resultContent,
+              timestamp: new Date(),
+              outputType: { type: "text" },
+            };
+            addMessageWithPaneRouting(set, get, assistantMessage, paneType, paneId);
+          }
         }
 
         // Always add a brief system message with metadata

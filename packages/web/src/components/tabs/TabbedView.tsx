@@ -289,7 +289,13 @@ export function TabbedView() {
   const handleAddTab = useCallback((provider: string = "claude", model?: string) => {
     const isMiniMax = provider === "minimax" || (provider === "claude" && isMiniMaxModel(model));
     const isGlm = provider === "glm" || (provider === "claude" && isGlmModel(model));
-    const prefix = provider === "codex" ? "Codex" : isMiniMax ? "MiniMax" : isGlm ? "GLM" : "Claude";
+    const prefix = provider === "codex"
+      ? "Codex"
+      : provider === "cursor-agent"
+        ? "Cursor"
+        : provider === "opencode"
+          ? "OpenCode"
+          : isMiniMax ? "MiniMax" : isGlm ? "GLM" : "Claude";
     const label = `${prefix} ${effectiveTabs.length + 1}`;
     const result = addPane(provider, "interactive", label, undefined, model);
     if (result.success) {

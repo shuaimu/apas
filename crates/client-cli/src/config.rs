@@ -26,6 +26,10 @@ pub struct LocalConfig {
     pub minimax_path: String,
     #[serde(default = "default_codex_path")]
     pub codex_path: String,
+    #[serde(default = "default_opencode_path")]
+    pub opencode_path: String,
+    #[serde(default = "default_cursor_agent_path")]
+    pub cursor_agent_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minimax_api_base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,12 +56,22 @@ fn default_codex_path() -> String {
     "codex".to_string()
 }
 
+fn default_opencode_path() -> String {
+    "opencode".to_string()
+}
+
+fn default_cursor_agent_path() -> String {
+    "cursor-agent".to_string()
+}
+
 impl Default for LocalConfig {
     fn default() -> Self {
         Self {
             claude_path: "claude".to_string(),
             minimax_path: default_minimax_path(),
             codex_path: default_codex_path(),
+            opencode_path: default_opencode_path(),
+            cursor_agent_path: default_cursor_agent_path(),
             minimax_api_base_url: None,
             minimax_api_key: None,
             glm_api_base_url: None,

@@ -245,6 +245,33 @@ function parseRawStreamMessage(content: string): { msgType: string; summary: str
   return null;
 }
 
+/** Detect pipe-table blocks that lack a header separator and inject one so remark-gfm renders them. */
+function fixHeaderlessTables(text: string): string {
+  const lines = text.split("\n");
+  const out: string[] = [];
+  const isTableRow = (l: string) => /^\|.*\|.*\|/.test(l.trim());
+  const isSeparator = (l: string) => /^\|[\s:]*-+[\s:]*/.test(l.trim());
+
+  let i = 0;
+  while (i < lines.length) {
+    if (isTableRow(lines[i]) && !(i + 1 < lines.length && isSeparator(lines[i + 1]))) {
+      // Start of a headerless table block — collect all consecutive rows
+      const blockStart = i;
+      while (i < lines.length && isTableRow(lines[i])) i++;
+      const firstRow = lines[blockStart];
+      const cols = firstRow.trim().replace(/^\||\|$/g, "").split("|").length;
+      const separator = "|" + " --- |".repeat(cols);
+      out.push(firstRow);
+      out.push(separator);
+      for (let j = blockStart + 1; j < i; j++) out.push(lines[j]);
+    } else {
+      out.push(lines[i]);
+      i++;
+    }
+  }
+  return out.join("\n");
+}
+
 function TextContent({ content }: { content: string }) {
   const foldableItemEvent = parseFoldableItemEventPreview(content);
 
@@ -284,6 +311,8 @@ function TextContent({ content }: { content: string }) {
       </div>
     );
   }
+
+  const processed = fixHeaderlessTables(content);
 
   return (
     <div className="bg-gray-100 dark:bg-gray-800 rounded-2xl rounded-tl-sm px-3 sm:px-4 py-2 prose dark:prose-invert prose-sm sm:prose-base max-w-full overflow-x-auto">
@@ -351,7 +380,7 @@ function TextContent({ content }: { content: string }) {
           },
         }}
       >
-        {content}
+        {processed}
       </ReactMarkdown>
     </div>
   );

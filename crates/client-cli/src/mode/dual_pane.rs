@@ -115,10 +115,14 @@ fn resolve_pane_binary_path(
     claude_path: &str,
     _minimax_path: &str,
     codex_path: &str,
+    opencode_path: &str,
+    cursor_agent_path: &str,
 ) -> String {
     match provider {
         Provider::Claude | Provider::Minimax | Provider::Glm => claude_path.to_string(),
         Provider::Codex => codex_path.to_string(),
+        Provider::Opencode => opencode_path.to_string(),
+        Provider::CursorAgent => cursor_agent_path.to_string(),
     }
 }
 
@@ -130,6 +134,8 @@ fn provider_display_name(provider: &Provider, model: Option<&str>) -> &'static s
         Provider::Codex => "Codex",
         Provider::Minimax => "MiniMax",
         Provider::Glm => "GLM",
+        Provider::Opencode => "OpenCode",
+        Provider::CursorAgent => "Cursor",
     }
 }
 
@@ -140,6 +146,8 @@ fn provider_config_key(provider: &Provider, model: Option<&str>) -> &'static str
         Provider::Codex => "codex_path",
         Provider::Minimax => "claude_path",
         Provider::Glm => "claude_path",
+        Provider::Opencode => "opencode_path",
+        Provider::CursorAgent => "cursor_agent_path",
     }
 }
 
@@ -321,6 +329,8 @@ async fn run_inner(
     // Legacy compatibility only: MiniMax now uses claude_path + backend env config.
     let minimax_path = resolve_binary_path(&config.local.minimax_path);
     let codex_path = resolve_binary_path(&config.local.codex_path);
+    let opencode_path = resolve_binary_path(&config.local.opencode_path);
+    let cursor_agent_path = resolve_binary_path(&config.local.cursor_agent_path);
 
     // Load or create project metadata
     let mut metadata = get_or_create_project(working_dir)?;
@@ -629,6 +639,8 @@ async fn run_inner(
             &claude_path,
             &minimax_path,
             &codex_path,
+            &opencode_path,
+            &cursor_agent_path,
         );
         pane_threads.push(thread::spawn(move || {
             run_deadloop_session(
@@ -664,6 +676,8 @@ async fn run_inner(
             &claude_path,
             &minimax_path,
             &codex_path,
+            &opencode_path,
+            &cursor_agent_path,
         );
         pane_threads.push(thread::spawn(move || {
             run_pane_session(
@@ -694,6 +708,8 @@ async fn run_inner(
         let claude_path_event = claude_path.clone();
         let minimax_path_event = minimax_path.clone();
         let codex_path_event = codex_path.clone();
+        let opencode_path_event = opencode_path.clone();
+        let cursor_agent_path_event = cursor_agent_path.clone();
         let pane_sessions_event = pane_sessions.clone();
         let pane_pauses_event = pane_pauses.clone();
         let pane_stop_requests_event = pane_stop_requests.clone();
@@ -712,6 +728,8 @@ async fn run_inner(
                 &claude_path_event,
                 &minimax_path_event,
                 &codex_path_event,
+                &opencode_path_event,
+                &cursor_agent_path_event,
                 &working_dir_event,
                 command_tx,
                 pane_sessions_event,
@@ -892,6 +910,8 @@ fn handle_tui_events(
     claude_path: &str,
     minimax_path: &str,
     codex_path: &str,
+    opencode_path: &str,
+    cursor_agent_path: &str,
     working_dir: &str,
     command_tx: mpsc::Sender<TuiCommand>,
     pane_sessions: Arc<Mutex<HashMap<u32, Uuid>>>,
@@ -963,6 +983,8 @@ fn handle_tui_events(
                         claude_path,
                         minimax_path,
                         codex_path,
+                        opencode_path,
+                        cursor_agent_path,
                     );
                     let working_dir = working_dir.to_string();
                     thread::spawn(move || {
@@ -1046,6 +1068,8 @@ fn handle_tui_events(
                     claude_path,
                     minimax_path,
                     codex_path,
+                    opencode_path,
+                    cursor_agent_path,
                 );
 
                 // Notify TUI to add the tab visually
@@ -1343,6 +1367,8 @@ fn handle_tui_events(
                     claude_path,
                     minimax_path,
                     codex_path,
+                    opencode_path,
+                    cursor_agent_path,
                 );
                 {
                     let output_tx = output_tx.clone();
@@ -1643,6 +1669,8 @@ fn handle_tui_events(
                     claude_path,
                     minimax_path,
                     codex_path,
+                    opencode_path,
+                    cursor_agent_path,
                 );
                 {
                     let output_tx = output_tx.clone();
@@ -1798,6 +1826,8 @@ fn active_usage_providers(pane_metas: &PaneMetas) -> (bool, bool, bool, bool) {
             Provider::Codex => has_codex = true,
             Provider::Minimax => has_minimax = true,
             Provider::Glm => has_glm = true,
+            Provider::Opencode => {}
+            Provider::CursorAgent => {}
         }
         if has_claude && has_codex && has_minimax && has_glm {
             break;
@@ -1909,11 +1939,71 @@ fn build_agent_args(
                 (args, true)
             }
         }
+        Provider::CursorAgent => {
+            // cursor-agent uses: cursor-agent --print --output-format stream-json --force [--model m] [--continue] <prompt>
+            let mut base = vec![
+                "--print".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--force".to_string(),
+            ];
+            if let Some(model) = model {
+                let trimmed = model.trim();
+                if !trimmed.is_empty() {
+                    base.extend_from_slice(&["--model".to_string(), trimmed.to_string()]);
+                }
+            }
+            if first_message && try_resume {
+                // We don't track cursor's internal chatId; fall back to --continue
+                base.push("--continue".to_string());
+                base.push(prompt.to_string());
+                (base, true)
+            } else if first_message {
+                base.push(prompt.to_string());
+                (base, false)
+            } else {
+                base.push("--continue".to_string());
+                base.push(prompt.to_string());
+                (base, true)
+            }
+        }
+        Provider::Opencode => {
+            // OpenCode uses: opencode run --format json [-m model] [-c -s session_id] -- <prompt>
+            let mut base = vec!["run".to_string(), "--format".to_string(), "json".to_string()];
+            if let Some(model) = model {
+                let trimmed = model.trim();
+                if !trimmed.is_empty() {
+                    base.extend_from_slice(&["-m".to_string(), trimmed.to_string()]);
+                }
+            }
+            if first_message && try_resume {
+                base.extend_from_slice(&[
+                    "-c".to_string(),
+                    "-s".to_string(),
+                    session_id.to_string(),
+                    "--".to_string(),
+                    prompt.to_string(),
+                ]);
+                (base, true)
+            } else if first_message {
+                base.extend_from_slice(&["--".to_string(), prompt.to_string()]);
+                (base, false)
+            } else {
+                // Subsequent messages — always resume
+                base.extend_from_slice(&[
+                    "-c".to_string(),
+                    "-s".to_string(),
+                    session_id.to_string(),
+                    "--".to_string(),
+                    prompt.to_string(),
+                ]);
+                (base, true)
+            }
+        }
     }
 }
 
 /// Parse a line of output and convert to ClaudeStreamMessage based on provider.
-/// For Claude, parses as ClaudeStreamMessage directly.
 /// For Codex, parses as CodexStreamMessage and converts.
 fn parse_agent_output(
     provider: &Provider,
@@ -1928,6 +2018,14 @@ fn parse_agent_output(
             Ok(codex_msg) => shared::convert_codex_to_claude(&codex_msg, session_id_str),
             Err(_) => None,
         },
+        Provider::Opencode => {
+            // OpenCode --format json outputs JSON lines; try parsing as ClaudeStreamMessage
+            serde_json::from_str::<ClaudeStreamMessage>(line).ok()
+        }
+        Provider::CursorAgent => {
+            // cursor-agent --output-format stream-json emits Claude-compatible events
+            serde_json::from_str::<ClaudeStreamMessage>(line).ok()
+        }
     }
 }
 
@@ -2033,6 +2131,8 @@ mod tests {
             "claude",
             "claude2",
             "codex",
+            "opencode",
+            "cursor-agent",
         );
         assert_eq!(path, "claude");
     }
@@ -2040,7 +2140,7 @@ mod tests {
     #[test]
     fn resolve_pane_binary_path_uses_claude_for_m2_alias_model() {
         let path =
-            resolve_pane_binary_path(Provider::Claude, Some("m2.7"), "claude", "claude2", "codex");
+            resolve_pane_binary_path(Provider::Claude, Some("m2.7"), "claude", "claude2", "codex", "opencode", "cursor-agent");
         assert_eq!(path, "claude");
     }
 
@@ -2052,6 +2152,8 @@ mod tests {
             "claude",
             "claude2",
             "codex",
+            "opencode",
+            "cursor-agent",
         );
         assert_eq!(path, "claude");
     }
@@ -2064,6 +2166,8 @@ mod tests {
             "/opt/bin/claude",
             "claude2",
             "codex",
+            "opencode",
+            "cursor-agent",
         );
         assert_eq!(path, "/opt/bin/claude");
     }
