@@ -373,7 +373,7 @@ function TextContent({ content }: { content: string }) {
           },
           tr({ children }) {
             return (
-              <tr className="even:bg-gray-50 dark:even:bg-gray-750">
+              <tr className="even:bg-gray-50 dark:even:bg-gray-800">
                 {children}
               </tr>
             );
