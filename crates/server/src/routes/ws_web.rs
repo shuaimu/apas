@@ -1391,19 +1391,64 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .as_ref()
                             .map(|p| shared::PaneConfig::pane_id_from_legacy(p))
                     });
-                    match state
-                        .storage
-                        .get_messages_paginated_by_pane_id(
-                            &sid,
-                            Some(limit),
-                            before_id.as_deref(),
-                            effective_pane_filter,
-                        )
-                        .await
+                    // Initial loads (no filter, no before_id) should return `limit` messages
+                    // PER pane so every tab has history. Filtered/paginated fetches still use
+                    // the linear paginator so they behave predictably.
+                    let is_initial_load =
+                        before_id.is_none() && effective_pane_filter.is_none();
+                    let fetch_result = if is_initial_load {
+                        state.storage.get_messages_per_pane(&sid, limit).await
+                    } else {
+                        state
+                            .storage
+                            .get_messages_paginated_by_pane_id(
+                                &sid,
+                                Some(limit),
+                                before_id.as_deref(),
+                                effective_pane_filter,
+                            )
+                            .await
+                    };
+                    match fetch_result
                     {
                         Ok((stored_messages, has_more)) => {
                             let messages: Vec<MessageInfo> =
                                 stored_messages.into_iter().map(to_message_info).collect();
+
+                            if is_initial_load {
+                                let mut panes_to_send = state.sessions.get_session_panes(&sid);
+                                if panes_to_send.is_empty() {
+                                    if let Ok(stored_panes) = state.storage.load_pane_list(&sid).await {
+                                        if !stored_panes.is_empty() {
+                                            state
+                                                .sessions
+                                                .set_session_panes(&sid, stored_panes.clone());
+                                            panes_to_send = stored_panes;
+                                        }
+                                    }
+                                }
+                                if panes_to_send.is_empty() {
+                                    panes_to_send = infer_panes_from_messages(sid, &messages);
+                                    if !panes_to_send.is_empty() {
+                                        state
+                                            .sessions
+                                            .set_session_panes(&sid, panes_to_send.clone());
+                                    }
+                                }
+                                if !panes_to_send.is_empty() {
+                                    state
+                                        .sessions
+                                        .send_to_web(
+                                            &connection_id,
+                                            ServerToWeb::PaneList {
+                                                session_id: sid,
+                                                panes: panes_to_send,
+                                            },
+                                        )
+                                        .await;
+                                }
+                            }
+
                             state
                                 .sessions
                                 .send_to_web(
