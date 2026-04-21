@@ -618,6 +618,11 @@ pub struct MachineProjectInfo {
     pub is_running: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    /// Resident set size of the headless CLI process, in KiB. Reported by the
+    /// daemon from /proc/<pid>/status so the UI can spot runaway memory usage
+    /// before the kernel does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_kb: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }

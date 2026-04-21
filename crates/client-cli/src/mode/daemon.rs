@@ -174,6 +174,21 @@ fn is_headless_running_for(project_path: &Path) -> bool {
     headless_pid_for(project_path).is_some()
 }
 
+/// Read resident-set size (VmRSS) of a running process from /proc/<pid>/status,
+/// returned in KiB. Returns None if the process is gone or /proc is unreadable.
+fn read_process_rss_kb(pid: u32) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            // "VmRSS:     12345 kB"
+            let trimmed = rest.trim();
+            let numeric = trimmed.split_whitespace().next()?;
+            return numeric.parse::<u64>().ok();
+        }
+    }
+    None
+}
+
 /// Quote a string for safe use inside a single-quoted sh -c argument.
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -336,12 +351,14 @@ impl DaemonState {
 
         for (project_id, project) in &self.projects {
             let pid = headless_pid_for(&project.path);
+            let memory_kb = pid.and_then(read_process_rss_kb);
             projects.push(MachineProjectInfo {
                 project_id: project_id.clone(),
                 name: project.name.clone(),
                 path: project.path.to_string_lossy().to_string(),
                 is_running: pid.is_some(),
                 pid,
+                memory_kb,
                 last_error: project.last_error.clone(),
             });
         }

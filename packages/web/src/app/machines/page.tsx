@@ -10,6 +10,17 @@ import { AllProvidersUsage } from "@/components/UsageLimits";
 const MINIMAX_API_BASE_URL = "https://api.minimax.io/anthropic";
 const GLM_API_BASE_URL = "https://api.z.ai/api/anthropic";
 
+function formatMemory(memoryKb?: number): string {
+  if (memoryKb == null) return "";
+  if (memoryKb >= 1024 * 1024) {
+    return ` · ${(memoryKb / (1024 * 1024)).toFixed(1)} GiB`;
+  }
+  if (memoryKb >= 1024) {
+    return ` · ${Math.round(memoryKb / 1024)} MiB`;
+  }
+  return ` · ${memoryKb} KiB`;
+}
+
 export default function MachinesPage() {
   const router = useRouter();
   const {
@@ -260,7 +271,9 @@ export default function MachinesPage() {
                           : "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300"
                       }`}
                     >
-                      {project.isRunning ? `Running${project.pid ? ` (pid ${project.pid})` : ""}` : "Stopped"}
+                      {project.isRunning
+                        ? `Running${project.pid ? ` (pid ${project.pid})` : ""}${formatMemory(project.memoryKb)}`
+                        : "Stopped"}
                     </span>
                     {project.isRunning ? (
                       <button
