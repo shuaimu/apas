@@ -174,8 +174,8 @@ fn is_headless_running_for(project_path: &Path) -> bool {
     headless_pid_for(project_path).is_some()
 }
 
-fn tmux_session_name(project_id: &str) -> String {
-    let sanitized: String = project_id
+fn sanitize_for_unit(project_id: &str) -> String {
+    project_id
         .chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
@@ -184,13 +184,29 @@ fn tmux_session_name(project_id: &str) -> String {
                 '_'
             }
         })
-        .collect();
-    format!("{}_{}", TMUX_SESSION_PREFIX, sanitized)
+        .collect()
 }
 
-fn tmux_has_session(session_name: &str) -> bool {
+fn tmux_session_name(project_id: &str) -> String {
+    format!("{}_{}", TMUX_SESSION_PREFIX, sanitize_for_unit(project_id))
+}
+
+/// Per-project tmux socket name. We give each project its own tmux server so
+/// one project's processes can live in their own systemd scope independent of
+/// the daemon and of other projects.
+fn tmux_socket_name(project_id: &str) -> String {
+    format!("apas-{}", sanitize_for_unit(project_id))
+}
+
+fn tmux_has_session(project_id: &str, session_name: &str) -> bool {
     Command::new("tmux")
-        .args(["has-session", "-t", session_name])
+        .args([
+            "-L",
+            &tmux_socket_name(project_id),
+            "has-session",
+            "-t",
+            session_name,
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -199,13 +215,19 @@ fn tmux_has_session(session_name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn tmux_kill_session(session_name: &str) -> Result<()> {
-    if !tmux_has_session(session_name) {
+fn tmux_kill_session(project_id: &str, session_name: &str) -> Result<()> {
+    if !tmux_has_session(project_id, session_name) {
         return Ok(());
     }
 
     let output = Command::new("tmux")
-        .args(["kill-session", "-t", session_name])
+        .args([
+            "-L",
+            &tmux_socket_name(project_id),
+            "kill-session",
+            "-t",
+            session_name,
+        ])
         .output()?;
     if output.status.success() {
         return Ok(());
@@ -291,7 +313,7 @@ impl DaemonState {
             .sessions
             .iter()
             .filter_map(|(project_id, session_name)| {
-                if tmux_has_session(session_name) {
+                if tmux_has_session(project_id, session_name) {
                     None
                 } else {
                     Some(project_id.clone())
@@ -330,7 +352,7 @@ impl DaemonState {
         if self
             .sessions
             .get(project_id)
-            .map(|session_name| tmux_has_session(session_name))
+            .map(|session_name| tmux_has_session(project_id, session_name))
             .unwrap_or(false)
         {
             return Ok(());
@@ -347,7 +369,7 @@ impl DaemonState {
         // Check if an external process (e.g. manually started via systemd-run,
         // or surviving from a previous daemon) is already running for this project.
         if is_headless_running_for(&project.path) {
-            if tmux_has_session(&session_name) {
+            if tmux_has_session(project_id, &session_name) {
                 self.sessions
                     .insert(project_id.to_string(), session_name.clone());
             }
@@ -361,8 +383,8 @@ impl DaemonState {
         // Prefer a real on-disk installed binary, never /proc/self/exe.
         let executable = crate::update::resolve_preferred_apas_executable();
         let child_path = launch_path();
-        if tmux_has_session(&session_name) {
-            tmux_kill_session(&session_name)?;
+        if tmux_has_session(project_id, &session_name) {
+            tmux_kill_session(project_id, &session_name)?;
         }
 
         // Run tmux inside its own systemd user scope when available, so that
@@ -375,6 +397,7 @@ impl DaemonState {
                 .iter()
                 .any(|p| std::path::Path::new(p).exists());
         let tmux_program = if use_systemd_run { "systemd-run" } else { "tmux" };
+        let socket_name = tmux_socket_name(project_id);
         let mut cmd = Command::new(tmux_program);
         if use_systemd_run {
             cmd.arg("--user")
@@ -382,10 +405,15 @@ impl DaemonState {
                 .arg("--quiet")
                 .arg("--collect")
                 .arg("--slice=apas-tmux.slice")
-                .arg(format!("--unit=apas-tmux-{}.scope", project_id))
+                .arg(format!("--unit=apas-tmux-{}.scope", sanitize_for_unit(project_id)))
                 .arg("tmux");
         }
-        cmd.arg("new-session")
+        // Per-project socket forces a fresh tmux server (rather than reusing the
+        // user's default tmux server), so this server process is captured by
+        // the systemd scope and survives independently.
+        cmd.arg("-L")
+            .arg(&socket_name)
+            .arg("new-session")
             .arg("-d")
             .arg("-s")
             .arg(&session_name)
@@ -444,7 +472,7 @@ impl DaemonState {
             .sessions
             .remove(project_id)
             .unwrap_or_else(|| tmux_session_name(project_id));
-        tmux_kill_session(&session_name)?;
+        tmux_kill_session(project_id, &session_name)?;
 
         if let Some(project) = self.projects.get(project_id) {
             for pid in headless_pids_for(&project.path) {
