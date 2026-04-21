@@ -150,14 +150,21 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Auto-upgrade on boot if a new version is available
-    // Skip for subcommands like update, login, etc.
-    if cli.command.is_none() {
+    // Auto-upgrade on boot if a new version is available.
+    // Skip for subcommands (login, update, etc.) and for --headless:
+    // headless processes are spawned by the daemon, often several at once,
+    // and each one running cargo build in parallel has triggered OOM-kills.
+    // The daemon itself is responsible for keeping the binary current.
+    if cli.command.is_none() && !cli.headless {
         update::check_and_upgrade_on_boot();
     }
 
     // Auto-start daemon for interactive/remote CLI modes (best-effort).
-    if cli.command.is_none() && !cli.offline {
+    // Explicitly skip for --headless: a headless CLI is already a descendant
+    // of the daemon that spawned it, so ensure_daemon_running would just
+    // tear down the live daemon and spawn a replacement, kicking off a
+    // thrash loop.
+    if cli.command.is_none() && !cli.offline && !cli.headless {
         if let Err(err) = maybe_auto_start_daemon(&cli) {
             tracing::warn!("Failed to auto-start daemon: {}", err);
         }
