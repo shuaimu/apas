@@ -23,10 +23,6 @@ const DEFAULT_SERVER: &str = "ws://apas.mpaxos.com:8080";
 // Web UI URL for users to view sessions
 const WEB_UI_URL: &str = "http://apas.mpaxos.com";
 const CURRENT_VERSION: &str = env!("APAS_VERSION");
-#[cfg(target_os = "linux")]
-const DAEMON_SYSTEMD_UNIT: &str = "apas-daemon";
-#[cfg(target_os = "linux")]
-const DAEMON_SYSTEMD_SERVICE: &str = "apas-daemon.service";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DaemonStateFile {
@@ -425,20 +421,15 @@ fn ensure_daemon_running(server: &str, roots: &[String], target_version: &str) -
         }
     }
 
-    if let Some(pid) = start_daemon_with_systemd(server, roots)? {
-        let state = DaemonStateFile {
-            pid,
-            version: target_version.to_string(),
-        };
-        write_daemon_state(&state_path, &state)?;
-        let _ = fs::write(legacy_pid_path, pid.to_string());
-        return Ok(());
-    }
-
     let mut cmd = Command::new(resolve_apas_executable());
     cmd.arg("--server").arg(server).arg("daemon");
     for root in roots {
         cmd.arg("--root").arg(root);
+    }
+    // Preserve the launching shell's PATH so the daemon and its headless
+    // children can find claude/codex installed via nvm etc.
+    if let Ok(path) = std::env::var("PATH") {
+        cmd.env("PATH", path);
     }
     let log_path = state_path.with_file_name("daemon.log");
     let log_file = fs::OpenOptions::new()
@@ -450,14 +441,19 @@ fn ensure_daemon_running(server: &str, roots: &[String], target_version: &str) -
         .stdout(Stdio::null())
         .stderr(Stdio::from(log_file));
 
-    // Detach daemon into its own session so it survives parent exit
-    // without becoming a zombie.
+    // Detach the daemon fully from this process so it survives our exit and
+    // logout: new session (setsid) + new process group. Without this, the
+    // daemon's lifetime gets tied to our session's cgroup/pgrp.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         unsafe {
             cmd.pre_exec(|| {
-                libc::setsid();
+                // New session: detach from controlling terminal and
+                // escape the parent's process group.
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
         }
@@ -521,21 +517,10 @@ fn detect_running_daemon(state_path: &Path, legacy_pid_path: &Path) -> Option<Ru
         });
     }
     let _ = fs::remove_file(legacy_pid_path);
-
-    #[cfg(target_os = "linux")]
-    if let Some(pid) = daemon_systemd_main_pid() {
-        if is_apas_daemon_process(pid) {
-            let version = read_daemon_state(state_path).map(|state| state.version);
-            return Some(RunningDaemon { pid, version });
-        }
-    }
-
     None
 }
 
 fn stop_daemon_process(pid: u32) -> Result<()> {
-    stop_daemon_systemd_service();
-
     if !is_apas_daemon_process(pid) {
         return Ok(());
     }
@@ -563,111 +548,6 @@ fn stop_daemon_process(pid: u32) -> Result<()> {
 
 fn resolve_apas_executable() -> PathBuf {
     update::resolve_preferred_apas_executable()
-}
-
-fn start_daemon_with_systemd(server: &str, roots: &[String]) -> Result<Option<u32>> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (server, roots);
-        Ok(None)
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let executable = resolve_apas_executable();
-        let mut cmd = Command::new("systemd-run");
-        cmd.arg("--user")
-            .arg("--unit")
-            .arg(DAEMON_SYSTEMD_UNIT)
-            .arg("--collect")
-            .arg("--quiet")
-            .arg("--property=Restart=on-failure")
-            .arg("--property=RestartSec=2s")
-            .arg("--same-dir");
-        // Pass the launching shell's PATH so the daemon (and its headless
-        // children) can find claude/codex binaries installed via nvm etc.
-        if let Ok(path) = std::env::var("PATH") {
-            cmd.arg(format!("--setenv=PATH={}", path));
-        }
-        cmd.arg("--")
-            .arg(executable)
-            .arg("--server")
-            .arg(server)
-            .arg("daemon");
-        for root in roots {
-            cmd.arg("--root").arg(root);
-        }
-
-        let status = match cmd.status() {
-            Ok(status) => status,
-            Err(err) => {
-                // systemd-run may be unavailable (e.g. non-systemd runtime); fall back.
-                tracing::debug!("systemd-run unavailable for daemon launch: {}", err);
-                return Ok(None);
-            }
-        };
-
-        if !status.success() {
-            // Failed to launch with systemd-run. Use detached spawn fallback.
-            tracing::debug!(
-                "systemd-run failed for daemon launch with status {}",
-                status
-            );
-            return Ok(None);
-        }
-
-        for _ in 0..100 {
-            if let Some(pid) = daemon_systemd_main_pid() {
-                if is_apas_daemon_process(pid) {
-                    return Ok(Some(pid));
-                }
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-
-        anyhow::bail!(
-            "systemd-run started {}, but MainPID was not reported in time",
-            DAEMON_SYSTEMD_SERVICE
-        )
-    }
-}
-
-fn stop_daemon_systemd_service() {
-    #[cfg(target_os = "linux")]
-    {
-        let _ = Command::new("systemctl")
-            .args(["--user", "stop", DAEMON_SYSTEMD_SERVICE])
-            .status();
-        let _ = Command::new("systemctl")
-            .args(["--user", "reset-failed", DAEMON_SYSTEMD_SERVICE])
-            .status();
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn daemon_systemd_main_pid() -> Option<u32> {
-    let output = Command::new("systemctl")
-        .args([
-            "--user",
-            "show",
-            DAEMON_SYSTEMD_SERVICE,
-            "--property",
-            "MainPID",
-            "--value",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout);
-    let pid = text.trim().parse::<u32>().ok()?;
-    if pid == 0 {
-        None
-    } else {
-        Some(pid)
-    }
 }
 
 fn read_daemon_state(path: &Path) -> Option<DaemonStateFile> {

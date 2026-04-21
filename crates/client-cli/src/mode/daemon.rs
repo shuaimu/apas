@@ -387,30 +387,12 @@ impl DaemonState {
             tmux_kill_session(project_id, &session_name)?;
         }
 
-        // Run tmux inside its own systemd user scope when available, so that
-        // the tmux server (and the headless CLI it hosts) lives in a cgroup
-        // independent of this daemon. That way killing the daemon or its
-        // systemd unit does not tear down the tmux sessions.
-        let use_systemd_run = std::env::var("XDG_RUNTIME_DIR").is_ok()
-            && std::path::Path::new("/run/systemd/system").exists()
-            && ["/usr/bin/systemd-run", "/bin/systemd-run"]
-                .iter()
-                .any(|p| std::path::Path::new(p).exists());
-        let tmux_program = if use_systemd_run { "systemd-run" } else { "tmux" };
+        // Per-project socket so each project gets its own tmux server, and
+        // one project's tmux dying doesn't affect others. tmux itself
+        // double-forks and the server reparents to PID 1 on detach, so it
+        // survives the daemon exiting and our login session ending.
         let socket_name = tmux_socket_name(project_id);
-        let mut cmd = Command::new(tmux_program);
-        if use_systemd_run {
-            cmd.arg("--user")
-                .arg("--scope")
-                .arg("--quiet")
-                .arg("--collect")
-                .arg("--slice=apas-tmux.slice")
-                .arg(format!("--unit=apas-tmux-{}.scope", sanitize_for_unit(project_id)))
-                .arg("tmux");
-        }
-        // Per-project socket forces a fresh tmux server (rather than reusing the
-        // user's default tmux server), so this server process is captured by
-        // the systemd scope and survives independently.
+        let mut cmd = Command::new("tmux");
         cmd.arg("-L")
             .arg(&socket_name)
             .arg("new-session")
