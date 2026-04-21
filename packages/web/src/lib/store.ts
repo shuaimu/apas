@@ -1189,12 +1189,19 @@ function handleServerMessage(
       get().listMachines();
       get().listSessions();
       get().startAutoRefresh();
-      const savedSessionId = localStorage.getItem("apas_session_id");
-      if (savedSessionId) {
-        console.log("Restoring session:", savedSessionId);
-        setTimeout(() => {
-          get().attachSession(savedSessionId, true);
-        }, 500);
+      {
+        // Prefer the in-memory sessionId (what this tab is currently viewing)
+        // over localStorage — otherwise a reconnect could hijack this tab to a
+        // session another browser tab wrote to localStorage.
+        const currentSessionId = get().sessionId;
+        const sessionToRestore =
+          currentSessionId || localStorage.getItem("apas_session_id");
+        if (sessionToRestore) {
+          console.log("Restoring session:", sessionToRestore);
+          setTimeout(() => {
+            get().attachSession(sessionToRestore, true);
+          }, 500);
+        }
       }
       break;
 
@@ -1339,10 +1346,26 @@ function handleServerMessage(
       break;
     }
 
-    case "session_started":
-      set({ sessionId: data.session_id as string });
-      console.log("Session started:", data.session_id);
+    case "session_started": {
+      const newSessionId = data.session_id as string;
+      const existing = get().sessionId;
+      // Only adopt the session if we don't already have one — otherwise this
+      // is a stale response for a previous attach the user has since navigated
+      // away from.
+      if (!existing || existing === newSessionId) {
+        set({ sessionId: newSessionId });
+        console.log("Session started:", newSessionId);
+      } else {
+        console.log(
+          "Ignoring stale session_started for",
+          newSessionId,
+          "(currently on",
+          existing,
+          ")",
+        );
+      }
       break;
+    }
 
     case "session_status":
       console.log("Session status:", data.status);
@@ -1376,6 +1399,12 @@ function handleServerMessage(
     }
 
     case "pane_list": {
+      // Drop pane_list events for sessions we're not currently viewing.
+      const msgSid = data.session_id as string | undefined;
+      const curSid = get().sessionId;
+      if (msgSid && curSid && msgSid !== curSid) {
+        break;
+      }
       const panes = ((data.panes as PaneConfig[]) || []).map((pane) => ({
         ...pane,
         provider: normalizeProvider(pane.provider) ?? "claude",
@@ -1466,6 +1495,15 @@ function handleServerMessage(
     case "session_messages": {
       const messages = (data.messages as Array<Record<string, unknown>>) || [];
       const hasMore = data.has_more as boolean || false;
+
+      // Drop stale responses — if the response is for a different session
+      // than the one we're currently viewing, ignore it entirely (do NOT
+      // overwrite sessionId or panes).
+      const responseSessionId = data.session_id as string | undefined;
+      const currentSessionId = get().sessionId;
+      if (responseSessionId && currentSessionId && responseSessionId !== currentSessionId) {
+        break;
+      }
 
       const { isLoadingMore, loadingMorePane } = get();
 

@@ -364,8 +364,28 @@ impl DaemonState {
         if tmux_has_session(&session_name) {
             tmux_kill_session(&session_name)?;
         }
-        let output = Command::new("tmux")
-            .arg("new-session")
+
+        // Run tmux inside its own systemd user scope when available, so that
+        // the tmux server (and the headless CLI it hosts) lives in a cgroup
+        // independent of this daemon. That way killing the daemon or its
+        // systemd unit does not tear down the tmux sessions.
+        let use_systemd_run = std::env::var("XDG_RUNTIME_DIR").is_ok()
+            && std::path::Path::new("/run/systemd/system").exists()
+            && ["/usr/bin/systemd-run", "/bin/systemd-run"]
+                .iter()
+                .any(|p| std::path::Path::new(p).exists());
+        let tmux_program = if use_systemd_run { "systemd-run" } else { "tmux" };
+        let mut cmd = Command::new(tmux_program);
+        if use_systemd_run {
+            cmd.arg("--user")
+                .arg("--scope")
+                .arg("--quiet")
+                .arg("--collect")
+                .arg("--slice=apas-tmux.slice")
+                .arg(format!("--unit=apas-tmux-{}.scope", project_id))
+                .arg("tmux");
+        }
+        cmd.arg("new-session")
             .arg("-d")
             .arg("-s")
             .arg(&session_name)
@@ -377,7 +397,7 @@ impl DaemonState {
             .arg("-u")
             .arg("CLAUDECODE")
             .arg(format!("PATH={}", child_path))
-            .arg(executable)
+            .arg(&executable)
             .arg("--headless")
             .arg("--server")
             .arg(server_url)
@@ -387,8 +407,8 @@ impl DaemonState {
             .arg(&project.path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output();
+            .stderr(Stdio::piped());
+        let output = cmd.output();
 
         match output {
             Ok(output) if output.status.success() => {

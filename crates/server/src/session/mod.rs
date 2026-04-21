@@ -1,8 +1,8 @@
 use dashmap::DashMap;
 use shared::{
     CliClientInfo, CliClientStatus, GlmBackendInfo, MachineInfo, MachineProjectInfo,
-    MachineWithProjects, MiniMaxBackendInfo, PaneConfig, Provider, ServerToCli, ServerToDaemon,
-    ServerToWeb, UsageLimits,
+    MachineWithProjects, MiniMaxBackendInfo, PaneConfig, PaneType, Provider, ServerToCli,
+    ServerToDaemon, ServerToWeb, UsageLimits,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -132,6 +132,10 @@ pub struct SessionState {
     pub is_paused: bool,
     /// Cached pane configurations (last PaneList from CLI)
     pub panes: Vec<PaneConfig>,
+    /// Latest pane status per pane_id (e.g., "thinking") so we can replay to
+    /// re-attaching web clients — otherwise the indicator vanishes on tab
+    /// switch until the CLI next reports status.
+    pub pane_statuses: HashMap<u32, (PaneType, String)>,
     /// Working directory of the CLI session
     pub working_dir: Option<String>,
     /// Hostname of the CLI session
@@ -197,6 +201,9 @@ impl SessionManager {
                     // A new CLI may have already taken over (reconnect scenario).
                     if session.cli_client_id == Some(*cli_id) {
                         session.cli_client_id = None;
+                        // Drop any cached "thinking"/status — the producer is gone,
+                        // otherwise the next web attach would replay a stale indicator.
+                        session.pane_statuses.clear();
                     }
                 }
             }
@@ -257,6 +264,16 @@ impl SessionManager {
         // Keep machine metadata/project snapshot to avoid UI flicker during transient daemon reconnects.
         if let Some(mut machine) = self.machine_infos.get_mut(machine_id) {
             machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
+        }
+        // Without the daemon we can't trust the `is_running` flags — the
+        // processes may still be running, but we have no way to interact with
+        // them. Mark all projects as not running so the UI doesn't advertise
+        // them as bootable/attachable via this machine.
+        if let Some(mut projects) = self.machine_projects.get_mut(machine_id) {
+            for p in projects.iter_mut() {
+                p.is_running = false;
+                p.pid = None;
+            }
         }
 
         if let Some(user_id) = owner {
@@ -591,6 +608,7 @@ impl SessionManager {
             web_connection_ids: vec![web_connection_id],
             is_paused: false,
             panes: Vec::new(),
+            pane_statuses: HashMap::new(),
             working_dir: None,
             hostname: None,
         };
@@ -655,6 +673,7 @@ impl SessionManager {
                 web_connection_ids: Vec::new(),
                 is_paused: false,
                 panes: Vec::new(),
+                pane_statuses: HashMap::new(),
                 working_dir,
                 hostname,
             };
@@ -685,6 +704,16 @@ impl SessionManager {
         web_connection_id: Uuid,
         cli_client_id: Option<Uuid>,
     ) -> bool {
+        // Detach this web connection from any previously-attached session so
+        // we don't leak broadcasts (pane_list, output, etc.) from sessions the
+        // user has navigated away from.
+        for mut entry in self.sessions.iter_mut() {
+            if *entry.key() == *session_id {
+                continue;
+            }
+            entry.value_mut().web_connection_ids.retain(|id| *id != web_connection_id);
+        }
+
         if let Some(mut session) = self.sessions.get_mut(session_id) {
             // Add this web client if not already attached
             if !session.web_connection_ids.contains(&web_connection_id) {
@@ -716,6 +745,7 @@ impl SessionManager {
             web_connection_ids: vec![web_connection_id],
             is_paused: false,
             panes: Vec::new(),
+            pane_statuses: HashMap::new(),
             working_dir: None,
             hostname: None,
         };
@@ -756,6 +786,7 @@ impl SessionManager {
             web_connection_ids: s.web_connection_ids.clone(),
             is_paused: s.is_paused,
             panes: s.panes.clone(),
+            pane_statuses: s.pane_statuses.clone(),
             working_dir: s.working_dir.clone(),
             hostname: s.hostname.clone(),
         })
@@ -810,6 +841,41 @@ impl SessionManager {
             .map(|s| s.panes.clone())
             .unwrap_or_default()
     }
+
+    /// Cache the latest pane status so it can be replayed when a web client
+    /// re-attaches. `None` status clears the cache entry (pane is idle).
+    pub fn set_pane_status(
+        &self,
+        session_id: &Uuid,
+        pane_type: PaneType,
+        pane_id: u32,
+        status: Option<String>,
+    ) {
+        if let Some(mut session) = self.sessions.get_mut(session_id) {
+            match status {
+                Some(s) => {
+                    session.pane_statuses.insert(pane_id, (pane_type, s));
+                }
+                None => {
+                    session.pane_statuses.remove(&pane_id);
+                }
+            }
+        }
+    }
+
+    /// Get cached pane statuses for replay on web re-attach.
+    pub fn get_pane_statuses(&self, session_id: &Uuid) -> Vec<(PaneType, u32, String)> {
+        self.sessions
+            .get(session_id)
+            .map(|s| {
+                s.pane_statuses
+                    .iter()
+                    .map(|(pane_id, (pane_type, status))| (*pane_type, *pane_id, status.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
 
     // Message routing
     pub async fn send_to_cli(&self, cli_id: &Uuid, msg: ServerToCli) -> bool {

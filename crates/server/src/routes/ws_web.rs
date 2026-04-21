@@ -1258,6 +1258,24 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .route_to_cli(&sid, ServerToCli::RequestPaneList { session_id: sid })
                             .await;
 
+                        // Replay the last known pane statuses so the "thinking"
+                        // indicator survives tab/project switches. Without this,
+                        // the web client clears paneStatuses on attach and would
+                        // wait for the next CLI status change to repopulate it.
+                        for (pane_type, pane_id, status) in state.sessions.get_pane_statuses(&sid) {
+                            state
+                                .sessions
+                                .send_to_web(
+                                    &connection_id,
+                                    ServerToWeb::PaneStatus {
+                                        pane_type,
+                                        pane_id: Some(pane_id),
+                                        status: Some(status),
+                                    },
+                                )
+                                .await;
+                        }
+
                         state
                             .sessions
                             .send_to_web(
