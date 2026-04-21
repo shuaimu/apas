@@ -174,6 +174,11 @@ fn is_headless_running_for(project_path: &Path) -> bool {
     headless_pid_for(project_path).is_some()
 }
 
+/// Quote a string for safe use inside a single-quoted sh -c argument.
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 fn sanitize_for_unit(project_id: &str) -> String {
     project_id
         .chars()
@@ -392,6 +397,22 @@ impl DaemonState {
         // double-forks and the server reparents to PID 1 on detach, so it
         // survives the daemon exiting and our login session ending.
         let socket_name = tmux_socket_name(project_id);
+        // Log headless stderr to a per-project file so we can postmortem
+        // crashes (tmux normally swallows stderr into its pane buffer which
+        // is lost when tmux dies).
+        let stderr_log = format!("/tmp/apas-headless-{}.log", sanitize_for_unit(project_id));
+        // Build the command as "sh -c '... exec apas ... 2>>logfile'" so the
+        // redirection happens inside the shell tmux runs, after env/PATH have
+        // been applied.
+        let inner_cmd = format!(
+            "exec env -u CLAUDECODE PATH={} {} --headless --server {} --token {} -d {} 2>>{}",
+            shell_escape(&child_path),
+            shell_escape(&executable.to_string_lossy()),
+            shell_escape(server_url),
+            shell_escape(token),
+            shell_escape(&project.path.to_string_lossy()),
+            shell_escape(&stderr_log),
+        );
         let mut cmd = Command::new("tmux");
         cmd.arg("-L")
             .arg(&socket_name)
@@ -401,20 +422,9 @@ impl DaemonState {
             .arg(&session_name)
             .arg("-c")
             .arg(&project.path)
-            // Use env -u to keep nested CLI tools from inheriting CLAUDECODE
-            // from long-lived tmux servers that may have stale environments.
-            .arg("env")
-            .arg("-u")
-            .arg("CLAUDECODE")
-            .arg(format!("PATH={}", child_path))
-            .arg(&executable)
-            .arg("--headless")
-            .arg("--server")
-            .arg(server_url)
-            .arg("--token")
-            .arg(token)
-            .arg("-d")
-            .arg(&project.path)
+            .arg("sh")
+            .arg("-c")
+            .arg(&inner_cmd)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
