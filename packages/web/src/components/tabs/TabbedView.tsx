@@ -94,6 +94,33 @@ function isGlmModel(model?: string): boolean {
   return normalized.startsWith("glm") || normalized.includes("glm-");
 }
 
+const CLAUDE_EFFORT_OPTIONS = [
+  { value: "default", label: "Default" },
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+  { value: "max", label: "Max" },
+  { value: "xhigh", label: "XHigh" },
+] as const;
+type ClaudeEffortOption = (typeof CLAUDE_EFFORT_OPTIONS)[number]["value"];
+
+function normalizeClaudeEffortOption(raw?: string | null): ClaudeEffortOption {
+  if (typeof raw !== "string") return "default";
+  const normalized = raw.trim().toLowerCase();
+  if (
+    normalized === "default" ||
+    normalized === "low" ||
+    normalized === "medium" ||
+    normalized === "high" ||
+    normalized === "max" ||
+    normalized === "xhigh"
+  ) {
+    return normalized;
+  }
+  if (normalized === "x-high") return "xhigh";
+  return "default";
+}
+
 // Synthesize PaneConfig entries from observed pane_id keys when no PaneList was received
 function synthesizeConfigs(
   paneMessages: Record<string, Message[]>,
@@ -179,6 +206,7 @@ export function TabbedView() {
   const [startBotPaneId, setStartBotPaneId] = useState<number | null>(null);
   const [botPromptDraft, setBotPromptDraft] = useState("");
   const [botMinIntervalDraft, setBotMinIntervalDraft] = useState(String(DEFAULT_BOT_MIN_INTERVAL_MINUTES));
+  const [botEffortDraft, setBotEffortDraft] = useState<ClaudeEffortOption>("default");
   const [inputDrafts, setInputDrafts] = useState<Record<string, string>>({});
   const [addTabError, setAddTabError] = useState<string | null>(null);
 
@@ -376,6 +404,8 @@ export function TabbedView() {
     )
   );
   const activeUsageProvider = activeIsMiniMax ? "minimax" : activeIsGlm ? "glm" : activeProvider;
+  const activeSupportsClaudeEffort = activeUsageProvider === "claude";
+  const activeBotEffortOption = normalizeClaudeEffortOption(activeConfig?.effort);
   const activeBotPrompt = activeConfig?.prompt && activeConfig.prompt.trim().length > 0
     ? activeConfig.prompt
     : DEFAULT_BOT_LOOP_PROMPT;
@@ -405,6 +435,10 @@ export function TabbedView() {
     if (activeUsageProvider === "glm") return "GLM Usage";
     return "Claude Usage";
   }, [activeUsageProvider]);
+
+  useEffect(() => {
+    setBotEffortDraft(activeBotEffortOption);
+  }, [activeBotEffortOption, activeTabId]);
 
   const bootTarget = useMemo(() => {
     if (!sessionId) return null;
@@ -502,9 +536,20 @@ export function TabbedView() {
         ws.send(JSON.stringify({ type: "input", text }));
         return { success: true };
       }
+      // Guard against a stale activeTabId left over from a previous session —
+      // refuse to send if the active tab is not actually in the current
+      // session's pane list. Otherwise the server routes input with a
+      // pane_id the current CLI has never heard of and returns
+      // "Pane worker unavailable".
+      if (!effectiveTabs.some((t) => t.pane_id === activeTabId)) {
+        return {
+          success: false,
+          error: "Active tab is stale for this project. Click a tab to retry.",
+        };
+      }
       return sendMessageToPane(text, activeTabId);
     },
-    [activeIsBot, activeTabId, sendMessageToPane],
+    [activeIsBot, activeTabId, effectiveTabs, sendMessageToPane],
   );
 
   const handleStartBot = useCallback(() => {
@@ -518,8 +563,9 @@ export function TabbedView() {
       savedPrompt && savedPrompt.trim().length > 0 ? savedPrompt : DEFAULT_BOT_LOOP_PROMPT,
     );
     setBotMinIntervalDraft(String(savedMinInterval));
+    setBotEffortDraft(activeBotEffortOption);
     setStartBotModalOpen(true);
-  }, [activeConfig?.min_iteration_interval_minutes, activeConfig?.prompt, activeTabId]);
+  }, [activeBotEffortOption, activeConfig?.min_iteration_interval_minutes, activeConfig?.prompt, activeTabId]);
 
   const handleStopBot = useCallback(() => {
     if (activeTabId == null) return;
@@ -552,10 +598,11 @@ export function TabbedView() {
       startBotPaneId,
       trimmed.length > 0 ? botPromptDraft : DEFAULT_BOT_LOOP_PROMPT,
       minIntervalMinutes,
+      activeSupportsClaudeEffort ? botEffortDraft : undefined,
     );
     setStartBotModalOpen(false);
     setStartBotPaneId(null);
-  }, [botMinIntervalDraft, botPromptDraft, startBot, startBotPaneId]);
+  }, [activeSupportsClaudeEffort, botEffortDraft, botMinIntervalDraft, botPromptDraft, startBot, startBotPaneId]);
 
   useEffect(() => {
     if (!activeIsBot && viewBotPromptModalOpen) {
@@ -647,14 +694,33 @@ export function TabbedView() {
               </button>
             </>
           ) : (
-            <button
-              onClick={handleStartBot}
-              className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-green-500 hover:bg-green-600 text-white"
-              title="Start autonomous bot execution in this tab"
-            >
-              <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
-              Start Bot
-            </button>
+            <>
+              <button
+                onClick={handleStartBot}
+                className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-green-500 hover:bg-green-600 text-white"
+                title="Start autonomous bot execution in this tab"
+              >
+                <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
+                Start Bot
+              </button>
+              {activeSupportsClaudeEffort && (
+                <label className="flex items-center gap-1 text-xs text-gray-700 dark:text-gray-300">
+                  <span>Effort</span>
+                  <select
+                    value={botEffortDraft}
+                    onChange={(e) => setBotEffortDraft(normalizeClaudeEffortOption(e.target.value))}
+                    className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-1.5 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    title="Claude thinking effort for the next bot run"
+                  >
+                    {CLAUDE_EFFORT_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+            </>
           )
         )}
 

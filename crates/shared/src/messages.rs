@@ -173,6 +173,8 @@ pub enum ServerToCli {
         prompt: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         min_iteration_interval_minutes: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
     },
 
     /// Stop bot on a pane (revert to interactive)
@@ -353,6 +355,8 @@ pub enum WebToServer {
         prompt: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         min_iteration_interval_minutes: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
     },
 
     /// Stop bot on a pane — converts deadloop pane back to interactive
@@ -686,6 +690,8 @@ pub struct PaneConfig {
     pub label: Option<String>, // User-facing label like "Deadloop" or "Interactive"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>, // Optional model/backend override (e.g., "o3", "MiniMax-M2.7")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>, // Optional Claude thinking effort override (e.g., "high", "max")
 }
 
 /// Legacy pane_id constants
@@ -706,6 +712,7 @@ impl PaneConfig {
             min_iteration_interval_minutes: None,
             label: Some("Interactive".to_string()),
             model: None,
+            effort: None,
         }]
     }
 

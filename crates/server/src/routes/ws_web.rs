@@ -102,9 +102,27 @@ fn infer_panes_from_messages(
                 min_iteration_interval_minutes: None,
                 label: Some(label),
                 model: None,
+                effort: None,
             }
         })
         .collect()
+}
+
+fn normalize_start_bot_effort(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = trimmed.to_ascii_lowercase();
+    match normalized.as_str() {
+        "default" | "auto" | "none" | "off" => None,
+        "low" => Some("low".to_string()),
+        "medium" | "med" => Some("medium".to_string()),
+        "high" => Some("high".to_string()),
+        "max" => Some("max".to_string()),
+        "xhigh" | "x-high" => Some("max".to_string()),
+        _ => None,
+    }
 }
 
 fn normalize_machine_hostname(raw: &str) -> String {
@@ -909,6 +927,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             min_iteration_interval_minutes: None,
                             label,
                             model,
+                            effort: None,
                         };
                         tracing::info!("Adding pane {} to session {}", pane_id, sid);
                         state
@@ -996,6 +1015,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     pane_id,
                     prompt,
                     min_iteration_interval_minutes,
+                    effort,
                 }) => {
                     if let Some(sid) = session_id {
                         tracing::info!("Starting bot on pane {} for session {}", pane_id, sid);
@@ -1008,6 +1028,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     pane_id,
                                     prompt: prompt.clone(),
                                     min_iteration_interval_minutes,
+                                    effort: effort.clone(),
                                 },
                             )
                             .await;
@@ -1020,6 +1041,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             pane.prompt = prompt;
                             pane.min_iteration_interval_minutes = min_iteration_interval_minutes
                                 .or(pane.min_iteration_interval_minutes);
+                            if let Some(requested_effort) = effort.as_deref() {
+                                pane.effort = normalize_start_bot_effort(requested_effort);
+                            }
                             pane.stop_requested = false;
                             state.sessions.set_session_panes(&sid, panes.clone());
                             let _ = state.storage.save_pane_list(&sid, &panes).await;

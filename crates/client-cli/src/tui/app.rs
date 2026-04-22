@@ -67,6 +67,7 @@ pub enum TuiEvent {
         prompt: Option<String>,
         min_iteration_interval_minutes: Option<u64>,
         model: Option<String>,
+        effort: Option<String>,
     },
     CloseTab(u32),
     /// Start bot (deadloop) on an existing interactive pane
@@ -74,6 +75,7 @@ pub enum TuiEvent {
         pane_id: u32,
         prompt: Option<String>,
         min_iteration_interval_minutes: Option<u64>,
+        effort: Option<String>,
     },
     /// Stop bot on a deadloop pane (revert to interactive)
     StopBot {

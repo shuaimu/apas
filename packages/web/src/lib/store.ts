@@ -123,6 +123,7 @@ export interface PaneConfig {
   min_iteration_interval_minutes?: number;
   label?: string;
   model?: string;
+  effort?: string;
 }
 
 // Legacy pane_id constants (must match shared::PANE_ID_DEADLOOP / PANE_ID_INTERACTIVE)
@@ -346,7 +347,12 @@ interface AppState {
   removePane: (paneId: number) => void;
   updatePaneLabel: (paneId: number, label: string) => void;
   reorderPanes: (paneIds: number[]) => void;
-  startBot: (paneId: number, prompt?: string, minIterationIntervalMinutes?: number) => void;
+  startBot: (
+    paneId: number,
+    prompt?: string,
+    minIterationIntervalMinutes?: number,
+    effort?: string,
+  ) => void;
   stopBot: (paneId: number) => void;
   rebootCli: () => void;
   downloadSession: () => void;
@@ -1084,9 +1090,15 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  startBot: (paneId: number, prompt?: string, minIterationIntervalMinutes?: number) => {
+  startBot: (
+    paneId: number,
+    prompt?: string,
+    minIterationIntervalMinutes?: number,
+    effort?: string,
+  ) => {
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
+      const trimmedEffort = typeof effort === "string" ? effort.trim() : "";
       ws.send(JSON.stringify({
         type: "start_bot",
         pane_id: paneId,
@@ -1094,6 +1106,7 @@ export const useStore = create<AppState>((set, get) => ({
         ...(typeof minIterationIntervalMinutes === "number" && Number.isFinite(minIterationIntervalMinutes)
           ? { min_iteration_interval_minutes: Math.max(0, Math.floor(minIterationIntervalMinutes)) }
           : {}),
+        ...(trimmedEffort ? { effort: trimmedEffort } : {}),
       }));
     }
   },

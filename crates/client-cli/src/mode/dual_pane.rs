@@ -166,6 +166,22 @@ fn trim_to_option(raw: Option<String>) -> Option<String> {
     })
 }
 
+fn normalize_effort_level(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = trimmed.to_ascii_lowercase();
+    match normalized.as_str() {
+        "default" | "auto" | "none" | "off" => None,
+        "low" => Some("low".to_string()),
+        "medium" | "med" => Some("medium".to_string()),
+        "high" => Some("high".to_string()),
+        "max" | "xhigh" | "x-high" => Some("max".to_string()),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct MiniMaxBackendRuntimeConfig {
     api_key: Option<String>,
@@ -285,7 +301,7 @@ type PanePauses = Arc<Mutex<HashMap<u32, Arc<AtomicBool>>>>;
 /// Per-pane graceful stop requests (for deadloop panes).
 type PaneStopRequests = Arc<Mutex<HashMap<u32, Arc<AtomicBool>>>>;
 
-/// Per-pane metadata: mode, provider, prompt, optional min interval, and child process handle.
+/// Per-pane metadata: mode/provider/prompt/model/effort, optional min interval, and child process handle.
 #[derive(Clone)]
 struct PaneMeta {
     mode: shared::PaneMode,
@@ -293,6 +309,7 @@ struct PaneMeta {
     label: String,
     prompt: Option<String>,
     model: Option<String>,
+    effort: Option<String>,
     min_iteration_interval_minutes: Option<u64>,
     child_process: Arc<Mutex<Option<std::process::Child>>>,
 }
@@ -357,6 +374,7 @@ async fn run_inner(
         Provider,
         Option<String>,
         Option<String>,
+        Option<String>,
         Option<u64>,
         bool,
     )> = metadata
@@ -390,6 +408,7 @@ async fn run_inner(
                 pane.provider,
                 pane.prompt.clone(),
                 pane.model.clone(),
+                normalize_effort_level(pane.effort.as_deref()),
                 pane.min_iteration_interval_minutes,
                 is_paused,
             )
@@ -434,6 +453,7 @@ async fn run_inner(
         Provider,
         String,
         Option<String>,
+        Option<String>,
         u64,
         Arc<AtomicBool>,
         Arc<AtomicBool>,
@@ -443,6 +463,7 @@ async fn run_inner(
         u32,
         Uuid,
         Provider,
+        Option<String>,
         Option<String>,
         mpsc::Receiver<PaneInput>,
         Arc<Mutex<Option<std::process::Child>>>,
@@ -462,6 +483,7 @@ async fn run_inner(
             provider,
             tab_prompt,
             tab_model,
+            tab_effort,
             min_interval_minutes,
             is_paused,
         ) in &tabs_to_restore
@@ -475,6 +497,7 @@ async fn run_inner(
                     label: tab_label.clone(),
                     prompt: tab_prompt.clone(),
                     model: tab_model.clone(),
+                    effort: tab_effort.clone(),
                     min_iteration_interval_minutes: *min_interval_minutes,
                     child_process: child_proc.clone(),
                 },
@@ -498,6 +521,7 @@ async fn run_inner(
                     *provider,
                     dl_prompt,
                     tab_model.clone(),
+                    tab_effort.clone(),
                     resolved_min_interval_minutes,
                     pause_flag,
                     stop_flag,
@@ -511,6 +535,7 @@ async fn run_inner(
                     *pane_session_id,
                     *provider,
                     tab_model.clone(),
+                    tab_effort.clone(),
                     input_rx,
                     child_proc,
                 ));
@@ -580,7 +605,7 @@ async fn run_inner(
     };
 
     // Send initial messages for restored panes.
-    for (pane_id, _, label, mode, _, _, _, _, is_paused) in &tabs_to_restore {
+    for (pane_id, _, label, mode, _, _, _, _, _, is_paused) in &tabs_to_restore {
         let init_text = if *pane_id == shared::PANE_ID_DEADLOOP
             && *mode == shared::PaneMode::Deadloop
         {
@@ -621,6 +646,7 @@ async fn run_inner(
         provider,
         dl_prompt,
         model,
+        effort,
         min_interval_minutes,
         pause_flag,
         stop_flag,
@@ -651,6 +677,7 @@ async fn run_inner(
                 pane_id,
                 &dl_prompt,
                 model.clone(),
+                effort.clone(),
                 min_interval_minutes,
                 &provider,
                 output_tx,
@@ -664,7 +691,7 @@ async fn run_inner(
         }));
     }
 
-    for (pane_id, pane_session_id, provider, model, input_rx, child_proc) in interactive_startups {
+    for (pane_id, pane_session_id, provider, model, effort, input_rx, child_proc) in interactive_startups {
         let output_tx = output_tx.clone();
         let server_tx = server_tx.clone();
         let shutdown = shutdown.clone();
@@ -688,6 +715,7 @@ async fn run_inner(
                 pane_id,
                 &provider,
                 model.clone(),
+                effort.clone(),
                 input_rx,
                 output_tx,
                 server_tx,
@@ -845,7 +873,7 @@ fn save_pane_configs(
         let mut panes: Vec<shared::PaneConfig> = pane_sessions
             .iter()
             .map(|(&pane_id, &claude_sid)| {
-                let (mode, provider, label, prompt, model, min_iteration_interval_minutes) =
+                let (mode, provider, label, prompt, model, effort, min_iteration_interval_minutes) =
                     if let Some(meta) = pane_metas.get(&pane_id) {
                         (
                             meta.mode.clone(),
@@ -853,6 +881,7 @@ fn save_pane_configs(
                             meta.label.clone(),
                             meta.prompt.clone(),
                             meta.model.clone(),
+                            meta.effort.clone(),
                             meta.min_iteration_interval_minutes,
                         )
                     } else if pane_id == shared::PANE_ID_DEADLOOP {
@@ -862,6 +891,7 @@ fn save_pane_configs(
                             default_pane_label(pane_id, None),
                             None,
                             None,
+                            None,
                             Some(DEFAULT_MIN_ITERATION_INTERVAL_MINUTES),
                         )
                     } else {
@@ -869,6 +899,7 @@ fn save_pane_configs(
                             shared::PaneMode::Interactive,
                             Provider::Claude,
                             default_pane_label(pane_id, None),
+                            None,
                             None,
                             None,
                             None,
@@ -889,6 +920,7 @@ fn save_pane_configs(
                         model.as_deref(),
                     )),
                     model,
+                    effort,
                 }
             })
             .collect();
@@ -954,6 +986,7 @@ fn handle_tui_events(
                             label: label.clone(),
                             prompt: None,
                             model: None,
+                            effort: None,
                             min_iteration_interval_minutes: None,
                             child_process: child_proc.clone(),
                         },
@@ -996,6 +1029,7 @@ fn handle_tui_events(
                             pane_id,
                             &Provider::Claude,
                             None,
+                            None,
                             input_rx,
                             output_tx,
                             server_tx,
@@ -1036,9 +1070,11 @@ fn handle_tui_events(
                 prompt,
                 min_iteration_interval_minutes,
                 model,
+                effort,
             }) => {
                 let label =
                     pane_label_or_default(Some(&requested_label), pane_id, model.as_deref());
+                let normalized_effort = normalize_effort_level(effort.as_deref());
                 // Track claude session and metadata for this pane
                 {
                     let mut ps = pane_sessions.lock().unwrap();
@@ -1057,6 +1093,7 @@ fn handle_tui_events(
                             label: label.clone(),
                             prompt: prompt.clone(),
                             model: model.clone(),
+                            effort: normalized_effort.clone(),
                             min_iteration_interval_minutes,
                             child_process: child_proc.clone(),
                         },
@@ -1113,6 +1150,7 @@ fn handle_tui_events(
                             pane_id,
                             &dl_prompt,
                             model.clone(),
+                            normalized_effort.clone(),
                             resolved_min_interval_minutes,
                             &provider,
                             output_tx,
@@ -1144,6 +1182,7 @@ fn handle_tui_events(
                             pane_id,
                             &provider,
                             model.clone(),
+                            normalized_effort.clone(),
                             input_rx,
                             output_tx,
                             server_tx,
@@ -1248,6 +1287,7 @@ fn handle_tui_events(
                 pane_id,
                 prompt,
                 min_iteration_interval_minutes,
+                effort,
             }) => {
                 // Preserve provider/model and any existing per-pane prompt across mode switches.
                 let (
@@ -1255,6 +1295,7 @@ fn handle_tui_events(
                     existing_label,
                     existing_prompt,
                     existing_model,
+                    existing_effort,
                     existing_min_interval_minutes,
                 ) = {
                     let metas = pane_metas.lock().unwrap();
@@ -1264,6 +1305,7 @@ fn handle_tui_events(
                             meta.label.clone(),
                             meta.prompt.clone(),
                             meta.model.clone(),
+                            meta.effort.clone(),
                             meta.min_iteration_interval_minutes,
                         ),
                         None => (
@@ -1272,10 +1314,16 @@ fn handle_tui_events(
                             None,
                             None,
                             None,
+                            None,
                         ),
                     }
                 };
                 let resolved_prompt = prompt.filter(|p| !p.trim().is_empty()).or(existing_prompt);
+                let resolved_effort = if let Some(requested_effort) = effort.as_deref() {
+                    normalize_effort_level(Some(requested_effort))
+                } else {
+                    normalize_effort_level(existing_effort.as_deref())
+                };
                 let resolved_min_interval_minutes = min_iteration_interval_minutes
                     .or(existing_min_interval_minutes)
                     .unwrap_or(DEFAULT_MIN_ITERATION_INTERVAL_MINUTES);
@@ -1336,6 +1384,7 @@ fn handle_tui_events(
                             label: existing_label,
                             prompt: resolved_prompt.clone(),
                             model: existing_model.clone(),
+                            effort: resolved_effort.clone(),
                             min_iteration_interval_minutes: Some(resolved_min_interval_minutes),
                             child_process: child_proc.clone(),
                         },
@@ -1385,6 +1434,7 @@ fn handle_tui_events(
                             pane_id,
                             &dl_prompt,
                             existing_model.clone(),
+                            resolved_effort.clone(),
                             resolved_min_interval_minutes,
                             &provider,
                             output_tx,
@@ -1576,7 +1626,14 @@ fn handle_tui_events(
                     // (e.g. pane was removed). Still safe to proceed.
                 }
 
-                let (provider, saved_label, saved_prompt, saved_model, saved_min_interval_minutes) = {
+                let (
+                    provider,
+                    saved_label,
+                    saved_prompt,
+                    saved_model,
+                    saved_effort,
+                    saved_min_interval_minutes,
+                ) = {
                     let metas = pane_metas.lock().unwrap();
                     let Some(meta) = metas.get(&pane_id) else {
                         continue;
@@ -1589,6 +1646,7 @@ fn handle_tui_events(
                         meta.label.clone(),
                         meta.prompt.clone(),
                         meta.model.clone(),
+                        meta.effort.clone(),
                         meta.min_iteration_interval_minutes,
                     )
                 };
@@ -1623,6 +1681,7 @@ fn handle_tui_events(
                             label: saved_label,
                             prompt: saved_prompt,
                             model: saved_model.clone(),
+                            effort: saved_effort.clone(),
                             min_iteration_interval_minutes: saved_min_interval_minutes,
                             child_process: child_proc.clone(),
                         },
@@ -1686,6 +1745,7 @@ fn handle_tui_events(
                             pane_id,
                             &provider,
                             saved_model.clone(),
+                            saved_effort.clone(),
                             input_rx,
                             output_tx,
                             server_tx,
@@ -1761,6 +1821,7 @@ fn build_pane_list(
             min_iteration_interval_minutes: meta.min_iteration_interval_minutes,
             label: Some(label),
             model: meta.model.clone(),
+            effort: meta.effort.clone(),
         });
     }
 
@@ -1779,6 +1840,7 @@ fn build_pane_list(
                 min_iteration_interval_minutes: None,
                 label: Some(default_pane_label(pane_id, None)),
                 model: None,
+                effort: None,
             });
         }
     }
@@ -1862,6 +1924,7 @@ fn build_agent_args(
     session_id: &Uuid,
     prompt: &str,
     model: Option<&str>,
+    effort: Option<&str>,
     first_message: bool,
     try_resume: bool,
 ) -> (Vec<String>, bool) {
@@ -1883,6 +1946,14 @@ fn build_agent_args(
                     && !is_glm_model(Some(trimmed))
                 {
                     base.extend_from_slice(&["--model".to_string(), trimmed.to_string()]);
+                }
+            }
+            if matches!(provider, Provider::Claude)
+                && !is_minimax_model(model)
+                && !is_glm_model(model)
+            {
+                if let Some(normalized_effort) = normalize_effort_level(effort) {
+                    base.extend_from_slice(&["--effort".to_string(), normalized_effort]);
                 }
             }
             if first_message && try_resume {
@@ -2051,6 +2122,7 @@ mod tests {
             &session_id,
             FULL_PROMPT,
             None,
+            None,
             false,
             true,
         );
@@ -2067,6 +2139,7 @@ mod tests {
             &Provider::Codex,
             &session_id,
             FULL_PROMPT,
+            None,
             None,
             false,
             true,
@@ -2086,6 +2159,7 @@ mod tests {
             &session_id,
             FULL_PROMPT,
             Some("sonnet"),
+            None,
             true,
             false,
         );
@@ -2101,6 +2175,7 @@ mod tests {
             &session_id,
             FULL_PROMPT,
             Some("MiniMax-M2.7"),
+            None,
             true,
             false,
         );
@@ -2116,11 +2191,44 @@ mod tests {
             &session_id,
             FULL_PROMPT,
             Some("glm-5.1"),
+            None,
             true,
             false,
         );
 
         assert!(!args.iter().any(|arg| arg == "--model"));
+    }
+
+    #[test]
+    fn build_agent_args_claude_effort_maps_xhigh_to_max() {
+        let session_id = Uuid::new_v4();
+        let (args, _) = build_agent_args(
+            &Provider::Claude,
+            &session_id,
+            FULL_PROMPT,
+            None,
+            Some("xhigh"),
+            true,
+            false,
+        );
+
+        assert!(args.windows(2).any(|w| w == ["--effort", "max"]));
+    }
+
+    #[test]
+    fn build_agent_args_claude_minimax_backend_ignores_effort_flag() {
+        let session_id = Uuid::new_v4();
+        let (args, _) = build_agent_args(
+            &Provider::Claude,
+            &session_id,
+            FULL_PROMPT,
+            Some("MiniMax-M2.7"),
+            Some("max"),
+            true,
+            false,
+        );
+
+        assert!(!args.iter().any(|arg| arg == "--effort"));
     }
 
     #[test]
@@ -2205,6 +2313,7 @@ mod tests {
                     label: "Interactive".to_string(),
                     prompt: None,
                     model: None,
+                    effort: None,
                     min_iteration_interval_minutes: None,
                     child_process: child_process.clone(),
                 },
@@ -2217,6 +2326,7 @@ mod tests {
                     label: "Tab 2".to_string(),
                     prompt: None,
                     model: None,
+                    effort: None,
                     min_iteration_interval_minutes: None,
                     child_process,
                 },
@@ -2244,6 +2354,7 @@ mod tests {
                     label: "MiniMax 1".to_string(),
                     prompt: None,
                     model: Some("MiniMax-M2.7".to_string()),
+                    effort: None,
                     min_iteration_interval_minutes: None,
                     child_process,
                 },
@@ -2271,6 +2382,7 @@ mod tests {
                     label: "MiniMax 1".to_string(),
                     prompt: None,
                     model: Some("m2.7".to_string()),
+                    effort: None,
                     min_iteration_interval_minutes: None,
                     child_process: child_process.clone(),
                 },
@@ -2283,6 +2395,7 @@ mod tests {
                     label: "Tab 2".to_string(),
                     prompt: None,
                     model: None,
+                    effort: None,
                     min_iteration_interval_minutes: None,
                     child_process,
                 },
@@ -2310,6 +2423,7 @@ mod tests {
                     label: "MiniMax 7".to_string(),
                     prompt: None,
                     model: Some("MiniMax-M2.7".to_string()),
+                    effort: None,
                     min_iteration_interval_minutes: None,
                     child_process,
                 },
@@ -2337,6 +2451,7 @@ mod tests {
                     label: "GLM 9".to_string(),
                     prompt: None,
                     model: Some("glm-5.1".to_string()),
+                    effort: None,
                     min_iteration_interval_minutes: None,
                     child_process,
                 },
@@ -2364,6 +2479,7 @@ mod tests {
                     label: "GLM Experimental".to_string(),
                     prompt: None,
                     model: None,
+                    effort: None,
                     min_iteration_interval_minutes: None,
                     child_process,
                 },
@@ -2386,6 +2502,7 @@ fn run_deadloop_session(
     pane_id: u32,
     prompt: &str,
     model: Option<String>,
+    effort: Option<String>,
     min_iteration_interval_minutes: u64,
     provider: &Provider,
     output_tx: mpsc::Sender<PaneOutput>,
@@ -2405,6 +2522,7 @@ fn run_deadloop_session(
             pane_id,
             prompt,
             model,
+            effort,
             min_iteration_interval_minutes,
             provider,
             output_tx.clone(),
@@ -2440,6 +2558,7 @@ fn run_deadloop_session_inner(
     pane_id: u32,
     prompt: &str,
     model: Option<String>,
+    effort: Option<String>,
     min_iteration_interval_minutes: u64,
     provider: &Provider,
     output_tx: mpsc::Sender<PaneOutput>,
@@ -2569,6 +2688,7 @@ fn run_deadloop_session_inner(
             &claude_session_id,
             iteration_prompt,
             model.as_deref(),
+            effort.as_deref(),
             first_message,
             try_resume_first,
         );
@@ -2910,6 +3030,7 @@ fn run_pane_session(
     pane_id: u32,
     provider: &Provider,
     model: Option<String>,
+    effort: Option<String>,
     input_rx: mpsc::Receiver<PaneInput>,
     output_tx: mpsc::Sender<PaneOutput>,
     server_tx: tokio_mpsc::Sender<CliToServer>,
@@ -2976,6 +3097,7 @@ fn run_pane_session(
             &claude_session_id,
             &prompt,
             model.as_deref(),
+            effort.as_deref(),
             first_message,
             try_resume_first,
         );
@@ -3573,6 +3695,7 @@ async fn run_server_connection(
                                                             min_iteration_interval_minutes: meta
                                                                 .min_iteration_interval_minutes,
                                                             model: meta.model,
+                                                            effort: meta.effort,
                                                         });
                                                     } else {
                                                         tracing::warn!(
@@ -3738,6 +3861,7 @@ async fn run_server_connection(
                                                     prompt: pane_config.prompt,
                                                     min_iteration_interval_minutes: pane_config.min_iteration_interval_minutes,
                                                     model: pane_config.model,
+                                                    effort: pane_config.effort,
                                                 });
                                             }
                                             ServerToCli::RemovePane { session_id: _, pane_id: remove_id } => {
@@ -3749,11 +3873,13 @@ async fn run_server_connection(
                                                 pane_id: target_pane,
                                                 prompt: bot_prompt,
                                                 min_iteration_interval_minutes,
+                                                effort,
                                             } => {
                                                 let _ = tui_event_tx.send(TuiEvent::StartBot {
                                                     pane_id: target_pane,
                                                     prompt: bot_prompt,
                                                     min_iteration_interval_minutes,
+                                                    effort,
                                                 });
                                             }
                                             ServerToCli::StopBot { session_id: _, pane_id: target_pane } => {

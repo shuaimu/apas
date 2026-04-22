@@ -97,6 +97,7 @@ impl ProjectMetadata {
                     min_iteration_interval_minutes: Some(15),
                     label: Some("Claude Deadloop".to_string()),
                     model: None,
+                    effort: None,
                 },
                 PaneConfig {
                     pane_id: shared::PANE_ID_INTERACTIVE,
@@ -109,6 +110,7 @@ impl ProjectMetadata {
                     min_iteration_interval_minutes: None,
                     label: Some("Claude Interactive".to_string()),
                     model: None,
+                    effort: None,
                 },
             ];
         }
