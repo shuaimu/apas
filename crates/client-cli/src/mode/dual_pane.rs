@@ -172,12 +172,16 @@ fn normalize_effort_level(raw: Option<&str>) -> Option<String> {
         return None;
     }
     let normalized = trimmed.to_ascii_lowercase();
+    // Valid levels (from `claude --help`): low, medium, high, xhigh, max.
+    // Pass the user's selection through verbatim so xhigh and max stay
+    // distinct — previously we coerced xhigh → max.
     match normalized.as_str() {
         "default" | "auto" | "none" | "off" => None,
         "low" => Some("low".to_string()),
         "medium" | "med" => Some("medium".to_string()),
         "high" => Some("high".to_string()),
-        "max" | "xhigh" | "x-high" => Some("max".to_string()),
+        "xhigh" | "x-high" => Some("xhigh".to_string()),
+        "max" => Some("max".to_string()),
         _ => None,
     }
 }
@@ -1953,6 +1957,11 @@ fn build_agent_args(
                 && !is_glm_model(model)
             {
                 if let Some(normalized_effort) = normalize_effort_level(effort) {
+                    tracing::info!(
+                        target: "apas::effort",
+                        effort = %normalized_effort,
+                        "Launching claude with --effort",
+                    );
                     base.extend_from_slice(&["--effort".to_string(), normalized_effort]);
                 }
             }
@@ -2200,7 +2209,7 @@ mod tests {
     }
 
     #[test]
-    fn build_agent_args_claude_effort_maps_xhigh_to_max() {
+    fn build_agent_args_claude_effort_passes_xhigh_verbatim() {
         let session_id = Uuid::new_v4();
         let (args, _) = build_agent_args(
             &Provider::Claude,
@@ -2208,6 +2217,25 @@ mod tests {
             FULL_PROMPT,
             None,
             Some("xhigh"),
+            true,
+            false,
+        );
+
+        // xhigh and max are distinct levels in claude --help; don't collapse
+        // them.
+        assert!(args.windows(2).any(|w| w == ["--effort", "xhigh"]));
+        assert!(!args.windows(2).any(|w| w == ["--effort", "max"]));
+    }
+
+    #[test]
+    fn build_agent_args_claude_effort_passes_max_verbatim() {
+        let session_id = Uuid::new_v4();
+        let (args, _) = build_agent_args(
+            &Provider::Claude,
+            &session_id,
+            FULL_PROMPT,
+            None,
+            Some("max"),
             true,
             false,
         );
