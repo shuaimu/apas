@@ -3899,6 +3899,27 @@ async fn run_server_connection(
                                                     session_id, panes }).unwrap_or_default();
                                                 let _ = ws_sender.send(Message::Text(msg.into())).await;
                                             }
+                                            ServerToCli::UpdatePaneEffort { session_id: _, pane_id: target_pane, effort } => {
+                                                let normalized = normalize_effort_level(effort.as_deref());
+                                                {
+                                                    let mut metas = pane_metas.lock().unwrap();
+                                                    if let Some(meta) = metas.get_mut(&target_pane) {
+                                                        meta.effort = normalized.clone();
+                                                    }
+                                                }
+                                                save_pane_configs(
+                                                    working_dir,
+                                                    &pane_sessions,
+                                                    &pane_metas,
+                                                    &pane_pauses,
+                                                    &pane_stop_requests,
+                                                );
+                                                tracing::info!(
+                                                    pane_id = target_pane,
+                                                    effort = ?normalized,
+                                                    "Pane effort updated and persisted to .apas",
+                                                );
+                                            }
                                             _ => {}
                                         }
                                     }

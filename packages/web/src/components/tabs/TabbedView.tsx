@@ -192,6 +192,7 @@ export function TabbedView() {
   const addPane = useStore((s) => s.addPane);
   const removePane = useStore((s) => s.removePane);
   const updatePaneLabel = useStore((s) => s.updatePaneLabel);
+  const updatePaneEffort = useStore((s) => s.updatePaneEffort);
   const reorderPanes = useStore((s) => s.reorderPanes);
   const startBot = useStore((s) => s.startBot);
   const stopBot = useStore((s) => s.stopBot);
@@ -708,9 +709,17 @@ export function TabbedView() {
                   <span>Effort</span>
                   <select
                     value={botEffortDraft}
-                    onChange={(e) => setBotEffortDraft(normalizeClaudeEffortOption(e.target.value))}
+                    onChange={(e) => {
+                      const next = normalizeClaudeEffortOption(e.target.value);
+                      setBotEffortDraft(next);
+                      // Persist on the server (and CLI's .apas) so the choice
+                      // survives tab-switch and CLI restart.
+                      if (activeTabId != null) {
+                        updatePaneEffort(activeTabId, next === "default" ? null : next);
+                      }
+                    }}
                     className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-1.5 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    title="Claude thinking effort for the next bot run"
+                    title="Claude thinking effort — persisted per tab"
                   >
                     {CLAUDE_EFFORT_OPTIONS.map((option) => (
                       <option key={option.value} value={option.value}>

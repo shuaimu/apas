@@ -346,6 +346,7 @@ interface AppState {
   ) => { success: boolean; error?: string };
   removePane: (paneId: number) => void;
   updatePaneLabel: (paneId: number, label: string) => void;
+  updatePaneEffort: (paneId: number, effort: string | null) => void;
   reorderPanes: (paneIds: number[]) => void;
   startBot: (
     paneId: number,
@@ -1080,6 +1081,17 @@ export const useStore = create<AppState>((set, get) => ({
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "update_pane_label", pane_id: paneId, label }));
+    }
+  },
+
+  updatePaneEffort: (paneId: number, effort: string | null) => {
+    const { ws } = get();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: "update_pane_effort",
+        pane_id: paneId,
+        effort: effort ?? null,
+      }));
     }
   },
 

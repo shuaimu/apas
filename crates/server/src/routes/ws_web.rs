@@ -980,6 +980,43 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         }
                     }
                 }
+                Ok(WebToServer::UpdatePaneEffort { pane_id, effort }) => {
+                    if let Some(sid) = session_id {
+                        let normalized = effort.as_deref().and_then(normalize_start_bot_effort);
+                        tracing::info!(
+                            "Updating pane {} effort in session {} to {:?}",
+                            pane_id, sid, normalized
+                        );
+                        let mut panes = state.sessions.get_session_panes(&sid);
+                        if let Some(pane) = panes.iter_mut().find(|p| p.pane_id == pane_id) {
+                            pane.effort = normalized.clone();
+                            state.sessions.set_session_panes(&sid, panes.clone());
+                            let _ = state.storage.save_pane_list(&sid, &panes).await;
+                            state
+                                .sessions
+                                .route_to_web(
+                                    &sid,
+                                    ServerToWeb::PaneList {
+                                        session_id: sid,
+                                        panes,
+                                    },
+                                )
+                                .await;
+                            // Forward to CLI so it persists to the .apas file.
+                            state
+                                .sessions
+                                .route_to_cli(
+                                    &sid,
+                                    ServerToCli::UpdatePaneEffort {
+                                        session_id: sid,
+                                        pane_id,
+                                        effort: normalized,
+                                    },
+                                )
+                                .await;
+                        }
+                    }
+                }
                 Ok(WebToServer::ReorderPanes { pane_ids }) => {
                     if let Some(sid) = session_id {
                         tracing::info!("Reordering panes in session {}", sid);

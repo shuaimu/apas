@@ -579,6 +579,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             Ok(CliToServer::PaneStatus { session_id, pane_type, pane_id, status }) => {
                                 // Forward pane status to web clients
                                 tracing::info!("Pane status for session {}: pane_id={:?} = {:?}", session_id, pane_id, status);
+                                // Cache so we can replay to web clients that attach
+                                // later (tab switch, sidebar switch) — the CLI won't
+                                // re-send the current status until it changes.
+                                let resolved_pane_id = pane_id
+                                    .unwrap_or_else(|| shared::PaneConfig::pane_id_from_legacy(&pane_type));
+                                state.sessions.set_pane_status(
+                                    &session_id,
+                                    pane_type,
+                                    resolved_pane_id,
+                                    status.clone(),
+                                );
                                 state
                                     .sessions
                                     .route_to_web(

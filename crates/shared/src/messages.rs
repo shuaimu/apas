@@ -185,6 +185,15 @@ pub enum ServerToCli {
 
     /// Request CLI to send its current PaneList
     RequestPaneList { session_id: Uuid },
+
+    /// Update a pane's Claude thinking-effort override without starting a bot,
+    /// so the CLI can persist it to the .apas file.
+    UpdatePaneEffort {
+        session_id: Uuid,
+        pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+    },
 }
 
 // ============================================================================
@@ -343,6 +352,14 @@ pub enum WebToServer {
     UpdatePaneLabel {
         pane_id: u32,
         label: String,
+    },
+
+    /// Update a pane's Claude thinking-effort override. Persisted in the
+    /// project .apas so switching tabs doesn't reset it to default.
+    UpdatePaneEffort {
+        pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
     },
 
     /// Reorder panes (array of pane_ids in desired order)
