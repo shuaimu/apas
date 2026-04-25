@@ -166,6 +166,31 @@ fn trim_to_option(raw: Option<String>) -> Option<String> {
     })
 }
 
+/// Send SIGTERM (then SIGKILL after a grace period) to the entire process
+/// group led by `pgid`. Used to reap a deadloop-pane's agent plus any
+/// background children it left behind once the agent has emitted its
+/// `result` event — without this the deadloop's next iteration never
+/// starts because the agent process lingers indefinitely.
+#[cfg(unix)]
+fn kill_process_group(pgid: u32) {
+    if pgid == 0 {
+        return;
+    }
+    unsafe {
+        libc::kill(-(pgid as i32), libc::SIGTERM);
+    }
+    let pgid_for_fallback = pgid;
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(500));
+        unsafe {
+            libc::kill(-(pgid_for_fallback as i32), libc::SIGKILL);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pgid: u32) {}
+
 fn normalize_effort_level(raw: Option<&str>) -> Option<String> {
     let trimmed = raw?.trim();
     if trimmed.is_empty() {
@@ -2767,6 +2792,22 @@ fn run_deadloop_session_inner(
         for (key, value) in &pane_env {
             command.env(key, value);
         }
+        // Deadloop only: put the agent in its own process group so we can
+        // group-kill it (and any background children it spawned) the moment
+        // it emits its result event. The deadloop must iterate; an agent
+        // that lingers past result wedges every subsequent iteration.
+        // Interactive panes deliberately don't do this — users may want to
+        // launch persistent background work that outlives the turn.
+        #[cfg(unix)]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
 
         match command.spawn() {
             Ok(mut child) => {
@@ -2924,16 +2965,18 @@ fn run_deadloop_session_inner(
                                     });
                                     if is_result {
                                         // Clear "Thinking..." as soon as the agent signals turn
-                                        // completion, even if the process lingers afterward.
+                                        // completion.
                                         let _ = server_tx.try_send(CliToServer::PaneStatus {
                                             session_id,
                                             pane_type: PaneType::Deadloop,
                                             pane_id: Some(pane_id),
                                             status: None,
                                         });
-                                        // Don't auto-tear down background children — the
-                                        // user may have intentionally backgrounded work
-                                        // they expect to keep running across turns.
+                                        // Deadloop must iterate. Reap the agent + any
+                                        // background children it left running so the next
+                                        // iteration can start. (Interactive panes do NOT
+                                        // do this — see run_pane_session.)
+                                        kill_process_group(child_pid);
                                     }
                                 }
                                 None => {
