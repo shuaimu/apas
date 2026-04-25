@@ -166,6 +166,33 @@ fn trim_to_option(raw: Option<String>) -> Option<String> {
     })
 }
 
+/// Send SIGTERM (then SIGKILL after a short grace) to the entire process group
+/// led by `pgid`. We spawn the agent with setpgid(0,0), so its PID equals its
+/// PGID and every descendant inherits the same group — `kill -- -pgid` reaps
+/// claude plus any background shells / tail -F it spawned during a turn.
+#[cfg(unix)]
+fn kill_process_group(pgid: u32) {
+    if pgid == 0 {
+        return;
+    }
+    unsafe {
+        // Negative target means "process group".
+        libc::kill(-(pgid as i32), libc::SIGTERM);
+    }
+    let pgid_for_fallback = pgid;
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(500));
+        // Best-effort SIGKILL escalation. If the group is already gone the
+        // syscall is a no-op (ESRCH).
+        unsafe {
+            libc::kill(-(pgid_for_fallback as i32), libc::SIGKILL);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pgid: u32) {}
+
 fn normalize_effort_level(raw: Option<&str>) -> Option<String> {
     let trimmed = raw?.trim();
     if trimmed.is_empty() {
@@ -2767,6 +2794,18 @@ fn run_deadloop_session_inner(
         for (key, value) in &pane_env {
             command.env(key, value);
         }
+        // Put agent in its own process group so we can group-kill the whole
+        // tree (agent + spawned shells / tail -F etc.) on result.
+        #[cfg(unix)]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
 
         match command.spawn() {
             Ok(mut child) => {
@@ -2931,6 +2970,9 @@ fn run_deadloop_session_inner(
                                             pane_id: Some(pane_id),
                                             status: None,
                                         });
+                                        // Tear down agent + any background children so
+                                        // tail -F / build watchers don't leak across turns.
+                                        kill_process_group(child_pid);
                                     }
                                 }
                                 None => {
@@ -3178,9 +3220,24 @@ fn run_pane_session(
         for (key, value) in &pane_env {
             command.env(key, value);
         }
+        // Put the agent in its own process group. This lets us kill the whole
+        // tree (agent + every shell/tail/whatever it spawned) by signalling
+        // the negative PID, instead of leaking orphan children when claude
+        // lingers past its result event.
+        #[cfg(unix)]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
 
         match command.spawn() {
             Ok(mut child) => {
+                let agent_pid = child.id();
                 let stdout = child.stdout.take().unwrap();
                 let stderr = child.stderr.take().unwrap();
 
@@ -3296,6 +3353,10 @@ fn run_pane_session(
                                             pane_id: Some(pane_id),
                                             status: None,
                                         });
+                                        // Kill the agent's entire process group so any
+                                        // background children it spawned (tail -F etc.) die
+                                        // with it instead of leaking after the turn.
+                                        kill_process_group(agent_pid);
                                     }
                                 }
                                 None => {
