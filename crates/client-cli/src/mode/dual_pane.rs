@@ -2902,6 +2902,10 @@ fn run_deadloop_session_inner(
 
                             match parse_agent_output(provider, &line, &session_id_str) {
                                 Some(message) => {
+                                    let is_result = matches!(
+                                        message,
+                                        ClaudeStreamMessage::Result { .. }
+                                    );
                                     if let ClaudeStreamMessage::Result { is_error, .. } = &message {
                                         if *is_error {
                                             had_error = true;
@@ -2918,6 +2922,16 @@ fn run_deadloop_session_inner(
                                         pane_type: Some(PaneType::Deadloop),
                                         pane_id: Some(pane_id),
                                     });
+                                    if is_result {
+                                        // Clear "Thinking..." as soon as the agent signals turn
+                                        // completion, even if the process lingers afterward.
+                                        let _ = server_tx.try_send(CliToServer::PaneStatus {
+                                            session_id,
+                                            pane_type: PaneType::Deadloop,
+                                            pane_id: Some(pane_id),
+                                            status: None,
+                                        });
+                                    }
                                 }
                                 None => {
                                     let _ = output_tx.send(PaneOutput {
@@ -3254,6 +3268,16 @@ fn run_pane_session(
 
                             match parse_agent_output(provider, &line, &session_id_str) {
                                 Some(message) => {
+                                    // The agent's result event signals "turn complete" at the
+                                    // protocol level. Clear the pane's transient status now,
+                                    // even if the underlying process keeps lingering (e.g. it
+                                    // spawned background children like `tail -F`). Without
+                                    // this, the UI shows "Thinking..." forever after the user
+                                    // already sees the final answer + cost.
+                                    let is_result = matches!(
+                                        message,
+                                        ClaudeStreamMessage::Result { .. }
+                                    );
                                     let display_text = format_stream_message(&message);
                                     let _ = output_tx.send(PaneOutput {
                                         text: display_text,
@@ -3265,6 +3289,14 @@ fn run_pane_session(
                                         pane_type: Some(PaneType::Interactive),
                                         pane_id: Some(pane_id),
                                     });
+                                    if is_result {
+                                        let _ = server_tx.blocking_send(CliToServer::PaneStatus {
+                                            session_id,
+                                            pane_type: PaneType::Interactive,
+                                            pane_id: Some(pane_id),
+                                            status: None,
+                                        });
+                                    }
                                 }
                                 None => {
                                     let _ = output_tx.send(PaneOutput {
