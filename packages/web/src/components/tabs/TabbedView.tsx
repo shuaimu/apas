@@ -706,29 +706,26 @@ export function TabbedView() {
                 Bot
               </button>
               {activeSupportsClaudeEffort && (
-                <label className="flex items-center gap-1 text-xs text-gray-700 dark:text-gray-300">
-                  <span>Effort</span>
-                  <select
-                    value={botEffortDraft}
-                    onChange={(e) => {
-                      const next = normalizeClaudeEffortOption(e.target.value);
-                      setBotEffortDraft(next);
-                      // Persist on the server (and CLI's .apas) so the choice
-                      // survives tab-switch and CLI restart.
-                      if (activeTabId != null) {
-                        updatePaneEffort(activeTabId, next === "default" ? null : next);
-                      }
-                    }}
-                    className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-1.5 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    title="Claude thinking effort — persisted per tab"
-                  >
-                    {CLAUDE_EFFORT_OPTIONS.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                <select
+                  value={botEffortDraft}
+                  onChange={(e) => {
+                    const next = normalizeClaudeEffortOption(e.target.value);
+                    setBotEffortDraft(next);
+                    // Persist on the server (and CLI's .apas) so the choice
+                    // survives tab-switch and CLI restart.
+                    if (activeTabId != null) {
+                      updatePaneEffort(activeTabId, next === "default" ? null : next);
+                    }
+                  }}
+                  className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-1.5 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  title="Claude thinking effort — persisted per tab"
+                >
+                  {CLAUDE_EFFORT_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
               )}
               {activeStatus && activeTabId != null && (
                 <button
