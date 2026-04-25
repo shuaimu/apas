@@ -980,6 +980,21 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         }
                     }
                 }
+                Ok(WebToServer::InterruptPane { pane_id }) => {
+                    if let Some(sid) = session_id {
+                        tracing::info!("Interrupting pane {} in session {}", pane_id, sid);
+                        state
+                            .sessions
+                            .route_to_cli(
+                                &sid,
+                                ServerToCli::InterruptPane {
+                                    session_id: sid,
+                                    pane_id,
+                                },
+                            )
+                            .await;
+                    }
+                }
                 Ok(WebToServer::UpdatePaneEffort { pane_id, effort }) => {
                     if let Some(sid) = session_id {
                         let normalized = effort.as_deref().and_then(normalize_start_bot_effort);

@@ -3927,6 +3927,59 @@ async fn run_server_connection(
                                                     session_id, panes }).unwrap_or_default();
                                                 let _ = ws_sender.send(Message::Text(msg.into())).await;
                                             }
+                                            ServerToCli::InterruptPane { session_id: _, pane_id: target_pane } => {
+                                                // Snapshot the child PID without holding the meta
+                                                // lock across the kill (the worker thread may want
+                                                // it on exit).
+                                                let child_pid: Option<u32> = {
+                                                    let metas = pane_metas.lock().unwrap();
+                                                    metas
+                                                        .get(&target_pane)
+                                                        .and_then(|m| m.child_process.lock().ok().and_then(|g| g.as_ref().map(|c| c.id())))
+                                                };
+                                                match child_pid {
+                                                    Some(pid) => {
+                                                        tracing::info!(
+                                                            pane_id = target_pane,
+                                                            pid,
+                                                            "InterruptPane: sending SIGINT to agent",
+                                                        );
+                                                        // SIGINT first; if it doesn't die in 2s, SIGKILL.
+                                                        let _ = std::process::Command::new("kill")
+                                                            .arg("-INT")
+                                                            .arg(pid.to_string())
+                                                            .status();
+                                                        let pid_for_fallback = pid;
+                                                        let pane_for_fallback = target_pane;
+                                                        std::thread::spawn(move || {
+                                                            std::thread::sleep(Duration::from_secs(2));
+                                                            // If still alive, escalate.
+                                                            let alive = std::path::Path::new(&format!(
+                                                                "/proc/{}",
+                                                                pid_for_fallback
+                                                            ))
+                                                            .exists();
+                                                            if alive {
+                                                                tracing::warn!(
+                                                                    pane_id = pane_for_fallback,
+                                                                    pid = pid_for_fallback,
+                                                                    "InterruptPane: SIGINT didn't take, sending SIGKILL",
+                                                                );
+                                                                let _ = std::process::Command::new("kill")
+                                                                    .arg("-KILL")
+                                                                    .arg(pid_for_fallback.to_string())
+                                                                    .status();
+                                                            }
+                                                        });
+                                                    }
+                                                    None => {
+                                                        tracing::info!(
+                                                            pane_id = target_pane,
+                                                            "InterruptPane: no live agent for this pane, ignoring",
+                                                        );
+                                                    }
+                                                }
+                                            }
                                             ServerToCli::UpdatePaneEffort { session_id: _, pane_id: target_pane, effort } => {
                                                 let normalized = normalize_effort_level(effort.as_deref());
                                                 {

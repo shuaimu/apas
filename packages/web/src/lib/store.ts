@@ -347,6 +347,7 @@ interface AppState {
   removePane: (paneId: number) => void;
   updatePaneLabel: (paneId: number, label: string) => void;
   updatePaneEffort: (paneId: number, effort: string | null) => void;
+  interruptPane: (paneId: number) => void;
   reorderPanes: (paneIds: number[]) => void;
   startBot: (
     paneId: number,
@@ -1092,6 +1093,13 @@ export const useStore = create<AppState>((set, get) => ({
         pane_id: paneId,
         effort: effort ?? null,
       }));
+    }
+  },
+
+  interruptPane: (paneId: number) => {
+    const { ws } = get();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "interrupt_pane", pane_id: paneId }));
     }
   },
 

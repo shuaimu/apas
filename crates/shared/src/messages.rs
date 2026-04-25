@@ -194,6 +194,10 @@ pub enum ServerToCli {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
     },
+
+    /// Interrupt a pane's agent subprocess (SIGINT). Used to unwedge a turn
+    /// stuck in a tool call so the queued user input can be processed.
+    InterruptPane { session_id: Uuid, pane_id: u32 },
 }
 
 // ============================================================================
@@ -361,6 +365,11 @@ pub enum WebToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
     },
+
+    /// Interrupt the agent process running for a pane (e.g. claude wedged on
+    /// a long-running Bash tool call). The CLI signals SIGINT to its
+    /// subprocess so the current turn aborts and queued input can flow.
+    InterruptPane { pane_id: u32 },
 
     /// Reorder panes (array of pane_ids in desired order)
     ReorderPanes { pane_ids: Vec<u32> },

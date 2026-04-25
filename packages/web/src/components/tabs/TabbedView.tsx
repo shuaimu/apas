@@ -193,6 +193,7 @@ export function TabbedView() {
   const removePane = useStore((s) => s.removePane);
   const updatePaneLabel = useStore((s) => s.updatePaneLabel);
   const updatePaneEffort = useStore((s) => s.updatePaneEffort);
+  const interruptPane = useStore((s) => s.interruptPane);
   const reorderPanes = useStore((s) => s.reorderPanes);
   const startBot = useStore((s) => s.startBot);
   const stopBot = useStore((s) => s.stopBot);
@@ -728,6 +729,23 @@ export function TabbedView() {
                     ))}
                   </select>
                 </label>
+              )}
+              {activeStatus && activeTabId != null && (
+                <button
+                  onClick={() => {
+                    if (activeTabId == null) return;
+                    if (confirm(
+                      "Interrupt this pane's current turn? The agent process will be sent SIGINT (and SIGKILL after 2s if it doesn't exit). Queued input will run next.",
+                    )) {
+                      interruptPane(activeTabId);
+                    }
+                  }}
+                  className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-red-500 hover:bg-red-600 text-white"
+                  title="Interrupt the current agent run (SIGINT). Use when a turn is wedged on a hung tool call."
+                >
+                  <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h12v12H6z" /></svg>
+                  Interrupt
+                </button>
               )}
             </>
           )
