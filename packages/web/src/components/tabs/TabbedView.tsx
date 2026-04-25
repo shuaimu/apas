@@ -703,7 +703,7 @@ export function TabbedView() {
                 title="Start autonomous bot execution in this tab"
               >
                 <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
-                Start Bot
+                Bot
               </button>
               {activeSupportsClaudeEffort && (
                 <label className="flex items-center gap-1 text-xs text-gray-700 dark:text-gray-300">
