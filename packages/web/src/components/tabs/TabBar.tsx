@@ -467,6 +467,15 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
             Claude Tab
           </button>
           <button
+            onClick={() => { onAddTab("claude-old"); setShowMenu(false); }}
+            className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
+          >
+            <span className="text-blue-400 flex-shrink-0">
+              <ProviderIcon provider="claude" className="w-4 h-4" />
+            </span>
+            Claude-old Tab
+          </button>
+          <button
             onClick={() => {
               onAddTab("claude", MINIMAX_DEFAULT_MODEL);
               setShowMenu(false);

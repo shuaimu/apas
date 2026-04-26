@@ -54,7 +54,7 @@ export interface UsageLimits {
   fetchedAt?: string;
 }
 
-export type Provider = "claude" | "codex" | "minimax" | "glm" | "opencode" | "cursor-agent";
+export type Provider = "claude" | "claude-old" | "codex" | "minimax" | "glm" | "opencode" | "cursor-agent";
 
 export type UsageLimitsByProvider = Partial<Record<Provider, UsageLimits>>;
 
@@ -136,6 +136,7 @@ function normalizeProvider(raw: unknown): Provider | null {
     const normalized = raw.trim().toLowerCase();
     if (normalized === "minimax" || normalized === "mini_max") return "minimax";
     if (normalized === "claude" || normalized === "anthropic") return "claude";
+    if (normalized === "claude-old" || normalized === "claude_old") return "claude-old";
     if (normalized === "codex" || normalized === "openai" || normalized === "chatgpt") return "codex";
     if (normalized === "glm" || normalized === "zai" || normalized === "z.ai" || normalized === "zhipu") return "glm";
     if (normalized === "opencode") return "opencode";

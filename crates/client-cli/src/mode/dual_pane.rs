@@ -119,7 +119,9 @@ fn resolve_pane_binary_path(
     cursor_agent_path: &str,
 ) -> String {
     match provider {
-        Provider::Claude | Provider::Minimax | Provider::Glm => claude_path.to_string(),
+        Provider::Claude | Provider::ClaudeOld | Provider::Minimax | Provider::Glm => {
+            claude_path.to_string()
+        }
         Provider::Codex => codex_path.to_string(),
         Provider::Opencode => opencode_path.to_string(),
         Provider::CursorAgent => cursor_agent_path.to_string(),
@@ -131,6 +133,7 @@ fn provider_display_name(provider: &Provider, model: Option<&str>) -> &'static s
         Provider::Claude if is_minimax_model(model) => "MiniMax",
         Provider::Claude if is_glm_model(model) => "GLM",
         Provider::Claude => "Claude",
+        Provider::ClaudeOld => "Claude-old",
         Provider::Codex => "Codex",
         Provider::Minimax => "MiniMax",
         Provider::Glm => "GLM",
@@ -143,6 +146,7 @@ fn provider_config_key(provider: &Provider, model: Option<&str>) -> &'static str
     match provider {
         Provider::Claude if is_minimax_model(model) => "claude_path",
         Provider::Claude => "claude_path",
+        Provider::ClaudeOld => "claude_path",
         Provider::Codex => "codex_path",
         Provider::Minimax => "claude_path",
         Provider::Glm => "claude_path",
@@ -241,7 +245,7 @@ fn build_pane_env_overrides(
 ) -> Result<Vec<(String, String)>, String> {
     if !matches!(
         provider,
-        Provider::Claude | Provider::Minimax | Provider::Glm
+        Provider::Claude | Provider::ClaudeOld | Provider::Minimax | Provider::Glm
     ) {
         return Ok(Vec::new());
     }
@@ -1914,6 +1918,7 @@ fn active_usage_providers(pane_metas: &PaneMetas) -> (bool, bool, bool, bool) {
                 has_glm = true
             }
             Provider::Claude => has_claude = true,
+            Provider::ClaudeOld => has_claude = true,
             Provider::Codex => has_codex = true,
             Provider::Minimax => has_minimax = true,
             Provider::Glm => has_glm = true,
@@ -1958,7 +1963,7 @@ fn build_agent_args(
     try_resume: bool,
 ) -> (Vec<String>, bool) {
     match provider {
-        Provider::Claude | Provider::Minimax | Provider::Glm => {
+        Provider::Claude | Provider::ClaudeOld | Provider::Minimax | Provider::Glm => {
             let mut base = vec![
                 "--print".to_string(),
                 "--output-format".to_string(),
@@ -1977,7 +1982,7 @@ fn build_agent_args(
                     base.extend_from_slice(&["--model".to_string(), trimmed.to_string()]);
                 }
             }
-            if matches!(provider, Provider::Claude)
+            if matches!(provider, Provider::Claude | Provider::ClaudeOld)
                 && !is_minimax_model(model)
                 && !is_glm_model(model)
             {
@@ -2116,7 +2121,7 @@ fn parse_agent_output(
     session_id_str: &str,
 ) -> Option<ClaudeStreamMessage> {
     match provider {
-        Provider::Claude | Provider::Minimax | Provider::Glm => {
+        Provider::Claude | Provider::ClaudeOld | Provider::Minimax | Provider::Glm => {
             serde_json::from_str::<ClaudeStreamMessage>(line).ok()
         }
         Provider::Codex => match serde_json::from_str::<CodexStreamMessage>(line) {
@@ -3108,8 +3113,623 @@ fn run_deadloop_session_inner(
     }
 }
 
+/// Check if claude code's on-disk session log exists for the given session
+/// id and working dir. Used by the streaming worker to decide whether the
+/// first spawn should `--resume` an existing session or `--session-id` a new
+/// one. Layout matches claude code's: `~/.claude/projects/<encoded-cwd>/<session_id>.jsonl`,
+/// where the cwd is encoded by replacing `/` with `-`.
+fn session_jsonl_exists(working_dir: &str, session_id: &Uuid) -> bool {
+    let Some(home) = std::env::var_os("HOME") else { return false };
+    let encoded: String = working_dir
+        .chars()
+        .map(|c| if c == '/' { '-' } else { c })
+        .collect();
+    let path = std::path::Path::new(&home)
+        .join(".claude")
+        .join("projects")
+        .join(encoded)
+        .join(format!("{}.jsonl", session_id));
+    path.exists()
+}
+
+/// Per-pane background-task watcher for the streaming worker.
+///
+/// Claude code stores Bash background-task output at
+/// `/tmp/claude-<uid>/<encoded-cwd>/<session_id>/tasks/<task-id>.output`,
+/// growing in real time as the task writes. By default claude only re-reads
+/// these files when the user asks (via `TaskOutput`), so a Monitor watcher or
+/// `tail -F` that fires after the agent's last turn sits unread until the
+/// user types something. With the streaming worker in place we own claude's
+/// stdin, so we can poll these files and synthesize a wake-up prompt the
+/// instant a task produces new output that has settled.
+///
+/// Algorithm:
+///   * Every 5 s, scan the tasks dir for `*.output` files.
+///   * Track per-file high-water mark in memory.
+///   * If a file has grown since last poll, mark it "growing" and remember
+///     the timestamp.
+///   * If a file has NOT grown since the previous poll, has previously
+///     grown (i.e. there's pending unread output), and we haven't already
+///     fired for this growth episode, send a synthesized prompt to the
+///     streaming worker via `wake_tx` and mark "fired".
+///
+/// `wake_tx` is consumed by the inner loop, which writes the prompt onto
+/// claude's stdin as a normal user turn (the same mechanism we use for
+/// human prompts).
+fn poll_background_tasks(
+    session_id: Uuid,
+    working_dir: &str,
+    pane_id: u32,
+    wake_tx: std::sync::mpsc::Sender<String>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let uid = unsafe { libc::getuid() };
+    let encoded_cwd: String = working_dir
+        .chars()
+        .map(|c| if c == '/' { '-' } else { c })
+        .collect();
+    let tasks_dir = std::path::PathBuf::from(format!(
+        "/tmp/claude-{}/{}/{}/tasks",
+        uid, encoded_cwd, session_id
+    ));
+    // Marker file written by `apas-stop-hook.sh` (configured in claude code's
+    // settings.json hooks.Stop). Its mtime is the authoritative "claude went
+    // idle at" timestamp. We only fire auto-wake for task output that grew
+    // AFTER this mtime — output produced during a turn is part of the turn
+    // and claude already saw it, so it shouldn't trigger a new prompt.
+    let stop_marker_path = std::path::PathBuf::from(format!(
+        "/tmp/apas-stop-marks/{}",
+        session_id
+    ));
+
+    // task_id -> (last_seen_size, last_seen_mtime, fired_for_this_episode)
+    let mut state: HashMap<String, (u64, std::time::SystemTime, bool)> = HashMap::new();
+    const POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+    while !shutdown.load(Ordering::SeqCst) {
+        let entries = match std::fs::read_dir(&tasks_dir) {
+            Ok(it) => it,
+            Err(_) => {
+                thread::sleep(POLL_INTERVAL);
+                continue;
+            }
+        };
+
+        let stop_mtime = std::fs::metadata(&stop_marker_path)
+            .and_then(|m| m.modified())
+            .ok();
+
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("output") {
+                continue;
+            }
+            let Some(task_id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let task_id = task_id.to_string();
+            let meta = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let size = meta.len();
+            let file_mtime = match meta.modified() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+
+            let entry_state = state
+                .entry(task_id.clone())
+                .or_insert_with(|| (size, file_mtime, true));
+            // Brand-new files we observe with their full current size are NOT
+            // a wake event — they were already there when we started polling.
+            // Setting fired=true suppresses the first-sighting fire.
+
+            if size > entry_state.0 {
+                // Grew since last poll → not yet settled.
+                entry_state.0 = size;
+                entry_state.1 = file_mtime;
+                entry_state.2 = false;
+                continue;
+            }
+            // Settled. Decide whether to fire.
+            //   1. Must not have already fired for this growth episode.
+            //   2. Stop hook must have observed at least one idle event
+            //      (otherwise we don't know whether the file's growth is
+            //      part of an in-progress turn or genuinely post-idle).
+            //   3. The file's growth must have happened AFTER claude went
+            //      idle (file_mtime > stop_mtime). Output produced during
+            //      a turn was already consumed by claude as a tool result.
+            if entry_state.2 {
+                continue;
+            }
+            let Some(stop_mtime) = stop_mtime else { continue };
+            if entry_state.1 <= stop_mtime {
+                continue;
+            }
+            let prompt = format!(
+                "[apas auto-wake] Background task {} produced new output. Use TaskOutput to read it.",
+                task_id
+            );
+            if wake_tx.send(prompt).is_err() {
+                return; // inner loop gone
+            }
+            tracing::info!(
+                pane_id,
+                task_id = %task_id,
+                size,
+                "auto-wake fired (post-stop, settled)",
+            );
+            entry_state.2 = true;
+        }
+
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Streaming variant for `Provider::Claude` interactive panes: keeps a single
+/// long-lived `claude --print --input-format stream-json --output-format
+/// stream-json --resume <id>` process alive across many turns. User prompts
+/// are pushed onto its stdin as `{"type":"user","message":{"role":"user",
+/// "content":"..."}}` JSON lines (the wire format the
+/// `@anthropic-ai/claude-code` SDK uses, observed via slopus/happy-cli).
+///
+/// Why this exists, vs. the per-turn `--print --resume` path:
+///   * Background tasks (Monitor watcher, `tail -F`, etc.) stay attached to
+///     one stable parent. When they emit output, claude can react in the
+///     same session — the precondition for any future "auto-wake" feature.
+///   * Subagent / Task children stay alive across turns instead of being
+///     orphaned at every Result.
+///   * Cold-start cost (model load, MCP init) is paid once.
+///
+/// Restart conditions: child crashes, stdout EOFs, stdin write fails, or
+/// shutdown / pane teardown is requested. On restart we re-spawn with
+/// `--resume <claude_session_id>` so the conversation continues.
+#[allow(clippy::too_many_arguments)]
+fn run_pane_session_streaming(
+    binary_path: &str,
+    working_dir: &str,
+    session_id: Uuid,
+    claude_session_id: Uuid,
+    pane_id: u32,
+    provider: &Provider,
+    model: Option<String>,
+    effort: Option<String>,
+    input_rx: mpsc::Receiver<PaneInput>,
+    output_tx: mpsc::Sender<PaneOutput>,
+    server_tx: tokio_mpsc::Sender<CliToServer>,
+    shutdown: Arc<AtomicBool>,
+    child_process: Arc<Mutex<Option<std::process::Child>>>,
+) {
+    use std::io::Write;
+
+    let _ = output_tx.send(PaneOutput {
+        text: format!("[Session: {} (streaming)]", &claude_session_id.to_string()[..8]),
+        pane_id,
+    });
+
+    // Spawn the per-pane background-task watcher once. It survives across
+    // claude respawns (state hashmap persists) so we don't refire wakes for
+    // tasks that grew during a respawn gap.
+    let (auto_wake_tx, auto_wake_rx) = mpsc::channel::<String>();
+    let watcher_session = claude_session_id;
+    let watcher_working_dir = working_dir.to_string();
+    let watcher_pane_id = pane_id;
+    let watcher_shutdown = shutdown.clone();
+    thread::spawn(move || {
+        poll_background_tasks(
+            watcher_session,
+            &watcher_working_dir,
+            watcher_pane_id,
+            auto_wake_tx,
+            watcher_shutdown,
+        );
+    });
+
+    // First spawn for a brand-new session_id: --resume will fail ("No
+    // conversation found"). Use --session-id <uuid> to create it. After the
+    // first successful spawn (or after we observe the session file on disk),
+    // flip to --resume for all subsequent restarts.
+    let mut try_resume_first = session_jsonl_exists(working_dir, &claude_session_id);
+
+    'spawn_loop: while !shutdown.load(Ordering::SeqCst) {
+        let pane_env = match build_pane_env_overrides(provider, model.as_deref()) {
+            Ok(env) => env,
+            Err(err) => {
+                let _ = output_tx.send(PaneOutput {
+                    text: format!("[{}]", err),
+                    pane_id,
+                });
+                thread::sleep(Duration::from_secs(2));
+                continue 'spawn_loop;
+            }
+        };
+
+        let using_resume = try_resume_first;
+        let mut args: Vec<String> = vec![
+            "--print".into(),
+            "--input-format".into(),
+            "stream-json".into(),
+            "--output-format".into(),
+            "stream-json".into(),
+            "--verbose".into(),
+            "--dangerously-skip-permissions".into(),
+        ];
+        if using_resume {
+            args.push("--resume".into());
+        } else {
+            args.push("--session-id".into());
+        }
+        args.push(claude_session_id.to_string());
+        if let Some(m) = model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if !is_minimax_model(Some(m)) && !is_glm_model(Some(m)) {
+                args.push("--model".into());
+                args.push(m.to_string());
+            }
+        }
+        if !is_minimax_model(model.as_deref()) && !is_glm_model(model.as_deref()) {
+            if let Some(eff) = normalize_effort_level(effort.as_deref()) {
+                tracing::info!(
+                    target: "apas::effort",
+                    effort = %eff,
+                    "Launching streaming claude with --effort",
+                );
+                args.push("--effort".into());
+                args.push(eff);
+            }
+        }
+
+        // Defensive: same guard as the per-turn path. Two `--resume` processes
+        // on one session would interleave writes to the .jsonl.
+        kill_processes_using_session(&claude_session_id.to_string());
+
+        let mut command = Command::new(binary_path);
+        command
+            .args(&args)
+            .current_dir(working_dir)
+            .env_remove("CLAUDECODE")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, value) in &pane_env {
+            command.env(key, value);
+        }
+
+        let mut child = match command.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = output_tx.send(PaneOutput {
+                    text: format!("[Failed to spawn agent: {}]", e),
+                    pane_id,
+                });
+                thread::sleep(Duration::from_secs(2));
+                continue 'spawn_loop;
+            }
+        };
+
+        let mut stdin = match child.stdin.take() {
+            Some(s) => s,
+            None => {
+                let _ = output_tx.send(PaneOutput {
+                    text: "[Failed to capture stdin]".to_string(),
+                    pane_id,
+                });
+                let _ = child.kill();
+                let _ = child.wait();
+                thread::sleep(Duration::from_secs(2));
+                continue 'spawn_loop;
+            }
+        };
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let stderr = child.stderr.take();
+        let child_pid = child.id();
+
+        // Hand the child to the shared slot so InterruptPane / shutdown
+        // handlers elsewhere can find and signal it.
+        if let Ok(mut guard) = child_process.lock() {
+            *guard = Some(child);
+        }
+
+        // Reader thread: parse stream-json off stdout, forward to UI/server.
+        // Unlike the per-turn path, we DO NOT exit on `result` — the process
+        // stays alive for the next turn.
+        let (reader_done_tx, reader_done_rx) = mpsc::channel::<()>();
+        let output_tx_reader = output_tx.clone();
+        let server_tx_reader = server_tx.clone();
+        let provider_reader = *provider;
+        let session_id_reader = session_id;
+        let pane_id_reader = pane_id;
+        let claude_session_id_str = claude_session_id.to_string();
+        let reader_thread = thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            let mut line_count: u64 = 0;
+            let mut had_io_error = false;
+            for line in reader.lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::warn!(
+                            pane_id = pane_id_reader,
+                            error = %e,
+                            "streaming reader hit IO error",
+                        );
+                        had_io_error = true;
+                        break;
+                    }
+                };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                line_count += 1;
+                match parse_agent_output(&provider_reader, &line, &claude_session_id_str) {
+                    Some(message) => {
+                        let is_result = matches!(message, ClaudeStreamMessage::Result { .. });
+                        let display_text = format_stream_message(&message);
+                        let _ = output_tx_reader.send(PaneOutput {
+                            text: display_text,
+                            pane_id: pane_id_reader,
+                        });
+                        let _ = server_tx_reader.blocking_send(CliToServer::StreamMessage {
+                            session_id: session_id_reader,
+                            message,
+                            pane_type: Some(PaneType::Interactive),
+                            pane_id: Some(pane_id_reader),
+                        });
+                        if is_result {
+                            // Same as per-turn path: clear the transient
+                            // "Thinking..." status as soon as the protocol
+                            // says the turn is done. The process stays alive
+                            // for the next user prompt.
+                            let _ = server_tx_reader.blocking_send(CliToServer::PaneStatus {
+                                session_id: session_id_reader,
+                                pane_type: PaneType::Interactive,
+                                pane_id: Some(pane_id_reader),
+                                status: None,
+                            });
+                        }
+                    }
+                    None => {
+                        let _ = output_tx_reader.send(PaneOutput {
+                            text: line,
+                            pane_id: pane_id_reader,
+                        });
+                    }
+                }
+            }
+            tracing::info!(
+                pane_id = pane_id_reader,
+                lines = line_count,
+                io_error = had_io_error,
+                "streaming reader exited (stdout closed or EOF)",
+            );
+            let _ = reader_done_tx.send(());
+        });
+
+        let stderr_thread = stderr.map(|err| {
+            let output_tx_err = output_tx.clone();
+            let server_tx_err = server_tx.clone();
+            let pane_id_err = pane_id;
+            let session_id_err = session_id;
+            thread::spawn(move || {
+                let reader = BufReader::new(err);
+                for line in reader.lines() {
+                    let Ok(line) = line else { break };
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let _ = output_tx_err.send(PaneOutput {
+                        text: format!("[stderr] {}", line),
+                        pane_id: pane_id_err,
+                    });
+                    let _ = server_tx_err.blocking_send(CliToServer::Output {
+                        session_id: session_id_err,
+                        data: format!("[stderr] {}", line),
+                        output_type: shared::OutputType::Error,
+                        pane_type: Some(PaneType::Interactive),
+                        pane_id: Some(pane_id_err),
+                    });
+                }
+            })
+        });
+
+        tracing::info!(
+            pane_id,
+            pid = child_pid,
+            using_resume,
+            session = %claude_session_id,
+            "streaming claude spawned",
+        );
+
+        // Inner loop: pump user prompts into stdin, watch for child death.
+        let mut break_reason = "shutdown";
+        let mut exit_status_str: Option<String> = None;
+        let mut prompts_sent: u64 = 0;
+        loop {
+            if shutdown.load(Ordering::SeqCst) {
+                if let Ok(mut guard) = child_process.lock() {
+                    if let Some(ref mut c) = *guard {
+                        let _ = c.kill();
+                    }
+                }
+                break_reason = "shutdown";
+                break;
+            }
+
+            // Stdout EOF means the child closed it (crashed or exited).
+            if reader_done_rx.try_recv().is_ok() {
+                break_reason = "stdout-eof";
+                break;
+            }
+
+            // Independent liveness check (covers crash where stdout still
+            // buffered): try_wait the child.
+            let (exited, status_dbg) = if let Ok(mut guard) = child_process.try_lock() {
+                if let Some(ref mut c) = *guard {
+                    match c.try_wait() {
+                        Ok(Some(s)) => (true, Some(format!("{:?}", s))),
+                        Ok(None) => (false, None),
+                        Err(e) => (true, Some(format!("try_wait error: {}", e))),
+                    }
+                } else {
+                    (true, Some("guard empty".to_string()))
+                }
+            } else {
+                (false, None)
+            };
+            if exited {
+                exit_status_str = status_dbg;
+                break_reason = "child-exited";
+                break;
+            }
+
+            // Auto-wake prompts (synthesized by the background-task watcher)
+            // take priority over user input — drain them first, non-blocking.
+            // They go onto the same stdin via the same JSON envelope, but we
+            // tag display so the user can tell them apart in the UI and we
+            // do NOT echo them as UserInput to the server (they're not user-
+            // typed; claude's session jsonl will record them as user turns
+            // anyway because they arrive on stdin).
+            let next_prompt: Option<(String, bool, bool)> = match auto_wake_rx.try_recv() {
+                Ok(p) => Some((p, false, true)),
+                Err(_) => match input_rx.recv_timeout(Duration::from_millis(200)) {
+                    Ok((p, from_tui)) => Some((p, from_tui, false)),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        if let Ok(mut guard) = child_process.lock() {
+                            if let Some(ref mut c) = *guard {
+                                let _ = c.kill();
+                            }
+                        }
+                        break_reason = "input-channel-closed";
+                        break;
+                    }
+                },
+            };
+
+            match next_prompt {
+                Some((prompt, from_tui, is_auto_wake)) => {
+                    let display_prefix = if is_auto_wake { "[auto-wake]" } else { ">" };
+                    let _ = output_tx.send(PaneOutput {
+                        text: format!(
+                            "{} {}",
+                            display_prefix,
+                            &prompt[..std::cmp::min(140, prompt.len())]
+                        ),
+                        pane_id,
+                    });
+                    let _ = output_tx.send(PaneOutput {
+                        text: "[Thinking...]".to_string(),
+                        pane_id,
+                    });
+                    let _ = server_tx.blocking_send(CliToServer::PaneStatus {
+                        session_id,
+                        pane_type: PaneType::Interactive,
+                        pane_id: Some(pane_id),
+                        status: Some("Thinking...".to_string()),
+                    });
+                    if from_tui && !is_auto_wake {
+                        let _ = server_tx.blocking_send(CliToServer::UserInput {
+                            session_id,
+                            text: prompt.clone(),
+                            pane_type: Some(PaneType::Interactive),
+                            pane_id: Some(pane_id),
+                        });
+                    }
+                    // Wire format from happy-cli/src/claude/sdk/utils.ts:190.
+                    // Plain string content, not a content-block array.
+                    let envelope = serde_json::json!({
+                        "type": "user",
+                        "message": { "role": "user", "content": prompt },
+                    });
+                    let line = format!("{}\n", envelope);
+                    if let Err(e) = stdin.write_all(line.as_bytes()) {
+                        let _ = output_tx.send(PaneOutput {
+                            text: format!("[Failed to send input to agent: {}]", e),
+                            pane_id,
+                        });
+                        tracing::warn!(
+                            pane_id,
+                            pid = child_pid,
+                            error = %e,
+                            "streaming stdin write failed",
+                        );
+                        break_reason = "stdin-write-failed";
+                        break;
+                    }
+                    let _ = stdin.flush();
+                    prompts_sent += 1;
+                    tracing::info!(
+                        pane_id,
+                        pid = child_pid,
+                        prompts_sent,
+                        prompt_len = prompt.len(),
+                        is_auto_wake,
+                        "streaming wrote prompt to stdin",
+                    );
+                }
+                None => {
+                    // No prompt this tick (auto-wake empty + input_rx timed out);
+                    // loop again to check shutdown / liveness.
+                }
+            }
+        }
+
+        tracing::info!(
+            pane_id,
+            pid = child_pid,
+            reason = break_reason,
+            prompts_sent,
+            exit_status = ?exit_status_str,
+            "streaming claude inner loop ended",
+        );
+
+        // Drop stdin to signal EOF to claude (it will exit cleanly if it
+        // hasn't already), then reap.
+        drop(stdin);
+        if let Ok(mut guard) = child_process.lock() {
+            if let Some(mut c) = guard.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+        let _ = reader_thread.join();
+        if let Some(t) = stderr_thread {
+            let _ = t.join();
+        }
+
+        let _ = server_tx.blocking_send(CliToServer::PaneStatus {
+            session_id,
+            pane_type: PaneType::Interactive,
+            pane_id: Some(pane_id),
+            status: None,
+        });
+
+        if shutdown.load(Ordering::SeqCst) || break_reason == "input-channel-closed" {
+            return;
+        }
+
+        // If we tried --resume on a session that doesn't exist on disk yet,
+        // the child exits almost immediately with an error. Flip to
+        // --session-id for the next spawn so we create the session instead.
+        if using_resume && !session_jsonl_exists(working_dir, &claude_session_id) {
+            try_resume_first = false;
+            let _ = output_tx.send(PaneOutput {
+                text: "[No prior session found, creating fresh session...]".to_string(),
+                pane_id,
+            });
+        } else {
+            // Once the session exists, all future restarts must --resume.
+            try_resume_first = true;
+        }
+
+        // Brief backoff before respawning, so a crash-loop doesn't burn CPU.
+        thread::sleep(Duration::from_secs(2));
+    }
+}
+
 /// Run a generic interactive pane session.
 /// Input comes from a single channel — both TUI and web input are routed through input_channels.
+#[allow(clippy::too_many_arguments)]
 fn run_pane_session(
     binary_path: &str,
     working_dir: &str,
@@ -3125,6 +3745,26 @@ fn run_pane_session(
     shutdown: Arc<AtomicBool>,
     child_process: Arc<Mutex<Option<std::process::Child>>>,
 ) {
+    // Provider::Claude → new long-lived stream-json process.
+    // Provider::ClaudeOld and everyone else → legacy per-turn --print spawn.
+    if matches!(provider, Provider::Claude) {
+        return run_pane_session_streaming(
+            binary_path,
+            working_dir,
+            session_id,
+            claude_session_id,
+            pane_id,
+            provider,
+            model,
+            effort,
+            input_rx,
+            output_tx,
+            server_tx,
+            shutdown,
+            child_process,
+        );
+    }
+
     let mut first_message = true;
     let mut try_resume_first = true;
     // For Codex, we need to capture the real thread_id from the first invocation
@@ -3212,6 +3852,14 @@ fn run_pane_session(
             }
         };
 
+        // Defensive: if a previous agent for this same session_id is somehow
+        // still alive (orphaned grandchild kept the stdout pipe open and we
+        // never reaped, or a parallel pane assigned the same id), kill it
+        // before spawning a new --resume. Two concurrent --resume processes
+        // on the same session would interleave writes to its .jsonl.
+        // Mirrors the deadloop spawn path.
+        kill_processes_using_session(&claude_session_id.to_string());
+
         let mut command = Command::new(binary_path);
         command
             .args(&args)
@@ -3279,6 +3927,14 @@ fn run_pane_session(
                 });
 
                 let check_interval = Duration::from_millis(100);
+                let mut process_exited = false;
+                let mut timeouts_after_exit: u32 = 0;
+                // 100ms * 30 = 3s grace for stdout drain after the child dies.
+                // Without this, an orphaned grandchild (Monitor watcher,
+                // tail -F, etc.) holding the stdout fd would keep the pipe
+                // open forever and we'd never reach the wait() below — leaving
+                // a [claude] <defunct> zombie under the apas daemon.
+                const MAX_TIMEOUTS_AFTER_EXIT: u32 = 30;
                 loop {
                     if shutdown.load(Ordering::SeqCst) {
                         if let Ok(mut guard) = child_process.lock() {
@@ -3287,6 +3943,16 @@ fn run_pane_session(
                             }
                         }
                         break;
+                    }
+
+                    if !process_exited {
+                        if let Ok(mut guard) = child_process.try_lock() {
+                            if let Some(ref mut child) = *guard {
+                                if let Ok(Some(_status)) = child.try_wait() {
+                                    process_exited = true;
+                                }
+                            }
+                        }
                     }
 
                     let session_id_str = claude_session_id.to_string();
@@ -3360,7 +4026,15 @@ fn run_pane_session(
                             }
                         }
                         Ok(None) => break,
-                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if process_exited {
+                                timeouts_after_exit += 1;
+                                if timeouts_after_exit >= MAX_TIMEOUTS_AFTER_EXIT {
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }

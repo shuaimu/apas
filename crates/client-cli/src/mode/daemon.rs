@@ -421,8 +421,12 @@ impl DaemonState {
         // Build the command as "sh -c '... exec apas ... 2>>logfile'" so the
         // redirection happens inside the shell tmux runs, after env/PATH have
         // been applied.
+        // RUST_LOG=apas=info so the headless daemon emits the streaming worker's
+        // tracing::info! breadcrumbs (spawn, prompt-sent, reader-exit, inner
+        // loop break reason). Default tracing level is "warn", which hides
+        // them. The log goes to /tmp/apas-headless-<id>.log.
         let inner_cmd = format!(
-            "exec env -u CLAUDECODE PATH={} {} --headless --server {} --token {} -d {} 2>>{}",
+            "exec env -u CLAUDECODE PATH={} RUST_LOG=apas=info {} --headless --server {} --token {} -d {} 2>>{}",
             shell_escape(&child_path),
             shell_escape(&executable.to_string_lossy()),
             shell_escape(server_url),

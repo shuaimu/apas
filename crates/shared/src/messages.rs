@@ -681,6 +681,8 @@ pub enum PaneType {
 pub enum Provider {
     #[default]
     Claude,
+    #[serde(rename = "claude-old")]
+    ClaudeOld,
     Codex,
     Minimax,
     Glm,
