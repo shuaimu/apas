@@ -704,6 +704,12 @@ async fn run_inner(
             &opencode_path,
             &cursor_agent_path,
         );
+        let interrupt_slot = pane_metas
+            .lock()
+            .unwrap()
+            .get(&pane_id)
+            .map(|m| m.streaming_interrupt_tx.clone())
+            .unwrap_or_else(|| Arc::new(Mutex::new(None)));
         pane_threads.push(thread::spawn(move || {
             run_deadloop_session(
                 &binary_path,
@@ -723,6 +729,7 @@ async fn run_inner(
                 stop_flag,
                 child_process,
                 event_tx,
+                interrupt_slot,
             )
         }));
     }
@@ -1193,6 +1200,12 @@ fn handle_tui_events(
                     let shutdown = shutdown.clone();
                     let event_tx = event_tx.clone();
                     let working_dir = working_dir.to_string();
+                    let interrupt_slot = pane_metas
+                        .lock()
+                        .unwrap()
+                        .get(&pane_id)
+                        .map(|m| m.streaming_interrupt_tx.clone())
+                        .unwrap_or_else(|| Arc::new(Mutex::new(None)));
                     thread::spawn(move || {
                         run_deadloop_session(
                             &binary_path,
@@ -1212,6 +1225,7 @@ fn handle_tui_events(
                             stop_flag,
                             child_proc,
                             event_tx,
+                            interrupt_slot,
                         )
                     });
                 } else {
@@ -1485,6 +1499,12 @@ fn handle_tui_events(
                     let shutdown = shutdown.clone();
                     let event_tx = event_tx.clone();
                     let working_dir = working_dir.to_string();
+                    let interrupt_slot = pane_metas
+                        .lock()
+                        .unwrap()
+                        .get(&pane_id)
+                        .map(|m| m.streaming_interrupt_tx.clone())
+                        .unwrap_or_else(|| Arc::new(Mutex::new(None)));
                     thread::spawn(move || {
                         run_deadloop_session(
                             &binary_path,
@@ -1504,6 +1524,7 @@ fn handle_tui_events(
                             stop_flag,
                             child_proc,
                             event_tx,
+                            interrupt_slot,
                         )
                     });
                 }
@@ -2588,6 +2609,7 @@ mod tests {
 }
 
 /// Run the deadloop (autonomous) session on any pane
+#[allow(clippy::too_many_arguments)]
 fn run_deadloop_session(
     binary_path: &str,
     working_dir: &str,
@@ -2606,6 +2628,7 @@ fn run_deadloop_session(
     stop_requested: Arc<AtomicBool>,
     child_process: Arc<Mutex<Option<std::process::Child>>>,
     event_tx: mpsc::Sender<TuiEvent>,
+    interrupt_tx_slot: Arc<Mutex<Option<mpsc::Sender<()>>>>,
 ) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_deadloop_session_inner(
@@ -2626,6 +2649,7 @@ fn run_deadloop_session(
             stop_requested,
             child_process,
             event_tx,
+            interrupt_tx_slot,
         )
     }));
 
@@ -2644,6 +2668,7 @@ fn run_deadloop_session(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_deadloop_session_inner(
     binary_path: &str,
     working_dir: &str,
@@ -2662,7 +2687,35 @@ fn run_deadloop_session_inner(
     stop_requested: Arc<AtomicBool>,
     child_process: Arc<Mutex<Option<std::process::Child>>>,
     event_tx: mpsc::Sender<TuiEvent>,
+    interrupt_tx_slot: Arc<Mutex<Option<mpsc::Sender<()>>>>,
 ) {
+    // Provider::Claude → long-lived stream-json process driven from
+    // run_deadloop_session_streaming. Other providers fall through to the
+    // legacy per-iteration --print spawn below.
+    if matches!(provider, Provider::Claude) {
+        return run_deadloop_session_streaming(
+            binary_path,
+            working_dir,
+            session_id,
+            claude_session_id,
+            pane_id,
+            prompt,
+            model,
+            effort,
+            min_iteration_interval_minutes,
+            provider,
+            output_tx,
+            server_tx,
+            shutdown,
+            pause,
+            stop_requested,
+            child_process,
+            event_tx,
+            interrupt_tx_slot,
+        );
+    }
+    let _ = interrupt_tx_slot; // unused for legacy path
+
     // For Codex, we need to capture the real thread_id from the first invocation
     // and use it for subsequent `codex exec resume` calls.
     let mut claude_session_id = claude_session_id;
@@ -3349,6 +3402,7 @@ fn tail_session_jsonl(
     server_tx: tokio_mpsc::Sender<CliToServer>,
     seen_uuids: Arc<Mutex<HashSet<String>>>,
     shutdown: Arc<AtomicBool>,
+    pane_type: PaneType,
 ) {
     let Some(home) = std::env::var_os("HOME") else { return };
     let encoded: String = working_dir
@@ -3466,7 +3520,7 @@ fn tail_session_jsonl(
                 let _ = server_tx.blocking_send(CliToServer::StreamMessage {
                     session_id: apas_session_id,
                     message,
-                    pane_type: Some(PaneType::Interactive),
+                    pane_type: Some(pane_type),
                     pane_id: Some(pane_id),
                 });
                 forwarded_count += 1;
@@ -3521,6 +3575,15 @@ fn run_pane_session_streaming(
     shutdown: Arc<AtomicBool>,
     child_process: Arc<Mutex<Option<std::process::Child>>>,
     interrupt_tx_slot: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+    // result_signal_tx: when Some, the stdout reader sends () on every
+    // Result event. Used by the deadloop driver to detect iteration
+    // boundary so it can throttle and re-inject the next prompt. None for
+    // plain interactive panes.
+    result_signal_tx: Option<mpsc::Sender<()>>,
+    // pane_type: tagged on every StreamMessage / PaneStatus / Output sent
+    // upstream so the server / web UI route correctly. Interactive for
+    // user-driven panes, Deadloop for the streaming-deadloop driver.
+    pane_type: PaneType,
 ) {
     use std::io::Write;
 
@@ -3572,6 +3635,7 @@ fn run_pane_session_streaming(
     let tailer_server_tx = server_tx.clone();
     let tailer_seen = seen_uuids.clone();
     let tailer_shutdown = shutdown.clone();
+    let tailer_pane_type = pane_type;
     thread::spawn(move || {
         tail_session_jsonl(
             tailer_session,
@@ -3581,6 +3645,7 @@ fn run_pane_session_streaming(
             tailer_server_tx,
             tailer_seen,
             tailer_shutdown,
+            tailer_pane_type,
         );
     });
 
@@ -3697,8 +3762,10 @@ fn run_pane_session_streaming(
         let provider_reader = *provider;
         let session_id_reader = session_id;
         let pane_id_reader = pane_id;
+        let pane_type_reader = pane_type;
         let claude_session_id_str = claude_session_id.to_string();
         let reader_seen = seen_uuids.clone();
+        let reader_result_signal = result_signal_tx.clone();
         let reader_thread = thread::spawn(move || {
             let reader = BufReader::new(stdout);
             let mut line_count: u64 = 0;
@@ -3740,7 +3807,7 @@ fn run_pane_session_streaming(
                         let _ = server_tx_reader.blocking_send(CliToServer::StreamMessage {
                             session_id: session_id_reader,
                             message,
-                            pane_type: Some(PaneType::Interactive),
+                            pane_type: Some(pane_type_reader),
                             pane_id: Some(pane_id_reader),
                         });
                         if is_result {
@@ -3750,10 +3817,16 @@ fn run_pane_session_streaming(
                             // for the next user prompt.
                             let _ = server_tx_reader.blocking_send(CliToServer::PaneStatus {
                                 session_id: session_id_reader,
-                                pane_type: PaneType::Interactive,
+                                pane_type: pane_type_reader,
                                 pane_id: Some(pane_id_reader),
                                 status: None,
                             });
+                            // Notify a deadloop driver (if attached) that
+                            // an iteration just finished — drive_streaming_deadloop
+                            // uses this to throttle and re-inject the next prompt.
+                            if let Some(ref tx) = reader_result_signal {
+                                let _ = tx.send(());
+                            }
                         }
                     }
                     None => {
@@ -3778,6 +3851,7 @@ fn run_pane_session_streaming(
             let server_tx_err = server_tx.clone();
             let pane_id_err = pane_id;
             let session_id_err = session_id;
+            let pane_type_err = pane_type;
             thread::spawn(move || {
                 let reader = BufReader::new(err);
                 for line in reader.lines() {
@@ -3793,7 +3867,7 @@ fn run_pane_session_streaming(
                         session_id: session_id_err,
                         data: format!("[stderr] {}", line),
                         output_type: shared::OutputType::Error,
-                        pane_type: Some(PaneType::Interactive),
+                        pane_type: Some(pane_type_err),
                         pane_id: Some(pane_id_err),
                     });
                 }
@@ -3932,7 +4006,7 @@ fn run_pane_session_streaming(
                     });
                     let _ = server_tx.blocking_send(CliToServer::PaneStatus {
                         session_id,
-                        pane_type: PaneType::Interactive,
+                        pane_type,
                         pane_id: Some(pane_id),
                         status: Some("Thinking...".to_string()),
                     });
@@ -3940,7 +4014,7 @@ fn run_pane_session_streaming(
                         let _ = server_tx.blocking_send(CliToServer::UserInput {
                             session_id,
                             text: prompt.clone(),
-                            pane_type: Some(PaneType::Interactive),
+                            pane_type: Some(pane_type),
                             pane_id: Some(pane_id),
                         });
                     }
@@ -4008,7 +4082,7 @@ fn run_pane_session_streaming(
 
         let _ = server_tx.blocking_send(CliToServer::PaneStatus {
             session_id,
-            pane_type: PaneType::Interactive,
+            pane_type,
             pane_id: Some(pane_id),
             status: None,
         });
@@ -4033,6 +4107,220 @@ fn run_pane_session_streaming(
 
         // Brief backoff before respawning, so a crash-loop doesn't burn CPU.
         thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// Streaming variant for `Provider::Claude` deadloop panes (a.k.a. bots).
+///
+/// Reuses `run_pane_session_streaming` as the long-lived-claude substrate.
+/// Drives it from this thread by:
+///   * sending the deadloop prompt onto `input_tx` at the start of each
+///     iteration (after honoring `min_iteration_interval_minutes`)
+///   * waiting on `result_signal_rx` for the agent's `Result` event before
+///     starting the throttle for the next iteration
+///   * checking `pause` / `stop_requested` / `shutdown` between every step
+///
+/// Differences from the legacy per-turn deadloop:
+///   * Claude process stays alive across iterations (faster startup, no
+///     model/MCP cold-start, background tasks attached to a stable parent).
+///   * Group-kill on Result is gone — the streaming worker keeps the
+///     process running; the next iteration's prompt arrives on stdin.
+///   * Auto-wake watcher is intentionally inherited (it gates on the Stop
+///     hook marker, which fires on every Result, so it shouldn't spuriously
+///     interleave with the deadloop's own cadence — but worth watching for
+///     symptoms).
+#[allow(clippy::too_many_arguments)]
+fn run_deadloop_session_streaming(
+    binary_path: &str,
+    working_dir: &str,
+    session_id: Uuid,
+    claude_session_id: Uuid,
+    pane_id: u32,
+    prompt: &str,
+    model: Option<String>,
+    effort: Option<String>,
+    min_iteration_interval_minutes: u64,
+    provider: &Provider,
+    output_tx: mpsc::Sender<PaneOutput>,
+    server_tx: tokio_mpsc::Sender<CliToServer>,
+    shutdown: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
+    stop_requested: Arc<AtomicBool>,
+    child_process: Arc<Mutex<Option<std::process::Child>>>,
+    event_tx: mpsc::Sender<TuiEvent>,
+    interrupt_tx_slot: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+) {
+    let _ = output_tx.send(PaneOutput {
+        text: format!(
+            "[Streaming deadloop session: {}]",
+            &claude_session_id.to_string()[..8]
+        ),
+        pane_id,
+    });
+
+    let (input_tx, input_rx) = mpsc::channel::<PaneInput>();
+    let (result_signal_tx, result_signal_rx) = mpsc::channel::<()>();
+
+    // Spawn the streaming worker. It keeps claude alive; we drive prompts
+    // from this thread.
+    {
+        let binary_path = binary_path.to_string();
+        let working_dir = working_dir.to_string();
+        let model = model.clone();
+        let effort = effort.clone();
+        let provider = *provider;
+        let output_tx = output_tx.clone();
+        let server_tx = server_tx.clone();
+        let shutdown = shutdown.clone();
+        let child_process = child_process.clone();
+        let interrupt_tx_slot = interrupt_tx_slot.clone();
+        thread::spawn(move || {
+            run_pane_session_streaming(
+                &binary_path,
+                &working_dir,
+                session_id,
+                claude_session_id,
+                pane_id,
+                &provider,
+                model,
+                effort,
+                input_rx,
+                output_tx,
+                server_tx,
+                shutdown,
+                child_process,
+                interrupt_tx_slot,
+                Some(result_signal_tx),
+                PaneType::Deadloop,
+            );
+        });
+    }
+
+    let mut iteration: u64 = 0;
+    let mut was_paused = false;
+    let min_iteration_interval =
+        Duration::from_secs(min_iteration_interval_minutes.saturating_mul(60));
+    let mut last_iteration_started_at: Option<Instant> = None;
+
+    while !shutdown.load(Ordering::SeqCst) {
+        if stop_requested.load(Ordering::SeqCst) {
+            let _ = event_tx.send(TuiEvent::FinalizeStopBot {
+                pane_id,
+                stop_flag: stop_requested.clone(),
+            });
+            // Drop input_tx → streaming worker tears down naturally.
+            return;
+        }
+
+        if pause.load(Ordering::SeqCst) {
+            if !was_paused {
+                was_paused = true;
+                let _ = output_tx.send(PaneOutput {
+                    text: "[Deadloop paused — waiting for resume...]".to_string(),
+                    pane_id,
+                });
+            }
+            thread::sleep(Duration::from_millis(500));
+            continue;
+        } else if was_paused {
+            was_paused = false;
+            let _ = output_tx.send(PaneOutput {
+                text: "[Deadloop resumed]".to_string(),
+                pane_id,
+            });
+        }
+
+        // Throttle: enforce min_iteration_interval since previous iteration
+        // started, with cancellable sleep.
+        if let Some(last_started_at) = last_iteration_started_at {
+            if let Some(mut remaining) =
+                min_iteration_interval.checked_sub(last_started_at.elapsed())
+            {
+                if !remaining.is_zero() {
+                    let _ = output_tx.send(PaneOutput {
+                        text: format!(
+                            "[Waiting {}s before next iteration (min interval: {}m)]",
+                            remaining.as_secs(),
+                            min_iteration_interval_minutes
+                        ),
+                        pane_id,
+                    });
+                }
+                while !remaining.is_zero() {
+                    if shutdown.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if stop_requested.load(Ordering::SeqCst) {
+                        let _ = event_tx.send(TuiEvent::FinalizeStopBot {
+                            pane_id,
+                            stop_flag: stop_requested.clone(),
+                        });
+                        return;
+                    }
+                    if pause.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let sleep_for = std::cmp::min(remaining, Duration::from_millis(500));
+                    thread::sleep(sleep_for);
+                    remaining = min_iteration_interval
+                        .checked_sub(last_started_at.elapsed())
+                        .unwrap_or(Duration::ZERO);
+                }
+                if pause.load(Ordering::SeqCst) {
+                    continue;
+                }
+            }
+        }
+
+        last_iteration_started_at = Some(Instant::now());
+        iteration += 1;
+        let _ = output_tx.send(PaneOutput {
+            text: format!("=== Iteration {} ===", iteration),
+            pane_id,
+        });
+        // Echo the iteration prompt to the server's UserInput stream so the
+        // web UI shows what the bot is being asked. The streaming worker
+        // would NOT echo this for us (we pass from_tui=false below).
+        let _ = server_tx.try_send(CliToServer::UserInput {
+            session_id,
+            text: format!("[Iteration {}]\n{}", iteration, prompt),
+            pane_type: Some(PaneType::Deadloop),
+            pane_id: Some(pane_id),
+        });
+
+        if input_tx.send((prompt.to_string(), false)).is_err() {
+            let _ = output_tx.send(PaneOutput {
+                text: "[Streaming worker exited; deadloop ending.]".to_string(),
+                pane_id,
+            });
+            return;
+        }
+
+        // Wait for the iteration's `Result` event with periodic
+        // shutdown/stop cancellation.
+        loop {
+            if shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            if stop_requested.load(Ordering::SeqCst) {
+                let _ = event_tx.send(TuiEvent::FinalizeStopBot {
+                    pane_id,
+                    stop_flag: stop_requested.clone(),
+                });
+                return;
+            }
+            match result_signal_rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(()) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = output_tx.send(PaneOutput {
+                        text: "[Streaming worker channel closed; deadloop ending.]".to_string(),
+                        pane_id,
+                    });
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -4074,6 +4362,8 @@ fn run_pane_session(
             shutdown,
             child_process,
             interrupt_tx_slot,
+            None, // no deadloop driver listening for Result events
+            PaneType::Interactive,
         );
     }
     let _ = interrupt_tx_slot; // unused for legacy path
