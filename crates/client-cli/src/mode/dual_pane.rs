@@ -3248,6 +3248,15 @@ fn poll_background_tasks(
             let Some(task_id) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
+            // Two distinct .output file types live in this dir: `b*` = Bash
+            // background tasks (readable by claude via the TaskOutput tool)
+            // and `a*` = Agent/Task subagent IDs (NOT readable by TaskOutput;
+            // their content is delivered to the parent via the Task tool's
+            // result). Auto-waking on `a*` ids produces "No task with ID ..."
+            // errors. We only ever want to surface `b*` ids.
+            if !task_id.starts_with('b') {
+                continue;
+            }
             let task_id = task_id.to_string();
             let meta = match std::fs::metadata(&path) {
                 Ok(m) => m,
