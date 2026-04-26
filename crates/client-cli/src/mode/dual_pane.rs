@@ -9,7 +9,7 @@ use anyhow::Result;
 use shared::{
     ClaudeStreamMessage, CliToServer, CodexStreamMessage, PaneType, Provider, ServerToCli,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -345,6 +345,12 @@ struct PaneMeta {
     effort: Option<String>,
     min_iteration_interval_minutes: Option<u64>,
     child_process: Arc<Mutex<Option<std::process::Child>>>,
+    /// Set by the streaming worker on entry; the `InterruptPane` handler
+    /// uses it to signal a soft interrupt (control_request on stdin) instead
+    /// of SIGKILL, so the long-lived process survives. `None` for
+    /// non-streaming panes (legacy `--print`, codex, opencode, etc.) which
+    /// fall back to the existing SIGINT-then-SIGKILL path.
+    streaming_interrupt_tx: Arc<Mutex<Option<mpsc::Sender<()>>>>,
 }
 
 /// Per-pane metadata registry.
@@ -533,6 +539,7 @@ async fn run_inner(
                     effort: tab_effort.clone(),
                     min_iteration_interval_minutes: *min_interval_minutes,
                     child_process: child_proc.clone(),
+                    streaming_interrupt_tx: Arc::new(Mutex::new(None)),
                 },
             );
             sessions.insert(*pane_id, *pane_session_id);
@@ -739,6 +746,12 @@ async fn run_inner(
             &opencode_path,
             &cursor_agent_path,
         );
+        let interrupt_slot = pane_metas
+            .lock()
+            .unwrap()
+            .get(&pane_id)
+            .map(|m| m.streaming_interrupt_tx.clone())
+            .unwrap_or_else(|| Arc::new(Mutex::new(None)));
         pane_threads.push(thread::spawn(move || {
             run_pane_session(
                 &binary_path,
@@ -754,6 +767,7 @@ async fn run_inner(
                 server_tx,
                 shutdown,
                 child_proc,
+                interrupt_slot,
             )
         }));
     }
@@ -1022,6 +1036,7 @@ fn handle_tui_events(
                             effort: None,
                             min_iteration_interval_minutes: None,
                             child_process: child_proc.clone(),
+                            streaming_interrupt_tx: Arc::new(Mutex::new(None)),
                         },
                     );
                 }
@@ -1053,6 +1068,12 @@ fn handle_tui_events(
                         cursor_agent_path,
                     );
                     let working_dir = working_dir.to_string();
+                    let interrupt_slot = pane_metas
+                        .lock()
+                        .unwrap()
+                        .get(&pane_id)
+                        .map(|m| m.streaming_interrupt_tx.clone())
+                        .unwrap_or_else(|| Arc::new(Mutex::new(None)));
                     thread::spawn(move || {
                         run_pane_session(
                             &binary_path,
@@ -1068,6 +1089,7 @@ fn handle_tui_events(
                             server_tx,
                             shutdown,
                             child_proc,
+                            interrupt_slot,
                         )
                     });
                 }
@@ -1129,6 +1151,7 @@ fn handle_tui_events(
                             effort: normalized_effort.clone(),
                             min_iteration_interval_minutes,
                             child_process: child_proc.clone(),
+                            streaming_interrupt_tx: Arc::new(Mutex::new(None)),
                         },
                     );
                 }
@@ -1206,6 +1229,12 @@ fn handle_tui_events(
                     let server_tx = server_tx.clone();
                     let shutdown = shutdown.clone();
                     let working_dir = working_dir.to_string();
+                    let interrupt_slot = pane_metas
+                        .lock()
+                        .unwrap()
+                        .get(&pane_id)
+                        .map(|m| m.streaming_interrupt_tx.clone())
+                        .unwrap_or_else(|| Arc::new(Mutex::new(None)));
                     thread::spawn(move || {
                         run_pane_session(
                             &binary_path,
@@ -1221,6 +1250,7 @@ fn handle_tui_events(
                             server_tx,
                             shutdown,
                             child_proc,
+                            interrupt_slot,
                         )
                     });
                 }
@@ -1420,6 +1450,7 @@ fn handle_tui_events(
                             effort: resolved_effort.clone(),
                             min_iteration_interval_minutes: Some(resolved_min_interval_minutes),
                             child_process: child_proc.clone(),
+                            streaming_interrupt_tx: Arc::new(Mutex::new(None)),
                         },
                     );
                 }
@@ -1717,6 +1748,7 @@ fn handle_tui_events(
                             effort: saved_effort.clone(),
                             min_iteration_interval_minutes: saved_min_interval_minutes,
                             child_process: child_proc.clone(),
+                            streaming_interrupt_tx: Arc::new(Mutex::new(None)),
                         },
                     );
                 }
@@ -1769,6 +1801,12 @@ fn handle_tui_events(
                     let server_tx = server_tx.clone();
                     let shutdown = shutdown.clone();
                     let working_dir = working_dir.to_string();
+                    let interrupt_slot = pane_metas
+                        .lock()
+                        .unwrap()
+                        .get(&pane_id)
+                        .map(|m| m.streaming_interrupt_tx.clone())
+                        .unwrap_or_else(|| Arc::new(Mutex::new(None)));
                     thread::spawn(move || {
                         run_pane_session(
                             &binary_path,
@@ -1784,6 +1822,7 @@ fn handle_tui_events(
                             server_tx,
                             shutdown,
                             child_proc,
+                            interrupt_slot,
                         )
                     });
                 }
@@ -2374,6 +2413,7 @@ mod tests {
                     effort: None,
                     min_iteration_interval_minutes: None,
                     child_process: child_process.clone(),
+                    streaming_interrupt_tx: Arc::new(Mutex::new(None)),
                 },
             );
             metas.insert(
@@ -2443,6 +2483,7 @@ mod tests {
                     effort: None,
                     min_iteration_interval_minutes: None,
                     child_process: child_process.clone(),
+                    streaming_interrupt_tx: Arc::new(Mutex::new(None)),
                 },
             );
             metas.insert(
@@ -3267,6 +3308,180 @@ fn poll_background_tasks(
     }
 }
 
+/// Extract the `uuid` field from a raw JSON line (claude's stream-json /
+/// session jsonl entries always carry one). Used by the dedup machinery
+/// shared between the stdout reader and the session-jsonl tailer.
+fn extract_message_uuid(line: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| {
+            v.get("uuid")
+                .and_then(|u| u.as_str())
+                .map(|s| s.to_string())
+        })
+}
+
+/// Tail claude code's on-disk session jsonl for messages that don't appear on
+/// `claude --print`'s stdout — chiefly Task/subagent intermediate work.
+///
+/// When a streaming claude spawns a Task subagent, the subagent's tool calls,
+/// reasoning, and tool results all land in the *parent's* session jsonl at
+/// `~/.claude/projects/<encoded-cwd>/<session_id>.jsonl`, but on the parent's
+/// stdout we only see `tool_use(Task)` followed by the final `tool_result`
+/// containing the subagent's last message. The intermediate work is invisible
+/// to apas (and therefore the web UI) without tailing the file.
+///
+/// Algorithm: poll the file every 1 s; on size growth, read new bytes since
+/// last position, split on `\n`, parse each line, look up its `uuid` in the
+/// shared `seen_uuids` set, and forward as `CliToServer::StreamMessage` if
+/// not already forwarded. The stdout reader inserts uuids it forwards into
+/// the same set, so whichever side observes a message first wins and the
+/// other side de-duplicates.
+fn tail_session_jsonl(
+    session_id: Uuid,
+    working_dir: &str,
+    pane_id: u32,
+    apas_session_id: Uuid,
+    server_tx: tokio_mpsc::Sender<CliToServer>,
+    seen_uuids: Arc<Mutex<HashSet<String>>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let encoded: String = working_dir
+        .chars()
+        .map(|c| if c == '/' { '-' } else { c })
+        .collect();
+    let path = std::path::Path::new(&home)
+        .join(".claude")
+        .join("projects")
+        .join(encoded)
+        .join(format!("{}.jsonl", session_id));
+
+    let mut position: u64 = 0;
+    let mut buf = String::new();
+    const POLL_INTERVAL: Duration = Duration::from_secs(1);
+    let session_id_str = session_id.to_string();
+    let mut forwarded_count: u64 = 0;
+    let mut initialized_position = false;
+
+    while !shutdown.load(Ordering::SeqCst) {
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => {
+                // File doesn't exist yet — claude hasn't written its first
+                // turn for this session. Wait for it.
+                thread::sleep(POLL_INTERVAL);
+                continue;
+            }
+        };
+        let len = meta.len();
+
+        // First-time initialization: jump to current EOF so we don't replay
+        // the entire prior conversation. The stdout reader has been forwarding
+        // live messages since pane spawn; everything before that is already
+        // in the persisted session and the web UI loads it on attach.
+        if !initialized_position {
+            position = len;
+            initialized_position = true;
+            tracing::info!(
+                pane_id,
+                path = %path.display(),
+                start_position = position,
+                "session jsonl tail initialized",
+            );
+            thread::sleep(POLL_INTERVAL);
+            continue;
+        }
+
+        if len < position {
+            // File was truncated (claude /clear, fork, etc.) — restart from
+            // the new EOF.
+            tracing::info!(
+                pane_id,
+                old_position = position,
+                new_len = len,
+                "session jsonl shrank; resetting position",
+            );
+            position = len;
+            buf.clear();
+            thread::sleep(POLL_INTERVAL);
+            continue;
+        }
+        if len == position {
+            thread::sleep(POLL_INTERVAL);
+            continue;
+        }
+
+        let mut file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => {
+                thread::sleep(POLL_INTERVAL);
+                continue;
+            }
+        };
+        use std::io::{Read, Seek, SeekFrom};
+        if file.seek(SeekFrom::Start(position)).is_err() {
+            thread::sleep(POLL_INTERVAL);
+            continue;
+        }
+        let mut chunk = Vec::with_capacity((len - position) as usize);
+        if file.read_to_end(&mut chunk).is_err() {
+            thread::sleep(POLL_INTERVAL);
+            continue;
+        }
+        position = len;
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+
+        // Split on newline; the trailing partial line stays in `buf` until
+        // the next poll completes it.
+        let mut last_newline = 0usize;
+        for (i, c) in buf.char_indices() {
+            if c == '\n' {
+                let line = &buf[last_newline..i];
+                last_newline = i + 1;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let Some(uuid) = extract_message_uuid(line) else {
+                    continue;
+                };
+                {
+                    let mut set = seen_uuids.lock().unwrap();
+                    if set.contains(&uuid) {
+                        continue;
+                    }
+                    set.insert(uuid.clone());
+                }
+                let Some(message) = parse_agent_output(
+                    &Provider::Claude,
+                    line,
+                    &session_id_str,
+                ) else {
+                    continue;
+                };
+                let _ = server_tx.blocking_send(CliToServer::StreamMessage {
+                    session_id: apas_session_id,
+                    message,
+                    pane_type: Some(PaneType::Interactive),
+                    pane_id: Some(pane_id),
+                });
+                forwarded_count += 1;
+                if forwarded_count <= 5 || forwarded_count % 50 == 0 {
+                    tracing::info!(
+                        pane_id,
+                        uuid,
+                        forwarded_count,
+                        "session jsonl tail forwarded supplemental message",
+                    );
+                }
+            }
+        }
+        if last_newline > 0 {
+            buf.drain(..last_newline);
+        }
+    }
+}
+
 /// Streaming variant for `Provider::Claude` interactive panes: keeps a single
 /// long-lived `claude --print --input-format stream-json --output-format
 /// stream-json --resume <id>` process alive across many turns. User prompts
@@ -3286,6 +3501,7 @@ fn poll_background_tasks(
 /// shutdown / pane teardown is requested. On restart we re-spawn with
 /// `--resume <claude_session_id>` so the conversation continues.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn run_pane_session_streaming(
     binary_path: &str,
     working_dir: &str,
@@ -3300,6 +3516,7 @@ fn run_pane_session_streaming(
     server_tx: tokio_mpsc::Sender<CliToServer>,
     shutdown: Arc<AtomicBool>,
     child_process: Arc<Mutex<Option<std::process::Child>>>,
+    interrupt_tx_slot: Arc<Mutex<Option<mpsc::Sender<()>>>>,
 ) {
     use std::io::Write;
 
@@ -3307,6 +3524,16 @@ fn run_pane_session_streaming(
         text: format!("[Session: {} (streaming)]", &claude_session_id.to_string()[..8]),
         pane_id,
     });
+
+    // Register a soft-interrupt channel with the InterruptPane handler. When
+    // the user clicks Interrupt, the handler sends () on this channel and we
+    // pump a control_request("interrupt") onto claude's stdin — which stops
+    // the current turn but keeps the long-lived process alive (which is the
+    // whole point of streaming mode).
+    let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>();
+    if let Ok(mut slot) = interrupt_tx_slot.lock() {
+        *slot = Some(interrupt_tx);
+    }
 
     // Spawn the per-pane background-task watcher once. It survives across
     // claude respawns (state hashmap persists) so we don't refire wakes for
@@ -3323,6 +3550,33 @@ fn run_pane_session_streaming(
             watcher_pane_id,
             auto_wake_tx,
             watcher_shutdown,
+        );
+    });
+
+    // Shared dedup set between the stdout reader (spawned per claude
+    // process below) and the session-jsonl tailer (spawned once here).
+    // Both check before forwarding; whoever sees a uuid first inserts it
+    // and the other side skips. This lets the tailer surface subagent /
+    // Task intermediate work that doesn't appear on the parent claude's
+    // stdout, without doubling up on messages that DO appear there.
+    let seen_uuids: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    let tailer_session = claude_session_id;
+    let tailer_working_dir = working_dir.to_string();
+    let tailer_pane_id = pane_id;
+    let tailer_apas_session = session_id;
+    let tailer_server_tx = server_tx.clone();
+    let tailer_seen = seen_uuids.clone();
+    let tailer_shutdown = shutdown.clone();
+    thread::spawn(move || {
+        tail_session_jsonl(
+            tailer_session,
+            &tailer_working_dir,
+            tailer_pane_id,
+            tailer_apas_session,
+            tailer_server_tx,
+            tailer_seen,
+            tailer_shutdown,
         );
     });
 
@@ -3440,6 +3694,7 @@ fn run_pane_session_streaming(
         let session_id_reader = session_id;
         let pane_id_reader = pane_id;
         let claude_session_id_str = claude_session_id.to_string();
+        let reader_seen = seen_uuids.clone();
         let reader_thread = thread::spawn(move || {
             let reader = BufReader::new(stdout);
             let mut line_count: u64 = 0;
@@ -3461,6 +3716,15 @@ fn run_pane_session_streaming(
                     continue;
                 }
                 line_count += 1;
+                // Dedup with the session-jsonl tailer. If this uuid was
+                // already forwarded by the tailer (rare race), skip.
+                if let Some(uuid) = extract_message_uuid(&line) {
+                    let mut set = reader_seen.lock().unwrap();
+                    if set.contains(&uuid) {
+                        continue;
+                    }
+                    set.insert(uuid);
+                }
                 match parse_agent_output(&provider_reader, &line, &claude_session_id_str) {
                     Some(message) => {
                         let is_result = matches!(message, ClaudeStreamMessage::Result { .. });
@@ -3559,6 +3823,47 @@ fn run_pane_session_streaming(
             if reader_done_rx.try_recv().is_ok() {
                 break_reason = "stdout-eof";
                 break;
+            }
+
+            // Soft-interrupt request from the InterruptPane handler. Drain
+            // any pending signals (we collapse multiple to one) and write a
+            // control_request to claude's stdin. Wire format from
+            // happy-cli/src/claude/sdk/query.ts:175-208 — claude responds by
+            // aborting the current turn and emitting a Result with an
+            // interrupted stop_reason; the process stays alive for the next
+            // user prompt.
+            let mut interrupted = false;
+            while let Ok(()) = interrupt_rx.try_recv() {
+                interrupted = true;
+            }
+            if interrupted {
+                let req_id = format!("apas-interrupt-{}", uuid::Uuid::new_v4());
+                let envelope = serde_json::json!({
+                    "type": "control_request",
+                    "request_id": req_id,
+                    "request": { "subtype": "interrupt" },
+                });
+                let line = format!("{}\n", envelope);
+                if let Err(e) = stdin.write_all(line.as_bytes()) {
+                    tracing::warn!(
+                        pane_id,
+                        pid = child_pid,
+                        error = %e,
+                        "streaming interrupt write failed",
+                    );
+                    break_reason = "stdin-write-failed";
+                    break;
+                }
+                let _ = stdin.flush();
+                tracing::info!(
+                    pane_id,
+                    pid = child_pid,
+                    "streaming sent control_request(interrupt)",
+                );
+                let _ = output_tx.send(PaneOutput {
+                    text: "[Interrupted current turn — process still alive.]".to_string(),
+                    pane_id,
+                });
             }
 
             // Independent liveness check (covers crash where stdout still
@@ -3744,6 +4049,7 @@ fn run_pane_session(
     server_tx: tokio_mpsc::Sender<CliToServer>,
     shutdown: Arc<AtomicBool>,
     child_process: Arc<Mutex<Option<std::process::Child>>>,
+    interrupt_tx_slot: Arc<Mutex<Option<mpsc::Sender<()>>>>,
 ) {
     // Provider::Claude → new long-lived stream-json process.
     // Provider::ClaudeOld and everyone else → legacy per-turn --print spawn.
@@ -3762,8 +4068,10 @@ fn run_pane_session(
             server_tx,
             shutdown,
             child_process,
+            interrupt_tx_slot,
         );
     }
+    let _ = interrupt_tx_slot; // unused for legacy path
 
     let mut first_message = true;
     let mut try_resume_first = true;
@@ -4687,15 +4995,41 @@ async fn run_server_connection(
                                                 let _ = ws_sender.send(Message::Text(msg.into())).await;
                                             }
                                             ServerToCli::InterruptPane { session_id: _, pane_id: target_pane } => {
-                                                // Snapshot the child PID without holding the meta
-                                                // lock across the kill (the worker thread may want
-                                                // it on exit).
-                                                let child_pid: Option<u32> = {
+                                                // Snapshot the streaming-interrupt sender (if any)
+                                                // and the child PID without holding the meta lock
+                                                // across the kill (the worker thread may want it
+                                                // on exit).
+                                                let (soft_interrupt, child_pid): (Option<mpsc::Sender<()>>, Option<u32>) = {
                                                     let metas = pane_metas.lock().unwrap();
-                                                    metas
-                                                        .get(&target_pane)
-                                                        .and_then(|m| m.child_process.lock().ok().and_then(|g| g.as_ref().map(|c| c.id())))
+                                                    match metas.get(&target_pane) {
+                                                        Some(m) => {
+                                                            let soft = m.streaming_interrupt_tx.lock().ok()
+                                                                .and_then(|g| g.as_ref().cloned());
+                                                            let pid = m.child_process.lock().ok()
+                                                                .and_then(|g| g.as_ref().map(|c| c.id()));
+                                                            (soft, pid)
+                                                        }
+                                                        None => (None, None),
+                                                    }
                                                 };
+                                                // Streaming-pane soft interrupt: ask the worker to
+                                                // pump a control_request("interrupt") onto claude's
+                                                // stdin, which aborts the current turn but keeps
+                                                // the long-lived process alive. Falls through to
+                                                // the SIGINT path on send failure (worker dead).
+                                                if let Some(tx) = soft_interrupt {
+                                                    if tx.send(()).is_ok() {
+                                                        tracing::info!(
+                                                            pane_id = target_pane,
+                                                            "InterruptPane: signaled streaming worker for soft interrupt",
+                                                        );
+                                                        continue;
+                                                    }
+                                                    tracing::warn!(
+                                                        pane_id = target_pane,
+                                                        "InterruptPane: streaming worker channel dead, falling back to SIGINT",
+                                                    );
+                                                }
                                                 match child_pid {
                                                     Some(pid) => {
                                                         tracing::info!(
