@@ -3273,6 +3273,14 @@ fn poll_background_tasks(
 
     // task_id -> (last_seen_size, last_seen_mtime, fired_for_this_episode)
     let mut state: HashMap<String, (u64, std::time::SystemTime, bool)> = HashMap::new();
+    // Snapshot of task ids that already existed on the first poll. These are
+    // pre-restart leftovers: their writer processes (if still alive) are
+    // orphans the new streaming claude has no record of, so firing wake on
+    // them produces "No task found with ID …" errors. We permanently ignore
+    // them for this watcher's lifetime; only ids that *appear* in the dir
+    // after the first poll are eligible.
+    let mut pre_existing: HashSet<String> = HashSet::new();
+    let mut snapshot_done = false;
     const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
     while !shutdown.load(Ordering::SeqCst) {
@@ -3288,6 +3296,7 @@ fn poll_background_tasks(
             .and_then(|m| m.modified())
             .ok();
 
+        let is_initial_snapshot = !snapshot_done;
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) != Some("output") {
@@ -3303,6 +3312,18 @@ fn poll_background_tasks(
             // result). Auto-waking on `a*` ids produces "No task with ID ..."
             // errors. We only ever want to surface `b*` ids.
             if !task_id.starts_with('b') {
+                continue;
+            }
+            // Pre-existing snapshot: any id observed in the first poll is a
+            // leftover from before this watcher started. Their writer
+            // processes (if still alive) are orphans the resumed claude
+            // doesn't track, so TaskOutput would fail with "No task found
+            // with ID …" — exactly the symptom we keep hitting.
+            if is_initial_snapshot {
+                pre_existing.insert(task_id.to_string());
+                continue;
+            }
+            if pre_existing.contains(task_id) {
                 continue;
             }
             let task_id = task_id.to_string();
@@ -3359,6 +3380,15 @@ fn poll_background_tasks(
                 "auto-wake fired (post-stop, settled)",
             );
             entry_state.2 = true;
+        }
+
+        if is_initial_snapshot {
+            snapshot_done = true;
+            tracing::info!(
+                pane_id,
+                pre_existing_count = pre_existing.len(),
+                "auto-wake: initial task snapshot complete (pre-existing ids will be ignored)",
+            );
         }
 
         thread::sleep(POLL_INTERVAL);
