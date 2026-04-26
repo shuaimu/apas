@@ -679,10 +679,13 @@ pub enum PaneType {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
+    /// `claude-old` / `claude_old` aliases keep panes serialized before the
+    /// streaming-only switchover deserializing as the (now-only) Claude
+    /// variant. The legacy per-turn `--print` worker has been removed; all
+    /// `Provider::Claude` panes use the long-lived stream-json worker.
     #[default]
+    #[serde(alias = "claude-old", alias = "claude_old")]
     Claude,
-    #[serde(rename = "claude-old")]
-    ClaudeOld,
     Codex,
     Minimax,
     Glm,

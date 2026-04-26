@@ -119,9 +119,7 @@ fn resolve_pane_binary_path(
     cursor_agent_path: &str,
 ) -> String {
     match provider {
-        Provider::Claude | Provider::ClaudeOld | Provider::Minimax | Provider::Glm => {
-            claude_path.to_string()
-        }
+        Provider::Claude | Provider::Minimax | Provider::Glm => claude_path.to_string(),
         Provider::Codex => codex_path.to_string(),
         Provider::Opencode => opencode_path.to_string(),
         Provider::CursorAgent => cursor_agent_path.to_string(),
@@ -133,7 +131,6 @@ fn provider_display_name(provider: &Provider, model: Option<&str>) -> &'static s
         Provider::Claude if is_minimax_model(model) => "MiniMax",
         Provider::Claude if is_glm_model(model) => "GLM",
         Provider::Claude => "Claude",
-        Provider::ClaudeOld => "Claude-old",
         Provider::Codex => "Codex",
         Provider::Minimax => "MiniMax",
         Provider::Glm => "GLM",
@@ -146,7 +143,6 @@ fn provider_config_key(provider: &Provider, model: Option<&str>) -> &'static str
     match provider {
         Provider::Claude if is_minimax_model(model) => "claude_path",
         Provider::Claude => "claude_path",
-        Provider::ClaudeOld => "claude_path",
         Provider::Codex => "codex_path",
         Provider::Minimax => "claude_path",
         Provider::Glm => "claude_path",
@@ -245,7 +241,7 @@ fn build_pane_env_overrides(
 ) -> Result<Vec<(String, String)>, String> {
     if !matches!(
         provider,
-        Provider::Claude | Provider::ClaudeOld | Provider::Minimax | Provider::Glm
+        Provider::Claude | Provider::Minimax | Provider::Glm
     ) {
         return Ok(Vec::new());
     }
@@ -1957,7 +1953,6 @@ fn active_usage_providers(pane_metas: &PaneMetas) -> (bool, bool, bool, bool) {
                 has_glm = true
             }
             Provider::Claude => has_claude = true,
-            Provider::ClaudeOld => has_claude = true,
             Provider::Codex => has_codex = true,
             Provider::Minimax => has_minimax = true,
             Provider::Glm => has_glm = true,
@@ -2002,7 +1997,7 @@ fn build_agent_args(
     try_resume: bool,
 ) -> (Vec<String>, bool) {
     match provider {
-        Provider::Claude | Provider::ClaudeOld | Provider::Minimax | Provider::Glm => {
+        Provider::Claude | Provider::Minimax | Provider::Glm => {
             let mut base = vec![
                 "--print".to_string(),
                 "--output-format".to_string(),
@@ -2021,7 +2016,7 @@ fn build_agent_args(
                     base.extend_from_slice(&["--model".to_string(), trimmed.to_string()]);
                 }
             }
-            if matches!(provider, Provider::Claude | Provider::ClaudeOld)
+            if matches!(provider, Provider::Claude)
                 && !is_minimax_model(model)
                 && !is_glm_model(model)
             {
@@ -2160,7 +2155,7 @@ fn parse_agent_output(
     session_id_str: &str,
 ) -> Option<ClaudeStreamMessage> {
     match provider {
-        Provider::Claude | Provider::ClaudeOld | Provider::Minimax | Provider::Glm => {
+        Provider::Claude | Provider::Minimax | Provider::Glm => {
             serde_json::from_str::<ClaudeStreamMessage>(line).ok()
         }
         Provider::Codex => match serde_json::from_str::<CodexStreamMessage>(line) {
@@ -4060,8 +4055,9 @@ fn run_pane_session(
     child_process: Arc<Mutex<Option<std::process::Child>>>,
     interrupt_tx_slot: Arc<Mutex<Option<mpsc::Sender<()>>>>,
 ) {
-    // Provider::Claude → new long-lived stream-json process.
-    // Provider::ClaudeOld and everyone else → legacy per-turn --print spawn.
+    // Provider::Claude → long-lived stream-json process. Other providers
+    // (Codex, Cursor, OpenCode, MiniMax, GLM) → legacy per-turn --print
+    // spawn below.
     if matches!(provider, Provider::Claude) {
         return run_pane_session_streaming(
             binary_path,
