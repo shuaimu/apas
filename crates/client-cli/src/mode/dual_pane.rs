@@ -10,7 +10,7 @@ use shared::{
     ClaudeContentBlock, ClaudeStreamMessage, CliToServer, CodexStreamMessage, PaneType, Provider,
     ServerToCli,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -3571,27 +3571,26 @@ fn tail_session_jsonl(
     }
 }
 
-/// Compose the streaming pane's status string from the two activity signals
-/// the worker tracks: whether the agent is mid-turn (`thinking`), and how
-/// many in-flight Task subagents are running. Returned `None` collapses to
-/// "no status" — the UI hides the indicator.
+/// Compose the streaming pane's status string. The pane is considered "busy"
+/// (still on the same turn from the user's POV) whenever the parent claude
+/// is mid-inference (`thinking`) OR has any in-flight subagents. We treat
+/// subagent activity as a turn extension: even after the parent emits its
+/// `result`, if subagents are still running they're doing the real work,
+/// so we keep the `Thinking...` indicator up.
 fn compose_streaming_status(thinking: bool, n_subagents: usize) -> Option<String> {
-    let pluralize = |n: usize, singular: &str, plural: &str| {
-        if n == 1 { singular.to_string() } else { plural.to_string() }
-    };
-    match (thinking, n_subagents) {
-        (false, 0) => None,
-        (true, 0) => Some("Thinking...".to_string()),
-        (false, n) => Some(format!(
-            "{} {} working",
-            n,
-            pluralize(n, "subagent", "subagents")
-        )),
-        (true, n) => Some(format!(
+    let busy = thinking || n_subagents > 0;
+    if !busy {
+        return None;
+    }
+    let pluralize = |n: usize| if n == 1 { "subagent" } else { "subagents" };
+    if n_subagents == 0 {
+        Some("Thinking...".to_string())
+    } else {
+        Some(format!(
             "Thinking... ({} {})",
-            n,
-            pluralize(n, "subagent", "subagents")
-        )),
+            n_subagents,
+            pluralize(n_subagents)
+        ))
     }
 }
 
@@ -3854,6 +3853,12 @@ fn run_pane_session_streaming(
             let reader = BufReader::new(stdout);
             let mut line_count: u64 = 0;
             let mut had_io_error = false;
+            // Set when the parent claude emits Result while subagents are
+            // still in-flight. Cleared (and signal fired) the moment the
+            // last subagent's tool_result drains the in-flight set. This
+            // realizes the contract: "iteration done" means parent done
+            // AND all subagents done, not just parent done.
+            let mut result_pending: bool = false;
             for line in reader.lines() {
                 let line = match line {
                     Ok(l) => l,
@@ -3933,28 +3938,53 @@ fn run_pane_session_streaming(
                             pane_id: Some(pane_id_reader),
                         });
                         if is_result {
-                            // Turn ended → not Thinking anymore. Recompute
-                            // composite status (might still show "N
-                            // subagents working" if any orphaned past the
-                            // result, though that should be rare).
+                            // Parent claude finished the turn → not Thinking
+                            // anymore. But subagents may still be doing real
+                            // work — we keep the "busy" state via the in-flight
+                            // count and only fire the result_signal once the
+                            // last subagent drains.
                             if let Ok(mut t) = reader_thinking.lock() {
                                 *t = false;
                             }
                         }
+
+                        let n_after = reader_in_flight.lock().map(|s| s.len()).unwrap_or(0);
+
+                        // Determine whether this is the "fully idle"
+                        // transition: parent done AND no subagents pending.
+                        // We fire result_signal exactly once per turn at this
+                        // moment, even if it's late (subagents finished after
+                        // parent's Result event).
+                        let mut fully_idle_now = false;
+                        if is_result {
+                            if n_after == 0 {
+                                fully_idle_now = true;
+                            } else {
+                                result_pending = true;
+                            }
+                        } else if subagent_state_changed && result_pending && n_after == 0 {
+                            fully_idle_now = true;
+                            result_pending = false;
+                        }
+
                         if is_result || subagent_state_changed {
-                            let n = reader_in_flight.lock().map(|s| s.len()).unwrap_or(0);
                             let t = reader_thinking.lock().map(|g| *g).unwrap_or(false);
                             let _ = server_tx_reader.blocking_send(CliToServer::PaneStatus {
                                 session_id: session_id_reader,
                                 pane_type: pane_type_reader,
                                 pane_id: Some(pane_id_reader),
-                                status: compose_streaming_status(t, n),
+                                status: compose_streaming_status(t, n_after),
                             });
                         }
-                        if is_result {
-                            // Notify a deadloop driver (if attached) that
-                            // an iteration just finished — drive_streaming_deadloop
-                            // uses this to throttle and re-inject the next prompt.
+
+                        if fully_idle_now {
+                            tracing::info!(
+                                pane_id = pane_id_reader,
+                                "streaming pane fully idle (parent done, all subagents done)",
+                            );
+                            // Notify the deadloop driver (if attached) and
+                            // unblock the inner-loop input gate so any
+                            // pending user prompts can be flushed.
                             if let Some(ref tx) = reader_result_signal {
                                 let _ = tx.send(());
                             }
@@ -4017,6 +4047,12 @@ fn run_pane_session_streaming(
         let mut break_reason = "shutdown";
         let mut exit_status_str: Option<String> = None;
         let mut prompts_sent: u64 = 0;
+        // Pending prompts that arrived while the pane was busy (parent
+        // mid-turn or any subagent in flight). Drained FIFO once the pane
+        // returns to fully-idle. Auto-wakes and human-typed input share
+        // this queue; they're disambiguated by the (from_tui, is_auto_wake)
+        // tags.
+        let mut pending: VecDeque<(String, bool, bool)> = VecDeque::new();
         loop {
             if shutdown.load(Ordering::SeqCst) {
                 if let Ok(mut guard) = child_process.lock() {
@@ -4096,28 +4132,47 @@ fn run_pane_session_streaming(
                 break;
             }
 
-            // Auto-wake prompts (synthesized by the background-task watcher)
-            // take priority over user input — drain them first, non-blocking.
-            // They go onto the same stdin via the same JSON envelope, but we
-            // tag display so the user can tell them apart in the UI and we
-            // do NOT echo them as UserInput to the server (they're not user-
-            // typed; claude's session jsonl will record them as user turns
-            // anyway because they arrive on stdin).
-            let next_prompt: Option<(String, bool, bool)> = match auto_wake_rx.try_recv() {
-                Ok(p) => Some((p, false, true)),
-                Err(_) => match input_rx.recv_timeout(Duration::from_millis(200)) {
-                    Ok((p, from_tui)) => Some((p, from_tui, false)),
-                    Err(mpsc::RecvTimeoutError::Timeout) => None,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        if let Ok(mut guard) = child_process.lock() {
-                            if let Some(ref mut c) = *guard {
-                                let _ = c.kill();
-                            }
+            // Compute "busy": parent mid-turn OR any subagent still running.
+            // While busy we MUST NOT push another prompt onto stdin, even
+            // though stream-json claude technically supports interleaving —
+            // doing so would race the parent's in-progress work and confuse
+            // the conversation. We queue everything and drain FIFO once the
+            // pane returns to fully-idle.
+            let busy = {
+                let t = thinking.lock().map(|g| *g).unwrap_or(false);
+                let n = in_flight_subagents.lock().map(|s| s.len()).unwrap_or(0);
+                t || n > 0
+            };
+
+            // 1) Drain queued auto-wakes / inputs into `pending` (FIFO).
+            //    Auto-wakes are checked first only because their channel is
+            //    cheaper to poll; ordering between the two is otherwise
+            //    insertion order into `pending`.
+            while let Ok(p) = auto_wake_rx.try_recv() {
+                pending.push_back((p, false, true));
+            }
+            match input_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok((p, from_tui)) => pending.push_back((p, from_tui, false)),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if let Ok(mut guard) = child_process.lock() {
+                        if let Some(ref mut c) = *guard {
+                            let _ = c.kill();
                         }
-                        break_reason = "input-channel-closed";
-                        break;
                     }
-                },
+                    break_reason = "input-channel-closed";
+                    break;
+                }
+            }
+
+            // 2) If busy, do nothing this tick — let subagents drain. We'll
+            //    fire next_prompt the moment the reader thread observes
+            //    fully-idle (Result + subagents=0) and updates the shared
+            //    state.
+            let next_prompt: Option<(String, bool, bool)> = if !busy {
+                pending.pop_front()
+            } else {
+                None
             };
 
             match next_prompt {
