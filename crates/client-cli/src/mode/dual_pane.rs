@@ -4485,23 +4485,24 @@ fn run_pane_session_streaming(
 
 /// Streaming variant for `Provider::Claude` deadloop panes (a.k.a. bots).
 ///
-/// Reuses `run_pane_session_streaming` as the long-lived-claude substrate.
-/// Drives it from this thread by:
-///   * sending the deadloop prompt onto `input_tx` at the start of each
-///     iteration (after honoring `min_iteration_interval_minutes`)
-///   * waiting on `result_signal_rx` for the agent's `Result` event before
-///     starting the throttle for the next iteration
-///   * checking `pause` / `stop_requested` / `shutdown` between every step
+/// **Agent-driven via `/loop`**: rather than apas firing iteration prompts
+/// on a fixed timer, we kick off claude code's built-in `/loop` skill once
+/// at startup and let claude pace itself via `ScheduleWakeup`. The runtime
+/// fires the next iteration internally on the agent's chosen schedule
+/// (verified to work in `--print --input-format stream-json` mode by the
+/// /loop spike). When the agent has bg work in flight it can extend the
+/// next-wake delay; when it's truly done it can stop calling
+/// ScheduleWakeup, ending the loop naturally.
 ///
-/// Differences from the legacy per-turn deadloop:
-///   * Claude process stays alive across iterations (faster startup, no
-///     model/MCP cold-start, background tasks attached to a stable parent).
-///   * Group-kill on Result is gone — the streaming worker keeps the
-///     process running; the next iteration's prompt arrives on stdin.
-///   * Auto-wake watcher is intentionally inherited (it gates on the Stop
-///     hook marker, which fires on every Result, so it shouldn't spuriously
-///     interleave with the deadloop's own cadence — but worth watching for
-///     symptoms).
+/// Driver responsibilities:
+///   * Send `/loop <prompt>` once on the streaming worker's `input_tx`
+///   * Watch `shutdown` / `stop_requested` / `pause` and react
+///   * On `stop_requested`: send a soft control_request via the streaming
+///     worker's interrupt channel (aborts the current turn AND cancels any
+///     pending ScheduleWakeup), drop input_tx so the worker tears down,
+///     fire FinalizeStopBot to flip the pane back to interactive mode
+///
+/// Codex bots keep the legacy per-iteration `--print` driver below.
 #[allow(clippy::too_many_arguments)]
 fn run_deadloop_session_streaming(
     binary_path: &str,
@@ -4525,17 +4526,18 @@ fn run_deadloop_session_streaming(
 ) {
     let _ = output_tx.send(PaneOutput {
         text: format!(
-            "[Streaming deadloop session: {}]",
+            "[Streaming /loop deadloop session: {}]",
             &claude_session_id.to_string()[..8]
         ),
         pane_id,
     });
 
     let (input_tx, input_rx) = mpsc::channel::<PaneInput>();
-    let (result_signal_tx, result_signal_rx) = mpsc::channel::<()>();
 
-    // Spawn the streaming worker. It keeps claude alive; we drive prompts
-    // from this thread.
+    // Spawn the streaming worker. It keeps claude alive; we kick off /loop
+    // exactly once and the runtime self-paces from there. We pass
+    // `result_signal_tx = None` because we don't gate on iterations — the
+    // agent picks its own cadence via ScheduleWakeup.
     {
         let binary_path = binary_path.to_string();
         let working_dir = working_dir.to_string();
@@ -4563,137 +4565,92 @@ fn run_deadloop_session_streaming(
                 shutdown,
                 child_process,
                 interrupt_tx_slot,
-                Some(result_signal_tx),
+                None, // no iteration gating; /loop runtime self-paces
                 PaneType::Deadloop,
             );
         });
     }
 
-    let mut iteration: u64 = 0;
-    let mut was_paused = false;
-    let min_iteration_interval =
-        Duration::from_secs(min_iteration_interval_minutes.saturating_mul(60));
-    let mut last_iteration_started_at: Option<Instant> = None;
+    // Kick off `/loop`. The runtime keeps re-firing the prompt on the
+    // schedule the agent dictates via ScheduleWakeup — no further action
+    // from this thread. `min_iteration_interval_minutes` is communicated
+    // to the agent in the wrapper so it can pick a sensible cadence
+    // (the runtime also enforces a ~120s floor independently).
+    let loop_cadence_hint = if min_iteration_interval_minutes > 0 {
+        format!(
+            "Iterate at roughly {}-minute cadence. Use ScheduleWakeup with delaySeconds={} between iterations, or longer if background work needs more time. ",
+            min_iteration_interval_minutes,
+            min_iteration_interval_minutes.saturating_mul(60),
+        )
+    } else {
+        String::new()
+    };
+    let loop_input = format!("/loop {}{}", loop_cadence_hint, prompt);
+    let _ = output_tx.send(PaneOutput {
+        text: format!(
+            "[Bot started in /loop mode (agent-paced); cadence hint: {}m]",
+            min_iteration_interval_minutes
+        ),
+        pane_id,
+    });
+    let _ = server_tx.try_send(CliToServer::UserInput {
+        session_id,
+        text: loop_input.clone(),
+        pane_type: Some(PaneType::Deadloop),
+        pane_id: Some(pane_id),
+    });
+    if input_tx.send((loop_input, false)).is_err() {
+        let _ = output_tx.send(PaneOutput {
+            text: "[Streaming worker exited before /loop kickoff; deadloop ending.]".to_string(),
+            pane_id,
+        });
+        return;
+    }
 
+    // Sit and watch shutdown / stop / pause. The /loop runtime drives
+    // claude on its own; we don't fire any further prompts.
+    let mut was_paused = false;
     while !shutdown.load(Ordering::SeqCst) {
         if stop_requested.load(Ordering::SeqCst) {
+            // Soft interrupt: aborts the current turn and (we expect) the
+            // pending ScheduleWakeup. Then drop input_tx so the streaming
+            // worker tears down — FinalizeStopBot will rebuild the pane
+            // worker as plain interactive mode.
+            if let Some(tx) = interrupt_tx_slot
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().cloned())
+            {
+                let _ = tx.send(());
+            }
+            let _ = output_tx.send(PaneOutput {
+                text: "[Bot stop requested — interrupting /loop and finalizing.]".to_string(),
+                pane_id,
+            });
             let _ = event_tx.send(TuiEvent::FinalizeStopBot {
                 pane_id,
                 stop_flag: stop_requested.clone(),
             });
-            // Drop input_tx → streaming worker tears down naturally.
             return;
         }
 
+        // Pause is poorly defined for /loop (the agent paces itself; we
+        // can't easily withhold the next iteration without killing the
+        // process). We surface a one-line note the first time pause is
+        // requested and otherwise let the loop run.
         if pause.load(Ordering::SeqCst) {
             if !was_paused {
                 was_paused = true;
                 let _ = output_tx.send(PaneOutput {
-                    text: "[Deadloop paused — waiting for resume...]".to_string(),
+                    text: "[Note: pause not directly supported for /loop bots — the agent paces itself. Use Stop to interrupt.]".to_string(),
                     pane_id,
                 });
             }
-            thread::sleep(Duration::from_millis(500));
-            continue;
         } else if was_paused {
             was_paused = false;
-            let _ = output_tx.send(PaneOutput {
-                text: "[Deadloop resumed]".to_string(),
-                pane_id,
-            });
         }
 
-        // Throttle: enforce min_iteration_interval since previous iteration
-        // started, with cancellable sleep.
-        if let Some(last_started_at) = last_iteration_started_at {
-            if let Some(mut remaining) =
-                min_iteration_interval.checked_sub(last_started_at.elapsed())
-            {
-                if !remaining.is_zero() {
-                    let _ = output_tx.send(PaneOutput {
-                        text: format!(
-                            "[Waiting {}s before next iteration (min interval: {}m)]",
-                            remaining.as_secs(),
-                            min_iteration_interval_minutes
-                        ),
-                        pane_id,
-                    });
-                }
-                while !remaining.is_zero() {
-                    if shutdown.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    if stop_requested.load(Ordering::SeqCst) {
-                        let _ = event_tx.send(TuiEvent::FinalizeStopBot {
-                            pane_id,
-                            stop_flag: stop_requested.clone(),
-                        });
-                        return;
-                    }
-                    if pause.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let sleep_for = std::cmp::min(remaining, Duration::from_millis(500));
-                    thread::sleep(sleep_for);
-                    remaining = min_iteration_interval
-                        .checked_sub(last_started_at.elapsed())
-                        .unwrap_or(Duration::ZERO);
-                }
-                if pause.load(Ordering::SeqCst) {
-                    continue;
-                }
-            }
-        }
-
-        last_iteration_started_at = Some(Instant::now());
-        iteration += 1;
-        let _ = output_tx.send(PaneOutput {
-            text: format!("=== Iteration {} ===", iteration),
-            pane_id,
-        });
-        // Echo the iteration prompt to the server's UserInput stream so the
-        // web UI shows what the bot is being asked. The streaming worker
-        // would NOT echo this for us (we pass from_tui=false below).
-        let _ = server_tx.try_send(CliToServer::UserInput {
-            session_id,
-            text: format!("[Iteration {}]\n{}", iteration, prompt),
-            pane_type: Some(PaneType::Deadloop),
-            pane_id: Some(pane_id),
-        });
-
-        if input_tx.send((prompt.to_string(), false)).is_err() {
-            let _ = output_tx.send(PaneOutput {
-                text: "[Streaming worker exited; deadloop ending.]".to_string(),
-                pane_id,
-            });
-            return;
-        }
-
-        // Wait for the iteration's `Result` event with periodic
-        // shutdown/stop cancellation.
-        loop {
-            if shutdown.load(Ordering::SeqCst) {
-                return;
-            }
-            if stop_requested.load(Ordering::SeqCst) {
-                let _ = event_tx.send(TuiEvent::FinalizeStopBot {
-                    pane_id,
-                    stop_flag: stop_requested.clone(),
-                });
-                return;
-            }
-            match result_signal_rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(()) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    let _ = output_tx.send(PaneOutput {
-                        text: "[Streaming worker channel closed; deadloop ending.]".to_string(),
-                        pane_id,
-                    });
-                    return;
-                }
-            }
-        }
+        thread::sleep(Duration::from_secs(1));
     }
 }
 
