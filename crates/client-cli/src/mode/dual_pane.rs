@@ -1560,9 +1560,36 @@ fn handle_tui_events(
                     meta.mode.clone()
                 };
 
-                // For interactive panes: force-kill the child process directly
+                // For interactive panes: prefer the soft control_request
+                // (preserves the long-lived streaming claude — same path as
+                // InterruptPane), fall back to kill if the streaming
+                // interrupt channel is absent (non-streaming providers) or
+                // the worker is dead.
                 if pane_mode == shared::PaneMode::Interactive {
-                    {
+                    let (soft_interrupt, _child_present): (Option<mpsc::Sender<()>>, bool) = {
+                        let metas = pane_metas.lock().unwrap();
+                        match metas.get(&pane_id) {
+                            Some(m) => {
+                                let soft = m.streaming_interrupt_tx.lock().ok()
+                                    .and_then(|g| g.as_ref().cloned());
+                                let present = m.child_process.lock().ok()
+                                    .map(|g| g.is_some()).unwrap_or(false);
+                                (soft, present)
+                            }
+                            None => (None, false),
+                        }
+                    };
+                    let mut soft_sent = false;
+                    if let Some(tx) = soft_interrupt {
+                        if tx.send(()).is_ok() {
+                            soft_sent = true;
+                            tracing::info!(
+                                pane_id,
+                                "StopBot(Interactive): signaled streaming worker for soft interrupt",
+                            );
+                        }
+                    }
+                    if !soft_sent {
                         let metas = pane_metas.lock().unwrap();
                         if let Some(meta) = metas.get(&pane_id) {
                             if let Ok(mut guard) = meta.child_process.lock() {
@@ -1572,15 +1599,20 @@ fn handle_tui_events(
                             }
                         }
                     }
+                    let msg = if soft_sent {
+                        "[Interrupted current turn — process still alive.]"
+                    } else {
+                        "[Process killed]"
+                    };
                     let _ = output_tx.send(PaneOutput {
-                        text: "[Process killed]".to_string(),
+                        text: msg.to_string(),
                         pane_id,
                     });
                     let _ = server_tx.blocking_send(CliToServer::StreamMessage {
                         session_id,
                         message: shared::ClaudeStreamMessage::Result {
                             subtype: "text".to_string(),
-                            result: "[Process killed]".to_string(),
+                            result: msg.to_string(),
                             is_error: false,
                             total_cost_usd: 0.0,
                             duration_ms: 0,
@@ -1659,8 +1691,63 @@ fn handle_tui_events(
                     );
                 } else {
                     // === Stage 2: Force stop ===
-                    // Kill the deadloop child process and wait for full exit
-                    {
+                    // Soft path first: send control_request("interrupt") to
+                    // the streaming worker. The current turn aborts, claude
+                    // emits Result, the deadloop driver sees stop_requested
+                    // is already true, and the loop unwinds — without losing
+                    // the long-lived claude process. SIGKILL fallback if the
+                    // streaming channel is absent (non-streaming provider)
+                    // or send fails (worker dead). The 3-second escalation
+                    // ensures a wedged turn that ignores control_request
+                    // still gets killed.
+                    let (soft_interrupt, child_pid): (Option<mpsc::Sender<()>>, Option<u32>) = {
+                        let metas = pane_metas.lock().unwrap();
+                        match metas.get(&pane_id) {
+                            Some(m) => {
+                                let soft = m.streaming_interrupt_tx.lock().ok()
+                                    .and_then(|g| g.as_ref().cloned());
+                                let pid = m.child_process.lock().ok()
+                                    .and_then(|g| g.as_ref().map(|c| c.id()));
+                                (soft, pid)
+                            }
+                            None => (None, None),
+                        }
+                    };
+                    let mut soft_sent = false;
+                    if let Some(tx) = soft_interrupt {
+                        if tx.send(()).is_ok() {
+                            soft_sent = true;
+                            tracing::info!(
+                                pane_id,
+                                "StopBot(Force,Deadloop): signaled streaming worker for soft interrupt",
+                            );
+                            // Escalate to SIGKILL after 3s if the process is
+                            // still alive — covers the case where the turn
+                            // is genuinely wedged below the stream-json layer
+                            // (e.g. claude itself isn't reading stdin).
+                            if let Some(pid) = child_pid {
+                                let pane_for_log = pane_id;
+                                std::thread::spawn(move || {
+                                    std::thread::sleep(Duration::from_secs(3));
+                                    let alive = std::path::Path::new(&format!(
+                                        "/proc/{}", pid
+                                    )).exists();
+                                    if alive {
+                                        tracing::warn!(
+                                            pane_id = pane_for_log,
+                                            pid,
+                                            "StopBot(Force): soft interrupt didn't take in 3s, escalating to SIGKILL",
+                                        );
+                                        let _ = std::process::Command::new("kill")
+                                            .arg("-KILL")
+                                            .arg(pid.to_string())
+                                            .status();
+                                    }
+                                });
+                            }
+                        }
+                    }
+                    if !soft_sent {
                         let metas = pane_metas.lock().unwrap();
                         if let Some(meta) = metas.get(&pane_id) {
                             if let Ok(mut guard) = meta.child_process.lock() {
