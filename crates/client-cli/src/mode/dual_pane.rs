@@ -7,7 +7,8 @@
 
 use anyhow::Result;
 use shared::{
-    ClaudeStreamMessage, CliToServer, CodexStreamMessage, PaneType, Provider, ServerToCli,
+    ClaudeContentBlock, ClaudeStreamMessage, CliToServer, CodexStreamMessage, PaneType, Provider,
+    ServerToCli,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
@@ -3570,6 +3571,30 @@ fn tail_session_jsonl(
     }
 }
 
+/// Compose the streaming pane's status string from the two activity signals
+/// the worker tracks: whether the agent is mid-turn (`thinking`), and how
+/// many in-flight Task subagents are running. Returned `None` collapses to
+/// "no status" — the UI hides the indicator.
+fn compose_streaming_status(thinking: bool, n_subagents: usize) -> Option<String> {
+    let pluralize = |n: usize, singular: &str, plural: &str| {
+        if n == 1 { singular.to_string() } else { plural.to_string() }
+    };
+    match (thinking, n_subagents) {
+        (false, 0) => None,
+        (true, 0) => Some("Thinking...".to_string()),
+        (false, n) => Some(format!(
+            "{} {} working",
+            n,
+            pluralize(n, "subagent", "subagents")
+        )),
+        (true, n) => Some(format!(
+            "Thinking... ({} {})",
+            n,
+            pluralize(n, "subagent", "subagents")
+        )),
+    }
+}
+
 /// Streaming variant for `Provider::Claude` interactive panes: keeps a single
 /// long-lived `claude --print --input-format stream-json --output-format
 /// stream-json --resume <id>` process alive across many turns. User prompts
@@ -3657,6 +3682,23 @@ fn run_pane_session_streaming(
     // Task intermediate work that doesn't appear on the parent claude's
     // stdout, without doubling up on messages that DO appear there.
     let seen_uuids: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    // In-flight Task subagent tracking: every `assistant` message with a
+    // tool_use block where name=="Task" is a new subagent; the matching
+    // tool_result (id correlation in a later `user` message) marks it done.
+    // The set's size is the live subagent count, surfaced in PaneStatus
+    // as e.g. "Thinking... (2 subagents)".
+    //
+    // Note: this is intentionally NOT tracking Bash with run_in_background.
+    // That tool returns its tool_result IMMEDIATELY with the task id, so
+    // id-correlation says "done" before the underlying process has run.
+    // Tracking those properly requires polling the .output file mtime
+    // — separate followup.
+    let in_flight_subagents: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    // Composite-status state. The inner loop sets thinking=true on prompt
+    // write; the reader thread sets it false on Result. Either side calls
+    // send_status() after mutating to recompute and publish the status.
+    let thinking: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 
     let tailer_session = claude_session_id;
     let tailer_working_dir = working_dir.to_string();
@@ -3783,6 +3825,16 @@ fn run_pane_session_streaming(
             *guard = Some(child);
         }
 
+        // Reset per-spawn liveness state: the previous claude (if any) is
+        // dead, so any tool_use ids it had outstanding are gone. Also reset
+        // the Thinking flag.
+        if let Ok(mut s) = in_flight_subagents.lock() {
+            s.clear();
+        }
+        if let Ok(mut t) = thinking.lock() {
+            *t = false;
+        }
+
         // Reader thread: parse stream-json off stdout, forward to UI/server.
         // Unlike the per-turn path, we DO NOT exit on `result` — the process
         // stays alive for the next turn.
@@ -3796,6 +3848,8 @@ fn run_pane_session_streaming(
         let claude_session_id_str = claude_session_id.to_string();
         let reader_seen = seen_uuids.clone();
         let reader_result_signal = result_signal_tx.clone();
+        let reader_in_flight = in_flight_subagents.clone();
+        let reader_thinking = thinking.clone();
         let reader_thread = thread::spawn(move || {
             let reader = BufReader::new(stdout);
             let mut line_count: u64 = 0;
@@ -3829,6 +3883,44 @@ fn run_pane_session_streaming(
                 match parse_agent_output(&provider_reader, &line, &claude_session_id_str) {
                     Some(message) => {
                         let is_result = matches!(message, ClaudeStreamMessage::Result { .. });
+
+                        // Sniff for Task subagent activity BEFORE moving
+                        // `message` into the StreamMessage forward. New
+                        // Task tool_use → insert; matching tool_result →
+                        // remove. Status is recomputed and sent only when
+                        // the in-flight set actually changed (debounces
+                        // the noise of every assistant chunk).
+                        let mut subagent_state_changed = false;
+                        match &message {
+                            ClaudeStreamMessage::Assistant { message: msg, .. } => {
+                                for block in &msg.content {
+                                    if let ClaudeContentBlock::ToolUse { id, name, .. } = block {
+                                        if name == "Task" {
+                                            let mut s = reader_in_flight.lock().unwrap();
+                                            if s.insert(id.clone()) {
+                                                subagent_state_changed = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            ClaudeStreamMessage::User { message: msg, .. } => {
+                                for block in &msg.content {
+                                    if let ClaudeContentBlock::ToolResult {
+                                        tool_use_id,
+                                        ..
+                                    } = block
+                                    {
+                                        let mut s = reader_in_flight.lock().unwrap();
+                                        if s.remove(tool_use_id) {
+                                            subagent_state_changed = true;
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+
                         let display_text = format_stream_message(&message);
                         let _ = output_tx_reader.send(PaneOutput {
                             text: display_text,
@@ -3841,16 +3933,25 @@ fn run_pane_session_streaming(
                             pane_id: Some(pane_id_reader),
                         });
                         if is_result {
-                            // Same as per-turn path: clear the transient
-                            // "Thinking..." status as soon as the protocol
-                            // says the turn is done. The process stays alive
-                            // for the next user prompt.
+                            // Turn ended → not Thinking anymore. Recompute
+                            // composite status (might still show "N
+                            // subagents working" if any orphaned past the
+                            // result, though that should be rare).
+                            if let Ok(mut t) = reader_thinking.lock() {
+                                *t = false;
+                            }
+                        }
+                        if is_result || subagent_state_changed {
+                            let n = reader_in_flight.lock().map(|s| s.len()).unwrap_or(0);
+                            let t = reader_thinking.lock().map(|g| *g).unwrap_or(false);
                             let _ = server_tx_reader.blocking_send(CliToServer::PaneStatus {
                                 session_id: session_id_reader,
                                 pane_type: pane_type_reader,
                                 pane_id: Some(pane_id_reader),
-                                status: None,
+                                status: compose_streaming_status(t, n),
                             });
+                        }
+                        if is_result {
                             // Notify a deadloop driver (if attached) that
                             // an iteration just finished — drive_streaming_deadloop
                             // uses this to throttle and re-inject the next prompt.
@@ -4034,11 +4135,18 @@ fn run_pane_session_streaming(
                         text: "[Thinking...]".to_string(),
                         pane_id,
                     });
+                    if let Ok(mut t) = thinking.lock() {
+                        *t = true;
+                    }
+                    let n_subagents = in_flight_subagents
+                        .lock()
+                        .map(|s| s.len())
+                        .unwrap_or(0);
                     let _ = server_tx.blocking_send(CliToServer::PaneStatus {
                         session_id,
                         pane_type,
                         pane_id: Some(pane_id),
-                        status: Some("Thinking...".to_string()),
+                        status: compose_streaming_status(true, n_subagents),
                     });
                     if from_tui && !is_auto_wake {
                         let _ = server_tx.blocking_send(CliToServer::UserInput {
