@@ -3283,6 +3283,12 @@ fn poll_background_tasks(
     let mut pre_existing: HashSet<String> = HashSet::new();
     let mut snapshot_done = false;
     const POLL_INTERVAL: Duration = Duration::from_secs(5);
+    // Cap how much of a task's `.output` we inline into the wake prompt.
+    // Big enough to convey context (a Monitor watcher's last update or a
+    // bash script's tail), small enough that a chatty task can't bloat a
+    // single wake into a multi-MB user turn. Claude can always Read the
+    // file path in the prompt for the full content.
+    const MAX_INLINE_BYTES: u64 = 4096;
 
     while !shutdown.load(Ordering::SeqCst) {
         let entries = match std::fs::read_dir(&tasks_dir) {
@@ -3367,10 +3373,44 @@ fn poll_background_tasks(
             if entry_state.1 <= stop_mtime {
                 continue;
             }
-            let prompt = format!(
-                "[apas auto-wake] Background task {} produced new output. Use TaskOutput to read it.",
-                task_id
-            );
+            // Inline the tail of the task's .output so claude has the actual
+            // content even if the task has since been reaped from its
+            // registry (TaskOutput would say "No task found") or the file
+            // has been cleaned up by the time claude processes the wake.
+            let mut snippet = String::new();
+            let mut snippet_truncated = false;
+            if let Ok(mut f) = std::fs::File::open(&path) {
+                use std::io::{Read, Seek, SeekFrom};
+                let read_from = if size > MAX_INLINE_BYTES {
+                    snippet_truncated = true;
+                    size - MAX_INLINE_BYTES
+                } else {
+                    0
+                };
+                if f.seek(SeekFrom::Start(read_from)).is_ok() {
+                    let mut buf = vec![0u8; MAX_INLINE_BYTES as usize];
+                    if let Ok(n) = f.read(&mut buf) {
+                        snippet = String::from_utf8_lossy(&buf[..n]).to_string();
+                    }
+                }
+            }
+            let path_display = path.display();
+            let prompt = if snippet.is_empty() {
+                format!(
+                    "[apas auto-wake] Background task {} produced new output but the .output file is no longer readable. Path was: {}",
+                    task_id, path_display
+                )
+            } else if snippet_truncated {
+                format!(
+                    "[apas auto-wake] Background task {} produced new output (showing last {} of {} bytes; Read {} for full):\n```\n{}\n```",
+                    task_id, MAX_INLINE_BYTES, size, path_display, snippet
+                )
+            } else {
+                format!(
+                    "[apas auto-wake] Background task {} produced new output ({} bytes from {}):\n```\n{}\n```",
+                    task_id, size, path_display, snippet
+                )
+            };
             if wake_tx.send(prompt).is_err() {
                 return; // inner loop gone
             }
@@ -3378,6 +3418,7 @@ fn poll_background_tasks(
                 pane_id,
                 task_id = %task_id,
                 size,
+                snippet_bytes = snippet.len(),
                 "auto-wake fired (post-stop, settled)",
             );
             entry_state.2 = true;
