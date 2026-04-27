@@ -3338,6 +3338,7 @@ fn poll_background_tasks(
     working_dir: &str,
     pane_id: u32,
     wake_tx: std::sync::mpsc::Sender<String>,
+    watched_tasks: Arc<Mutex<HashSet<String>>>,
     shutdown: Arc<AtomicBool>,
 ) {
     let uid = unsafe { libc::getuid() };
@@ -3459,6 +3460,20 @@ fn poll_background_tasks(
             let Some(stop_mtime) = stop_mtime else { continue };
             if entry_state.1 <= stop_mtime {
                 continue;
+            }
+            // Watched-set gate: only fire wake for tasks the agent has
+            // expressed interest in by calling Monitor or BashOutput on
+            // them. Foreground bash that the agent merely ran and forgot
+            // (e.g. `Bash("ls")`) writes to the same .output dir but is
+            // already part of the turn's tool_result — waking on its
+            // post-stop tail growth is noise. Long-running services the
+            // agent fired-and-forgot (e.g. an HTTP server) are also
+            // excluded by this filter.
+            {
+                let watched = watched_tasks.lock().unwrap();
+                if !watched.contains(&task_id) {
+                    continue;
+                }
             }
             // Inline the tail of the task's .output so claude has the actual
             // content even if the task has since been reaped from its
@@ -3784,6 +3799,15 @@ fn run_pane_session_streaming(
         *slot = Some(interrupt_tx);
     }
 
+    // Per-pane "watched task" set: task ids the agent has expressed
+    // interest in by calling Monitor or BashOutput on them. The auto-wake
+    // watcher only fires for ids in this set — so foreground bash output
+    // that's already part of a tool_result (or fire-and-forget services
+    // like an HTTP server the agent never re-checks) doesn't trigger wakes.
+    // Populated by the stdout reader (see tool_use parser below) and shared
+    // with poll_background_tasks.
+    let watched_tasks: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
     // Spawn the per-pane background-task watcher once. It survives across
     // claude respawns (state hashmap persists) so we don't refire wakes for
     // tasks that grew during a respawn gap.
@@ -3792,12 +3816,14 @@ fn run_pane_session_streaming(
     let watcher_working_dir = working_dir.to_string();
     let watcher_pane_id = pane_id;
     let watcher_shutdown = shutdown.clone();
+    let watcher_watched = watched_tasks.clone();
     thread::spawn(move || {
         poll_background_tasks(
             watcher_session,
             &watcher_working_dir,
             watcher_pane_id,
             auto_wake_tx,
+            watcher_watched,
             watcher_shutdown,
         );
     });
@@ -3977,6 +4003,7 @@ fn run_pane_session_streaming(
         let reader_result_signal = result_signal_tx.clone();
         let reader_in_flight = in_flight_subagents.clone();
         let reader_thinking = thinking.clone();
+        let reader_watched = watched_tasks.clone();
         let reader_thread = thread::spawn(move || {
             let reader = BufReader::new(stdout);
             let mut line_count: u64 = 0;
@@ -4027,11 +4054,36 @@ fn run_pane_session_streaming(
                         match &message {
                             ClaudeStreamMessage::Assistant { message: msg, .. } => {
                                 for block in &msg.content {
-                                    if let ClaudeContentBlock::ToolUse { id, name, .. } = block {
+                                    if let ClaudeContentBlock::ToolUse { id, name, input } = block {
                                         if name == "Task" {
                                             let mut s = reader_in_flight.lock().unwrap();
                                             if s.insert(id.clone()) {
                                                 subagent_state_changed = true;
+                                            }
+                                        }
+                                        // Watched-set: the agent calling
+                                        // Monitor or BashOutput on a task is
+                                        // the explicit "I care about this
+                                        // task's future output" signal.
+                                        // Auto-wake only fires for ids in
+                                        // this set (poll_background_tasks
+                                        // checks it). Foreground bash that
+                                        // never gets re-checked stays out
+                                        // of the set → no wake noise.
+                                        if name == "Monitor" || name == "BashOutput" {
+                                            if let Some(tid) = input
+                                                .get("task_id")
+                                                .and_then(|v| v.as_str())
+                                            {
+                                                let mut w = reader_watched.lock().unwrap();
+                                                if w.insert(tid.to_string()) {
+                                                    tracing::info!(
+                                                        pane_id = pane_id_reader,
+                                                        task_id = tid,
+                                                        tool = name.as_str(),
+                                                        "auto-wake: agent expressed interest in task",
+                                                    );
+                                                }
                                             }
                                         }
                                     }
