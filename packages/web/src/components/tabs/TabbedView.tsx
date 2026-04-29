@@ -762,7 +762,7 @@ export function TabbedView() {
         {/* Actions */}
         <button
           onClick={downloadSession}
-          className="px-2.5 py-1 text-xs font-medium rounded transition-colors bg-blue-500 hover:bg-blue-600 text-white"
+          className="hidden md:inline-flex items-center px-2.5 py-1 text-xs font-medium rounded transition-colors bg-blue-500 hover:bg-blue-600 text-white"
           title="Download session data"
         >
           Download
