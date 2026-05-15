@@ -114,6 +114,14 @@ export type OutputType =
   | { type: "system" }
   | { type: "error" };
 
+export type ToastKind = "success" | "info" | "error";
+
+export interface Toast {
+  id: string;
+  kind: ToastKind;
+  message: string;
+}
+
 export type PaneType = "deadloop" | "interactive";
 
 export interface PaneConfig {
@@ -300,6 +308,10 @@ interface AppState {
   // clicks Submit, instead of waiting for the round-trip tool_result.
   answeredQuestions: Map<string, Record<string, string>>;
 
+  // Transient toast notifications surfaced at the top of the viewport.
+  // Auto-dismiss is the Toaster component's job (timer on mount).
+  toasts: Toast[];
+
   // Legacy compat (derived from dynamic state)
   deadloopMessages: Message[];
   interactiveMessages: Message[];
@@ -328,6 +340,8 @@ interface AppState {
   approve: (toolCallId: string) => void;
   reject: (toolCallId: string) => void;
   answerQuestion: (toolUseId: string, answers: Record<string, string>) => void;
+  showToast: (message: string, kind?: ToastKind) => void;
+  dismissToast: (id: string) => void;
   clearMessages: () => void;
   startSession: (cliClientId?: string) => void;
   attachSession: (sessionId: string, forceReload?: boolean) => void;
@@ -416,6 +430,7 @@ export const useStore = create<AppState>((set, get) => ({
   paneModes: {},
   pausedPanes: [],
   answeredQuestions: new Map(),
+  toasts: [],
   loadingMorePane: null,
   // Legacy compat getters (populated from dynamic state)
   deadloopMessages: [],
@@ -894,13 +909,16 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   answerQuestion: (toolUseId: string, answers: Record<string, string>) => {
-    const { ws } = get();
+    const { ws, showToast } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
         type: "answer_question",
         tool_use_id: toolUseId,
         answers,
       }));
+      showToast("Answer sent to Claude", "success");
+    } else {
+      showToast("Not connected — answer not sent", "error");
     }
     // Mark the question locally as answered so the card flips to the
     // submitted state immediately, even before the tool_result arrives.
@@ -909,6 +927,15 @@ export const useStore = create<AppState>((set, get) => ({
       next.set(toolUseId, answers);
       return { answeredQuestions: next };
     });
+  },
+
+  showToast: (message: string, kind: ToastKind = "info") => {
+    const id = generateId();
+    set((state) => ({ toasts: [...state.toasts, { id, kind, message }] }));
+  },
+
+  dismissToast: (id: string) => {
+    set((state) => ({ toasts: state.toasts.filter((t) => t.id !== id) }));
   },
 
   clearMessages: () => {
