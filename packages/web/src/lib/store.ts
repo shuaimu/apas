@@ -122,6 +122,21 @@ export interface Toast {
   message: string;
 }
 
+/// Snapshot of the message-related state for a single session. Stored
+/// in-memory keyed by session_id so tab switches restore last-seen
+/// messages instantly while the fresh server fetch is still in flight.
+export interface SessionCacheEntry {
+  messages: Message[];
+  paneMessages: Record<string, Message[]>;
+  paneHasMore: Record<string, boolean>;
+  paneConfigs: PaneConfig[];
+  paneModes: Record<string, PaneType>;
+  hasMoreMessages: boolean;
+  isDualPane: boolean;
+  answeredQuestions: Map<string, Record<string, string>>;
+  cachedAt: number;
+}
+
 export type PaneType = "deadloop" | "interactive";
 
 export interface PaneConfig {
@@ -312,6 +327,12 @@ interface AppState {
   // Auto-dismiss is the Toaster component's job (timer on mount).
   toasts: Toast[];
 
+  // Per-session message snapshot keyed by session_id. Lets tab switches
+  // restore the last-seen messages instantly while we re-fetch fresh data
+  // from the server in the background. Snapshots are written on
+  // attachSession just before swapping to a new session.
+  sessionCache: Map<string, SessionCacheEntry>;
+
   // Legacy compat (derived from dynamic state)
   deadloopMessages: Message[];
   interactiveMessages: Message[];
@@ -431,6 +452,7 @@ export const useStore = create<AppState>((set, get) => ({
   pausedPanes: [],
   answeredQuestions: new Map(),
   toasts: [],
+  sessionCache: new Map(),
   loadingMorePane: null,
   // Legacy compat getters (populated from dynamic state)
   deadloopMessages: [],
@@ -650,7 +672,8 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   attachSession: (sessionId: string, forceReload = false) => {
-    const { ws, sessionId: currentSessionId } = get();
+    const state = get();
+    const { ws, sessionId: currentSessionId } = state;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       console.error("WebSocket not connected");
       return;
@@ -660,7 +683,7 @@ export const useStore = create<AppState>((set, get) => ({
 
     const isSameSession = currentSessionId === sessionId;
 
-    const { cliClients, sessions } = get();
+    const { cliClients, sessions } = state;
     const hasActiveClient = cliClients.some(c => c.activeSession === sessionId);
 
     let newCliClientId: string | null = null;
@@ -678,25 +701,86 @@ export const useStore = create<AppState>((set, get) => ({
     }
 
     if (!isSameSession || forceReload) {
-      set({
-        sessionId,
-        cliClientId: newCliClientId,
-        messages: [],
-        paneMessages: {},
-        paneHasMore: {},
-        paneStatuses: {},
-        paneModes: {},
-        pausedPanes: [],
-        paneConfigs: [],
-        answeredQuestions: new Map(),
-        deadloopMessages: [],
-        interactiveMessages: [],
-        isDualPane: false,
-        isAttached: hasActiveClient,
-        isDeadloopPaused: false,
-        interactiveStatus: null,
-        deadloopStatus: null,
-      });
+      // Snapshot the session we're leaving so we can restore it instantly
+      // next time the user comes back. Only snapshot if the session had
+      // any messages — otherwise we'd cache an empty state and shadow a
+      // fresh fetch on return.
+      const sessionCache = new Map(state.sessionCache);
+      if (
+        currentSessionId &&
+        currentSessionId !== sessionId &&
+        (state.messages.length > 0 || Object.keys(state.paneMessages).length > 0)
+      ) {
+        sessionCache.set(currentSessionId, {
+          messages: state.messages,
+          paneMessages: state.paneMessages,
+          paneHasMore: state.paneHasMore,
+          paneConfigs: state.paneConfigs,
+          paneModes: state.paneModes,
+          hasMoreMessages: state.hasMoreMessages,
+          isDualPane: state.isDualPane,
+          answeredQuestions: state.answeredQuestions,
+          cachedAt: Date.now(),
+        });
+        // Cap the cache to prevent unbounded growth across long sessions
+        // of project hopping. LRU by insertion order — Map preserves it.
+        const MAX_CACHED_SESSIONS = 12;
+        while (sessionCache.size > MAX_CACHED_SESSIONS) {
+          const oldest = sessionCache.keys().next().value;
+          if (oldest === undefined) break;
+          sessionCache.delete(oldest);
+        }
+      }
+
+      // Restore from cache if we have a snapshot — instant tab switch.
+      // Server-side session_messages will still arrive and replace as the
+      // authoritative state.
+      const cached = forceReload ? undefined : sessionCache.get(sessionId);
+      if (cached) {
+        set({
+          sessionId,
+          cliClientId: newCliClientId,
+          messages: cached.messages,
+          paneMessages: cached.paneMessages,
+          paneHasMore: cached.paneHasMore,
+          paneConfigs: cached.paneConfigs,
+          paneModes: cached.paneModes,
+          hasMoreMessages: cached.hasMoreMessages,
+          isDualPane: cached.isDualPane,
+          answeredQuestions: cached.answeredQuestions,
+          // Live state that doesn't survive a switch — refresh on attach.
+          paneStatuses: {},
+          pausedPanes: [],
+          deadloopMessages: cached.paneMessages[paneKey(PANE_ID_DEADLOOP)] ?? [],
+          interactiveMessages: cached.paneMessages[paneKey(PANE_ID_INTERACTIVE)] ?? [],
+          isAttached: hasActiveClient,
+          isDeadloopPaused: false,
+          interactiveStatus: null,
+          deadloopStatus: null,
+          sessionCache,
+        });
+      } else {
+        set({
+          sessionId,
+          cliClientId: newCliClientId,
+          messages: [],
+          paneMessages: {},
+          paneHasMore: {},
+          paneStatuses: {},
+          paneModes: {},
+          pausedPanes: [],
+          paneConfigs: [],
+          answeredQuestions: new Map(),
+          deadloopMessages: [],
+          interactiveMessages: [],
+          isDualPane: false,
+          isAttached: hasActiveClient,
+          isDeadloopPaused: false,
+          interactiveStatus: null,
+          deadloopStatus: null,
+          sessionCache,
+        });
+      }
     } else {
       set({ isAttached: hasActiveClient, cliClientId: newCliClientId });
     }
@@ -1758,21 +1842,21 @@ function handleServerMessage(
           get().prependMessages(parsedMessages, hasMore);
         }
       } else if (isDualPane || hasPaneType) {
-        // Initial load - dual pane mode
-        const {
-          paneMessages: existingPaneMessages,
-          messages: existingMain,
-          paneModes: existingPaneModes,
-        } = get();
-        const newPaneMessages = { ...existingPaneMessages };
+        // Initial load - dual pane mode. Replace existing pane messages with
+        // the server's authoritative snapshot (rather than prepending) — if
+        // the user is returning to a cached session, the cached state and
+        // the server's latest 50 overlap, and prepending would create
+        // duplicates plus mis-order the timeline.
+        const { paneModes: existingPaneModes } = get();
+        const newPaneMessages: Record<string, Message[]> = {};
         const newPaneHasMore: Record<string, boolean> = {};
         for (const [paneId, msgs] of Object.entries(paneMsgBuckets)) {
-          newPaneMessages[paneId] = [...msgs, ...(newPaneMessages[paneId] || [])];
+          newPaneMessages[paneId] = msgs;
           newPaneHasMore[paneId] = hasMore;
         }
         set({
           sessionId: data.session_id as string,
-          messages: [...mainMsgs, ...existingMain],
+          messages: mainMsgs,
           paneMessages: newPaneMessages,
           paneHasMore: newPaneHasMore,
           deadloopMessages: newPaneMessages[paneKey(PANE_ID_DEADLOOP)] || [],
