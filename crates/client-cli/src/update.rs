@@ -44,11 +44,27 @@ fn is_deleted_path(path: &Path) -> bool {
     path.to_string_lossy().contains(" (deleted)")
 }
 
+/// NFS "silly-rename": when an open file is unlinked on NFS, the client
+/// renames it to `.nfsXXXX...` so existing open handles still work. The
+/// file keeps existing (so `path.exists()` is true) but it's the *old*
+/// inode, not the freshly installed binary. We must treat these as
+/// stale or the auto-update path will exec() the binary it just replaced.
+fn is_nfs_silly_rename(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.starts_with(".nfs"))
+        .unwrap_or(false)
+}
+
 /// Return a usable on-disk executable for the current process.
 /// This intentionally excludes /proc/self/exe and deleted inode paths.
 fn get_current_on_disk_exe() -> Option<PathBuf> {
     let path = get_current_exe()?;
-    if is_proc_self_exe(&path) || is_deleted_path(&path) || !path.exists() {
+    if is_proc_self_exe(&path)
+        || is_deleted_path(&path)
+        || is_nfs_silly_rename(&path)
+        || !path.exists()
+    {
         return None;
     }
     Some(path)
@@ -67,7 +83,10 @@ fn path_installed_exe() -> Option<PathBuf> {
         if !candidate.exists() {
             continue;
         }
-        if is_proc_self_exe(&candidate) || is_deleted_path(&candidate) {
+        if is_proc_self_exe(&candidate)
+            || is_deleted_path(&candidate)
+            || is_nfs_silly_rename(&candidate)
+        {
             continue;
         }
         return Some(candidate);
@@ -81,7 +100,7 @@ fn argv0_exe() -> Option<PathBuf> {
     if !path.is_absolute() || !path.exists() {
         return None;
     }
-    if is_proc_self_exe(&path) || is_deleted_path(&path) {
+    if is_proc_self_exe(&path) || is_deleted_path(&path) || is_nfs_silly_rename(&path) {
         return None;
     }
     Some(path)
@@ -472,4 +491,27 @@ pub fn restart_cli() {
 pub fn restart_cli() {
     eprintln!("[Restart] Auto-restart not supported on this platform");
     eprintln!("[Restart] Please restart manually");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_nfs_silly_rename_matches_nfs_prefix() {
+        assert!(is_nfs_silly_rename(Path::new(
+            "/home/users/shuai/.local/bin/.nfs0000000001e8ab86000001f5"
+        )));
+        assert!(is_nfs_silly_rename(Path::new(".nfs1234")));
+    }
+
+    #[test]
+    fn is_nfs_silly_rename_rejects_normal_paths() {
+        assert!(!is_nfs_silly_rename(Path::new("/home/users/shuai/.local/bin/apas")));
+        assert!(!is_nfs_silly_rename(Path::new("apas")));
+        assert!(!is_nfs_silly_rename(Path::new("/usr/bin/apas")));
+        // Hidden dotfiles that aren't NFS ghosts should not match.
+        assert!(!is_nfs_silly_rename(Path::new("/home/user/.bashrc")));
+        assert!(!is_nfs_silly_rename(Path::new("/home/user/.config/apas")));
+    }
 }
