@@ -8,6 +8,7 @@ import remarkGfm from "remark-gfm";
 import { CodeBlock } from "@/components/code/CodeBlock";
 import { ToolCard } from "@/components/tools/ToolCard";
 import { ApprovalPrompt } from "@/components/tools/ApprovalPrompt";
+import { AskUserQuestionCard } from "@/components/tools/AskUserQuestionCard";
 
 interface AssistantMessageProps {
   message: Message;
@@ -181,6 +182,14 @@ function renderContent(message: Message, outputType: Message["outputType"]) {
       return <CodeBlock code={message.content} language={outputType.language} />;
 
     case "tool_use":
+      if (outputType.tool === "AskUserQuestion") {
+        return (
+          <AskUserQuestionCard
+            toolUseId={outputType.toolUseId}
+            input={outputType.input}
+          />
+        );
+      }
       return (
         <ToolCard
           tool={outputType.tool}
@@ -190,6 +199,13 @@ function renderContent(message: Message, outputType: Message["outputType"]) {
       );
 
     case "tool_result":
+      // AskUserQuestion's tool_result echoes back the {questions, answers}
+      // object, which would look like noise in the chat. The
+      // AskUserQuestionCard already shows the final answer, so we hide the
+      // raw tool_result entirely for this tool.
+      if (outputType.tool === "AskUserQuestion") {
+        return null;
+      }
       return (
         <ToolCard
           tool={outputType.tool}

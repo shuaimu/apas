@@ -30,6 +30,11 @@ pub struct Session {
     pub updated_at: Option<String>,
     #[sqlx(default)]
     pub is_paused: bool,
+    /// Stable project identity sourced from the CLI's `.apas` file. Backfilled
+    /// to `id` for sessions that pre-date the column, so old rows still group
+    /// one-session-per-project.
+    #[sqlx(default)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]

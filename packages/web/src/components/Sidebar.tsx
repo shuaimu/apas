@@ -92,7 +92,7 @@ interface ShareListState {
 const ADMIN_USER_ID = "88b6016d-a8b4-400c-bdc9-f0120504a4fc";
 
 export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
-  const { cliClients, sessions, machines, attachSession, loadSessionMessages, refreshCliClients, listSessions, sessionId, connected, token, userId } = useStore();
+  const { cliClients, sessions, machines, attachSession, refreshCliClients, listSessions, sessionId, connected, token, userId } = useStore();
   const [shareModalOpen, setShareModalOpen] = useState(false);
   const [mounted, setMounted] = useState(false);
 
@@ -116,8 +116,9 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
   const [removingUserId, setRemovingUserId] = useState<string | null>(null);
   const [updatingRoleUserId, setUpdatingRoleUserId] = useState<string | null>(null);
 
-  // Merge CLI clients (active) and sessions (historical) into unified project list
-  // Deduplicate by working directory, keeping the most recent session
+  // Merge CLI clients (active) and sessions (historical) into unified project list.
+  // Deduplicate by project_id (the stable .apas id) so moving a project directory
+  // doesn't show up as a second project. Falls back to id for legacy rows.
   const projects = useMemo(() => {
     const projectMap = new Map<string, {
       id: string;
@@ -132,7 +133,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
       cliClientId?: string;
     }>();
 
-    // Sort sessions by date (newest first) so we keep the most recent per directory
+    // Sort sessions by date (newest first) so we keep the most recent per project
     const sortedSessions = [...sessions].sort((a, b) => {
       if (a.createdAt && b.createdAt) {
         return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
@@ -140,15 +141,16 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
       return 0;
     });
 
-    // Add sessions, deduplicating by working directory
-    // Active sessions take precedence over inactive ones for the same directory
+    // Add sessions, deduplicating by project_id
+    // Active sessions take precedence over inactive ones for the same project
     for (const session of sortedSessions) {
+      const projectKey = session.projectId || session.id;
       const workingDir = session.workingDir || session.id;
-      const name = session.workingDir?.split('/').pop() || `Project ${session.id.slice(0, 8)}`;
+      const name = session.workingDir?.split('/').pop() || `Project ${(session.projectId || session.id).slice(0, 8)}`;
 
-      const existing = projectMap.get(workingDir);
+      const existing = projectMap.get(projectKey);
       if (!existing || (session.isActive && !existing.isActive)) {
-        projectMap.set(workingDir, {
+        projectMap.set(projectKey, {
           id: session.id,
           name,
           workingDir,
@@ -177,16 +179,14 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
       }
     }
 
-    // Also mark projects as active if daemon reports them as running
-    // (handles case where CLI process is up but hasn't connected via WebSocket yet)
+    // Also mark projects as active if daemon reports them as running.
+    // Daemon's project_id is the .apas id, so match against the project key.
     for (const machine of machines) {
       for (const mp of machine.projects) {
         if (mp.isRunning) {
-          for (const project of projectMap.values()) {
-            if (project.workingDir === mp.path) {
-              project.isActive = true;
-              break;
-            }
+          const project = projectMap.get(mp.projectId);
+          if (project) {
+            project.isActive = true;
           }
         }
       }
@@ -213,12 +213,13 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
     }, 1000);
   };
 
-  const handleProjectClick = (projectId: string, isActive: boolean) => {
-    if (isActive) {
-      attachSession(projectId);
-    } else {
-      loadSessionMessages(projectId);
-    }
+  const handleProjectClick = (projectId: string) => {
+    // Always attach so the server's per-connection session_id stays in sync
+    // with the project the user is viewing. Branching on a stale isActive
+    // could leave the server routing input to a previously-attached session,
+    // surfacing as "Pane worker unavailable" when the wrong CLI receives a
+    // pane_id it doesn't know.
+    attachSession(projectId);
     // Close sidebar on mobile after selecting a project
     onClose?.();
   };
@@ -465,7 +466,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
             {projects.map((project) => (
               <div key={project.id}>
                 <div
-                  onClick={() => handleProjectClick(project.id, project.isActive)}
+                  onClick={() => handleProjectClick(project.id)}
                   className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-left text-sm transition-colors cursor-pointer ${
                     sessionId === project.id
                       ? "bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-300"

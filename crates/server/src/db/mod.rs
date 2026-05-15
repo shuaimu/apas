@@ -101,6 +101,21 @@ impl Database {
         let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN is_paused INTEGER DEFAULT 0")
             .execute(&self.pool)
             .await;
+        let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN project_id TEXT")
+            .execute(&self.pool)
+            .await;
+        // Backfill project_id for rows that pre-date the column. Until now,
+        // each .apas held a single id used as both project and session id, so
+        // the safest backfill is project_id = id — old rows keep their
+        // existing one-session-per-project grouping.
+        let _ = sqlx::query("UPDATE sessions SET project_id = id WHERE project_id IS NULL")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_project_id ON sessions(project_id)",
+        )
+        .execute(&self.pool)
+        .await;
 
         sqlx::query(
             r#"
@@ -261,15 +276,22 @@ impl Database {
         //
         // Also update user_id if the existing session owner is a dev/placeholder user
         // (email like 'dev-*@local'). This migrates sessions from temp users to real users.
+        // project_id falls back to the session id for older CLIs that don't
+        // send it; matches the historical 1:1 mapping.
+        let project_id = session
+            .project_id
+            .clone()
+            .unwrap_or_else(|| session.id.clone());
         sqlx::query(
             r#"
-            INSERT INTO sessions (id, user_id, cli_client_id, working_dir, hostname, status)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO sessions (id, user_id, cli_client_id, working_dir, hostname, status, project_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 cli_client_id = excluded.cli_client_id,
                 working_dir = excluded.working_dir,
                 hostname = excluded.hostname,
                 status = excluded.status,
+                project_id = excluded.project_id,
                 updated_at = CURRENT_TIMESTAMP,
                 user_id = CASE
                     WHEN (SELECT email FROM users WHERE id = sessions.user_id) LIKE 'dev-%@local'
@@ -284,6 +306,7 @@ impl Database {
         .bind(&session.working_dir)
         .bind(&session.hostname)
         .bind(&session.status)
+        .bind(&project_id)
         .execute(&self.pool)
         .await?;
 
@@ -356,7 +379,7 @@ impl Database {
 
     pub async fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let session = sqlx::query_as::<_, Session>(
-            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at, COALESCE(is_paused, 0) as is_paused FROM sessions WHERE id = ?",
+            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at, COALESCE(is_paused, 0) as is_paused, COALESCE(project_id, id) as project_id FROM sessions WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -395,7 +418,7 @@ impl Database {
 
     pub async fn get_all_sessions(&self) -> Result<Vec<Session>> {
         let sessions = sqlx::query_as::<_, Session>(
-            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at, COALESCE(is_paused, 0) as is_paused FROM sessions ORDER BY created_at DESC LIMIT 50",
+            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at, COALESCE(is_paused, 0) as is_paused, COALESCE(project_id, id) as project_id FROM sessions ORDER BY created_at DESC LIMIT 50",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -404,7 +427,7 @@ impl Database {
 
     pub async fn get_sessions_for_user(&self, user_id: &str) -> Result<Vec<Session>> {
         let sessions = sqlx::query_as::<_, Session>(
-            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at, COALESCE(is_paused, 0) as is_paused FROM sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
+            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at, COALESCE(is_paused, 0) as is_paused, COALESCE(project_id, id) as project_id FROM sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
         )
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -518,7 +541,7 @@ impl Database {
         // Returns sessions shared with this user along with the owner's email and share role
         let rows = sqlx::query(
             r#"
-            SELECT s.id, s.user_id, s.cli_client_id, s.working_dir, s.hostname, s.status, s.created_at, s.updated_at, COALESCE(s.is_paused, 0) as is_paused, u.email, COALESCE(ss.role, 'user') AS role
+            SELECT s.id, s.user_id, s.cli_client_id, s.working_dir, s.hostname, s.status, s.created_at, s.updated_at, COALESCE(s.is_paused, 0) as is_paused, COALESCE(s.project_id, s.id) as project_id, u.email, COALESCE(ss.role, 'user') AS role
             FROM sessions s
             INNER JOIN session_shares ss ON s.id = ss.session_id
             INNER JOIN users u ON s.user_id = u.id
@@ -544,6 +567,7 @@ impl Database {
                 created_at: row.get("created_at"),
                 updated_at: row.get("updated_at"),
                 is_paused: row.get::<i32, _>("is_paused") != 0,
+                project_id: row.get("project_id"),
             };
             let email: String = row.get("email");
             let role: String = row.get("role");

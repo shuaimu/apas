@@ -263,11 +263,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         match parsed {
                             Ok(CliToServer::SessionStart {
                                 session_id,
+                                project_id,
                                 working_dir,
                                 hostname,
                                 pane_type: _,
                                 panes,
                             }) => {
+                                // Older CLIs omit project_id; preserve the
+                                // historical 1:1 mapping where the .apas id
+                                // also served as the session id.
+                                let project_id = project_id.unwrap_or(session_id);
                                 // Reject if this session_id is already owned by a different user
                                 // (typically caused by .apas files copied/shared between users).
                                 if let Ok(Some(existing)) =
@@ -389,6 +394,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     created_at: None,
                                     updated_at: None,
                                     is_paused: false,
+                                    project_id: Some(project_id.to_string()),
                                 };
                                 if let Err(e) = state.db.create_session(&session).await {
                                     tracing::error!("Failed to persist session to database: {}", e);
@@ -837,8 +843,15 @@ fn stream_message_to_stored(
                 pane_type: pane_type_str,
             });
         }
-        ClaudeStreamMessage::User { message: msg, .. } => {
-            // Store tool results from user messages
+        ClaudeStreamMessage::User {
+            message: msg,
+            tool_use_result,
+            ..
+        } => {
+            // Store tool results from user messages. We tuck the top-level
+            // `tool_use_result` payload (e.g. AskUserQuestion's
+            // `{questions, answers}` echo) inside the stored JSON so the
+            // web UI can recover the structured answer after a reload.
             for block in &msg.content {
                 if let ClaudeContentBlock::ToolResult {
                     tool_use_id,
@@ -846,11 +859,16 @@ fn stream_message_to_stored(
                     is_error,
                 } = block
                 {
-                    let result_data = serde_json::json!({
+                    let mut result_data = serde_json::json!({
                         "tool_use_id": tool_use_id,
                         "content": content,
-                        "is_error": is_error
+                        "is_error": is_error,
                     });
+                    if let Some(tur) = tool_use_result {
+                        if let serde_json::Value::Object(ref mut map) = result_data {
+                            map.insert("tool_use_result".to_string(), tur.clone());
+                        }
+                    }
                     messages.push(crate::storage::StoredMessage {
                         id: Uuid::new_v4().to_string(),
                         role: "tool".to_string(),

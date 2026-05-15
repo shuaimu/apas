@@ -528,6 +528,8 @@ async fn connect_to_server(
     let hostname = hostname::get().ok().and_then(|h| h.into_string().ok());
     let session_start_msg = CliToServer::SessionStart {
         session_id,
+        // session_id is the .apas project id in this mode (1:1).
+        project_id: Some(session_id),
         working_dir: Some(working_dir.to_string()),
         hostname,
         pane_type: None,

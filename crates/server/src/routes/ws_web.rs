@@ -995,6 +995,32 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
+                Ok(WebToServer::AnswerQuestion { tool_use_id, answers }) => {
+                    // Relay the user's AskUserQuestion answers down to the CLI
+                    // streaming worker. The worker matches by tool_use_id
+                    // against its pending_questions map and writes the
+                    // control_response onto claude's stdin so the SDK's
+                    // canUseTool callback completes.
+                    if let Some(sid) = session_id {
+                        tracing::info!(
+                            tool_use_id = tool_use_id.as_str(),
+                            answer_count = answers.len(),
+                            "Forwarding AskUserQuestion answers to CLI for session {}",
+                            sid
+                        );
+                        state
+                            .sessions
+                            .route_to_cli(
+                                &sid,
+                                ServerToCli::AnswerQuestion {
+                                    session_id: sid,
+                                    tool_use_id,
+                                    answers,
+                                },
+                            )
+                            .await;
+                    }
+                }
                 Ok(WebToServer::UpdatePaneEffort { pane_id, effort }) => {
                     if let Some(sid) = session_id {
                         let normalized = effort.as_deref().and_then(normalize_start_bot_effort);
@@ -1430,8 +1456,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         .map(|s| {
                             let session_id = Uuid::parse_str(&s.id).unwrap_or_default();
                             let is_active = state.sessions.is_session_active(&session_id);
+                            let project_id = s
+                                .project_id
+                                .as_deref()
+                                .and_then(|p| Uuid::parse_str(p).ok())
+                                .or(Some(session_id));
                             SessionInfo {
                                 id: session_id,
+                                project_id,
                                 cli_client_id: s
                                     .cli_client_id
                                     .and_then(|id| Uuid::parse_str(&id).ok()),
@@ -1451,8 +1483,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     for (s, owner_email, share_role) in shared_sessions {
                         let session_id = Uuid::parse_str(&s.id).unwrap_or_default();
                         let is_active = state.sessions.is_session_active(&session_id);
+                        let project_id = s
+                            .project_id
+                            .as_deref()
+                            .and_then(|p| Uuid::parse_str(p).ok())
+                            .or(Some(session_id));
                         sessions.push(SessionInfo {
                             id: session_id,
+                            project_id,
                             cli_client_id: s.cli_client_id.and_then(|id| Uuid::parse_str(&id).ok()),
                             working_dir: s.working_dir,
                             hostname: s.hostname,
@@ -1574,12 +1612,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     tracing::info!("Downloading session data for {}", sid);
 
                     // Get session metadata from database
-                    let (working_dir, hostname, created_at) =
+                    let (project_id, working_dir, hostname, created_at) =
                         match state.db.get_session(&sid.to_string()).await {
                             Ok(Some(session)) => {
-                                (session.working_dir, session.hostname, session.created_at)
+                                let project_id = session
+                                    .project_id
+                                    .as_deref()
+                                    .and_then(|p| Uuid::parse_str(p).ok())
+                                    .or(Some(sid));
+                                (
+                                    project_id,
+                                    session.working_dir,
+                                    session.hostname,
+                                    session.created_at,
+                                )
                             }
-                            _ => (None, None, None),
+                            _ => (Some(sid), None, None, None),
                         };
 
                     // Get all messages without limit
@@ -1593,6 +1641,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     &connection_id,
                                     ServerToWeb::SessionDownload {
                                         session_id: sid,
+                                        project_id,
                                         messages,
                                         working_dir,
                                         hostname,

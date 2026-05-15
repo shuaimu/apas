@@ -348,6 +348,30 @@ struct PaneMeta {
     /// non-streaming panes (legacy `--print`, codex, opencode, etc.) which
     /// fall back to the existing SIGINT-then-SIGKILL path.
     streaming_interrupt_tx: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+    /// Set by the streaming worker on entry; the `AnswerQuestion` handler
+    /// pushes pre-serialized control_response JSON strings here, which the
+    /// inner loop drains and writes to claude's stdin. This is how the
+    /// canUseTool callback completes for AskUserQuestion. `None` for
+    /// non-streaming panes (auto-approved via `--dangerously-skip-permissions`).
+    control_response_tx: Arc<Mutex<Option<mpsc::Sender<String>>>>,
+    /// Set by the streaming worker on entry; the reader thread inserts an
+    /// entry on each AskUserQuestion control_request so the AnswerQuestion
+    /// handler can recover claude's request_id and original questions when
+    /// the user's answers arrive from the web UI.
+    pending_questions: Arc<Mutex<HashMap<String, PendingAskQuestion>>>,
+}
+
+/// State stored for each in-flight AskUserQuestion call, keyed by tool_use_id.
+/// Populated when the streaming reader sees a `can_use_tool` control_request
+/// for `AskUserQuestion`, consumed when the AnswerQuestion handler arrives.
+#[derive(Clone, Debug)]
+struct PendingAskQuestion {
+    /// claude's `request_id` for the control_request — must echo back in the
+    /// control_response or claude can't match the response to the call.
+    request_id: String,
+    /// Original questions array from claude's tool input — must echo back in
+    /// `updatedInput.questions` alongside the user's answers.
+    questions: serde_json::Value,
 }
 
 /// Per-pane metadata registry.
@@ -537,6 +561,8 @@ async fn run_inner(
                     min_iteration_interval_minutes: *min_interval_minutes,
                     child_process: child_proc.clone(),
                     streaming_interrupt_tx: Arc::new(Mutex::new(None)),
+                    control_response_tx: Arc::new(Mutex::new(None)),
+                    pending_questions: Arc::new(Mutex::new(HashMap::new())),
                 },
             );
             sessions.insert(*pane_id, *pane_session_id);
@@ -705,12 +731,20 @@ async fn run_inner(
             &opencode_path,
             &cursor_agent_path,
         );
-        let interrupt_slot = pane_metas
+        let (interrupt_slot, control_resp_slot, pending_qs) = pane_metas
             .lock()
             .unwrap()
             .get(&pane_id)
-            .map(|m| m.streaming_interrupt_tx.clone())
-            .unwrap_or_else(|| Arc::new(Mutex::new(None)));
+            .map(|m| (
+                m.streaming_interrupt_tx.clone(),
+                m.control_response_tx.clone(),
+                m.pending_questions.clone(),
+            ))
+            .unwrap_or_else(|| (
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(HashMap::new())),
+            ));
         pane_threads.push(thread::spawn(move || {
             run_deadloop_session(
                 &binary_path,
@@ -731,6 +765,8 @@ async fn run_inner(
                 child_process,
                 event_tx,
                 interrupt_slot,
+                control_resp_slot,
+                pending_qs,
             )
         }));
     }
@@ -750,12 +786,20 @@ async fn run_inner(
             &opencode_path,
             &cursor_agent_path,
         );
-        let interrupt_slot = pane_metas
+        let (interrupt_slot, control_resp_slot, pending_qs) = pane_metas
             .lock()
             .unwrap()
             .get(&pane_id)
-            .map(|m| m.streaming_interrupt_tx.clone())
-            .unwrap_or_else(|| Arc::new(Mutex::new(None)));
+            .map(|m| (
+                m.streaming_interrupt_tx.clone(),
+                m.control_response_tx.clone(),
+                m.pending_questions.clone(),
+            ))
+            .unwrap_or_else(|| (
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(HashMap::new())),
+            ));
         pane_threads.push(thread::spawn(move || {
             run_pane_session(
                 &binary_path,
@@ -772,6 +816,8 @@ async fn run_inner(
                 shutdown,
                 child_proc,
                 interrupt_slot,
+                control_resp_slot,
+                pending_qs,
             )
         }));
     }
@@ -1041,6 +1087,8 @@ fn handle_tui_events(
                             min_iteration_interval_minutes: None,
                             child_process: child_proc.clone(),
                             streaming_interrupt_tx: Arc::new(Mutex::new(None)),
+                            control_response_tx: Arc::new(Mutex::new(None)),
+                            pending_questions: Arc::new(Mutex::new(HashMap::new())),
                         },
                     );
                 }
@@ -1072,12 +1120,20 @@ fn handle_tui_events(
                         cursor_agent_path,
                     );
                     let working_dir = working_dir.to_string();
-                    let interrupt_slot = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
-                        .map(|m| m.streaming_interrupt_tx.clone())
-                        .unwrap_or_else(|| Arc::new(Mutex::new(None)));
+                        .map(|m| (
+                            m.streaming_interrupt_tx.clone(),
+                            m.control_response_tx.clone(),
+                            m.pending_questions.clone(),
+                        ))
+                        .unwrap_or_else(|| (
+                            Arc::new(Mutex::new(None)),
+                            Arc::new(Mutex::new(None)),
+                            Arc::new(Mutex::new(HashMap::new())),
+                        ));
                     thread::spawn(move || {
                         run_pane_session(
                             &binary_path,
@@ -1094,6 +1150,8 @@ fn handle_tui_events(
                             shutdown,
                             child_proc,
                             interrupt_slot,
+                            control_resp_slot,
+                            pending_qs,
                         )
                     });
                 }
@@ -1156,6 +1214,8 @@ fn handle_tui_events(
                             min_iteration_interval_minutes,
                             child_process: child_proc.clone(),
                             streaming_interrupt_tx: Arc::new(Mutex::new(None)),
+                            control_response_tx: Arc::new(Mutex::new(None)),
+                            pending_questions: Arc::new(Mutex::new(HashMap::new())),
                         },
                     );
                 }
@@ -1201,12 +1261,20 @@ fn handle_tui_events(
                     let shutdown = shutdown.clone();
                     let event_tx = event_tx.clone();
                     let working_dir = working_dir.to_string();
-                    let interrupt_slot = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
-                        .map(|m| m.streaming_interrupt_tx.clone())
-                        .unwrap_or_else(|| Arc::new(Mutex::new(None)));
+                        .map(|m| (
+                            m.streaming_interrupt_tx.clone(),
+                            m.control_response_tx.clone(),
+                            m.pending_questions.clone(),
+                        ))
+                        .unwrap_or_else(|| (
+                            Arc::new(Mutex::new(None)),
+                            Arc::new(Mutex::new(None)),
+                            Arc::new(Mutex::new(HashMap::new())),
+                        ));
                     thread::spawn(move || {
                         run_deadloop_session(
                             &binary_path,
@@ -1227,6 +1295,8 @@ fn handle_tui_events(
                             child_proc,
                             event_tx,
                             interrupt_slot,
+                            control_resp_slot,
+                            pending_qs,
                         )
                     });
                 } else {
@@ -1240,12 +1310,20 @@ fn handle_tui_events(
                     let server_tx = server_tx.clone();
                     let shutdown = shutdown.clone();
                     let working_dir = working_dir.to_string();
-                    let interrupt_slot = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
-                        .map(|m| m.streaming_interrupt_tx.clone())
-                        .unwrap_or_else(|| Arc::new(Mutex::new(None)));
+                        .map(|m| (
+                            m.streaming_interrupt_tx.clone(),
+                            m.control_response_tx.clone(),
+                            m.pending_questions.clone(),
+                        ))
+                        .unwrap_or_else(|| (
+                            Arc::new(Mutex::new(None)),
+                            Arc::new(Mutex::new(None)),
+                            Arc::new(Mutex::new(HashMap::new())),
+                        ));
                     thread::spawn(move || {
                         run_pane_session(
                             &binary_path,
@@ -1262,6 +1340,8 @@ fn handle_tui_events(
                             shutdown,
                             child_proc,
                             interrupt_slot,
+                            control_resp_slot,
+                            pending_qs,
                         )
                     });
                 }
@@ -1462,6 +1542,8 @@ fn handle_tui_events(
                             min_iteration_interval_minutes: Some(resolved_min_interval_minutes),
                             child_process: child_proc.clone(),
                             streaming_interrupt_tx: Arc::new(Mutex::new(None)),
+                            control_response_tx: Arc::new(Mutex::new(None)),
+                            pending_questions: Arc::new(Mutex::new(HashMap::new())),
                         },
                     );
                 }
@@ -1500,12 +1582,20 @@ fn handle_tui_events(
                     let shutdown = shutdown.clone();
                     let event_tx = event_tx.clone();
                     let working_dir = working_dir.to_string();
-                    let interrupt_slot = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
-                        .map(|m| m.streaming_interrupt_tx.clone())
-                        .unwrap_or_else(|| Arc::new(Mutex::new(None)));
+                        .map(|m| (
+                            m.streaming_interrupt_tx.clone(),
+                            m.control_response_tx.clone(),
+                            m.pending_questions.clone(),
+                        ))
+                        .unwrap_or_else(|| (
+                            Arc::new(Mutex::new(None)),
+                            Arc::new(Mutex::new(None)),
+                            Arc::new(Mutex::new(HashMap::new())),
+                        ));
                     thread::spawn(move || {
                         run_deadloop_session(
                             &binary_path,
@@ -1526,6 +1616,8 @@ fn handle_tui_events(
                             child_proc,
                             event_tx,
                             interrupt_slot,
+                            control_resp_slot,
+                            pending_qs,
                         )
                     });
                 }
@@ -1854,6 +1946,8 @@ fn handle_tui_events(
                             min_iteration_interval_minutes: saved_min_interval_minutes,
                             child_process: child_proc.clone(),
                             streaming_interrupt_tx: Arc::new(Mutex::new(None)),
+                            control_response_tx: Arc::new(Mutex::new(None)),
+                            pending_questions: Arc::new(Mutex::new(HashMap::new())),
                         },
                     );
                 }
@@ -1906,12 +2000,20 @@ fn handle_tui_events(
                     let server_tx = server_tx.clone();
                     let shutdown = shutdown.clone();
                     let working_dir = working_dir.to_string();
-                    let interrupt_slot = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
-                        .map(|m| m.streaming_interrupt_tx.clone())
-                        .unwrap_or_else(|| Arc::new(Mutex::new(None)));
+                        .map(|m| (
+                            m.streaming_interrupt_tx.clone(),
+                            m.control_response_tx.clone(),
+                            m.pending_questions.clone(),
+                        ))
+                        .unwrap_or_else(|| (
+                            Arc::new(Mutex::new(None)),
+                            Arc::new(Mutex::new(None)),
+                            Arc::new(Mutex::new(HashMap::new())),
+                        ));
                     thread::spawn(move || {
                         run_pane_session(
                             &binary_path,
@@ -1928,6 +2030,8 @@ fn handle_tui_events(
                             shutdown,
                             child_proc,
                             interrupt_slot,
+                            control_resp_slot,
+                            pending_qs,
                         )
                     });
                 }
@@ -2256,6 +2360,118 @@ fn build_agent_args(
     }
 }
 
+/// Intercept claude's `control_request` envelopes on stdout. Returns
+/// `Some(true)` if the line was a control_request (caller should `continue`),
+/// `Some(false)` if it's a control_request we explicitly leave for downstream
+/// (unused today), or `None` if the line isn't a control_request at all.
+///
+/// Wire format mirrors `@anthropic-ai/claude-agent-sdk` v0.3.x. AskUserQuestion
+/// is parked in `pending_questions` so the AnswerQuestion path can recover the
+/// `request_id` and original questions when the user submits answers. Every
+/// other `can_use_tool` request is auto-approved — in `bypassPermissions` mode
+/// these are rare (claude pre-clears most tools itself) but harmless to
+/// rubber-stamp.
+fn try_handle_control_request(
+    line: &str,
+    pane_id: u32,
+    _session_id: Uuid,
+    _pane_type: PaneType,
+    pending_questions: &Arc<Mutex<HashMap<String, PendingAskQuestion>>>,
+    control_response_tx: &mpsc::Sender<String>,
+    _server_tx: &tokio_mpsc::Sender<CliToServer>,
+) -> Option<bool> {
+    // Cheap pre-filter: control_request lines always start with the
+    // `{"type":"control_request"` prefix. Anything else short-circuits.
+    if !line.contains("\"type\":\"control_request\"") {
+        return None;
+    }
+    let value: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    if value.get("type").and_then(|v| v.as_str()) != Some("control_request") {
+        return None;
+    }
+    let request_id = value
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let request = match value.get("request") {
+        Some(r) => r,
+        None => return Some(true),
+    };
+    let subtype = request.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
+    if subtype != "can_use_tool" {
+        tracing::debug!(
+            pane_id,
+            subtype,
+            "ignoring unhandled control_request subtype",
+        );
+        return Some(true);
+    }
+    let tool_name = request
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let tool_use_id = request
+        .get("tool_use_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let input = request.get("input").cloned().unwrap_or(serde_json::Value::Null);
+
+    if tool_name == "AskUserQuestion" {
+        // Park the request so the AnswerQuestion handler can echo back the
+        // original questions array and the matching request_id when the
+        // user submits. The tool_use block itself is forwarded via the
+        // regular assistant stream — the web UI renders the question card
+        // from that block, not from a separate notification.
+        let questions = input
+            .get("questions")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        if let Ok(mut map) = pending_questions.lock() {
+            map.insert(
+                tool_use_id.clone(),
+                PendingAskQuestion {
+                    request_id,
+                    questions,
+                },
+            );
+        }
+        tracing::info!(
+            pane_id,
+            tool_use_id = tool_use_id.as_str(),
+            "AskUserQuestion parked; waiting for web answer",
+        );
+        return Some(true);
+    }
+
+    // Non-AskUserQuestion permission prompt slipped through bypass mode.
+    // Auto-approve so the turn doesn't stall.
+    let response = serde_json::json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": {
+                "behavior": "allow",
+                "updatedInput": input,
+                "toolUseID": tool_use_id,
+            }
+        }
+    });
+    let _ = control_response_tx.send(response.to_string());
+    tracing::debug!(
+        pane_id,
+        tool = tool_name.as_str(),
+        "auto-approved non-AskUserQuestion permission prompt",
+    );
+    Some(true)
+}
+
 /// Parse a line of output and convert to ClaudeStreamMessage based on provider.
 /// For Codex, parses as CodexStreamMessage and converts.
 fn parse_agent_output(
@@ -2518,6 +2734,8 @@ mod tests {
                     min_iteration_interval_minutes: None,
                     child_process: child_process.clone(),
                     streaming_interrupt_tx: Arc::new(Mutex::new(None)),
+                    control_response_tx: Arc::new(Mutex::new(None)),
+                    pending_questions: Arc::new(Mutex::new(HashMap::new())),
                 },
             );
             metas.insert(
@@ -2531,6 +2749,9 @@ mod tests {
                     effort: None,
                     min_iteration_interval_minutes: None,
                     child_process,
+                    streaming_interrupt_tx: Arc::new(Mutex::new(None)),
+                    control_response_tx: Arc::new(Mutex::new(None)),
+                    pending_questions: Arc::new(Mutex::new(HashMap::new())),
                 },
             );
         }
@@ -2559,6 +2780,9 @@ mod tests {
                     effort: None,
                     min_iteration_interval_minutes: None,
                     child_process,
+                    streaming_interrupt_tx: Arc::new(Mutex::new(None)),
+                    control_response_tx: Arc::new(Mutex::new(None)),
+                    pending_questions: Arc::new(Mutex::new(HashMap::new())),
                 },
             );
         }
@@ -2588,6 +2812,8 @@ mod tests {
                     min_iteration_interval_minutes: None,
                     child_process: child_process.clone(),
                     streaming_interrupt_tx: Arc::new(Mutex::new(None)),
+                    control_response_tx: Arc::new(Mutex::new(None)),
+                    pending_questions: Arc::new(Mutex::new(HashMap::new())),
                 },
             );
             metas.insert(
@@ -2601,6 +2827,9 @@ mod tests {
                     effort: None,
                     min_iteration_interval_minutes: None,
                     child_process,
+                    streaming_interrupt_tx: Arc::new(Mutex::new(None)),
+                    control_response_tx: Arc::new(Mutex::new(None)),
+                    pending_questions: Arc::new(Mutex::new(HashMap::new())),
                 },
             );
         }
@@ -2629,6 +2858,9 @@ mod tests {
                     effort: None,
                     min_iteration_interval_minutes: None,
                     child_process,
+                    streaming_interrupt_tx: Arc::new(Mutex::new(None)),
+                    control_response_tx: Arc::new(Mutex::new(None)),
+                    pending_questions: Arc::new(Mutex::new(HashMap::new())),
                 },
             );
         }
@@ -2657,6 +2889,9 @@ mod tests {
                     effort: None,
                     min_iteration_interval_minutes: None,
                     child_process,
+                    streaming_interrupt_tx: Arc::new(Mutex::new(None)),
+                    control_response_tx: Arc::new(Mutex::new(None)),
+                    pending_questions: Arc::new(Mutex::new(HashMap::new())),
                 },
             );
         }
@@ -2685,6 +2920,9 @@ mod tests {
                     effort: None,
                     min_iteration_interval_minutes: None,
                     child_process,
+                    streaming_interrupt_tx: Arc::new(Mutex::new(None)),
+                    control_response_tx: Arc::new(Mutex::new(None)),
+                    pending_questions: Arc::new(Mutex::new(HashMap::new())),
                 },
             );
         }
@@ -2693,6 +2931,91 @@ mod tests {
             active_usage_providers(&pane_metas),
             (false, false, false, true)
         );
+    }
+
+    #[test]
+    fn control_request_parser_parks_ask_user_question() {
+        use super::{try_handle_control_request, PendingAskQuestion};
+        use shared::CliToServer;
+        use std::sync::{Arc, Mutex};
+        use std::collections::HashMap;
+
+        let pending: Arc<Mutex<HashMap<String, PendingAskQuestion>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (cr_tx, cr_rx) = std::sync::mpsc::channel::<String>();
+        let (server_tx, _server_rx) = tokio::sync::mpsc::channel::<CliToServer>(8);
+
+        let line = r#"{"type":"control_request","request_id":"req-1","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{"question":"Q?","header":"H","options":[{"label":"A","description":"a"}],"multiSelect":false}]},"tool_use_id":"toolu_abc"}}"#;
+        let handled = try_handle_control_request(
+            line,
+            42,
+            Uuid::new_v4(),
+            shared::PaneType::Interactive,
+            &pending,
+            &cr_tx,
+            &server_tx,
+        );
+        assert_eq!(handled, Some(true));
+        let guard = pending.lock().unwrap();
+        assert!(guard.contains_key("toolu_abc"));
+        assert_eq!(guard["toolu_abc"].request_id, "req-1");
+        // AskUserQuestion does NOT auto-approve; channel stays empty.
+        assert!(cr_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn control_request_parser_auto_approves_other_tools() {
+        use super::{try_handle_control_request, PendingAskQuestion};
+        use shared::CliToServer;
+        use std::sync::{Arc, Mutex};
+        use std::collections::HashMap;
+
+        let pending: Arc<Mutex<HashMap<String, PendingAskQuestion>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (cr_tx, cr_rx) = std::sync::mpsc::channel::<String>();
+        let (server_tx, _server_rx) = tokio::sync::mpsc::channel::<CliToServer>(8);
+
+        let line = r#"{"type":"control_request","request_id":"req-2","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},"tool_use_id":"toolu_xyz"}}"#;
+        let handled = try_handle_control_request(
+            line,
+            42,
+            Uuid::new_v4(),
+            shared::PaneType::Interactive,
+            &pending,
+            &cr_tx,
+            &server_tx,
+        );
+        assert_eq!(handled, Some(true));
+        let payload = cr_rx.try_recv().expect("auto-approve should send a control_response");
+        assert!(payload.contains("\"behavior\":\"allow\""));
+        assert!(payload.contains("\"request_id\":\"req-2\""));
+        assert!(payload.contains("\"toolUseID\":\"toolu_xyz\""));
+    }
+
+    #[test]
+    fn control_request_parser_ignores_non_control_lines() {
+        use super::{try_handle_control_request, PendingAskQuestion};
+        use shared::CliToServer;
+        use std::sync::{Arc, Mutex};
+        use std::collections::HashMap;
+
+        let pending: Arc<Mutex<HashMap<String, PendingAskQuestion>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (cr_tx, _cr_rx) = std::sync::mpsc::channel::<String>();
+        let (server_tx, _server_rx) = tokio::sync::mpsc::channel::<CliToServer>(8);
+
+        // Normal assistant stream message — must be left alone for parse_agent_output.
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}],"model":"claude"},"session_id":"abc"}"#;
+        let handled = try_handle_control_request(
+            line,
+            1,
+            Uuid::new_v4(),
+            shared::PaneType::Interactive,
+            &pending,
+            &cr_tx,
+            &server_tx,
+        );
+        assert_eq!(handled, None);
     }
 }
 
@@ -2717,6 +3040,8 @@ fn run_deadloop_session(
     child_process: Arc<Mutex<Option<std::process::Child>>>,
     event_tx: mpsc::Sender<TuiEvent>,
     interrupt_tx_slot: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+    control_response_tx_slot: Arc<Mutex<Option<mpsc::Sender<String>>>>,
+    pending_questions: Arc<Mutex<HashMap<String, PendingAskQuestion>>>,
 ) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_deadloop_session_inner(
@@ -2738,6 +3063,8 @@ fn run_deadloop_session(
             child_process,
             event_tx,
             interrupt_tx_slot,
+            control_response_tx_slot,
+            pending_questions,
         )
     }));
 
@@ -2776,6 +3103,8 @@ fn run_deadloop_session_inner(
     child_process: Arc<Mutex<Option<std::process::Child>>>,
     event_tx: mpsc::Sender<TuiEvent>,
     interrupt_tx_slot: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+    control_response_tx_slot: Arc<Mutex<Option<mpsc::Sender<String>>>>,
+    pending_questions: Arc<Mutex<HashMap<String, PendingAskQuestion>>>,
 ) {
     // Provider::Claude → long-lived stream-json process driven from
     // run_deadloop_session_streaming. Other providers fall through to the
@@ -2800,9 +3129,13 @@ fn run_deadloop_session_inner(
             child_process,
             event_tx,
             interrupt_tx_slot,
+            control_response_tx_slot,
+            pending_questions,
         );
     }
     let _ = interrupt_tx_slot; // unused for legacy path
+    let _ = control_response_tx_slot; // unused for legacy path
+    let _ = pending_questions; // unused for legacy path
 
     // For Codex, we need to capture the real thread_id from the first invocation
     // and use it for subsequent `codex exec resume` calls.
@@ -2823,6 +3156,9 @@ fn run_deadloop_session_inner(
     let min_iteration_interval =
         Duration::from_secs(min_iteration_interval_minutes.saturating_mul(60));
     let mut last_iteration_started_at: Option<Instant> = None;
+    // Suppress duplicate env-config errors so a misconfigured backend doesn't
+    // spam the pane every iteration; cleared once env build succeeds.
+    let mut last_env_err: Option<String> = None;
 
     while !shutdown.load(Ordering::SeqCst) {
         if stop_requested.load(Ordering::SeqCst) {
@@ -2936,27 +3272,33 @@ fn run_deadloop_session_inner(
         kill_processes_using_session(&claude_session_id.to_string());
 
         let pane_env = match build_pane_env_overrides(provider, model.as_deref()) {
-            Ok(env) => env,
+            Ok(env) => {
+                last_env_err = None;
+                env
+            }
             Err(err) => {
-                let err_msg = format!("[{}]", err);
-                let _ = output_tx.send(PaneOutput {
-                    text: err_msg.clone(),
-                    pane_id,
-                });
-                let _ = server_tx.try_send(CliToServer::StreamMessage {
-                    session_id,
-                    message: shared::ClaudeStreamMessage::Result {
-                        subtype: "text".to_string(),
-                        result: err_msg,
-                        is_error: true,
-                        total_cost_usd: 0.0,
-                        duration_ms: 0,
-                        session_id: session_id.to_string(),
-                        extra: serde_json::Value::Null,
-                    },
-                    pane_type: Some(PaneType::Deadloop),
-                    pane_id: Some(pane_id),
-                });
+                if last_env_err.as_deref() != Some(err.as_str()) {
+                    last_env_err = Some(err.clone());
+                    let err_msg = format!("[{}]", err);
+                    let _ = output_tx.send(PaneOutput {
+                        text: err_msg.clone(),
+                        pane_id,
+                    });
+                    let _ = server_tx.try_send(CliToServer::StreamMessage {
+                        session_id,
+                        message: shared::ClaudeStreamMessage::Result {
+                            subtype: "text".to_string(),
+                            result: err_msg,
+                            is_error: true,
+                            total_cost_usd: 0.0,
+                            duration_ms: 0,
+                            session_id: session_id.to_string(),
+                            extra: serde_json::Value::Null,
+                        },
+                        pane_type: Some(PaneType::Deadloop),
+                        pane_id: Some(pane_id),
+                    });
+                }
                 thread::sleep(Duration::from_secs(2));
                 continue;
             }
@@ -3772,6 +4114,16 @@ fn run_pane_session_streaming(
     shutdown: Arc<AtomicBool>,
     child_process: Arc<Mutex<Option<std::process::Child>>>,
     interrupt_tx_slot: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+    // control_response_tx_slot: the AnswerQuestion handler pushes
+    // pre-serialized control_response JSON into this channel; the inner
+    // loop drains it and writes to claude's stdin. Same lifecycle as
+    // interrupt_tx_slot — set on entry, cleared on shutdown.
+    control_response_tx_slot: Arc<Mutex<Option<mpsc::Sender<String>>>>,
+    // pending_questions: shared map keyed by tool_use_id. Reader thread
+    // inserts on AskUserQuestion control_request; AnswerQuestion handler
+    // reads to recover claude's request_id + questions before pushing
+    // the control_response.
+    pending_questions: Arc<Mutex<HashMap<String, PendingAskQuestion>>>,
     // result_signal_tx: when Some, the stdout reader sends () on every
     // Result event. Used by the deadloop driver to detect iteration
     // boundary so it can throttle and re-inject the next prompt. None for
@@ -3797,6 +4149,17 @@ fn run_pane_session_streaming(
     let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>();
     if let Ok(mut slot) = interrupt_tx_slot.lock() {
         *slot = Some(interrupt_tx);
+    }
+
+    // Channel for control_response JSON lines. Producers: the reader thread
+    // (auto-approving non-AskUserQuestion permission prompts that slip
+    // through) and the AnswerQuestion handler in the WebSocket task (when
+    // the user submits answers). The inner loop drains and writes to
+    // claude's stdin, so all stdin writes stay serialized through a single
+    // owner.
+    let (control_response_tx, control_response_rx) = mpsc::channel::<String>();
+    if let Ok(mut slot) = control_response_tx_slot.lock() {
+        *slot = Some(control_response_tx.clone());
     }
 
     // Per-pane "watched task" set: task ids the agent has expressed
@@ -3879,21 +4242,34 @@ fn run_pane_session_streaming(
     // first successful spawn (or after we observe the session file on disk),
     // flip to --resume for all subsequent restarts.
     let mut try_resume_first = session_jsonl_exists(working_dir, &claude_session_id);
+    // Suppress duplicate env-config errors across spawn retries.
+    let mut last_env_err: Option<String> = None;
 
     'spawn_loop: while !shutdown.load(Ordering::SeqCst) {
         let pane_env = match build_pane_env_overrides(provider, model.as_deref()) {
-            Ok(env) => env,
+            Ok(env) => {
+                last_env_err = None;
+                env
+            }
             Err(err) => {
-                let _ = output_tx.send(PaneOutput {
-                    text: format!("[{}]", err),
-                    pane_id,
-                });
+                if last_env_err.as_deref() != Some(err.as_str()) {
+                    last_env_err = Some(err.clone());
+                    let _ = output_tx.send(PaneOutput {
+                        text: format!("[{}]", err),
+                        pane_id,
+                    });
+                }
                 thread::sleep(Duration::from_secs(2));
                 continue 'spawn_loop;
             }
         };
 
         let using_resume = try_resume_first;
+        // We use --permission-prompt-tool stdio (not --dangerously-skip-permissions)
+        // so claude routes AskUserQuestion calls through canUseTool via the
+        // stdio control_request protocol. Bypass mode keeps regular tools
+        // auto-approved; AskUserQuestion still surfaces a control_request
+        // because claude's SDK gates it on requiresUserInteraction().
         let mut args: Vec<String> = vec![
             "--print".into(),
             "--input-format".into(),
@@ -3901,7 +4277,11 @@ fn run_pane_session_streaming(
             "--output-format".into(),
             "stream-json".into(),
             "--verbose".into(),
-            "--dangerously-skip-permissions".into(),
+            "--permission-prompt-tool".into(),
+            "stdio".into(),
+            "--allow-dangerously-skip-permissions".into(),
+            "--permission-mode".into(),
+            "bypassPermissions".into(),
         ];
         if using_resume {
             args.push("--resume".into());
@@ -4004,6 +4384,13 @@ fn run_pane_session_streaming(
         let reader_in_flight = in_flight_subagents.clone();
         let reader_thinking = thinking.clone();
         let reader_watched = watched_tasks.clone();
+        // Reader-thread access to the same pending-questions map and
+        // control_response channel as the AnswerQuestion handler. The
+        // reader records AskUserQuestion control_requests; for everything
+        // else it auto-approves via the same channel the inner loop drains
+        // onto claude's stdin.
+        let reader_pending_questions = pending_questions.clone();
+        let reader_control_response_tx = control_response_tx.clone();
         let reader_thread = thread::spawn(move || {
             let reader = BufReader::new(stdout);
             let mut line_count: u64 = 0;
@@ -4031,6 +4418,24 @@ fn run_pane_session_streaming(
                     continue;
                 }
                 line_count += 1;
+                // Intercept claude's control_request envelope before we hand
+                // the line to parse_agent_output, which only understands
+                // ClaudeStreamMessage. With `--permission-prompt-tool stdio`
+                // claude routes permission/AskUserQuestion prompts through
+                // this channel; we respond on stdin via control_response.
+                if let Some(handled) = try_handle_control_request(
+                    &line,
+                    pane_id_reader,
+                    session_id_reader,
+                    pane_type_reader,
+                    &reader_pending_questions,
+                    &reader_control_response_tx,
+                    &server_tx_reader,
+                ) {
+                    if handled {
+                        continue;
+                    }
+                }
                 // Dedup with the session-jsonl tailer. If this uuid was
                 // already forwarded by the tailer (rare race), skip.
                 if let Some(uuid) = extract_message_uuid(&line) {
@@ -4291,6 +4696,39 @@ fn run_pane_session_streaming(
                 });
             }
 
+            // Drain any pending control_response payloads. These come from
+            // the reader thread (auto-approvals) and the AnswerQuestion
+            // handler (AskUserQuestion submissions). All stdin writes funnel
+            // through this single owner so we never interleave a partial
+            // JSON line with another writer.
+            let mut control_write_failed: Option<std::io::Error> = None;
+            while let Ok(payload) = control_response_rx.try_recv() {
+                let line = format!("{}\n", payload);
+                if let Err(e) = stdin.write_all(line.as_bytes()) {
+                    control_write_failed = Some(e);
+                    break;
+                }
+                if let Err(e) = stdin.flush() {
+                    control_write_failed = Some(e);
+                    break;
+                }
+                tracing::debug!(
+                    pane_id,
+                    pid = child_pid,
+                    "streaming wrote control_response to stdin",
+                );
+            }
+            if let Some(e) = control_write_failed {
+                tracing::warn!(
+                    pane_id,
+                    pid = child_pid,
+                    error = %e,
+                    "streaming control_response write failed",
+                );
+                break_reason = "stdin-write-failed";
+                break;
+            }
+
             // Independent liveness check (covers crash where stdout still
             // buffered): try_wait the child.
             let (exited, status_dbg) = if let Ok(mut guard) = child_process.try_lock() {
@@ -4523,6 +4961,8 @@ fn run_deadloop_session_streaming(
     child_process: Arc<Mutex<Option<std::process::Child>>>,
     event_tx: mpsc::Sender<TuiEvent>,
     interrupt_tx_slot: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+    control_response_tx_slot: Arc<Mutex<Option<mpsc::Sender<String>>>>,
+    pending_questions: Arc<Mutex<HashMap<String, PendingAskQuestion>>>,
 ) {
     let _ = output_tx.send(PaneOutput {
         text: format!(
@@ -4549,6 +4989,8 @@ fn run_deadloop_session_streaming(
         let shutdown = shutdown.clone();
         let child_process = child_process.clone();
         let interrupt_tx_slot = interrupt_tx_slot.clone();
+        let control_response_tx_slot = control_response_tx_slot.clone();
+        let pending_questions = pending_questions.clone();
         thread::spawn(move || {
             run_pane_session_streaming(
                 &binary_path,
@@ -4565,6 +5007,8 @@ fn run_deadloop_session_streaming(
                 shutdown,
                 child_process,
                 interrupt_tx_slot,
+                control_response_tx_slot,
+                pending_questions,
                 None, // no iteration gating; /loop runtime self-paces
                 PaneType::Deadloop,
             );
@@ -4672,6 +5116,8 @@ fn run_pane_session(
     shutdown: Arc<AtomicBool>,
     child_process: Arc<Mutex<Option<std::process::Child>>>,
     interrupt_tx_slot: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+    control_response_tx_slot: Arc<Mutex<Option<mpsc::Sender<String>>>>,
+    pending_questions: Arc<Mutex<HashMap<String, PendingAskQuestion>>>,
 ) {
     // Provider::Claude → long-lived stream-json process. Other providers
     // (Codex, Cursor, OpenCode, MiniMax, GLM) → legacy per-turn --print
@@ -4692,11 +5138,15 @@ fn run_pane_session(
             shutdown,
             child_process,
             interrupt_tx_slot,
+            control_response_tx_slot,
+            pending_questions,
             None, // no deadloop driver listening for Result events
             PaneType::Interactive,
         );
     }
     let _ = interrupt_tx_slot; // unused for legacy path
+    let _ = control_response_tx_slot; // unused for legacy path
+    let _ = pending_questions; // unused for legacy path
 
     let mut first_message = true;
     let mut try_resume_first = true;
@@ -4708,6 +5158,8 @@ fn run_pane_session(
         text: format!("[Session: {}]", &claude_session_id.to_string()[..8]),
         pane_id,
     });
+    // Suppress duplicate env-config errors across turns; cleared on success.
+    let mut last_env_err: Option<String> = None;
 
     while !shutdown.load(Ordering::SeqCst) {
         // Wait for user input (from TUI or web, both routed through same channel)
@@ -4767,20 +5219,26 @@ fn run_pane_session(
         }
 
         let pane_env = match build_pane_env_overrides(provider, model.as_deref()) {
-            Ok(env) => env,
+            Ok(env) => {
+                last_env_err = None;
+                env
+            }
             Err(err) => {
-                let error_text = format!("[{}]", err);
-                let _ = output_tx.send(PaneOutput {
-                    text: error_text.clone(),
-                    pane_id,
-                });
-                let _ = server_tx.blocking_send(CliToServer::Output {
-                    session_id,
-                    data: error_text,
-                    output_type: shared::OutputType::Text,
-                    pane_type: Some(PaneType::Interactive),
-                    pane_id: Some(pane_id),
-                });
+                if last_env_err.as_deref() != Some(err.as_str()) {
+                    last_env_err = Some(err.clone());
+                    let error_text = format!("[{}]", err);
+                    let _ = output_tx.send(PaneOutput {
+                        text: error_text.clone(),
+                        pane_id,
+                    });
+                    let _ = server_tx.blocking_send(CliToServer::Output {
+                        session_id,
+                        data: error_text,
+                        output_type: shared::OutputType::Text,
+                        pane_type: Some(PaneType::Interactive),
+                        pane_id: Some(pane_id),
+                    });
+                }
                 continue;
             }
         };
@@ -5283,6 +5741,8 @@ async fn run_server_connection(
 
                 let session_start = CliToServer::SessionStart {
                     session_id,
+                    // session_id is `metadata.id` from .apas, which is the project id.
+                    project_id: Some(session_id),
                     working_dir: Some(working_dir.to_string()),
                     hostname,
                     pane_type: None,
@@ -5718,6 +6178,89 @@ async fn run_server_connection(
                                                     effort = ?normalized,
                                                     "Pane effort updated and persisted to .apas",
                                                 );
+                                            }
+                                            ServerToCli::AnswerQuestion {
+                                                session_id: _,
+                                                tool_use_id,
+                                                answers,
+                                            } => {
+                                                // Find the pane whose pending_questions map holds
+                                                // this tool_use_id, then build the matching
+                                                // control_response and hand it to that pane's
+                                                // streaming worker for write-to-stdin. Tool use
+                                                // ids are globally unique so the first match wins.
+                                                let mut handled = false;
+                                                let metas_snapshot: Vec<(u32, Arc<Mutex<HashMap<String, PendingAskQuestion>>>, Arc<Mutex<Option<mpsc::Sender<String>>>>)> = {
+                                                    let metas = pane_metas.lock().unwrap();
+                                                    metas
+                                                        .iter()
+                                                        .map(|(pid, m)| (
+                                                            *pid,
+                                                            m.pending_questions.clone(),
+                                                            m.control_response_tx.clone(),
+                                                        ))
+                                                        .collect()
+                                                };
+                                                for (pid, pending_arc, tx_arc) in metas_snapshot {
+                                                    let pending = {
+                                                        let mut map = match pending_arc.lock() {
+                                                            Ok(m) => m,
+                                                            Err(_) => continue,
+                                                        };
+                                                        map.remove(&tool_use_id)
+                                                    };
+                                                    if let Some(pending) = pending {
+                                                        let response = serde_json::json!({
+                                                            "type": "control_response",
+                                                            "response": {
+                                                                "subtype": "success",
+                                                                "request_id": pending.request_id,
+                                                                "response": {
+                                                                    "behavior": "allow",
+                                                                    "updatedInput": {
+                                                                        "questions": pending.questions,
+                                                                        "answers": answers,
+                                                                    },
+                                                                    "toolUseID": tool_use_id,
+                                                                }
+                                                            }
+                                                        });
+                                                        let payload = response.to_string();
+                                                        let sender = tx_arc.lock().ok().and_then(|g| g.as_ref().cloned());
+                                                        match sender {
+                                                            Some(tx) => {
+                                                                if tx.send(payload).is_err() {
+                                                                    tracing::warn!(
+                                                                        pane_id = pid,
+                                                                        tool_use_id = tool_use_id.as_str(),
+                                                                        "AnswerQuestion: streaming worker channel dead",
+                                                                    );
+                                                                } else {
+                                                                    tracing::info!(
+                                                                        pane_id = pid,
+                                                                        tool_use_id = tool_use_id.as_str(),
+                                                                        "AnswerQuestion: queued control_response for stdin",
+                                                                    );
+                                                                }
+                                                            }
+                                                            None => {
+                                                                tracing::warn!(
+                                                                    pane_id = pid,
+                                                                    tool_use_id = tool_use_id.as_str(),
+                                                                    "AnswerQuestion: no control_response sender registered",
+                                                                );
+                                                            }
+                                                        }
+                                                        handled = true;
+                                                        break;
+                                                    }
+                                                }
+                                                if !handled {
+                                                    tracing::warn!(
+                                                        tool_use_id = tool_use_id.as_str(),
+                                                        "AnswerQuestion: no matching pending AskUserQuestion (already answered or expired)",
+                                                    );
+                                                }
                                             }
                                             _ => {}
                                         }

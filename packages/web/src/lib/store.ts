@@ -32,6 +32,10 @@ export interface CliClient {
 
 export interface SessionInfo {
   id: string;
+  /** Stable project identity from `.apas`. Sidebar groups by this so moving
+   * the project directory doesn't create a duplicate entry. Falls back to `id`
+   * for legacy rows that pre-date the column. */
+  projectId?: string;
   cliClientId?: string;
   workingDir?: string;
   hostname?: string;
@@ -104,7 +108,7 @@ const toolNameMap = new Map<string, string>();
 export type OutputType =
   | { type: "text" }
   | { type: "code"; language?: string }
-  | { type: "tool_use"; tool: string; input: unknown }
+  | { type: "tool_use"; tool: string; input: unknown; toolUseId?: string }
   | { type: "tool_result"; tool: string; success: boolean }
   | { type: "approval_request"; toolCallId: string; tool: string; description: string }
   | { type: "system" }
@@ -291,6 +295,11 @@ interface AppState {
   pausedPanes: number[]; // pane_ids that are paused
   loadingMorePane: number | null;
 
+  // tool_use_id -> answers map. The AskUserQuestionCard reads this so the
+  // form flips to the read-only submitted state immediately after the user
+  // clicks Submit, instead of waiting for the round-trip tool_result.
+  answeredQuestions: Map<string, Record<string, string>>;
+
   // Legacy compat (derived from dynamic state)
   deadloopMessages: Message[];
   interactiveMessages: Message[];
@@ -318,6 +327,7 @@ interface AppState {
   addMessage: (message: Message) => void;
   approve: (toolCallId: string) => void;
   reject: (toolCallId: string) => void;
+  answerQuestion: (toolUseId: string, answers: Record<string, string>) => void;
   clearMessages: () => void;
   startSession: (cliClientId?: string) => void;
   attachSession: (sessionId: string, forceReload?: boolean) => void;
@@ -405,6 +415,7 @@ export const useStore = create<AppState>((set, get) => ({
   paneStatuses: {},
   paneModes: {},
   pausedPanes: [],
+  answeredQuestions: new Map(),
   loadingMorePane: null,
   // Legacy compat getters (populated from dynamic state)
   deadloopMessages: [],
@@ -608,6 +619,7 @@ export const useStore = create<AppState>((set, get) => ({
       paneModes: {},
       pausedPanes: [],
       paneConfigs: [],
+      answeredQuestions: new Map(),
       deadloopMessages: [],
       interactiveMessages: [],
       isDualPane: false,
@@ -661,6 +673,7 @@ export const useStore = create<AppState>((set, get) => ({
         paneModes: {},
         pausedPanes: [],
         paneConfigs: [],
+        answeredQuestions: new Map(),
         deadloopMessages: [],
         interactiveMessages: [],
         isDualPane: false,
@@ -827,6 +840,7 @@ export const useStore = create<AppState>((set, get) => ({
       paneModes: {},
       pausedPanes: [],
       paneConfigs: [],
+      answeredQuestions: new Map(),
       deadloopMessages: [],
       interactiveMessages: [],
       isDeadloopPaused: false,
@@ -877,6 +891,24 @@ export const useStore = create<AppState>((set, get) => ({
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "reject", tool_call_id: toolCallId }));
     }
+  },
+
+  answerQuestion: (toolUseId: string, answers: Record<string, string>) => {
+    const { ws } = get();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: "answer_question",
+        tool_use_id: toolUseId,
+        answers,
+      }));
+    }
+    // Mark the question locally as answered so the card flips to the
+    // submitted state immediately, even before the tool_result arrives.
+    set((state) => {
+      const next = new Map(state.answeredQuestions);
+      next.set(toolUseId, answers);
+      return { answeredQuestions: next };
+    });
   },
 
   clearMessages: () => {
@@ -1503,6 +1535,7 @@ function handleServerMessage(
       const sessions = (data.sessions as Array<Record<string, unknown>>) || [];
       const parsedSessions = sessions.map((s) => ({
         id: s.id as string,
+        projectId: (s.project_id as string | undefined) ?? (s.id as string),
         cliClientId: s.cli_client_id as string | undefined,
         workingDir: s.working_dir as string | undefined,
         hostname: s.hostname as string | undefined,
@@ -1572,6 +1605,7 @@ function handleServerMessage(
               type: "tool_use",
               tool: toolData.name as string,
               input: toolData.input,
+              toolUseId: toolData.id as string | undefined,
             };
             displayContent = `Using ${toolData.name}: ${JSON.stringify(toolData.input)}`;
             // Store id→name mapping so tool_result can look it up
@@ -1591,6 +1625,28 @@ function handleServerMessage(
               success: !resultData.is_error,
             };
             displayContent = resultData.content as string || content;
+            // Recover AskUserQuestion's answers from the persisted
+            // tool_use_result so the card shows its submitted state after
+            // a page reload.
+            if (
+              toolUseId &&
+              toolNameMap.get(toolUseId) === "AskUserQuestion" &&
+              resultData.tool_use_result &&
+              typeof resultData.tool_use_result === "object"
+            ) {
+              const answers = (resultData.tool_use_result as Record<string, unknown>)
+                .answers as Record<string, string> | undefined;
+              if (answers && typeof answers === "object") {
+                set((state) => {
+                  if (state.answeredQuestions.has(toolUseId)) {
+                    return {};
+                  }
+                  const next = new Map(state.answeredQuestions);
+                  next.set(toolUseId, answers);
+                  return { answeredQuestions: next };
+                });
+              }
+            }
           } catch {
             outputType = { type: "text" };
           }
@@ -1775,7 +1831,12 @@ function handleServerMessage(
                 role: "assistant",
                 content: `Using ${block.name}: ${JSON.stringify(block.input)}`,
                 timestamp: new Date(),
-                outputType: { type: "tool_use", tool: block.name as string, input: block.input },
+                outputType: {
+                  type: "tool_use",
+                  tool: block.name as string,
+                  input: block.input,
+                  toolUseId: block.id as string | undefined,
+                },
               };
               addMessageWithPaneRouting(set, get, toolMessage, paneType, paneId);
             }
@@ -1784,6 +1845,31 @@ function handleServerMessage(
       } else if (msgType === "user") {
         const message = msg.message as Record<string, unknown>;
         const content = message?.content as Array<Record<string, unknown>>;
+        // Claude tucks AskUserQuestion's structured answer payload into
+        // `tool_use_result` at the top of the user stream message (not in
+        // the tool_result content block). Hoist it so the card can flip to
+        // its "answered" state and persist across reloads.
+        const toolUseResult = msg.tool_use_result as Record<string, unknown> | undefined;
+        if (toolUseResult && content) {
+          const answers = toolUseResult.answers as Record<string, string> | undefined;
+          if (answers && typeof answers === "object") {
+            for (const block of content) {
+              if (block.type === "tool_result") {
+                const toolUseId = block.tool_use_id as string | undefined;
+                if (toolUseId && toolNameMap.get(toolUseId) === "AskUserQuestion") {
+                  set((state) => {
+                    if (state.answeredQuestions.has(toolUseId)) {
+                      return {};
+                    }
+                    const next = new Map(state.answeredQuestions);
+                    next.set(toolUseId, answers);
+                    return { answeredQuestions: next };
+                  });
+                }
+              }
+            }
+          }
+        }
         if (content) {
           for (const block of content) {
             if (block.type === "tool_result") {
@@ -1887,6 +1973,7 @@ function handleServerMessage(
 
     case "session_download": {
       const sessionId = data.session_id as string;
+      const projectId = data.project_id as string | undefined;
       const messages = data.messages as Array<Record<string, unknown>> || [];
       const workingDir = data.working_dir as string | undefined;
       const hostname = data.hostname as string | undefined;
@@ -1894,6 +1981,7 @@ function handleServerMessage(
 
       const downloadData = {
         session_id: sessionId,
+        project_id: projectId,
         working_dir: workingDir,
         hostname: hostname,
         created_at: createdAt,
@@ -1981,7 +2069,12 @@ function parseOutputType(data: Record<string, unknown> | undefined): OutputType 
     case "code":
       return { type: "code", language: data.language as string | undefined };
     case "tool_use":
-      return { type: "tool_use", tool: data.tool as string, input: data.input };
+      return {
+        type: "tool_use",
+        tool: data.tool as string,
+        input: data.input,
+        toolUseId: data.tool_use_id as string | undefined,
+      };
     case "tool_result":
       return { type: "tool_result", tool: data.tool as string, success: data.success as boolean };
     case "approval_request":

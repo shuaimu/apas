@@ -19,6 +19,10 @@ pub enum CliToServer {
     /// CLI starts a local session (hybrid mode)
     SessionStart {
         session_id: Uuid,
+        /// Stable project identity from `.apas` (`ProjectMetadata.id`). Older
+        /// CLIs may omit this; the server falls back to session_id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<Uuid>,
         working_dir: Option<String>,
         hostname: Option<String>,
         #[serde(default)]
@@ -198,6 +202,21 @@ pub enum ServerToCli {
     /// Interrupt a pane's agent subprocess (SIGINT). Used to unwedge a turn
     /// stuck in a tool call so the queued user input can be processed.
     InterruptPane { session_id: Uuid, pane_id: u32 },
+
+    /// Forward an AskUserQuestion answer from the web UI down to the CLI's
+    /// streaming worker, which writes the matching control_response onto
+    /// claude's stdin to complete the canUseTool callback.
+    AnswerQuestion {
+        session_id: Uuid,
+        /// Claude's tool_use_id for the AskUserQuestion call. Must match the
+        /// id from the original tool_use block so the CLI can look up the
+        /// pending control_request.
+        tool_use_id: String,
+        /// Map of question text → selected option label(s). Multi-select
+        /// values are joined with ", ". Built by the web UI from the user's
+        /// selections.
+        answers: std::collections::HashMap<String, String>,
+    },
 }
 
 // ============================================================================
@@ -427,6 +446,16 @@ pub enum WebToServer {
 
     /// Download all session data
     DownloadSession { session_id: Uuid },
+
+    /// Submit answers to a pending AskUserQuestion tool call. The server
+    /// relays this to the CLI which writes a control_response onto claude's
+    /// stdin so the SDK's canUseTool callback completes with these answers.
+    AnswerQuestion {
+        tool_use_id: String,
+        /// Question text → selected option label(s) joined with ", " for
+        /// multi-select.
+        answers: std::collections::HashMap<String, String>,
+    },
 }
 
 /// Messages sent from server to web client
@@ -550,6 +579,8 @@ pub enum ServerToWeb {
     /// Full session data for download
     SessionDownload {
         session_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<Uuid>,
         messages: Vec<MessageInfo>,
         working_dir: Option<String>,
         hostname: Option<String>,
@@ -561,6 +592,10 @@ pub enum ServerToWeb {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: Uuid,
+    /// Stable project identity from `.apas`. Web UI groups by this.
+    /// Falls back to `id` for legacy rows that pre-date the column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
     pub cli_client_id: Option<Uuid>,
     pub working_dir: Option<String>,
     pub hostname: Option<String>,
@@ -1280,6 +1315,7 @@ mod tests {
         let session_id = Uuid::new_v4();
         let msg = CliToServer::SessionStart {
             session_id,
+            project_id: None,
             working_dir: Some("/home/user/project".to_string()),
             hostname: None,
             pane_type: None,

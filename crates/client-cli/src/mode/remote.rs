@@ -151,6 +151,7 @@ async fn run_connection(
         let hostname = hostname::get().ok().and_then(|v| v.into_string().ok());
         let session_start = CliToServer::SessionStart {
             session_id: project.id,
+            project_id: Some(project.id),
             working_dir: Some(working_dir.to_string_lossy().to_string()),
             hostname,
             pane_type: None,
@@ -300,8 +301,11 @@ async fn run_connection(
                     | Ok(ServerToCli::StopBot { .. })
                     | Ok(ServerToCli::RequestPaneList { .. })
                     | Ok(ServerToCli::UpdatePaneEffort { .. })
-                    | Ok(ServerToCli::InterruptPane { .. }) => {
-                        // Pause/resume/pane/bot management not supported in remote mode
+                    | Ok(ServerToCli::InterruptPane { .. })
+                    | Ok(ServerToCli::AnswerQuestion { .. }) => {
+                        // Pause/resume/pane/bot management not supported in remote mode.
+                        // AnswerQuestion is dual_pane-only — remote mode doesn't run
+                        // the streaming worker that owns the pending_questions map.
                     }
                     Ok(ServerToCli::RebootCli { .. }) => {
                         tracing::info!("Reboot command received, restarting...");
