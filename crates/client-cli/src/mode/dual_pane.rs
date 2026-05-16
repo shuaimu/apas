@@ -6279,7 +6279,7 @@ async fn run_server_connection(
                                                 // effort; the next prompt fires at the new level.
                                                 // No restart, no SIGINT, no waiting.
                                                 if is_claude {
-                                                    match (control_tx, normalized.clone()) {
+                                                    let chat_text = match (control_tx, normalized.clone()) {
                                                         (Some(tx), Some(level)) => {
                                                             let req = serde_json::json!({
                                                                 "type": "control_request",
@@ -6295,18 +6295,21 @@ async fn run_server_connection(
                                                                     effort = %level,
                                                                     "Sent apply_flag_settings(effortLevel) live to claude",
                                                                 );
+                                                                Some(format!("[Effort set to {} — applies to the next prompt]", level))
                                                             } else {
                                                                 tracing::warn!(
                                                                     pane_id = target_pane,
                                                                     "Effort change: control_response channel dead; new effort will apply on next claude respawn",
                                                                 );
+                                                                Some(format!("[Effort persisted to {}; channel dead, will apply on next claude restart]", level))
                                                             }
                                                         }
-                                                        (None, _) => {
+                                                        (None, Some(level)) => {
                                                             tracing::warn!(
                                                                 pane_id = target_pane,
                                                                 "Effort change: no control_response_tx registered (worker not initialized yet?); new effort will apply on next claude respawn",
                                                             );
+                                                            Some(format!("[Effort persisted to {}; live update unavailable, will apply on next claude restart]", level))
                                                         }
                                                         (_, None) => {
                                                             // User reset to default (no --effort)
@@ -6318,7 +6321,23 @@ async fn run_server_connection(
                                                                 pane_id = target_pane,
                                                                 "Effort cleared to default; live claude unchanged until next respawn",
                                                             );
+                                                            Some("[Effort reset to default; takes effect on next claude restart]".to_string())
                                                         }
+                                                    };
+                                                    // Surface a system message in the chat so the
+                                                    // change is unmistakably visible — silent
+                                                    // success was confusing users into thinking
+                                                    // nothing happened.
+                                                    if let Some(text) = chat_text {
+                                                        let msg = CliToServer::Output {
+                                                            session_id,
+                                                            data: text,
+                                                            output_type: shared::OutputType::System,
+                                                            pane_type: None,
+                                                            pane_id: Some(target_pane),
+                                                        };
+                                                        let msg_text = serde_json::to_string(&msg).unwrap_or_default();
+                                                        let _ = ws_sender.send(Message::Text(msg_text.into())).await;
                                                     }
                                                 }
                                             }
