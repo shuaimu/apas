@@ -25,6 +25,12 @@ interface AskUserQuestionCardProps {
   input: unknown;
 }
 
+// Sentinel index used to represent the "Other / free text" choice in the
+// selections set, so we don't have to invent a separate parallel
+// data structure. Negative values are safe because real option indices
+// are always ≥ 0.
+const OTHER_INDEX = -1;
+
 function isQuestionList(value: unknown): value is AskUserQuestionInput {
   if (!value || typeof value !== "object") return false;
   const list = (value as { questions?: unknown }).questions;
@@ -44,10 +50,12 @@ export const AskUserQuestionCard = memo(function AskUserQuestionCard({
     [data.questions],
   );
 
-  // Map of questionIndex -> set of selected option indices.
+  // questionIndex -> set of selected option indices (OTHER_INDEX for free text).
   const [selections, setSelections] = useState<Map<number, Set<number>>>(
     () => new Map(),
   );
+  // questionIndex -> the user's free-text input for "Other".
+  const [otherTexts, setOtherTexts] = useState<Map<number, string>>(() => new Map());
 
   const submittedAnswers = toolUseId ? answeredQuestions.get(toolUseId) : undefined;
   const isSubmitted = !!submittedAnswers;
@@ -59,13 +67,22 @@ export const AskUserQuestionCard = memo(function AskUserQuestionCard({
   const [justSubmitted, setJustSubmitted] = useState(false);
   const cardRef = useRef<HTMLDivElement | null>(null);
 
+  // A question counts as answered when:
+  //  - at least one option is selected, AND
+  //  - if "Other" is among the selections, the free-text field is non-empty
+  //    (otherwise we'd send an empty answer / dangling commas).
   const allAnswered = useMemo(
     () =>
       questions.every((_, idx) => {
         const set = selections.get(idx);
-        return set && set.size > 0;
+        if (!set || set.size === 0) return false;
+        if (set.has(OTHER_INDEX)) {
+          const txt = otherTexts.get(idx)?.trim() ?? "";
+          if (txt.length === 0) return false;
+        }
+        return true;
       }),
-    [questions, selections],
+    [questions, selections, otherTexts],
   );
 
   const toggleOption = (qIdx: number, oIdx: number, multi: boolean) => {
@@ -85,19 +102,39 @@ export const AskUserQuestionCard = memo(function AskUserQuestionCard({
     });
   };
 
+  const updateOtherText = (qIdx: number, value: string) => {
+    if (isSubmitted) return;
+    setOtherTexts((prev) => {
+      const next = new Map(prev);
+      next.set(qIdx, value);
+      return next;
+    });
+  };
+
   const handleSubmit = () => {
     if (!toolUseId || isSubmitted || !allAnswered) return;
     const answers: Record<string, string> = {};
     questions.forEach((q, idx) => {
       const set = selections.get(idx);
       if (!set || set.size === 0) return;
-      const labels = Array.from(set)
+      const parts: string[] = [];
+      // Iterate sorted real option indices first, then the Other text at the
+      // end, so "Option A, my custom answer" reads naturally for multi-select.
+      Array.from(set)
+        .filter((i) => i !== OTHER_INDEX)
         .sort((a, b) => a - b)
-        .map((i) => q.options[i]?.label)
-        .filter((s): s is string => !!s);
+        .forEach((i) => {
+          const label = q.options[i]?.label;
+          if (label) parts.push(label);
+        });
+      if (set.has(OTHER_INDEX)) {
+        const txt = otherTexts.get(idx)?.trim();
+        if (txt) parts.push(txt);
+      }
       // Key must exactly match the question text — claude correlates
-      // answers by question text, not by index.
-      answers[q.question] = labels.join(", ");
+      // answers by question text, not by index. Per Anthropic's docs,
+      // free-text answers go through as the literal text (not "Other").
+      answers[q.question] = parts.join(", ");
     });
     setJustSubmitted(true);
     answerQuestion(toolUseId, answers);
@@ -155,6 +192,8 @@ export const AskUserQuestionCard = memo(function AskUserQuestionCard({
           const selectedSet = selections.get(qIdx) ?? new Set<number>();
           const submittedLabel = submittedAnswers?.[q.question];
           const multi = q.multiSelect === true;
+          const otherSelected = selectedSet.has(OTHER_INDEX);
+          const otherText = otherTexts.get(qIdx) ?? "";
           return (
             <div key={qIdx} className="space-y-2">
               {q.header && (
@@ -222,6 +261,60 @@ export const AskUserQuestionCard = memo(function AskUserQuestionCard({
                       </button>
                     );
                   })}
+                  {/* "Other / free text" choice — always rendered after the
+                      claude-supplied options so the user can answer with
+                      something not on the list. The text is what gets sent
+                      to claude (per Anthropic's docs), not the word "Other". */}
+                  <button
+                    type="button"
+                    onClick={() => toggleOption(qIdx, OTHER_INDEX, multi)}
+                    className={`w-full flex items-start gap-3 text-left px-3 py-2 rounded border transition-colors ${
+                      otherSelected
+                        ? "border-blue-400 dark:border-blue-500 bg-blue-50 dark:bg-blue-900/40"
+                        : "border-dashed border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-800"
+                    }`}
+                  >
+                    <span className="mt-0.5 flex-shrink-0 text-blue-500">
+                      {multi ? (
+                        otherSelected ? (
+                          <CheckSquare className="w-4 h-4" />
+                        ) : (
+                          <Square className="w-4 h-4 text-gray-400" />
+                        )
+                      ) : (
+                        <span
+                          className={`block w-4 h-4 rounded-full border-2 ${
+                            otherSelected
+                              ? "border-blue-500 bg-blue-500"
+                              : "border-gray-400"
+                          }`}
+                        />
+                      )}
+                    </span>
+                    <span className="flex-1 min-w-0">
+                      <span className="block text-sm font-medium text-gray-700 dark:text-gray-300 italic">
+                        Other (write your own answer)
+                      </span>
+                    </span>
+                  </button>
+                  {otherSelected && (
+                    <div className="pl-7 pr-1 pt-1">
+                      <input
+                        type="text"
+                        autoFocus
+                        value={otherText}
+                        onChange={(e) => updateOtherText(qIdx, e.target.value)}
+                        placeholder="Type your answer…"
+                        className="w-full rounded border border-blue-300 dark:border-blue-700 bg-white dark:bg-gray-800 px-3 py-2 text-sm text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-400"
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" && allAnswered) {
+                            e.preventDefault();
+                            handleSubmit();
+                          }
+                        }}
+                      />
+                    </div>
+                  )}
                 </div>
               )}
             </div>
