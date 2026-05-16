@@ -366,6 +366,14 @@ struct PaneMeta {
     /// launch. UpdatePaneEffort writes both `effort` (persisted to .apas)
     /// and this Arc (read by the worker).
     effort_arc: Arc<Mutex<Option<String>>>,
+    /// Set true by `UpdatePaneEffort` when the user actually changes the
+    /// effort dropdown. The streaming worker's inner loop polls this each
+    /// tick and, the moment claude is idle (no in-flight turn, no queued
+    /// prompts), kills the child so `spawn_loop` re-enters and respawns
+    /// claude with the new `--effort`. Deferring to idle is the happy-
+    /// code-style "natural boundary" — the user's current response isn't
+    /// aborted; the new effort applies to the next prompt.
+    restart_requested: Arc<AtomicBool>,
 }
 
 /// State stored for each in-flight AskUserQuestion call, keyed by tool_use_id.
@@ -571,6 +579,7 @@ async fn run_inner(
                     control_response_tx: Arc::new(Mutex::new(None)),
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(tab_effort.clone())),
+                    restart_requested: Arc::new(AtomicBool::new(false)),
                 },
             );
             sessions.insert(*pane_id, *pane_session_id);
@@ -739,7 +748,7 @@ async fn run_inner(
             &opencode_path,
             &cursor_agent_path,
         );
-        let (interrupt_slot, control_resp_slot, pending_qs, effort_arc) = pane_metas
+        let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, restart_req) = pane_metas
             .lock()
             .unwrap()
             .get(&pane_id)
@@ -748,12 +757,14 @@ async fn run_inner(
                 m.control_response_tx.clone(),
                 m.pending_questions.clone(),
                 m.effort_arc.clone(),
+                m.restart_requested.clone(),
             ))
             .unwrap_or_else(|| (
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(HashMap::new())),
                 Arc::new(Mutex::new(None)),
+                Arc::new(AtomicBool::new(false)),
             ));
         pane_threads.push(thread::spawn(move || {
             run_deadloop_session(
@@ -778,6 +789,7 @@ async fn run_inner(
                 control_resp_slot,
                 pending_qs,
                 effort_arc,
+                restart_req,
             )
         }));
     }
@@ -797,7 +809,7 @@ async fn run_inner(
             &opencode_path,
             &cursor_agent_path,
         );
-        let (interrupt_slot, control_resp_slot, pending_qs, effort_arc) = pane_metas
+        let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, restart_req) = pane_metas
             .lock()
             .unwrap()
             .get(&pane_id)
@@ -806,12 +818,14 @@ async fn run_inner(
                 m.control_response_tx.clone(),
                 m.pending_questions.clone(),
                 m.effort_arc.clone(),
+                m.restart_requested.clone(),
             ))
             .unwrap_or_else(|| (
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(HashMap::new())),
                 Arc::new(Mutex::new(None)),
+                Arc::new(AtomicBool::new(false)),
             ));
         pane_threads.push(thread::spawn(move || {
             run_pane_session(
@@ -832,6 +846,7 @@ async fn run_inner(
                 control_resp_slot,
                 pending_qs,
                 effort_arc,
+                restart_req,
             )
         }));
     }
@@ -1104,6 +1119,7 @@ fn handle_tui_events(
                             control_response_tx: Arc::new(Mutex::new(None)),
                             pending_questions: Arc::new(Mutex::new(HashMap::new())),
                             effort_arc: Arc::new(Mutex::new(None)),
+                            restart_requested: Arc::new(AtomicBool::new(false)),
                         },
                     );
                 }
@@ -1135,7 +1151,7 @@ fn handle_tui_events(
                         cursor_agent_path,
                     );
                     let working_dir = working_dir.to_string();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc) = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, restart_req) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
@@ -1144,12 +1160,14 @@ fn handle_tui_events(
                             m.control_response_tx.clone(),
                             m.pending_questions.clone(),
                             m.effort_arc.clone(),
+                            m.restart_requested.clone(),
                         ))
                         .unwrap_or_else(|| (
                             Arc::new(Mutex::new(None)),
                             Arc::new(Mutex::new(None)),
                             Arc::new(Mutex::new(HashMap::new())),
                             Arc::new(Mutex::new(None)),
+                            Arc::new(AtomicBool::new(false)),
                         ));
                     thread::spawn(move || {
                         run_pane_session(
@@ -1170,6 +1188,7 @@ fn handle_tui_events(
                             control_resp_slot,
                             pending_qs,
                             effort_arc,
+                            restart_req,
                         )
                     });
                 }
@@ -1235,6 +1254,7 @@ fn handle_tui_events(
                             control_response_tx: Arc::new(Mutex::new(None)),
                             pending_questions: Arc::new(Mutex::new(HashMap::new())),
                             effort_arc: Arc::new(Mutex::new(normalized_effort.clone())),
+                            restart_requested: Arc::new(AtomicBool::new(false)),
                         },
                     );
                 }
@@ -1280,7 +1300,7 @@ fn handle_tui_events(
                     let shutdown = shutdown.clone();
                     let event_tx = event_tx.clone();
                     let working_dir = working_dir.to_string();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc) = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, restart_req) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
@@ -1289,12 +1309,14 @@ fn handle_tui_events(
                             m.control_response_tx.clone(),
                             m.pending_questions.clone(),
                             m.effort_arc.clone(),
+                            m.restart_requested.clone(),
                         ))
                         .unwrap_or_else(|| (
                             Arc::new(Mutex::new(None)),
                             Arc::new(Mutex::new(None)),
                             Arc::new(Mutex::new(HashMap::new())),
                             Arc::new(Mutex::new(None)),
+                            Arc::new(AtomicBool::new(false)),
                         ));
                     thread::spawn(move || {
                         run_deadloop_session(
@@ -1319,6 +1341,7 @@ fn handle_tui_events(
                             control_resp_slot,
                             pending_qs,
                             effort_arc,
+                            restart_req,
                         )
                     });
                 } else {
@@ -1332,7 +1355,7 @@ fn handle_tui_events(
                     let server_tx = server_tx.clone();
                     let shutdown = shutdown.clone();
                     let working_dir = working_dir.to_string();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc) = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, restart_req) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
@@ -1341,12 +1364,14 @@ fn handle_tui_events(
                             m.control_response_tx.clone(),
                             m.pending_questions.clone(),
                             m.effort_arc.clone(),
+                            m.restart_requested.clone(),
                         ))
                         .unwrap_or_else(|| (
                             Arc::new(Mutex::new(None)),
                             Arc::new(Mutex::new(None)),
                             Arc::new(Mutex::new(HashMap::new())),
                             Arc::new(Mutex::new(None)),
+                            Arc::new(AtomicBool::new(false)),
                         ));
                     thread::spawn(move || {
                         run_pane_session(
@@ -1367,6 +1392,7 @@ fn handle_tui_events(
                             control_resp_slot,
                             pending_qs,
                             effort_arc,
+                            restart_req,
                         )
                     });
                 }
@@ -1570,6 +1596,7 @@ fn handle_tui_events(
                             control_response_tx: Arc::new(Mutex::new(None)),
                             pending_questions: Arc::new(Mutex::new(HashMap::new())),
                             effort_arc: Arc::new(Mutex::new(resolved_effort.clone())),
+                            restart_requested: Arc::new(AtomicBool::new(false)),
                         },
                     );
                 }
@@ -1608,7 +1635,7 @@ fn handle_tui_events(
                     let shutdown = shutdown.clone();
                     let event_tx = event_tx.clone();
                     let working_dir = working_dir.to_string();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc) = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, restart_req) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
@@ -1617,12 +1644,14 @@ fn handle_tui_events(
                             m.control_response_tx.clone(),
                             m.pending_questions.clone(),
                             m.effort_arc.clone(),
+                            m.restart_requested.clone(),
                         ))
                         .unwrap_or_else(|| (
                             Arc::new(Mutex::new(None)),
                             Arc::new(Mutex::new(None)),
                             Arc::new(Mutex::new(HashMap::new())),
                             Arc::new(Mutex::new(None)),
+                            Arc::new(AtomicBool::new(false)),
                         ));
                     thread::spawn(move || {
                         run_deadloop_session(
@@ -1647,6 +1676,7 @@ fn handle_tui_events(
                             control_resp_slot,
                             pending_qs,
                             effort_arc,
+                            restart_req,
                         )
                     });
                 }
@@ -1978,6 +2008,7 @@ fn handle_tui_events(
                             control_response_tx: Arc::new(Mutex::new(None)),
                             pending_questions: Arc::new(Mutex::new(HashMap::new())),
                             effort_arc: Arc::new(Mutex::new(saved_effort.clone())),
+                            restart_requested: Arc::new(AtomicBool::new(false)),
                         },
                     );
                 }
@@ -2030,7 +2061,7 @@ fn handle_tui_events(
                     let server_tx = server_tx.clone();
                     let shutdown = shutdown.clone();
                     let working_dir = working_dir.to_string();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc) = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, restart_req) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
@@ -2039,12 +2070,14 @@ fn handle_tui_events(
                             m.control_response_tx.clone(),
                             m.pending_questions.clone(),
                             m.effort_arc.clone(),
+                            m.restart_requested.clone(),
                         ))
                         .unwrap_or_else(|| (
                             Arc::new(Mutex::new(None)),
                             Arc::new(Mutex::new(None)),
                             Arc::new(Mutex::new(HashMap::new())),
                             Arc::new(Mutex::new(None)),
+                            Arc::new(AtomicBool::new(false)),
                         ));
                     thread::spawn(move || {
                         run_pane_session(
@@ -2065,6 +2098,7 @@ fn handle_tui_events(
                             control_resp_slot,
                             pending_qs,
                             effort_arc,
+                            restart_req,
                         )
                     });
                 }
@@ -2539,6 +2573,7 @@ mod tests {
     };
     use shared::Provider;
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
     use uuid::Uuid;
 
@@ -2770,6 +2805,7 @@ mod tests {
                     control_response_tx: Arc::new(Mutex::new(None)),
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(None)),
+                    restart_requested: Arc::new(AtomicBool::new(false)),
                 },
             );
             metas.insert(
@@ -2787,6 +2823,7 @@ mod tests {
                     control_response_tx: Arc::new(Mutex::new(None)),
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(None)),
+                    restart_requested: Arc::new(AtomicBool::new(false)),
                 },
             );
         }
@@ -2819,6 +2856,7 @@ mod tests {
                     control_response_tx: Arc::new(Mutex::new(None)),
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(None)),
+                    restart_requested: Arc::new(AtomicBool::new(false)),
                 },
             );
         }
@@ -2851,6 +2889,7 @@ mod tests {
                     control_response_tx: Arc::new(Mutex::new(None)),
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(None)),
+                    restart_requested: Arc::new(AtomicBool::new(false)),
                 },
             );
             metas.insert(
@@ -2868,6 +2907,7 @@ mod tests {
                     control_response_tx: Arc::new(Mutex::new(None)),
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(None)),
+                    restart_requested: Arc::new(AtomicBool::new(false)),
                 },
             );
         }
@@ -2900,6 +2940,7 @@ mod tests {
                     control_response_tx: Arc::new(Mutex::new(None)),
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(None)),
+                    restart_requested: Arc::new(AtomicBool::new(false)),
                 },
             );
         }
@@ -2932,6 +2973,7 @@ mod tests {
                     control_response_tx: Arc::new(Mutex::new(None)),
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(None)),
+                    restart_requested: Arc::new(AtomicBool::new(false)),
                 },
             );
         }
@@ -2964,6 +3006,7 @@ mod tests {
                     control_response_tx: Arc::new(Mutex::new(None)),
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(None)),
+                    restart_requested: Arc::new(AtomicBool::new(false)),
                 },
             );
         }
@@ -3084,6 +3127,7 @@ fn run_deadloop_session(
     control_response_tx_slot: Arc<Mutex<Option<mpsc::Sender<String>>>>,
     pending_questions: Arc<Mutex<HashMap<String, PendingAskQuestion>>>,
     effort_arc: Arc<Mutex<Option<String>>>,
+    restart_requested: Arc<AtomicBool>,
 ) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_deadloop_session_inner(
@@ -3108,6 +3152,7 @@ fn run_deadloop_session(
             control_response_tx_slot,
             pending_questions,
             effort_arc,
+            restart_requested,
         )
     }));
 
@@ -3149,6 +3194,7 @@ fn run_deadloop_session_inner(
     control_response_tx_slot: Arc<Mutex<Option<mpsc::Sender<String>>>>,
     pending_questions: Arc<Mutex<HashMap<String, PendingAskQuestion>>>,
     effort_arc: Arc<Mutex<Option<String>>>,
+    restart_requested: Arc<AtomicBool>,
 ) {
     // Provider::Claude → long-lived stream-json process driven from
     // run_deadloop_session_streaming. Other providers fall through to the
@@ -3176,12 +3222,14 @@ fn run_deadloop_session_inner(
             control_response_tx_slot,
             pending_questions,
             effort_arc,
+            restart_requested,
         );
     }
     let _ = interrupt_tx_slot; // unused for legacy path
     let _ = control_response_tx_slot; // unused for legacy path
     let _ = pending_questions; // unused for legacy path
     let _ = effort_arc; // unused for legacy path
+    let _ = restart_requested; // unused for legacy path
 
     // For Codex, we need to capture the real thread_id from the first invocation
     // and use it for subsequent `codex exec resume` calls.
@@ -4172,9 +4220,14 @@ fn run_pane_session_streaming(
     pending_questions: Arc<Mutex<HashMap<String, PendingAskQuestion>>>,
     // effort_arc: live mirror of the pane's effort. spawn_loop re-reads
     // this every iteration so UpdatePaneEffort that fires while claude
-    // is running takes effect on the next respawn (UpdatePaneEffort
-    // SIGINTs the child to force that respawn promptly).
+    // is running takes effect on the next respawn.
     effort_arc: Arc<Mutex<Option<String>>>,
+    // restart_requested: UpdatePaneEffort sets this true when the user
+    // picks a new effort level. The inner loop polls it and, at the next
+    // idle moment (claude not mid-turn, no queued prompts), kills the
+    // child so spawn_loop re-enters with the fresh effort. Deferring to
+    // idle avoids aborting an in-progress response.
+    restart_requested: Arc<AtomicBool>,
     // result_signal_tx: when Some, the stdout reader sends () on every
     // Result event. Used by the deadloop driver to detect iteration
     // boundary so it can throttle and re-inject the next prompt. None for
@@ -4824,6 +4877,31 @@ fn run_pane_session_streaming(
                 t || n > 0
             };
 
+            // Effort-change restart: only act at a clean idle boundary so
+            // we never abort an in-flight turn. The flag is set by
+            // UpdatePaneEffort when the user picks a new effort level.
+            // spawn_loop will re-read effort_arc on the next iteration
+            // and respawn claude with the new --effort.
+            if restart_requested.load(Ordering::SeqCst) && !busy && pending.is_empty() {
+                restart_requested.store(false, Ordering::SeqCst);
+                tracing::info!(
+                    pane_id,
+                    pid = child_pid,
+                    "Effort changed — claude is idle, restarting to apply new --effort",
+                );
+                let _ = output_tx.send(PaneOutput {
+                    text: "[Effort changed — restarting agent.]".to_string(),
+                    pane_id,
+                });
+                if let Ok(mut guard) = child_process.lock() {
+                    if let Some(ref mut c) = *guard {
+                        let _ = c.kill();
+                    }
+                }
+                break_reason = "effort-restart";
+                break;
+            }
+
             // 1) Drain queued auto-wakes / inputs into `pending` (FIFO).
             //    Auto-wakes are checked first only because their channel is
             //    cheaper to poll; ordering between the two is otherwise
@@ -5026,6 +5104,7 @@ fn run_deadloop_session_streaming(
     control_response_tx_slot: Arc<Mutex<Option<mpsc::Sender<String>>>>,
     pending_questions: Arc<Mutex<HashMap<String, PendingAskQuestion>>>,
     effort_arc: Arc<Mutex<Option<String>>>,
+    restart_requested: Arc<AtomicBool>,
 ) {
     let _ = output_tx.send(PaneOutput {
         text: format!(
@@ -5055,6 +5134,7 @@ fn run_deadloop_session_streaming(
         let control_response_tx_slot = control_response_tx_slot.clone();
         let pending_questions = pending_questions.clone();
         let effort_arc = effort_arc.clone();
+        let restart_requested = restart_requested.clone();
         thread::spawn(move || {
             run_pane_session_streaming(
                 &binary_path,
@@ -5074,6 +5154,7 @@ fn run_deadloop_session_streaming(
                 control_response_tx_slot,
                 pending_questions,
                 effort_arc,
+                restart_requested,
                 None, // no iteration gating; /loop runtime self-paces
                 PaneType::Deadloop,
             );
@@ -5184,6 +5265,7 @@ fn run_pane_session(
     control_response_tx_slot: Arc<Mutex<Option<mpsc::Sender<String>>>>,
     pending_questions: Arc<Mutex<HashMap<String, PendingAskQuestion>>>,
     effort_arc: Arc<Mutex<Option<String>>>,
+    restart_requested: Arc<AtomicBool>,
 ) {
     // Provider::Claude → long-lived stream-json process. Other providers
     // (Codex, Cursor, OpenCode, MiniMax, GLM) → legacy per-turn --print
@@ -5207,6 +5289,7 @@ fn run_pane_session(
             control_response_tx_slot,
             pending_questions,
             effort_arc,
+            restart_requested,
             None, // no deadloop driver listening for Result events
             PaneType::Interactive,
         );
@@ -5215,6 +5298,7 @@ fn run_pane_session(
     let _ = control_response_tx_slot; // unused for legacy path
     let _ = pending_questions; // unused for legacy path
     let _ = effort_arc; // unused for legacy path
+    let _ = restart_requested; // unused for legacy path
 
     let mut first_message = true;
     let mut try_resume_first = true;
@@ -6229,12 +6313,16 @@ async fn run_server_connection(
                                             ServerToCli::UpdatePaneEffort { session_id: _, pane_id: target_pane, effort } => {
                                                 let normalized = normalize_effort_level(effort.as_deref());
                                                 // Mutate effort + the live mirror cell that the
-                                                // streaming worker re-reads on each respawn. Snapshot
-                                                // whether the value actually changed and grab the
-                                                // child PID for the kick — we only want to bounce
-                                                // claude when the user actually picked a different
-                                                // level. Persisting always is harmless.
-                                                let (effort_changed, child_pid): (bool, Option<u32>) = {
+                                                // streaming worker re-reads on each respawn, and
+                                                // set restart_requested so the worker's inner loop
+                                                // picks an idle moment to bounce claude. We do NOT
+                                                // SIGINT here — that would abort an in-flight
+                                                // response. Instead the worker waits until the
+                                                // current turn finishes (and no prompts are
+                                                // queued), then kills, and spawn_loop respawns
+                                                // with the new --effort. Matches happy's "wait
+                                                // for the natural turn boundary" pattern.
+                                                let effort_changed: bool = {
                                                     let mut metas = pane_metas.lock().unwrap();
                                                     if let Some(meta) = metas.get_mut(&target_pane) {
                                                         let changed = meta.effort != normalized;
@@ -6242,17 +6330,12 @@ async fn run_server_connection(
                                                         if let Ok(mut g) = meta.effort_arc.lock() {
                                                             *g = normalized.clone();
                                                         }
-                                                        let pid = if changed && matches!(meta.provider, shared::Provider::Claude) {
-                                                            meta.child_process
-                                                                .lock()
-                                                                .ok()
-                                                                .and_then(|g| g.as_ref().map(|c| c.id()))
-                                                        } else {
-                                                            None
-                                                        };
-                                                        (changed, pid)
+                                                        if changed && matches!(meta.provider, shared::Provider::Claude) {
+                                                            meta.restart_requested.store(true, Ordering::SeqCst);
+                                                        }
+                                                        changed
                                                     } else {
-                                                        (false, None)
+                                                        false
                                                     }
                                                 };
                                                 save_pane_configs(
@@ -6266,43 +6349,8 @@ async fn run_server_connection(
                                                     pane_id = target_pane,
                                                     effort = ?normalized,
                                                     changed = effort_changed,
-                                                    "Pane effort updated and persisted to .apas",
+                                                    "Pane effort updated and persisted to .apas (restart deferred to idle)",
                                                 );
-                                                // Kick the live claude so spawn_loop re-reads
-                                                // effort_arc on respawn. SIGINT first; SIGKILL
-                                                // escalation in 2s if claude ignores it. Mirrors
-                                                // the InterruptPane fallback path so the recovery
-                                                // semantics are familiar.
-                                                if let Some(pid) = child_pid {
-                                                    tracing::info!(
-                                                        pane_id = target_pane,
-                                                        pid,
-                                                        "Effort changed — restarting claude to pick up new --effort",
-                                                    );
-                                                    let _ = std::process::Command::new("kill")
-                                                        .arg("-INT")
-                                                        .arg(pid.to_string())
-                                                        .status();
-                                                    let pid_for_fallback = pid;
-                                                    let pane_for_fallback = target_pane;
-                                                    std::thread::spawn(move || {
-                                                        std::thread::sleep(Duration::from_secs(2));
-                                                        let alive = std::path::Path::new(&format!(
-                                                            "/proc/{}", pid_for_fallback
-                                                        )).exists();
-                                                        if alive {
-                                                            tracing::warn!(
-                                                                pane_id = pane_for_fallback,
-                                                                pid = pid_for_fallback,
-                                                                "Effort restart: SIGINT didn't take, sending SIGKILL",
-                                                            );
-                                                            let _ = std::process::Command::new("kill")
-                                                                .arg("-KILL")
-                                                                .arg(pid_for_fallback.to_string())
-                                                                .status();
-                                                        }
-                                                    });
-                                                }
                                             }
                                             ServerToCli::AnswerQuestion {
                                                 session_id: _,
