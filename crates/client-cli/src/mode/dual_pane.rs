@@ -2506,6 +2506,67 @@ fn try_handle_control_request(
     Some(true)
 }
 
+/// Intercept `control_response` envelopes that claude emits in reply to
+/// our own `control_request`s — specifically the `apas-effort-*` ones we
+/// queue when the user changes the effort dropdown. Returns true if the
+/// line was a control_response we recognized (caller should `continue`).
+/// Non-effort control_responses (success acks for other apas-issued
+/// requests, if any) are also swallowed so they don't leak into
+/// parse_agent_output, but only the effort ones produce chat output.
+fn try_handle_control_response(
+    line: &str,
+    pane_id: u32,
+    session_id: Uuid,
+    pane_type: PaneType,
+    server_tx: &tokio_mpsc::Sender<CliToServer>,
+) -> bool {
+    if !line.contains("\"type\":\"control_response\"") {
+        return false;
+    }
+    let value: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if value.get("type").and_then(|v| v.as_str()) != Some("control_response") {
+        return false;
+    }
+    let response = match value.get("response") {
+        Some(r) => r,
+        None => return true, // structurally a control_response but malformed; swallow
+    };
+    let request_id = response
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !request_id.starts_with("apas-effort-") {
+        // Some other apas-issued control_request — let it be swallowed
+        // (it's not a stream message anyway), but no chat feedback.
+        return true;
+    }
+    let subtype = response.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
+    let text = if subtype == "success" {
+        "[✓ Effort change confirmed by claude]".to_string()
+    } else {
+        let err = response.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error");
+        format!("[✗ Effort change rejected by claude: {}]", err)
+    };
+    let msg = CliToServer::Output {
+        session_id,
+        data: text,
+        output_type: shared::OutputType::System,
+        pane_type: Some(pane_type),
+        pane_id: Some(pane_id),
+    };
+    let _ = server_tx.blocking_send(msg);
+    tracing::info!(
+        pane_id,
+        request_id,
+        subtype,
+        "received control_response for apas-effort request",
+    );
+    true
+}
+
 /// Parse a line of output and convert to ClaudeStreamMessage based on provider.
 /// For Codex, parses as CodexStreamMessage and converts.
 fn parse_agent_output(
@@ -4488,6 +4549,15 @@ fn run_pane_session_streaming(
                 // ClaudeStreamMessage. With `--permission-prompt-tool stdio`
                 // claude routes permission/AskUserQuestion prompts through
                 // this channel; we respond on stdin via control_response.
+                if try_handle_control_response(
+                    &line,
+                    pane_id_reader,
+                    session_id_reader,
+                    pane_type_reader,
+                    &server_tx_reader,
+                ) {
+                    continue;
+                }
                 if let Some(handled) = try_handle_control_request(
                     &line,
                     pane_id_reader,
