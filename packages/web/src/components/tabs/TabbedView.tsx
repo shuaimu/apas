@@ -94,13 +94,15 @@ function isGlmModel(model?: string): boolean {
   return normalized.startsWith("glm") || normalized.includes("glm-");
 }
 
+// Listed lowest → highest. xhigh sits between high and max (Opus-only
+// extra-deep tier); max is the highest level.
 const CLAUDE_EFFORT_OPTIONS = [
   { value: "default", label: "Default" },
   { value: "low", label: "Low" },
   { value: "medium", label: "Medium" },
   { value: "high", label: "High" },
-  { value: "max", label: "Max" },
   { value: "xhigh", label: "XHigh" },
+  { value: "max", label: "Max" },
 ] as const;
 type ClaudeEffortOption = (typeof CLAUDE_EFFORT_OPTIONS)[number]["value"];
 

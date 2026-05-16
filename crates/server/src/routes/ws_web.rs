@@ -119,8 +119,8 @@ fn normalize_start_bot_effort(raw: &str) -> Option<String> {
         "low" => Some("low".to_string()),
         "medium" | "med" => Some("medium".to_string()),
         "high" => Some("high".to_string()),
+        "xhigh" | "x-high" => Some("xhigh".to_string()),
         "max" => Some("max".to_string()),
-        "xhigh" | "x-high" => Some("max".to_string()),
         _ => None,
     }
 }
