@@ -6231,17 +6231,22 @@ async fn run_server_connection(
                                             }
                                             ServerToCli::UpdatePaneEffort { session_id: _, pane_id: target_pane, effort } => {
                                                 let normalized = normalize_effort_level(effort.as_deref());
-                                                // Mutate the persisted field + the live mirror
+                                                // Update the persisted field + the live mirror
                                                 // cell that the spawn loop reads. Then snapshot
                                                 // the control_response channel — we use it to
                                                 // push an `apply_flag_settings` control_request
                                                 // into claude's stdin, which updates effort
                                                 // live without killing the process. effort_arc
                                                 // is the safety net for the next fresh respawn.
-                                                let (effort_changed, control_tx, is_claude): (bool, Option<mpsc::Sender<String>>, bool) = {
+                                                //
+                                                // We do NOT short-circuit on "value unchanged":
+                                                // the user explicitly clicked the dropdown, so
+                                                // re-apply unconditionally. This also recovers
+                                                // from any drift between meta.effort (what we
+                                                // persisted) and the actual --effort in flight.
+                                                let (control_tx, is_claude): (Option<mpsc::Sender<String>>, bool) = {
                                                     let mut metas = pane_metas.lock().unwrap();
                                                     if let Some(meta) = metas.get_mut(&target_pane) {
-                                                        let changed = meta.effort != normalized;
                                                         meta.effort = normalized.clone();
                                                         if let Ok(mut g) = meta.effort_arc.lock() {
                                                             *g = normalized.clone();
@@ -6250,9 +6255,9 @@ async fn run_server_connection(
                                                             .lock()
                                                             .ok()
                                                             .and_then(|g| g.as_ref().cloned());
-                                                        (changed, tx, matches!(meta.provider, shared::Provider::Claude))
+                                                        (tx, matches!(meta.provider, shared::Provider::Claude))
                                                     } else {
-                                                        (false, None, false)
+                                                        (None, false)
                                                     }
                                                 };
                                                 save_pane_configs(
@@ -6265,7 +6270,6 @@ async fn run_server_connection(
                                                 tracing::info!(
                                                     pane_id = target_pane,
                                                     effort = ?normalized,
-                                                    changed = effort_changed,
                                                     "Pane effort updated and persisted to .apas",
                                                 );
                                                 // Push apply_flag_settings live — claude's SDK
@@ -6274,26 +6278,45 @@ async fn run_server_connection(
                                                 // current in-flight turn (if any) keeps the old
                                                 // effort; the next prompt fires at the new level.
                                                 // No restart, no SIGINT, no waiting.
-                                                if effort_changed && is_claude {
-                                                    if let (Some(tx), Some(level)) = (control_tx, normalized.clone()) {
-                                                        let req = serde_json::json!({
-                                                            "type": "control_request",
-                                                            "request_id": format!("apas-effort-{}", uuid::Uuid::new_v4()),
-                                                            "request": {
-                                                                "subtype": "apply_flag_settings",
-                                                                "settings": { "effortLevel": level },
-                                                            },
-                                                        });
-                                                        if tx.send(req.to_string()).is_ok() {
-                                                            tracing::info!(
-                                                                pane_id = target_pane,
-                                                                effort = %level,
-                                                                "Sent apply_flag_settings(effortLevel) live to claude",
-                                                            );
-                                                        } else {
+                                                if is_claude {
+                                                    match (control_tx, normalized.clone()) {
+                                                        (Some(tx), Some(level)) => {
+                                                            let req = serde_json::json!({
+                                                                "type": "control_request",
+                                                                "request_id": format!("apas-effort-{}", uuid::Uuid::new_v4()),
+                                                                "request": {
+                                                                    "subtype": "apply_flag_settings",
+                                                                    "settings": { "effortLevel": level },
+                                                                },
+                                                            });
+                                                            if tx.send(req.to_string()).is_ok() {
+                                                                tracing::info!(
+                                                                    pane_id = target_pane,
+                                                                    effort = %level,
+                                                                    "Sent apply_flag_settings(effortLevel) live to claude",
+                                                                );
+                                                            } else {
+                                                                tracing::warn!(
+                                                                    pane_id = target_pane,
+                                                                    "Effort change: control_response channel dead; new effort will apply on next claude respawn",
+                                                                );
+                                                            }
+                                                        }
+                                                        (None, _) => {
                                                             tracing::warn!(
                                                                 pane_id = target_pane,
-                                                                "Effort change: control_response channel dead; new effort will apply on next claude respawn",
+                                                                "Effort change: no control_response_tx registered (worker not initialized yet?); new effort will apply on next claude respawn",
+                                                            );
+                                                        }
+                                                        (_, None) => {
+                                                            // User reset to default (no --effort)
+                                                            // — we don't have a way to clear via
+                                                            // apply_flag_settings without
+                                                            // restarting, so just persist and
+                                                            // leave the live claude alone.
+                                                            tracing::info!(
+                                                                pane_id = target_pane,
+                                                                "Effort cleared to default; live claude unchanged until next respawn",
                                                             );
                                                         }
                                                     }
