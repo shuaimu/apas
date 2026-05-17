@@ -1,4 +1,9 @@
 import { create } from "zustand";
+import {
+  deleteSnapshot as deleteSnapshotIdb,
+  loadAllSnapshots as loadAllSnapshotsIdb,
+  saveSnapshot as saveSnapshotIdb,
+} from "./sessionCacheDb";
 
 // UUID generator with fallback for environments without crypto.randomUUID
 function generateId(): string {
@@ -711,7 +716,7 @@ export const useStore = create<AppState>((set, get) => ({
         currentSessionId !== sessionId &&
         (state.messages.length > 0 || Object.keys(state.paneMessages).length > 0)
       ) {
-        sessionCache.set(currentSessionId, {
+        const entry = {
           messages: state.messages,
           paneMessages: state.paneMessages,
           paneHasMore: state.paneHasMore,
@@ -721,7 +726,11 @@ export const useStore = create<AppState>((set, get) => ({
           isDualPane: state.isDualPane,
           answeredQuestions: state.answeredQuestions,
           cachedAt: Date.now(),
-        });
+        };
+        sessionCache.set(currentSessionId, entry);
+        // Mirror the snapshot to IndexedDB so it survives a reload —
+        // fire and forget; failure just means next reload re-fetches.
+        saveSnapshotIdb(currentSessionId, entry);
         // Cap the cache to prevent unbounded growth across long sessions
         // of project hopping. LRU by insertion order — Map preserves it.
         const MAX_CACHED_SESSIONS = 12;
@@ -729,6 +738,7 @@ export const useStore = create<AppState>((set, get) => ({
           const oldest = sessionCache.keys().next().value;
           if (oldest === undefined) break;
           sessionCache.delete(oldest);
+          deleteSnapshotIdb(oldest);
         }
       }
 
@@ -1305,6 +1315,26 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 }));
+
+// Hydrate the per-session message snapshots from IndexedDB on app boot.
+// Runs once at module load; until it resolves, the in-memory cache is
+// empty and tab switches fall back to the server fetch. Once hydrated,
+// subsequent tab switches (and reloads, since the data survives) become
+// instant. New entries written during the hydration window are merged
+// rather than overwritten — the in-memory write wins on conflict, since
+// it reflects the freshest state the user just saw.
+if (typeof window !== "undefined") {
+  loadAllSnapshotsIdb().then((diskCache) => {
+    if (diskCache.size === 0) return;
+    useStore.setState((state) => {
+      const merged = new Map(diskCache);
+      for (const [k, v] of state.sessionCache) {
+        merged.set(k, v); // in-memory wins
+      }
+      return { sessionCache: merged };
+    });
+  });
+}
 
 // Helper function to route messages to correct array based on pane_id
 function updatePaneModeHint(
