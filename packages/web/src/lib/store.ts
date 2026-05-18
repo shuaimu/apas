@@ -338,6 +338,12 @@ interface AppState {
   // attachSession just before swapping to a new session.
   sessionCache: Map<string, SessionCacheEntry>;
 
+  // Sessions that have received `stream_message`/`user_input` events
+  // while the user wasn't viewing them — used to drive the "new
+  // activity" indicator in the sidebar. Cleared when the user attaches
+  // to that session.
+  unreadSessions: Set<string>;
+
   // Legacy compat (derived from dynamic state)
   deadloopMessages: Message[];
   interactiveMessages: Message[];
@@ -458,6 +464,7 @@ export const useStore = create<AppState>((set, get) => ({
   answeredQuestions: new Map(),
   toasts: [],
   sessionCache: new Map(),
+  unreadSessions: new Set(),
   loadingMorePane: null,
   // Legacy compat getters (populated from dynamic state)
   deadloopMessages: [],
@@ -746,6 +753,14 @@ export const useStore = create<AppState>((set, get) => ({
       // Server-side session_messages will still arrive and replace as the
       // authoritative state.
       const cached = forceReload ? undefined : sessionCache.get(sessionId);
+      // Drop the unread indicator for the session we're navigating into.
+      const unreadSessions = state.unreadSessions.has(sessionId)
+        ? (() => {
+            const next = new Set(state.unreadSessions);
+            next.delete(sessionId);
+            return next;
+          })()
+        : state.unreadSessions;
       if (cached) {
         set({
           sessionId,
@@ -768,6 +783,7 @@ export const useStore = create<AppState>((set, get) => ({
           interactiveStatus: null,
           deadloopStatus: null,
           sessionCache,
+          unreadSessions,
         });
       } else {
         set({
@@ -789,6 +805,7 @@ export const useStore = create<AppState>((set, get) => ({
           interactiveStatus: null,
           deadloopStatus: null,
           sessionCache,
+          unreadSessions,
         });
       }
     } else {
@@ -1326,13 +1343,28 @@ export const useStore = create<AppState>((set, get) => ({
 if (typeof window !== "undefined") {
   loadAllSnapshotsIdb().then((diskCache) => {
     if (diskCache.size === 0) return;
+    let newKeys: string[] = [];
     useStore.setState((state) => {
       const merged = new Map(diskCache);
       for (const [k, v] of state.sessionCache) {
         merged.set(k, v); // in-memory wins
       }
+      newKeys = Array.from(diskCache.keys()).filter((k) => !state.sessionCache.has(k));
       return { sessionCache: merged };
     });
+    // If the WS is already authenticated, subscribe to the freshly-
+    // hydrated sessions so the server starts pushing for them too.
+    // (If hydration beat auth, the "authenticated" handler will do
+    // this pass itself.)
+    const state = useStore.getState();
+    const ws = state.ws;
+    if (state.isAuthenticated && ws && ws.readyState === WebSocket.OPEN) {
+      const currentSid = state.sessionId;
+      for (const sid of newKeys) {
+        if (sid === currentSid) continue;
+        ws.send(JSON.stringify({ type: "attach_session", session_id: sid }));
+      }
+    }
   });
 }
 
@@ -1350,6 +1382,72 @@ function updatePaneModeHint(
   const key = paneKey(paneId);
   if (get().paneModes[key] === modeHint) return;
   set((state) => ({ paneModes: { ...state.paneModes, [key]: modeHint } }));
+}
+
+/// Append `message` to the in-memory `sessionCache` entry for a session
+/// that isn't currently being viewed. Used to keep background tabs live
+/// while the user is on a different project, so the moment they switch
+/// they see exactly what claude did while they were away. No-op if the
+/// session isn't already cached (we don't synthesize a snapshot for a
+/// session we've never seen).
+function appendToCachedSession(
+  set: (partial: Partial<AppState> | ((state: AppState) => Partial<AppState>)) => void,
+  msgSessionId: string,
+  message: Message,
+  rawPaneType: string | undefined,
+  rawPaneId: number | string | undefined,
+) {
+  const paneId = normalizePaneId(rawPaneType, normalizeRawPaneId(rawPaneId));
+  set((state) => {
+    const existing = state.sessionCache.get(msgSessionId);
+    if (!existing) return {};
+    let next: SessionCacheEntry;
+    if (paneId) {
+      const key = paneKey(paneId);
+      const current = existing.paneMessages[key] || [];
+      next = {
+        ...existing,
+        paneMessages: { ...existing.paneMessages, [key]: [...current, message] },
+        isDualPane: true,
+        cachedAt: Date.now(),
+      };
+    } else {
+      next = {
+        ...existing,
+        messages: [...existing.messages, message],
+        cachedAt: Date.now(),
+      };
+    }
+    const cache = new Map(state.sessionCache);
+    cache.set(msgSessionId, next);
+    return { sessionCache: cache };
+  });
+}
+
+/// Dispatch a message to either the current-session state (real-time
+/// view) or the cached snapshot for another session (background tab),
+/// and mark the session unread when it's a background tab so the
+/// sidebar can show an activity dot.
+function routeMessage(
+  set: (partial: Partial<AppState> | ((state: AppState) => Partial<AppState>)) => void,
+  get: () => AppState,
+  message: Message,
+  msgSessionId: string | undefined,
+  rawPaneType: string | undefined,
+  rawPaneId: number | string | undefined,
+) {
+  const { sessionId: currentSessionId } = get();
+  if (!msgSessionId || msgSessionId === currentSessionId) {
+    addMessageWithPaneRouting(set, get, message, rawPaneType, rawPaneId);
+    return;
+  }
+  appendToCachedSession(set, msgSessionId, message, rawPaneType, rawPaneId);
+  set((state) => {
+    if (state.unreadSessions.has(msgSessionId)) return {};
+    const next = new Set(state.unreadSessions);
+    next.add(msgSessionId);
+    return { unreadSessions: next };
+  });
 }
 
 function addMessageWithPaneRouting(
@@ -1419,6 +1517,21 @@ function handleServerMessage(
           setTimeout(() => {
             get().attachSession(sessionToRestore, true);
           }, 500);
+        }
+        // Subscribe to every other session we have a cached snapshot for
+        // so the server starts pushing stream_messages for them too. This
+        // is what makes background tabs stay live without the user having
+        // to click into them. AttachSession is multi-attach on the server
+        // since the previous commit — earlier attachments aren't dropped.
+        const ws = get().ws;
+        const cachedIds = Array.from(get().sessionCache.keys());
+        for (const sid of cachedIds) {
+          if (sid === sessionToRestore) continue; // attached above
+          setTimeout(() => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: "attach_session", session_id: sid }));
+            }
+          }, 800);
         }
       }
       break;
@@ -1915,10 +2028,6 @@ function handleServerMessage(
 
     case "user_input": {
       const msgSessionId = data.session_id as string | undefined;
-      const { sessionId: currentSessionId } = get();
-      if (msgSessionId && currentSessionId && msgSessionId !== currentSessionId) {
-        break;
-      }
 
       const userMessage: Message = {
         id: generateId(),
@@ -1929,24 +2038,28 @@ function handleServerMessage(
       };
       const paneType = data.pane_type as string | undefined;
       const paneId = data.pane_id as number | string | undefined;
-      updatePaneModeHint(set, get, paneType, paneId);
-      addMessageWithPaneRouting(set, get, userMessage, paneType, paneId);
+      // updatePaneModeHint touches the current-session state; only run
+      // it for the active session (other sessions track this in their
+      // cache snapshot).
+      if (!msgSessionId || msgSessionId === get().sessionId) {
+        updatePaneModeHint(set, get, paneType, paneId);
+      }
+      routeMessage(set, get, userMessage, msgSessionId, paneType, paneId);
       break;
     }
 
     case "stream_message": {
       const msgSessionId = data.session_id as string | undefined;
-      const { sessionId: currentSessionId } = get();
-      if (msgSessionId && currentSessionId && msgSessionId !== currentSessionId) {
-        break;
-      }
 
       const msg = data.message as Record<string, unknown>;
       if (!msg) break;
 
       const paneType = data.pane_type as string | undefined;
       const paneId = data.pane_id as number | string | undefined;
-      updatePaneModeHint(set, get, paneType, paneId);
+      const isCurrentSession = !msgSessionId || msgSessionId === get().sessionId;
+      if (isCurrentSession) {
+        updatePaneModeHint(set, get, paneType, paneId);
+      }
       const msgType = msg.type as string;
       if (msgType === "assistant") {
         const message = msg.message as Record<string, unknown>;
@@ -1961,7 +2074,7 @@ function handleServerMessage(
                 timestamp: new Date(),
                 outputType: { type: "text" },
               };
-              addMessageWithPaneRouting(set, get, assistantMessage, paneType, paneId);
+              routeMessage(set, get, assistantMessage, msgSessionId, paneType, paneId);
             } else if (block.type === "tool_use") {
               // Store id→name mapping so tool_result can look it up
               if (block.id && block.name) {
@@ -1979,7 +2092,7 @@ function handleServerMessage(
                   toolUseId: block.id as string | undefined,
                 },
               };
-              addMessageWithPaneRouting(set, get, toolMessage, paneType, paneId);
+              routeMessage(set, get, toolMessage, msgSessionId, paneType, paneId);
             }
           }
         }
@@ -2026,7 +2139,7 @@ function handleServerMessage(
                   success: !(block.is_error as boolean),
                 },
               };
-              addMessageWithPaneRouting(set, get, toolResultMessage, paneType, paneId);
+              routeMessage(set, get, toolResultMessage, msgSessionId, paneType, paneId);
             }
           }
         }
@@ -2049,9 +2162,23 @@ function handleServerMessage(
           // via an earlier "assistant" event (Claude/Codex stream text blocks first,
           // but MiniMax only puts the full response in the result field).
           const normalizedPaneId = normalizePaneId(paneType, normalizeRawPaneId(paneId));
-          const existing = normalizedPaneId
-            ? (get().paneMessages[paneKey(normalizedPaneId)] || [])
-            : get().messages;
+          // Look in the right bucket — current session uses live state,
+          // background sessions use the cached snapshot.
+          let existing: Message[];
+          if (isCurrentSession) {
+            existing = normalizedPaneId
+              ? (get().paneMessages[paneKey(normalizedPaneId)] || [])
+              : get().messages;
+          } else if (msgSessionId) {
+            const cached = get().sessionCache.get(msgSessionId);
+            existing = cached
+              ? (normalizedPaneId
+                  ? (cached.paneMessages[paneKey(normalizedPaneId)] || [])
+                  : cached.messages)
+              : [];
+          } else {
+            existing = [];
+          }
           // Check recent messages (not just last — tool calls may interleave)
           const recentSlice = existing.slice(-10);
           const alreadyStreamed = recentSlice.some(
@@ -2068,7 +2195,7 @@ function handleServerMessage(
               timestamp: new Date(),
               outputType: { type: "text" },
             };
-            addMessageWithPaneRouting(set, get, assistantMessage, paneType, paneId);
+            routeMessage(set, get, assistantMessage, msgSessionId, paneType, paneId);
           }
         }
 
@@ -2081,7 +2208,7 @@ function handleServerMessage(
           timestamp: new Date(),
           outputType: { type: "system" },
         };
-        addMessageWithPaneRouting(set, get, resultMessage, paneType, paneId);
+        routeMessage(set, get, resultMessage, msgSessionId, paneType, paneId);
       }
       break;
     }

@@ -93,6 +93,7 @@ const ADMIN_USER_ID = "88b6016d-a8b4-400c-bdc9-f0120504a4fc";
 
 export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
   const { cliClients, sessions, machines, attachSession, refreshCliClients, listSessions, sessionId, connected, token, userId } = useStore();
+  const unreadSessions = useStore((s) => s.unreadSessions);
   const [shareModalOpen, setShareModalOpen] = useState(false);
   const [mounted, setMounted] = useState(false);
 
@@ -484,8 +485,16 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                         {project.hostname}
                       </div>
                     )}
-                    <div className="font-medium overflow-hidden whitespace-nowrap" title={project.workingDir}>
-                      {truncatePath(project.workingDir, width ? Math.max(12, Math.floor((width - 56) / 7.5)) : 22)}
+                    <div className="font-medium overflow-hidden whitespace-nowrap flex items-center gap-1.5" title={project.workingDir}>
+                      <span className="truncate">
+                        {truncatePath(project.workingDir, width ? Math.max(12, Math.floor((width - 56) / 7.5)) : 22)}
+                      </span>
+                      {unreadSessions.has(project.id) && sessionId !== project.id && (
+                        <span
+                          className="inline-block w-2 h-2 rounded-full bg-blue-500 flex-shrink-0 animate-pulse"
+                          title="New activity since you last viewed this session"
+                        />
+                      )}
                     </div>
                     <div className="text-xs text-gray-500 truncate">
                       {project.isShared ? (

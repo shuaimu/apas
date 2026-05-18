@@ -704,15 +704,12 @@ impl SessionManager {
         web_connection_id: Uuid,
         cli_client_id: Option<Uuid>,
     ) -> bool {
-        // Detach this web connection from any previously-attached session so
-        // we don't leak broadcasts (pane_list, output, etc.) from sessions the
-        // user has navigated away from.
-        for mut entry in self.sessions.iter_mut() {
-            if *entry.key() == *session_id {
-                continue;
-            }
-            entry.value_mut().web_connection_ids.retain(|id| *id != web_connection_id);
-        }
+        // Multi-attach: leave any previously-attached sessions alone so the
+        // web client keeps receiving stream_messages for all of them in
+        // parallel. The client routes per-session into its sessionCache so
+        // background tabs stay live. Disconnect (`unregister_web`) handles
+        // the cleanup wholesale, so we don't leak attachments across page
+        // reloads.
 
         if let Some(mut session) = self.sessions.get_mut(session_id) {
             // Add this web client if not already attached
