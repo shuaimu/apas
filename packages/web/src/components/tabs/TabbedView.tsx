@@ -264,35 +264,47 @@ export function TabbedView() {
     [effectiveTabs],
   );
 
-  // Reset active tab when switching sessions so localStorage preference is re-evaluated
-  useEffect(() => {
-    setActiveTabId(null);
-  }, [sessionId]);
+  // Track the cliClientId we last derived activeTabId for, so a project
+  // switch always re-reads the persisted preference even when the
+  // outgoing project's activeTabId happens to be a valid id in the
+  // new project. Without this, switching A→B→A used to corrupt A's
+  // saved active_tab — the effect would see stale activeTabId from B,
+  // fail the `ids.includes(activeTabId)` check, fall through, and
+  // overwrite A's localStorage with A's first pane id.
+  const lastDerivedForRef = useRef<string | null | undefined>(undefined);
 
-  // Load saved active tab when project or available tabs change
+  // Derive activeTabId from cliClientId + available panes + persisted
+  // preference. Writes to localStorage only happen through
+  // handleSelectTab (i.e. explicit user click) — this effect never
+  // persists the auto-derived fallback, so projects retain whichever
+  // tab the user last actually chose.
   useEffect(() => {
     const ids = tabIds.split(",").filter(Boolean).map(Number);
     if (ids.length === 0) return;
-    if (activeTabId != null && ids.includes(activeTabId)) return;
-    // When pane list is synthesized (pane_list missing/stale), keep current
-    // local selection to avoid unintended tab jumps from transient data.
-    if (activeTabId != null && paneConfigs.length === 0) {
+
+    const clientChanged = lastDerivedForRef.current !== cliClientId;
+    lastDerivedForRef.current = cliClientId;
+
+    // Same project, current pick is still valid → no change.
+    if (!clientChanged && activeTabId != null && ids.includes(activeTabId)) {
+      return;
+    }
+    // Same project, pane_list is synthesized (no authoritative panes yet)
+    // → keep current selection to avoid jumps from transient data.
+    if (!clientChanged && activeTabId != null && paneConfigs.length === 0) {
       return;
     }
 
-    // Initial selection: restore from persisted preference if possible.
-    if (activeTabId == null) {
-      const saved = getProjectLayout(cliClientId, "active_tab", "");
-      const savedNum = saved ? parseInt(saved, 10) : NaN;
-      if (!isNaN(savedNum) && ids.includes(savedNum)) {
-        setActiveTabId(savedNum);
-        return;
-      }
+    const saved = getProjectLayout(cliClientId, "active_tab", "");
+    const savedNum = saved ? parseInt(saved, 10) : NaN;
+    if (!isNaN(savedNum) && ids.includes(savedNum)) {
+      if (activeTabId !== savedNum) setActiveTabId(savedNum);
+      return;
     }
-
-    // Active tab was removed (authoritative pane_list): move to first visible tab.
-    setActiveTabId(ids[0]);
-    setProjectLayout(cliClientId, "active_tab", String(ids[0]));
+    // Fall through: persisted pref is gone or no longer matches a real
+    // pane. Pick the first visible tab visually but DON'T persist —
+    // we'd otherwise overwrite the user's intent on the next save.
+    if (activeTabId !== ids[0]) setActiveTabId(ids[0]);
   }, [activeTabId, cliClientId, paneConfigs.length, tabIds]);
 
   const handleSelectTab = useCallback(
