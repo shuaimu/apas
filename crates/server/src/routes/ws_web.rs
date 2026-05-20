@@ -946,9 +946,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         // (CLI will send back updated pane config)
                     }
                 }
-                Ok(WebToServer::RemovePane { pane_id }) => {
+                Ok(WebToServer::RemovePane { pane_id, cleanup_action }) => {
                     if let Some(sid) = session_id {
-                        tracing::info!("Removing pane {} from session {}", pane_id, sid);
+                        tracing::info!(
+                            "Removing pane {} from session {} (cleanup_action={:?})",
+                            pane_id, sid, cleanup_action,
+                        );
                         state
                             .sessions
                             .route_to_cli(
@@ -956,6 +959,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 ServerToCli::RemovePane {
                                     session_id: sid,
                                     pane_id,
+                                    cleanup_action,
                                 },
                             )
                             .await;

@@ -156,7 +156,10 @@ export interface PaneConfig {
   label?: string;
   model?: string;
   effort?: string;
+  worktree_path?: string;
 }
+
+export type PaneCleanupAction = "discard" | "merge_and_remove" | "leave_as_branch";
 
 // Legacy pane_id constants (must match shared::PANE_ID_DEADLOOP / PANE_ID_INTERACTIVE)
 export const PANE_ID_DEADLOOP = 1;
@@ -410,7 +413,7 @@ interface AppState {
     prompt?: string,
     model?: string
   ) => { success: boolean; error?: string };
-  removePane: (paneId: number) => void;
+  removePane: (paneId: number, cleanupAction?: PaneCleanupAction) => void;
   updatePaneLabel: (paneId: number, label: string) => void;
   updatePaneEffort: (paneId: number, effort: string | null) => void;
   interruptPane: (paneId: number) => void;
@@ -1251,10 +1254,14 @@ export const useStore = create<AppState>((set, get) => ({
     return { success: true };
   },
 
-  removePane: (paneId: number) => {
+  removePane: (paneId: number, cleanupAction?: PaneCleanupAction) => {
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "remove_pane", pane_id: paneId }));
+      const payload: Record<string, unknown> = { type: "remove_pane", pane_id: paneId };
+      if (cleanupAction) {
+        payload.cleanup_action = cleanupAction;
+      }
+      ws.send(JSON.stringify(payload));
     }
   },
 

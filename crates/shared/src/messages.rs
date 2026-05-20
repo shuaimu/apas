@@ -1,6 +1,27 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// What to do with an isolated git worktree (and its branch) when the pane
+/// that owns it is closed. Selected by the web UI before sending
+/// `WebToServer::RemovePane` so the CLI knows which git commands to run.
+/// Phase 1.1d of the swarm plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneCleanupAction {
+    /// `git worktree remove --force <path>` + `git branch -D <branch>`.
+    /// Permanently deletes work — pick only if the work is throwaway.
+    Discard,
+    /// `git -C <project> merge --no-ff <branch>` into the current main-worktree
+    /// branch, then remove the worktree + delete the branch. Errors out on
+    /// merge conflicts (the user resolves manually with normal git tools).
+    MergeAndRemove,
+    /// `git worktree remove <path>` (no --force — fails if there are
+    /// uncommitted changes, in which case we just clear `worktree_path` and
+    /// tell the user to clean up by hand). Branch is left alone so the user
+    /// can `git checkout` it for manual review.
+    LeaveAsBranch,
+}
+
 // ============================================================================
 // CLI <-> Server Messages
 // ============================================================================
@@ -166,8 +187,15 @@ pub enum ServerToCli {
         pane_config: PaneConfig,
     },
 
-    /// Remove a pane from the session
-    RemovePane { session_id: Uuid, pane_id: u32 },
+    /// Remove a pane from the session. `cleanup_action` (when Some) is
+    /// applied to the pane's isolated worktree before final teardown.
+    /// Phase 1.1d.
+    RemovePane {
+        session_id: Uuid,
+        pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cleanup_action: Option<PaneCleanupAction>,
+    },
 
     /// Start bot (deadloop) on a pane
     StartBot {
@@ -368,8 +396,15 @@ pub enum WebToServer {
         model: Option<String>,
     },
 
-    /// Remove a pane
-    RemovePane { pane_id: u32 },
+    /// Remove a pane. When the pane has an isolated worktree assigned
+    /// (`PaneConfig.worktree_path` set), `cleanup_action` says what to do
+    /// with that worktree and its branch. None = leave the on-disk worktree
+    /// and branch alone (legacy behaviour — just unlink the pane from .apas).
+    RemovePane {
+        pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cleanup_action: Option<PaneCleanupAction>,
+    },
 
     /// Update a pane's custom label
     UpdatePaneLabel {

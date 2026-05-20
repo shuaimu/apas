@@ -69,7 +69,13 @@ pub enum TuiEvent {
         model: Option<String>,
         effort: Option<String>,
     },
-    CloseTab(u32),
+    CloseTab {
+        pane_id: u32,
+        /// What to do with the pane's isolated worktree (and its branch) on
+        /// close. None means leave both alone — legacy behaviour and the
+        /// default for TUI-initiated close (which doesn't currently prompt).
+        cleanup_action: Option<shared::PaneCleanupAction>,
+    },
     /// Start bot (deadloop) on an existing interactive pane
     StartBot {
         pane_id: u32,
@@ -270,7 +276,10 @@ impl App {
                     if self.tabs.len() > 1 {
                         if let Some(tab) = self.tabs.get(self.active_tab) {
                             let pane_id = tab.pane_id;
-                            let _ = self.event_tx.send(TuiEvent::CloseTab(pane_id));
+                            let _ = self.event_tx.send(TuiEvent::CloseTab {
+                                pane_id,
+                                cleanup_action: None,
+                            });
                         }
                     }
                 }

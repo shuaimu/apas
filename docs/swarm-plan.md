@@ -88,9 +88,23 @@ review checkpoints.
   restart is a possible later leaf if the manual step proves annoying.
   Also exposed `remove <pane-id>` (clears the assignment but leaves the
   git worktree intact) and `list` (shows current assignments).
-- [ ] **1.1d — cleanup on pane removal** (next): prompt for "discard / merge
-  to current branch / leave as branch for manual review."
-- [ ] **1.1e — web UI toggle on Add Pane**: checkbox "isolated
+- [x] **1.1d — cleanup on pane removal**: shipped the three-option flow.
+  Closing a pane that owns a worktree opens a modal in the web UI
+  (`WorktreeCleanupModal`) with: "leave as branch (safe)", "merge into
+  current branch then remove", and "discard everything (with second
+  confirm)". The chosen action rides on `WebToServer::RemovePane` as a
+  new `cleanup_action` field, forwarded through `ServerToCli::RemovePane`
+  and into the existing `TuiEvent::CloseTab`. The CLI's CloseTab handler
+  reads `meta.worktree_path` (Phase 1.1a) before tearing down, then —
+  after killing the agent and removing the pane from in-memory state —
+  calls `worktree::cleanup_on_close` which runs the matching git
+  plumbing. `leave_as_branch` uses `git worktree remove` without
+  `--force` so uncommitted changes are preserved with a hand-off
+  message; `discard` uses `--force` and deletes the branch; merge does
+  `git merge --no-ff` first and aborts on conflict. Covered by 4 new
+  unit tests (clean leave, dirty leave, discard, merge bringing
+  commits into HEAD).
+- [ ] **1.1e — web UI toggle on Add Pane** (next): checkbox "isolated
   worktree", calls 1.1c under the hood.
 
 1.2  **Diff-review surface** in the web UI.

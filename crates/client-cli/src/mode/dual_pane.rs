@@ -1427,7 +1427,7 @@ fn handle_tui_events(
                     &pane_stop_requests,
                 );
             }
-            Ok(TuiEvent::CloseTab(pane_id)) => {
+            Ok(TuiEvent::CloseTab { pane_id, cleanup_action }) => {
                 // Remove input channel (causes interactive session thread to exit)
                 {
                     let mut channels = input_channels.lock().unwrap();
@@ -1445,8 +1445,9 @@ fn handle_tui_events(
                     let mut stop_requests = pane_stop_requests.lock().unwrap();
                     stop_requests.remove(&pane_id);
                 }
-                {
+                let worktree_path: Option<String> = {
                     let metas = pane_metas.lock().unwrap();
+                    let path = metas.get(&pane_id).and_then(|m| m.worktree_path.clone());
                     if let Some(meta) = metas.get(&pane_id) {
                         if let Ok(mut guard) = meta.child_process.lock() {
                             if let Some(ref mut child) = *guard {
@@ -1454,7 +1455,8 @@ fn handle_tui_events(
                             }
                         }
                     }
-                }
+                    path
+                };
 
                 // Remove from pane sessions and metas
                 {
@@ -1473,6 +1475,24 @@ fn handle_tui_events(
                     text: format!("[Tab {} closed]", pane_id),
                     pane_id,
                 });
+
+                // If the pane owned an isolated worktree AND the caller asked
+                // for cleanup, run the requested action. Errors are reported
+                // back via the chat stream — we don't fail the close itself.
+                if let (Some(path), Some(action)) = (worktree_path.as_deref(), cleanup_action) {
+                    let cleanup_msg = match crate::worktree::cleanup_on_close(
+                        working_dir,
+                        path,
+                        action,
+                    ) {
+                        Ok(text) => text,
+                        Err(err) => format!("[Worktree cleanup failed: {}]", err),
+                    };
+                    let _ = output_tx.send(PaneOutput {
+                        text: cleanup_msg,
+                        pane_id,
+                    });
+                }
 
                 // Send pane list update
                 let _ = server_tx.blocking_send(CliToServer::PaneList {
@@ -6266,9 +6286,12 @@ async fn run_server_connection(
                                                     effort: pane_config.effort,
                                                 });
                                             }
-                                            ServerToCli::RemovePane { session_id: _, pane_id: remove_id } => {
+                                            ServerToCli::RemovePane { session_id: _, pane_id: remove_id, cleanup_action } => {
                                                 // Delegate to TUI event handler
-                                                let _ = tui_event_tx.send(TuiEvent::CloseTab(remove_id));
+                                                let _ = tui_event_tx.send(TuiEvent::CloseTab {
+                                                    pane_id: remove_id,
+                                                    cleanup_action,
+                                                });
                                             }
                                             ServerToCli::StartBot {
                                                 session_id: _,

@@ -1,7 +1,7 @@
 "use client";
 
 import { useRef, useCallback, useEffect, useState, useMemo, memo } from "react";
-import { useStore, Message, PaneConfig, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, paneKey } from "@/lib/store";
+import { useStore, Message, PaneConfig, PaneCleanupAction, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, paneKey } from "@/lib/store";
 import { UserMessage } from "../chat/UserMessage";
 import { AssistantMessage } from "../chat/AssistantMessage";
 import { TabBar } from "./TabBar";
@@ -213,6 +213,11 @@ export function TabbedView() {
   const [botEffortDraft, setBotEffortDraft] = useState<ClaudeEffortOption>("default");
   const [inputDrafts, setInputDrafts] = useState<Record<string, string>>({});
   const [addTabError, setAddTabError] = useState<string | null>(null);
+  // 3-option cleanup dialog shown when closing a pane that owns a worktree.
+  // null = closed. paneId/worktreePath populated when open.
+  const [cleanupDialog, setCleanupDialog] = useState<
+    { paneId: number; worktreePath: string } | null
+  >(null);
 
   // Determine effective tabs: use paneConfigs from server, or synthesize from observed messages
   const effectiveTabs = useMemo(() => {
@@ -317,6 +322,13 @@ export function TabbedView() {
 
   const handleCloseTab = useCallback(
     (paneId: number) => {
+      const pane = effectiveTabs.find((t) => t.pane_id === paneId);
+      const worktreePath = pane?.worktree_path;
+      if (worktreePath) {
+        // Pane owns an isolated worktree — open the 3-option dialog.
+        setCleanupDialog({ paneId, worktreePath });
+        return;
+      }
       if (!confirm("Close this tab?")) return;
       removePane(paneId);
       // If closing active tab, switch to another
@@ -328,6 +340,22 @@ export function TabbedView() {
       }
     },
     [removePane, activeTabId, effectiveTabs, handleSelectTab],
+  );
+
+  const handleConfirmCleanup = useCallback(
+    (action: PaneCleanupAction) => {
+      if (!cleanupDialog) return;
+      const { paneId } = cleanupDialog;
+      removePane(paneId, action);
+      setCleanupDialog(null);
+      if (paneId === activeTabId && effectiveTabs.length > 1) {
+        const remaining = effectiveTabs.filter((t) => t.pane_id !== paneId);
+        if (remaining.length > 0) {
+          handleSelectTab(remaining[0].pane_id);
+        }
+      }
+    },
+    [cleanupDialog, removePane, activeTabId, effectiveTabs, handleSelectTab],
   );
 
   const handleAddTab = useCallback((provider: string = "claude", model?: string) => {
@@ -840,6 +868,84 @@ export function TabbedView() {
         tabLabel={activeConfig?.label || (activeTabId != null ? `Tab ${activeTabId}` : "Tab")}
         onClose={handleCloseBotPrompt}
       />
+
+      <WorktreeCleanupModal
+        open={cleanupDialog !== null}
+        worktreePath={cleanupDialog?.worktreePath || ""}
+        onCancel={() => setCleanupDialog(null)}
+        onConfirm={handleConfirmCleanup}
+      />
+    </div>
+  );
+}
+
+interface WorktreeCleanupModalProps {
+  open: boolean;
+  worktreePath: string;
+  onCancel: () => void;
+  onConfirm: (action: PaneCleanupAction) => void;
+}
+
+function WorktreeCleanupModal({ open, worktreePath, onCancel, onConfirm }: WorktreeCleanupModalProps) {
+  if (!open) return null;
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      onClick={onCancel}
+    >
+      <div
+        className="w-full max-w-lg rounded-lg border border-zinc-700 bg-zinc-900 p-5 text-zinc-100 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 className="mb-1 text-lg font-semibold">Close pane with isolated worktree</h3>
+        <p className="mb-4 break-all text-sm text-zinc-400">
+          Worktree: <span className="font-mono text-zinc-200">{worktreePath}</span>
+        </p>
+        <div className="flex flex-col gap-2">
+          <button
+            type="button"
+            onClick={() => onConfirm("leave_as_branch")}
+            className="rounded border border-zinc-600 bg-zinc-800 px-3 py-2 text-left text-sm hover:bg-zinc-700"
+          >
+            <div className="font-medium">Leave as branch (safe)</div>
+            <div className="text-xs text-zinc-400">
+              Remove the worktree directory; keep the branch so you can review it later. If the worktree has uncommitted changes, removal is skipped and you&apos;ll be told to clean it up by hand.
+            </div>
+          </button>
+          <button
+            type="button"
+            onClick={() => onConfirm("merge_and_remove")}
+            className="rounded border border-zinc-600 bg-zinc-800 px-3 py-2 text-left text-sm hover:bg-zinc-700"
+          >
+            <div className="font-medium">Merge into current branch, then remove</div>
+            <div className="text-xs text-zinc-400">
+              git merge --no-ff the worktree&apos;s branch into the main checkout&apos;s HEAD, then remove the worktree and delete the branch. Aborts on conflicts (resolve manually with git).
+            </div>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              if (!confirm("Permanently discard the worktree AND its branch? This cannot be undone.")) return;
+              onConfirm("discard");
+            }}
+            className="rounded border border-red-700 bg-red-900/30 px-3 py-2 text-left text-sm hover:bg-red-900/50"
+          >
+            <div className="font-medium text-red-300">Discard everything</div>
+            <div className="text-xs text-red-300/80">
+              Force-remove the worktree and delete the branch. Loses uncommitted changes. Only pick this if the work is throwaway.
+            </div>
+          </button>
+        </div>
+        <div className="mt-4 flex justify-end">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="rounded border border-zinc-600 bg-zinc-800 px-3 py-1.5 text-sm hover:bg-zinc-700"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
