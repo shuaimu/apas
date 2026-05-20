@@ -98,6 +98,7 @@ impl ProjectMetadata {
                     label: Some("Claude Deadloop".to_string()),
                     model: None,
                     effort: None,
+                    worktree_path: None,
                 },
                 PaneConfig {
                     pane_id: shared::PANE_ID_INTERACTIVE,
@@ -111,6 +112,7 @@ impl ProjectMetadata {
                     label: Some("Claude Interactive".to_string()),
                     model: None,
                     effort: None,
+                    worktree_path: None,
                 },
             ];
         }

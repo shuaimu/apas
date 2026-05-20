@@ -367,6 +367,14 @@ struct PaneMeta {
     /// control_request to the live claude (see UpdatePaneEffort handler);
     /// this Arc is the safety net for fresh process spawns.
     effort_arc: Arc<Mutex<Option<String>>>,
+    /// Absolute path to an isolated git worktree the pane should run in.
+    /// Mirrors `PaneConfig.worktree_path` from `.apas`. When `Some`,
+    /// callers swap the project's `working_dir` for this path at process
+    /// spawn time (claude's session-jsonl tailer, the child's cwd, etc.).
+    /// `None` keeps the legacy "all panes share one tree" behaviour.
+    /// The git worktree itself is created out-of-band; setting this
+    /// field does not invoke git.
+    worktree_path: Option<String>,
 }
 
 /// State stored for each in-flight AskUserQuestion call, keyed by tool_use_id.
@@ -445,6 +453,7 @@ async fn run_inner(
         Option<String>,
         Option<u64>,
         bool,
+        Option<String>, // worktree_path from .apas (Phase 1.1)
     )> = metadata
         .panes
         .iter()
@@ -479,6 +488,7 @@ async fn run_inner(
                 normalize_effort_level(pane.effort.as_deref()),
                 pane.min_iteration_interval_minutes,
                 is_paused,
+                pane.worktree_path.clone(),
             )
         })
         .collect();
@@ -554,6 +564,7 @@ async fn run_inner(
             tab_effort,
             min_interval_minutes,
             is_paused,
+            tab_worktree,
         ) in &tabs_to_restore
         {
             let child_proc: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
@@ -572,6 +583,7 @@ async fn run_inner(
                     control_response_tx: Arc::new(Mutex::new(None)),
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(tab_effort.clone())),
+                    worktree_path: tab_worktree.clone(),
                 },
             );
             sessions.insert(*pane_id, *pane_session_id);
@@ -677,7 +689,7 @@ async fn run_inner(
     };
 
     // Send initial messages for restored panes.
-    for (pane_id, _, label, mode, _, _, _, _, _, is_paused) in &tabs_to_restore {
+    for (pane_id, _, label, mode, _, _, _, _, _, is_paused, _) in &tabs_to_restore {
         let init_text = if *pane_id == shared::PANE_ID_DEADLOOP
             && *mode == shared::PaneMode::Deadloop
         {
@@ -1017,6 +1029,9 @@ fn save_pane_configs(
                             None,
                         )
                     };
+                let worktree_path = pane_metas
+                    .get(&pane_id)
+                    .and_then(|p| p.worktree_path.clone());
                 shared::PaneConfig {
                     pane_id,
                     provider,
@@ -1033,6 +1048,7 @@ fn save_pane_configs(
                     )),
                     model,
                     effort,
+                    worktree_path,
                 }
             })
             .collect();
@@ -1105,6 +1121,7 @@ fn handle_tui_events(
                             control_response_tx: Arc::new(Mutex::new(None)),
                             pending_questions: Arc::new(Mutex::new(HashMap::new())),
                             effort_arc: Arc::new(Mutex::new(None)),
+                            worktree_path: None,
                         },
                     );
                 }
@@ -1236,6 +1253,7 @@ fn handle_tui_events(
                             control_response_tx: Arc::new(Mutex::new(None)),
                             pending_questions: Arc::new(Mutex::new(HashMap::new())),
                             effort_arc: Arc::new(Mutex::new(normalized_effort.clone())),
+                            worktree_path: None,
                         },
                     );
                 }
@@ -1571,6 +1589,7 @@ fn handle_tui_events(
                             control_response_tx: Arc::new(Mutex::new(None)),
                             pending_questions: Arc::new(Mutex::new(HashMap::new())),
                             effort_arc: Arc::new(Mutex::new(resolved_effort.clone())),
+                            worktree_path: None,
                         },
                     );
                 }
@@ -1979,6 +1998,7 @@ fn handle_tui_events(
                             control_response_tx: Arc::new(Mutex::new(None)),
                             pending_questions: Arc::new(Mutex::new(HashMap::new())),
                             effort_arc: Arc::new(Mutex::new(saved_effort.clone())),
+                            worktree_path: None,
                         },
                     );
                 }
@@ -2137,6 +2157,7 @@ fn build_pane_list(
             label: Some(label),
             model: meta.model.clone(),
             effort: meta.effort.clone(),
+            worktree_path: meta.worktree_path.clone(),
         });
     }
 
@@ -2156,6 +2177,7 @@ fn build_pane_list(
                 label: Some(default_pane_label(pane_id, None)),
                 model: None,
                 effort: None,
+                worktree_path: None,
             });
         }
     }
@@ -2833,6 +2855,7 @@ mod tests {
                     control_response_tx: Arc::new(Mutex::new(None)),
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(None)),
+                    worktree_path: None,
                 },
             );
             metas.insert(
@@ -2850,6 +2873,7 @@ mod tests {
                     control_response_tx: Arc::new(Mutex::new(None)),
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(None)),
+                    worktree_path: None,
                 },
             );
         }
@@ -2882,6 +2906,7 @@ mod tests {
                     control_response_tx: Arc::new(Mutex::new(None)),
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(None)),
+                    worktree_path: None,
                 },
             );
         }
@@ -2914,6 +2939,7 @@ mod tests {
                     control_response_tx: Arc::new(Mutex::new(None)),
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(None)),
+                    worktree_path: None,
                 },
             );
             metas.insert(
@@ -2931,6 +2957,7 @@ mod tests {
                     control_response_tx: Arc::new(Mutex::new(None)),
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(None)),
+                    worktree_path: None,
                 },
             );
         }
@@ -2963,6 +2990,7 @@ mod tests {
                     control_response_tx: Arc::new(Mutex::new(None)),
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(None)),
+                    worktree_path: None,
                 },
             );
         }
@@ -2995,6 +3023,7 @@ mod tests {
                     control_response_tx: Arc::new(Mutex::new(None)),
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(None)),
+                    worktree_path: None,
                 },
             );
         }
@@ -3027,6 +3056,7 @@ mod tests {
                     control_response_tx: Arc::new(Mutex::new(None)),
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(None)),
+                    worktree_path: None,
                 },
             );
         }

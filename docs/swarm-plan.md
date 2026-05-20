@@ -58,13 +58,26 @@ review checkpoints.
 **Why first**: every later phase assumes panes can't trash each other's work.
 
 1.1  **Worktree-per-pane**.
-- On pane spawn (Claude provider initially): `git worktree add` to
-  `.apas/worktrees/<pane-label-slug>` on branch `apas/<pane-label-slug>`.
-- Pane's `working_dir` becomes that worktree path.
-- On pane removal: prompt for "discard / merge to current branch / leave as
-  branch for manual review."
-- Per-pane toggle to opt out (legacy "shared working dir" mode).
-- Persist in `.apas`: new field `worktree_path: Option<String>` on `PaneConfig`.
+- [x] **1.1a — data model** (commit pending): `worktree_path:
+  Option<String>` added to `PaneConfig` (persisted in `.apas`) and
+  mirrored on the in-memory `PaneMeta`. All 13 PaneMeta construction
+  sites and all PaneConfig sites pass `worktree_path` through;
+  defaults to `None` (legacy behaviour preserved). Restore-from-.apas
+  threads it into the `tabs_to_restore` tuple. No runtime behaviour
+  change yet — sets up the field so the next leaf can read it.
+- [ ] **1.1b — spawn cwd** (next): at the three spawn sites in
+  `dual_pane.rs` (codex non-streaming, streaming claude, claude
+  legacy non-streaming), use
+  `worktree_path.as_deref().unwrap_or(working_dir)` for `current_dir`.
+  Also for the session-jsonl tailer's encoded-cwd computation, since
+  claude stores its sessions keyed by cwd.
+- [ ] **1.1c — opt-in CLI subcommand**: `apas worktree add <pane-id>
+  [branch-name]` creates the worktree, sets `PaneConfig.worktree_path`,
+  re-saves `.apas`, optionally restarts the pane.
+- [ ] **1.1d — cleanup on pane removal**: prompt for "discard / merge
+  to current branch / leave as branch for manual review."
+- [ ] **1.1e — web UI toggle on Add Pane**: checkbox "isolated
+  worktree", calls 1.1c under the hood.
 
 1.2  **Diff-review surface** in the web UI.
 - Server-side: per pane, watch `git diff <branch>..HEAD` on commit hook (or
