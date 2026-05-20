@@ -136,9 +136,16 @@ Phase 1.1 is complete.
   button. No polling, no syntax highlighting yet — those are 1.2b/c.
   Two new unit tests (happy-path diff with content, error path when
   no worktree).
-- [ ] **1.2b — auto-refresh**: CLI watches the worktree branch's tip
-  (poll `git rev-parse <branch>` every few seconds, or use a commit
-  hook) and re-emits `PaneDiff` on change so the modal stays live.
+- [x] **1.2b — auto-refresh**: a single shared poller thread (spawned
+  from `dual_pane::run_inner`, 3-second tick) scans `pane_metas` for
+  panes with `worktree_path`, runs `git rev-parse HEAD` in each, and
+  re-emits `PaneDiff` only when the SHA differs from the previous
+  tick. New panes are picked up automatically on the next scan; closed
+  panes have their `last_seen` entry reaped so the state map stays
+  bounded. Helper `worktree::poll_changed_diffs(project, state, panes)`
+  is exposed so the loop body is testable in isolation — covered by a
+  new unit test that walks the (baseline → no change → commit → reap)
+  cycle.
 - [ ] **1.2c — syntax-highlighted view**: render the patch with
   `CodeBlock` (already wired) + per-file collapsible sections, instead
   of a raw `<pre>` dump.

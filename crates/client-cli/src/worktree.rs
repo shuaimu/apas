@@ -175,6 +175,82 @@ pub fn list(project_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the current commit SHA at the tip of a worktree's branch
+/// (`git rev-parse HEAD` in the worktree). Returns None when the call
+/// fails for any reason — callers treat that as "no change to report".
+fn current_head_sha(worktree_path: &str) -> Option<String> {
+    let out = run_git_cd(worktree_path, &["rev-parse", "HEAD"]).ok()?;
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Snapshot used by the diff poll loop. Holds the last-seen SHA per
+/// pane so we only re-emit `PaneDiff` when the branch tip moves.
+pub struct DiffPollState {
+    last_seen: std::collections::HashMap<u32, String>,
+}
+
+impl DiffPollState {
+    pub fn new() -> Self {
+        Self {
+            last_seen: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl Default for DiffPollState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One iteration of the auto-refresh poller. Given a snapshot of
+/// (pane_id, worktree_path) entries, run `rev-parse HEAD` on each one;
+/// if the SHA differs from the previous tick, recompute the diff and
+/// emit it via the returned vector of (pane_id, branch, base, diff).
+/// Also reaps `last_seen` entries for panes that disappeared so the
+/// state doesn't grow unboundedly. Phase 1.2b.
+pub fn poll_changed_diffs(
+    project_dir: &Path,
+    state: &mut DiffPollState,
+    panes_with_worktrees: &[(u32, String)],
+) -> Vec<(u32, String, String, String)> {
+    let mut out = Vec::new();
+    let live_ids: std::collections::HashSet<u32> =
+        panes_with_worktrees.iter().map(|(id, _)| *id).collect();
+    state.last_seen.retain(|id, _| live_ids.contains(id));
+
+    for (pane_id, wt) in panes_with_worktrees {
+        let sha = match current_head_sha(wt) {
+            Some(s) => s,
+            None => continue,
+        };
+        let changed = match state.last_seen.get(pane_id) {
+            Some(prev) => prev != &sha,
+            None => true,
+        };
+        if !changed {
+            continue;
+        }
+        state.last_seen.insert(*pane_id, sha);
+        match compute_pane_diff(project_dir, Some(wt)) {
+            Ok((branch, base, diff)) => out.push((*pane_id, branch, base, diff)),
+            Err(err) => {
+                tracing::warn!(
+                    pane_id,
+                    error = %err,
+                    "poll_changed_diffs: compute_pane_diff failed; skipping emission this tick",
+                );
+            }
+        }
+    }
+    out
+}
+
 /// Compute the diff for a pane's isolated worktree branch against the
 /// project's HEAD. Returns (branch_name, base_ref, diff_text). Phase 1.2a.
 ///
@@ -391,6 +467,42 @@ mod tests {
         assert!(!wt.exists(), "worktree dir gone");
         let branches = run_git_cd(proj_str, &["branch", "--list", "apas-pane-2"]).unwrap();
         assert!(!branches.contains("apas-pane-2"), "branch deleted");
+    }
+
+    #[test]
+    fn poll_changed_diffs_only_fires_on_sha_change_and_reaps_gone_panes() {
+        let (_tmp, proj, wt) = setup_repo_with_worktree();
+        let wt_str = wt.to_str().unwrap().to_string();
+        let mut state = DiffPollState::new();
+
+        let panes = vec![(2u32, wt_str.clone())];
+        // First poll: SHA hasn't been seen, so we emit even with no
+        // new commits (the diff text will just be empty).
+        let first = poll_changed_diffs(&proj, &mut state, &panes);
+        assert_eq!(first.len(), 1, "first tick should emit baseline");
+        assert_eq!(first[0].0, 2);
+
+        // Second poll without changes: nothing should fire.
+        let second = poll_changed_diffs(&proj, &mut state, &panes);
+        assert!(second.is_empty(), "no SHA change should produce no emissions");
+
+        // Commit something on the branch — third poll should fire.
+        std::fs::write(wt.join("a.txt"), b"a").unwrap();
+        assert!(Command::new("git")
+            .arg("-C").arg(&wt_str)
+            .args(["add", "a.txt"]).status().unwrap().success());
+        assert!(Command::new("git")
+            .arg("-C").arg(&wt_str)
+            .args(["-c", "user.email=t@e", "-c", "user.name=t", "commit", "-m", "a"])
+            .status().unwrap().success());
+        let third = poll_changed_diffs(&proj, &mut state, &panes);
+        assert_eq!(third.len(), 1, "branch tip moved → should re-emit");
+        assert!(third[0].3.contains("a.txt"));
+
+        // Pane disappears: last_seen entry should be reaped.
+        assert!(state.last_seen.contains_key(&2));
+        let _ = poll_changed_diffs(&proj, &mut state, &[]);
+        assert!(!state.last_seen.contains_key(&2), "stale entry should be dropped");
     }
 
     #[test]

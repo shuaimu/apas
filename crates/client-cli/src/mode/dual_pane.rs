@@ -899,6 +899,47 @@ async fn run_inner(
         })
     };
 
+    // Phase 1.2b: auto-refresh diff poller. Scans pane_metas every few
+    // seconds for panes with worktree_path set; when any one's branch tip
+    // (HEAD in the worktree) has moved since the last tick, it recomputes
+    // the diff and pushes a fresh PaneDiff over the wire so the web modal
+    // updates live. Sleep tick is short — git rev-parse is cheap (one
+    // file read) so polling is essentially free.
+    {
+        let pane_metas_for_poll = pane_metas.clone();
+        let server_tx_for_poll = server_tx.clone();
+        let shutdown_for_poll = shutdown.clone();
+        let working_dir_for_poll = working_dir_str.clone();
+        thread::spawn(move || {
+            let mut state = crate::worktree::DiffPollState::new();
+            let project = std::path::PathBuf::from(working_dir_for_poll);
+            while !shutdown_for_poll.load(Ordering::SeqCst) {
+                let panes: Vec<(u32, String)> = {
+                    let metas = pane_metas_for_poll.lock().unwrap();
+                    metas
+                        .iter()
+                        .filter_map(|(id, m)| {
+                            m.worktree_path.as_ref().map(|wt| (*id, wt.clone()))
+                        })
+                        .collect()
+                };
+                let updates = crate::worktree::poll_changed_diffs(&project, &mut state, &panes);
+                for (pane_id, branch, base, diff) in updates {
+                    let _ = server_tx_for_poll
+                        .blocking_send(CliToServer::PaneDiff {
+                            session_id,
+                            pane_id,
+                            branch: Some(branch),
+                            base: Some(base),
+                            diff: Some(diff),
+                            error: None,
+                        });
+                }
+                thread::sleep(Duration::from_secs(3));
+            }
+        });
+    }
+
     if headless {
         // Headless mode: drain output (nobody reads it) and wait for server task
         drop(output_rx);
