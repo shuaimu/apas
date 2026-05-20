@@ -201,16 +201,26 @@ Phase 1.2 is complete.
 
 Phase 2.1 is complete.
 
-2.2  **Project-scoped team scratchpad** (`.apas/team.jsonl`).
-- Append-only JSONL, one record per published artifact:
-  ```json
-  {"ts":"...","pane_id":42,"tags":["pr-review","auth-module"],
-   "kind":"diff","body":"..."}
-  ```
-- Each pane's system-prompt-append includes a one-liner reminding it of the
-  file + the tags it should `tail -f`.
-- Web UI: a global "Team" tab next to the per-pane chats that renders the
-  scratchpad as a timeline.
+2.2  **Project-scoped team scratchpad** (`.apas/team.jsonl`). Sub-split:
+- [x] **2.2a — data model + CLI helpers**: new `crate::scratchpad`
+  module with `TeamRecord { ts, pane_id, tags, kind, body }`, an
+  `append()` helper, `read_all()`, and `read_filtered_by_tags()`.
+  Deviation from plan: `.apas` is a *file* (project metadata), so the
+  scratchpad lives at `<project>/.apas-team.jsonl` (sibling) rather
+  than `<project>/.apas/team.jsonl` (would conflict with the file).
+  Documented in the path-resolution helper so a future leaf that
+  migrates `.apas` to a directory has one place to change. Four unit
+  tests cover round-trip, tag filter, missing-file → empty, and
+  malformed-line skipping.
+- [ ] **2.2b — wire + web UI Team timeline**: new
+  `CliToServer::TeamRecord` push when the CLI appends; CLI also
+  streams the file on attach so the web shows existing history.
+  `ServerToWeb::TeamRecord` and a global "Team" tab next to per-pane
+  chats render the scratchpad as a timeline.
+- [ ] **2.2c — system-prompt mention**: include a one-liner in
+  `crate::role::compose_system_prompt` telling the agent the file
+  exists and what tags it should `tail -f` / look at. Best done after
+  2.2b so we know what's actually flowing through the file.
 
 ### Phase 3 — orchestration
 

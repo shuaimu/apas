@@ -15,6 +15,7 @@ mod config;
 mod mode;
 mod project;
 mod role;
+mod scratchpad;
 mod tui;
 mod update;
 mod usage;
