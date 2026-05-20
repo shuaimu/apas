@@ -771,7 +771,7 @@ async fn run_inner(
             &opencode_path,
             &cursor_agent_path,
         );
-        let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path) = pane_metas
+        let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt) = pane_metas
             .lock()
             .unwrap()
             .get(&pane_id)
@@ -781,6 +781,7 @@ async fn run_inner(
                 m.pending_questions.clone(),
                 m.effort_arc.clone(),
                 m.worktree_path.clone(),
+                crate::role::compose_system_prompt(m.role.as_deref(), m.goal.as_deref(), m.backstory.as_deref()),
             ))
             .unwrap_or_else(|| (
                 Arc::new(Mutex::new(None)),
@@ -788,12 +789,14 @@ async fn run_inner(
                 Arc::new(Mutex::new(HashMap::new())),
                 Arc::new(Mutex::new(None)),
                 None,
+                None,
             ));
         pane_threads.push(thread::spawn(move || {
             run_deadloop_session(
                 &binary_path,
                 &working_dir,
                 worktree_path,
+                system_prompt,
                 sid,
                 pane_session_id,
                 pane_id,
@@ -832,7 +835,7 @@ async fn run_inner(
             &opencode_path,
             &cursor_agent_path,
         );
-        let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path) = pane_metas
+        let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt) = pane_metas
             .lock()
             .unwrap()
             .get(&pane_id)
@@ -842,6 +845,7 @@ async fn run_inner(
                 m.pending_questions.clone(),
                 m.effort_arc.clone(),
                 m.worktree_path.clone(),
+                crate::role::compose_system_prompt(m.role.as_deref(), m.goal.as_deref(), m.backstory.as_deref()),
             ))
             .unwrap_or_else(|| (
                 Arc::new(Mutex::new(None)),
@@ -849,12 +853,14 @@ async fn run_inner(
                 Arc::new(Mutex::new(HashMap::new())),
                 Arc::new(Mutex::new(None)),
                 None,
+                None,
             ));
         pane_threads.push(thread::spawn(move || {
             run_pane_session(
                 &binary_path,
                 &working_dir,
                 worktree_path,
+                system_prompt,
                 sid,
                 pane_session_id,
                 pane_id,
@@ -1226,7 +1232,7 @@ fn handle_tui_events(
                         cursor_agent_path,
                     );
                     let working_dir = working_dir.to_string();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path) = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
@@ -1236,6 +1242,7 @@ fn handle_tui_events(
                             m.pending_questions.clone(),
                             m.effort_arc.clone(),
                             m.worktree_path.clone(),
+                            crate::role::compose_system_prompt(m.role.as_deref(), m.goal.as_deref(), m.backstory.as_deref()),
                         ))
                         .unwrap_or_else(|| (
                             Arc::new(Mutex::new(None)),
@@ -1243,12 +1250,14 @@ fn handle_tui_events(
                             Arc::new(Mutex::new(HashMap::new())),
                             Arc::new(Mutex::new(None)),
                             None,
+                            None,
                         ));
                     thread::spawn(move || {
                         run_pane_session(
                             &binary_path,
                             &working_dir,
                             worktree_path,
+                            system_prompt,
                             session_id,
                             claude_session_id,
                             pane_id,
@@ -1379,7 +1388,7 @@ fn handle_tui_events(
                     let shutdown = shutdown.clone();
                     let event_tx = event_tx.clone();
                     let working_dir = working_dir.to_string();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path) = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
@@ -1389,6 +1398,7 @@ fn handle_tui_events(
                             m.pending_questions.clone(),
                             m.effort_arc.clone(),
                             m.worktree_path.clone(),
+                            crate::role::compose_system_prompt(m.role.as_deref(), m.goal.as_deref(), m.backstory.as_deref()),
                         ))
                         .unwrap_or_else(|| (
                             Arc::new(Mutex::new(None)),
@@ -1396,12 +1406,14 @@ fn handle_tui_events(
                             Arc::new(Mutex::new(HashMap::new())),
                             Arc::new(Mutex::new(None)),
                             None,
+                            None,
                         ));
                     thread::spawn(move || {
                         run_deadloop_session(
                             &binary_path,
                             &working_dir,
                             worktree_path,
+                            system_prompt,
                             session_id,
                             claude_session_id,
                             pane_id,
@@ -1434,7 +1446,7 @@ fn handle_tui_events(
                     let server_tx = server_tx.clone();
                     let shutdown = shutdown.clone();
                     let working_dir = working_dir.to_string();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path) = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
@@ -1444,6 +1456,7 @@ fn handle_tui_events(
                             m.pending_questions.clone(),
                             m.effort_arc.clone(),
                             m.worktree_path.clone(),
+                            crate::role::compose_system_prompt(m.role.as_deref(), m.goal.as_deref(), m.backstory.as_deref()),
                         ))
                         .unwrap_or_else(|| (
                             Arc::new(Mutex::new(None)),
@@ -1451,12 +1464,14 @@ fn handle_tui_events(
                             Arc::new(Mutex::new(HashMap::new())),
                             Arc::new(Mutex::new(None)),
                             None,
+                            None,
                         ));
                     thread::spawn(move || {
                         run_pane_session(
                             &binary_path,
                             &working_dir,
                             worktree_path,
+                            system_prompt,
                             session_id,
                             claude_session_id,
                             pane_id,
@@ -1737,7 +1752,7 @@ fn handle_tui_events(
                     let shutdown = shutdown.clone();
                     let event_tx = event_tx.clone();
                     let working_dir = working_dir.to_string();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path) = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
@@ -1747,6 +1762,7 @@ fn handle_tui_events(
                             m.pending_questions.clone(),
                             m.effort_arc.clone(),
                             m.worktree_path.clone(),
+                            crate::role::compose_system_prompt(m.role.as_deref(), m.goal.as_deref(), m.backstory.as_deref()),
                         ))
                         .unwrap_or_else(|| (
                             Arc::new(Mutex::new(None)),
@@ -1754,12 +1770,14 @@ fn handle_tui_events(
                             Arc::new(Mutex::new(HashMap::new())),
                             Arc::new(Mutex::new(None)),
                             None,
+                            None,
                         ));
                     thread::spawn(move || {
                         run_deadloop_session(
                             &binary_path,
                             &working_dir,
                             worktree_path,
+                            system_prompt,
                             session_id,
                             claude_session_id,
                             pane_id,
@@ -2166,7 +2184,7 @@ fn handle_tui_events(
                     let server_tx = server_tx.clone();
                     let shutdown = shutdown.clone();
                     let working_dir = working_dir.to_string();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path) = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
@@ -2176,6 +2194,7 @@ fn handle_tui_events(
                             m.pending_questions.clone(),
                             m.effort_arc.clone(),
                             m.worktree_path.clone(),
+                            crate::role::compose_system_prompt(m.role.as_deref(), m.goal.as_deref(), m.backstory.as_deref()),
                         ))
                         .unwrap_or_else(|| (
                             Arc::new(Mutex::new(None)),
@@ -2183,12 +2202,14 @@ fn handle_tui_events(
                             Arc::new(Mutex::new(HashMap::new())),
                             Arc::new(Mutex::new(None)),
                             None,
+                            None,
                         ));
                     thread::spawn(move || {
                         run_pane_session(
                             &binary_path,
                             &working_dir,
                             worktree_path,
+                            system_prompt,
                             session_id,
                             claude_session_id,
                             pane_id,
@@ -3307,6 +3328,7 @@ fn run_deadloop_session(
     binary_path: &str,
     working_dir: &str,
     worktree_path: Option<String>,
+    system_prompt: Option<String>,
     session_id: Uuid,
     claude_session_id: Uuid,
     pane_id: u32,
@@ -3332,6 +3354,7 @@ fn run_deadloop_session(
             binary_path,
             working_dir,
             worktree_path,
+            system_prompt,
             session_id,
             claude_session_id,
             pane_id,
@@ -3374,6 +3397,7 @@ fn run_deadloop_session_inner(
     binary_path: &str,
     working_dir: &str,
     worktree_path: Option<String>,
+    system_prompt: Option<String>,
     session_id: Uuid,
     claude_session_id: Uuid,
     pane_id: u32,
@@ -3402,6 +3426,7 @@ fn run_deadloop_session_inner(
             binary_path,
             working_dir,
             worktree_path,
+            system_prompt,
             session_id,
             claude_session_id,
             pane_id,
@@ -3427,6 +3452,7 @@ fn run_deadloop_session_inner(
         .as_deref()
         .unwrap_or(working_dir)
         .to_string();
+    let _ = system_prompt; // codex/cursor/etc. ignored for now — see role.rs note.
     let _ = interrupt_tx_slot; // unused for legacy path
     let _ = control_response_tx_slot; // unused for legacy path
     let _ = pending_questions; // unused for legacy path
@@ -4402,6 +4428,10 @@ fn run_pane_session_streaming(
     // jsonl is keyed by encoded-cwd so they MUST agree. `.apas` and
     // project metadata stay rooted at `working_dir`. Phase 1.1b.
     worktree_path: Option<String>,
+    // Optional pre-rendered system-prompt prefix built from role/goal/
+    // backstory (Phase 2.1b). When Some, gets passed to claude as
+    // `--append-system-prompt <prefix>` at every spawn.
+    system_prompt: Option<String>,
     session_id: Uuid,
     claude_session_id: Uuid,
     pane_id: u32,
@@ -4630,6 +4660,13 @@ fn run_pane_session_streaming(
                 args.push("--effort".into());
                 args.push(eff);
             }
+        }
+
+        // Phase 2.1b: append the role/goal/backstory prelude so claude
+        // self-identifies. Skipped silently when the prelude is None.
+        if let Some(sp) = system_prompt.as_deref() {
+            args.push("--append-system-prompt".into());
+            args.push(sp.to_string());
         }
 
         // Defensive: same guard as the per-turn path. Two `--resume` processes
@@ -5280,6 +5317,7 @@ fn run_deadloop_session_streaming(
     binary_path: &str,
     working_dir: &str,
     worktree_path: Option<String>,
+    system_prompt: Option<String>,
     session_id: Uuid,
     claude_session_id: Uuid,
     pane_id: u32,
@@ -5318,6 +5356,7 @@ fn run_deadloop_session_streaming(
         let binary_path = binary_path.to_string();
         let working_dir = working_dir.to_string();
         let worktree_path = worktree_path.clone();
+        let system_prompt = system_prompt.clone();
         let model = model.clone();
         let effort = effort.clone();
         let provider = *provider;
@@ -5334,6 +5373,7 @@ fn run_deadloop_session_streaming(
                 &binary_path,
                 &working_dir,
                 worktree_path,
+                system_prompt,
                 session_id,
                 claude_session_id,
                 pane_id,
@@ -5445,6 +5485,7 @@ fn run_pane_session(
     binary_path: &str,
     working_dir: &str,
     worktree_path: Option<String>,
+    system_prompt: Option<String>,
     session_id: Uuid,
     claude_session_id: Uuid,
     pane_id: u32,
@@ -5469,6 +5510,7 @@ fn run_pane_session(
             binary_path,
             working_dir,
             worktree_path,
+            system_prompt,
             session_id,
             claude_session_id,
             pane_id,
@@ -5488,6 +5530,7 @@ fn run_pane_session(
             PaneType::Interactive,
         );
     }
+    let _ = system_prompt; // codex/cursor/etc. ignored for now — see role.rs note.
     let effective_dir: String = worktree_path
         .as_deref()
         .unwrap_or(working_dir)

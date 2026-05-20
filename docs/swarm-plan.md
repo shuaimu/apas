@@ -176,12 +176,19 @@ Phase 1.2 is complete.
   restore-from-.apas round-trips the three new fields. No runtime
   behaviour change yet — sets up the fields for 2.1b's
   --append-system-prompt wiring.
-- [ ] **2.1b — claude launch wiring**: at the spawn sites, if any of
-  the three are set, build a single `--append-system-prompt` argument
-  with a small template (e.g. `# Role\n{role}\n\n# Goal\n{goal}\n\n#
-  Backstory\n{backstory}`). For non-claude providers (codex, opencode,
-  cursor) — best-effort via an `APAS_ROLE/GOAL/BACKSTORY` env or skip
-  with a note in the chat surface.
+- [x] **2.1b — claude launch wiring**: new `crate::role` module exposes
+  `compose_system_prompt(role, goal, backstory) -> Option<String>` that
+  joins set fields into a markdown-styled block (`# Role\n…\n\n# Goal\n…`
+  etc.) and returns None when all three are empty. Spawn functions
+  (`run_pane_session{,_streaming}`,
+  `run_deadloop_session{,_inner,_streaming}`) now take an extra
+  `system_prompt: Option<String>` argument; the streaming claude spawn
+  pushes `--append-system-prompt <prompt>` when Some, the legacy
+  non-claude path explicitly suppresses the param with a comment
+  pointing at this leaf. All 7 call sites compose from
+  `meta.role/goal/backstory` via the new helper and pass through. 4 new
+  unit tests in `role.rs` cover the empty / single / all-three / partial
+  cases.
 - [ ] **2.1c — web UI Role drawer**: a "Role" tab in the pane settings
   drawer with three short textareas. Saving sends new
   `WebToServer::UpdatePaneRole { pane_id, role, goal, backstory }` →

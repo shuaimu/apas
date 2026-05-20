@@ -14,6 +14,7 @@ mod claude;
 mod config;
 mod mode;
 mod project;
+mod role;
 mod tui;
 mod update;
 mod usage;
