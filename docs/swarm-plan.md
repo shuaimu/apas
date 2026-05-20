@@ -223,10 +223,18 @@ Phase 2.1 is complete.
   plan: shipped as a modal rather than a full "Team tab" alongside
   the per-pane chats — cheaper, can be promoted later if it
   warrants the layout work.
-- [ ] **2.2c — system-prompt mention**: include a one-liner in
-  `crate::role::compose_system_prompt` telling the agent the file
-  exists and what tags it should `tail -f` / look at. Best done after
-  2.2b so we know what's actually flowing through the file.
+- [x] **2.2c — system-prompt mention**: `role::compose_system_prompt`
+  now appends a static "# Team scratchpad" section after the
+  role/goal/backstory blocks, telling the agent about
+  `.apas-team.jsonl`, showing the JSON line shape (with the known
+  `kind` values), and suggesting `tail -f` / Write to consume and
+  publish. Rides along only when at least one of role/goal/backstory
+  is set — without those, no system prompt is emitted at all, so the
+  note stays quiet for panes that haven't opted in. Existing role
+  tests updated to assert structural properties (section ordering,
+  scratchpad note presence) rather than exact strings.
+
+Phase 2.2 is complete.
 
 ### Phase 3 — orchestration
 
