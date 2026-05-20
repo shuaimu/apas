@@ -123,6 +123,25 @@ pub enum CliToServer {
         provider: Provider,
         limits: UsageLimits,
     },
+
+    /// Diff payload for a pane that owns an isolated worktree. Sent in
+    /// response to `ServerToCli::RequestPaneDiff`. `diff` is the unified
+    /// patch text (UTF-8, may be empty for "no changes"). `error` is set
+    /// instead when something blocked the diff (no worktree, not a git
+    /// repo, branch not found, etc.) so the web UI can render it inline
+    /// instead of silently dropping the response. Phase 1.2a.
+    PaneDiff {
+        session_id: Uuid,
+        pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 /// Messages sent from server to CLI client
@@ -251,6 +270,10 @@ pub enum ServerToCli {
         /// selections.
         answers: std::collections::HashMap<String, String>,
     },
+
+    /// Compute and return the current `git diff` for a pane's isolated
+    /// worktree branch against the project's HEAD. Phase 1.2a.
+    RequestPaneDiff { session_id: Uuid, pane_id: u32 },
 }
 
 // ============================================================================
@@ -503,6 +526,11 @@ pub enum WebToServer {
         /// multi-select.
         answers: std::collections::HashMap<String, String>,
     },
+
+    /// Ask the CLI for the current `git diff` between the pane's worktree
+    /// branch and the project's HEAD. Returns via `ServerToWeb::PaneDiff`.
+    /// Phase 1.2a.
+    RequestPaneDiff { pane_id: u32 },
 }
 
 /// Messages sent from server to web client
@@ -632,6 +660,20 @@ pub enum ServerToWeb {
         working_dir: Option<String>,
         hostname: Option<String>,
         created_at: Option<String>,
+    },
+
+    /// On-demand diff for a pane's isolated worktree branch. Phase 1.2a.
+    PaneDiff {
+        session_id: Uuid,
+        pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
 }
 

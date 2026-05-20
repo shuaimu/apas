@@ -121,14 +121,31 @@ review checkpoints.
 
 Phase 1.1 is complete.
 
-1.2  **Diff-review surface** in the web UI.
-- Server-side: per pane, watch `git diff <branch>..HEAD` on commit hook (or
-  poll the working tree). Emit `ServerToWeb::PaneDiff` with stats + maybe
-  a truncated patch.
-- Web: a "Diff" toggle in the pane header that expands to a syntax-highlighted
-  diff view (reuse `CodeBlock`).
-- Buttons: "Merge to current branch" (delegates to the manager pane or a
-  user-confirmed `git merge`), "Discard", "Open in $EDITOR".
+1.2  **Diff-review surface** in the web UI. Sub-split per the
+"break chunky leaves into smaller ones" rule:
+- [x] **1.2a — on-demand diff**: shipped the smallest viable diff
+  surface. New wire types `WebToServer::RequestPaneDiff`,
+  `ServerToCli::RequestPaneDiff`, `CliToServer::PaneDiff`,
+  `ServerToWeb::PaneDiff` (carries `branch`, `base`, `diff`, `error`).
+  CLI helper `worktree::compute_pane_diff(project_dir, worktree_path)`
+  runs `git diff HEAD...<branch>` (three-dot, so it's "changes on the
+  worktree branch since divergence" — the intuitive answer for "what
+  did this pane change?"). Web UI: green "Diff" button appears in the
+  pane header next to Interrupt when the active pane has a
+  worktree_path. Click opens a modal with the patch text + a Refresh
+  button. No polling, no syntax highlighting yet — those are 1.2b/c.
+  Two new unit tests (happy-path diff with content, error path when
+  no worktree).
+- [ ] **1.2b — auto-refresh**: CLI watches the worktree branch's tip
+  (poll `git rev-parse <branch>` every few seconds, or use a commit
+  hook) and re-emits `PaneDiff` on change so the modal stays live.
+- [ ] **1.2c — syntax-highlighted view**: render the patch with
+  `CodeBlock` (already wired) + per-file collapsible sections, instead
+  of a raw `<pre>` dump.
+- [ ] **1.2d — action buttons in the diff view**: "Merge to current
+  branch" (reuses 1.1d's MergeAndRemove path on demand instead of on
+  close), "Discard branch", "Open in $EDITOR" (best-effort
+  `$EDITOR <path>` via the CLI).
 
 ### Phase 2 — coordination primitives
 

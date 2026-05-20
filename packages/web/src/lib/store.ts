@@ -428,6 +428,16 @@ interface AppState {
   stopBot: (paneId: number) => void;
   rebootCli: () => void;
   downloadSession: () => void;
+  requestPaneDiff: (paneId: number) => void;
+  paneDiffs: Record<number, PaneDiff>;
+}
+
+export interface PaneDiff {
+  branch?: string;
+  base?: string;
+  diff?: string;
+  error?: string;
+  fetchedAt: number;
 }
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://apas.mpaxos.com:8080";
@@ -465,6 +475,7 @@ export const useStore = create<AppState>((set, get) => ({
   paneStatuses: {},
   paneModes: {},
   pausedPanes: [],
+  paneDiffs: {},
   answeredQuestions: new Map(),
   toasts: [],
   sessionCache: new Map(),
@@ -1268,6 +1279,13 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
+  requestPaneDiff: (paneId: number) => {
+    const { ws } = get();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "request_pane_diff", pane_id: paneId }));
+    }
+  },
+
   updatePaneLabel: (paneId: number, label: string) => {
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -1717,6 +1735,25 @@ function handleServerMessage(
       const hasActiveCli = data.has_active_cli as boolean;
       console.log("Session attached, has active CLI:", hasActiveCli);
       set({ isAttached: hasActiveCli });
+      break;
+    }
+
+    case "pane_diff": {
+      const paneId = data.pane_id as number | undefined;
+      if (typeof paneId === "number") {
+        set((state) => ({
+          paneDiffs: {
+            ...state.paneDiffs,
+            [paneId]: {
+              branch: data.branch as string | undefined,
+              base: data.base as string | undefined,
+              diff: data.diff as string | undefined,
+              error: data.error as string | undefined,
+              fetchedAt: Date.now(),
+            },
+          },
+        }));
+      }
       break;
     }
 

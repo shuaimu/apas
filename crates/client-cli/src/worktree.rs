@@ -175,6 +175,36 @@ pub fn list(project_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Compute the diff for a pane's isolated worktree branch against the
+/// project's HEAD. Returns (branch_name, base_ref, diff_text). Phase 1.2a.
+///
+/// Both args use string paths so the WebSocket-receiving call site doesn't
+/// have to juggle Path types. `worktree_path` is None when the pane has no
+/// isolated worktree — that's a "polite error" case.
+pub fn compute_pane_diff(
+    project_dir: &Path,
+    worktree_path: Option<&str>,
+) -> Result<(String, String, String)> {
+    let worktree = worktree_path.ok_or_else(|| {
+        anyhow!("pane has no isolated worktree — nothing to diff. Use the \"Isolated git worktree\" checkbox when creating the pane, or `apas worktree add <pane-id>`.")
+    })?;
+    let project_str = project_dir.to_str().ok_or_else(|| {
+        anyhow!("project dir is not valid UTF-8: {}", project_dir.display())
+    })?;
+    let branch = current_branch_in(worktree).ok_or_else(|| {
+        anyhow!("worktree at {} is on detached HEAD; nothing to diff", worktree)
+    })?;
+    // Diff three-dot syntax (A...B) shows what's on the worktree branch
+    // since it diverged from the project's HEAD — the right semantics for
+    // "what did this pane change?".
+    let base_ref = "HEAD".to_string();
+    let diff = run_git_cd(
+        project_str,
+        &["diff", &format!("{}...{}", base_ref, branch)],
+    )?;
+    Ok((branch, base_ref, diff))
+}
+
 /// Run a `git -C <dir> <args…>` command and return its stdout on success.
 fn run_git_cd(cwd: &str, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
@@ -361,6 +391,36 @@ mod tests {
         assert!(!wt.exists(), "worktree dir gone");
         let branches = run_git_cd(proj_str, &["branch", "--list", "apas-pane-2"]).unwrap();
         assert!(!branches.contains("apas-pane-2"), "branch deleted");
+    }
+
+    #[test]
+    fn compute_pane_diff_returns_branch_changes() {
+        let (_tmp, proj, wt) = setup_repo_with_worktree();
+        // Put a commit on the worktree branch.
+        std::fs::write(wt.join("feature.txt"), b"hello").unwrap();
+        let wt_str = wt.to_str().unwrap();
+        assert!(Command::new("git")
+            .arg("-C").arg(wt_str)
+            .args(["add", "feature.txt"])
+            .status().unwrap().success());
+        assert!(Command::new("git")
+            .arg("-C").arg(wt_str)
+            .args(["-c", "user.email=t@e", "-c", "user.name=t", "commit", "-m", "feature"])
+            .status().unwrap().success());
+
+        let (branch, base, diff) = compute_pane_diff(&proj, Some(wt_str)).expect("diff");
+        assert_eq!(branch, "apas-pane-2");
+        assert_eq!(base, "HEAD");
+        assert!(diff.contains("feature.txt"), "diff should mention the new file: {}", diff);
+        assert!(diff.contains("+hello"), "diff should show the addition: {}", diff);
+    }
+
+    #[test]
+    fn compute_pane_diff_errors_without_worktree() {
+        let (_tmp, proj, _wt) = setup_repo_with_worktree();
+        let err = compute_pane_diff(&proj, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no isolated worktree"), "{}", msg);
     }
 
     #[test]

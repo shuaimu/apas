@@ -6653,6 +6653,41 @@ async fn run_server_connection(
                                                     );
                                                 }
                                             }
+                                            ServerToCli::RequestPaneDiff { session_id: _, pane_id: diff_pane_id } => {
+                                                // Look up the pane's worktree path. If unset, return a polite error
+                                                // so the web UI can render guidance instead of nothing.
+                                                let wt: Option<String> = {
+                                                    let metas = pane_metas.lock().unwrap();
+                                                    metas.get(&diff_pane_id).and_then(|m| m.worktree_path.clone())
+                                                };
+                                                let result = crate::worktree::compute_pane_diff(
+                                                    std::path::Path::new(&working_dir),
+                                                    wt.as_deref(),
+                                                );
+                                                let pane_diff_msg = match result {
+                                                    Ok((branch, base, diff)) => CliToServer::PaneDiff {
+                                                        session_id,
+                                                        pane_id: diff_pane_id,
+                                                        branch: Some(branch),
+                                                        base: Some(base),
+                                                        diff: Some(diff),
+                                                        error: None,
+                                                    },
+                                                    Err(err) => CliToServer::PaneDiff {
+                                                        session_id,
+                                                        pane_id: diff_pane_id,
+                                                        branch: None,
+                                                        base: None,
+                                                        diff: None,
+                                                        error: Some(err.to_string()),
+                                                    },
+                                                };
+                                                if let Ok(text) = serde_json::to_string(&pane_diff_msg) {
+                                                    let _ = ws_sender
+                                                        .send(Message::Text(text.into()))
+                                                        .await;
+                                                }
+                                            }
                                             _ => {}
                                         }
                                     }

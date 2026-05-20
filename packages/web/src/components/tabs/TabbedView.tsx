@@ -202,6 +202,8 @@ export function TabbedView() {
   const startMachineProjectCli = useStore((s) => s.startMachineProjectCli);
   const rebootCli = useStore((s) => s.rebootCli);
   const downloadSession = useStore((s) => s.downloadSession);
+  const requestPaneDiff = useStore((s) => s.requestPaneDiff);
+  const paneDiffs = useStore((s) => s.paneDiffs);
 
   // Active tab state, persisted per project
   const [activeTabId, setActiveTabId] = useState<number | null>(null);
@@ -218,6 +220,8 @@ export function TabbedView() {
   const [cleanupDialog, setCleanupDialog] = useState<
     { paneId: number; worktreePath: string } | null
   >(null);
+  // Diff viewer modal (Phase 1.2a). When set, shows paneDiffs[paneId].
+  const [diffModalPaneId, setDiffModalPaneId] = useState<number | null>(null);
 
   // Determine effective tabs: use paneConfigs from server, or synthesize from observed messages
   const effectiveTabs = useMemo(() => {
@@ -786,6 +790,19 @@ export function TabbedView() {
                   Interrupt
                 </button>
               )}
+              {activeConfig?.worktree_path && activeTabId != null && (
+                <button
+                  onClick={() => {
+                    if (activeTabId == null) return;
+                    setDiffModalPaneId(activeTabId);
+                    requestPaneDiff(activeTabId);
+                  }}
+                  className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-emerald-600 hover:bg-emerald-700 text-white"
+                  title={`View git diff for branch (worktree at ${activeConfig.worktree_path})`}
+                >
+                  Diff
+                </button>
+              )}
             </>
           )
         )}
@@ -875,6 +892,79 @@ export function TabbedView() {
         onCancel={() => setCleanupDialog(null)}
         onConfirm={handleConfirmCleanup}
       />
+
+      <PaneDiffModal
+        open={diffModalPaneId !== null}
+        diff={diffModalPaneId !== null ? paneDiffs[diffModalPaneId] : undefined}
+        onClose={() => setDiffModalPaneId(null)}
+        onRefresh={() => {
+          if (diffModalPaneId !== null) requestPaneDiff(diffModalPaneId);
+        }}
+      />
+    </div>
+  );
+}
+
+interface PaneDiffModalProps {
+  open: boolean;
+  diff?: {
+    branch?: string;
+    base?: string;
+    diff?: string;
+    error?: string;
+    fetchedAt: number;
+  };
+  onClose: () => void;
+  onRefresh: () => void;
+}
+
+function PaneDiffModal({ open, diff, onClose, onRefresh }: PaneDiffModalProps) {
+  if (!open) return null;
+  const body = diff?.error
+    ? <pre className="whitespace-pre-wrap break-words text-red-300 text-xs">{diff.error}</pre>
+    : diff?.diff !== undefined
+      ? (diff.diff.length === 0
+          ? <p className="text-zinc-400 text-sm italic">No changes vs base.</p>
+          : <pre className="whitespace-pre-wrap break-words text-zinc-100 text-xs font-mono">{diff.diff}</pre>)
+      : <p className="text-zinc-400 text-sm italic">Loading…</p>;
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="flex w-full max-w-4xl flex-col rounded-lg border border-zinc-700 bg-zinc-900 p-5 text-zinc-100 shadow-xl"
+        style={{ maxHeight: "80vh" }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <h3 className="text-lg font-semibold">Pane diff</h3>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={onRefresh}
+              className="rounded border border-zinc-600 bg-zinc-800 px-3 py-1 text-xs hover:bg-zinc-700"
+            >
+              Refresh
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded border border-zinc-600 bg-zinc-800 px-3 py-1 text-xs hover:bg-zinc-700"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+        {(diff?.branch || diff?.base) && (
+          <div className="mb-2 text-xs text-zinc-400">
+            {diff.base ?? "?"} <span className="text-zinc-500">→</span> {diff.branch ?? "?"}
+          </div>
+        )}
+        <div className="flex-1 overflow-auto rounded border border-zinc-800 bg-black/30 p-3">
+          {body}
+        </div>
+      </div>
     </div>
   );
 }

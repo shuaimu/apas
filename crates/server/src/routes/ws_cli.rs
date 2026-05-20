@@ -638,6 +638,27 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 );
                                 state.sessions.update_usage_limits(cli_id, provider, limits);
                             }
+                            Ok(CliToServer::PaneDiff { session_id, pane_id, branch, base, diff, error }) => {
+                                tracing::info!(
+                                    "Pane diff for pane {} in session {} ({} bytes)",
+                                    pane_id, session_id,
+                                    diff.as_ref().map(|s| s.len()).unwrap_or(0),
+                                );
+                                state
+                                    .sessions
+                                    .route_to_web(
+                                        &session_id,
+                                        ServerToWeb::PaneDiff {
+                                            session_id,
+                                            pane_id,
+                                            branch,
+                                            base,
+                                            diff,
+                                            error,
+                                        },
+                                    )
+                                    .await;
+                            }
                             Ok(CliToServer::PaneList { session_id, mut panes }) => {
                                 // Cache pane list and forward to attached web clients
                                 tracing::info!("CLI {} sent pane list for session {}: {} panes", cli_id, session_id, panes.len());
