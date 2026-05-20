@@ -78,10 +78,17 @@ review checkpoints.
   when a worktree is set, claude's cwd, its session jsonl path, and the
   auto-wake tmp dir all use the worktree path — they MUST agree because
   claude keys its jsonl by encoded-cwd.
-- [ ] **1.1c — opt-in CLI subcommand** (next): `apas worktree add <pane-id>
-  [branch-name]` creates the worktree, sets `PaneConfig.worktree_path`,
-  re-saves `.apas`, optionally restarts the pane.
-- [ ] **1.1d — cleanup on pane removal**: prompt for "discard / merge
+- [x] **1.1c — opt-in CLI subcommand**: shipped `apas worktree {add,remove,list}`.
+  `add <pane-id> [branch] [--path <p>]` runs `git -C <project> worktree add
+  <path> -b <branch>`, canonicalizes the resulting path, and writes it into
+  the matching `PaneConfig.worktree_path` in `.apas`. Defaults: branch
+  `apas-pane-<id>`, path `<project>/.apas-worktrees/pane-<id>`. Deviation
+  from plan: did NOT implement auto-restart of the running pane — instead
+  the command prints a "close + re-add the tab, or reboot" hint. Live
+  restart is a possible later leaf if the manual step proves annoying.
+  Also exposed `remove <pane-id>` (clears the assignment but leaves the
+  git worktree intact) and `list` (shows current assignments).
+- [ ] **1.1d — cleanup on pane removal** (next): prompt for "discard / merge
   to current branch / leave as branch for manual review."
 - [ ] **1.1e — web UI toggle on Add Pane**: checkbox "isolated
   worktree", calls 1.1c under the hood.

@@ -17,6 +17,7 @@ mod project;
 mod tui;
 mod update;
 mod usage;
+mod worktree;
 
 // Default server URL
 const DEFAULT_SERVER: &str = "ws://apas.mpaxos.com:8080";
@@ -115,6 +116,32 @@ enum Commands {
         #[arg(long = "root", short = 'r')]
         roots: Vec<PathBuf>,
     },
+    /// Manage per-pane isolated git worktrees (Phase 1.1 swarm plan)
+    Worktree {
+        #[command(subcommand)]
+        action: WorktreeAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorktreeAction {
+    /// Create a git worktree for a pane and persist its path into .apas
+    Add {
+        /// Pane id (0 = deadloop, 1 = interactive, or a dynamic-tab id)
+        pane_id: u32,
+        /// Branch name (default: `apas-pane-<id>`)
+        branch: Option<String>,
+        /// Worktree directory path (default: `<project>/.apas-worktrees/pane-<id>`)
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// Clear a pane's worktree assignment in .apas (does NOT delete the git worktree)
+    Remove {
+        /// Pane id
+        pane_id: u32,
+    },
+    /// List all worktree assignments in the current project's .apas
+    List,
 }
 
 #[derive(Subcommand)]
@@ -284,6 +311,25 @@ async fn main() -> Result<()> {
                 write_daemon_state(&state_path, &state)?;
                 let _state_guard = DaemonStateGuard::new(state_path, std::process::id());
                 mode::daemon::run(&server, &token, machine_id, project_roots).await?;
+                return Ok(());
+            }
+            Commands::Worktree { action } => {
+                let project_dir = cli
+                    .working_dir
+                    .clone()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                match action {
+                    WorktreeAction::Add { pane_id, branch, path } => {
+                        worktree::add(&project_dir, pane_id, branch, path)?;
+                    }
+                    WorktreeAction::Remove { pane_id } => {
+                        worktree::remove(&project_dir, pane_id)?;
+                    }
+                    WorktreeAction::List => {
+                        worktree::list(&project_dir)?;
+                    }
+                }
                 return Ok(());
             }
         }
