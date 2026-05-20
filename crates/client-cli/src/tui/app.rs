@@ -68,6 +68,10 @@ pub enum TuiEvent {
         min_iteration_interval_minutes: Option<u64>,
         model: Option<String>,
         effort: Option<String>,
+        /// Absolute path of an isolated git worktree (Phase 1.1e). When
+        /// Some, the new pane spawns its agent in this dir and its
+        /// session jsonl is keyed by it. None = legacy shared cwd.
+        worktree_path: Option<String>,
     },
     CloseTab {
         pane_id: u32,

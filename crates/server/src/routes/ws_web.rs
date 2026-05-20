@@ -913,6 +913,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     label,
                     prompt,
                     model,
+                    isolated_worktree,
                 }) => {
                     if let Some(sid) = session_id {
                         // Generate a unique pane_id starting from 3 (1 and 2 are reserved for legacy deadloop/interactive)
@@ -931,7 +932,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             effort: None,
                             worktree_path: None,
                         };
-                        tracing::info!("Adding pane {} to session {}", pane_id, sid);
+                        tracing::info!(
+                            "Adding pane {} to session {} (isolated_worktree={})",
+                            pane_id, sid, isolated_worktree,
+                        );
                         state
                             .sessions
                             .route_to_cli(
@@ -939,6 +943,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 ServerToCli::AddPane {
                                     session_id: sid,
                                     pane_config: pane_config.clone(),
+                                    isolated_worktree,
                                 },
                             )
                             .await;

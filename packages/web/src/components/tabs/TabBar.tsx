@@ -9,7 +9,7 @@ interface TabBarProps {
   activeTabId: number | null;
   onSelectTab: (paneId: number) => void;
   onCloseTab: (paneId: number) => void;
-  onAddTab: (provider?: string, model?: string) => void;
+  onAddTab: (provider?: string, model?: string, isolatedWorktree?: boolean) => void;
   onRenameTab?: (paneId: number, newLabel: string) => void;
   onReorderTabs?: (orderedIds: number[]) => void;
   onBootCli?: () => void;
@@ -429,8 +429,9 @@ export function TabBar({
   );
 }
 
-function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: string) => void }) {
+function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: string, isolatedWorktree?: boolean) => void }) {
   const [showMenu, setShowMenu] = useState(false);
+  const [isolatedWorktree, setIsolatedWorktree] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -444,6 +445,15 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
     return () => document.removeEventListener("mousedown", handleClick);
   }, [showMenu]);
 
+  // Stays toggled across menu open/close (intentional — user's choice persists
+  // for a session), but new tab creation resets to false so a second tab
+  // doesn't silently get a new worktree.
+  const handlePick = (provider: string, model?: string) => {
+    onAddTab(provider, model, isolatedWorktree || undefined);
+    setIsolatedWorktree(false);
+    setShowMenu(false);
+  };
+
   return (
     <div className="relative flex-shrink-0" ref={menuRef}>
       <button
@@ -456,9 +466,22 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
         </svg>
       </button>
       {showMenu && (
-        <div className="absolute right-0 top-full mt-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-lg py-1 z-50 min-w-[160px]">
+        <div className="absolute right-0 top-full mt-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-lg py-1 z-50 min-w-[200px]">
+          <label
+            className="flex items-center gap-2 px-3 py-2 text-xs text-gray-600 dark:text-gray-300 border-b border-gray-100 dark:border-gray-700 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700/50"
+            title="When checked, the new tab spawns in a fresh git worktree (branch apas-pane-<id>) so it can't race other tabs on file edits. Requires the project to be a git repo."
+          >
+            <input
+              type="checkbox"
+              checked={isolatedWorktree}
+              onChange={(e) => setIsolatedWorktree(e.target.checked)}
+              onClick={(e) => e.stopPropagation()}
+              className="h-3.5 w-3.5"
+            />
+            Isolated git worktree
+          </label>
           <button
-            onClick={() => { onAddTab("claude"); setShowMenu(false); }}
+            onClick={() => handlePick("claude")}
             className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
           >
             <span className="text-blue-500 flex-shrink-0">
@@ -467,10 +490,7 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
             Claude Tab
           </button>
           <button
-            onClick={() => {
-              onAddTab("claude", MINIMAX_DEFAULT_MODEL);
-              setShowMenu(false);
-            }}
+            onClick={() => handlePick("claude", MINIMAX_DEFAULT_MODEL)}
             className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
           >
             <span className="text-cyan-500 flex-shrink-0">
@@ -479,10 +499,7 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
             MiniMax 2.7 Tab
           </button>
           <button
-            onClick={() => {
-              onAddTab("claude", GLM_DEFAULT_MODEL);
-              setShowMenu(false);
-            }}
+            onClick={() => handlePick("claude", GLM_DEFAULT_MODEL)}
             className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
           >
             <span className="text-emerald-500 flex-shrink-0">
@@ -492,7 +509,7 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
           </button>
           <div className="border-t border-gray-100 dark:border-gray-700 my-0.5" />
           <button
-            onClick={() => { onAddTab("codex"); setShowMenu(false); }}
+            onClick={() => handlePick("codex")}
             className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
           >
             <span className="text-green-500 flex-shrink-0">
@@ -502,7 +519,7 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
           </button>
           <div className="border-t border-gray-100 dark:border-gray-700 my-0.5" />
           <button
-            onClick={() => { onAddTab("opencode"); setShowMenu(false); }}
+            onClick={() => handlePick("opencode")}
             className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
           >
             <span className="text-orange-500 flex-shrink-0">
@@ -512,7 +529,7 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
           </button>
           <div className="border-t border-gray-100 dark:border-gray-700 my-0.5" />
           <button
-            onClick={() => { onAddTab("cursor-agent"); setShowMenu(false); }}
+            onClick={() => handlePick("cursor-agent")}
             className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
           >
             <span className="text-sky-500 flex-shrink-0">

@@ -22,6 +22,69 @@ use crate::project;
 
 const DEFAULT_WORKTREES_BASE: &str = ".apas-worktrees";
 
+/// Materialize a fresh git worktree for `pane_id` under
+/// `<project>/.apas-worktrees/pane-<id>` on branch `apas-pane-<id>`. Returns
+/// the canonicalized absolute path on success. Used by both the `apas
+/// worktree add` subcommand and the Phase 1.1e "create with isolated
+/// worktree" AddPane flow.
+pub fn create_for_pane(
+    project_dir: &Path,
+    pane_id: u32,
+    branch: Option<&str>,
+    custom_path: Option<&Path>,
+) -> Result<String> {
+    let worktree_path: PathBuf = match custom_path {
+        Some(p) => p.to_path_buf(),
+        None => project_dir
+            .join(DEFAULT_WORKTREES_BASE)
+            .join(format!("pane-{}", pane_id)),
+    };
+
+    if worktree_path.exists() {
+        return Err(anyhow!(
+            "worktree path {} already exists; pick a different location or remove it first",
+            worktree_path.display(),
+        ));
+    }
+
+    let owned_branch;
+    let branch_name: &str = match branch {
+        Some(b) => b,
+        None => {
+            owned_branch = format!("apas-pane-{}", pane_id);
+            &owned_branch
+        }
+    };
+
+    if let Some(parent) = worktree_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(project_dir)
+        .arg("worktree")
+        .arg("add")
+        .arg(&worktree_path)
+        .arg("-b")
+        .arg(branch_name)
+        .status()
+        .context("running `git worktree add` — is this a git repo?")?;
+
+    if !status.success() {
+        return Err(anyhow!(
+            "`git worktree add` failed (exit {:?})",
+            status.code(),
+        ));
+    }
+
+    let abs_path = worktree_path
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", worktree_path.display()))?;
+    Ok(abs_path.to_string_lossy().into_owned())
+}
+
 pub fn add(
     project_dir: &Path,
     pane_id: u32,
@@ -45,52 +108,15 @@ pub fn add(
         ));
     }
 
-    let worktree_path = match custom_path {
-        Some(p) => p,
-        None => project_dir
-            .join(DEFAULT_WORKTREES_BASE)
-            .join(format!("pane-{}", pane_id)),
-    };
-
-    if worktree_path.exists() {
-        return Err(anyhow!(
-            "worktree path {} already exists; pick --path elsewhere or remove the existing dir",
-            worktree_path.display(),
-        ));
-    }
-
-    let branch_name = branch.unwrap_or_else(|| format!("apas-pane-{}", pane_id));
-
-    if let Some(parent) = worktree_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(project_dir)
-        .arg("worktree")
-        .arg("add")
-        .arg(&worktree_path)
-        .arg("-b")
-        .arg(&branch_name)
-        .status()
-        .context("running `git worktree add` — is this a git repo?")?;
-
-    if !status.success() {
-        return Err(anyhow!(
-            "`git worktree add` failed (exit {:?})",
-            status.code(),
-        ));
-    }
-
-    // Canonicalize so the saved path is absolute and survives the user cd-ing
-    // elsewhere. Phase 1.1b's spawn site passes this verbatim to .current_dir,
-    // so any caller-side cd would otherwise break it.
-    let abs_path = worktree_path
-        .canonicalize()
-        .with_context(|| format!("canonicalize {}", worktree_path.display()))?;
-    let abs_path_str = abs_path.to_string_lossy().to_string();
+    let abs_path_str = create_for_pane(
+        project_dir,
+        pane_id,
+        branch.as_deref(),
+        custom_path.as_deref(),
+    )?;
+    let display_branch = branch
+        .clone()
+        .unwrap_or_else(|| format!("apas-pane-{}", pane_id));
 
     if let Some(pane_mut) = metadata.get_pane_mut(pane_id) {
         pane_mut.worktree_path = Some(abs_path_str.clone());
@@ -99,7 +125,7 @@ pub fn add(
 
     println!(
         "✓ Created worktree for pane {} at {} (branch {})",
-        pane_id, abs_path_str, branch_name,
+        pane_id, abs_path_str, display_branch,
     );
     println!(
         "Restart the pane (close + re-add the tab, or reboot the apas CLI) so the next spawn picks up the new cwd.",

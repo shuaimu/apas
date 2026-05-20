@@ -104,8 +104,22 @@ review checkpoints.
   `git merge --no-ff` first and aborts on conflict. Covered by 4 new
   unit tests (clean leave, dirty leave, discard, merge bringing
   commits into HEAD).
-- [ ] **1.1e — web UI toggle on Add Pane** (next): checkbox "isolated
-  worktree", calls 1.1c under the hood.
+- [x] **1.1e — web UI toggle on Add Pane**: the "+" dropdown in TabBar
+  now has an "Isolated git worktree" checkbox at the top. When checked,
+  the next provider click sends `isolated_worktree: true` on the
+  `WebToServer::AddPane`; the server forwards it as a new field on
+  `ServerToCli::AddPane`; the CLI's AddPane handler (in
+  `run_server_connection`) calls `worktree::create_for_pane` — a new
+  shared helper extracted from `worktree::add` — and threads the
+  resulting absolute path into `TuiEvent::AddTabWithConfig.worktree_path`,
+  which now also persists into `PaneMeta.worktree_path`. The checkbox
+  resets to off after each tab creation so a second tab doesn't silently
+  inherit the choice. Failure to create the worktree (not a git repo,
+  path collision, etc.) is surfaced as a system message in the new pane
+  and the spawn falls back to the shared cwd — so the user always gets
+  a working pane.
+
+Phase 1.1 is complete.
 
 1.2  **Diff-review surface** in the web UI.
 - Server-side: per pane, watch `git diff <branch>..HEAD` on commit hook (or

@@ -411,7 +411,8 @@ interface AppState {
     mode: string,
     label?: string,
     prompt?: string,
-    model?: string
+    model?: string,
+    isolatedWorktree?: boolean,
   ) => { success: boolean; error?: string };
   removePane: (paneId: number, cleanupAction?: PaneCleanupAction) => void;
   updatePaneLabel: (paneId: number, label: string) => void;
@@ -1231,7 +1232,8 @@ export const useStore = create<AppState>((set, get) => ({
     mode: string,
     label?: string,
     prompt?: string,
-    model?: string
+    model?: string,
+    isolatedWorktree?: boolean,
   ) => {
     const { ws, sessionId, isAttached } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -1250,6 +1252,7 @@ export const useStore = create<AppState>((set, get) => ({
       label: label || undefined,
       prompt: prompt || undefined,
       model: model || undefined,
+      isolated_worktree: isolatedWorktree === true ? true : undefined,
     }));
     return { success: true };
   },

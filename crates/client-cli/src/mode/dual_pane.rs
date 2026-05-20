@@ -1233,6 +1233,7 @@ fn handle_tui_events(
                 min_iteration_interval_minutes,
                 model,
                 effort,
+                worktree_path,
             }) => {
                 let label =
                     pane_label_or_default(Some(&requested_label), pane_id, model.as_deref());
@@ -1262,7 +1263,7 @@ fn handle_tui_events(
                             control_response_tx: Arc::new(Mutex::new(None)),
                             pending_questions: Arc::new(Mutex::new(HashMap::new())),
                             effort_arc: Arc::new(Mutex::new(normalized_effort.clone())),
-                            worktree_path: None,
+                            worktree_path: worktree_path.clone(),
                         },
                     );
                 }
@@ -6118,6 +6119,7 @@ async fn run_server_connection(
                                                                 .min_iteration_interval_minutes,
                                                             model: meta.model,
                                                             effort: meta.effort,
+                                                            worktree_path: meta.worktree_path,
                                                         });
                                                     } else {
                                                         tracing::warn!(
@@ -6271,8 +6273,60 @@ async fn run_server_connection(
                                                     let _ = ws_sender.send(Message::Text(msg_text.into())).await;
                                                 }
                                             }
-                                            ServerToCli::AddPane { session_id: _, pane_config } => {
+                                            ServerToCli::AddPane { session_id: _, pane_config, isolated_worktree } => {
                                                 let label = pane_config.label.clone().unwrap_or_else(|| format!("Tab {}", pane_config.pane_id));
+                                                // Phase 1.1e: if the web asked for an isolated worktree, create
+                                                // it now (synchronously) and surface any error back to the user
+                                                // as a chat message rather than silently dropping the request.
+                                                let send_status = |text: String| {
+                                                    // Local TUI surface
+                                                    let _ = status_tx.send(PaneOutput {
+                                                        text: text.clone(),
+                                                        pane_id: pane_config.pane_id,
+                                                    });
+                                                    // Web surface — same plumbing as PaneStatus uses below
+                                                    let msg = CliToServer::Output {
+                                                        session_id,
+                                                        data: text,
+                                                        output_type: shared::OutputType::System,
+                                                        pane_type: None,
+                                                        pane_id: Some(pane_config.pane_id),
+                                                    };
+                                                    serde_json::to_string(&msg).ok()
+                                                };
+                                                let worktree_path: Option<String> = if isolated_worktree {
+                                                    match crate::worktree::create_for_pane(
+                                                        std::path::Path::new(&working_dir),
+                                                        pane_config.pane_id,
+                                                        None,
+                                                        None,
+                                                    ) {
+                                                        Ok(path) => {
+                                                            if let Some(msg_text) = send_status(format!(
+                                                                "[Created isolated worktree at {} (branch apas-pane-{})]",
+                                                                path, pane_config.pane_id,
+                                                            )) {
+                                                                let _ = ws_sender
+                                                                    .send(Message::Text(msg_text.into()))
+                                                                    .await;
+                                                            }
+                                                            Some(path)
+                                                        }
+                                                        Err(err) => {
+                                                            if let Some(msg_text) = send_status(format!(
+                                                                "[Could not create isolated worktree for new pane (falling back to shared cwd): {}]",
+                                                                err,
+                                                            )) {
+                                                                let _ = ws_sender
+                                                                    .send(Message::Text(msg_text.into()))
+                                                                    .await;
+                                                            }
+                                                            None
+                                                        }
+                                                    }
+                                                } else {
+                                                    pane_config.worktree_path.clone()
+                                                };
                                                 // Delegate to TUI event handler which has server_tx and can spawn the session thread
                                                 let _ = tui_event_tx.send(TuiEvent::AddTabWithConfig {
                                                     pane_id: pane_config.pane_id,
@@ -6284,6 +6338,7 @@ async fn run_server_connection(
                                                     min_iteration_interval_minutes: pane_config.min_iteration_interval_minutes,
                                                     model: pane_config.model,
                                                     effort: pane_config.effort,
+                                                    worktree_path,
                                                 });
                                             }
                                             ServerToCli::RemovePane { session_id: _, pane_id: remove_id, cleanup_action } => {

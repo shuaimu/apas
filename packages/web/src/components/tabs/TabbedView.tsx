@@ -358,7 +358,7 @@ export function TabbedView() {
     [cleanupDialog, removePane, activeTabId, effectiveTabs, handleSelectTab],
   );
 
-  const handleAddTab = useCallback((provider: string = "claude", model?: string) => {
+  const handleAddTab = useCallback((provider: string = "claude", model?: string, isolatedWorktree?: boolean) => {
     const isMiniMax = provider === "minimax" || (provider === "claude" && isMiniMaxModel(model));
     const isGlm = provider === "glm" || (provider === "claude" && isGlmModel(model));
     const prefix = provider === "codex"
@@ -369,7 +369,7 @@ export function TabbedView() {
           ? "OpenCode"
           : isMiniMax ? "MiniMax" : isGlm ? "GLM" : "Claude";
     const label = `${prefix} ${effectiveTabs.length + 1}`;
-    const result = addPane(provider, "interactive", label, undefined, model);
+    const result = addPane(provider, "interactive", label, undefined, model, isolatedWorktree);
     if (result.success) {
       setAddTabError(null);
     } else {

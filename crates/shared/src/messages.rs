@@ -185,6 +185,12 @@ pub enum ServerToCli {
     AddPane {
         session_id: Uuid,
         pane_config: PaneConfig,
+        /// Phase 1.1e: when true, the CLI creates a fresh git worktree
+        /// for this pane (path written into the in-memory PaneConfig
+        /// before spawn). pane_config.worktree_path is ignored when this
+        /// is true — the CLI computes the path.
+        #[serde(default)]
+        isolated_worktree: bool,
     },
 
     /// Remove a pane from the session. `cleanup_action` (when Some) is
@@ -394,6 +400,12 @@ pub enum WebToServer {
         prompt: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// When true, the CLI creates an isolated git worktree under
+        /// `<project>/.apas-worktrees/pane-<id>` (branch `apas-pane-<id>`)
+        /// before spawning, and persists the resulting absolute path on
+        /// PaneConfig.worktree_path. Phase 1.1e.
+        #[serde(default)]
+        isolated_worktree: bool,
     },
 
     /// Remove a pane. When the pane has an isolated worktree assigned
