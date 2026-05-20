@@ -62,6 +62,17 @@ impl TeamRecord {
         self.tags.push(tag.into());
         self
     }
+
+    /// Convert to the wire-stable shape used in CliToServer / ServerToWeb.
+    pub fn to_wire(&self) -> shared::TeamScratchpadRecord {
+        shared::TeamScratchpadRecord {
+            ts: self.ts.clone(),
+            pane_id: self.pane_id,
+            tags: self.tags.clone(),
+            kind: self.kind.clone(),
+            body: self.body.clone(),
+        }
+    }
 }
 
 /// Resolve the absolute path of the scratchpad for a given project dir.

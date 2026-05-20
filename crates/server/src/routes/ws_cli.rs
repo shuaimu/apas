@@ -638,6 +638,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 );
                                 state.sessions.update_usage_limits(cli_id, provider, limits);
                             }
+                            Ok(CliToServer::TeamRecord { session_id, record }) => {
+                                tracing::info!(
+                                    "Team scratchpad record for session {} (kind={}, pane={:?})",
+                                    session_id, record.kind, record.pane_id,
+                                );
+                                state
+                                    .sessions
+                                    .route_to_web(
+                                        &session_id,
+                                        ServerToWeb::TeamRecord { session_id, record },
+                                    )
+                                    .await;
+                            }
                             Ok(CliToServer::PaneDiff { session_id, pane_id, branch, base, diff, error }) => {
                                 tracing::info!(
                                     "Pane diff for pane {} in session {} ({} bytes)",

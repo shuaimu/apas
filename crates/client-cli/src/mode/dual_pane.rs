@@ -965,6 +965,69 @@ async fn run_inner(
         });
     }
 
+    // Phase 2.2b: team scratchpad watcher. Tails `.apas-team.jsonl` and
+    // pushes new records to the server (which forwards to web). On
+    // first tick we send the existing history so newly-attached web
+    // clients see what came before. Polls mtime+size — cheap; only
+    // re-reads on growth.
+    {
+        let server_tx_for_pad = server_tx.clone();
+        let shutdown_for_pad = shutdown.clone();
+        let project_for_pad = std::path::PathBuf::from(working_dir_str.clone());
+        thread::spawn(move || {
+            let path = crate::scratchpad::scratchpad_path(&project_for_pad);
+            // Replace the path resolver with the actual on-disk file.
+            // scratchpad_path() returns the *conceptual* path; the
+            // resolver inside the module maps it to the sibling. Read
+            // helpers handle the mapping, so just use read_all() for
+            // diffing.
+            let _ = path;
+            let mut last_size: u64 = 0;
+            let mut seen_count: usize = 0;
+            // Send existing history once on startup so attached web
+            // clients can backfill.
+            if let Ok(records) = crate::scratchpad::read_all(&project_for_pad) {
+                for r in &records {
+                    let _ = server_tx_for_pad.blocking_send(CliToServer::TeamRecord {
+                        session_id,
+                        record: r.to_wire(),
+                    });
+                }
+                seen_count = records.len();
+            }
+            while !shutdown_for_pad.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_secs(2));
+                // Cheap change check: if file size hasn't grown since
+                // last tick, skip the re-read entirely. read_all()
+                // does its own malformed-line tolerance.
+                let actual_path = project_for_pad.join(".apas-team.jsonl");
+                let size = std::fs::metadata(&actual_path).map(|m| m.len()).unwrap_or(0);
+                if size == last_size {
+                    continue;
+                }
+                last_size = size;
+                match crate::scratchpad::read_all(&project_for_pad) {
+                    Ok(all) if all.len() > seen_count => {
+                        for r in &all[seen_count..] {
+                            let _ = server_tx_for_pad.blocking_send(CliToServer::TeamRecord {
+                                session_id,
+                                record: r.to_wire(),
+                            });
+                        }
+                        seen_count = all.len();
+                    }
+                    Ok(all) => {
+                        // File shrunk (truncate / external rewrite). Reset state.
+                        seen_count = all.len();
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "scratchpad watcher: read failed");
+                    }
+                }
+            }
+        });
+    }
+
     if headless {
         // Headless mode: drain output (nobody reads it) and wait for server task
         drop(output_rx);

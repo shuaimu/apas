@@ -212,11 +212,17 @@ Phase 2.1 is complete.
   migrates `.apas` to a directory has one place to change. Four unit
   tests cover round-trip, tag filter, missing-file → empty, and
   malformed-line skipping.
-- [ ] **2.2b — wire + web UI Team timeline**: new
-  `CliToServer::TeamRecord` push when the CLI appends; CLI also
-  streams the file on attach so the web shows existing history.
-  `ServerToWeb::TeamRecord` and a global "Team" tab next to per-pane
-  chats render the scratchpad as a timeline.
+- [x] **2.2b — wire + web UI Team timeline**: new shared
+  `TeamScratchpadRecord` type +
+  `CliToServer::TeamRecord` / `ServerToWeb::TeamRecord` envelopes.
+  CLI background watcher polls `.apas-team.jsonl` every 2s by file
+  size; on growth (or on CLI startup) it emits each new record
+  upstream. Web store accumulates them in `teamRecords` and an
+  amber "Team" button in the header opens a modal with the timeline
+  (kind/ts/pane/tags chips + body in monospace). Deviation from the
+  plan: shipped as a modal rather than a full "Team tab" alongside
+  the per-pane chats — cheaper, can be promoted later if it
+  warrants the layout work.
 - [ ] **2.2c — system-prompt mention**: include a one-liner in
   `crate::role::compose_system_prompt` telling the agent the file
   exists and what tags it should `tail -f` / look at. Best done after

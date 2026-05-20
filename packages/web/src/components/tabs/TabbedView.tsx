@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useRef, useCallback, useEffect, useState, useMemo, memo } from "react";
-import { useStore, Message, PaneConfig, PaneCleanupAction, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, paneKey } from "@/lib/store";
+import { useStore, Message, PaneConfig, PaneCleanupAction, TeamRecord, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, paneKey } from "@/lib/store";
 import { UserMessage } from "../chat/UserMessage";
 import { AssistantMessage } from "../chat/AssistantMessage";
 import { TabBar } from "./TabBar";
@@ -206,6 +206,7 @@ export function TabbedView() {
   const requestPaneDiff = useStore((s) => s.requestPaneDiff);
   const paneDiffs = useStore((s) => s.paneDiffs);
   const updatePaneRole = useStore((s) => s.updatePaneRole);
+  const teamRecords = useStore((s) => s.teamRecords);
 
   // Active tab state, persisted per project
   const [activeTabId, setActiveTabId] = useState<number | null>(null);
@@ -226,6 +227,8 @@ export function TabbedView() {
   const [diffModalPaneId, setDiffModalPaneId] = useState<number | null>(null);
   // Role drawer modal (Phase 2.1c). When set, edits role/goal/backstory.
   const [roleModalPaneId, setRoleModalPaneId] = useState<number | null>(null);
+  // Team scratchpad modal (Phase 2.2b). Just a boolean — content lives in store.
+  const [teamModalOpen, setTeamModalOpen] = useState(false);
 
   // Determine effective tabs: use paneConfigs from server, or synthesize from observed messages
   const effectiveTabs = useMemo(() => {
@@ -833,6 +836,13 @@ export function TabbedView() {
 
         {/* Actions */}
         <button
+          onClick={() => setTeamModalOpen(true)}
+          className="inline-flex items-center px-2.5 py-1 text-xs font-medium rounded transition-colors bg-amber-600 hover:bg-amber-700 text-white"
+          title="Team scratchpad — append-only timeline of artifacts (diffs, reviews, decisions) shared across panes via .apas-team.jsonl"
+        >
+          Team{teamRecords.length > 0 ? ` (${teamRecords.length})` : ""}
+        </button>
+        <button
           onClick={downloadSession}
           className="hidden md:inline-flex items-center px-2.5 py-1 text-xs font-medium rounded transition-colors bg-blue-500 hover:bg-blue-600 text-white"
           title="Download session data"
@@ -937,6 +947,88 @@ export function TabbedView() {
           setRoleModalPaneId(null);
         }}
       />
+
+      <TeamModal
+        open={teamModalOpen}
+        records={teamRecords}
+        onClose={() => setTeamModalOpen(false)}
+      />
+    </div>
+  );
+}
+
+interface TeamModalProps {
+  open: boolean;
+  records: TeamRecord[];
+  onClose: () => void;
+}
+
+function TeamModal({ open, records, onClose }: TeamModalProps) {
+  if (!open) return null;
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="flex w-full max-w-3xl flex-col rounded-lg border border-zinc-700 bg-zinc-900 p-5 text-zinc-100 shadow-xl"
+        style={{ maxHeight: "85vh" }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <h3 className="text-lg font-semibold">
+            Team scratchpad ({records.length} record{records.length === 1 ? "" : "s"})
+          </h3>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded border border-zinc-600 bg-zinc-800 px-3 py-1 text-xs hover:bg-zinc-700"
+          >
+            Close
+          </button>
+        </div>
+        <p className="mb-3 text-xs text-zinc-400">
+          Append-only timeline of artifacts published by panes, stored at <code>.apas-team.jsonl</code> in the project root. Agents append via Bash/Write tools; this view tails the file.
+        </p>
+        <div className="flex-1 overflow-auto rounded border border-zinc-800 bg-black/30 p-3">
+          {records.length === 0 ? (
+            <p className="text-sm italic text-zinc-400">
+              No records yet. Agents can append by writing JSON lines to <code>.apas-team.jsonl</code>.
+            </p>
+          ) : (
+            <ul className="flex flex-col gap-3">
+              {records.map((r, i) => (
+                <li key={i} className="rounded border border-zinc-800 bg-zinc-900/60 p-3">
+                  <div className="mb-1 flex flex-wrap items-center gap-2 text-xs text-zinc-400">
+                    <span className="font-mono text-zinc-300">{r.kind}</span>
+                    <span>·</span>
+                    <span>{r.ts}</span>
+                    {r.pane_id !== undefined && (
+                      <>
+                        <span>·</span>
+                        <span>pane {r.pane_id}</span>
+                      </>
+                    )}
+                    {r.tags.length > 0 && (
+                      <>
+                        <span>·</span>
+                        {r.tags.map((t) => (
+                          <span key={t} className="rounded bg-zinc-800 px-1.5 py-0.5 font-mono text-[10px] text-zinc-300">
+                            {t}
+                          </span>
+                        ))}
+                      </>
+                    )}
+                  </div>
+                  <pre className="whitespace-pre-wrap break-words text-xs text-zinc-100 font-mono">
+                    {r.body}
+                  </pre>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

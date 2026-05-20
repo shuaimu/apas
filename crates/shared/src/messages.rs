@@ -1,6 +1,21 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// One published artifact in the team scratchpad (`.apas-team.jsonl`),
+/// mirroring the CLI's `crate::scratchpad::TeamRecord`. Separate type
+/// here so the wire shape is stable across CLI/server/web even if the
+/// CLI's internal helper grows extra columns. Phase 2.2b.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamScratchpadRecord {
+    pub ts: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<u32>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub kind: String,
+    pub body: String,
+}
+
 /// What to do with an isolated git worktree (and its branch) when the pane
 /// that owns it is closed. Selected by the web UI before sending
 /// `WebToServer::RemovePane` so the CLI knows which git commands to run.
@@ -122,6 +137,15 @@ pub enum CliToServer {
         #[serde(default)]
         provider: Provider,
         limits: UsageLimits,
+    },
+
+    /// One team-scratchpad record (Phase 2.2b). CLI pushes when it
+    /// detects new lines in `.apas-team.jsonl` (either appended by an
+    /// agent via Bash/Write, or by a future MCP-publish helper). Sent
+    /// in batches on attach, then individually as new ones land.
+    TeamRecord {
+        session_id: Uuid,
+        record: TeamScratchpadRecord,
     },
 
     /// Diff payload for a pane that owns an isolated worktree. Sent in
@@ -688,6 +712,12 @@ pub enum ServerToWeb {
         working_dir: Option<String>,
         hostname: Option<String>,
         created_at: Option<String>,
+    },
+
+    /// One team scratchpad record forwarded from the CLI. Phase 2.2b.
+    TeamRecord {
+        session_id: Uuid,
+        record: TeamScratchpadRecord,
     },
 
     /// On-demand diff for a pane's isolated worktree branch. Phase 1.2a.
