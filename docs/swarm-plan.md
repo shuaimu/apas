@@ -152,10 +152,17 @@ Phase 1.1 is complete.
   `+N / -N` line counts (handy when collapsed). Each section uses the
   existing `CodeBlock` component with `language="diff"` so the patch
   gets Prism syntax highlighting + a copy button for free.
-- [ ] **1.2d — action buttons in the diff view**: "Merge to current
-  branch" (reuses 1.1d's MergeAndRemove path on demand instead of on
-  close), "Discard branch", "Open in $EDITOR" (best-effort
-  `$EDITOR <path>` via the CLI).
+- [x] **1.2d — action buttons in the diff view**: PaneDiffModal now
+  has "Merge & close" (green) and "Discard" (red) buttons in the
+  header. Each shows a confirm dialog, then calls the existing
+  `removePane(paneId, action)` from 1.1d — so the entire backend git
+  plumbing is shared with the on-close cleanup prompt. "Open in
+  $EDITOR" was dropped from scope: the worktree lives on the CLI host,
+  which is often a different machine from the user's browser, making
+  remote-editor a brittle UX. The path is already shown in the Diff
+  button's tooltip so the user can `$EDITOR` it manually when local.
+
+Phase 1.2 is complete.
 
 ### Phase 2 — coordination primitives
 

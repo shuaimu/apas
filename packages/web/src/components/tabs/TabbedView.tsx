@@ -901,6 +901,18 @@ export function TabbedView() {
         onRefresh={() => {
           if (diffModalPaneId !== null) requestPaneDiff(diffModalPaneId);
         }}
+        onMerge={() => {
+          if (diffModalPaneId === null) return;
+          if (!confirm("Merge this pane's branch into the project's HEAD, then close the pane? Aborts on conflict — resolve manually with git if it fails.")) return;
+          removePane(diffModalPaneId, "merge_and_remove");
+          setDiffModalPaneId(null);
+        }}
+        onDiscard={() => {
+          if (diffModalPaneId === null) return;
+          if (!confirm("Discard this branch AND its worktree, then close the pane? This is destructive — uncommitted changes are lost.")) return;
+          removePane(diffModalPaneId, "discard");
+          setDiffModalPaneId(null);
+        }}
       />
     </div>
   );
@@ -917,6 +929,8 @@ interface PaneDiffModalProps {
   };
   onClose: () => void;
   onRefresh: () => void;
+  onMerge: () => void;
+  onDiscard: () => void;
 }
 
 // Split a unified `git diff` output into per-file sections. Each `diff
@@ -977,7 +991,7 @@ function DiffFileSection({ path, body }: DiffFileSectionProps) {
   );
 }
 
-function PaneDiffModal({ open, diff, onClose, onRefresh }: PaneDiffModalProps) {
+function PaneDiffModal({ open, diff, onClose, onRefresh, onMerge, onDiscard }: PaneDiffModalProps) {
   if (!open) return null;
   let body: React.ReactNode;
   if (diff?.error) {
@@ -1011,6 +1025,22 @@ function PaneDiffModal({ open, diff, onClose, onRefresh }: PaneDiffModalProps) {
               className="rounded border border-zinc-600 bg-zinc-800 px-3 py-1 text-xs hover:bg-zinc-700"
             >
               Refresh
+            </button>
+            <button
+              type="button"
+              onClick={onMerge}
+              className="rounded border border-emerald-700 bg-emerald-900/40 px-3 py-1 text-xs text-emerald-200 hover:bg-emerald-900/60"
+              title="git merge --no-ff this pane's branch into HEAD, then close the pane. Aborts on conflict."
+            >
+              Merge &amp; close
+            </button>
+            <button
+              type="button"
+              onClick={onDiscard}
+              className="rounded border border-red-700 bg-red-900/30 px-3 py-1 text-xs text-red-200 hover:bg-red-900/50"
+              title="Force-remove the worktree and delete the branch, then close the pane. Destructive."
+            >
+              Discard
             </button>
             <button
               type="button"
