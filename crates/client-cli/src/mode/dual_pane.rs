@@ -752,7 +752,7 @@ async fn run_inner(
             &opencode_path,
             &cursor_agent_path,
         );
-        let (interrupt_slot, control_resp_slot, pending_qs, effort_arc) = pane_metas
+        let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path) = pane_metas
             .lock()
             .unwrap()
             .get(&pane_id)
@@ -761,17 +761,20 @@ async fn run_inner(
                 m.control_response_tx.clone(),
                 m.pending_questions.clone(),
                 m.effort_arc.clone(),
+                m.worktree_path.clone(),
             ))
             .unwrap_or_else(|| (
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(HashMap::new())),
                 Arc::new(Mutex::new(None)),
+                None,
             ));
         pane_threads.push(thread::spawn(move || {
             run_deadloop_session(
                 &binary_path,
                 &working_dir,
+                worktree_path,
                 sid,
                 pane_session_id,
                 pane_id,
@@ -810,7 +813,7 @@ async fn run_inner(
             &opencode_path,
             &cursor_agent_path,
         );
-        let (interrupt_slot, control_resp_slot, pending_qs, effort_arc) = pane_metas
+        let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path) = pane_metas
             .lock()
             .unwrap()
             .get(&pane_id)
@@ -819,17 +822,20 @@ async fn run_inner(
                 m.control_response_tx.clone(),
                 m.pending_questions.clone(),
                 m.effort_arc.clone(),
+                m.worktree_path.clone(),
             ))
             .unwrap_or_else(|| (
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(HashMap::new())),
                 Arc::new(Mutex::new(None)),
+                None,
             ));
         pane_threads.push(thread::spawn(move || {
             run_pane_session(
                 &binary_path,
                 &working_dir,
+                worktree_path,
                 sid,
                 pane_session_id,
                 pane_id,
@@ -1153,7 +1159,7 @@ fn handle_tui_events(
                         cursor_agent_path,
                     );
                     let working_dir = working_dir.to_string();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc) = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
@@ -1162,17 +1168,20 @@ fn handle_tui_events(
                             m.control_response_tx.clone(),
                             m.pending_questions.clone(),
                             m.effort_arc.clone(),
+                            m.worktree_path.clone(),
                         ))
                         .unwrap_or_else(|| (
                             Arc::new(Mutex::new(None)),
                             Arc::new(Mutex::new(None)),
                             Arc::new(Mutex::new(HashMap::new())),
                             Arc::new(Mutex::new(None)),
+                            None,
                         ));
                     thread::spawn(move || {
                         run_pane_session(
                             &binary_path,
                             &working_dir,
+                            worktree_path,
                             session_id,
                             claude_session_id,
                             pane_id,
@@ -1299,7 +1308,7 @@ fn handle_tui_events(
                     let shutdown = shutdown.clone();
                     let event_tx = event_tx.clone();
                     let working_dir = working_dir.to_string();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc) = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
@@ -1308,17 +1317,20 @@ fn handle_tui_events(
                             m.control_response_tx.clone(),
                             m.pending_questions.clone(),
                             m.effort_arc.clone(),
+                            m.worktree_path.clone(),
                         ))
                         .unwrap_or_else(|| (
                             Arc::new(Mutex::new(None)),
                             Arc::new(Mutex::new(None)),
                             Arc::new(Mutex::new(HashMap::new())),
                             Arc::new(Mutex::new(None)),
+                            None,
                         ));
                     thread::spawn(move || {
                         run_deadloop_session(
                             &binary_path,
                             &working_dir,
+                            worktree_path,
                             session_id,
                             claude_session_id,
                             pane_id,
@@ -1351,7 +1363,7 @@ fn handle_tui_events(
                     let server_tx = server_tx.clone();
                     let shutdown = shutdown.clone();
                     let working_dir = working_dir.to_string();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc) = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
@@ -1360,17 +1372,20 @@ fn handle_tui_events(
                             m.control_response_tx.clone(),
                             m.pending_questions.clone(),
                             m.effort_arc.clone(),
+                            m.worktree_path.clone(),
                         ))
                         .unwrap_or_else(|| (
                             Arc::new(Mutex::new(None)),
                             Arc::new(Mutex::new(None)),
                             Arc::new(Mutex::new(HashMap::new())),
                             Arc::new(Mutex::new(None)),
+                            None,
                         ));
                     thread::spawn(move || {
                         run_pane_session(
                             &binary_path,
                             &working_dir,
+                            worktree_path,
                             session_id,
                             claude_session_id,
                             pane_id,
@@ -1628,7 +1643,7 @@ fn handle_tui_events(
                     let shutdown = shutdown.clone();
                     let event_tx = event_tx.clone();
                     let working_dir = working_dir.to_string();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc) = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
@@ -1637,17 +1652,20 @@ fn handle_tui_events(
                             m.control_response_tx.clone(),
                             m.pending_questions.clone(),
                             m.effort_arc.clone(),
+                            m.worktree_path.clone(),
                         ))
                         .unwrap_or_else(|| (
                             Arc::new(Mutex::new(None)),
                             Arc::new(Mutex::new(None)),
                             Arc::new(Mutex::new(HashMap::new())),
                             Arc::new(Mutex::new(None)),
+                            None,
                         ));
                     thread::spawn(move || {
                         run_deadloop_session(
                             &binary_path,
                             &working_dir,
+                            worktree_path,
                             session_id,
                             claude_session_id,
                             pane_id,
@@ -2051,7 +2069,7 @@ fn handle_tui_events(
                     let server_tx = server_tx.clone();
                     let shutdown = shutdown.clone();
                     let working_dir = working_dir.to_string();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc) = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
@@ -2060,17 +2078,20 @@ fn handle_tui_events(
                             m.control_response_tx.clone(),
                             m.pending_questions.clone(),
                             m.effort_arc.clone(),
+                            m.worktree_path.clone(),
                         ))
                         .unwrap_or_else(|| (
                             Arc::new(Mutex::new(None)),
                             Arc::new(Mutex::new(None)),
                             Arc::new(Mutex::new(HashMap::new())),
                             Arc::new(Mutex::new(None)),
+                            None,
                         ));
                     thread::spawn(move || {
                         run_pane_session(
                             &binary_path,
                             &working_dir,
+                            worktree_path,
                             session_id,
                             claude_session_id,
                             pane_id,
@@ -3158,6 +3179,7 @@ mod tests {
 fn run_deadloop_session(
     binary_path: &str,
     working_dir: &str,
+    worktree_path: Option<String>,
     session_id: Uuid,
     claude_session_id: Uuid,
     pane_id: u32,
@@ -3182,6 +3204,7 @@ fn run_deadloop_session(
         run_deadloop_session_inner(
             binary_path,
             working_dir,
+            worktree_path,
             session_id,
             claude_session_id,
             pane_id,
@@ -3223,6 +3246,7 @@ fn run_deadloop_session(
 fn run_deadloop_session_inner(
     binary_path: &str,
     working_dir: &str,
+    worktree_path: Option<String>,
     session_id: Uuid,
     claude_session_id: Uuid,
     pane_id: u32,
@@ -3250,6 +3274,7 @@ fn run_deadloop_session_inner(
         return run_deadloop_session_streaming(
             binary_path,
             working_dir,
+            worktree_path,
             session_id,
             claude_session_id,
             pane_id,
@@ -3271,6 +3296,10 @@ fn run_deadloop_session_inner(
             effort_arc,
         );
     }
+    let effective_dir: String = worktree_path
+        .as_deref()
+        .unwrap_or(working_dir)
+        .to_string();
     let _ = interrupt_tx_slot; // unused for legacy path
     let _ = control_response_tx_slot; // unused for legacy path
     let _ = pending_questions; // unused for legacy path
@@ -3446,7 +3475,7 @@ fn run_deadloop_session_inner(
         let mut command = Command::new(binary_path);
         command
             .args(&args)
-            .current_dir(working_dir)
+            .current_dir(&effective_dir)
             // Clear CLAUDECODE so Claude CLI doesn't refuse to start (nesting detection)
             .env_remove("CLAUDECODE")
             .stdin(Stdio::null())
@@ -4241,6 +4270,11 @@ fn compose_streaming_status(thinking: bool, n_subagents: usize) -> Option<String
 fn run_pane_session_streaming(
     binary_path: &str,
     working_dir: &str,
+    // Optional isolated git worktree path. When Some, the claude process
+    // and the session-jsonl tailer use this as their cwd; claude's session
+    // jsonl is keyed by encoded-cwd so they MUST agree. `.apas` and
+    // project metadata stay rooted at `working_dir`. Phase 1.1b.
+    worktree_path: Option<String>,
     session_id: Uuid,
     claude_session_id: Uuid,
     pane_id: u32,
@@ -4280,6 +4314,14 @@ fn run_pane_session_streaming(
     pane_type: PaneType,
 ) {
     use std::io::Write;
+
+    // effective_dir is what we pass to claude as cwd and what we use to
+    // locate its session jsonl / background-task tmp dir. With no worktree
+    // set, this collapses to the project working_dir (legacy behaviour).
+    let effective_dir: String = worktree_path
+        .as_deref()
+        .unwrap_or(working_dir)
+        .to_string();
 
     let _ = output_tx.send(PaneOutput {
         text: format!("[Session: {} (streaming)]", &claude_session_id.to_string()[..8]),
@@ -4321,7 +4363,7 @@ fn run_pane_session_streaming(
     // tasks that grew during a respawn gap.
     let (auto_wake_tx, auto_wake_rx) = mpsc::channel::<String>();
     let watcher_session = claude_session_id;
-    let watcher_working_dir = working_dir.to_string();
+    let watcher_working_dir = effective_dir.clone();
     let watcher_pane_id = pane_id;
     let watcher_shutdown = shutdown.clone();
     let watcher_watched = watched_tasks.clone();
@@ -4362,7 +4404,7 @@ fn run_pane_session_streaming(
     let thinking: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 
     let tailer_session = claude_session_id;
-    let tailer_working_dir = working_dir.to_string();
+    let tailer_working_dir = effective_dir.clone();
     let tailer_pane_id = pane_id;
     let tailer_apas_session = session_id;
     let tailer_server_tx = server_tx.clone();
@@ -4386,7 +4428,7 @@ fn run_pane_session_streaming(
     // conversation found"). Use --session-id <uuid> to create it. After the
     // first successful spawn (or after we observe the session file on disk),
     // flip to --resume for all subsequent restarts.
-    let mut try_resume_first = session_jsonl_exists(working_dir, &claude_session_id);
+    let mut try_resume_first = session_jsonl_exists(&effective_dir, &claude_session_id);
     // Suppress duplicate env-config errors across spawn retries.
     let mut last_env_err: Option<String> = None;
 
@@ -4470,7 +4512,7 @@ fn run_pane_session_streaming(
         let mut command = Command::new(binary_path);
         command
             .args(&args)
-            .current_dir(working_dir)
+            .current_dir(&effective_dir)
             .env_remove("CLAUDECODE")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -5070,7 +5112,7 @@ fn run_pane_session_streaming(
         // If we tried --resume on a session that doesn't exist on disk yet,
         // the child exits almost immediately with an error. Flip to
         // --session-id for the next spawn so we create the session instead.
-        if using_resume && !session_jsonl_exists(working_dir, &claude_session_id) {
+        if using_resume && !session_jsonl_exists(&effective_dir, &claude_session_id) {
             try_resume_first = false;
             let _ = output_tx.send(PaneOutput {
                 text: "[No prior session found, creating fresh session...]".to_string(),
@@ -5110,6 +5152,7 @@ fn run_pane_session_streaming(
 fn run_deadloop_session_streaming(
     binary_path: &str,
     working_dir: &str,
+    worktree_path: Option<String>,
     session_id: Uuid,
     claude_session_id: Uuid,
     pane_id: u32,
@@ -5147,6 +5190,7 @@ fn run_deadloop_session_streaming(
     {
         let binary_path = binary_path.to_string();
         let working_dir = working_dir.to_string();
+        let worktree_path = worktree_path.clone();
         let model = model.clone();
         let effort = effort.clone();
         let provider = *provider;
@@ -5162,6 +5206,7 @@ fn run_deadloop_session_streaming(
             run_pane_session_streaming(
                 &binary_path,
                 &working_dir,
+                worktree_path,
                 session_id,
                 claude_session_id,
                 pane_id,
@@ -5272,6 +5317,7 @@ fn run_deadloop_session_streaming(
 fn run_pane_session(
     binary_path: &str,
     working_dir: &str,
+    worktree_path: Option<String>,
     session_id: Uuid,
     claude_session_id: Uuid,
     pane_id: u32,
@@ -5295,6 +5341,7 @@ fn run_pane_session(
         return run_pane_session_streaming(
             binary_path,
             working_dir,
+            worktree_path,
             session_id,
             claude_session_id,
             pane_id,
@@ -5314,6 +5361,10 @@ fn run_pane_session(
             PaneType::Interactive,
         );
     }
+    let effective_dir: String = worktree_path
+        .as_deref()
+        .unwrap_or(working_dir)
+        .to_string();
     let _ = interrupt_tx_slot; // unused for legacy path
     let _ = control_response_tx_slot; // unused for legacy path
     let _ = pending_questions; // unused for legacy path
@@ -5425,7 +5476,7 @@ fn run_pane_session(
         let mut command = Command::new(binary_path);
         command
             .args(&args)
-            .current_dir(working_dir)
+            .current_dir(&effective_dir)
             // Clear CLAUDECODE so Claude CLI doesn't refuse to start (nesting detection)
             .env_remove("CLAUDECODE")
             .stdin(Stdio::null())

@@ -65,13 +65,20 @@ review checkpoints.
   defaults to `None` (legacy behaviour preserved). Restore-from-.apas
   threads it into the `tabs_to_restore` tuple. No runtime behaviour
   change yet — sets up the field so the next leaf can read it.
-- [ ] **1.1b — spawn cwd** (next): at the three spawn sites in
-  `dual_pane.rs` (codex non-streaming, streaming claude, claude
-  legacy non-streaming), use
-  `worktree_path.as_deref().unwrap_or(working_dir)` for `current_dir`.
-  Also for the session-jsonl tailer's encoded-cwd computation, since
-  claude stores its sessions keyed by cwd.
-- [ ] **1.1c — opt-in CLI subcommand**: `apas worktree add <pane-id>
+- [x] **1.1b — spawn cwd**: threaded `worktree_path: Option<String>`
+  through `run_pane_session{,_streaming}` and
+  `run_deadloop_session{,_inner,_streaming}`. Each leaf computes
+  `effective_dir = worktree_path.as_deref().unwrap_or(working_dir)` and
+  uses it for `.current_dir()` plus the session-jsonl tailer
+  (`tail_session_jsonl`), background-task watcher
+  (`poll_background_tasks`), and the `session_jsonl_exists` first-spawn
+  probe. All 7 call sites in `dual_pane.rs` now look up
+  `meta.worktree_path` from `pane_metas` alongside the existing per-pane
+  slots. Default `None` preserves legacy behaviour. Behaviour change:
+  when a worktree is set, claude's cwd, its session jsonl path, and the
+  auto-wake tmp dir all use the worktree path — they MUST agree because
+  claude keys its jsonl by encoded-cwd.
+- [ ] **1.1c — opt-in CLI subcommand** (next): `apas worktree add <pane-id>
   [branch-name]` creates the worktree, sets `PaneConfig.worktree_path`,
   re-saves `.apas`, optionally restarts the pane.
 - [ ] **1.1d — cleanup on pane removal**: prompt for "discard / merge
