@@ -157,6 +157,9 @@ export interface PaneConfig {
   model?: string;
   effort?: string;
   worktree_path?: string;
+  role?: string;
+  goal?: string;
+  backstory?: string;
 }
 
 export type PaneCleanupAction = "discard" | "merge_and_remove" | "leave_as_branch";
@@ -430,6 +433,7 @@ interface AppState {
   downloadSession: () => void;
   requestPaneDiff: (paneId: number) => void;
   paneDiffs: Record<number, PaneDiff>;
+  updatePaneRole: (paneId: number, role?: string, goal?: string, backstory?: string) => void;
 }
 
 export interface PaneDiff {
@@ -1283,6 +1287,17 @@ export const useStore = create<AppState>((set, get) => ({
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "request_pane_diff", pane_id: paneId }));
+    }
+  },
+
+  updatePaneRole: (paneId: number, role?: string, goal?: string, backstory?: string) => {
+    const { ws } = get();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      const payload: Record<string, unknown> = { type: "update_pane_role", pane_id: paneId };
+      if (role !== undefined) payload.role = role;
+      if (goal !== undefined) payload.goal = goal;
+      if (backstory !== undefined) payload.backstory = backstory;
+      ws.send(JSON.stringify(payload));
     }
   },
 

@@ -6802,6 +6802,50 @@ async fn run_server_connection(
                                                     );
                                                 }
                                             }
+                                            ServerToCli::UpdatePaneRole { session_id: _, pane_id: role_pane_id, role, goal, backstory } => {
+                                                // Mutate in-memory PaneMeta. Empty strings normalize to None
+                                                // so the user can clear a field via the web UI.
+                                                let norm = |s: Option<String>| s.and_then(|v| {
+                                                    let t = v.trim().to_string();
+                                                    if t.is_empty() { None } else { Some(t) }
+                                                });
+                                                let role = norm(role);
+                                                let goal = norm(goal);
+                                                let backstory = norm(backstory);
+                                                let updated = {
+                                                    let mut metas = pane_metas.lock().unwrap();
+                                                    if let Some(m) = metas.get_mut(&role_pane_id) {
+                                                        m.role = role.clone();
+                                                        m.goal = goal.clone();
+                                                        m.backstory = backstory.clone();
+                                                        true
+                                                    } else {
+                                                        false
+                                                    }
+                                                };
+                                                if updated {
+                                                    save_pane_configs(
+                                                        &working_dir,
+                                                        &pane_sessions,
+                                                        &pane_metas,
+                                                        &pane_pauses,
+                                                        &pane_stop_requests,
+                                                    );
+                                                    let hint = "[Role/goal/backstory updated. Takes effect on next pane restart (close + re-add the tab, or reboot the apas CLI).]".to_string();
+                                                    let msg = CliToServer::Output {
+                                                        session_id,
+                                                        data: hint,
+                                                        output_type: shared::OutputType::System,
+                                                        pane_type: None,
+                                                        pane_id: Some(role_pane_id),
+                                                    };
+                                                    if let Ok(text) = serde_json::to_string(&msg) {
+                                                        let _ = ws_sender
+                                                            .send(Message::Text(text.into()))
+                                                            .await;
+                                                    }
+                                                }
+                                            }
                                             ServerToCli::RequestPaneDiff { session_id: _, pane_id: diff_pane_id } => {
                                                 // Look up the pane's worktree path. If unset, return a polite error
                                                 // so the web UI can render guidance instead of nothing.

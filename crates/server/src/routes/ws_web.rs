@@ -1012,6 +1012,27 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
+                Ok(WebToServer::UpdatePaneRole { pane_id, role, goal, backstory }) => {
+                    if let Some(sid) = session_id {
+                        tracing::info!(
+                            "Updating pane {} role for session {} (role={:?}, goal={:?})",
+                            pane_id, sid, role, goal,
+                        );
+                        state
+                            .sessions
+                            .route_to_cli(
+                                &sid,
+                                ServerToCli::UpdatePaneRole {
+                                    session_id: sid,
+                                    pane_id,
+                                    role,
+                                    goal,
+                                    backstory,
+                                },
+                            )
+                            .await;
+                    }
+                }
                 Ok(WebToServer::RequestPaneDiff { pane_id }) => {
                     if let Some(sid) = session_id {
                         tracing::info!("Requesting pane diff for pane {} in session {}", pane_id, sid);

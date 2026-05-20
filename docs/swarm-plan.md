@@ -189,11 +189,17 @@ Phase 1.2 is complete.
   `meta.role/goal/backstory` via the new helper and pass through. 4 new
   unit tests in `role.rs` cover the empty / single / all-three / partial
   cases.
-- [ ] **2.1c — web UI Role drawer**: a "Role" tab in the pane settings
-  drawer with three short textareas. Saving sends new
+- [x] **2.1c — web UI Role drawer**: purple "Role" button in the pane
+  header (next to Diff) opens a modal with three inputs (role + goal:
+  text inputs; backstory: 6-row textarea). Save sends new
   `WebToServer::UpdatePaneRole { pane_id, role, goal, backstory }` →
-  CLI persists to .apas. Effective on next pane restart (with a hint
-  in the chat surface, same pattern as effort changes).
+  `ServerToCli::UpdatePaneRole` → CLI updates `PaneMeta.role/goal/
+  backstory`, persists via `save_pane_configs`, and emits a system
+  message into the pane reminding the user the change takes effect on
+  next spawn. The modal pre-populates from the current values in
+  `PaneConfig` (which is sync'd from PaneMeta via PaneList).
+
+Phase 2.1 is complete.
 
 2.2  **Project-scoped team scratchpad** (`.apas/team.jsonl`).
 - Append-only JSONL, one record per published artifact:

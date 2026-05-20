@@ -274,6 +274,19 @@ pub enum ServerToCli {
     /// Compute and return the current `git diff` for a pane's isolated
     /// worktree branch against the project's HEAD. Phase 1.2a.
     RequestPaneDiff { session_id: Uuid, pane_id: u32 },
+
+    /// Set role/goal/backstory on the named pane and persist to .apas.
+    /// Phase 2.1c.
+    UpdatePaneRole {
+        session_id: Uuid,
+        pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        backstory: Option<String>,
+    },
 }
 
 // ============================================================================
@@ -531,6 +544,21 @@ pub enum WebToServer {
     /// branch and the project's HEAD. Returns via `ServerToWeb::PaneDiff`.
     /// Phase 1.2a.
     RequestPaneDiff { pane_id: u32 },
+
+    /// Update a pane's role/goal/backstory triple (Phase 2.1c). All three
+    /// fields are optional — sending null for any of them clears that
+    /// piece. Takes effect on the next pane spawn (close + reopen tab,
+    /// or reboot the apas CLI) since claude reads --append-system-prompt
+    /// only at launch.
+    UpdatePaneRole {
+        pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        backstory: Option<String>,
+    },
 }
 
 /// Messages sent from server to web client

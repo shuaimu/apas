@@ -205,6 +205,7 @@ export function TabbedView() {
   const downloadSession = useStore((s) => s.downloadSession);
   const requestPaneDiff = useStore((s) => s.requestPaneDiff);
   const paneDiffs = useStore((s) => s.paneDiffs);
+  const updatePaneRole = useStore((s) => s.updatePaneRole);
 
   // Active tab state, persisted per project
   const [activeTabId, setActiveTabId] = useState<number | null>(null);
@@ -223,6 +224,8 @@ export function TabbedView() {
   >(null);
   // Diff viewer modal (Phase 1.2a). When set, shows paneDiffs[paneId].
   const [diffModalPaneId, setDiffModalPaneId] = useState<number | null>(null);
+  // Role drawer modal (Phase 2.1c). When set, edits role/goal/backstory.
+  const [roleModalPaneId, setRoleModalPaneId] = useState<number | null>(null);
 
   // Determine effective tabs: use paneConfigs from server, or synthesize from observed messages
   const effectiveTabs = useMemo(() => {
@@ -804,6 +807,15 @@ export function TabbedView() {
                   Diff
                 </button>
               )}
+              {activeTabId != null && activeConfig && (
+                <button
+                  onClick={() => setRoleModalPaneId(activeTabId)}
+                  className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-purple-600 hover:bg-purple-700 text-white"
+                  title="Edit role / goal / backstory for this pane (composed into --append-system-prompt at next spawn)"
+                >
+                  Role
+                </button>
+              )}
             </>
           )
         )}
@@ -914,6 +926,102 @@ export function TabbedView() {
           setDiffModalPaneId(null);
         }}
       />
+
+      <RoleModal
+        open={roleModalPaneId !== null}
+        pane={roleModalPaneId !== null ? effectiveTabs.find((t) => t.pane_id === roleModalPaneId) : undefined}
+        onClose={() => setRoleModalPaneId(null)}
+        onSave={(role, goal, backstory) => {
+          if (roleModalPaneId === null) return;
+          updatePaneRole(roleModalPaneId, role, goal, backstory);
+          setRoleModalPaneId(null);
+        }}
+      />
+    </div>
+  );
+}
+
+interface RoleModalProps {
+  open: boolean;
+  pane?: PaneConfig;
+  onClose: () => void;
+  onSave: (role: string, goal: string, backstory: string) => void;
+}
+
+function RoleModal({ open, pane, onClose, onSave }: RoleModalProps) {
+  const [role, setRole] = useState(pane?.role ?? "");
+  const [goal, setGoal] = useState(pane?.goal ?? "");
+  const [backstory, setBackstory] = useState(pane?.backstory ?? "");
+  // Reset fields when modal opens for a different pane (or re-opens).
+  React.useEffect(() => {
+    if (open) {
+      setRole(pane?.role ?? "");
+      setGoal(pane?.goal ?? "");
+      setBackstory(pane?.backstory ?? "");
+    }
+  }, [open, pane?.pane_id, pane?.role, pane?.goal, pane?.backstory]);
+  if (!open) return null;
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="flex w-full max-w-2xl flex-col rounded-lg border border-zinc-700 bg-zinc-900 p-5 text-zinc-100 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 className="mb-1 text-lg font-semibold">
+          Role · Goal · Backstory{pane?.label ? ` — ${pane.label}` : ""}
+        </h3>
+        <p className="mb-4 text-xs text-zinc-400">
+          Appended to the agent&apos;s system prompt at next spawn (close + re-add the tab, or reboot the apas CLI to apply).
+        </p>
+        <div className="flex flex-col gap-3">
+          <label className="flex flex-col gap-1 text-xs">
+            <span className="text-zinc-300">Role <span className="text-zinc-500">(e.g. &quot;backend implementer&quot;, &quot;reviewer&quot;)</span></span>
+            <input
+              type="text"
+              value={role}
+              onChange={(e) => setRole(e.target.value)}
+              className="rounded border border-zinc-700 bg-zinc-800 px-2 py-1 font-mono"
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-xs">
+            <span className="text-zinc-300">Goal <span className="text-zinc-500">(one-line objective)</span></span>
+            <input
+              type="text"
+              value={goal}
+              onChange={(e) => setGoal(e.target.value)}
+              className="rounded border border-zinc-700 bg-zinc-800 px-2 py-1 font-mono"
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-xs">
+            <span className="text-zinc-300">Backstory <span className="text-zinc-500">(free-form context, conventions, constraints)</span></span>
+            <textarea
+              value={backstory}
+              onChange={(e) => setBackstory(e.target.value)}
+              rows={6}
+              className="rounded border border-zinc-700 bg-zinc-800 px-2 py-1 font-mono resize-y"
+            />
+          </label>
+        </div>
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded border border-zinc-600 bg-zinc-800 px-3 py-1.5 text-sm hover:bg-zinc-700"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={() => onSave(role, goal, backstory)}
+            className="rounded border border-purple-700 bg-purple-700 px-3 py-1.5 text-sm hover:bg-purple-600"
+          >
+            Save
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
