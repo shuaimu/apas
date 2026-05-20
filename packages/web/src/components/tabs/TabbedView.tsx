@@ -1,11 +1,12 @@
 "use client";
 
-import { useRef, useCallback, useEffect, useState, useMemo, memo } from "react";
+import React, { useRef, useCallback, useEffect, useState, useMemo, memo } from "react";
 import { useStore, Message, PaneConfig, PaneCleanupAction, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, paneKey } from "@/lib/store";
 import { UserMessage } from "../chat/UserMessage";
 import { AssistantMessage } from "../chat/AssistantMessage";
 import { TabBar } from "./TabBar";
 import { UsageLimitsDisplay } from "../UsageLimits";
+import { CodeBlock } from "../code/CodeBlock";
 
 // Sentinel pane_id for the single-pane fallback (no pane system)
 const PANE_ID_MAIN = 0;
@@ -918,15 +919,79 @@ interface PaneDiffModalProps {
   onRefresh: () => void;
 }
 
+// Split a unified `git diff` output into per-file sections. Each `diff
+// --git a/<path> b/<path>` header opens a new section. Phase 1.2c.
+function splitDiffByFile(text: string): Array<{ path: string; body: string }> {
+  if (!text) return [];
+  const lines = text.split("\n");
+  const sections: Array<{ path: string; body: string }> = [];
+  let current: { path: string; lines: string[] } | null = null;
+  const flush = () => {
+    if (current) {
+      sections.push({ path: current.path, body: current.lines.join("\n") });
+    }
+  };
+  for (const line of lines) {
+    const m = line.match(/^diff --git a\/(.+) b\/(.+)$/);
+    if (m) {
+      flush();
+      current = { path: m[2] || m[1], lines: [line] };
+    } else if (current) {
+      current.lines.push(line);
+    }
+  }
+  flush();
+  return sections;
+}
+
+interface DiffFileSectionProps {
+  path: string;
+  body: string;
+}
+
+function DiffFileSection({ path, body }: DiffFileSectionProps) {
+  const [expanded, setExpanded] = useState(true);
+  // Quick line-count summary so collapsed view still gives signal.
+  let added = 0;
+  let removed = 0;
+  for (const line of body.split("\n")) {
+    if (line.startsWith("+") && !line.startsWith("+++")) added++;
+    else if (line.startsWith("-") && !line.startsWith("---")) removed++;
+  }
+  return (
+    <div className="mb-3 rounded border border-zinc-800 bg-black/30">
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-xs hover:bg-zinc-800/50"
+      >
+        <span className="font-mono text-zinc-200 break-all">{path}</span>
+        <span className="flex flex-shrink-0 items-center gap-2 text-zinc-400">
+          <span className="text-emerald-400">+{added}</span>
+          <span className="text-red-400">-{removed}</span>
+          <span>{expanded ? "▾" : "▸"}</span>
+        </span>
+      </button>
+      {expanded && <CodeBlock code={body} language="diff" />}
+    </div>
+  );
+}
+
 function PaneDiffModal({ open, diff, onClose, onRefresh }: PaneDiffModalProps) {
   if (!open) return null;
-  const body = diff?.error
-    ? <pre className="whitespace-pre-wrap break-words text-red-300 text-xs">{diff.error}</pre>
-    : diff?.diff !== undefined
-      ? (diff.diff.length === 0
-          ? <p className="text-zinc-400 text-sm italic">No changes vs base.</p>
-          : <pre className="whitespace-pre-wrap break-words text-zinc-100 text-xs font-mono">{diff.diff}</pre>)
-      : <p className="text-zinc-400 text-sm italic">Loading…</p>;
+  let body: React.ReactNode;
+  if (diff?.error) {
+    body = <pre className="whitespace-pre-wrap break-words text-red-300 text-xs">{diff.error}</pre>;
+  } else if (diff?.diff === undefined) {
+    body = <p className="text-zinc-400 text-sm italic">Loading…</p>;
+  } else if (diff.diff.length === 0) {
+    body = <p className="text-zinc-400 text-sm italic">No changes vs base.</p>;
+  } else {
+    const sections = splitDiffByFile(diff.diff);
+    body = sections.length > 0
+      ? <>{sections.map((s) => <DiffFileSection key={s.path} path={s.path} body={s.body} />)}</>
+      : <pre className="whitespace-pre-wrap break-words text-zinc-100 text-xs font-mono">{diff.diff}</pre>;
+  }
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"

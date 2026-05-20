@@ -146,9 +146,12 @@ Phase 1.1 is complete.
   is exposed so the loop body is testable in isolation — covered by a
   new unit test that walks the (baseline → no change → commit → reap)
   cycle.
-- [ ] **1.2c — syntax-highlighted view**: render the patch with
-  `CodeBlock` (already wired) + per-file collapsible sections, instead
-  of a raw `<pre>` dump.
+- [x] **1.2c — syntax-highlighted view**: the modal now splits the
+  unified diff on `diff --git a/<path> b/<path>` headers and renders
+  each file as a collapsible section. Header shows the path + per-file
+  `+N / -N` line counts (handy when collapsed). Each section uses the
+  existing `CodeBlock` component with `language="diff"` so the patch
+  gets Prism syntax highlighting + a copy button for free.
 - [ ] **1.2d — action buttons in the diff view**: "Merge to current
   branch" (reuses 1.1d's MergeAndRemove path on demand instead of on
   close), "Discard branch", "Open in $EDITOR" (best-effort
