@@ -166,18 +166,27 @@ Phase 1.2 is complete.
 
 ### Phase 2 — coordination primitives
 
-2.1  **Role / goal / backstory** on each pane.
-- New fields in `PaneConfig`:
-  ```rust
-  role: Option<String>,         // e.g. "backend implementer"
-  goal: Option<String>,         // e.g. "make auth tests green"
-  backstory: Option<String>,    // appended to system prompt
-  ```
-- Wire via `--append-system-prompt` on claude launch. (For codex/others,
-  best-effort via env or system message.)
-- Replaces the current "raw prompt" field for deadloops with three smaller
-  inputs (and persists alongside it; old prompt still works).
-- Web UI: a "Role" tab in the pane settings drawer with three short textareas.
+2.1  **Role / goal / backstory** on each pane. Sub-split:
+- [x] **2.1a — data model**: added `role`, `goal`, `backstory:
+  Option<String>` to `shared::PaneConfig` (persisted, default-None via
+  serde) and mirrored them on the in-memory `PaneMeta`. Threaded
+  through every PaneConfig/PaneMeta construction site (14 PaneMeta
+  sites, 5 PaneConfig sites across dual_pane.rs, project.rs, ws_web.rs,
+  messages.rs). `tabs_to_restore` tuple grew from 11 to 14 elements so
+  restore-from-.apas round-trips the three new fields. No runtime
+  behaviour change yet — sets up the fields for 2.1b's
+  --append-system-prompt wiring.
+- [ ] **2.1b — claude launch wiring**: at the spawn sites, if any of
+  the three are set, build a single `--append-system-prompt` argument
+  with a small template (e.g. `# Role\n{role}\n\n# Goal\n{goal}\n\n#
+  Backstory\n{backstory}`). For non-claude providers (codex, opencode,
+  cursor) — best-effort via an `APAS_ROLE/GOAL/BACKSTORY` env or skip
+  with a note in the chat surface.
+- [ ] **2.1c — web UI Role drawer**: a "Role" tab in the pane settings
+  drawer with three short textareas. Saving sends new
+  `WebToServer::UpdatePaneRole { pane_id, role, goal, backstory }` →
+  CLI persists to .apas. Effective on next pane restart (with a hint
+  in the chat surface, same pattern as effort changes).
 
 2.2  **Project-scoped team scratchpad** (`.apas/team.jsonl`).
 - Append-only JSONL, one record per published artifact:

@@ -104,6 +104,9 @@ fn infer_panes_from_messages(
                 model: None,
                 effort: None,
                 worktree_path: None,
+                role: None,
+                goal: None,
+                backstory: None,
             }
         })
         .collect()
@@ -931,6 +934,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             model,
                             effort: None,
                             worktree_path: None,
+                            role: None,
+                            goal: None,
+                            backstory: None,
                         };
                         tracing::info!(
                             "Adding pane {} to session {} (isolated_worktree={})",

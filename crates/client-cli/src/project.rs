@@ -99,6 +99,9 @@ impl ProjectMetadata {
                     model: None,
                     effort: None,
                     worktree_path: None,
+                    role: None,
+                    goal: None,
+                    backstory: None,
                 },
                 PaneConfig {
                     pane_id: shared::PANE_ID_INTERACTIVE,
@@ -113,6 +116,9 @@ impl ProjectMetadata {
                     model: None,
                     effort: None,
                     worktree_path: None,
+                    role: None,
+                    goal: None,
+                    backstory: None,
                 },
             ];
         }

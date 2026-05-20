@@ -375,6 +375,13 @@ struct PaneMeta {
     /// The git worktree itself is created out-of-band; setting this
     /// field does not invoke git.
     worktree_path: Option<String>,
+    /// Phase 2.1: role / goal / backstory triple that gets composed into a
+    /// system-prompt prefix at spawn time. All three are persisted in
+    /// `.apas` alongside the other pane config; default-None preserves
+    /// legacy "no role identity" behaviour.
+    role: Option<String>,
+    goal: Option<String>,
+    backstory: Option<String>,
 }
 
 /// State stored for each in-flight AskUserQuestion call, keyed by tool_use_id.
@@ -454,6 +461,9 @@ async fn run_inner(
         Option<u64>,
         bool,
         Option<String>, // worktree_path from .apas (Phase 1.1)
+        Option<String>, // role from .apas (Phase 2.1)
+        Option<String>, // goal from .apas (Phase 2.1)
+        Option<String>, // backstory from .apas (Phase 2.1)
     )> = metadata
         .panes
         .iter()
@@ -489,6 +499,9 @@ async fn run_inner(
                 pane.min_iteration_interval_minutes,
                 is_paused,
                 pane.worktree_path.clone(),
+                pane.role.clone(),
+                pane.goal.clone(),
+                pane.backstory.clone(),
             )
         })
         .collect();
@@ -565,6 +578,9 @@ async fn run_inner(
             min_interval_minutes,
             is_paused,
             tab_worktree,
+            tab_role,
+            tab_goal,
+            tab_backstory,
         ) in &tabs_to_restore
         {
             let child_proc: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
@@ -584,6 +600,9 @@ async fn run_inner(
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(tab_effort.clone())),
                     worktree_path: tab_worktree.clone(),
+                    role: tab_role.clone(),
+                    goal: tab_goal.clone(),
+                    backstory: tab_backstory.clone(),
                 },
             );
             sessions.insert(*pane_id, *pane_session_id);
@@ -689,7 +708,7 @@ async fn run_inner(
     };
 
     // Send initial messages for restored panes.
-    for (pane_id, _, label, mode, _, _, _, _, _, is_paused, _) in &tabs_to_restore {
+    for (pane_id, _, label, mode, _, _, _, _, _, is_paused, _, _, _, _) in &tabs_to_restore {
         let init_text = if *pane_id == shared::PANE_ID_DEADLOOP
             && *mode == shared::PaneMode::Deadloop
         {
@@ -1076,9 +1095,10 @@ fn save_pane_configs(
                             None,
                         )
                     };
-                let worktree_path = pane_metas
+                let (worktree_path, role, goal, backstory) = pane_metas
                     .get(&pane_id)
-                    .and_then(|p| p.worktree_path.clone());
+                    .map(|p| (p.worktree_path.clone(), p.role.clone(), p.goal.clone(), p.backstory.clone()))
+                    .unwrap_or((None, None, None, None));
                 shared::PaneConfig {
                     pane_id,
                     provider,
@@ -1096,6 +1116,9 @@ fn save_pane_configs(
                     model,
                     effort,
                     worktree_path,
+                    role,
+                    goal,
+                    backstory,
                 }
             })
             .collect();
@@ -1169,6 +1192,9 @@ fn handle_tui_events(
                             pending_questions: Arc::new(Mutex::new(HashMap::new())),
                             effort_arc: Arc::new(Mutex::new(None)),
                             worktree_path: None,
+                            role: None,
+                            goal: None,
+                            backstory: None,
                         },
                     );
                 }
@@ -1305,6 +1331,9 @@ fn handle_tui_events(
                             pending_questions: Arc::new(Mutex::new(HashMap::new())),
                             effort_arc: Arc::new(Mutex::new(normalized_effort.clone())),
                             worktree_path: worktree_path.clone(),
+                            role: None,
+                            goal: None,
+                            backstory: None,
                         },
                     );
                 }
@@ -1667,6 +1696,9 @@ fn handle_tui_events(
                             pending_questions: Arc::new(Mutex::new(HashMap::new())),
                             effort_arc: Arc::new(Mutex::new(resolved_effort.clone())),
                             worktree_path: None,
+                            role: None,
+                            goal: None,
+                            backstory: None,
                         },
                     );
                 }
@@ -2079,6 +2111,9 @@ fn handle_tui_events(
                             pending_questions: Arc::new(Mutex::new(HashMap::new())),
                             effort_arc: Arc::new(Mutex::new(saved_effort.clone())),
                             worktree_path: None,
+                            role: None,
+                            goal: None,
+                            backstory: None,
                         },
                     );
                 }
@@ -2241,6 +2276,9 @@ fn build_pane_list(
             model: meta.model.clone(),
             effort: meta.effort.clone(),
             worktree_path: meta.worktree_path.clone(),
+            role: meta.role.clone(),
+            goal: meta.goal.clone(),
+            backstory: meta.backstory.clone(),
         });
     }
 
@@ -2261,6 +2299,9 @@ fn build_pane_list(
                 model: None,
                 effort: None,
                 worktree_path: None,
+                role: None,
+                goal: None,
+                backstory: None,
             });
         }
     }
@@ -2939,6 +2980,9 @@ mod tests {
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(None)),
                     worktree_path: None,
+                    role: None,
+                    goal: None,
+                    backstory: None,
                 },
             );
             metas.insert(
@@ -2957,6 +3001,9 @@ mod tests {
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(None)),
                     worktree_path: None,
+                    role: None,
+                    goal: None,
+                    backstory: None,
                 },
             );
         }
@@ -2990,6 +3037,9 @@ mod tests {
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(None)),
                     worktree_path: None,
+                    role: None,
+                    goal: None,
+                    backstory: None,
                 },
             );
         }
@@ -3023,6 +3073,9 @@ mod tests {
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(None)),
                     worktree_path: None,
+                    role: None,
+                    goal: None,
+                    backstory: None,
                 },
             );
             metas.insert(
@@ -3041,6 +3094,9 @@ mod tests {
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(None)),
                     worktree_path: None,
+                    role: None,
+                    goal: None,
+                    backstory: None,
                 },
             );
         }
@@ -3074,6 +3130,9 @@ mod tests {
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(None)),
                     worktree_path: None,
+                    role: None,
+                    goal: None,
+                    backstory: None,
                 },
             );
         }
@@ -3107,6 +3166,9 @@ mod tests {
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(None)),
                     worktree_path: None,
+                    role: None,
+                    goal: None,
+                    backstory: None,
                 },
             );
         }
@@ -3140,6 +3202,9 @@ mod tests {
                     pending_questions: Arc::new(Mutex::new(HashMap::new())),
                     effort_arc: Arc::new(Mutex::new(None)),
                     worktree_path: None,
+                    role: None,
+                    goal: None,
+                    backstory: None,
                 },
             );
         }

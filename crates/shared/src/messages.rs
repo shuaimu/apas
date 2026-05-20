@@ -857,6 +857,21 @@ pub struct PaneConfig {
     /// just because the field is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<String>,
+    /// Short role label for the agent in this pane, e.g. "backend
+    /// implementer" or "reviewer". When set, gets prepended to claude's
+    /// system prompt at spawn so the agent self-identifies. Phase 2.1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// One-line objective the pane is currently working toward, e.g.
+    /// "make the auth tests green". Surfaced in the system prompt and
+    /// (later) on the pane header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
+    /// Free-form additional context appended to the system prompt
+    /// (project conventions, constraints, prior decisions). Long-ish
+    /// is fine — claude's context window is large.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backstory: Option<String>,
 }
 
 /// Legacy pane_id constants
@@ -879,6 +894,9 @@ impl PaneConfig {
             model: None,
             effort: None,
             worktree_path: None,
+            role: None,
+            goal: None,
+            backstory: None,
         }]
     }
 
