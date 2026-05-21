@@ -5113,10 +5113,18 @@ fn run_pane_session_streaming(
                         // the in-flight set actually changed (debounces
                         // the noise of every assistant chunk).
                         let mut subagent_state_changed = false;
+                        // Phase 4.1b: track the latest pane-status pill from
+                        // any tool_use block in this assistant message; we
+                        // emit it once after the loop so multi-tool messages
+                        // don't spam the pill channel.
+                        let mut latest_pill: Option<String> = None;
                         match &message {
                             ClaudeStreamMessage::Assistant { message: msg, .. } => {
                                 for block in &msg.content {
                                     if let ClaudeContentBlock::ToolUse { id, name, input } = block {
+                                        if let Some(pill) = crate::pane_status::pane_status_from_tool_use(name, input) {
+                                            latest_pill = Some(pill);
+                                        }
                                         if name == "Task" {
                                             let mut s = reader_in_flight.lock().unwrap();
                                             if s.insert(id.clone()) {
@@ -5216,6 +5224,17 @@ fn run_pane_session_streaming(
                                 pane_type: pane_type_reader,
                                 pane_id: Some(pane_id_reader),
                                 status: compose_streaming_status(t, n_after),
+                            });
+                        } else if let Some(pill) = latest_pill {
+                            // Phase 4.1b: push the tool-derived pill so the
+                            // pane header shows what the agent is doing
+                            // mid-turn. Subagent / result transitions take
+                            // priority (`compose_streaming_status` above).
+                            let _ = server_tx_reader.blocking_send(CliToServer::PaneStatus {
+                                session_id: session_id_reader,
+                                pane_type: pane_type_reader,
+                                pane_id: Some(pane_id_reader),
+                                status: Some(pill),
                             });
                         }
 

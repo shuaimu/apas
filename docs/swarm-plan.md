@@ -341,9 +341,17 @@ Phase 3.2 is complete.
   signal. Seven unit tests cover each family + truncation edge
   cases. No wire-up yet — 4.1b will emit `PaneStatus` from the
   reader.
-- [ ] **4.1b — wire into reader**: emit `PaneStatus` from the
-  streaming reader's tool_use parser so the existing pane-header
-  status pill updates as the agent works.
+- [x] **4.1b — wire into reader**: the streaming reader's
+  Assistant-message loop now feeds every tool_use block through
+  `pane_status::pane_status_from_tool_use` and remembers the latest
+  `Some(...)` per message. After the existing subagent / result
+  status checks (which take priority), the reader emits a
+  `CliToServer::PaneStatus` carrying that pill — so the pane header
+  updates as the agent works ("Editing src/foo.rs", "Running: cargo
+  test", etc.). Multi-tool messages only emit one status per
+  message (latest wins) so the channel doesn't get spammed.
+
+Phase 4.1 is complete.
 
 4.2  **Action/observation timeline** (sidebar, collapsible).
 - Per-turn summary: "tool: Bash; args: …; → 14 failures".
