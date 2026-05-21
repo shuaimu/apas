@@ -21,6 +21,33 @@ Other panes in this project share a project-local append-only log at \
 Publish anything worth other panes seeing — diffs, reviews, decisions — by appending a line with `>>` redirection or the Write tool. \
 Read it (`tail -f` / cat) when you want to see what they've done.";
 
+/// Phase 3.1b: additional protocol paragraph injected for panes whose
+/// role is manager-shaped. Teaches the two scratchpad tag conventions
+/// that the CLI watcher actually routes on (Phase 3.1a):
+///   - `delegate-to:<pane_id>` → CLI sends `body` into that pane's input
+///   - `reply-to:<task_id>` → bookkeeping for the manager's bookkeeping
+/// We deliberately do NOT enumerate available worker pane ids here —
+/// the agent can grep the project's `.apas` file (or ask the human) for
+/// current roles. Hard-coding sibling info would force a plumbing leaf
+/// (siblings list into compose_system_prompt) and rot quickly.
+const MANAGER_NOTE: &str = "\
+# Manager protocol
+You are the manager for this project. To dispatch work to another pane, \
+append a record to `.apas-team.jsonl` with `tags` containing \
+`delegate-to:<pane_id>` and (optionally) a unique `task-id:<uuid>` tag. \
+The CLI watches the file and routes the record's `body` into the target \
+pane's input queue as if a user had typed it. \
+Workers reply by appending their own record with `tags: [\"reply-to:<task_id>\"]`; \
+poll the scratchpad to collect replies. \
+You can discover the available workers by reading `.apas` in the project root \
+(`panes[]` lists each pane's id, label, role, goal — Phase 2.1).";
+
+fn role_is_manager(role: Option<&str>) -> bool {
+    role.map(str::trim)
+        .map(|r| r.to_ascii_lowercase().contains("manager"))
+        .unwrap_or(false)
+}
+
 /// Render the three optional fields into an `--append-system-prompt` body.
 /// Returns None when all three are empty/None so the caller can skip
 /// pushing the flag entirely. When at least one is set, the team
@@ -45,6 +72,9 @@ pub fn compose_system_prompt(
         None
     } else {
         sections.push(SCRATCHPAD_NOTE.to_string());
+        if role_is_manager(role) {
+            sections.push(MANAGER_NOTE.to_string());
+        }
         Some(sections.join("\n\n"))
     }
 }
@@ -104,5 +134,38 @@ mod tests {
         // Phase 2.2c: scratchpad note rides along with role/goal/backstory.
         // Without any of those, no system prompt is emitted at all.
         assert_eq!(compose_system_prompt(None, None, None), None);
+    }
+
+    #[test]
+    fn manager_role_gets_protocol_addendum() {
+        let got = compose_system_prompt(Some("manager"), None, None).unwrap();
+        assert!(got.contains("# Manager protocol"));
+        assert!(got.contains("delegate-to:<pane_id>"));
+        assert!(got.contains("reply-to:<task_id>"));
+        // Section ordering: role → scratchpad → manager
+        let role_pos = got.find("# Role").unwrap();
+        let scratchpad_pos = got.find("# Team scratchpad").unwrap();
+        let manager_pos = got.find("# Manager protocol").unwrap();
+        assert!(role_pos < scratchpad_pos);
+        assert!(scratchpad_pos < manager_pos);
+    }
+
+    #[test]
+    fn manager_detection_is_case_insensitive_and_substring() {
+        for r in ["manager", "Manager", "MANAGER", "team manager", "manager-agent"] {
+            assert!(role_is_manager(Some(r)), "role {:?} should be manager", r);
+        }
+        for r in ["reviewer", "backend", "", "mgr"] {
+            assert!(!role_is_manager(Some(r)), "role {:?} should NOT be manager", r);
+        }
+        assert!(!role_is_manager(None));
+    }
+
+    #[test]
+    fn non_manager_role_skips_protocol_addendum() {
+        let got = compose_system_prompt(Some("reviewer"), None, None).unwrap();
+        assert!(!got.contains("# Manager protocol"));
+        // But scratchpad note still rides along.
+        assert!(got.contains("# Team scratchpad"));
     }
 }

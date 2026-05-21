@@ -253,11 +253,16 @@ file-based-vs-MCP decision):
   (e.g. delegating to a pane that was closed). See
   `docs/dev/3.1-delegation-via-scratchpad.md` for the
   file-based-vs-MCP rationale.
-- [ ] **3.1b — manager system-prompt addendum**: when a pane's role
-  contains "manager" (case-insensitive), the role module appends a
-  short paragraph teaching the agent the `delegate-to:N` /
-  `reply-to:<task_id>` conventions and listing the available worker
-  pane ids + roles.
+- [x] **3.1b — manager system-prompt addendum**: when a pane's role
+  contains "manager" (case-insensitive), `compose_system_prompt`
+  appends a "# Manager protocol" section after the scratchpad note,
+  teaching the agent the `delegate-to:<pane_id>` and
+  `reply-to:<task_id>` tag conventions and pointing it at the project
+  `.apas` file to discover available workers. Deviation: did NOT
+  enumerate sibling panes inline — would require plumbing siblings
+  into compose_system_prompt and would rot as tabs come and go. Three
+  new role tests: addendum presence on manager-role, case-insensitive
+  substring detection, and that non-manager roles don't get it.
 - [ ] **3.1c (optional) — MCP delegate tool**: replace the JSONL
   convention with a proper MCP server when the simpler approach
   starts feeling limiting. Deferred until needed.
