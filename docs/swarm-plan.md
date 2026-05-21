@@ -267,15 +267,24 @@ file-based-vs-MCP decision):
   convention with a proper MCP server when the simpler approach
   starts feeling limiting. Deferred until needed.
 
-3.2  **Editable plan checkpoint** (per-pane policy).
-- New `PaneConfig.plan_review_mode: "always" | "risky-only" | "never"`.
-- When `always`: every new turn from claude is wrapped in an
-  `AskUserQuestion`-style card showing the plan text (extracted from the
-  first assistant message before any tool_use). User clicks
-  Approve / Edit / Reject before tools execute.
-- When `risky-only`: only fires for turns containing `Write/Edit/Bash` tools.
-- When `never`: today's behaviour.
-- Persisted alongside the plan + final diff for review history.
+3.2  **Editable plan checkpoint** (per-pane policy). Sub-split:
+- [x] **3.2a — data model**: new `shared::PlanReviewMode` enum
+  (`Always` / `RiskyOnly` / `Never`, default `Never`) added to
+  `PaneConfig` (persisted, default via `#[serde(default)]`) and
+  mirrored on `PaneMeta`. Threaded through every PaneConfig (15 sites
+  total: messages/project/ws_web + 13 dual_pane bulk-patched) and
+  through the `tabs_to_restore` tuple (now 15 elements) so the value
+  survives CLI restarts. `build_pane_list` reads it from PaneMeta;
+  the synthetic PaneConfig path defaults to `Never`. No runtime
+  behaviour change — sets up 3.2b's gating logic.
+- [ ] **3.2b — gating logic**: when `always` (or `risky-only` and the
+  pending tool_use is Write/Edit/Bash), the streaming worker holds
+  the tool-use until the user approves via a new card. Effectively
+  the AskUserQuestion plumbing (Phase 1's permission_prompt path)
+  with a different card kind.
+- [ ] **3.2c — web UI mode picker**: extend the Role drawer (or add
+  a separate dropdown) so the user can change plan_review_mode per
+  pane.
 
 3.3  **Judge / auto-reviewer pane** (optional).
 - A pane with `role: "reviewer"` subscribes to `team.jsonl` for `kind: "diff"`

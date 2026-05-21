@@ -107,6 +107,7 @@ fn infer_panes_from_messages(
                 role: None,
                 goal: None,
                 backstory: None,
+                plan_review_mode: shared::PlanReviewMode::default(),
             }
         })
         .collect()
@@ -937,6 +938,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             role: None,
                             goal: None,
                             backstory: None,
+                            plan_review_mode: shared::PlanReviewMode::default(),
                         };
                         tracing::info!(
                             "Adding pane {} to session {} (isolated_worktree={})",

@@ -16,6 +16,22 @@ pub struct TeamScratchpadRecord {
     pub body: String,
 }
 
+/// Phase 3.2a: per-pane policy for the "editable plan checkpoint"
+/// feature. The streaming worker reads this at every turn to decide
+/// whether to gate the first tool_use behind a user-approval card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanReviewMode {
+    /// Hold every turn's first tool_use until the user approves.
+    Always,
+    /// Hold only when the turn's first tool_use is in a "risky" set
+    /// (Write/Edit/Bash). Read-only tools run through.
+    RiskyOnly,
+    /// Today's behaviour: no gating.
+    #[default]
+    Never,
+}
+
 /// What to do with an isolated git worktree (and its branch) when the pane
 /// that owns it is closed. Selected by the web UI before sending
 /// `WebToServer::RemovePane` so the CLI knows which git commands to run.
@@ -930,6 +946,11 @@ pub struct PaneConfig {
     /// is fine — claude's context window is large.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backstory: Option<String>,
+    /// Phase 3.2a: per-pane policy for the editable plan checkpoint.
+    /// Default is `Never` (today's behaviour) so existing panes keep
+    /// running without prompts.
+    #[serde(default)]
+    pub plan_review_mode: PlanReviewMode,
 }
 
 /// Legacy pane_id constants
@@ -955,6 +976,7 @@ impl PaneConfig {
             role: None,
             goal: None,
             backstory: None,
+            plan_review_mode: PlanReviewMode::default(),
         }]
     }
 

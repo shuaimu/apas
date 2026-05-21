@@ -382,6 +382,10 @@ struct PaneMeta {
     role: Option<String>,
     goal: Option<String>,
     backstory: Option<String>,
+    /// Phase 3.2a: editable-plan-checkpoint policy mirrored from
+    /// `PaneConfig`. Default `Never` preserves legacy behaviour;
+    /// the gating logic in 3.2b will read this at every turn.
+    plan_review_mode: shared::PlanReviewMode,
 }
 
 /// State stored for each in-flight AskUserQuestion call, keyed by tool_use_id.
@@ -464,6 +468,7 @@ async fn run_inner(
         Option<String>, // role from .apas (Phase 2.1)
         Option<String>, // goal from .apas (Phase 2.1)
         Option<String>, // backstory from .apas (Phase 2.1)
+        shared::PlanReviewMode, // plan_review_mode from .apas (Phase 3.2)
     )> = metadata
         .panes
         .iter()
@@ -502,6 +507,7 @@ async fn run_inner(
                 pane.role.clone(),
                 pane.goal.clone(),
                 pane.backstory.clone(),
+                pane.plan_review_mode,
             )
         })
         .collect();
@@ -581,6 +587,7 @@ async fn run_inner(
             tab_role,
             tab_goal,
             tab_backstory,
+            tab_plan_review_mode,
         ) in &tabs_to_restore
         {
             let child_proc: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
@@ -603,6 +610,7 @@ async fn run_inner(
                     role: tab_role.clone(),
                     goal: tab_goal.clone(),
                     backstory: tab_backstory.clone(),
+                    plan_review_mode: *tab_plan_review_mode,
                 },
             );
             sessions.insert(*pane_id, *pane_session_id);
@@ -708,7 +716,7 @@ async fn run_inner(
     };
 
     // Send initial messages for restored panes.
-    for (pane_id, _, label, mode, _, _, _, _, _, is_paused, _, _, _, _) in &tabs_to_restore {
+    for (pane_id, _, label, mode, _, _, _, _, _, is_paused, _, _, _, _, _) in &tabs_to_restore {
         let init_text = if *pane_id == shared::PANE_ID_DEADLOOP
             && *mode == shared::PaneMode::Deadloop
         {
@@ -1194,10 +1202,16 @@ fn save_pane_configs(
                             None,
                         )
                     };
-                let (worktree_path, role, goal, backstory) = pane_metas
+                let (worktree_path, role, goal, backstory, plan_review_mode) = pane_metas
                     .get(&pane_id)
-                    .map(|p| (p.worktree_path.clone(), p.role.clone(), p.goal.clone(), p.backstory.clone()))
-                    .unwrap_or((None, None, None, None));
+                    .map(|p| (
+                        p.worktree_path.clone(),
+                        p.role.clone(),
+                        p.goal.clone(),
+                        p.backstory.clone(),
+                        p.plan_review_mode,
+                    ))
+                    .unwrap_or((None, None, None, None, shared::PlanReviewMode::default()));
                 shared::PaneConfig {
                     pane_id,
                     provider,
@@ -1218,6 +1232,7 @@ fn save_pane_configs(
                     role,
                     goal,
                     backstory,
+                    plan_review_mode,
                 }
             })
             .collect();
@@ -1294,6 +1309,7 @@ fn handle_tui_events(
                             role: None,
                             goal: None,
                             backstory: None,
+                            plan_review_mode: shared::PlanReviewMode::default(),
                         },
                     );
                 }
@@ -1436,6 +1452,7 @@ fn handle_tui_events(
                             role: None,
                             goal: None,
                             backstory: None,
+                            plan_review_mode: shared::PlanReviewMode::default(),
                         },
                     );
                 }
@@ -1807,6 +1824,7 @@ fn handle_tui_events(
                             role: None,
                             goal: None,
                             backstory: None,
+                            plan_review_mode: shared::PlanReviewMode::default(),
                         },
                     );
                 }
@@ -2225,6 +2243,7 @@ fn handle_tui_events(
                             role: None,
                             goal: None,
                             backstory: None,
+                            plan_review_mode: shared::PlanReviewMode::default(),
                         },
                     );
                 }
@@ -2393,6 +2412,7 @@ fn build_pane_list(
             role: meta.role.clone(),
             goal: meta.goal.clone(),
             backstory: meta.backstory.clone(),
+            plan_review_mode: meta.plan_review_mode,
         });
     }
 
@@ -2416,6 +2436,7 @@ fn build_pane_list(
                 role: None,
                 goal: None,
                 backstory: None,
+                plan_review_mode: shared::PlanReviewMode::default(),
             });
         }
     }
@@ -3097,6 +3118,7 @@ mod tests {
                     role: None,
                     goal: None,
                     backstory: None,
+                    plan_review_mode: shared::PlanReviewMode::default(),
                 },
             );
             metas.insert(
@@ -3118,6 +3140,7 @@ mod tests {
                     role: None,
                     goal: None,
                     backstory: None,
+                    plan_review_mode: shared::PlanReviewMode::default(),
                 },
             );
         }
@@ -3154,6 +3177,7 @@ mod tests {
                     role: None,
                     goal: None,
                     backstory: None,
+                    plan_review_mode: shared::PlanReviewMode::default(),
                 },
             );
         }
@@ -3190,6 +3214,7 @@ mod tests {
                     role: None,
                     goal: None,
                     backstory: None,
+                    plan_review_mode: shared::PlanReviewMode::default(),
                 },
             );
             metas.insert(
@@ -3211,6 +3236,7 @@ mod tests {
                     role: None,
                     goal: None,
                     backstory: None,
+                    plan_review_mode: shared::PlanReviewMode::default(),
                 },
             );
         }
@@ -3247,6 +3273,7 @@ mod tests {
                     role: None,
                     goal: None,
                     backstory: None,
+                    plan_review_mode: shared::PlanReviewMode::default(),
                 },
             );
         }
@@ -3283,6 +3310,7 @@ mod tests {
                     role: None,
                     goal: None,
                     backstory: None,
+                    plan_review_mode: shared::PlanReviewMode::default(),
                 },
             );
         }
@@ -3319,6 +3347,7 @@ mod tests {
                     role: None,
                     goal: None,
                     backstory: None,
+                    plan_review_mode: shared::PlanReviewMode::default(),
                 },
             );
         }
