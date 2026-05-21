@@ -404,11 +404,26 @@ Phase 4.2 is complete. Phase 4 (UX polish) substantively done —
   Role). Clicking the card body switches the active tab to that
   pane; click on Diff/Role buttons opens the existing modals.
   Wired via callback props passed down from TabbedView.
-- [ ] **5.1c — scratchpad ticker**: last ~20 records + filter chips.
-- [ ] **5.1d — delegation board**: delegate-to / reply-to pairing.
-- [ ] **5.1e — resource use rollup**: UsageLimitsDisplay per
-  provider, consolidated.
+- [x] **5.1c — scratchpad ticker**: new `ScratchpadTicker.tsx`
+  shows the last 20 records (newest first) with filter chips for
+  diff / review / decision / status / all + per-kind counts. Tag
+  chips inline + relative timestamp; truncates body via line-clamp-3
+  so the section stays compact in the Overview.
+- [x] **5.1d — delegation board**: new `DelegationBoard.tsx` builds
+  `DelegationRow { delegate, toPane, taskId, reply }` from the
+  scratchpad by scanning for `delegate-to:N` and `reply-to:<task_id>`
+  tags. Renders as a small 4-column table (from→to, task id,
+  truncated body, status chip with reply latency). "untracked"
+  status when no task-id tag, "awaiting reply" + amber when task-id
+  but no matching reply, "replied (+Δt)" + emerald when paired.
+- [x] **5.1e — resource use rollup**: new `ResourceUseRollup.tsx`
+  collects providers in use by this project's panes and renders
+  `UsageLimitsDisplay` (the existing per-pane-header component) in
+  a 1/2/3-column grid keyed by provider. Skips providers with no
+  cached limits yet.
 - [ ] **5.1f — sparkline** *(optional)*: last-hour activity per pane.
+
+Phase 5.1 is substantively complete (5.1f deferred — nice-to-have).
 
 ## Tradeoffs to revisit at each phase
 

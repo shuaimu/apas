@@ -1,6 +1,9 @@
 "use client";
 
 import { PaneGrid } from "./PaneGrid";
+import { ScratchpadTicker } from "./ScratchpadTicker";
+import { DelegationBoard } from "./DelegationBoard";
+import { ResourceUseRollup } from "./ResourceUseRollup";
 
 /**
  * Phase 5.1 — team overview pseudo-tab.
@@ -35,15 +38,15 @@ export function OverviewView({ onOpenPane, onOpenDiff, onOpenRole }: OverviewVie
         </OverviewSection>
 
         <OverviewSection title="Team scratchpad">
-          <Placeholder note="5.1c — recent .apas-team.jsonl records + filter chips" />
+          <ScratchpadTicker />
         </OverviewSection>
 
         <OverviewSection title="Delegation board">
-          <Placeholder note="5.1d — delegate-to / reply-to pairing" />
+          <DelegationBoard />
         </OverviewSection>
 
         <OverviewSection title="Resource use">
-          <Placeholder note="5.1e — per-provider usage limits rollup" />
+          <ResourceUseRollup />
         </OverviewSection>
       </div>
     </div>
@@ -61,10 +64,3 @@ function OverviewSection({ title, children }: { title: string; children: React.R
   );
 }
 
-function Placeholder({ note }: { note: string }) {
-  return (
-    <div className="rounded border border-dashed border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30 p-4 text-xs italic text-gray-500 dark:text-gray-400">
-      {note}
-    </div>
-  );
-}
