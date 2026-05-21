@@ -330,18 +330,30 @@ Phase 3.2 is complete.
 ### Phase 4 — UX polish
 
 4.1  **Distilled "what's happening" pill** per pane.
-- Derive from the most recent `tool_use` block: "Running tests…",
-  "Editing `src/foo.rs`…", "Waiting on review".
-- Reuses today's `PaneStatus` plumbing; just a new text-generation rule.
+- [x] **4.1a — tool→status text generator**: new `crate::pane_status`
+  module with a pure `pane_status_from_tool_use(tool_name, input) ->
+  Option<String>`. Recognized tools: Read/Glob/Grep/LS,
+  Edit/MultiEdit/Write/NotebookEdit, Bash, Task, AskUserQuestion,
+  WebFetch/WebSearch. Long commands truncate at 60 chars with `…`;
+  long paths use middle-truncation so head + filename both survive
+  (`crates/…/file.rs`). TodoWrite returns None (purely internal).
+  Unknown tools return `Calling <name>` so the pill always has
+  signal. Seven unit tests cover each family + truncation edge
+  cases. No wire-up yet — 4.1b will emit `PaneStatus` from the
+  reader.
+- [ ] **4.1b — wire into reader**: emit `PaneStatus` from the
+  streaming reader's tool_use parser so the existing pane-header
+  status pill updates as the agent works.
 
 4.2  **Action/observation timeline** (sidebar, collapsible).
 - Per-turn summary: "tool: Bash; args: …; → 14 failures".
 - Toggle between this and the raw chat. Same data, different view.
 
 4.3  **Tool-level approval policy** per pane.
-- `PaneConfig.tool_approval_mode: "never" | "risky-only" | "always"`.
-- Default `risky-only` for new manager panes, `never` for low-stakes workers.
-- Reuses the existing `--permission-prompt-tool stdio` plumbing.
+- Largely subsumed by Phase 3.2 (`plan_review_mode`). The
+  remaining sliver — different default policy for manager vs worker
+  roles — could ride on the existing field by setting a role-aware
+  default on AddPane. Deferred to follow-up if useful in practice.
 
 ## Tradeoffs to revisit at each phase
 

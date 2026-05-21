@@ -13,6 +13,7 @@ mod auth;
 mod claude;
 mod config;
 mod mode;
+mod pane_status;
 mod plan_review;
 mod project;
 mod role;
