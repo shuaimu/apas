@@ -791,6 +791,7 @@ async fn run_inner(
         let shutdown = shutdown.clone();
         let event_tx = event_tx.clone();
         let working_dir = working_dir_str.clone();
+        let input_channels_for_dl = input_channels.clone();
         let sid = session_id;
         let binary_path = resolve_pane_binary_path(
             provider,
@@ -852,6 +853,7 @@ async fn run_inner(
                 control_resp_slot,
                 pending_qs,
                 effort_arc,
+                input_channels_for_dl,
             )
         }));
     }
@@ -1553,6 +1555,7 @@ fn handle_tui_events(
                     let shutdown = shutdown.clone();
                     let event_tx = event_tx.clone();
                     let working_dir = working_dir.to_string();
+                    let input_channels_for_dl = input_channels.clone();
                     let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt, pr_mode_arc, pr_pending) = pane_metas
                         .lock()
                         .unwrap()
@@ -1604,6 +1607,7 @@ fn handle_tui_events(
                             control_resp_slot,
                             pending_qs,
                             effort_arc,
+                            input_channels_for_dl,
                         )
                     });
                 } else {
@@ -1944,6 +1948,7 @@ fn handle_tui_events(
                     let shutdown = shutdown.clone();
                     let event_tx = event_tx.clone();
                     let working_dir = working_dir.to_string();
+                    let input_channels_for_dl = input_channels.clone();
                     let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt, pr_mode_arc, pr_pending) = pane_metas
                         .lock()
                         .unwrap()
@@ -1995,6 +2000,7 @@ fn handle_tui_events(
                             control_resp_slot,
                             pending_qs,
                             effort_arc,
+                            input_channels_for_dl,
                         )
                     });
                 }
@@ -3635,6 +3641,7 @@ fn run_deadloop_session(
     control_response_tx_slot: Arc<Mutex<Option<mpsc::Sender<String>>>>,
     pending_questions: Arc<Mutex<HashMap<String, PendingAskQuestion>>>,
     effort_arc: Arc<Mutex<Option<String>>>,
+    input_channels: InputChannels,
 ) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_deadloop_session_inner(
@@ -3663,6 +3670,7 @@ fn run_deadloop_session(
             control_response_tx_slot,
             pending_questions,
             effort_arc,
+            input_channels,
         )
     }));
 
@@ -3708,6 +3716,7 @@ fn run_deadloop_session_inner(
     control_response_tx_slot: Arc<Mutex<Option<mpsc::Sender<String>>>>,
     pending_questions: Arc<Mutex<HashMap<String, PendingAskQuestion>>>,
     effort_arc: Arc<Mutex<Option<String>>>,
+    input_channels: InputChannels,
 ) {
     // Provider::Claude → long-lived stream-json process driven from
     // run_deadloop_session_streaming. Other providers fall through to the
@@ -3739,6 +3748,7 @@ fn run_deadloop_session_inner(
             control_response_tx_slot,
             pending_questions,
             effort_arc,
+            input_channels,
         );
     }
     let effective_dir: String = worktree_path
@@ -3748,6 +3758,7 @@ fn run_deadloop_session_inner(
     let _ = system_prompt; // codex/cursor/etc. ignored for now — see role.rs note.
     let _ = plan_review_mode_arc; // non-claude legacy path doesn't gate
     let _ = pending_plan_reviews;
+    let _ = input_channels; // legacy non-streaming codex/glm path doesn't register
     let _ = interrupt_tx_slot; // unused for legacy path
     let _ = control_response_tx_slot; // unused for legacy path
     let _ = pending_questions; // unused for legacy path
@@ -5667,6 +5678,11 @@ fn run_deadloop_session_streaming(
     control_response_tx_slot: Arc<Mutex<Option<mpsc::Sender<String>>>>,
     pending_questions: Arc<Mutex<HashMap<String, PendingAskQuestion>>>,
     effort_arc: Arc<Mutex<Option<String>>>,
+    // Bugfix: register the local input_tx here so web/TUI input can
+    // reach a running deadloop pane. Pre-fix, deadloop input_tx lived
+    // only inside this function and external input hit "Pane worker
+    // unavailable; restart requested. Please resend." every time.
+    input_channels: InputChannels,
 ) {
     let _ = output_tx.send(PaneOutput {
         text: format!(
@@ -5677,6 +5693,15 @@ fn run_deadloop_session_streaming(
     });
 
     let (input_tx, input_rx) = mpsc::channel::<PaneInput>();
+    // Register so external input flows here as if the deadloop were
+    // an interactive pane. The streaming worker writes everything from
+    // input_rx onto claude's stdin, so external input becomes another
+    // turn for the running /loop — the agent picks it up between its
+    // self-paced iterations.
+    {
+        let mut channels = input_channels.lock().unwrap();
+        channels.insert(pane_id, input_tx.clone());
+    }
 
     // Spawn the streaming worker. It keeps claude alive; we kick off /loop
     // exactly once and the runtime self-paces from there. We pass
