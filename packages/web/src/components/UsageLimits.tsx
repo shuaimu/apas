@@ -172,16 +172,26 @@ export function UsageLimitsDisplay({ limits, compact = false }: UsageLimitsDispl
     if (!primary) return null;
 
     const percentage = formatUtilizationPercent(primary.utilization);
-    const resetMeta = formatResetMeta(primary.resetsAt);
+    // Mobile-friendly compact rendering: only the dot + percentage live
+    // in the header strip. Reset info is hidden until utilization is
+    // actually meaningful (≥50% — below that, the window resetting in
+    // "5d" doesn't matter), or when the window is actively resetting
+    // (a transition state worth surfacing). The full relative + absolute
+    // text moves to a title= tooltip so the info isn't lost.
+    const relative = formatTimeUntilReset(primary.resetsAt);
+    const fullMeta = formatResetMeta(primary.resetsAt);
+    const isResetting = relative === "resetting...";
+    const showReset = !!relative && (primary.utilization >= 0.5 || isResetting);
 
     return (
-      <div className={`flex items-center gap-1 text-xs ${getTextColor(primary.utilization)}`}>
+      <div
+        className={`flex items-center gap-1 text-xs ${getTextColor(primary.utilization)}`}
+        title={fullMeta || undefined}
+      >
         <div className={`w-2 h-2 rounded-full ${getUtilizationColor(primary.utilization)}`} />
-        <span>{percentage}% used</span>
-        {resetMeta && (
-          <span className="text-gray-500 dark:text-gray-400">
-            · {primary.label.toLowerCase()} {resetMeta}
-          </span>
+        <span>{percentage}%</span>
+        {showReset && (
+          <span className="text-gray-500 dark:text-gray-400">· {relative}</span>
         )}
       </div>
     );
