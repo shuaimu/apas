@@ -1461,6 +1461,7 @@ fn handle_tui_events(
                 model,
                 effort,
                 worktree_path,
+                initial_input,
             }) => {
                 let label =
                     pane_label_or_default(Some(&requested_label), pane_id, model.as_deref());
@@ -1523,6 +1524,16 @@ fn handle_tui_events(
                 });
 
                 if mode == shared::PaneMode::Deadloop {
+                    // Deadloop's input_tx lives inside the streaming worker
+                    // and isn't registered in input_channels, so we can't
+                    // replay a queued input here. Log + drop so we know it
+                    // happened.
+                    if initial_input.is_some() {
+                        tracing::warn!(
+                            pane_id,
+                            "Dropping buffered input on recreated deadloop pane (no external input channel)",
+                        );
+                    }
                     // Deadloop tab: spawn deadloop session with its own pause flag
                     let pause_flag = Arc::new(AtomicBool::new(false));
                     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -1600,7 +1611,19 @@ fn handle_tui_events(
                     let (input_tx, input_rx) = mpsc::channel::<PaneInput>();
                     {
                         let mut channels = input_channels.lock().unwrap();
-                        channels.insert(pane_id, input_tx);
+                        channels.insert(pane_id, input_tx.clone());
+                    }
+                    // Bugfix: if the user just typed something at a pane
+                    // whose worker hadn't registered an input channel yet
+                    // (typical right after a CLI restart), replay it now
+                    // so they don't have to retype.
+                    if let Some(text) = initial_input.clone() {
+                        if input_tx.send((text, false)).is_ok() {
+                            tracing::info!(
+                                pane_id,
+                                "Auto-replayed buffered input on recreated interactive pane",
+                            );
+                        }
                     }
                     let output_tx = output_tx.clone();
                     let server_tx = server_tx.clone();
@@ -6567,6 +6590,8 @@ async fn run_server_connection(
                                                         sessions.get(&target_pane).copied()
                                                     };
 
+                                                    let mut buffered_input = Some(data.clone());
+                                                    let mut replayed = false;
                                                     if let (Some(meta), Some(claude_session_id)) =
                                                         (pane_meta, pane_session_id)
                                                     {
@@ -6574,6 +6599,16 @@ async fn run_server_connection(
                                                             pane_id = target_pane,
                                                             "Missing input channel for pane; requesting pane worker recreation"
                                                         );
+                                                        // Only replay automatically for interactive panes —
+                                                        // the AddTabWithConfig handler's deadloop branch
+                                                        // can't route initial_input anywhere useful.
+                                                        let is_interactive = !matches!(meta.mode, shared::PaneMode::Deadloop);
+                                                        let queued = if is_interactive {
+                                                            replayed = true;
+                                                            buffered_input.take()
+                                                        } else {
+                                                            None
+                                                        };
                                                         let _ = tui_event_tx.send(TuiEvent::AddTabWithConfig {
                                                             pane_id: target_pane,
                                                             label: meta.label,
@@ -6586,6 +6621,7 @@ async fn run_server_connection(
                                                             model: meta.model,
                                                             effort: meta.effort,
                                                             worktree_path: meta.worktree_path,
+                                                            initial_input: queued,
                                                         });
                                                     } else {
                                                         tracing::warn!(
@@ -6593,11 +6629,19 @@ async fn run_server_connection(
                                                             "Missing input channel for pane and no pane metadata found"
                                                         );
                                                     }
+                                                    let _ = buffered_input;
 
-                                                    let unavailable_status = format!(
-                                                        "[Pane {} is unavailable. Restarting pane worker; please resend your message.]",
-                                                        target_pane
-                                                    );
+                                                    let unavailable_status = if replayed {
+                                                        format!(
+                                                            "[Pane {} worker is restarting; your message will be sent automatically when it's ready.]",
+                                                            target_pane,
+                                                        )
+                                                    } else {
+                                                        format!(
+                                                            "[Pane {} is unavailable. Restarting pane worker; please resend your message.]",
+                                                            target_pane,
+                                                        )
+                                                    };
                                                     let _ = status_tx.send(PaneOutput {
                                                         text: unavailable_status.clone(),
                                                         pane_id: target_pane,
@@ -6612,8 +6656,11 @@ async fn run_server_connection(
                                                         pane_type: shared::PaneType::Interactive,
                                                         pane_id: Some(target_pane),
                                                         status: Some(
-                                                            "Pane worker unavailable; restart requested. Please resend."
-                                                                .to_string(),
+                                                            if replayed {
+                                                                "Pane worker restarting; replaying your input…".to_string()
+                                                            } else {
+                                                                "Pane worker unavailable; restart requested. Please resend.".to_string()
+                                                            },
                                                         ),
                                                     };
                                                     if let Ok(msg_text) =
@@ -6805,6 +6852,7 @@ async fn run_server_connection(
                                                     model: pane_config.model,
                                                     effort: pane_config.effort,
                                                     worktree_path,
+                                                    initial_input: None,
                                                 });
                                             }
                                             ServerToCli::RemovePane { session_id: _, pane_id: remove_id, cleanup_action } => {

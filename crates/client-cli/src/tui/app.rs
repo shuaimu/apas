@@ -72,6 +72,14 @@ pub enum TuiEvent {
         /// Some, the new pane spawns its agent in this dir and its
         /// session jsonl is keyed by it. None = legacy shared cwd.
         worktree_path: Option<String>,
+        /// A user-submitted input that arrived just BEFORE the pane's
+        /// input channel existed (e.g. because the CLI was restarted
+        /// and the pane is being recreated to handle it). When Some,
+        /// the interactive-pane handler replays it on the newly-
+        /// registered input_tx so the user doesn't have to retype.
+        /// Deadloop panes log + drop it (no good place to inject mid-
+        /// loop without disrupting the /loop kickoff).
+        initial_input: Option<String>,
     },
     CloseTab {
         pane_id: u32,
