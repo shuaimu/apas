@@ -353,9 +353,27 @@ Phase 3.2 is complete.
 
 Phase 4.1 is complete.
 
-4.2  **Action/observation timeline** (sidebar, collapsible).
-- Per-turn summary: "tool: Bash; args: …; → 14 failures".
-- Toggle between this and the raw chat. Same data, different view.
+4.2  **Action/observation timeline** (sidebar, collapsible). Sub-split:
+- [x] **4.2a — turn extractor**: new `packages/web/src/lib/timeline.ts`
+  with `extractTimeline(messages) -> TimelineEntry[]` that walks the
+  pane's flat message list and pairs each `tool_use` outputType with
+  its matching `tool_result` (by tool name + insertion order, since
+  the OutputType doesn't currently surface tool_use_id on results).
+  Each entry exposes tool, args summary (per-tool field
+  selection — file_path / command / pattern / etc.), result body +
+  one-line summary, ok flag, and start/finish timestamps. Pure
+  function; no UI wire-up yet — that's 4.2b.
+- [x] **4.2b — view toggle + render**: new `TimelinePane` component +
+  per-pane toggle state (`timelinePanes: Set<number>` in TabbedView).
+  Indigo "Timeline"/"Chat" button in the pane header switches the
+  message area between raw chat and the timeline list. Each entry
+  shows ✓/✗ status, tool name, arg summary, and a truncated result
+  summary on one line; click expands to show the full JSON input
+  and the raw result body. Per-pane toggle so different tabs can be
+  in different modes simultaneously.
+
+Phase 4.2 is complete. Phase 4 (UX polish) substantively done —
+4.3 was subsumed by Phase 3.2 earlier.
 
 4.3  **Tool-level approval policy** per pane.
 - Largely subsumed by Phase 3.2 (`plan_review_mode`). The

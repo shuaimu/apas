@@ -2,6 +2,7 @@
 
 import React, { useRef, useCallback, useEffect, useState, useMemo, memo } from "react";
 import { useStore, Message, PaneConfig, PaneCleanupAction, PlanReviewMode, TeamRecord, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, paneKey } from "@/lib/store";
+import { extractTimeline, TimelineEntry } from "@/lib/timeline";
 import { UserMessage } from "../chat/UserMessage";
 import { AssistantMessage } from "../chat/AssistantMessage";
 import { TabBar } from "./TabBar";
@@ -232,6 +233,8 @@ export function TabbedView() {
   const [roleModalPaneId, setRoleModalPaneId] = useState<number | null>(null);
   // Team scratchpad modal (Phase 2.2b). Just a boolean — content lives in store.
   const [teamModalOpen, setTeamModalOpen] = useState(false);
+  // Per-pane timeline-vs-raw-chat toggle (Phase 4.2b).
+  const [timelinePanes, setTimelinePanes] = useState<Set<number>>(new Set());
 
   // Determine effective tabs: use paneConfigs from server, or synthesize from observed messages
   const effectiveTabs = useMemo(() => {
@@ -822,6 +825,26 @@ export function TabbedView() {
                   Role
                 </button>
               )}
+              {activeTabId != null && (
+                <button
+                  onClick={() => {
+                    setTimelinePanes((prev) => {
+                      const next = new Set(prev);
+                      if (next.has(activeTabId)) next.delete(activeTabId);
+                      else next.add(activeTabId);
+                      return next;
+                    });
+                  }}
+                  className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors ${
+                    timelinePanes.has(activeTabId)
+                      ? "bg-indigo-700 hover:bg-indigo-800 text-white"
+                      : "bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-200"
+                  }`}
+                  title="Toggle between raw chat and a per-action timeline (tool name + args summary + result)"
+                >
+                  {timelinePanes.has(activeTabId) ? "Chat" : "Timeline"}
+                </button>
+              )}
             </>
           )
         )}
@@ -854,15 +877,22 @@ export function TabbedView() {
         </button>
       </div>
 
-      {/* Message pane for active tab — keyed so each tab gets its own DOM/scroll state */}
-      <MessagePane
-        key={`${sessionId}-${activeTabId ?? PANE_ID_MAIN}`}
-        paneId={activeTabId ?? PANE_ID_MAIN}
-        messages={activeMessages}
-        onLoadMore={handleLoadMore}
-        isLoading={activeIsLoading}
-        hasMore={activeHasMore}
-      />
+      {/* Message pane (or per-action timeline) for active tab — keyed so each tab gets its own DOM/scroll state */}
+      {activeTabId != null && timelinePanes.has(activeTabId) ? (
+        <TimelinePane
+          key={`timeline-${sessionId}-${activeTabId}`}
+          messages={activeMessages}
+        />
+      ) : (
+        <MessagePane
+          key={`${sessionId}-${activeTabId ?? PANE_ID_MAIN}`}
+          paneId={activeTabId ?? PANE_ID_MAIN}
+          messages={activeMessages}
+          onLoadMore={handleLoadMore}
+          isLoading={activeIsLoading}
+          hasMore={activeHasMore}
+        />
+      )}
 
       {/* Status bar */}
       {activeStatus && (
@@ -1547,6 +1577,92 @@ function StartBotPromptModal({
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+// --- TimelinePane (Phase 4.2b) ---
+
+interface TimelinePaneProps {
+  messages: Message[];
+}
+
+function TimelinePane({ messages }: TimelinePaneProps) {
+  const entries = useMemo(() => extractTimeline(messages), [messages]);
+  const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set());
+  if (entries.length === 0) {
+    return (
+      <div className="flex-1 overflow-auto p-4 text-sm italic text-gray-500 dark:text-gray-400">
+        No tool calls in this pane yet. The Timeline view fills in as the agent uses tools.
+      </div>
+    );
+  }
+  return (
+    <div className="flex-1 overflow-auto p-3">
+      <ul className="flex flex-col gap-1.5">
+        {entries.map((e: TimelineEntry, i: number) => {
+          const expanded = expandedIds.has(i);
+          const status = e.ok === undefined ? "•" : e.ok ? "✓" : "✗";
+          const statusColor = e.ok === undefined
+            ? "text-gray-400"
+            : e.ok ? "text-emerald-500" : "text-red-500";
+          return (
+            <li
+              key={e.toolUseId ?? `${e.tool}-${i}`}
+              className="rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800/40"
+            >
+              <button
+                type="button"
+                onClick={() => {
+                  setExpandedIds((prev) => {
+                    const next = new Set(prev);
+                    if (next.has(i)) next.delete(i);
+                    else next.add(i);
+                    return next;
+                  });
+                }}
+                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs hover:bg-gray-50 dark:hover:bg-gray-700/30"
+              >
+                <span className={`flex-shrink-0 font-bold ${statusColor}`}>{status}</span>
+                <span className="font-mono text-gray-800 dark:text-gray-200 flex-shrink-0">{e.tool}</span>
+                {e.argSummary && (
+                  <span className="truncate font-mono text-gray-600 dark:text-gray-400">
+                    {e.argSummary}
+                  </span>
+                )}
+                {e.resultSummary && (
+                  <span className="ml-auto flex-shrink-0 truncate font-mono text-gray-500 dark:text-gray-500 max-w-[40%]">
+                    → {e.resultSummary}
+                  </span>
+                )}
+                <span className="ml-2 flex-shrink-0 text-gray-400">{expanded ? "▾" : "▸"}</span>
+              </button>
+              {expanded && (
+                <div className="border-t border-gray-200 dark:border-gray-700 px-3 py-2 text-xs">
+                  <div className="mb-1 text-gray-500 dark:text-gray-400">input:</div>
+                  <pre className="mb-2 whitespace-pre-wrap break-words font-mono text-gray-800 dark:text-gray-200">
+                    {(() => {
+                      try {
+                        return JSON.stringify(e.input, null, 2);
+                      } catch {
+                        return String(e.input);
+                      }
+                    })()}
+                  </pre>
+                  {e.resultBody !== undefined && (
+                    <>
+                      <div className="mb-1 text-gray-500 dark:text-gray-400">result:</div>
+                      <pre className="whitespace-pre-wrap break-words font-mono text-gray-800 dark:text-gray-200">
+                        {e.resultBody}
+                      </pre>
+                    </>
+                  )}
+                </div>
+              )}
+            </li>
+          );
+        })}
+      </ul>
     </div>
   );
 }
