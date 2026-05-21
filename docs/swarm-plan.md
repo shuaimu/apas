@@ -310,12 +310,22 @@ file-based-vs-MCP decision):
 
 Phase 3.2 is complete.
 
-3.3  **Judge / auto-reviewer pane** (optional).
-- A pane with `role: "reviewer"` subscribes to `team.jsonl` for `kind: "diff"`
-  events from other panes, reads the diff, and publishes back a review
-  (`kind: "review"`, `tags: ["approves:<task_id>"]` or `["rejects:..."]`).
-- The plan-review card (3.2) renders the judge's verdict inline so the human
-  can rubber-stamp common cases.
+3.3  **Judge / auto-reviewer pane** (optional). Sub-split:
+- [x] **3.3a — reviewer system-prompt addendum**: symmetric with
+  `MANAGER_NOTE`. When a pane's role contains "reviewer"
+  (case-insensitive substring), `compose_system_prompt` appends a
+  "# Reviewer protocol" section teaching the diff-subscribe /
+  review-publish loop via `.apas-team.jsonl` (`kind: "diff"` in,
+  `kind: "review"` + `approves:` / `rejects:` tags out). Four new
+  role tests: reviewer-role gets addendum, case-insensitive substring
+  detection, role can be both manager+reviewer (both sections
+  appear), and the existing non-manager test updated to also assert
+  no Reviewer block for non-reviewer roles.
+- [ ] **3.3b — UI cross-reference** (deferred): plan-review cards
+  surface recent reviewer-pane reviews for the same pane so the
+  human can rubber-stamp. Loose correlation by pane id; ID-by-ID
+  matching would require threading task_ids through the
+  tool_use_id → review chain which is out of scope here.
 
 ### Phase 4 — UX polish
 

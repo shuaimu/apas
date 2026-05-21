@@ -42,9 +42,33 @@ poll the scratchpad to collect replies. \
 You can discover the available workers by reading `.apas` in the project root \
 (`panes[]` lists each pane's id, label, role, goal — Phase 2.1).";
 
+/// Phase 3.3a: additional protocol paragraph for panes whose role is
+/// reviewer-shaped. Teaches the diff-subscribe / review-publish loop.
+/// Kept symmetric with [`MANAGER_NOTE`] — different role, same
+/// scratchpad-as-bus pattern.
+const REVIEWER_NOTE: &str = "\
+# Reviewer protocol
+You are an auto-reviewer for this project. Subscribe to \
+`.apas-team.jsonl` (tail -f or periodic re-read) and look for records \
+with `kind: \"diff\"`. For each one, read the diff body, evaluate it \
+against the project's conventions, and append your verdict as a new \
+record with `kind: \"review\"` and `tags` containing either \
+`approves:<task_id>` or `rejects:<task_id>` (the task_id comes from the \
+original diff record's tags, if present). \
+Keep reviews short — the goal is to give the human a one-line read on \
+each change so they can rubber-stamp common cases. \
+Do NOT publish diffs yourself unless you're also a worker — your job \
+is to react to other panes' output.";
+
 fn role_is_manager(role: Option<&str>) -> bool {
     role.map(str::trim)
         .map(|r| r.to_ascii_lowercase().contains("manager"))
+        .unwrap_or(false)
+}
+
+fn role_is_reviewer(role: Option<&str>) -> bool {
+    role.map(str::trim)
+        .map(|r| r.to_ascii_lowercase().contains("reviewer"))
         .unwrap_or(false)
 }
 
@@ -74,6 +98,9 @@ pub fn compose_system_prompt(
         sections.push(SCRATCHPAD_NOTE.to_string());
         if role_is_manager(role) {
             sections.push(MANAGER_NOTE.to_string());
+        }
+        if role_is_reviewer(role) {
+            sections.push(REVIEWER_NOTE.to_string());
         }
         Some(sections.join("\n\n"))
     }
@@ -163,9 +190,38 @@ mod tests {
 
     #[test]
     fn non_manager_role_skips_protocol_addendum() {
-        let got = compose_system_prompt(Some("reviewer"), None, None).unwrap();
+        let got = compose_system_prompt(Some("backend implementer"), None, None).unwrap();
         assert!(!got.contains("# Manager protocol"));
+        assert!(!got.contains("# Reviewer protocol"));
         // But scratchpad note still rides along.
         assert!(got.contains("# Team scratchpad"));
+    }
+
+    #[test]
+    fn reviewer_role_gets_protocol_addendum() {
+        let got = compose_system_prompt(Some("reviewer"), None, None).unwrap();
+        assert!(got.contains("# Reviewer protocol"));
+        assert!(got.contains("approves:<task_id>"));
+        assert!(got.contains("rejects:<task_id>"));
+        // And not the manager one.
+        assert!(!got.contains("# Manager protocol"));
+    }
+
+    #[test]
+    fn reviewer_detection_is_case_insensitive_and_substring() {
+        for r in ["reviewer", "Reviewer", "REVIEWER", "code reviewer", "reviewer-bot"] {
+            assert!(role_is_reviewer(Some(r)), "role {:?} should be reviewer", r);
+        }
+        for r in ["manager", "backend", "", "review"] {
+            assert!(!role_is_reviewer(Some(r)), "role {:?} should NOT be reviewer", r);
+        }
+        assert!(!role_is_reviewer(None));
+    }
+
+    #[test]
+    fn role_can_be_both_manager_and_reviewer() {
+        let got = compose_system_prompt(Some("manager-reviewer"), None, None).unwrap();
+        assert!(got.contains("# Manager protocol"));
+        assert!(got.contains("# Reviewer protocol"));
     }
 }
