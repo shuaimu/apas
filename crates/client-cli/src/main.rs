@@ -13,6 +13,7 @@ mod auth;
 mod claude;
 mod config;
 mod mode;
+mod plan_review;
 mod project;
 mod role;
 mod scratchpad;

@@ -277,11 +277,19 @@ file-based-vs-MCP decision):
   survives CLI restarts. `build_pane_list` reads it from PaneMeta;
   the synthetic PaneConfig path defaults to `Never`. No runtime
   behaviour change — sets up 3.2b's gating logic.
-- [ ] **3.2b — gating logic**: when `always` (or `risky-only` and the
-  pending tool_use is Write/Edit/Bash), the streaming worker holds
-  the tool-use until the user approves via a new card. Effectively
-  the AskUserQuestion plumbing (Phase 1's permission_prompt path)
-  with a different card kind.
+- [ ] **3.2b — gating logic**, sub-split:
+  - [x] **3.2b1 — decision function**: new `crate::plan_review`
+    module with `should_hold_tool(mode, tool_name) -> bool`. RISKY
+    set: Write / Edit / MultiEdit / NotebookEdit / Bash / Task.
+    `AskUserQuestion` always passes (it has its own approval flow;
+    gating it would deadlock). Unknown tools default to safe in
+    `RiskyOnly` (conservative-by-name). Five unit tests cover
+    Never/Always/RiskyOnly × risky/safe/AskUserQuestion/Unknown.
+  - [ ] **3.2b2 — wire-up + web card**: hook the streaming worker's
+    `can_use_tool` reader to consult `should_hold_tool`, park
+    held tool calls in a new `pending_plan_reviews` map, push a
+    new `PaneReviewRequest` to the web, and complete with allow/deny
+    control_response on the user's answer.
 - [ ] **3.2c — web UI mode picker**: extend the Role drawer (or add
   a separate dropdown) so the user can change plan_review_mode per
   pane.
