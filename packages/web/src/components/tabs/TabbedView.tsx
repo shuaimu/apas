@@ -3,6 +3,7 @@
 import React, { useRef, useCallback, useEffect, useState, useMemo, memo } from "react";
 import { useStore, Message, PaneConfig, PaneCleanupAction, PlanReviewMode, TeamRecord, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, paneKey } from "@/lib/store";
 import { extractTimeline, TimelineEntry } from "@/lib/timeline";
+import { OverviewView } from "../overview/OverviewView";
 import { UserMessage } from "../chat/UserMessage";
 import { AssistantMessage } from "../chat/AssistantMessage";
 import { TabBar } from "./TabBar";
@@ -11,6 +12,10 @@ import { CodeBlock } from "../code/CodeBlock";
 
 // Sentinel pane_id for the single-pane fallback (no pane system)
 const PANE_ID_MAIN = 0;
+// Sentinel for the Overview pseudo-tab (Phase 5.1). Negative so it
+// can't collide with real pane ids (Rust-side u32, dynamic ids start
+// from 3) and survives the `parseInt` round-trip in localStorage.
+const OVERVIEW_PANE_ID = -1;
 const DEFAULT_BOT_MIN_INTERVAL_MINUTES = 15;
 const DEFAULT_BOT_LOOP_PROMPT = `Work on tasks defined in TODO.md. Do the following steps. Don't ask me for advice, just pick the best option you think that is honest, complete, and not corner-cutting:
 
@@ -308,7 +313,8 @@ export function TabbedView() {
     lastDerivedForRef.current = cliClientId;
 
     // Same project, current pick is still valid → no change.
-    if (!clientChanged && activeTabId != null && ids.includes(activeTabId)) {
+    // Overview pseudo-tab (sentinel) is always valid.
+    if (!clientChanged && activeTabId != null && (activeTabId === OVERVIEW_PANE_ID || ids.includes(activeTabId))) {
       return;
     }
     // Same project, pane_list is synthesized (no authoritative panes yet)
@@ -319,7 +325,7 @@ export function TabbedView() {
 
     const saved = getProjectLayout(cliClientId, "active_tab", "");
     const savedNum = saved ? parseInt(saved, 10) : NaN;
-    if (!isNaN(savedNum) && ids.includes(savedNum)) {
+    if (!isNaN(savedNum) && (savedNum === OVERVIEW_PANE_ID || ids.includes(savedNum))) {
       if (activeTabId !== savedNum) setActiveTabId(savedNum);
       return;
     }
@@ -825,7 +831,7 @@ export function TabbedView() {
                   Role
                 </button>
               )}
-              {activeTabId != null && (
+              {activeTabId != null && activeTabId !== OVERVIEW_PANE_ID && activeConfig && (
                 <button
                   onClick={() => {
                     setTimelinePanes((prev) => {
@@ -877,8 +883,11 @@ export function TabbedView() {
         </button>
       </div>
 
-      {/* Message pane (or per-action timeline) for active tab — keyed so each tab gets its own DOM/scroll state */}
-      {activeTabId != null && timelinePanes.has(activeTabId) ? (
+      {/* Message pane (or per-action timeline / overview) for active tab.
+          Keyed so each tab gets its own DOM/scroll state. */}
+      {activeTabId === OVERVIEW_PANE_ID ? (
+        <OverviewView key="overview" />
+      ) : activeTabId != null && timelinePanes.has(activeTabId) ? (
         <TimelinePane
           key={`timeline-${sessionId}-${activeTabId}`}
           messages={activeMessages}
@@ -894,8 +903,8 @@ export function TabbedView() {
         />
       )}
 
-      {/* Status bar */}
-      {activeStatus && (
+      {/* Status bar — never shown on the Overview pseudo-tab */}
+      {activeStatus && activeTabId !== OVERVIEW_PANE_ID && (
         <div className="px-3 py-2 border-t border-gray-200 dark:border-gray-700 bg-blue-50 dark:bg-blue-900/20 flex-shrink-0">
           <div className="flex items-center gap-2 text-sm text-blue-700 dark:text-blue-300">
             <div className="animate-pulse">●</div>
@@ -904,24 +913,26 @@ export function TabbedView() {
         </div>
       )}
 
-      {/* Input box - disabled for running deadloop panes */}
-      <div className="p-3 border-t border-gray-200 dark:border-gray-700 flex-shrink-0">
-        {activeIsBot ? (
-          <div className="text-center text-sm text-gray-400 dark:text-gray-500 py-2">
-            {activeStopRequested
-              ? "Stop requested — waiting for current work to finish. Click Force Stop to kill immediately."
-              : activeIsPaused
-                ? "Bot is paused from previous state. Click Stop Bot to switch to interactive mode."
-                : "Bot is running autonomously. Click Stop Bot to switch to interactive mode after current work finishes."}
-          </div>
-        ) : (
-          <InteractiveInput
-            draft={activeInputDraft}
-            onDraftChange={handleInputDraftChange}
-            onSend={handleSend}
-          />
-        )}
-      </div>
+      {/* Input box — disabled for running deadloop panes, hidden on Overview */}
+      {activeTabId !== OVERVIEW_PANE_ID && (
+        <div className="p-3 border-t border-gray-200 dark:border-gray-700 flex-shrink-0">
+          {activeIsBot ? (
+            <div className="text-center text-sm text-gray-400 dark:text-gray-500 py-2">
+              {activeStopRequested
+                ? "Stop requested — waiting for current work to finish. Click Force Stop to kill immediately."
+                : activeIsPaused
+                  ? "Bot is paused from previous state. Click Stop Bot to switch to interactive mode."
+                  : "Bot is running autonomously. Click Stop Bot to switch to interactive mode after current work finishes."}
+            </div>
+          ) : (
+            <InteractiveInput
+              draft={activeInputDraft}
+              onDraftChange={handleInputDraftChange}
+              onSend={handleSend}
+            />
+          )}
+        </div>
+      )}
 
       <StartBotPromptModal
         open={startBotModalOpen}

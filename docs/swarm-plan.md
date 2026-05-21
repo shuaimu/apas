@@ -381,6 +381,28 @@ Phase 4.2 is complete. Phase 4 (UX polish) substantively done —
   roles — could ride on the existing field by setting a role-aware
   default on AddPane. Deferred to follow-up if useful in practice.
 
+### Phase 5 — overview tab
+
+5.1  **Team overview pseudo-tab**. See
+`docs/dev/5.1-overview-tab.md` for full design. Sub-split:
+- [x] **5.1a — scaffold**: pinned "Overview" pseudo-tab at the front
+  of TabBar (with a small grid icon + label), sentinel
+  `OVERVIEW_PANE_ID = -1` (negative so it can't collide with real
+  pane ids), empty `OverviewView` shell at
+  `components/overview/OverviewView.tsx` with four section
+  placeholders. activeTabId derivation effect updated to treat the
+  sentinel as always-valid (survives the localStorage round-trip).
+  Input box + status bar suppressed when the sentinel is active —
+  typing into an overview tab makes no sense. Timeline button also
+  hidden on Overview.
+- [ ] **5.1b — pane grid**: one card per pane (label, role, status
+  pill, mode, worktree info, last activity, quick actions).
+- [ ] **5.1c — scratchpad ticker**: last ~20 records + filter chips.
+- [ ] **5.1d — delegation board**: delegate-to / reply-to pairing.
+- [ ] **5.1e — resource use rollup**: UsageLimitsDisplay per
+  provider, consolidated.
+- [ ] **5.1f — sparkline** *(optional)*: last-hour activity per pane.
+
 ## Tradeoffs to revisit at each phase
 
 - Worktree-per-pane complicates the user's mental model — provide an explicit

@@ -249,12 +249,31 @@ export function TabBar({
     setDropSide(null);
   }, []);
 
+  // Phase 5.1: pinned Overview pseudo-tab at the front. Sentinel id = -1.
+  const OVERVIEW_PANE_ID = -1;
+  const isOverviewActive = activeTabId === OVERVIEW_PANE_ID;
+
   return (
     <div className="flex items-end border-b border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-800/50 flex-shrink-0 min-h-[40px]">
       <div
         ref={scrollRef}
         className="flex-1 flex flex-wrap items-end overflow-x-hidden overflow-y-hidden"
       >
+        <button
+          type="button"
+          onClick={() => onSelectTab(OVERVIEW_PANE_ID)}
+          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border-r border-gray-200 dark:border-gray-700 transition-colors ${
+            isOverviewActive
+              ? "bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 border-t-2 border-t-indigo-500"
+              : "text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700/50 border-t-2 border-t-transparent"
+          }`}
+          title="Team overview — status of every pane in this project"
+        >
+          <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 10h16M4 14h16M4 18h10" />
+          </svg>
+          <span>Overview</span>
+        </button>
         {tabs.map((tab, index) => {
           const isActive = tab.pane_id === activeTabId;
           const isBot = tab.mode === "deadloop";
