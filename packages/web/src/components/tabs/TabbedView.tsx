@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useRef, useCallback, useEffect, useState, useMemo, memo } from "react";
-import { useStore, Message, PaneConfig, PaneCleanupAction, TeamRecord, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, paneKey } from "@/lib/store";
+import { useStore, Message, PaneConfig, PaneCleanupAction, PlanReviewMode, TeamRecord, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, paneKey } from "@/lib/store";
 import { UserMessage } from "../chat/UserMessage";
 import { AssistantMessage } from "../chat/AssistantMessage";
 import { TabBar } from "./TabBar";
@@ -209,6 +209,7 @@ export function TabbedView() {
   const teamRecords = useStore((s) => s.teamRecords);
   const planReviewPending = useStore((s) => s.planReviewPending);
   const answerPlanReview = useStore((s) => s.answerPlanReview);
+  const updatePaneReviewMode = useStore((s) => s.updatePaneReviewMode);
 
   // Active tab state, persisted per project
   const [activeTabId, setActiveTabId] = useState<number | null>(null);
@@ -943,9 +944,10 @@ export function TabbedView() {
         open={roleModalPaneId !== null}
         pane={roleModalPaneId !== null ? effectiveTabs.find((t) => t.pane_id === roleModalPaneId) : undefined}
         onClose={() => setRoleModalPaneId(null)}
-        onSave={(role, goal, backstory) => {
+        onSave={(role, goal, backstory, mode) => {
           if (roleModalPaneId === null) return;
           updatePaneRole(roleModalPaneId, role, goal, backstory);
+          updatePaneReviewMode(roleModalPaneId, mode);
           setRoleModalPaneId(null);
         }}
       />
@@ -1084,21 +1086,23 @@ interface RoleModalProps {
   open: boolean;
   pane?: PaneConfig;
   onClose: () => void;
-  onSave: (role: string, goal: string, backstory: string) => void;
+  onSave: (role: string, goal: string, backstory: string, mode: PlanReviewMode) => void;
 }
 
 function RoleModal({ open, pane, onClose, onSave }: RoleModalProps) {
   const [role, setRole] = useState(pane?.role ?? "");
   const [goal, setGoal] = useState(pane?.goal ?? "");
   const [backstory, setBackstory] = useState(pane?.backstory ?? "");
+  const [mode, setMode] = useState<PlanReviewMode>(pane?.plan_review_mode ?? "never");
   // Reset fields when modal opens for a different pane (or re-opens).
   React.useEffect(() => {
     if (open) {
       setRole(pane?.role ?? "");
       setGoal(pane?.goal ?? "");
       setBackstory(pane?.backstory ?? "");
+      setMode(pane?.plan_review_mode ?? "never");
     }
-  }, [open, pane?.pane_id, pane?.role, pane?.goal, pane?.backstory]);
+  }, [open, pane?.pane_id, pane?.role, pane?.goal, pane?.backstory, pane?.plan_review_mode]);
   if (!open) return null;
   return (
     <div
@@ -1143,6 +1147,20 @@ function RoleModal({ open, pane, onClose, onSave }: RoleModalProps) {
               className="rounded border border-zinc-700 bg-zinc-800 px-2 py-1 font-mono resize-y"
             />
           </label>
+          <label className="flex flex-col gap-1 text-xs">
+            <span className="text-zinc-300">
+              Plan review <span className="text-zinc-500">(gate tool execution behind user approval)</span>
+            </span>
+            <select
+              value={mode}
+              onChange={(e) => setMode(e.target.value as PlanReviewMode)}
+              className="rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-zinc-100"
+            >
+              <option value="never">Never (default — agent runs tools freely)</option>
+              <option value="risky_only">Risky only (gate Write / Edit / Bash / Task)</option>
+              <option value="always">Always (gate every tool except AskUserQuestion)</option>
+            </select>
+          </label>
         </div>
         <div className="mt-5 flex justify-end gap-2">
           <button
@@ -1154,7 +1172,7 @@ function RoleModal({ open, pane, onClose, onSave }: RoleModalProps) {
           </button>
           <button
             type="button"
-            onClick={() => onSave(role, goal, backstory)}
+            onClick={() => onSave(role, goal, backstory, mode)}
             className="rounded border border-purple-700 bg-purple-700 px-3 py-1.5 text-sm hover:bg-purple-600"
           >
             Save

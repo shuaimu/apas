@@ -301,9 +301,14 @@ file-based-vs-MCP decision):
     render as a stack of orange cards along the bottom of the page
     with Approve/Deny buttons and the raw tool input pretty-printed
     so the human can sanity-check before approving.
-- [ ] **3.2c — web UI mode picker**: extend the Role drawer (or add
-  a separate dropdown) so the user can change plan_review_mode per
-  pane.
+- [x] **3.2c — web UI mode picker**: extended the Role modal with a
+  "Plan review" dropdown (Never / Risky only / Always). Save calls
+  both `updatePaneRole` and `updatePaneReviewMode` so role identity
+  and gating policy travel together. The wire types
+  (`UpdatePaneReviewMode` in both directions) plus the CLI handler
+  shipped already in 3.2b2 — this leaf is the UI on top.
+
+Phase 3.2 is complete.
 
 3.3  **Judge / auto-reviewer pane** (optional).
 - A pane with `role: "reviewer"` subscribes to `team.jsonl` for `kind: "diff"`
