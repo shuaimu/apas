@@ -974,6 +974,7 @@ async fn run_inner(
         let server_tx_for_pad = server_tx.clone();
         let shutdown_for_pad = shutdown.clone();
         let project_for_pad = std::path::PathBuf::from(working_dir_str.clone());
+        let input_channels_for_pad = input_channels.clone();
         thread::spawn(move || {
             let path = crate::scratchpad::scratchpad_path(&project_for_pad);
             // Replace the path resolver with the actual on-disk file.
@@ -985,7 +986,10 @@ async fn run_inner(
             let mut last_size: u64 = 0;
             let mut seen_count: usize = 0;
             // Send existing history once on startup so attached web
-            // clients can backfill.
+            // clients can backfill. We intentionally do NOT route
+            // delegate-to records from history into pane input queues
+            // — that would re-deliver every historical task on every
+            // CLI restart. Routing only applies to NEW records below.
             if let Ok(records) = crate::scratchpad::read_all(&project_for_pad) {
                 for r in &records {
                     let _ = server_tx_for_pad.blocking_send(CliToServer::TeamRecord {
@@ -1013,6 +1017,32 @@ async fn run_inner(
                                 session_id,
                                 record: r.to_wire(),
                             });
+                            // Phase 3.1a: route delegate-to:<id> records
+                            // into the target pane's input queue. Only
+                            // for NEW records — never replay history.
+                            if let Some(target_pane_id) = crate::scratchpad::delegate_target_pane(r) {
+                                let routed = {
+                                    let channels = input_channels_for_pad.lock().unwrap();
+                                    if let Some(tx) = channels.get(&target_pane_id) {
+                                        tx.send((r.body.clone(), false)).is_ok()
+                                    } else {
+                                        false
+                                    }
+                                };
+                                if !routed {
+                                    tracing::warn!(
+                                        target_pane_id,
+                                        from_pane = r.pane_id,
+                                        "delegate-to: target pane has no input channel; skipping route",
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        target_pane_id,
+                                        from_pane = r.pane_id,
+                                        "delegate-to: routed scratchpad body into pane input",
+                                    );
+                                }
+                            }
                         }
                         seen_count = all.len();
                     }

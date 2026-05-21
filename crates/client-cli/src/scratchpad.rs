@@ -80,6 +80,21 @@ pub fn scratchpad_path(project_dir: &Path) -> PathBuf {
     project_dir.join(SCRATCHPAD_REL_PATH)
 }
 
+/// Phase 3.1a: scan a record's tags for `delegate-to:<pane_id>` and
+/// return the parsed pane id. Returns None when no such tag exists or
+/// when the suffix doesn't parse as `u32`. Used by the watcher to
+/// route delegated task bodies into the target pane's input channel.
+pub fn delegate_target_pane(record: &TeamRecord) -> Option<u32> {
+    for tag in &record.tags {
+        if let Some(rest) = tag.strip_prefix("delegate-to:") {
+            if let Ok(id) = rest.parse::<u32>() {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
 /// Append a single record to the project's scratchpad. Creates the
 /// `.apas/` parent dir if missing (the `.apas` file already lives in
 /// the project root, but the *directory* of that name may not exist —
@@ -222,6 +237,24 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let got = read_all(tmp.path()).unwrap();
         assert!(got.is_empty());
+    }
+
+    #[test]
+    fn delegate_target_pane_picks_first_valid_tag() {
+        let r = TeamRecord::now(Some(1), "task", "go fix the auth tests")
+            .with_tag("priority:high")
+            .with_tag("delegate-to:7")
+            .with_tag("task-id:abc");
+        assert_eq!(delegate_target_pane(&r), Some(7));
+    }
+
+    #[test]
+    fn delegate_target_pane_none_when_no_match() {
+        let r = TeamRecord::now(Some(1), "decision", "switch to sqlx");
+        assert_eq!(delegate_target_pane(&r), None);
+
+        let r = TeamRecord::now(Some(1), "task", "garbage").with_tag("delegate-to:not-a-number");
+        assert_eq!(delegate_target_pane(&r), None);
     }
 
     #[test]

@@ -238,15 +238,29 @@ Phase 2.2 is complete.
 
 ### Phase 3 — orchestration
 
-3.1  **Manager pane** (orchestrator).
-- A pane with `role: "manager"` runs an MCP server (via `--mcp-config`) that
-  exposes `delegate(target_pane_id, task, expected_artifacts)`. The MCP
-  implementation routes the task into the target pane's input queue (we
-  already have per-pane input channels in `dual_pane.rs`).
-- Workers reply by publishing to `team.jsonl` with `tags: ["reply-to:<task_id>"]`;
-  manager polls.
-- Optional convention: only manager panes are auto-approved to write to
-  `team.jsonl`; workers go through manager.
+3.1  **Manager pane** (orchestrator). Sub-split (see
+`docs/dev/3.1-delegation-via-scratchpad.md` for the
+file-based-vs-MCP decision):
+- [x] **3.1a — scratchpad-based delegation routing**: extended the
+  Phase 2.2b scratchpad watcher: for each NEW record (never history)
+  whose tags contain `delegate-to:<pane_id>`, the watcher sends the
+  record's `body` into the target pane's input channel via the same
+  channel that handles user input (with `from_tui=false`). New
+  testable helper `scratchpad::delegate_target_pane(record)` parses
+  the first `delegate-to:<u32>` tag and returns the id; unit-tested
+  for happy path, no-match, and malformed-suffix cases. Lookup fails
+  gracefully (log + skip) when the target pane has no input channel
+  (e.g. delegating to a pane that was closed). See
+  `docs/dev/3.1-delegation-via-scratchpad.md` for the
+  file-based-vs-MCP rationale.
+- [ ] **3.1b — manager system-prompt addendum**: when a pane's role
+  contains "manager" (case-insensitive), the role module appends a
+  short paragraph teaching the agent the `delegate-to:N` /
+  `reply-to:<task_id>` conventions and listing the available worker
+  pane ids + roles.
+- [ ] **3.1c (optional) — MCP delegate tool**: replace the JSONL
+  convention with a proper MCP server when the simpler approach
+  starts feeling limiting. Deferred until needed.
 
 3.2  **Editable plan checkpoint** (per-pane policy).
 - New `PaneConfig.plan_review_mode: "always" | "risky-only" | "never"`.
