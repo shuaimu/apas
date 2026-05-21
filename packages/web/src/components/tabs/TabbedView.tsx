@@ -207,6 +207,8 @@ export function TabbedView() {
   const paneDiffs = useStore((s) => s.paneDiffs);
   const updatePaneRole = useStore((s) => s.updatePaneRole);
   const teamRecords = useStore((s) => s.teamRecords);
+  const planReviewPending = useStore((s) => s.planReviewPending);
+  const answerPlanReview = useStore((s) => s.answerPlanReview);
 
   // Active tab state, persisted per project
   const [activeTabId, setActiveTabId] = useState<number | null>(null);
@@ -953,6 +955,51 @@ export function TabbedView() {
         records={teamRecords}
         onClose={() => setTeamModalOpen(false)}
       />
+
+      {planReviewPending.length > 0 && (
+        <div className="fixed inset-x-0 bottom-0 z-40 flex justify-center p-3 pointer-events-none">
+          <div className="pointer-events-auto flex w-full max-w-3xl flex-col gap-2">
+            {planReviewPending.map((item) => (
+              <div
+                key={item.toolUseId}
+                className="rounded-lg border border-orange-700 bg-orange-950/90 p-3 text-zinc-100 shadow-xl"
+              >
+                <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
+                  <h4 className="text-sm font-semibold">
+                    Plan review: pane {item.paneId} wants to call <span className="font-mono">{item.toolName}</span>
+                  </h4>
+                  <span className="text-[10px] uppercase tracking-wide text-orange-300">held</span>
+                </div>
+                <pre className="mb-2 max-h-48 overflow-auto rounded bg-black/30 p-2 text-xs font-mono whitespace-pre-wrap break-words text-zinc-200">
+                  {(() => {
+                    try {
+                      return JSON.stringify(item.input, null, 2);
+                    } catch {
+                      return String(item.input);
+                    }
+                  })()}
+                </pre>
+                <div className="flex justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => answerPlanReview(item.toolUseId, false)}
+                    className="rounded border border-red-700 bg-red-900/40 px-3 py-1 text-xs text-red-200 hover:bg-red-900/60"
+                  >
+                    Deny
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => answerPlanReview(item.toolUseId, true)}
+                    className="rounded border border-emerald-700 bg-emerald-700 px-3 py-1 text-xs text-emerald-50 hover:bg-emerald-600"
+                  >
+                    Approve
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

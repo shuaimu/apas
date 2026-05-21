@@ -285,11 +285,22 @@ file-based-vs-MCP decision):
     gating it would deadlock). Unknown tools default to safe in
     `RiskyOnly` (conservative-by-name). Five unit tests cover
     Never/Always/RiskyOnly × risky/safe/AskUserQuestion/Unknown.
-  - [ ] **3.2b2 — wire-up + web card**: hook the streaming worker's
-    `can_use_tool` reader to consult `should_hold_tool`, park
-    held tool calls in a new `pending_plan_reviews` map, push a
-    new `PaneReviewRequest` to the web, and complete with allow/deny
-    control_response on the user's answer.
+  - [x] **3.2b2 — wire-up + web card**: shipped end-to-end. New wire
+    types `CliToServer::PlanReviewRequest`,
+    `ServerToWeb::PlanReviewRequest`, `WebToServer::PlanReviewAnswer`,
+    `ServerToCli::PlanReviewAnswer`, plus `UpdatePaneReviewMode` for
+    Phase 3.2c. `PaneMeta` gains `plan_review_mode_arc` (live mirror,
+    so UpdatePaneReviewMode lands without a respawn) and
+    `pending_plan_reviews` (parking lot). `try_handle_control_request`
+    consults `should_hold_tool`; when held, it parks the
+    (request_id, input) pair and emits `PlanReviewRequest` upstream
+    instead of writing an auto-approve. The `PlanReviewAnswer` handler
+    looks up the parked entry across all panes, builds an allow/deny
+    `control_response`, and writes it to claude's stdin via the
+    existing `control_response_tx` channel. Web UI: pending requests
+    render as a stack of orange cards along the bottom of the page
+    with Approve/Deny buttons and the raw tool input pretty-printed
+    so the human can sanity-check before approving.
 - [ ] **3.2c — web UI mode picker**: extend the Role drawer (or add
   a separate dropdown) so the user can change plan_review_mode per
   pane.

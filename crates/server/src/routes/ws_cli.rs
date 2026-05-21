@@ -638,6 +638,25 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 );
                                 state.sessions.update_usage_limits(cli_id, provider, limits);
                             }
+                            Ok(CliToServer::PlanReviewRequest { session_id, pane_id, tool_use_id, tool_name, input }) => {
+                                tracing::info!(
+                                    "Plan review requested for session {} pane {} tool {} (id={})",
+                                    session_id, pane_id, tool_name, tool_use_id,
+                                );
+                                state
+                                    .sessions
+                                    .route_to_web(
+                                        &session_id,
+                                        ServerToWeb::PlanReviewRequest {
+                                            session_id,
+                                            pane_id,
+                                            tool_use_id,
+                                            tool_name,
+                                            input,
+                                        },
+                                    )
+                                    .await;
+                            }
                             Ok(CliToServer::TeamRecord { session_id, record }) => {
                                 tracing::info!(
                                     "Team scratchpad record for session {} (kind={}, pane={:?})",

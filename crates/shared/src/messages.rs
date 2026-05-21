@@ -164,6 +164,25 @@ pub enum CliToServer {
         record: TeamScratchpadRecord,
     },
 
+    /// Phase 3.2b2: CLI requests user approval for a held tool_use.
+    /// Fired when the pane's `plan_review_mode` says "hold this tool"
+    /// per `crate::plan_review::should_hold_tool`. The web UI shows
+    /// an Approve / Deny card; the user's answer rides back via
+    /// `WebToServer::PlanReviewAnswer`. While held, the agent is
+    /// effectively paused on this turn.
+    PlanReviewRequest {
+        session_id: Uuid,
+        pane_id: u32,
+        /// claude SDK tool_use_id — used to match the answer back to
+        /// the parked request.
+        tool_use_id: String,
+        /// Tool name as reported by claude (e.g. "Write", "Bash").
+        tool_name: String,
+        /// The tool's input JSON exactly as claude sent it, so the
+        /// web UI can render the would-be call for review.
+        input: serde_json::Value,
+    },
+
     /// Diff payload for a pane that owns an isolated worktree. Sent in
     /// response to `ServerToCli::RequestPaneDiff`. `diff` is the unified
     /// patch text (UTF-8, may be empty for "no changes"). `error` is set
@@ -326,6 +345,22 @@ pub enum ServerToCli {
         goal: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         backstory: Option<String>,
+    },
+
+    /// Forward a user's plan-review verdict to the CLI streaming worker
+    /// that parked the tool_use. Phase 3.2b2.
+    PlanReviewAnswer {
+        session_id: Uuid,
+        tool_use_id: String,
+        approve: bool,
+    },
+
+    /// Set the per-pane plan_review_mode policy and persist to .apas.
+    /// Phase 3.2c.
+    UpdatePaneReviewMode {
+        session_id: Uuid,
+        pane_id: u32,
+        mode: PlanReviewMode,
     },
 }
 
@@ -599,6 +634,22 @@ pub enum WebToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         backstory: Option<String>,
     },
+
+    /// User's verdict on a held tool_use from Phase 3.2b. `approve = true`
+    /// resumes the agent's turn; `approve = false` rejects the tool, which
+    /// claude will surface as a tool_result error.
+    PlanReviewAnswer {
+        tool_use_id: String,
+        approve: bool,
+    },
+
+    /// Update a pane's plan_review_mode (Phase 3.2c). Effective immediately
+    /// for future control_requests — the CLI reads the field at decision
+    /// time, not at spawn.
+    UpdatePaneReviewMode {
+        pane_id: u32,
+        mode: PlanReviewMode,
+    },
 }
 
 /// Messages sent from server to web client
@@ -734,6 +785,15 @@ pub enum ServerToWeb {
     TeamRecord {
         session_id: Uuid,
         record: TeamScratchpadRecord,
+    },
+
+    /// Plan-review request forwarded from CLI. Phase 3.2b2.
+    PlanReviewRequest {
+        session_id: Uuid,
+        pane_id: u32,
+        tool_use_id: String,
+        tool_name: String,
+        input: serde_json::Value,
     },
 
     /// On-demand diff for a pane's isolated worktree branch. Phase 1.2a.

@@ -160,6 +160,7 @@ export interface PaneConfig {
   role?: string;
   goal?: string;
   backstory?: string;
+  plan_review_mode?: PlanReviewMode;
 }
 
 export type PaneCleanupAction = "discard" | "merge_and_remove" | "leave_as_branch";
@@ -435,6 +436,9 @@ interface AppState {
   paneDiffs: Record<number, PaneDiff>;
   updatePaneRole: (paneId: number, role?: string, goal?: string, backstory?: string) => void;
   teamRecords: TeamRecord[];
+  planReviewPending: PlanReviewPendingItem[];
+  answerPlanReview: (toolUseId: string, approve: boolean) => void;
+  updatePaneReviewMode: (paneId: number, mode: PlanReviewMode) => void;
 }
 
 export interface PaneDiff {
@@ -451,6 +455,16 @@ export interface TeamRecord {
   tags: string[];
   kind: string;
   body: string;
+}
+
+export type PlanReviewMode = "always" | "risky_only" | "never";
+
+export interface PlanReviewPendingItem {
+  paneId: number;
+  toolUseId: string;
+  toolName: string;
+  input: unknown;
+  arrivedAt: number;
 }
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://apas.mpaxos.com:8080";
@@ -490,6 +504,7 @@ export const useStore = create<AppState>((set, get) => ({
   pausedPanes: [],
   paneDiffs: {},
   teamRecords: [],
+  planReviewPending: [],
   answeredQuestions: new Map(),
   toasts: [],
   sessionCache: new Map(),
@@ -1311,6 +1326,25 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
+  answerPlanReview: (toolUseId: string, approve: boolean) => {
+    const { ws } = get();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "plan_review_answer", tool_use_id: toolUseId, approve }));
+    }
+    // Optimistically drop the pending item — CLI will send the control_response
+    // regardless, and re-rendering it would confuse the user.
+    set((state) => ({
+      planReviewPending: state.planReviewPending.filter((p) => p.toolUseId !== toolUseId),
+    }));
+  },
+
+  updatePaneReviewMode: (paneId: number, mode: PlanReviewMode) => {
+    const { ws } = get();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "update_pane_review_mode", pane_id: paneId, mode }));
+    }
+  },
+
   updatePaneLabel: (paneId: number, label: string) => {
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -1760,6 +1794,27 @@ function handleServerMessage(
       const hasActiveCli = data.has_active_cli as boolean;
       console.log("Session attached, has active CLI:", hasActiveCli);
       set({ isAttached: hasActiveCli });
+      break;
+    }
+
+    case "plan_review_request": {
+      const paneId = data.pane_id as number | undefined;
+      const toolUseId = data.tool_use_id as string | undefined;
+      const toolName = data.tool_name as string | undefined;
+      if (typeof paneId === "number" && typeof toolUseId === "string" && typeof toolName === "string") {
+        set((state) => ({
+          planReviewPending: [
+            ...state.planReviewPending.filter((p) => p.toolUseId !== toolUseId),
+            {
+              paneId,
+              toolUseId,
+              toolName,
+              input: data.input,
+              arrivedAt: Date.now(),
+            },
+          ],
+        }));
+      }
       break;
     }
 

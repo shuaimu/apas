@@ -1014,6 +1014,44 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
+                Ok(WebToServer::PlanReviewAnswer { tool_use_id, approve }) => {
+                    if let Some(sid) = session_id {
+                        tracing::info!(
+                            "Plan review answer for session {}: {} → {}",
+                            sid, tool_use_id, approve,
+                        );
+                        state
+                            .sessions
+                            .route_to_cli(
+                                &sid,
+                                ServerToCli::PlanReviewAnswer {
+                                    session_id: sid,
+                                    tool_use_id,
+                                    approve,
+                                },
+                            )
+                            .await;
+                    }
+                }
+                Ok(WebToServer::UpdatePaneReviewMode { pane_id, mode }) => {
+                    if let Some(sid) = session_id {
+                        tracing::info!(
+                            "Update pane {} plan_review_mode for session {} → {:?}",
+                            pane_id, sid, mode,
+                        );
+                        state
+                            .sessions
+                            .route_to_cli(
+                                &sid,
+                                ServerToCli::UpdatePaneReviewMode {
+                                    session_id: sid,
+                                    pane_id,
+                                    mode,
+                                },
+                            )
+                            .await;
+                    }
+                }
                 Ok(WebToServer::UpdatePaneRole { pane_id, role, goal, backstory }) => {
                     if let Some(sid) = session_id {
                         tracing::info!(

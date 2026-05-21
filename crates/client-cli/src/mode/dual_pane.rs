@@ -386,6 +386,26 @@ struct PaneMeta {
     /// `PaneConfig`. Default `Never` preserves legacy behaviour;
     /// the gating logic in 3.2b will read this at every turn.
     plan_review_mode: shared::PlanReviewMode,
+    /// Live mirror of `plan_review_mode` for the streaming worker.
+    /// `UpdatePaneReviewMode` (Phase 3.2c) writes here so the reader
+    /// thread picks up the new policy without a respawn. Phase 3.2b2.
+    plan_review_mode_arc: Arc<Mutex<shared::PlanReviewMode>>,
+    /// Phase 3.2b2: parking lot for held tool_uses awaiting user
+    /// approval. Keyed by `tool_use_id`; populated when the streaming
+    /// worker decides to hold (per `plan_review::should_hold_tool`),
+    /// drained when `ServerToCli::PlanReviewAnswer` arrives.
+    pending_plan_reviews: Arc<Mutex<HashMap<String, PendingPlanReview>>>,
+}
+
+/// One held tool_use waiting on user approval (Phase 3.2b2).
+#[derive(Clone, Debug)]
+struct PendingPlanReview {
+    /// claude's `request_id` for the control_request — must echo back
+    /// in the control_response or claude can't match it.
+    request_id: String,
+    /// Original tool input, replayed verbatim in the allow path so the
+    /// agent's intent isn't accidentally clipped.
+    input: serde_json::Value,
 }
 
 /// State stored for each in-flight AskUserQuestion call, keyed by tool_use_id.
@@ -611,6 +631,8 @@ async fn run_inner(
                     goal: tab_goal.clone(),
                     backstory: tab_backstory.clone(),
                     plan_review_mode: *tab_plan_review_mode,
+                    plan_review_mode_arc: Arc::new(Mutex::new(*tab_plan_review_mode)),
+                    pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                 },
             );
             sessions.insert(*pane_id, *pane_session_id);
@@ -779,7 +801,7 @@ async fn run_inner(
             &opencode_path,
             &cursor_agent_path,
         );
-        let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt) = pane_metas
+        let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt, pr_mode_arc, pr_pending) = pane_metas
             .lock()
             .unwrap()
             .get(&pane_id)
@@ -790,6 +812,8 @@ async fn run_inner(
                 m.effort_arc.clone(),
                 m.worktree_path.clone(),
                 crate::role::compose_system_prompt(m.role.as_deref(), m.goal.as_deref(), m.backstory.as_deref()),
+                m.plan_review_mode_arc.clone(),
+                m.pending_plan_reviews.clone(),
             ))
             .unwrap_or_else(|| (
                 Arc::new(Mutex::new(None)),
@@ -798,6 +822,8 @@ async fn run_inner(
                 Arc::new(Mutex::new(None)),
                 None,
                 None,
+                Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                Arc::new(Mutex::new(HashMap::new())),
             ));
         pane_threads.push(thread::spawn(move || {
             run_deadloop_session(
@@ -805,6 +831,8 @@ async fn run_inner(
                 &working_dir,
                 worktree_path,
                 system_prompt,
+                pr_mode_arc,
+                pr_pending,
                 sid,
                 pane_session_id,
                 pane_id,
@@ -843,7 +871,7 @@ async fn run_inner(
             &opencode_path,
             &cursor_agent_path,
         );
-        let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt) = pane_metas
+        let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt, pr_mode_arc, pr_pending) = pane_metas
             .lock()
             .unwrap()
             .get(&pane_id)
@@ -854,6 +882,8 @@ async fn run_inner(
                 m.effort_arc.clone(),
                 m.worktree_path.clone(),
                 crate::role::compose_system_prompt(m.role.as_deref(), m.goal.as_deref(), m.backstory.as_deref()),
+                m.plan_review_mode_arc.clone(),
+                m.pending_plan_reviews.clone(),
             ))
             .unwrap_or_else(|| (
                 Arc::new(Mutex::new(None)),
@@ -862,6 +892,8 @@ async fn run_inner(
                 Arc::new(Mutex::new(None)),
                 None,
                 None,
+                Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                Arc::new(Mutex::new(HashMap::new())),
             ));
         pane_threads.push(thread::spawn(move || {
             run_pane_session(
@@ -869,6 +901,8 @@ async fn run_inner(
                 &working_dir,
                 worktree_path,
                 system_prompt,
+                pr_mode_arc,
+                pr_pending,
                 sid,
                 pane_session_id,
                 pane_id,
@@ -1310,6 +1344,8 @@ fn handle_tui_events(
                             goal: None,
                             backstory: None,
                             plan_review_mode: shared::PlanReviewMode::default(),
+                            plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                            pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                         },
                     );
                 }
@@ -1341,7 +1377,7 @@ fn handle_tui_events(
                         cursor_agent_path,
                     );
                     let working_dir = working_dir.to_string();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt) = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt, pr_mode_arc, pr_pending) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
@@ -1352,6 +1388,8 @@ fn handle_tui_events(
                             m.effort_arc.clone(),
                             m.worktree_path.clone(),
                             crate::role::compose_system_prompt(m.role.as_deref(), m.goal.as_deref(), m.backstory.as_deref()),
+                            m.plan_review_mode_arc.clone(),
+                            m.pending_plan_reviews.clone(),
                         ))
                         .unwrap_or_else(|| (
                             Arc::new(Mutex::new(None)),
@@ -1360,6 +1398,8 @@ fn handle_tui_events(
                             Arc::new(Mutex::new(None)),
                             None,
                             None,
+                            Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                            Arc::new(Mutex::new(HashMap::new())),
                         ));
                     thread::spawn(move || {
                         run_pane_session(
@@ -1367,6 +1407,8 @@ fn handle_tui_events(
                             &working_dir,
                             worktree_path,
                             system_prompt,
+                            pr_mode_arc,
+                            pr_pending,
                             session_id,
                             claude_session_id,
                             pane_id,
@@ -1453,6 +1495,8 @@ fn handle_tui_events(
                             goal: None,
                             backstory: None,
                             plan_review_mode: shared::PlanReviewMode::default(),
+                            plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                            pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                         },
                     );
                 }
@@ -1498,7 +1542,7 @@ fn handle_tui_events(
                     let shutdown = shutdown.clone();
                     let event_tx = event_tx.clone();
                     let working_dir = working_dir.to_string();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt) = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt, pr_mode_arc, pr_pending) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
@@ -1509,6 +1553,8 @@ fn handle_tui_events(
                             m.effort_arc.clone(),
                             m.worktree_path.clone(),
                             crate::role::compose_system_prompt(m.role.as_deref(), m.goal.as_deref(), m.backstory.as_deref()),
+                            m.plan_review_mode_arc.clone(),
+                            m.pending_plan_reviews.clone(),
                         ))
                         .unwrap_or_else(|| (
                             Arc::new(Mutex::new(None)),
@@ -1517,6 +1563,8 @@ fn handle_tui_events(
                             Arc::new(Mutex::new(None)),
                             None,
                             None,
+                            Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                            Arc::new(Mutex::new(HashMap::new())),
                         ));
                     thread::spawn(move || {
                         run_deadloop_session(
@@ -1524,6 +1572,8 @@ fn handle_tui_events(
                             &working_dir,
                             worktree_path,
                             system_prompt,
+                            pr_mode_arc,
+                            pr_pending,
                             session_id,
                             claude_session_id,
                             pane_id,
@@ -1556,7 +1606,7 @@ fn handle_tui_events(
                     let server_tx = server_tx.clone();
                     let shutdown = shutdown.clone();
                     let working_dir = working_dir.to_string();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt) = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt, pr_mode_arc, pr_pending) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
@@ -1567,6 +1617,8 @@ fn handle_tui_events(
                             m.effort_arc.clone(),
                             m.worktree_path.clone(),
                             crate::role::compose_system_prompt(m.role.as_deref(), m.goal.as_deref(), m.backstory.as_deref()),
+                            m.plan_review_mode_arc.clone(),
+                            m.pending_plan_reviews.clone(),
                         ))
                         .unwrap_or_else(|| (
                             Arc::new(Mutex::new(None)),
@@ -1575,6 +1627,8 @@ fn handle_tui_events(
                             Arc::new(Mutex::new(None)),
                             None,
                             None,
+                            Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                            Arc::new(Mutex::new(HashMap::new())),
                         ));
                     thread::spawn(move || {
                         run_pane_session(
@@ -1582,6 +1636,8 @@ fn handle_tui_events(
                             &working_dir,
                             worktree_path,
                             system_prompt,
+                            pr_mode_arc,
+                            pr_pending,
                             session_id,
                             claude_session_id,
                             pane_id,
@@ -1825,6 +1881,8 @@ fn handle_tui_events(
                             goal: None,
                             backstory: None,
                             plan_review_mode: shared::PlanReviewMode::default(),
+                            plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                            pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                         },
                     );
                 }
@@ -1863,7 +1921,7 @@ fn handle_tui_events(
                     let shutdown = shutdown.clone();
                     let event_tx = event_tx.clone();
                     let working_dir = working_dir.to_string();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt) = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt, pr_mode_arc, pr_pending) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
@@ -1874,6 +1932,8 @@ fn handle_tui_events(
                             m.effort_arc.clone(),
                             m.worktree_path.clone(),
                             crate::role::compose_system_prompt(m.role.as_deref(), m.goal.as_deref(), m.backstory.as_deref()),
+                            m.plan_review_mode_arc.clone(),
+                            m.pending_plan_reviews.clone(),
                         ))
                         .unwrap_or_else(|| (
                             Arc::new(Mutex::new(None)),
@@ -1882,6 +1942,8 @@ fn handle_tui_events(
                             Arc::new(Mutex::new(None)),
                             None,
                             None,
+                            Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                            Arc::new(Mutex::new(HashMap::new())),
                         ));
                     thread::spawn(move || {
                         run_deadloop_session(
@@ -1889,6 +1951,8 @@ fn handle_tui_events(
                             &working_dir,
                             worktree_path,
                             system_prompt,
+                            pr_mode_arc,
+                            pr_pending,
                             session_id,
                             claude_session_id,
                             pane_id,
@@ -2244,6 +2308,8 @@ fn handle_tui_events(
                             goal: None,
                             backstory: None,
                             plan_review_mode: shared::PlanReviewMode::default(),
+                            plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                            pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                         },
                     );
                 }
@@ -2296,7 +2362,7 @@ fn handle_tui_events(
                     let server_tx = server_tx.clone();
                     let shutdown = shutdown.clone();
                     let working_dir = working_dir.to_string();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt) = pane_metas
+                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt, pr_mode_arc, pr_pending) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
@@ -2307,6 +2373,8 @@ fn handle_tui_events(
                             m.effort_arc.clone(),
                             m.worktree_path.clone(),
                             crate::role::compose_system_prompt(m.role.as_deref(), m.goal.as_deref(), m.backstory.as_deref()),
+                            m.plan_review_mode_arc.clone(),
+                            m.pending_plan_reviews.clone(),
                         ))
                         .unwrap_or_else(|| (
                             Arc::new(Mutex::new(None)),
@@ -2315,6 +2383,8 @@ fn handle_tui_events(
                             Arc::new(Mutex::new(None)),
                             None,
                             None,
+                            Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                            Arc::new(Mutex::new(HashMap::new())),
                         ));
                     thread::spawn(move || {
                         run_pane_session(
@@ -2322,6 +2392,8 @@ fn handle_tui_events(
                             &working_dir,
                             worktree_path,
                             system_prompt,
+                            pr_mode_arc,
+                            pr_pending,
                             session_id,
                             claude_session_id,
                             pane_id,
@@ -2689,11 +2761,16 @@ fn build_agent_args(
 fn try_handle_control_request(
     line: &str,
     pane_id: u32,
-    _session_id: Uuid,
+    session_id: Uuid,
     _pane_type: PaneType,
     pending_questions: &Arc<Mutex<HashMap<String, PendingAskQuestion>>>,
     control_response_tx: &mpsc::Sender<String>,
-    _server_tx: &tokio_mpsc::Sender<CliToServer>,
+    server_tx: &tokio_mpsc::Sender<CliToServer>,
+    // Phase 3.2b2: parking lot for held tool_uses. None when caller is a
+    // legacy/test path that doesn't track plan reviews; otherwise the
+    // PaneMeta's pending_plan_reviews Arc.
+    pending_plan_reviews: Option<&Arc<Mutex<HashMap<String, PendingPlanReview>>>>,
+    plan_review_mode: shared::PlanReviewMode,
 ) -> Option<bool> {
     // Cheap pre-filter: control_request lines always start with the
     // `{"type":"control_request"` prefix. Anything else short-circuits.
@@ -2762,6 +2839,47 @@ fn try_handle_control_request(
             "AskUserQuestion parked; waiting for web answer",
         );
         return Some(true);
+    }
+
+    // Phase 3.2b2: ask the policy whether to hold this tool for user
+    // review. If yes — park, push a PlanReviewRequest upstream, and
+    // return without writing a control_response (the answer handler
+    // will write it when the user clicks). If no, fall through to
+    // auto-approve below.
+    if crate::plan_review::should_hold_tool(plan_review_mode, &tool_name) {
+        if let Some(park) = pending_plan_reviews {
+            if let Ok(mut map) = park.lock() {
+                map.insert(
+                    tool_use_id.clone(),
+                    PendingPlanReview {
+                        request_id: request_id.clone(),
+                        input: input.clone(),
+                    },
+                );
+            }
+            let _ = server_tx.try_send(CliToServer::PlanReviewRequest {
+                session_id,
+                pane_id,
+                tool_use_id: tool_use_id.clone(),
+                tool_name: tool_name.clone(),
+                input: input.clone(),
+            });
+            tracing::info!(
+                pane_id,
+                tool = tool_name.as_str(),
+                tool_use_id = tool_use_id.as_str(),
+                mode = ?plan_review_mode,
+                "plan review: tool held; awaiting user verdict",
+            );
+            return Some(true);
+        }
+        // No park slot (legacy/test path) — fall through to allow so
+        // we never deadlock the turn just because plumbing is missing.
+        tracing::warn!(
+            pane_id,
+            tool = tool_name.as_str(),
+            "plan review: should_hold_tool=true but no parking slot; auto-approving",
+        );
     }
 
     // Non-AskUserQuestion permission prompt slipped through bypass mode.
@@ -3119,6 +3237,8 @@ mod tests {
                     goal: None,
                     backstory: None,
                     plan_review_mode: shared::PlanReviewMode::default(),
+                    plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                    pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                 },
             );
             metas.insert(
@@ -3141,6 +3261,8 @@ mod tests {
                     goal: None,
                     backstory: None,
                     plan_review_mode: shared::PlanReviewMode::default(),
+                    plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                    pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                 },
             );
         }
@@ -3178,6 +3300,8 @@ mod tests {
                     goal: None,
                     backstory: None,
                     plan_review_mode: shared::PlanReviewMode::default(),
+                    plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                    pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                 },
             );
         }
@@ -3215,6 +3339,8 @@ mod tests {
                     goal: None,
                     backstory: None,
                     plan_review_mode: shared::PlanReviewMode::default(),
+                    plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                    pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                 },
             );
             metas.insert(
@@ -3237,6 +3363,8 @@ mod tests {
                     goal: None,
                     backstory: None,
                     plan_review_mode: shared::PlanReviewMode::default(),
+                    plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                    pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                 },
             );
         }
@@ -3274,6 +3402,8 @@ mod tests {
                     goal: None,
                     backstory: None,
                     plan_review_mode: shared::PlanReviewMode::default(),
+                    plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                    pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                 },
             );
         }
@@ -3311,6 +3441,8 @@ mod tests {
                     goal: None,
                     backstory: None,
                     plan_review_mode: shared::PlanReviewMode::default(),
+                    plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                    pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                 },
             );
         }
@@ -3348,6 +3480,8 @@ mod tests {
                     goal: None,
                     backstory: None,
                     plan_review_mode: shared::PlanReviewMode::default(),
+                    plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                    pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                 },
             );
         }
@@ -3379,6 +3513,8 @@ mod tests {
             &pending,
             &cr_tx,
             &server_tx,
+            None,
+            shared::PlanReviewMode::Never,
         );
         assert_eq!(handled, Some(true));
         let guard = pending.lock().unwrap();
@@ -3409,6 +3545,8 @@ mod tests {
             &pending,
             &cr_tx,
             &server_tx,
+            None,
+            shared::PlanReviewMode::Never,
         );
         assert_eq!(handled, Some(true));
         let payload = cr_rx.try_recv().expect("auto-approve should send a control_response");
@@ -3439,6 +3577,8 @@ mod tests {
             &pending,
             &cr_tx,
             &server_tx,
+            None,
+            shared::PlanReviewMode::Never,
         );
         assert_eq!(handled, None);
     }
@@ -3451,6 +3591,8 @@ fn run_deadloop_session(
     working_dir: &str,
     worktree_path: Option<String>,
     system_prompt: Option<String>,
+    plan_review_mode_arc: Arc<Mutex<shared::PlanReviewMode>>,
+    pending_plan_reviews: Arc<Mutex<HashMap<String, PendingPlanReview>>>,
     session_id: Uuid,
     claude_session_id: Uuid,
     pane_id: u32,
@@ -3477,6 +3619,8 @@ fn run_deadloop_session(
             working_dir,
             worktree_path,
             system_prompt,
+            plan_review_mode_arc,
+            pending_plan_reviews,
             session_id,
             claude_session_id,
             pane_id,
@@ -3520,6 +3664,8 @@ fn run_deadloop_session_inner(
     working_dir: &str,
     worktree_path: Option<String>,
     system_prompt: Option<String>,
+    plan_review_mode_arc: Arc<Mutex<shared::PlanReviewMode>>,
+    pending_plan_reviews: Arc<Mutex<HashMap<String, PendingPlanReview>>>,
     session_id: Uuid,
     claude_session_id: Uuid,
     pane_id: u32,
@@ -3549,6 +3695,8 @@ fn run_deadloop_session_inner(
             working_dir,
             worktree_path,
             system_prompt,
+            plan_review_mode_arc,
+            pending_plan_reviews,
             session_id,
             claude_session_id,
             pane_id,
@@ -3575,6 +3723,8 @@ fn run_deadloop_session_inner(
         .unwrap_or(working_dir)
         .to_string();
     let _ = system_prompt; // codex/cursor/etc. ignored for now — see role.rs note.
+    let _ = plan_review_mode_arc; // non-claude legacy path doesn't gate
+    let _ = pending_plan_reviews;
     let _ = interrupt_tx_slot; // unused for legacy path
     let _ = control_response_tx_slot; // unused for legacy path
     let _ = pending_questions; // unused for legacy path
@@ -4554,6 +4704,11 @@ fn run_pane_session_streaming(
     // backstory (Phase 2.1b). When Some, gets passed to claude as
     // `--append-system-prompt <prefix>` at every spawn.
     system_prompt: Option<String>,
+    // Phase 3.2b2: live mirror of the pane's plan-review policy, plus
+    // the parking map for held tool_uses. Reader thread consults both
+    // on every can_use_tool control_request.
+    plan_review_mode_arc: Arc<Mutex<shared::PlanReviewMode>>,
+    pending_plan_reviews: Arc<Mutex<HashMap<String, PendingPlanReview>>>,
     session_id: Uuid,
     claude_session_id: Uuid,
     pane_id: u32,
@@ -4875,6 +5030,8 @@ fn run_pane_session_streaming(
         // onto claude's stdin.
         let reader_pending_questions = pending_questions.clone();
         let reader_control_response_tx = control_response_tx.clone();
+        let reader_pending_plan_reviews = pending_plan_reviews.clone();
+        let reader_plan_review_mode_arc = plan_review_mode_arc.clone();
         let reader_thread = thread::spawn(move || {
             let reader = BufReader::new(stdout);
             let mut line_count: u64 = 0;
@@ -4916,6 +5073,11 @@ fn run_pane_session_streaming(
                 ) {
                     continue;
                 }
+                let current_review_mode = reader_plan_review_mode_arc
+                    .lock()
+                    .ok()
+                    .map(|g| *g)
+                    .unwrap_or_default();
                 if let Some(handled) = try_handle_control_request(
                     &line,
                     pane_id_reader,
@@ -4924,6 +5086,8 @@ fn run_pane_session_streaming(
                     &reader_pending_questions,
                     &reader_control_response_tx,
                     &server_tx_reader,
+                    Some(&reader_pending_plan_reviews),
+                    current_review_mode,
                 ) {
                     if handled {
                         continue;
@@ -5440,6 +5604,8 @@ fn run_deadloop_session_streaming(
     working_dir: &str,
     worktree_path: Option<String>,
     system_prompt: Option<String>,
+    plan_review_mode_arc: Arc<Mutex<shared::PlanReviewMode>>,
+    pending_plan_reviews: Arc<Mutex<HashMap<String, PendingPlanReview>>>,
     session_id: Uuid,
     claude_session_id: Uuid,
     pane_id: u32,
@@ -5479,6 +5645,8 @@ fn run_deadloop_session_streaming(
         let working_dir = working_dir.to_string();
         let worktree_path = worktree_path.clone();
         let system_prompt = system_prompt.clone();
+        let plan_review_mode_arc_clone = plan_review_mode_arc.clone();
+        let pending_plan_reviews_clone = pending_plan_reviews.clone();
         let model = model.clone();
         let effort = effort.clone();
         let provider = *provider;
@@ -5496,6 +5664,8 @@ fn run_deadloop_session_streaming(
                 &working_dir,
                 worktree_path,
                 system_prompt,
+                plan_review_mode_arc_clone,
+                pending_plan_reviews_clone,
                 session_id,
                 claude_session_id,
                 pane_id,
@@ -5608,6 +5778,8 @@ fn run_pane_session(
     working_dir: &str,
     worktree_path: Option<String>,
     system_prompt: Option<String>,
+    plan_review_mode_arc: Arc<Mutex<shared::PlanReviewMode>>,
+    pending_plan_reviews: Arc<Mutex<HashMap<String, PendingPlanReview>>>,
     session_id: Uuid,
     claude_session_id: Uuid,
     pane_id: u32,
@@ -5633,6 +5805,8 @@ fn run_pane_session(
             working_dir,
             worktree_path,
             system_prompt,
+            plan_review_mode_arc,
+            pending_plan_reviews,
             session_id,
             claude_session_id,
             pane_id,
@@ -5652,6 +5826,8 @@ fn run_pane_session(
             PaneType::Interactive,
         );
     }
+    let _ = plan_review_mode_arc; // non-claude legacy path doesn't gate
+    let _ = pending_plan_reviews;
     let _ = system_prompt; // codex/cursor/etc. ignored for now — see role.rs note.
     let effective_dir: String = worktree_path
         .as_deref()
@@ -6960,6 +7136,109 @@ async fn run_server_connection(
                                                         output_type: shared::OutputType::System,
                                                         pane_type: None,
                                                         pane_id: Some(role_pane_id),
+                                                    };
+                                                    if let Ok(text) = serde_json::to_string(&msg) {
+                                                        let _ = ws_sender
+                                                            .send(Message::Text(text.into()))
+                                                            .await;
+                                                    }
+                                                }
+                                            }
+                                            ServerToCli::PlanReviewAnswer { session_id: _, tool_use_id, approve } => {
+                                                // Find which pane has this tool_use_id parked, drain it,
+                                                // and send a control_response on its stdin channel. Tool
+                                                // use ids are globally unique so the first match wins.
+                                                let metas_snapshot: Vec<(u32, Arc<Mutex<HashMap<String, PendingPlanReview>>>, Arc<Mutex<Option<mpsc::Sender<String>>>>)> = {
+                                                    let metas = pane_metas.lock().unwrap();
+                                                    metas
+                                                        .iter()
+                                                        .map(|(pid, m)| (
+                                                            *pid,
+                                                            m.pending_plan_reviews.clone(),
+                                                            m.control_response_tx.clone(),
+                                                        ))
+                                                        .collect()
+                                                };
+                                                for (pid, pending_arc, tx_arc) in metas_snapshot {
+                                                    let pending = {
+                                                        let mut map = match pending_arc.lock() {
+                                                            Ok(m) => m,
+                                                            Err(_) => continue,
+                                                        };
+                                                        map.remove(&tool_use_id)
+                                                    };
+                                                    if let Some(pending) = pending {
+                                                        let response = serde_json::json!({
+                                                            "type": "control_response",
+                                                            "response": {
+                                                                "subtype": "success",
+                                                                "request_id": pending.request_id,
+                                                                "response": if approve {
+                                                                    serde_json::json!({
+                                                                        "behavior": "allow",
+                                                                        "updatedInput": pending.input,
+                                                                        "toolUseID": tool_use_id,
+                                                                    })
+                                                                } else {
+                                                                    serde_json::json!({
+                                                                        "behavior": "deny",
+                                                                        "message": "User rejected this tool use via the plan-review card.",
+                                                                        "toolUseID": tool_use_id,
+                                                                    })
+                                                                }
+                                                            }
+                                                        });
+                                                        let sender = tx_arc.lock().ok().and_then(|g| g.as_ref().cloned());
+                                                        if let Some(tx) = sender {
+                                                            let _ = tx.send(response.to_string());
+                                                            tracing::info!(
+                                                                pane_id = pid,
+                                                                tool_use_id = tool_use_id.as_str(),
+                                                                approve,
+                                                                "plan review: user verdict relayed to claude",
+                                                            );
+                                                        } else {
+                                                            tracing::warn!(
+                                                                pane_id = pid,
+                                                                tool_use_id = tool_use_id.as_str(),
+                                                                "plan review: no control_response sender registered",
+                                                            );
+                                                        }
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            ServerToCli::UpdatePaneReviewMode { session_id: _, pane_id: rmode_pane_id, mode } => {
+                                                let updated = {
+                                                    let mut metas = pane_metas.lock().unwrap();
+                                                    if let Some(m) = metas.get_mut(&rmode_pane_id) {
+                                                        m.plan_review_mode = mode;
+                                                        if let Ok(mut g) = m.plan_review_mode_arc.lock() {
+                                                            *g = mode;
+                                                        }
+                                                        true
+                                                    } else {
+                                                        false
+                                                    }
+                                                };
+                                                if updated {
+                                                    save_pane_configs(
+                                                        &working_dir,
+                                                        &pane_sessions,
+                                                        &pane_metas,
+                                                        &pane_pauses,
+                                                        &pane_stop_requests,
+                                                    );
+                                                    let hint = format!(
+                                                        "[Plan review mode → {:?} for this pane. Takes effect on the next tool_use.]",
+                                                        mode,
+                                                    );
+                                                    let msg = CliToServer::Output {
+                                                        session_id,
+                                                        data: hint,
+                                                        output_type: shared::OutputType::System,
+                                                        pane_type: None,
+                                                        pane_id: Some(rmode_pane_id),
                                                     };
                                                     if let Ok(text) = serde_json::to_string(&msg) {
                                                         let _ = ws_sender
