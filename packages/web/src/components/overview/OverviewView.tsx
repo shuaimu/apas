@@ -1,12 +1,21 @@
 "use client";
 
+import { PaneGrid } from "./PaneGrid";
+
 /**
  * Phase 5.1 — team overview pseudo-tab.
  *
- * Sub-leaf 5.1a: scaffold only. Empty shell with section placeholders;
- * 5.1b–5.1e fill them in.
+ * Sub-leaves complete: 5.1a (scaffold), 5.1b (pane grid).
+ * Remaining: 5.1c (scratchpad ticker), 5.1d (delegation board),
+ * 5.1e (resource use).
  */
-export function OverviewView() {
+interface OverviewViewProps {
+  onOpenPane: (paneId: number) => void;
+  onOpenDiff: (paneId: number) => void;
+  onOpenRole: (paneId: number) => void;
+}
+
+export function OverviewView({ onOpenPane, onOpenDiff, onOpenRole }: OverviewViewProps) {
   return (
     <div className="flex-1 overflow-auto p-4">
       <div className="mx-auto max-w-5xl">
@@ -18,7 +27,11 @@ export function OverviewView() {
         </p>
 
         <OverviewSection title="Pane grid">
-          <Placeholder note="5.1b — cards per pane (status pill, mode, worktree, last activity, quick actions)" />
+          <PaneGrid
+            onOpenPane={onOpenPane}
+            onOpenDiff={onOpenDiff}
+            onOpenRole={onOpenRole}
+          />
         </OverviewSection>
 
         <OverviewSection title="Team scratchpad">

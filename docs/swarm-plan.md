@@ -395,8 +395,15 @@ Phase 4.2 is complete. Phase 4 (UX polish) substantively done —
   Input box + status bar suppressed when the sentinel is active —
   typing into an overview tab makes no sense. Timeline button also
   hidden on Overview.
-- [ ] **5.1b — pane grid**: one card per pane (label, role, status
-  pill, mode, worktree info, last activity, quick actions).
+- [x] **5.1b — pane grid**: new `components/overview/PaneGrid.tsx`
+  renders one card per pane on a responsive 1/2/3-column grid. Card
+  shows: mode icon (⏵ running / ⏸ paused / ● thinking / • idle) +
+  label + role chip + provider/model badge; current status pill (if
+  any); worktree branch + diff stats `+N -M` when isolated; relative
+  last-activity timestamp; quick-action buttons (Diff if worktree,
+  Role). Clicking the card body switches the active tab to that
+  pane; click on Diff/Role buttons opens the existing modals.
+  Wired via callback props passed down from TabbedView.
 - [ ] **5.1c — scratchpad ticker**: last ~20 records + filter chips.
 - [ ] **5.1d — delegation board**: delegate-to / reply-to pairing.
 - [ ] **5.1e — resource use rollup**: UsageLimitsDisplay per

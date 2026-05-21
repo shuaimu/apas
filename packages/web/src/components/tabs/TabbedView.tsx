@@ -886,7 +886,15 @@ export function TabbedView() {
       {/* Message pane (or per-action timeline / overview) for active tab.
           Keyed so each tab gets its own DOM/scroll state. */}
       {activeTabId === OVERVIEW_PANE_ID ? (
-        <OverviewView key="overview" />
+        <OverviewView
+          key="overview"
+          onOpenPane={handleSelectTab}
+          onOpenDiff={(pid) => {
+            setDiffModalPaneId(pid);
+            requestPaneDiff(pid);
+          }}
+          onOpenRole={(pid) => setRoleModalPaneId(pid)}
+        />
       ) : activeTabId != null && timelinePanes.has(activeTabId) ? (
         <TimelinePane
           key={`timeline-${sessionId}-${activeTabId}`}
