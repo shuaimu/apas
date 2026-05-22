@@ -1178,6 +1178,22 @@ export const useStore = create<AppState>((set, get) => ({
     const paneId = typeof pane === "number" ? pane : normalizePaneId(pane, undefined);
     const paneType = legacyPaneType(paneId) || (typeof pane === "string" ? pane : undefined);
 
+    // Optimistic local render: drop the message into the pane immediately so
+    // the user sees it without waiting for the server's user_input bounce.
+    // The "optimistic-" id prefix is the dedupe handshake — the user_input
+    // handler claims the matching slot and strips the prefix instead of
+    // pushing a duplicate.
+    if (paneId != null) {
+      const optimisticMsg: Message = {
+        id: `optimistic-${generateId()}`,
+        role: "user",
+        content: text,
+        timestamp: new Date(),
+        outputType: { type: "text" },
+      };
+      get().addMessageToPane(optimisticMsg, pane);
+    }
+
     ws.send(JSON.stringify({
       type: "input",
       session_id: sessionId,
@@ -2215,20 +2231,62 @@ function handleServerMessage(
 
     case "user_input": {
       const msgSessionId = data.session_id as string | undefined;
+      const paneType = data.pane_type as string | undefined;
+      const paneId = data.pane_id as number | string | undefined;
+      const text = data.text as string;
+      const isCurrentSession = !msgSessionId || msgSessionId === get().sessionId;
+
+      // Server bounce of our own input: claim the optimistic slot the
+      // send handler placed locally. Match by content + recency + the
+      // "optimistic-" id prefix; strip the prefix so a later duplicate
+      // user_input with the same text doesn't re-claim this slot.
+      if (isCurrentSession) {
+        const normalizedPaneId = normalizePaneId(paneType, normalizeRawPaneId(paneId));
+        if (normalizedPaneId != null) {
+          const key = paneKey(normalizedPaneId);
+          const bucket = get().paneMessages[key] || [];
+          const now = Date.now();
+          const idx = bucket.findIndex(
+            (m) =>
+              m.role === "user" &&
+              m.id.startsWith("optimistic-") &&
+              m.content === text &&
+              now - m.timestamp.getTime() < 30_000,
+          );
+          if (idx >= 0) {
+            set((state) => {
+              const updated = [...(state.paneMessages[key] || [])];
+              const orig = updated[idx];
+              if (orig) {
+                updated[idx] = {
+                  ...orig,
+                  id: orig.id.replace(/^optimistic-/, ""),
+                };
+              }
+              const next: Partial<AppState> = {
+                paneMessages: { ...state.paneMessages, [key]: updated },
+              };
+              if (normalizedPaneId === PANE_ID_DEADLOOP) next.deadloopMessages = updated;
+              if (normalizedPaneId === PANE_ID_INTERACTIVE) next.interactiveMessages = updated;
+              return next;
+            });
+            updatePaneModeHint(set, get, paneType, paneId);
+            break;
+          }
+        }
+      }
 
       const userMessage: Message = {
         id: generateId(),
         role: "user",
-        content: data.text as string,
+        content: text,
         timestamp: new Date(),
         outputType: { type: "text" },
       };
-      const paneType = data.pane_type as string | undefined;
-      const paneId = data.pane_id as number | string | undefined;
       // updatePaneModeHint touches the current-session state; only run
       // it for the active session (other sessions track this in their
       // cache snapshot).
-      if (!msgSessionId || msgSessionId === get().sessionId) {
+      if (isCurrentSession) {
         updatePaneModeHint(set, get, paneType, paneId);
       }
       routeMessage(set, get, userMessage, msgSessionId, paneType, paneId);
