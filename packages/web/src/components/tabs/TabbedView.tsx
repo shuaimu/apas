@@ -909,6 +909,7 @@ export function TabbedView() {
           onLoadMore={handleLoadMore}
           isLoading={isLoadingMore}
           hasMore={hasMoreMessages}
+          isActive
         />
       ) : (
         effectiveTabs.map((tab) => {
@@ -933,6 +934,7 @@ export function TabbedView() {
                   onLoadMore={() => loadMoreMessages(tab.pane_id)}
                   isLoading={loadingMorePane === tab.pane_id}
                   hasMore={paneHasMore[paneKey(tab.pane_id)] || false}
+                  isActive={isActive}
                 />
               )}
             </div>
@@ -1723,9 +1725,14 @@ interface MessagePaneProps {
   onLoadMore?: () => void;
   isLoading?: boolean;
   hasMore?: boolean;
+  /** True when this pane is the one the user currently sees. Drives
+   * scroll save (going hidden) and restore (becoming visible). When
+   * false, the pane is mounted but `display: none`. Phase: hide-not-
+   * unmount switching. */
+  isActive: boolean;
 }
 
-function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore }: MessagePaneProps) {
+function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, isActive }: MessagePaneProps) {
   const sessionId = useStore((s) => s.sessionId);
   const containerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -1733,7 +1740,10 @@ function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore }: Messa
   const prevScrollHeight = useRef<number>(0);
   const isRestoringScroll = useRef(false);
   const scrollThrottleRef = useRef<number>(0);
-  const hasRestoredRef = useRef(false);
+  // `null` on first render so we can distinguish "first time we see
+  // isActive" from a later transition. After the effect runs once,
+  // it holds the previous value.
+  const wasActiveRef = useRef<boolean | null>(null);
 
   const scrollKey = getScrollKey(sessionId, paneId);
 
@@ -1775,7 +1785,9 @@ function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore }: Messa
     }
   }, [checkIfAtBottom, checkIfNearTop, onLoadMore, isLoading, hasMore, scrollKey]);
 
-  // Save scroll position on unmount (component is keyed by paneId, so unmount = tab switch)
+  // Save scroll position on unmount. With hide-not-unmount, "unmount"
+  // now only fires on session change (key includes sessionId). Tab
+  // switches go through the isActive transition effect below.
   useEffect(() => {
     return () => {
       const container = containerRef.current;
@@ -1792,51 +1804,79 @@ function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore }: Messa
     };
   }, [scrollKey]);
 
-  // Restore scroll position once messages are available.
-  // Waiting avoids restoring against an empty/partial DOM during session re-attach.
+  // Per-pane scroll lifecycle, driven by isActive transitions:
+  //   - first activation: scroll to bottom if no saved state, else restore.
+  //   - active → hidden: save current scroll position.
+  //   - hidden → active: restore saved position.
+  // Initial mount as inactive is a no-op (we'll handle it on first
+  // activation). Replaces the old "restore once on mount" effect,
+  // which would fire for every pane on initial render and miss the
+  // tab-switch transitions entirely.
   useEffect(() => {
-    if (!containerRef.current) return;
-    if (hasRestoredRef.current) return;
-    if (messages.length === 0) return;
+    const container = containerRef.current;
+    if (!container) return;
 
-    const savedState = scrollPositions.get(scrollKey);
-    if (savedState) {
-      isRestoringScroll.current = true;
-      shouldAutoScroll.current = savedState.wasAtBottom;
-      requestAnimationFrame(() => {
-        const container = containerRef.current;
-        if (container) {
-          const maxScrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
-          if (savedState.wasAtBottom) {
-            container.scrollTop = maxScrollTop;
-          } else {
-            const savedMaxScrollTop = Math.max(
-              0,
-              savedState.scrollHeight - savedState.clientHeight,
-            );
-            const nextScrollTop = savedMaxScrollTop > 0
-              ? (savedState.scrollTop / savedMaxScrollTop) * maxScrollTop
-              : savedState.scrollTop;
-            container.scrollTop = Math.max(
-              0,
-              Math.min(maxScrollTop, nextScrollTop),
-            );
-          }
-        }
-        hasRestoredRef.current = true;
-        isRestoringScroll.current = false;
+    const prev = wasActiveRef.current;
+    wasActiveRef.current = isActive;
+
+    // Hidden → hidden or first render while hidden: nothing to do.
+    if (!isActive && prev !== true) return;
+
+    if (prev === true && !isActive) {
+      // Going hidden: snapshot scroll for later restore.
+      const wasAtBottom =
+        container.scrollHeight - container.scrollTop - container.clientHeight <= 100;
+      scrollPositions.set(scrollKey, {
+        scrollTop: container.scrollTop,
+        wasAtBottom,
+        scrollHeight: container.scrollHeight,
+        clientHeight: container.clientHeight,
       });
-    } else {
-      shouldAutoScroll.current = true;
-      requestAnimationFrame(() => {
-        messagesEndRef.current?.scrollIntoView();
-      });
-      hasRestoredRef.current = true;
+      return;
     }
-  }, [messages.length, scrollKey]);
 
-  // Maintain scroll position when prepending messages
+    if (isActive) {
+      // First activation OR coming back into view: restore saved state
+      // if present, otherwise scroll to the bottom (latest messages).
+      const saved = scrollPositions.get(scrollKey);
+      isRestoringScroll.current = true;
+      if (saved) {
+        shouldAutoScroll.current = saved.wasAtBottom;
+        requestAnimationFrame(() => {
+          const c = containerRef.current;
+          if (c) {
+            const maxScrollTop = Math.max(0, c.scrollHeight - c.clientHeight);
+            if (saved.wasAtBottom) {
+              c.scrollTop = maxScrollTop;
+            } else {
+              const savedMaxScrollTop = Math.max(
+                0,
+                saved.scrollHeight - saved.clientHeight,
+              );
+              const nextScrollTop = savedMaxScrollTop > 0
+                ? (saved.scrollTop / savedMaxScrollTop) * maxScrollTop
+                : saved.scrollTop;
+              c.scrollTop = Math.max(0, Math.min(maxScrollTop, nextScrollTop));
+            }
+          }
+          isRestoringScroll.current = false;
+        });
+      } else {
+        shouldAutoScroll.current = true;
+        requestAnimationFrame(() => {
+          const c = containerRef.current;
+          if (c) c.scrollTop = c.scrollHeight;
+          isRestoringScroll.current = false;
+        });
+      }
+    }
+  }, [isActive, scrollKey]);
+
+  // Maintain scroll position when prepending older messages (loadMore).
+  // Only meaningful for the active pane — hidden panes can't scroll-to-
+  // top to trigger loadMore in the first place.
   useEffect(() => {
+    if (!isActive) return;
     if (prevScrollHeight.current > 0 && containerRef.current) {
       const newScrollHeight = containerRef.current.scrollHeight;
       const scrollDiff = newScrollHeight - prevScrollHeight.current;
@@ -1845,14 +1885,18 @@ function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore }: Messa
       }
       prevScrollHeight.current = 0;
     }
-  }, [messages.length]);
+  }, [messages.length, isActive]);
 
-  // Auto-scroll for new messages (only when count changes, not on every array ref change)
+  // Auto-scroll for new messages — only for the active pane. Hidden
+  // panes accumulate messages silently; when the user comes back, the
+  // becameVisible branch above restores them to wherever they were
+  // (or to the bottom if they had been at the bottom on save).
   useEffect(() => {
+    if (!isActive) return;
     if (shouldAutoScroll.current && !isRestoringScroll.current) {
       messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }
-  }, [messages.length]);
+  }, [messages.length, isActive]);
 
   if (messages.length === 0) {
     return (
