@@ -2130,41 +2130,45 @@ function handleServerMessage(
           get().prependMessages(parsedMessages, hasMore);
         }
       } else if (isDualPane || hasPaneType) {
-        // Initial load - dual pane mode. Replace existing pane messages with
-        // the server's authoritative snapshot (rather than prepending) — if
-        // the user is returning to a cached session, the cached state and
-        // the server's latest 50 overlap, and prepending would create
-        // duplicates plus mis-order the timeline.
+        // Initial load - dual pane mode. For each pane in the server
+        // payload: if local bucket is empty, accept the server's
+        // snapshot (first-time load). Otherwise IGNORE the server
+        // payload for that pane.
         //
-        // BUT: if our local bucket already has messages (we're an attached
-        // tab with live state), MERGE rather than replace so a spurious
-        // attach (visibility change, reconnect) doesn't yank the user back
-        // to whatever snapshot the server happens to have on disk. We
-        // dedupe by message id and keep local ordering for the overlap.
-        const { paneModes: existingPaneModes, paneMessages: existingPaneMessages } = get();
+        // Why ignore instead of merge? Stream-message-arrived messages
+        // have client-generated random IDs; session_messages-arrived
+        // ones have storage-record IDs. They're the same logical
+        // message but the id strings don't match — so dedupe-by-id
+        // can't tell them apart and naive merging produces
+        // duplicates-at-the-bottom (the original symptom of this fix).
+        // Since live stream_message events keep paneMessages
+        // authoritative anyway, treating the in-memory state as the
+        // truth source is the safe call. Server-only history that the
+        // client never saw is still reachable via loadMoreMessages
+        // (scroll-to-top), which goes through the isLoadingMore
+        // branch above.
+        const { paneModes: existingPaneModes, paneMessages: existingPaneMessages, paneHasMore: existingPaneHasMore, messages: existingMessages } = get();
         const newPaneMessages: Record<string, Message[]> = { ...existingPaneMessages };
-        const newPaneHasMore: Record<string, boolean> = {};
+        const newPaneHasMore: Record<string, boolean> = { ...existingPaneHasMore };
         for (const [paneId, msgs] of Object.entries(paneMsgBuckets)) {
           const existing = existingPaneMessages[paneId] || [];
           if (existing.length === 0) {
             // First load for this pane — accept the server snapshot.
             newPaneMessages[paneId] = msgs;
-          } else {
-            // Merge: server-only messages prepended, local kept intact.
-            const localIds = new Set(existing.map((m) => m.id));
-            const serverOnly = msgs.filter((m) => !localIds.has(m.id));
-            newPaneMessages[paneId] = [...serverOnly, ...existing];
+            newPaneHasMore[paneId] = hasMore;
           }
-          newPaneHasMore[paneId] = hasMore;
+          // Else: skip. Live state wins.
         }
+        // Same rule for the legacy single-pane bucket.
+        const effectiveMessages = existingMessages.length === 0 ? mainMsgs : existingMessages;
         set({
           sessionId: data.session_id as string,
-          messages: mainMsgs,
+          messages: effectiveMessages,
           paneMessages: newPaneMessages,
           paneHasMore: newPaneHasMore,
           deadloopMessages: newPaneMessages[paneKey(PANE_ID_DEADLOOP)] || [],
           interactiveMessages: newPaneMessages[paneKey(PANE_ID_INTERACTIVE)] || [],
-          hasMoreMessages: hasMore,
+          hasMoreMessages: existingMessages.length === 0 ? hasMore : get().hasMoreMessages,
           hasMoreDeadloop: newPaneHasMore[paneKey(PANE_ID_DEADLOOP)] || false,
           hasMoreInteractive: newPaneHasMore[paneKey(PANE_ID_INTERACTIVE)] || false,
           paneModes: hasPaneModeHints
@@ -2173,11 +2177,13 @@ function handleServerMessage(
           isDualPane: true,
         });
       } else {
-        // Initial load - single pane mode
+        // Initial load - single pane mode. Same "trust local" rule:
+        // if we already have messages, ignore the server snapshot to
+        // avoid the random-ID-vs-storage-ID duplicate-merge bug.
         set((state) => ({
           sessionId: data.session_id as string,
-          messages: parsedMessages,
-          hasMoreMessages: hasMore,
+          messages: state.messages.length === 0 ? parsedMessages : state.messages,
+          hasMoreMessages: state.messages.length === 0 ? hasMore : state.hasMoreMessages,
           paneModes: hasPaneModeHints
             ? { ...state.paneModes, ...paneModeHints }
             : state.paneModes,
