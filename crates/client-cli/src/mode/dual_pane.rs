@@ -1464,6 +1464,10 @@ fn handle_tui_events(
                 effort,
                 worktree_path,
                 initial_input,
+                role,
+                goal,
+                backstory,
+                plan_review_mode,
             }) => {
                 let label =
                     pane_label_or_default(Some(&requested_label), pane_id, model.as_deref());
@@ -1494,11 +1498,11 @@ fn handle_tui_events(
                             pending_questions: Arc::new(Mutex::new(HashMap::new())),
                             effort_arc: Arc::new(Mutex::new(normalized_effort.clone())),
                             worktree_path: worktree_path.clone(),
-                            role: None,
-                            goal: None,
-                            backstory: None,
-                            plan_review_mode: shared::PlanReviewMode::default(),
-                            plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                            role: role.clone(),
+                            goal: goal.clone(),
+                            backstory: backstory.clone(),
+                            plan_review_mode: plan_review_mode.clone(),
+                            plan_review_mode_arc: Arc::new(Mutex::new(plan_review_mode.clone())),
                             pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                         },
                     );
@@ -6647,6 +6651,10 @@ async fn run_server_connection(
                                                             effort: meta.effort,
                                                             worktree_path: meta.worktree_path,
                                                             initial_input: queued,
+                                                            role: meta.role,
+                                                            goal: meta.goal,
+                                                            backstory: meta.backstory,
+                                                            plan_review_mode: meta.plan_review_mode,
                                                         });
                                                     } else {
                                                         tracing::warn!(
@@ -6878,6 +6886,10 @@ async fn run_server_connection(
                                                     effort: pane_config.effort,
                                                     worktree_path,
                                                     initial_input: None,
+                                                    role: pane_config.role,
+                                                    goal: pane_config.goal,
+                                                    backstory: pane_config.backstory,
+                                                    plan_review_mode: pane_config.plan_review_mode,
                                                 });
                                             }
                                             ServerToCli::RemovePane { session_id: _, pane_id: remove_id, cleanup_action } => {

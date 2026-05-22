@@ -417,6 +417,12 @@ interface AppState {
     prompt?: string,
     model?: string,
     isolatedWorktree?: boolean,
+    initialRole?: {
+      role?: string;
+      goal?: string;
+      backstory?: string;
+      planReviewMode?: PlanReviewMode;
+    },
   ) => { success: boolean; error?: string };
   removePane: (paneId: number, cleanupAction?: PaneCleanupAction) => void;
   updatePaneLabel: (paneId: number, label: string) => void;
@@ -1304,6 +1310,12 @@ export const useStore = create<AppState>((set, get) => ({
     prompt?: string,
     model?: string,
     isolatedWorktree?: boolean,
+    initialRole?: {
+      role?: string;
+      goal?: string;
+      backstory?: string;
+      planReviewMode?: PlanReviewMode;
+    },
   ) => {
     const { ws, sessionId, isAttached } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -1323,6 +1335,10 @@ export const useStore = create<AppState>((set, get) => ({
       prompt: prompt || undefined,
       model: model || undefined,
       isolated_worktree: isolatedWorktree === true ? true : undefined,
+      role: initialRole?.role || undefined,
+      goal: initialRole?.goal || undefined,
+      backstory: initialRole?.backstory || undefined,
+      plan_review_mode: initialRole?.planReviewMode || undefined,
     }));
     return { success: true };
   },

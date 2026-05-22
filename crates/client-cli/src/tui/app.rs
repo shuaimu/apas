@@ -80,6 +80,14 @@ pub enum TuiEvent {
         /// Deadloop panes log + drop it (no good place to inject mid-
         /// loop without disrupting the /loop kickoff).
         initial_input: Option<String>,
+        /// Initial role/goal/backstory baked into the agent's first
+        /// system prompt — populated when the pane was created via
+        /// the Overview "Add Worker" modal with a template selected.
+        /// None on legacy paths.
+        role: Option<String>,
+        goal: Option<String>,
+        backstory: Option<String>,
+        plan_review_mode: shared::PlanReviewMode,
     },
     CloseTab {
         pane_id: u32,

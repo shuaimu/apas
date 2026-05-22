@@ -544,6 +544,19 @@ pub enum WebToServer {
         /// PaneConfig.worktree_path. Phase 1.1e.
         #[serde(default)]
         isolated_worktree: bool,
+        /// Initial role/goal/backstory/plan_review_mode applied to the new
+        /// pane BEFORE the first spawn — so a templated worker (Add Worker
+        /// modal on Overview) uses the right system prompt immediately
+        /// instead of needing a close+reopen. All optional; missing fields
+        /// keep the legacy "set via Role modal later" path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        backstory: Option<String>,
+        #[serde(default)]
+        plan_review_mode: PlanReviewMode,
     },
 
     /// Remove a pane. When the pane has an isolated worktree assigned

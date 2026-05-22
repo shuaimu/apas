@@ -1071,6 +1071,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     prompt,
                     model,
                     isolated_worktree,
+                    role,
+                    goal,
+                    backstory,
+                    plan_review_mode,
                 }) => {
                     if let Some(sid) = session_id {
                         // Generate a unique pane_id starting from 3 (1 and 2 are reserved for legacy deadloop/interactive)
@@ -1088,10 +1092,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             model,
                             effort: None,
                             worktree_path: None,
-                            role: None,
-                            goal: None,
-                            backstory: None,
-                            plan_review_mode: shared::PlanReviewMode::default(),
+                            role,
+                            goal,
+                            backstory,
+                            plan_review_mode,
                         };
                         tracing::info!(
                             "Adding pane {} to session {} (isolated_worktree={})",
