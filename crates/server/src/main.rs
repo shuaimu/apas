@@ -46,6 +46,35 @@ async fn async_main() -> Result<()> {
     // Create app state
     let state = AppState::new(db, config.clone());
 
+    // Spawn the 30-day GC task. Runs once at boot to catch the backlog,
+    // then every 24h. Pure delete — drops messages with created_at older
+    // than the cutoff, no archive.
+    let storage_for_gc = state.storage.clone();
+    tokio::spawn(async move {
+        let interval = std::time::Duration::from_secs(60 * 60 * 24);
+        let retention_days: i64 = 30;
+        loop {
+            let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days);
+            tracing::info!(
+                cutoff = %cutoff,
+                retention_days,
+                "Running message GC sweep"
+            );
+            match storage_for_gc.gc_all_sessions_before(cutoff).await {
+                Ok(stats) => tracing::info!(
+                    sessions_scanned = stats.sessions_scanned,
+                    sessions_modified = stats.sessions_modified,
+                    messages_kept = stats.messages_kept,
+                    messages_dropped = stats.messages_dropped,
+                    bytes_freed = stats.bytes_freed,
+                    "Message GC sweep complete"
+                ),
+                Err(e) => tracing::warn!("Message GC sweep failed: {}", e),
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+
     // Build router
     let app = routes::create_router(state);
 

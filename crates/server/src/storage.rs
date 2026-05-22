@@ -1,8 +1,12 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,13 +23,36 @@ pub struct StoredMessage {
 #[derive(Clone)]
 pub struct FileStorage {
     base_path: PathBuf,
+    /// Per-session locks shared between message appends and the periodic GC
+    /// task. Without this an `append_message` mid-write would race with the
+    /// GC's atomic rename — the append handle would land on the orphaned
+    /// pre-rename inode and the message would silently vanish.
+    session_locks: Arc<StdMutex<HashMap<Uuid, Arc<AsyncMutex<()>>>>>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct GcStats {
+    pub sessions_scanned: u64,
+    pub sessions_modified: u64,
+    pub messages_kept: u64,
+    pub messages_dropped: u64,
+    pub bytes_freed: u64,
 }
 
 impl FileStorage {
     pub fn new(base_path: impl AsRef<Path>) -> Self {
         Self {
             base_path: base_path.as_ref().to_path_buf(),
+            session_locks: Arc::new(StdMutex::new(HashMap::new())),
         }
+    }
+
+    fn session_lock(&self, session_id: &Uuid) -> Arc<AsyncMutex<()>> {
+        let mut locks = self.session_locks.lock().expect("session_locks poisoned");
+        locks
+            .entry(*session_id)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
     }
 
     /// Get the directory path for a session
@@ -52,6 +79,9 @@ impl FileStorage {
 
     /// Append a message to the session's message file
     pub async fn append_message(&self, session_id: &Uuid, message: &StoredMessage) -> Result<()> {
+        let lock = self.session_lock(session_id);
+        let _guard = lock.lock().await;
+
         self.ensure_session_dir(session_id).await?;
 
         let file_path = self.messages_file(session_id);
@@ -367,6 +397,109 @@ impl FileStorage {
         Ok((combined, has_more))
     }
 
+    /// Drop every message with `created_at < cutoff` from a session's
+    /// messages.jsonl. Reads the file, filters lines whose timestamp falls
+    /// before the cutoff, writes the survivors to `messages.jsonl.tmp`, then
+    /// atomically renames over the original. Holds the per-session lock for
+    /// the whole operation so concurrent appends queue cleanly.
+    ///
+    /// Returns (kept, dropped, bytes_freed). Lines that fail to parse are
+    /// kept defensively so a parser regression can't silently delete data.
+    pub async fn gc_session_before(
+        &self,
+        session_id: &Uuid,
+        cutoff: DateTime<Utc>,
+    ) -> Result<(u64, u64, u64)> {
+        let lock = self.session_lock(session_id);
+        let _guard = lock.lock().await;
+
+        let file_path = self.messages_file(session_id);
+        if !file_path.exists() {
+            return Ok((0, 0, 0));
+        }
+
+        let original_size = fs::metadata(&file_path).await?.len();
+
+        let file = fs::File::open(&file_path).await?;
+        let reader = BufReader::new(file);
+        let mut lines = reader.lines();
+
+        let tmp_path = file_path.with_extension("jsonl.tmp");
+        let mut tmp = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .await?;
+
+        let mut kept: u64 = 0;
+        let mut dropped: u64 = 0;
+
+        while let Some(line) = lines.next_line().await? {
+            if line.trim().is_empty() {
+                continue;
+            }
+            // Parse just enough to read created_at. Unparseable lines are
+            // kept — better to retain mystery data than to silently nuke it.
+            let keep = match serde_json::from_str::<StoredMessage>(&line) {
+                Ok(msg) => match DateTime::parse_from_rfc3339(&msg.created_at) {
+                    Ok(ts) => ts.with_timezone(&Utc) >= cutoff,
+                    Err(_) => true,
+                },
+                Err(_) => true,
+            };
+            if keep {
+                tmp.write_all(line.as_bytes()).await?;
+                tmp.write_all(b"\n").await?;
+                kept += 1;
+            } else {
+                dropped += 1;
+            }
+        }
+
+        tmp.flush().await?;
+        drop(tmp);
+
+        if dropped == 0 {
+            // Nothing to rewrite — leave the original alone.
+            let _ = fs::remove_file(&tmp_path).await;
+            return Ok((kept, 0, 0));
+        }
+
+        fs::rename(&tmp_path, &file_path).await?;
+        let new_size = fs::metadata(&file_path).await?.len();
+        let bytes_freed = original_size.saturating_sub(new_size);
+        Ok((kept, dropped, bytes_freed))
+    }
+
+    /// Walk every session directory and GC each. Returns aggregated stats so
+    /// the periodic task can log a single summary line per run.
+    pub async fn gc_all_sessions_before(&self, cutoff: DateTime<Utc>) -> Result<GcStats> {
+        let mut stats = GcStats::default();
+        let sessions = self.list_sessions_with_messages().await?;
+        for sid in sessions {
+            stats.sessions_scanned += 1;
+            match self.gc_session_before(&sid, cutoff).await {
+                Ok((kept, dropped, freed)) => {
+                    stats.messages_kept += kept;
+                    stats.messages_dropped += dropped;
+                    stats.bytes_freed += freed;
+                    if dropped > 0 {
+                        stats.sessions_modified += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "GC failed for session {}: {} — leaving file intact",
+                        sid,
+                        e
+                    );
+                }
+            }
+        }
+        Ok(stats)
+    }
+
     /// List all session IDs that have message files
     pub async fn list_sessions_with_messages(&self) -> Result<Vec<Uuid>> {
         let sessions_dir = self.base_path.join("sessions");
@@ -438,6 +571,165 @@ fn parse_stored_pane_id(raw_pane_type: Option<&str>) -> Option<u32> {
     }
     let trailing_digits: String = trailing_digits_rev.chars().rev().collect();
     trailing_digits.parse::<u32>().ok()
+}
+
+#[cfg(test)]
+mod gc_tests {
+    use super::{FileStorage, StoredMessage};
+    use chrono::{Duration, Utc};
+    use uuid::Uuid;
+
+    fn fresh_storage() -> FileStorage {
+        let base = std::env::temp_dir().join(format!("apas-gc-test-{}", Uuid::new_v4()));
+        FileStorage::new(base)
+    }
+
+    fn make_msg(id: &str, ts_iso: &str) -> StoredMessage {
+        StoredMessage {
+            id: id.into(),
+            role: "assistant".into(),
+            content: "hello".into(),
+            message_type: "text".into(),
+            created_at: ts_iso.into(),
+            pane_type: Some("2".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn gc_drops_messages_older_than_cutoff() {
+        let storage = fresh_storage();
+        let sid = Uuid::new_v4();
+        let now = Utc::now();
+        let old = (now - Duration::days(45)).to_rfc3339();
+        let recent = (now - Duration::days(2)).to_rfc3339();
+
+        storage
+            .append_message(&sid, &make_msg("old1", &old))
+            .await
+            .unwrap();
+        storage
+            .append_message(&sid, &make_msg("old2", &old))
+            .await
+            .unwrap();
+        storage
+            .append_message(&sid, &make_msg("recent1", &recent))
+            .await
+            .unwrap();
+
+        let cutoff = now - Duration::days(30);
+        let (kept, dropped, freed) = storage.gc_session_before(&sid, cutoff).await.unwrap();
+        assert_eq!(kept, 1);
+        assert_eq!(dropped, 2);
+        assert!(freed > 0);
+
+        let survivors = storage.get_messages(&sid).await.unwrap();
+        assert_eq!(survivors.len(), 1);
+        assert_eq!(survivors[0].id, "recent1");
+    }
+
+    #[tokio::test]
+    async fn gc_keeps_everything_when_nothing_is_old() {
+        let storage = fresh_storage();
+        let sid = Uuid::new_v4();
+        let now = Utc::now();
+        let recent = (now - Duration::days(2)).to_rfc3339();
+
+        storage
+            .append_message(&sid, &make_msg("r1", &recent))
+            .await
+            .unwrap();
+        storage
+            .append_message(&sid, &make_msg("r2", &recent))
+            .await
+            .unwrap();
+
+        let (kept, dropped, freed) = storage
+            .gc_session_before(&sid, now - Duration::days(30))
+            .await
+            .unwrap();
+        assert_eq!(kept, 2);
+        assert_eq!(dropped, 0);
+        assert_eq!(freed, 0);
+
+        let survivors = storage.get_messages(&sid).await.unwrap();
+        assert_eq!(survivors.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn gc_keeps_unparseable_lines_defensively() {
+        let storage = fresh_storage();
+        let sid = Uuid::new_v4();
+        let now = Utc::now();
+        let recent = (now - Duration::days(2)).to_rfc3339();
+
+        storage
+            .append_message(&sid, &make_msg("r1", &recent))
+            .await
+            .unwrap();
+        // Inject a malformed line — a parser regression must not silently
+        // delete it. Append directly to bypass JSON serialization.
+        let path = storage.messages_file(&sid);
+        let mut f = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut f, b"this is not json\n")
+            .await
+            .unwrap();
+        drop(f);
+
+        let (kept, dropped, _) = storage
+            .gc_session_before(&sid, now - Duration::days(30))
+            .await
+            .unwrap();
+        assert_eq!(kept, 2);
+        assert_eq!(dropped, 0);
+    }
+
+    #[tokio::test]
+    async fn gc_no_op_on_missing_file_is_zero() {
+        let storage = fresh_storage();
+        let sid = Uuid::new_v4();
+        let (kept, dropped, freed) = storage
+            .gc_session_before(&sid, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!((kept, dropped, freed), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn gc_all_aggregates_stats_across_sessions() {
+        let storage = fresh_storage();
+        let now = Utc::now();
+        let old = (now - Duration::days(45)).to_rfc3339();
+        let recent = (now - Duration::days(2)).to_rfc3339();
+
+        let sid_a = Uuid::new_v4();
+        storage
+            .append_message(&sid_a, &make_msg("a1", &old))
+            .await
+            .unwrap();
+        storage
+            .append_message(&sid_a, &make_msg("a2", &recent))
+            .await
+            .unwrap();
+
+        let sid_b = Uuid::new_v4();
+        storage
+            .append_message(&sid_b, &make_msg("b1", &recent))
+            .await
+            .unwrap();
+
+        let stats = storage
+            .gc_all_sessions_before(now - Duration::days(30))
+            .await
+            .unwrap();
+        assert_eq!(stats.sessions_scanned, 2);
+        assert_eq!(stats.sessions_modified, 1);
+        assert_eq!(stats.messages_kept, 2);
+        assert_eq!(stats.messages_dropped, 1);
+    }
 }
 
 #[cfg(test)]
