@@ -201,6 +201,8 @@ export function TabbedView() {
   const loadMoreMessages = useStore((s) => s.loadMoreMessages);
   const addPane = useStore((s) => s.addPane);
   const removePane = useStore((s) => s.removePane);
+  const pausePane = useStore((s) => s.pausePane);
+  const resumePane = useStore((s) => s.resumePane);
   const updatePaneLabel = useStore((s) => s.updatePaneLabel);
   const updatePaneEffort = useStore((s) => s.updatePaneEffort);
   const interruptPane = useStore((s) => s.interruptPane);
@@ -899,6 +901,9 @@ export function TabbedView() {
             requestPaneDiff(pid);
           }}
           onOpenRole={(pid) => setRoleModalPaneId(pid)}
+          onPausePane={pausePane}
+          onResumePane={resumePane}
+          onRemovePane={handleCloseTab}
         />
       ) : effectiveTabs.length === 0 ? (
         // Single-pane fallback (no pane system / synthesizing from
@@ -1246,12 +1251,12 @@ function RoleModal({ open, pane, onClose, onSave }: RoleModalProps) {
             />
           </label>
           <label className="flex flex-col gap-1 text-xs">
-            <span className="text-zinc-300">Goal <span className="text-zinc-500">(one-line objective)</span></span>
-            <input
-              type="text"
+            <span className="text-zinc-300">Goal <span className="text-zinc-500">(this worker&apos;s responsibility / scope — what files, subsystems, branches)</span></span>
+            <textarea
               value={goal}
               onChange={(e) => setGoal(e.target.value)}
-              className="rounded border border-zinc-700 bg-zinc-800 px-2 py-1 font-mono"
+              rows={3}
+              className="rounded border border-zinc-700 bg-zinc-800 px-2 py-1 font-mono resize-y"
             />
           </label>
           <label className="flex flex-col gap-1 text-xs">

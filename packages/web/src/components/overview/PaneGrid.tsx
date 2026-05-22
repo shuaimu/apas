@@ -22,9 +22,19 @@ interface PaneGridProps {
   onOpenPane: (paneId: number) => void;
   onOpenDiff: (paneId: number) => void;
   onOpenRole: (paneId: number) => void;
+  onPausePane: (paneId: number) => void;
+  onResumePane: (paneId: number) => void;
+  onRemovePane: (paneId: number) => void;
 }
 
-export function PaneGrid({ onOpenPane, onOpenDiff, onOpenRole }: PaneGridProps) {
+export function PaneGrid({
+  onOpenPane,
+  onOpenDiff,
+  onOpenRole,
+  onPausePane,
+  onResumePane,
+  onRemovePane,
+}: PaneGridProps) {
   const paneConfigs = useStore((s) => s.paneConfigs);
   const paneStatuses = useStore((s) => s.paneStatuses);
   const pausedPanes = useStore((s) => s.pausedPanes);
@@ -65,6 +75,9 @@ export function PaneGrid({ onOpenPane, onOpenDiff, onOpenRole }: PaneGridProps) 
             onOpen={() => onOpenPane(pane.pane_id)}
             onOpenDiff={() => onOpenDiff(pane.pane_id)}
             onOpenRole={() => onOpenRole(pane.pane_id)}
+            onPause={() => onPausePane(pane.pane_id)}
+            onResume={() => onResumePane(pane.pane_id)}
+            onRemove={() => onRemovePane(pane.pane_id)}
           />
         );
       })}
@@ -82,6 +95,9 @@ interface PaneCardProps {
   onOpen: () => void;
   onOpenDiff: () => void;
   onOpenRole: () => void;
+  onPause: () => void;
+  onResume: () => void;
+  onRemove: () => void;
 }
 
 function PaneCard({
@@ -94,6 +110,9 @@ function PaneCard({
   onOpen,
   onOpenDiff,
   onOpenRole,
+  onPause,
+  onResume,
+  onRemove,
 }: PaneCardProps) {
   const isBot = pane.mode === "deadloop";
   const isThinking = !!status && !isPaused;
@@ -137,6 +156,15 @@ function PaneCard({
         </span>
       </div>
 
+      {pane.goal && (
+        <div
+          className="line-clamp-2 text-xs text-gray-600 dark:text-gray-300"
+          title={pane.goal}
+        >
+          {pane.goal}
+        </div>
+      )}
+
       {status && (
         <div className="rounded bg-blue-50 dark:bg-blue-900/30 px-2 py-1 text-xs text-blue-700 dark:text-blue-300">
           {status}
@@ -178,9 +206,50 @@ function PaneCard({
               e.stopPropagation();
               onOpenRole();
             }}
+            title="Edit role / goal / backstory"
           >
             Role
           </span>
+          {isBot && (
+            isPaused ? (
+              <span
+                className="rounded border border-emerald-400 dark:border-emerald-700 bg-emerald-50 dark:bg-emerald-900/30 px-1.5 py-0.5 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/50"
+                role="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onResume();
+                }}
+                title="Resume this deadloop"
+              >
+                Resume
+              </span>
+            ) : (
+              <span
+                className="rounded border border-amber-400 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/30 px-1.5 py-0.5 text-amber-700 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-900/50"
+                role="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onPause();
+                }}
+                title="Pause this deadloop"
+              >
+                Pause
+              </span>
+            )
+          )}
+          {pane.pane_id !== PANE_ID_INTERACTIVE && pane.pane_id !== PANE_ID_DEADLOOP && (
+            <span
+              className="rounded border border-red-400 dark:border-red-700 bg-red-50 dark:bg-red-900/30 px-1.5 py-0.5 text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/50"
+              role="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onRemove();
+              }}
+              title="Close this pane (worktree-cleanup prompt opens if applicable)"
+            >
+              Remove
+            </span>
+          )}
           {(pane.pane_id === PANE_ID_INTERACTIVE || pane.pane_id === PANE_ID_DEADLOOP) && (
             <span
               className="rounded bg-gray-100 dark:bg-gray-700 px-1.5 py-0.5 text-[10px] text-gray-500 dark:text-gray-400"

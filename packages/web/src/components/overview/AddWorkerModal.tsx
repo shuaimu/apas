@@ -199,13 +199,13 @@ export function AddWorkerModal({ open, onClose }: AddWorkerModalProps) {
           </label>
           <label className="flex flex-col gap-1 text-xs">
             <span className="text-zinc-300">
-              Goal <span className="text-zinc-500">(one line)</span>
+              Goal <span className="text-zinc-500">(this worker&apos;s responsibility / scope)</span>
             </span>
-            <input
-              type="text"
+            <textarea
               value={goal}
               onChange={(e) => setGoal(e.target.value)}
-              className="rounded border border-zinc-700 bg-zinc-800 px-2 py-1 font-mono text-zinc-100"
+              rows={3}
+              className="rounded border border-zinc-700 bg-zinc-800 px-2 py-1 font-mono text-zinc-100 resize-y"
             />
           </label>
           <label className="flex flex-col gap-1 text-xs">

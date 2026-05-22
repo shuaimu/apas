@@ -15,9 +15,19 @@ interface OverviewViewProps {
   onOpenPane: (paneId: number) => void;
   onOpenDiff: (paneId: number) => void;
   onOpenRole: (paneId: number) => void;
+  onPausePane: (paneId: number) => void;
+  onResumePane: (paneId: number) => void;
+  onRemovePane: (paneId: number) => void;
 }
 
-export function OverviewView({ onOpenPane, onOpenDiff, onOpenRole }: OverviewViewProps) {
+export function OverviewView({
+  onOpenPane,
+  onOpenDiff,
+  onOpenRole,
+  onPausePane,
+  onResumePane,
+  onRemovePane,
+}: OverviewViewProps) {
   const [addWorkerOpen, setAddWorkerOpen] = useState(false);
 
   return (
@@ -46,6 +56,9 @@ export function OverviewView({ onOpenPane, onOpenDiff, onOpenRole }: OverviewVie
             onOpenPane={onOpenPane}
             onOpenDiff={onOpenDiff}
             onOpenRole={onOpenRole}
+            onPausePane={onPausePane}
+            onResumePane={onResumePane}
+            onRemovePane={onRemovePane}
           />
         </OverviewSection>
 
