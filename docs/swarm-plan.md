@@ -421,9 +421,25 @@ Phase 4.2 is complete. Phase 4 (UX polish) substantively done —
   `UsageLimitsDisplay` (the existing per-pane-header component) in
   a 1/2/3-column grid keyed by provider. Skips providers with no
   cached limits yet.
-- [ ] **5.1f — sparkline** *(optional)*: last-hour activity per pane.
+- [x] **5.1f — sparkline**: shipped per-pane last-hour activity
+  sparkline in the Overview PaneCard. New `ActivitySparkline.tsx`
+  renders a 60-bucket SVG (one bucket per minute) showing assistant
+  + tool_use message emissions over the previous hour, with the
+  latest bucket highlighted in indigo. Empty-hour state shows a faded
+  dashed baseline so the row still has visual weight. Counts ignore
+  user/system rows since the goal is "did the agent emit anything"
+  (relevant for deadloops: a wedged loop shows a flat line while a
+  healthy one paints regular bars). Pure bucketing helper
+  `bucketMessages(messages, now)` is exported and unit-tested
+  separately — 7 tests cover empty / role-filtering / boundary
+  buckets / out-of-window dropping / future-defensive / max.
+  Deviation from the plan: rendered inline in each PaneCard rather
+  than as a separate dashboard section — keeping it adjacent to the
+  pane's other metadata makes the "spot the wedged one" scan a
+  single visual sweep down the grid, and avoids duplicating the data
+  in two places.
 
-Phase 5.1 is substantively complete (5.1f deferred — nice-to-have).
+Phase 5.1 is complete.
 
 ## Tradeoffs to revisit at each phase
 

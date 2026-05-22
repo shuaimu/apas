@@ -9,12 +9,14 @@
  */
 import { useMemo } from "react";
 import {
+  Message,
   PaneConfig,
   useStore,
   paneKey,
   PANE_ID_DEADLOOP,
   PANE_ID_INTERACTIVE,
 } from "@/lib/store";
+import { ActivitySparkline } from "./ActivitySparkline";
 
 interface PaneGridProps {
   onOpenPane: (paneId: number) => void;
@@ -57,6 +59,7 @@ export function PaneGrid({ onOpenPane, onOpenDiff, onOpenRole }: PaneGridProps) 
             pane={pane}
             status={status ?? null}
             isPaused={isPaused}
+            messages={messages}
             lastActivity={lastMsg?.timestamp}
             diffStats={diff?.diff ? summarizeDiffStats(diff.diff) : undefined}
             onOpen={() => onOpenPane(pane.pane_id)}
@@ -73,6 +76,7 @@ interface PaneCardProps {
   pane: PaneConfig;
   status: string | null;
   isPaused: boolean;
+  messages: Message[];
   lastActivity?: Date;
   diffStats?: { added: number; removed: number };
   onOpen: () => void;
@@ -84,6 +88,7 @@ function PaneCard({
   pane,
   status,
   isPaused,
+  messages,
   lastActivity,
   diffStats,
   onOpen,
@@ -152,6 +157,7 @@ function PaneCard({
 
       <div className="flex items-center gap-2 text-[11px] text-gray-500 dark:text-gray-400">
         <span>{lastActivity ? `last: ${formatRelative(lastActivity)}` : "no activity yet"}</span>
+        <ActivitySparkline messages={messages} />
         <span className="ml-auto flex gap-1.5">
           {pane.worktree_path && (
             <span
