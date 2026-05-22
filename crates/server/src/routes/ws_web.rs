@@ -58,16 +58,102 @@ fn parse_stored_pane_id(raw_pane_type: Option<&str>) -> Option<u32> {
     trailing_digits.parse::<u32>().ok()
 }
 
+/// Cap any single message's serialized content to keep batched SessionMessages
+/// payloads below tungstenite's default ~16 MiB frame limit. The historical
+/// trigger: an Edit tool_result includes the entire before+after of a touched
+/// file, which for big source files can easily be multi-MB. 100 such messages
+/// for one pane × 3+ active panes blew past the frame limit and the whole
+/// load-on-attach payload was being dropped — the symptom was "rusty-lib pane
+/// loads no messages."
+const MAX_TRANSIT_CONTENT_BYTES: usize = 96 * 1024;
+
+fn truncate_for_transit(content: String, message_type: &str) -> String {
+    if content.len() <= MAX_TRANSIT_CONTENT_BYTES {
+        return content;
+    }
+    // tool_result content is a JSON envelope the web client parses; truncating
+    // the raw string would break JSON.parse on the client. Replace the inner
+    // payload with a stub that preserves the envelope.
+    if message_type == "tool_result" {
+        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(obj) = v.as_object_mut() {
+                let original_len = content.len();
+                if let Some(inner) = obj.get_mut("content") {
+                    if let Some(s) = inner.as_str() {
+                        let head: String = s.chars().take(8_192).collect();
+                        *inner = serde_json::Value::String(format!(
+                            "{head}\n…[truncated for transit; full size {} bytes]",
+                            original_len
+                        ));
+                    }
+                }
+                // tool_use_result holds full before/after for Edit and similar;
+                // dropping it keeps the human-visible content+is_error fields.
+                obj.remove("tool_use_result");
+                if let Ok(serialized) = serde_json::to_string(&v) {
+                    return serialized;
+                }
+            }
+        }
+    }
+    // Fallback for non-JSON content: hard-truncate with a marker.
+    let original_len = content.len();
+    let head: String = content.chars().take(8_192).collect();
+    format!("{head}\n…[truncated for transit; full size {original_len} bytes]")
+}
+
 fn to_message_info(message: crate::storage::StoredMessage) -> MessageInfo {
     let pane_id = parse_stored_pane_id(message.pane_type.as_deref());
+    let content = truncate_for_transit(message.content, &message.message_type);
     MessageInfo {
         id: message.id,
         role: message.role,
-        content: message.content,
+        content,
         message_type: message.message_type,
         created_at: Some(message.created_at),
         pane_type: message.pane_type,
         pane_id,
+    }
+}
+
+#[cfg(test)]
+mod transit_truncation_tests {
+    use super::*;
+
+    #[test]
+    fn passes_small_text_through() {
+        let s = "short assistant text".to_string();
+        assert_eq!(truncate_for_transit(s.clone(), "text"), s);
+    }
+
+    #[test]
+    fn truncates_non_json_oversize_with_marker() {
+        let big = "a".repeat(MAX_TRANSIT_CONTENT_BYTES + 100);
+        let out = truncate_for_transit(big.clone(), "text");
+        assert!(out.len() < MAX_TRANSIT_CONTENT_BYTES);
+        assert!(out.contains("truncated for transit"));
+        assert!(out.contains(&format!("{}", big.len())));
+    }
+
+    #[test]
+    fn keeps_tool_result_envelope_when_truncating() {
+        let huge_inner = "x".repeat(MAX_TRANSIT_CONTENT_BYTES);
+        let envelope = serde_json::json!({
+            "content": huge_inner,
+            "is_error": false,
+            "tool_use_id": "toolu_abc",
+            "tool_use_result": {"oldString": "y".repeat(1024)}
+        })
+        .to_string();
+        let out = truncate_for_transit(envelope, "tool_result");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("envelope must remain valid JSON");
+        assert_eq!(parsed["is_error"], false);
+        assert_eq!(parsed["tool_use_id"], "toolu_abc");
+        // tool_use_result is dropped on truncation
+        assert!(parsed.get("tool_use_result").is_none());
+        let inner = parsed["content"].as_str().expect("content stays a string");
+        assert!(inner.contains("truncated for transit"));
     }
 }
 
