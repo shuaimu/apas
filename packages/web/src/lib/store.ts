@@ -1050,7 +1050,12 @@ export const useStore = create<AppState>((set, get) => ({
       ws.send(JSON.stringify({ type: "start_session" }));
     }
 
-    ws.send(JSON.stringify({ type: "input", text }));
+    // `session_id` is required for multi-attached connections: the server
+    // routes pane-scoped messages on it instead of the connection's
+    // last-attached session, which is non-deterministic. See store.ts:1623
+    // (cached-session subscribe loop) and ws_web.rs:1328 (overwrites the
+    // connection's tracked session on every attach).
+    ws.send(JSON.stringify({ type: "input", session_id: sessionId, text }));
   },
 
   addMessage: (message: Message) => {
@@ -1058,16 +1063,16 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   approve: (toolCallId: string) => {
-    const { ws } = get();
+    const { ws, sessionId } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "approve", tool_call_id: toolCallId }));
+      ws.send(JSON.stringify({ type: "approve", session_id: sessionId, tool_call_id: toolCallId }));
     }
   },
 
   reject: (toolCallId: string) => {
-    const { ws } = get();
+    const { ws, sessionId } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "reject", tool_call_id: toolCallId }));
+      ws.send(JSON.stringify({ type: "reject", session_id: sessionId, tool_call_id: toolCallId }));
     }
   },
 
@@ -1175,6 +1180,7 @@ export const useStore = create<AppState>((set, get) => ({
 
     ws.send(JSON.stringify({
       type: "input",
+      session_id: sessionId,
       text,
       pane_type: paneType, // Legacy compat: must be "deadloop" or "interactive"
       pane_id: paneId
@@ -1237,27 +1243,27 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   pauseDeadloop: () => {
-    const { ws } = get();
+    const { ws, sessionId } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "pause_deadloop" }));
       // Also send new pane-specific pause
-      ws.send(JSON.stringify({ type: "pause_pane", pane_id: PANE_ID_DEADLOOP }));
+      ws.send(JSON.stringify({ type: "pause_pane", session_id: sessionId, pane_id: PANE_ID_DEADLOOP }));
     }
   },
 
   resumeDeadloop: () => {
-    const { ws } = get();
+    const { ws, sessionId } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "resume_deadloop" }));
       // Also send new pane-specific resume
-      ws.send(JSON.stringify({ type: "resume_pane", pane_id: PANE_ID_DEADLOOP }));
+      ws.send(JSON.stringify({ type: "resume_pane", session_id: sessionId, pane_id: PANE_ID_DEADLOOP }));
     }
   },
 
   pausePane: (paneId: number) => {
-    const { ws } = get();
+    const { ws, sessionId } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "pause_pane", pane_id: paneId }));
+      ws.send(JSON.stringify({ type: "pause_pane", session_id: sessionId, pane_id: paneId }));
       // Also send legacy message for backward compat
       if (paneId === PANE_ID_DEADLOOP) {
         ws.send(JSON.stringify({ type: "pause_deadloop" }));
@@ -1266,9 +1272,9 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   resumePane: (paneId: number) => {
-    const { ws } = get();
+    const { ws, sessionId } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "resume_pane", pane_id: paneId }));
+      ws.send(JSON.stringify({ type: "resume_pane", session_id: sessionId, pane_id: paneId }));
       if (paneId === PANE_ID_DEADLOOP) {
         ws.send(JSON.stringify({ type: "resume_deadloop" }));
       }
@@ -1856,6 +1862,16 @@ function handleServerMessage(
     }
 
     case "pane_status": {
+      // The web is multi-attached to several sessions (background tabs stay
+      // live). Statuses from non-foreground sessions would otherwise
+      // overwrite paneStatuses[paneId] for the tab the user is actually
+      // viewing — that's how a "Pane worker unavailable" status from one
+      // project's CLI ended up on another project's tab pill.
+      const msgSessionId = data.session_id as string | undefined;
+      const curSessionId = get().sessionId;
+      if (msgSessionId && curSessionId && msgSessionId !== curSessionId) {
+        break;
+      }
       const paneType = data.pane_type as string | undefined;
       const paneId = normalizePaneId(paneType, data.pane_id as number | undefined);
       const status = data.status as string | null;

@@ -455,8 +455,15 @@ pub enum WebToServer {
     /// Attach to observe an existing CLI session (hybrid mode)
     AttachSession { session_id: Uuid },
 
-    /// User input to send to Claude
+    /// User input to send to Claude.
+    /// When `session_id` is set, the server routes to that exact session
+    /// (after verifying this web connection is attached to it). This is the
+    /// only safe option for clients that multi-attach: the connection's
+    /// last-attached session is non-deterministic when several attaches
+    /// race. Omitted = legacy single-attach behaviour.
     Input {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
         text: String,
         #[serde(default)]
         pane_type: Option<PaneType>,
@@ -464,14 +471,26 @@ pub enum WebToServer {
         pane_id: Option<u32>,
     },
 
-    /// Approve a tool call
-    Approve { tool_call_id: String },
+    /// Approve a tool call. See `Input::session_id` for the multi-attach rationale.
+    Approve {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
+        tool_call_id: String,
+    },
 
-    /// Reject a tool call
-    Reject { tool_call_id: String },
+    /// Reject a tool call. See `Input::session_id`.
+    Reject {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
+        tool_call_id: String,
+    },
 
-    /// Send signal (e.g., cancel/interrupt)
-    Signal { signal: String },
+    /// Send signal (e.g., cancel/interrupt). See `Input::session_id`.
+    Signal {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
+        signal: String,
+    },
 
     /// List all sessions (persisted)
     ListSessions,
@@ -495,11 +514,19 @@ pub enum WebToServer {
     /// Resume the deadloop session (legacy - use ResumePane for new code)
     ResumeDeadloop,
 
-    /// Pause a specific pane
-    PausePane { pane_id: u32 },
+    /// Pause a specific pane. See `Input::session_id`.
+    PausePane {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
+        pane_id: u32,
+    },
 
-    /// Resume a specific pane
-    ResumePane { pane_id: u32 },
+    /// Resume a specific pane. See `Input::session_id`.
+    ResumePane {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
+        pane_id: u32,
+    },
 
     /// Add a new pane
     AddPane {
@@ -747,8 +774,12 @@ pub enum ServerToWeb {
         is_paused: bool,
     },
 
-    /// Pane status update (e.g., "thinking") for status bar display
+    /// Pane status update (e.g., "thinking") for status bar display.
+    /// `session_id` lets the web client drop statuses for sessions it is
+    /// not currently viewing — the web is multi-attached to keep background
+    /// tabs live, but only the foreground tab should drive the status pill.
     PaneStatus {
+        session_id: Uuid,
         #[serde(default)]
         pane_type: PaneType,
         #[serde(default, skip_serializing_if = "Option::is_none")]

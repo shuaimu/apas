@@ -760,6 +760,22 @@ impl SessionManager {
         true
     }
 
+    /// Is this web connection currently attached to the given session?
+    /// Used to validate `WebToServer` messages that carry an explicit
+    /// session_id — without this gate, a connection could route input to
+    /// sessions it never asked to observe (and that the user-access check
+    /// at attach time vouched for).
+    pub fn is_web_attached_to_session(
+        &self,
+        session_id: &Uuid,
+        web_connection_id: &Uuid,
+    ) -> bool {
+        self.sessions
+            .get(session_id)
+            .map(|s| s.web_connection_ids.contains(web_connection_id))
+            .unwrap_or(false)
+    }
+
     /// Get the active session for a CLI client
     pub fn get_cli_active_session(&self, cli_id: &Uuid) -> Option<Uuid> {
         self.cli_sessions

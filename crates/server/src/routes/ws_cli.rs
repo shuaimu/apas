@@ -601,6 +601,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     .route_to_web(
                                         &session_id,
                                         ServerToWeb::PaneStatus {
+                                            session_id,
                                             pane_type,
                                             pane_id,
                                             status,

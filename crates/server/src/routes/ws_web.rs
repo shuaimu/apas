@@ -213,6 +213,58 @@ async fn list_accessible_machines_for_user(
     machines
 }
 
+/// Pick the session a `WebToServer` message should act on.
+///
+/// Multi-attach (commit b0c674d) lets one web connection observe several
+/// sessions in parallel, but the connection's `session_id` local variable
+/// is overwritten on every `AttachSession`, so it points at whichever
+/// session was attached last — non-deterministic when the web fan-out
+/// races. Messages that carry an explicit `session_id` use that (after
+/// verifying this connection has actually attached to it). Messages that
+/// don't are legacy — fall back to the connection's last-attached session.
+///
+/// Returns `None` after pushing an `Error` to the web client.
+async fn resolve_target_session(
+    state: &AppState,
+    connection_id: &Uuid,
+    msg_session_id: Option<Uuid>,
+    fallback: Option<Uuid>,
+) -> Option<Uuid> {
+    if let Some(sid) = msg_session_id {
+        if state.sessions.is_web_attached_to_session(&sid, connection_id) {
+            return Some(sid);
+        }
+        tracing::warn!(
+            "Web connection {} sent a message for session {} it is not attached to",
+            connection_id,
+            sid
+        );
+        state
+            .sessions
+            .send_to_web(
+                connection_id,
+                ServerToWeb::Error {
+                    message: "Not attached to that session".to_string(),
+                },
+            )
+            .await;
+        return None;
+    }
+    if let Some(sid) = fallback {
+        return Some(sid);
+    }
+    state
+        .sessions
+        .send_to_web(
+            connection_id,
+            ServerToWeb::Error {
+                message: "No session attached".to_string(),
+            },
+        )
+        .await;
+    None
+}
+
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
     let connection_id = Uuid::new_v4();
@@ -448,136 +500,139 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     tracing::info!("Session started: {} (CLI: {:?})", new_session_id, cli_id);
                 }
                 Ok(WebToServer::Input {
+                    session_id: msg_sid,
                     text,
                     pane_type,
                     pane_id,
                 }) => {
-                    if let Some(sid) = session_id {
-                        tracing::info!(
-                            "Routing input to session {}: {:?}",
-                            sid,
-                            text.chars().take(50).collect::<String>()
-                        );
+                    let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    else {
+                        continue;
+                    };
+                    tracing::info!(
+                        "Routing input to session {}: {:?}",
+                        sid,
+                        text.chars().take(50).collect::<String>()
+                    );
 
-                        // Route input to CLI
-                        let sent = state
+                    let sent = state
+                        .sessions
+                        .route_to_cli(
+                            &sid,
+                            ServerToCli::Input {
+                                session_id: sid,
+                                data: text.clone(),
+                                pane_id: pane_id.clone(),
+                            },
+                        )
+                        .await;
+
+                    if sent {
+                        let effective_pane_id = pane_id.or_else(|| {
+                            pane_type.map(|p| shared::PaneConfig::pane_id_from_legacy(&p))
+                        });
+                        let stored_message = crate::storage::StoredMessage {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            role: "user".to_string(),
+                            content: text.clone(),
+                            message_type: "text".to_string(),
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                            pane_type: effective_pane_id.map(|id| id.to_string()),
+                        };
+                        if let Err(e) = state.storage.append_message(&sid, &stored_message).await {
+                            tracing::error!("Failed to save user input to file: {}", e);
+                        }
+
+                        // Echo user input to all web clients for immediate display.
+                        // The CLI skips CliToServer::UserInput for web-originated
+                        // input (from_tui=false), so this is the only display path.
+                        state
                             .sessions
-                            .route_to_cli(
+                            .route_to_web(
                                 &sid,
-                                ServerToCli::Input {
+                                ServerToWeb::UserInput {
                                     session_id: sid,
-                                    data: text.clone(),
-                                    pane_id: pane_id.clone(),
+                                    text,
+                                    pane_type,
+                                    pane_id,
                                 },
                             )
                             .await;
-
-                        if sent {
-                            // Use pane_id for storage, falling back to pane_type
-                            let effective_pane_id = pane_id.or_else(|| {
-                                pane_type.map(|p| shared::PaneConfig::pane_id_from_legacy(&p))
-                            });
-                            // Save user input to file storage (same as CLI does)
-                            let stored_message = crate::storage::StoredMessage {
-                                id: uuid::Uuid::new_v4().to_string(),
-                                role: "user".to_string(),
-                                content: text.clone(),
-                                message_type: "text".to_string(),
-                                created_at: chrono::Utc::now().to_rfc3339(),
-                                pane_type: effective_pane_id.map(|id| id.to_string()),
-                            };
-                            if let Err(e) =
-                                state.storage.append_message(&sid, &stored_message).await
-                            {
-                                tracing::error!("Failed to save user input to file: {}", e);
-                            }
-
-                            // Echo user input to all web clients for immediate display.
-                            // The CLI skips CliToServer::UserInput for web-originated
-                            // input (from_tui=false), so this is the only display path.
-                            state
-                                .sessions
-                                .route_to_web(
-                                    &sid,
-                                    ServerToWeb::UserInput {
-                                        session_id: sid,
-                                        text,
-                                        pane_type,
-                                        pane_id,
-                                    },
-                                )
-                                .await;
-                        } else {
-                            tracing::warn!("Failed to route input to CLI for session {}", sid);
-                            state
-                                .sessions
-                                .send_to_web(
-                                    &connection_id,
-                                    ServerToWeb::Error {
-                                        message: "CLI client not connected".to_string(),
-                                    },
-                                )
-                                .await;
-                        }
                     } else {
-                        tracing::warn!(
-                            "Input received but no session_id set for web connection {}",
-                            connection_id
-                        );
+                        tracing::warn!("Failed to route input to CLI for session {}", sid);
                         state
                             .sessions
                             .send_to_web(
                                 &connection_id,
                                 ServerToWeb::Error {
-                                    message: "No session attached".to_string(),
+                                    message: "CLI client not connected".to_string(),
                                 },
                             )
                             .await;
                     }
                 }
-                Ok(WebToServer::Signal { signal }) => {
-                    if let Some(sid) = session_id {
-                        state
-                            .sessions
-                            .route_to_cli(
-                                &sid,
-                                ServerToCli::Signal {
-                                    session_id: sid,
-                                    signal,
-                                },
-                            )
-                            .await;
-                    }
+                Ok(WebToServer::Signal {
+                    session_id: msg_sid,
+                    signal,
+                }) => {
+                    let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    else {
+                        continue;
+                    };
+                    state
+                        .sessions
+                        .route_to_cli(
+                            &sid,
+                            ServerToCli::Signal {
+                                session_id: sid,
+                                signal,
+                            },
+                        )
+                        .await;
                 }
-                Ok(WebToServer::Approve { tool_call_id: _ }) => {
-                    if let Some(sid) = session_id {
-                        state
-                            .sessions
-                            .route_to_cli(
-                                &sid,
-                                ServerToCli::Input {
-                                    session_id: sid,
-                                    data: "y".to_string(),
-                                    pane_id: None,
-                                },
-                            )
-                            .await;
-                    }
+                Ok(WebToServer::Approve {
+                    session_id: msg_sid,
+                    tool_call_id: _,
+                }) => {
+                    let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    else {
+                        continue;
+                    };
+                    state
+                        .sessions
+                        .route_to_cli(
+                            &sid,
+                            ServerToCli::Input {
+                                session_id: sid,
+                                data: "y".to_string(),
+                                pane_id: None,
+                            },
+                        )
+                        .await;
                 }
-                Ok(WebToServer::Reject { tool_call_id: _ }) => {
-                    if let Some(sid) = session_id {
-                        state
-                            .sessions
-                            .route_to_cli(
-                                &sid,
-                                ServerToCli::Input {
-                                    session_id: sid,
-                                    data: "n".to_string(),
-                                    pane_id: None,
-                                },
-                            )
-                            .await;
-                    }
+                Ok(WebToServer::Reject {
+                    session_id: msg_sid,
+                    tool_call_id: _,
+                }) => {
+                    let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    else {
+                        continue;
+                    };
+                    state
+                        .sessions
+                        .route_to_cli(
+                            &sid,
+                            ServerToCli::Input {
+                                session_id: sid,
+                                data: "n".to_string(),
+                                pane_id: None,
+                            },
+                        )
+                        .await;
                 }
                 Ok(WebToServer::PauseDeadloop) => {
                     if let Some(sid) = session_id {
@@ -881,35 +936,47 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         );
                     }
                 }
-                Ok(WebToServer::PausePane { pane_id }) => {
-                    if let Some(sid) = session_id {
-                        tracing::info!("Pausing pane {} for session {}", pane_id, sid);
-                        state
-                            .sessions
-                            .route_to_cli(
-                                &sid,
-                                ServerToCli::PausePane {
-                                    session_id: sid,
-                                    pane_id,
-                                },
-                            )
-                            .await;
-                    }
+                Ok(WebToServer::PausePane {
+                    session_id: msg_sid,
+                    pane_id,
+                }) => {
+                    let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    else {
+                        continue;
+                    };
+                    tracing::info!("Pausing pane {} for session {}", pane_id, sid);
+                    state
+                        .sessions
+                        .route_to_cli(
+                            &sid,
+                            ServerToCli::PausePane {
+                                session_id: sid,
+                                pane_id,
+                            },
+                        )
+                        .await;
                 }
-                Ok(WebToServer::ResumePane { pane_id }) => {
-                    if let Some(sid) = session_id {
-                        tracing::info!("Resuming pane {} for session {}", pane_id, sid);
-                        state
-                            .sessions
-                            .route_to_cli(
-                                &sid,
-                                ServerToCli::ResumePane {
-                                    session_id: sid,
-                                    pane_id,
-                                },
-                            )
-                            .await;
-                    }
+                Ok(WebToServer::ResumePane {
+                    session_id: msg_sid,
+                    pane_id,
+                }) => {
+                    let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    else {
+                        continue;
+                    };
+                    tracing::info!("Resuming pane {} for session {}", pane_id, sid);
+                    state
+                        .sessions
+                        .route_to_cli(
+                            &sid,
+                            ServerToCli::ResumePane {
+                                session_id: sid,
+                                pane_id,
+                            },
+                        )
+                        .await;
                 }
                 Ok(WebToServer::AddPane {
                     provider,
@@ -1463,6 +1530,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 .send_to_web(
                                     &connection_id,
                                     ServerToWeb::PaneStatus {
+                                        session_id: sid,
                                         pane_type,
                                         pane_id: Some(pane_id),
                                         status: Some(status),

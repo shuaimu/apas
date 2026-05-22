@@ -598,9 +598,9 @@ export function TabbedView() {
         };
       }
       if (activeTabId === PANE_ID_MAIN) {
-        const { ws } = useStore.getState();
+        const { ws, sessionId } = useStore.getState();
         if (!ws || ws.readyState !== WebSocket.OPEN) return { success: false, error: "Not connected" };
-        ws.send(JSON.stringify({ type: "input", text }));
+        ws.send(JSON.stringify({ type: "input", session_id: sessionId, text }));
         return { success: true };
       }
       // Guard against a stale activeTabId left over from a previous session —
