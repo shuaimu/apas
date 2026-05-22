@@ -2,6 +2,7 @@
 
 import React, { useRef, useCallback, useEffect, useState, useMemo, memo } from "react";
 import { useStore, Message, PaneConfig, PaneCleanupAction, PlanReviewMode, TeamRecord, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, paneKey } from "@/lib/store";
+import { ROLE_TEMPLATES, TEMPLATE_COLOR_CLASSES } from "@/lib/roleTemplates";
 import { extractTimeline, TimelineEntry } from "@/lib/timeline";
 import { OverviewView } from "../overview/OverviewView";
 import { UserMessage } from "../chat/UserMessage";
@@ -1196,9 +1197,44 @@ function RoleModal({ open, pane, onClose, onSave }: RoleModalProps) {
         <h3 className="mb-1 text-lg font-semibold">
           Role · Goal · Backstory{pane?.label ? ` — ${pane.label}` : ""}
         </h3>
-        <p className="mb-4 text-xs text-zinc-400">
+        <p className="mb-3 text-xs text-zinc-400">
           Appended to the agent&apos;s system prompt at next spawn (close + re-add the tab, or reboot the apas CLI to apply).
         </p>
+        <div className="mb-4">
+          <p className="mb-2 text-[11px] uppercase tracking-wide text-zinc-500">Quick pick — apply a team-role template</p>
+          <div className="flex flex-wrap gap-2">
+            {ROLE_TEMPLATES.map((t) => (
+              <button
+                key={t.id}
+                type="button"
+                onClick={() => {
+                  setRole(t.role);
+                  setGoal(t.goal);
+                  setBackstory(t.backstory);
+                  setMode(t.planReviewMode);
+                }}
+                className={`rounded border px-2 py-1 text-xs font-medium transition-colors ${TEMPLATE_COLOR_CLASSES[t.color]}`}
+                title={`Apply ${t.label} template — populates role, goal, backstory, and plan review mode`}
+              >
+                <span className="mr-1">{t.glyph}</span>
+                {t.label}
+              </button>
+            ))}
+            <button
+              type="button"
+              onClick={() => {
+                setRole("");
+                setGoal("");
+                setBackstory("");
+                setMode("never");
+              }}
+              className="rounded border border-zinc-600 bg-zinc-800 px-2 py-1 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-700"
+              title="Clear all fields"
+            >
+              ✕ Clear
+            </button>
+          </div>
+        </div>
         <div className="flex flex-col gap-3">
           <label className="flex flex-col gap-1 text-xs">
             <span className="text-zinc-300">Role <span className="text-zinc-500">(e.g. &quot;backend implementer&quot;, &quot;reviewer&quot;)</span></span>
