@@ -883,8 +883,12 @@ export function TabbedView() {
         </button>
       </div>
 
-      {/* Message pane (or per-action timeline / overview) for active tab.
-          Keyed so each tab gets its own DOM/scroll state. */}
+      {/* Pane bodies: Overview is rendered alone; otherwise every pane's
+          body is mounted once and visibility-toggled via `hidden`, so
+          switching tabs is a CSS class flip instead of an unmount+
+          remount+paint cycle. Avoids the 100-500ms delay that used to
+          look like a server fetch. Keyed by sessionId+paneId so a
+          project switch still resets state cleanly. */}
       {activeTabId === OVERVIEW_PANE_ID ? (
         <OverviewView
           key="overview"
@@ -895,20 +899,45 @@ export function TabbedView() {
           }}
           onOpenRole={(pid) => setRoleModalPaneId(pid)}
         />
-      ) : activeTabId != null && timelinePanes.has(activeTabId) ? (
-        <TimelinePane
-          key={`timeline-${sessionId}-${activeTabId}`}
-          messages={activeMessages}
+      ) : effectiveTabs.length === 0 ? (
+        // Single-pane fallback (no pane system / synthesizing from
+        // legacy messages list). Just one MessagePane, no toggling.
+        <MessagePane
+          key={`${sessionId}-${PANE_ID_MAIN}`}
+          paneId={PANE_ID_MAIN}
+          messages={messages}
+          onLoadMore={handleLoadMore}
+          isLoading={isLoadingMore}
+          hasMore={hasMoreMessages}
         />
       ) : (
-        <MessagePane
-          key={`${sessionId}-${activeTabId ?? PANE_ID_MAIN}`}
-          paneId={activeTabId ?? PANE_ID_MAIN}
-          messages={activeMessages}
-          onLoadMore={handleLoadMore}
-          isLoading={activeIsLoading}
-          hasMore={activeHasMore}
-        />
+        effectiveTabs.map((tab) => {
+          const isActive = tab.pane_id === activeTabId;
+          const isTimeline = timelinePanes.has(tab.pane_id);
+          const msgs = paneMessages[paneKey(tab.pane_id)] || [];
+          return (
+            <div
+              key={tab.pane_id}
+              className={isActive ? "flex-1 flex flex-col min-h-0" : "hidden"}
+            >
+              {isTimeline ? (
+                <TimelinePane
+                  key={`timeline-${sessionId}-${tab.pane_id}`}
+                  messages={msgs}
+                />
+              ) : (
+                <MessagePane
+                  key={`${sessionId}-${tab.pane_id}`}
+                  paneId={tab.pane_id}
+                  messages={msgs}
+                  onLoadMore={() => loadMoreMessages(tab.pane_id)}
+                  isLoading={loadingMorePane === tab.pane_id}
+                  hasMore={paneHasMore[paneKey(tab.pane_id)] || false}
+                />
+              )}
+            </div>
+          );
+        })
       )}
 
       {/* Status bar — never shown on the Overview pseudo-tab */}
