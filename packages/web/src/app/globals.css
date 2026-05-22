@@ -97,6 +97,13 @@ header {
   animation: flashGlow 1.6s ease-out;
 }
 
+/* Hide scrollbar but keep scrollability (TabBar horizontal scroll on
+   mobile). Firefox/IE use the inline scrollbarWidth/msOverflowStyle
+   styles; this rule handles webkit (Chrome / Safari / mobile). */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
 /* iOS safe area handling */
 @supports (padding: env(safe-area-inset-top)) {
   body {

@@ -257,12 +257,13 @@ export function TabBar({
     <div className="flex items-end border-b border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-800/50 flex-shrink-0 min-h-[40px]">
       <div
         ref={scrollRef}
-        className="flex-1 flex flex-wrap items-end overflow-x-hidden overflow-y-hidden"
+        className="flex-1 flex flex-nowrap items-end overflow-x-auto overflow-y-hidden no-scrollbar"
+        style={{ scrollbarWidth: "none", msOverflowStyle: "none" }}
       >
         <button
           type="button"
           onClick={() => onSelectTab(OVERVIEW_PANE_ID)}
-          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border-r border-gray-200 dark:border-gray-700 transition-colors ${
+          className={`flex items-center gap-1.5 px-2 sm:px-3 py-1.5 text-xs font-medium border-r border-gray-200 dark:border-gray-700 transition-colors flex-shrink-0 ${
             isOverviewActive
               ? "bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 border-t-2 border-t-indigo-500"
               : "text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700/50 border-t-2 border-t-transparent"
@@ -272,7 +273,8 @@ export function TabBar({
           <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 10h16M4 14h16M4 18h10" />
           </svg>
-          <span>Overview</span>
+          {/* Label shows on desktop, or when overview is the active view on mobile. */}
+          <span className={isOverviewActive ? "inline" : "hidden sm:inline"}>Overview</span>
         </button>
         {tabs.map((tab, index) => {
           const isActive = tab.pane_id === activeTabId;
@@ -361,7 +363,11 @@ export function TabBar({
                   className="w-full min-w-[60px] max-w-[140px] px-1 py-0 text-sm bg-white dark:bg-gray-800 border border-blue-400 rounded outline-none"
                 />
               ) : (
-                <span className="truncate">
+                // On mobile, only the active tab shows its label;
+                // inactive tabs collapse to icon + activity dot so a
+                // dozen panes still fit in one row. Desktop (sm:) keeps
+                // the label visible on all tabs.
+                <span className={`truncate ${isActive ? "inline" : "hidden sm:inline"}`}>
                   {label}
                   {isBot && " (Bot)"}
                 </span>
