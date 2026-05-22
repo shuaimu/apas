@@ -649,12 +649,20 @@ export const useStore = create<AppState>((set, get) => ({
             set({ reconnectAttempts: 0 });
             get().connect();
           } else {
+            // WS still alive — messages have been streaming the whole time
+            // (modulo any browser throttling). Just refresh ancillary
+            // state. Do NOT re-attach: forceReload would wipe
+            // paneMessages and refetch from the server, causing every
+            // mobile foreground to "snap back" mid-conversation.
             console.log("Connection appears healthy, refreshing data...");
             get().refreshCliClients();
             get().listSessions();
-            if (sessionId) {
-              console.log("Refreshing attached session after foreground...");
-              get().attachSession(sessionId, true);
+            // If sessionId is set but isAttached is false (server-side
+            // attachment got dropped for some reason), reattach without
+            // forceReload — cache-first so the user keeps their messages.
+            if (sessionId && !isAttached) {
+              console.log("Session was detached server-side; soft re-attach...");
+              get().attachSession(sessionId, false);
             }
           }
         }
@@ -2127,11 +2135,26 @@ function handleServerMessage(
         // the user is returning to a cached session, the cached state and
         // the server's latest 50 overlap, and prepending would create
         // duplicates plus mis-order the timeline.
-        const { paneModes: existingPaneModes } = get();
-        const newPaneMessages: Record<string, Message[]> = {};
+        //
+        // BUT: if our local bucket already has messages (we're an attached
+        // tab with live state), MERGE rather than replace so a spurious
+        // attach (visibility change, reconnect) doesn't yank the user back
+        // to whatever snapshot the server happens to have on disk. We
+        // dedupe by message id and keep local ordering for the overlap.
+        const { paneModes: existingPaneModes, paneMessages: existingPaneMessages } = get();
+        const newPaneMessages: Record<string, Message[]> = { ...existingPaneMessages };
         const newPaneHasMore: Record<string, boolean> = {};
         for (const [paneId, msgs] of Object.entries(paneMsgBuckets)) {
-          newPaneMessages[paneId] = msgs;
+          const existing = existingPaneMessages[paneId] || [];
+          if (existing.length === 0) {
+            // First load for this pane — accept the server snapshot.
+            newPaneMessages[paneId] = msgs;
+          } else {
+            // Merge: server-only messages prepended, local kept intact.
+            const localIds = new Set(existing.map((m) => m.id));
+            const serverOnly = msgs.filter((m) => !localIds.has(m.id));
+            newPaneMessages[paneId] = [...serverOnly, ...existing];
+          }
           newPaneHasMore[paneId] = hasMore;
         }
         set({
