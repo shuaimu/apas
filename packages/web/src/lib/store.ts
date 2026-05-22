@@ -1616,7 +1616,12 @@ function handleServerMessage(
         if (sessionToRestore) {
           console.log("Restoring session:", sessionToRestore);
           setTimeout(() => {
-            get().attachSession(sessionToRestore, true);
+            // forceReload=false: keep the cached paneMessages visible across
+            // the reconnect (e.g. phone unlock killed the WS). Without this,
+            // mobile users see the tab render normally for ~0.5s, then flash
+            // blank for ~0.5s, then repopulate from the server snapshot —
+            // exactly the "looks fine, then suddenly reloads" symptom.
+            get().attachSession(sessionToRestore, false);
           }, 500);
         }
         // Subscribe to every other session we have a cached snapshot for
