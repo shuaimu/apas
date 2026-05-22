@@ -17,6 +17,7 @@
 // don't collide with anything else the app might ever stash in IDB.
 
 import {
+  clear,
   createStore,
   del,
   entries,
@@ -116,4 +117,19 @@ export function deleteSnapshot(sessionId: string): void {
   del(sessionId, store).catch((e) => {
     console.warn("[sessionCacheDb] deleteSnapshot failed", e);
   });
+}
+
+/**
+ * Drop every persisted snapshot. Wired into the Settings → Clear local cache
+ * button so a user stuck with a partial bucket (lost stream_message + the
+ * trust-local rule) can recover without DevTools.
+ */
+export async function clearAllSnapshots(): Promise<void> {
+  const store = getStore();
+  if (!store) return;
+  try {
+    await clear(store);
+  } catch (e) {
+    console.warn("[sessionCacheDb] clearAllSnapshots failed", e);
+  }
 }

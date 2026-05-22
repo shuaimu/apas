@@ -7,7 +7,8 @@ import { TabbedView } from "@/components/tabs/TabbedView";
 import { Sidebar } from "@/components/Sidebar";
 import { ResizeHandle } from "@/components/ResizeHandle";
 import { useStore } from "@/lib/store";
-import { Settings, Wifi, WifiOff, LogOut, Menu, X, RefreshCw } from "lucide-react";
+import { clearAllSnapshots } from "@/lib/sessionCacheDb";
+import { Settings, Wifi, WifiOff, LogOut, Menu, X, RefreshCw, Trash2 } from "lucide-react";
 
 const MIN_SIDEBAR_WIDTH = 180;
 const MAX_SIDEBAR_WIDTH = 400;
@@ -45,6 +46,7 @@ export default function Home() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [isReconnecting, setIsReconnecting] = useState(false);
+  const [clearCacheState, setClearCacheState] = useState<"idle" | "confirm" | "clearing">("idle");
 
   // Sidebar width state - per-project
   const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
@@ -325,13 +327,13 @@ export default function Home() {
 
       {/* Settings Modal */}
       {settingsOpen && typeof document !== 'undefined' && createPortal(
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[100]" onClick={() => setSettingsOpen(false)}>
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[100]" onClick={() => { setSettingsOpen(false); setClearCacheState("idle"); }}>
           <div className="bg-white dark:bg-gray-800 rounded-lg max-w-md w-full mx-4 shadow-xl" onClick={(e) => e.stopPropagation()}>
             {/* Header */}
             <div className="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
               <h3 className="text-lg font-semibold">Settings</h3>
               <button
-                onClick={() => setSettingsOpen(false)}
+                onClick={() => { setSettingsOpen(false); setClearCacheState("idle"); }}
                 className="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 rounded"
               >
                 <X className="w-5 h-5" />
@@ -380,12 +382,56 @@ export default function Home() {
                 </div>
               </div>
 
+              {/* Local cache */}
+              <div>
+                <h4 className="text-sm font-medium text-gray-500 dark:text-gray-400 mb-2">Local cache</h4>
+                <div className="bg-gray-50 dark:bg-gray-700 rounded-lg p-3">
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mb-2">
+                    Drops every cached session snapshot from this browser, then reloads. Use this if a pane appears to be missing recent messages — the page will refetch from the server on reload.
+                  </p>
+                  {clearCacheState === "idle" && (
+                    <button
+                      onClick={() => setClearCacheState("confirm")}
+                      className="w-full px-3 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded text-sm font-medium transition-colors flex items-center justify-center gap-2"
+                    >
+                      <Trash2 className="w-4 h-4" /> Clear local cache
+                    </button>
+                  )}
+                  {clearCacheState === "confirm" && (
+                    <div className="flex gap-2">
+                      <button
+                        onClick={async () => {
+                          setClearCacheState("clearing");
+                          await clearAllSnapshots();
+                          window.location.reload();
+                        }}
+                        className="flex-1 px-3 py-2 bg-red-500 hover:bg-red-600 text-white rounded text-sm font-medium transition-colors"
+                      >
+                        Confirm clear & reload
+                      </button>
+                      <button
+                        onClick={() => setClearCacheState("idle")}
+                        className="flex-1 px-3 py-2 bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500 text-gray-700 dark:text-gray-100 rounded text-sm font-medium transition-colors"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  )}
+                  {clearCacheState === "clearing" && (
+                    <p className="text-xs text-gray-500 dark:text-gray-400 text-center py-2">
+                      Clearing cache and reloading…
+                    </p>
+                  )}
+                </div>
+              </div>
+
               {/* Actions */}
               <div className="flex gap-2 pt-2">
                 <button
                   onClick={() => {
                     handleReconnect();
                     setSettingsOpen(false);
+                    setClearCacheState("idle");
                   }}
                   className="flex-1 px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-lg text-sm font-medium transition-colors"
                 >
@@ -395,6 +441,7 @@ export default function Home() {
                   onClick={() => {
                     handleLogout();
                     setSettingsOpen(false);
+                    setClearCacheState("idle");
                   }}
                   className="flex-1 px-4 py-2 bg-red-500 hover:bg-red-600 text-white rounded-lg text-sm font-medium transition-colors"
                 >
