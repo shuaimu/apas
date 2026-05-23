@@ -20,10 +20,19 @@ export function ProjectGoalBar() {
   const paneConfigs = useStore((s) => s.paneConfigs);
   const addPane = useStore((s) => s.addPane);
   const sendMessageToPane = useStore((s) => s.sendMessageToPane);
+  const updatePaneRole = useStore((s) => s.updatePaneRole);
+  const updatePaneReviewMode = useStore((s) => s.updatePaneReviewMode);
   const showToast = useStore((s) => s.showToast);
 
   const [goal, setGoal] = useState("");
   const [pending, setPending] = useState<string | null>(null);
+  // Pane IDs that existed BEFORE the user clicked "Create manager and
+  // start". Used to identify the new pane in the fallback path when the
+  // CLI is on a pre-26.05.65 binary and didn't honor role/goal/backstory
+  // on AddPane (so the role-substring match returns nothing).
+  const [knownIdsAtCreate, setKnownIdsAtCreate] = useState<Set<number> | null>(
+    null,
+  );
 
   // First pane whose role contains "manager" (case-insensitive). The same
   // substring match that activates the manager system-prompt addendum in
@@ -37,21 +46,66 @@ export function ProjectGoalBar() {
   );
 
   // After "Create manager and start", wait for the new pane to appear in
-  // paneConfigs, then route the queued goal there. Drops the pending
-  // payload if the manager pane disappears again (e.g. user removed it
-  // before the spawn landed).
+  // paneConfigs, then route the queued goal there.
   useEffect(() => {
     if (!pending) return;
-    if (!managerPane) return;
-    const message = composeManagerMessage(paneConfigs, managerPane, pending);
-    const result = sendMessageToPane(message, managerPane.pane_id);
+    // Prefer a pane with proper "manager" role (CLI >= 26.05.65 path).
+    // Fall back to the newest pane we created (when CLI < 26.05.65 dropped
+    // role/goal/backstory from AddPane). The fallback also patches the
+    // role retroactively via UpdatePaneRole so the next spawn picks up
+    // the manager addendum without the user re-creating the pane.
+    let candidate = managerPane;
+    let needsRolePatch = false;
+    if (!candidate && knownIdsAtCreate) {
+      const fresh = paneConfigs.find(
+        (p) => !knownIdsAtCreate.has(p.pane_id),
+      );
+      if (fresh) {
+        candidate = fresh;
+        needsRolePatch = true;
+      }
+    }
+    if (!candidate) return;
+
+    const techLead = ROLE_TEMPLATES.find((t) => t.id === "tech-lead");
+    if (needsRolePatch && techLead) {
+      updatePaneRole(candidate.pane_id, techLead.role, techLead.goal, techLead.backstory);
+      updatePaneReviewMode(candidate.pane_id, techLead.planReviewMode);
+    }
+
+    // Message body: when the CLI didn't apply the manager addendum
+    // (needsRolePatch), inline the protocol so the agent knows what to
+    // do on this very first message. On properly-set-up panes, the
+    // addendum from compose_system_prompt is already in the system
+    // prompt and we don't repeat ourselves.
+    const protocolHint = needsRolePatch
+      ? "[Note: your role wasn't applied at spawn (CLI predates the AddPane wire change). You are the team manager / tech lead — break this goal into small leaves, delegate each to a worker pane via .apas-team.jsonl with tags delegate-to:<pane_id> and task:<id>, and track replies via reply-to:<id>. Don't write production code yourself. Reboot the CLI to get the proper manager addendum on next spawn.]\n\n"
+      : "";
+    const message =
+      protocolHint + composeManagerMessage(paneConfigs, candidate, pending);
+    const result = sendMessageToPane(message, candidate.pane_id);
     if (result.success) {
-      showToast("Goal sent to manager.", "success");
+      showToast(
+        needsRolePatch
+          ? "Goal sent — role patched retroactively. Reboot the CLI for the proper addendum."
+          : "Goal sent to manager.",
+        needsRolePatch ? "info" : "success",
+      );
       setPending(null);
+      setKnownIdsAtCreate(null);
     } else {
       showToast(result.error ?? "Failed to reach manager", "error");
     }
-  }, [pending, managerPane, paneConfigs, sendMessageToPane, showToast]);
+  }, [
+    pending,
+    managerPane,
+    paneConfigs,
+    knownIdsAtCreate,
+    sendMessageToPane,
+    updatePaneRole,
+    updatePaneReviewMode,
+    showToast,
+  ]);
 
   const handleSubmit = () => {
     const text = goal.trim();
@@ -74,6 +128,9 @@ export function ProjectGoalBar() {
       showToast("Tech Lead template missing — cannot create manager.", "error");
       return;
     }
+    // Snapshot the current pane IDs so the useEffect fallback can find
+    // the new one even if the CLI doesn't apply our requested role.
+    setKnownIdsAtCreate(new Set(paneConfigs.map((p) => p.pane_id)));
     const result = addPane(
       "claude",
       "interactive",
@@ -93,6 +150,7 @@ export function ProjectGoalBar() {
       setGoal("");
       showToast("Manager spawning — goal queued.", "info");
     } else {
+      setKnownIdsAtCreate(null);
       showToast(result.error ?? "Failed to create manager", "error");
     }
   };
