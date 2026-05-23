@@ -618,12 +618,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         let effective_pane_id = pane_id.or_else(|| {
                             pane_type.map(|p| shared::PaneConfig::pane_id_from_legacy(&p))
                         });
+                        let created_at = chrono::Utc::now().to_rfc3339();
                         let stored_message = crate::storage::StoredMessage {
                             id: uuid::Uuid::new_v4().to_string(),
                             role: "user".to_string(),
                             content: text.clone(),
                             message_type: "text".to_string(),
-                            created_at: chrono::Utc::now().to_rfc3339(),
+                            created_at: created_at.clone(),
                             pane_type: effective_pane_id.map(|id| id.to_string()),
                         };
                         if let Err(e) = state.storage.append_message(&sid, &stored_message).await {
@@ -642,6 +643,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     text,
                                     pane_type,
                                     pane_id,
+                                    created_at: Some(created_at),
                                 },
                             )
                             .await;
@@ -1652,6 +1654,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     session_id: sid,
                                     messages,
                                     has_more,
+                                    catchup: false,
                                 },
                             )
                             .await;
@@ -1780,6 +1783,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     before_id,
                     pane_type,
                     pane_id,
+                    after_created_at,
                 }) => {
                     // Get messages for a specific session from file storage with pagination
                     let limit = limit.unwrap_or(100);
@@ -1789,12 +1793,24 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .as_ref()
                             .map(|p| shared::PaneConfig::pane_id_from_legacy(p))
                     });
+                    // Catchup mode: client passed an `after_created_at` high-water mark
+                    // after reconnect. Return everything newer (flat, sorted ASC, no
+                    // per-pane limit) so the client can append the missing tail to its
+                    // live state. before_id / pane filters are ignored in catchup mode.
+                    let is_catchup = after_created_at.is_some();
                     // Initial loads (no filter, no before_id) should return `limit` messages
                     // PER pane so every tab has history. Filtered/paginated fetches still use
                     // the linear paginator so they behave predictably.
-                    let is_initial_load =
-                        before_id.is_none() && effective_pane_filter.is_none();
-                    let fetch_result = if is_initial_load {
+                    let is_initial_load = !is_catchup
+                        && before_id.is_none()
+                        && effective_pane_filter.is_none();
+                    let fetch_result = if let Some(after) = after_created_at.as_deref() {
+                        state
+                            .storage
+                            .get_messages_after(&sid, after)
+                            .await
+                            .map(|msgs| (msgs, false))
+                    } else if is_initial_load {
                         state.storage.get_messages_per_pane(&sid, limit).await
                     } else {
                         state
@@ -1855,6 +1871,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         session_id: sid,
                                         messages,
                                         has_more,
+                                        catchup: is_catchup,
                                     },
                                 )
                                 .await;

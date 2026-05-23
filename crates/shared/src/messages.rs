@@ -525,6 +525,13 @@ pub enum WebToServer {
         pane_type: Option<PaneType>, // Filter by pane type for per-pane pagination
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pane_id: Option<u32>, // Filter by pane ID for per-pane pagination
+        // Reconnect catchup: when set, return only messages with
+        // `created_at > after_created_at` (sorted ASC, flat across panes,
+        // capped at CATCHUP_LIMIT). Reply is flagged `catchup: true` so the
+        // client can append rather than replace. before_id / pane filters
+        // are ignored when this is set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_created_at: Option<String>,
     },
 
     /// Pause the deadloop session (legacy - use PausePane for new code)
@@ -778,6 +785,14 @@ pub enum ServerToWeb {
         pane_type: Option<PaneType>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pane_id: Option<u32>,
+        // Server's storage timestamp (max created_at of the stored messages
+        // produced from this stream event). The web client tracks the max
+        // across all stream messages it receives so it can ask the server
+        // for `after_created_at = max` on reconnect to fetch the gap that
+        // landed while its WS was down. Optional for forward compat with
+        // older clients/servers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        created_at: Option<String>,
     },
 
     /// List of persisted sessions
@@ -789,6 +804,11 @@ pub enum ServerToWeb {
         messages: Vec<MessageInfo>,
         #[serde(default)]
         has_more: bool, // True if there are older messages to load
+        // True when this payload is a reconnect catchup (response to a
+        // GetSessionMessages that carried `after_created_at`). Client should
+        // append to existing pane state rather than treat as initial load.
+        #[serde(default)]
+        catchup: bool,
     },
 
     /// User input/prompt from CLI (displayed in web UI)
@@ -799,6 +819,11 @@ pub enum ServerToWeb {
         pane_type: Option<PaneType>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pane_id: Option<u32>,
+        // Storage timestamp — same role as on StreamMessage: keeps the web
+        // client's reconnect-catchup high-water mark accurate even when a
+        // session opens with a user input before any stream activity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        created_at: Option<String>,
     },
 
     /// Deadloop pause status update (legacy - use PanePaused for new code)

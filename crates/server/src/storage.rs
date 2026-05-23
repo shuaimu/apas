@@ -201,6 +201,59 @@ impl FileStorage {
         Ok(messages)
     }
 
+    /// Return every stored message with `created_at > after_created_at`,
+    /// sorted ASC, capped at `CATCHUP_LIMIT`. Used by the web client to fill
+    /// the gap after a WebSocket reconnect — the client passes the max
+    /// `created_at` it has live-streamed and asks for everything newer the
+    /// server has on disk. Returns an empty vec when the timestamp is at or
+    /// past the tail (nothing missed).
+    pub async fn get_messages_after(
+        &self,
+        session_id: &Uuid,
+        after_created_at: &str,
+    ) -> Result<Vec<StoredMessage>> {
+        const CATCHUP_LIMIT: usize = 5000;
+        let file_path = self.messages_file(session_id);
+        if !file_path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let file = fs::File::open(&file_path).await?;
+        let reader = BufReader::new(file);
+        let mut lines = reader.lines();
+        let mut newer = Vec::new();
+        while let Some(line) = lines.next_line().await? {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<StoredMessage>(&line) {
+                Ok(msg) => {
+                    if msg.created_at.as_str() > after_created_at {
+                        newer.push(msg);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to parse message line: {}", e);
+                }
+            }
+        }
+        // RFC3339 timestamps are lexicographically ordered, but the file may
+        // contain late-write reorderings on the microsecond scale — sort to
+        // hand the client a clean ASC tail.
+        newer.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        if newer.len() > CATCHUP_LIMIT {
+            let drop = newer.len() - CATCHUP_LIMIT;
+            tracing::warn!(
+                "Catchup for session {} truncated: {} messages exceeded cap, dropping oldest {}",
+                session_id,
+                newer.len(),
+                drop
+            );
+            newer = newer.split_off(drop);
+        }
+        Ok(newer)
+    }
+
     /// Read messages for a session with pagination support
     /// Returns (messages, has_more)
     pub async fn get_messages_paginated(
@@ -625,6 +678,48 @@ mod gc_tests {
         let survivors = storage.get_messages(&sid).await.unwrap();
         assert_eq!(survivors.len(), 1);
         assert_eq!(survivors[0].id, "recent1");
+    }
+
+    #[tokio::test]
+    async fn get_messages_after_returns_only_newer_sorted_asc() {
+        let storage = fresh_storage();
+        let sid = Uuid::new_v4();
+        let now = Utc::now();
+        // Write three messages in reverse-time order so we exercise the sort.
+        let t1 = (now - Duration::seconds(30)).to_rfc3339();
+        let t2 = (now - Duration::seconds(20)).to_rfc3339();
+        let t3 = (now - Duration::seconds(10)).to_rfc3339();
+
+        storage
+            .append_message(&sid, &make_msg("c", &t3))
+            .await
+            .unwrap();
+        storage
+            .append_message(&sid, &make_msg("a", &t1))
+            .await
+            .unwrap();
+        storage
+            .append_message(&sid, &make_msg("b", &t2))
+            .await
+            .unwrap();
+
+        // Cut between t1 and t2 — expect b and c, in created_at ASC order.
+        let after = (now - Duration::seconds(25)).to_rfc3339();
+        let got = storage.get_messages_after(&sid, &after).await.unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].id, "b");
+        assert_eq!(got[1].id, "c");
+
+        // Cut after t3 — nothing missed.
+        let after = (now + Duration::seconds(5)).to_rfc3339();
+        let got = storage.get_messages_after(&sid, &after).await.unwrap();
+        assert!(got.is_empty());
+
+        // Empty string as cutoff — return everything.
+        let got = storage.get_messages_after(&sid, "").await.unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].id, "a");
+        assert_eq!(got[2].id, "c");
     }
 
     #[tokio::test]

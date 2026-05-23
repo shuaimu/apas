@@ -498,8 +498,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 // Use pane_id for storage, falling back to pane_type for backward compat
                                 let effective_pane_id = pane_id.or_else(|| pane_type.map(|p| shared::PaneConfig::pane_id_from_legacy(&p)));
 
-                                // Save message(s) to file storage
+                                // Save message(s) to file storage. Remember the max created_at
+                                // of the stored fragments so we can hand it to the web client as
+                                // a reconnect high-water mark.
+                                let mut max_created_at: Option<String> = None;
                                 for stored_message in stream_message_to_stored(&session_id, &message, effective_pane_id) {
+                                    match &max_created_at {
+                                        Some(prev) if prev.as_str() >= stored_message.created_at.as_str() => {}
+                                        _ => max_created_at = Some(stored_message.created_at.clone()),
+                                    }
                                     if let Err(e) = state.storage.append_message(&session_id, &stored_message).await {
                                         tracing::error!("Failed to save message to file: {}", e);
                                     }
@@ -510,7 +517,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     .sessions
                                     .route_to_web(
                                         &session_id,
-                                        ServerToWeb::StreamMessage { session_id, message, pane_type, pane_id },
+                                        ServerToWeb::StreamMessage { session_id, message, pane_type, pane_id, created_at: max_created_at },
                                     )
                                     .await;
                                 tracing::info!("StreamMessage routed to web: {}", routed);
@@ -520,12 +527,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 // Use pane_id for storage, falling back to pane_type
                                 let effective_pane_id = pane_id.or_else(|| pane_type.map(|p| shared::PaneConfig::pane_id_from_legacy(&p)));
                                 // Save user input to file storage
+                                let created_at = chrono::Utc::now().to_rfc3339();
                                 let stored_message = crate::storage::StoredMessage {
                                     id: Uuid::new_v4().to_string(),
                                     role: "user".to_string(),
                                     content: text.clone(),
                                     message_type: "text".to_string(),
-                                    created_at: chrono::Utc::now().to_rfc3339(),
+                                    created_at: created_at.clone(),
                                     pane_type: effective_pane_id.map(|id| id.to_string()),
                                 };
                                 if let Err(e) = state.storage.append_message(&session_id, &stored_message).await {
@@ -537,7 +545,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     .sessions
                                     .route_to_web(
                                         &session_id,
-                                        ServerToWeb::UserInput { session_id, text, pane_type, pane_id },
+                                        ServerToWeb::UserInput { session_id, text, pane_type, pane_id, created_at: Some(created_at) },
                                     )
                                     .await;
                             }

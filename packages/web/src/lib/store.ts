@@ -351,6 +351,13 @@ interface AppState {
   // to that session.
   unreadSessions: Set<string>;
 
+  // Reconnect catchup: per-session high-water mark of server `created_at`
+  // values seen via stream_message. After a WS drop we ask the server for
+  // `after_created_at = sessionLastCreatedAt[sid]` so the missing tail gets
+  // appended to live state instead of being silently dropped when
+  // `route_to_web` couldn't reach the disconnected old connection_id.
+  sessionLastCreatedAt: Map<string, string>;
+
   // Legacy compat (derived from dynamic state)
   deadloopMessages: Message[];
   interactiveMessages: Message[];
@@ -516,6 +523,7 @@ export const useStore = create<AppState>((set, get) => ({
   toasts: [],
   sessionCache: new Map(),
   unreadSessions: new Set(),
+  sessionLastCreatedAt: new Map(),
   loadingMorePane: null,
   // Legacy compat getters (populated from dynamic state)
   deadloopMessages: [],
@@ -1627,6 +1635,25 @@ function addMessageWithPaneRouting(
   }
 }
 
+/// After WS reconnect, ask the server for every stored message with
+/// `created_at > sessionLastCreatedAt[sid]`. Sends nothing if we don't have
+/// a high-water mark for the session yet — first attach of the tab has
+/// nothing to catch up on, the regular session_messages reply covers it.
+function requestCatchupIfNeeded(get: () => AppState, sessionId: string) {
+  const state = get();
+  const after = state.sessionLastCreatedAt.get(sessionId);
+  if (!after) return;
+  const ws = state.ws;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(
+    JSON.stringify({
+      type: "get_session_messages",
+      session_id: sessionId,
+      after_created_at: after,
+    }),
+  );
+}
+
 function handleServerMessage(
   data: Record<string, unknown>,
   set: (partial: Partial<AppState> | ((state: AppState) => Partial<AppState>)) => void,
@@ -1665,6 +1692,12 @@ function handleServerMessage(
             // blank for ~0.5s, then repopulate from the server snapshot —
             // exactly the "looks fine, then suddenly reloads" symptom.
             get().attachSession(sessionToRestore, false);
+            // Reconnect catchup: fill the gap that landed while the WS was
+            // down. AttachSession alone won't do it — the session_messages
+            // initial-load reply is ignored when the local panes already
+            // have messages ("live state wins" dedupe rule). The catchup
+            // reply is flagged so the handler appends instead of skipping.
+            requestCatchupIfNeeded(get, sessionToRestore);
           }, 500);
         }
         // Subscribe to every other session we have a cached snapshot for
@@ -1679,6 +1712,7 @@ function handleServerMessage(
           setTimeout(() => {
             if (ws && ws.readyState === WebSocket.OPEN) {
               ws.send(JSON.stringify({ type: "attach_session", session_id: sid }));
+              requestCatchupIfNeeded(get, sid);
             }
           }, 800);
         }
@@ -2054,13 +2088,21 @@ function handleServerMessage(
     case "session_messages": {
       const messages = (data.messages as Array<Record<string, unknown>>) || [];
       const hasMore = data.has_more as boolean || false;
+      const isCatchup = data.catchup === true;
 
       // Drop stale responses — if the response is for a different session
       // than the one we're currently viewing, ignore it entirely (do NOT
-      // overwrite sessionId or panes).
+      // overwrite sessionId or panes). Catchup is exempt: it's allowed to
+      // land in the sessionCache for background tabs so they stay current
+      // without the user clicking in.
       const responseSessionId = data.session_id as string | undefined;
       const currentSessionId = get().sessionId;
-      if (responseSessionId && currentSessionId && responseSessionId !== currentSessionId) {
+      if (
+        !isCatchup &&
+        responseSessionId &&
+        currentSessionId &&
+        responseSessionId !== currentSessionId
+      ) {
         break;
       }
 
@@ -2171,6 +2213,110 @@ function handleServerMessage(
       });
       const hasPaneModeHints = Object.keys(paneModeHints).length > 0;
 
+      // Bootstrap the reconnect high-water mark from whatever payload we
+      // got. Even initial loads need this so a tab that opens, sees its
+      // history, but receives zero live events before the WS drops can
+      // still ask for a meaningful catchup.
+      if (responseSessionId) {
+        let maxAt: string | undefined;
+        for (const m of messages) {
+          const ts = m.created_at as string | undefined;
+          if (ts && (!maxAt || ts > maxAt)) maxAt = ts;
+        }
+        if (maxAt) {
+          set((state) => {
+            const prev = state.sessionLastCreatedAt.get(responseSessionId);
+            if (prev && prev >= maxAt!) return {};
+            const next = new Map(state.sessionLastCreatedAt);
+            next.set(responseSessionId, maxAt!);
+            return { sessionLastCreatedAt: next };
+          });
+        }
+      }
+
+      if (isCatchup) {
+        // Reconnect tail: server filtered to `created_at > lastSeen`, so no
+        // overlap with the live state is expected. Append (dedupe by id is
+        // belt-and-suspenders; live IDs are client-random and won't match
+        // storage IDs anyway, so the filter is what's actually keeping
+        // duplicates out).
+        const targetSid = responseSessionId;
+        if (!targetSid) break;
+        // Compute the new high-water mark for sessionLastCreatedAt.
+        let maxCreatedAt: string | undefined;
+        for (const m of messages) {
+          const ts = m.created_at as string | undefined;
+          if (ts && (!maxCreatedAt || ts > maxCreatedAt)) maxCreatedAt = ts;
+        }
+
+        if (targetSid === currentSessionId) {
+          set((state) => {
+            const newPaneMessages = { ...state.paneMessages };
+            for (const [paneId, msgs] of Object.entries(paneMsgBuckets)) {
+              const existing = newPaneMessages[paneId] || [];
+              const existingIds = new Set(existing.map((m) => m.id));
+              const tail = msgs.filter((m) => !existingIds.has(m.id));
+              if (tail.length > 0) {
+                newPaneMessages[paneId] = [...existing, ...tail];
+              }
+            }
+            const existingMainIds = new Set(state.messages.map((m) => m.id));
+            const mainTail = mainMsgs.filter((m) => !existingMainIds.has(m.id));
+            const updates: Partial<AppState> = {
+              paneMessages: newPaneMessages,
+              deadloopMessages:
+                newPaneMessages[paneKey(PANE_ID_DEADLOOP)] || state.deadloopMessages,
+              interactiveMessages:
+                newPaneMessages[paneKey(PANE_ID_INTERACTIVE)] || state.interactiveMessages,
+            };
+            if (mainTail.length > 0) {
+              updates.messages = [...state.messages, ...mainTail];
+            }
+            if (maxCreatedAt) {
+              const prev = state.sessionLastCreatedAt.get(targetSid);
+              if (!prev || prev < maxCreatedAt) {
+                const next = new Map(state.sessionLastCreatedAt);
+                next.set(targetSid, maxCreatedAt);
+                updates.sessionLastCreatedAt = next;
+              }
+            }
+            return updates;
+          });
+        } else {
+          // Cached background session — apply tail to the snapshot so when
+          // the user opens that tab next they see what claude did while
+          // they were elsewhere.
+          set((state) => {
+            const cached = state.sessionCache.get(targetSid);
+            if (!cached) return {};
+            const newPaneMessages = { ...cached.paneMessages };
+            for (const [paneId, msgs] of Object.entries(paneMsgBuckets)) {
+              const cur = newPaneMessages[paneId] || [];
+              const curIds = new Set(cur.map((m) => m.id));
+              const tail = msgs.filter((m) => !curIds.has(m.id));
+              if (tail.length > 0) newPaneMessages[paneId] = [...cur, ...tail];
+            }
+            const cache = new Map(state.sessionCache);
+            cache.set(targetSid, {
+              ...cached,
+              paneMessages: newPaneMessages,
+              cachedAt: Date.now(),
+            });
+            const updates: Partial<AppState> = { sessionCache: cache };
+            if (maxCreatedAt) {
+              const prev = state.sessionLastCreatedAt.get(targetSid);
+              if (!prev || prev < maxCreatedAt) {
+                const nextSeen = new Map(state.sessionLastCreatedAt);
+                nextSeen.set(targetSid, maxCreatedAt);
+                updates.sessionLastCreatedAt = nextSeen;
+              }
+            }
+            return updates;
+          });
+        }
+        break;
+      }
+
       if (isLoadingMore) {
         // Prepend older messages
         if (isDualPane || hasPaneType) {
@@ -2280,6 +2426,18 @@ function handleServerMessage(
       const text = data.text as string;
       const isCurrentSession = !msgSessionId || msgSessionId === get().sessionId;
 
+      // Track the server's created_at for reconnect catchup (see stream_message).
+      const serverCreatedAt = data.created_at as string | undefined;
+      if (serverCreatedAt && msgSessionId) {
+        set((state) => {
+          const prev = state.sessionLastCreatedAt.get(msgSessionId);
+          if (prev && prev >= serverCreatedAt) return {};
+          const next = new Map(state.sessionLastCreatedAt);
+          next.set(msgSessionId, serverCreatedAt);
+          return { sessionLastCreatedAt: next };
+        });
+      }
+
       // Server bounce of our own input: claim the optimistic slot the
       // send handler placed locally. Match by content + recency + the
       // "optimistic-" id prefix; strip the prefix so a later duplicate
@@ -2348,6 +2506,18 @@ function handleServerMessage(
       const isCurrentSession = !msgSessionId || msgSessionId === get().sessionId;
       if (isCurrentSession) {
         updatePaneModeHint(set, get, paneType, paneId);
+      }
+      // Track the server's max created_at per session so we can fetch the
+      // tail with `after_created_at` after a WS reconnect.
+      const serverCreatedAt = data.created_at as string | undefined;
+      if (serverCreatedAt && msgSessionId) {
+        set((state) => {
+          const prev = state.sessionLastCreatedAt.get(msgSessionId);
+          if (prev && prev >= serverCreatedAt) return {};
+          const next = new Map(state.sessionLastCreatedAt);
+          next.set(msgSessionId, serverCreatedAt);
+          return { sessionLastCreatedAt: next };
+        });
       }
       const msgType = msg.type as string;
       if (msgType === "assistant") {
