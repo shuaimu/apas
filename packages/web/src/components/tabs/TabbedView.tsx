@@ -213,6 +213,7 @@ export function TabbedView() {
   const rebootCli = useStore((s) => s.rebootCli);
   const downloadSession = useStore((s) => s.downloadSession);
   const requestPaneDiff = useStore((s) => s.requestPaneDiff);
+  const createPanePr = useStore((s) => s.createPanePr);
   const paneDiffs = useStore((s) => s.paneDiffs);
   const updatePaneRole = useStore((s) => s.updatePaneRole);
   const teamRecords = useStore((s) => s.teamRecords);
@@ -1024,6 +1025,12 @@ export function TabbedView() {
           removePane(diffModalPaneId, "discard");
           setDiffModalPaneId(null);
         }}
+        onCreatePr={() => {
+          if (diffModalPaneId === null) return;
+          if (!confirm("Push this branch to origin and open a GitHub PR? Requires `gh` to be installed and authenticated on the CLI host.")) return;
+          createPanePr(diffModalPaneId);
+          setDiffModalPaneId(null);
+        }}
       />
 
       <RoleModal
@@ -1317,6 +1324,7 @@ interface PaneDiffModalProps {
   onRefresh: () => void;
   onMerge: () => void;
   onDiscard: () => void;
+  onCreatePr: () => void;
 }
 
 // Split a unified `git diff` output into per-file sections. Each `diff
@@ -1377,7 +1385,7 @@ function DiffFileSection({ path, body }: DiffFileSectionProps) {
   );
 }
 
-function PaneDiffModal({ open, diff, onClose, onRefresh, onMerge, onDiscard }: PaneDiffModalProps) {
+function PaneDiffModal({ open, diff, onClose, onRefresh, onMerge, onDiscard, onCreatePr }: PaneDiffModalProps) {
   if (!open) return null;
   let body: React.ReactNode;
   if (diff?.error) {
@@ -1411,6 +1419,14 @@ function PaneDiffModal({ open, diff, onClose, onRefresh, onMerge, onDiscard }: P
               className="rounded border border-zinc-600 bg-zinc-800 px-3 py-1 text-xs hover:bg-zinc-700"
             >
               Refresh
+            </button>
+            <button
+              type="button"
+              onClick={onCreatePr}
+              className="rounded border border-sky-600 bg-sky-900/40 px-3 py-1 text-xs text-sky-200 hover:bg-sky-900/60"
+              title="Push this branch to origin and open a GitHub PR via `gh pr create --fill`. Requires `gh` on the CLI host."
+            >
+              Create PR
             </button>
             <button
               type="button"

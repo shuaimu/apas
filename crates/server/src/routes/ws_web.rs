@@ -1245,6 +1245,21 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
+                Ok(WebToServer::CreatePr { pane_id }) => {
+                    if let Some(sid) = session_id {
+                        tracing::info!("Create PR for pane {} in session {}", pane_id, sid);
+                        state
+                            .sessions
+                            .route_to_cli(
+                                &sid,
+                                ServerToCli::CreatePr {
+                                    session_id: sid,
+                                    pane_id,
+                                },
+                            )
+                            .await;
+                    }
+                }
                 Ok(WebToServer::AnswerQuestion { tool_use_id, answers }) => {
                     // Relay the user's AskUserQuestion answers down to the CLI
                     // streaming worker. The worker matches by tool_use_id

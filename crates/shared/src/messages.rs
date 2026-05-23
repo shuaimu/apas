@@ -201,6 +201,19 @@ pub enum CliToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+
+    /// Result of `ServerToCli::CreatePr` — the CLI pushed the pane's
+    /// branch to origin and ran `gh pr create --fill`. `url` is set on
+    /// success; `error` is set on failure (no remote, `gh` not installed,
+    /// auth missing, no commits, etc.).
+    PrCreated {
+        session_id: Uuid,
+        pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 /// Messages sent from server to CLI client
@@ -333,6 +346,12 @@ pub enum ServerToCli {
     /// Compute and return the current `git diff` for a pane's isolated
     /// worktree branch against the project's HEAD. Phase 1.2a.
     RequestPaneDiff { session_id: Uuid, pane_id: u32 },
+
+    /// Ask the CLI to push the pane's branch to origin and create a
+    /// GitHub PR via `gh pr create --fill`. Triggered by the "Create PR"
+    /// button on the Diff modal. The CLI responds with
+    /// `CliToServer::PrCreated`.
+    CreatePr { session_id: Uuid, pane_id: u32 },
 
     /// Set role/goal/backstory on the named pane and persist to .apas.
     /// Phase 2.1c.
@@ -660,6 +679,11 @@ pub enum WebToServer {
     /// Phase 1.2a.
     RequestPaneDiff { pane_id: u32 },
 
+    /// Web → server → CLI: push the pane's branch and run
+    /// `gh pr create --fill` in its worktree. Result rides
+    /// `ServerToWeb::PrCreated`.
+    CreatePr { pane_id: u32 },
+
     /// Update a pane's role/goal/backstory triple (Phase 2.1c). All three
     /// fields are optional — sending null for any of them clears that
     /// piece. Takes effect on the next pane spawn (close + reopen tab,
@@ -850,6 +874,18 @@ pub enum ServerToWeb {
         base: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diff: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
+    /// Forwarded from `CliToServer::PrCreated` after the CLI ran
+    /// `gh pr create --fill`. The web shows a toast with the URL or
+    /// the error.
+    PrCreated {
+        session_id: Uuid,
+        pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },

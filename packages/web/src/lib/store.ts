@@ -440,6 +440,7 @@ interface AppState {
   downloadSession: () => void;
   requestPaneDiff: (paneId: number) => void;
   paneDiffs: Record<number, PaneDiff>;
+  createPanePr: (paneId: number) => void;
   updatePaneRole: (paneId: number, role?: string, goal?: string, backstory?: string) => void;
   teamRecords: TeamRecord[];
   planReviewPending: PlanReviewPendingItem[];
@@ -1361,6 +1362,16 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
+  createPanePr: (paneId: number) => {
+    const { ws, showToast } = get();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "create_pr", pane_id: paneId }));
+      showToast("Pushing branch + creating PR…", "info");
+    } else {
+      showToast("Not connected — cannot create PR", "error");
+    }
+  },
+
   updatePaneRole: (paneId: number, role?: string, goal?: string, backstory?: string) => {
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -1894,6 +1905,23 @@ function handleServerMessage(
             },
           },
         }));
+      }
+      break;
+    }
+
+    case "pr_created": {
+      const url = data.url as string | undefined;
+      const error = data.error as string | undefined;
+      const { showToast } = get();
+      if (url) {
+        // Toast as info so it stays around a bit; user clicks the URL
+        // from the toast to open the PR on GitHub.
+        showToast(`PR created: ${url}`, "success");
+        if (typeof window !== "undefined") {
+          window.open(url, "_blank", "noopener");
+        }
+      } else {
+        showToast(`PR create failed: ${error ?? "unknown error"}`, "error");
       }
       break;
     }

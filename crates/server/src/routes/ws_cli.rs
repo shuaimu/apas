@@ -692,6 +692,24 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     )
                                     .await;
                             }
+                            Ok(CliToServer::PrCreated { session_id, pane_id, url, error }) => {
+                                tracing::info!(
+                                    "PR created for pane {} in session {}: url={:?} error={:?}",
+                                    pane_id, session_id, url, error,
+                                );
+                                state
+                                    .sessions
+                                    .route_to_web(
+                                        &session_id,
+                                        ServerToWeb::PrCreated {
+                                            session_id,
+                                            pane_id,
+                                            url,
+                                            error,
+                                        },
+                                    )
+                                    .await;
+                            }
                             Ok(CliToServer::PaneList { session_id, mut panes }) => {
                                 // Cache pane list and forward to attached web clients
                                 tracing::info!("CLI {} sent pane list for session {}: {} panes", cli_id, session_id, panes.len());

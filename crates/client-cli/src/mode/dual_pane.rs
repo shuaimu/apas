@@ -7386,6 +7386,38 @@ async fn run_server_connection(
                                                         .await;
                                                 }
                                             }
+                                            ServerToCli::CreatePr { session_id: _, pane_id: pr_pane_id } => {
+                                                let wt: Option<String> = {
+                                                    let metas = pane_metas.lock().unwrap();
+                                                    metas.get(&pr_pane_id).and_then(|m| m.worktree_path.clone())
+                                                };
+                                                // gh pr create + git push are blocking on a network call;
+                                                // run in spawn_blocking so the WS reader loop stays responsive.
+                                                let result = tokio::task::spawn_blocking(move || {
+                                                    crate::worktree::create_pr_for_pane(wt.as_deref())
+                                                })
+                                                .await
+                                                .unwrap_or_else(|e| Err(anyhow::anyhow!("task join: {}", e)));
+                                                let pr_msg = match result {
+                                                    Ok(url) => CliToServer::PrCreated {
+                                                        session_id,
+                                                        pane_id: pr_pane_id,
+                                                        url: Some(url),
+                                                        error: None,
+                                                    },
+                                                    Err(err) => CliToServer::PrCreated {
+                                                        session_id,
+                                                        pane_id: pr_pane_id,
+                                                        url: None,
+                                                        error: Some(err.to_string()),
+                                                    },
+                                                };
+                                                if let Ok(text) = serde_json::to_string(&pr_msg) {
+                                                    let _ = ws_sender
+                                                        .send(Message::Text(text.into()))
+                                                        .await;
+                                                }
+                                            }
                                             _ => {}
                                         }
                                     }

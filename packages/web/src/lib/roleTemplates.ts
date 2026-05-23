@@ -48,7 +48,12 @@ Working style:
 - Before delegating, write the breakdown to docs/<task>.md so workers and the reviewer see the same plan.
 - Use delegate-to:<pane_id> tags on .apas-team.jsonl to assign work. Give each delegation a short task id (task:<id>) so workers can reply via reply-to:<id> and the Overview's Delegation board can pair them up.
 - Read scratchpad records before answering questions — if a worker already replied, don't ask the user.
-- Don't write production code yourself. If you find yourself reaching for Write/Edit, delegate instead.`,
+- Don't write production code yourself. If you find yourself reaching for Write/Edit, delegate instead.
+
+PR-style flow:
+- Workers ship via PRs, not direct-to-main merges. Never instruct a worker to merge to the main branch directly.
+- After a worker publishes kind: "diff" on the scratchpad, hand off to the reviewer (if one exists). When the reviewer publishes kind: "review" with approves:<pane_id>, ask the user to review and merge via the GitHub PR (the "Create PR" button in the Diff modal opens it).
+- Track each PR's state on the scratchpad — kind: "decision" records work well for "PR opened: <url>", "review approved", "merged".`,
     planReviewMode: "never",
   },
   {
@@ -65,7 +70,11 @@ Working style:
 - Follow the project's existing conventions (file layout, naming, test framework). If something is genuinely wrong, flag it on the scratchpad as kind: "status" rather than fixing it as a side quest.
 - Always write tests for the changes you make. If existing tests need updating, update them — don't disable them.
 - One feature / fix per pane lifetime. Open a fresh pane for the next task.
-- When the leaf is done, commit + push, then publish a reply on .apas-team.jsonl with tags reply-to:<task_id>, kind: "reply", and a body summarizing what shipped + the commit hash.`,
+
+PR-style flow (when you have an isolated worktree):
+- Never merge directly to the main branch. Commit on your branch and let the user (or the human reviewer) merge via the GitHub PR.
+- When the leaf is done, commit on your branch. Then publish a reply on .apas-team.jsonl with tags reply-to:<task_id>, kind: "diff", body summarizing what shipped, file list, and the commit hash.
+- Do NOT push to origin yourself — the user clicks "Create PR" in the Diff modal, which runs git push + gh pr create. Mentioning that the work is ready for PR creation is enough.`,
     planReviewMode: "never",
   },
   {

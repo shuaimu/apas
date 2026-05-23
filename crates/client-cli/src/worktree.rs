@@ -281,6 +281,58 @@ pub fn compute_pane_diff(
     Ok((branch, base_ref, diff))
 }
 
+/// Push the pane's branch to `origin` and open a GitHub PR via
+/// `gh pr create --fill`. Returns the new PR URL.
+///
+/// Preconditions: the pane has an isolated worktree, the worktree is on a
+/// branch (not detached HEAD), the project has an `origin` remote, and
+/// `gh` is installed + authenticated on the CLI host.
+pub fn create_pr_for_pane(worktree_path: Option<&str>) -> Result<String> {
+    let worktree = worktree_path.ok_or_else(|| {
+        anyhow!("pane has no isolated worktree — nothing to PR. Add a worktree to this pane first.")
+    })?;
+    let branch = current_branch_in(worktree).ok_or_else(|| {
+        anyhow!("worktree at {} is on detached HEAD; cannot push or open a PR", worktree)
+    })?;
+
+    // 1. Push the branch to origin (creating the remote ref if needed). The
+    //    `-u` keeps subsequent pushes from this worktree simple.
+    run_git_cd(worktree, &["push", "-u", "origin", &branch])?;
+
+    // 2. gh pr create --fill auto-fills the title and body from commits. We
+    //    intentionally don't specify --base — gh picks the repo's default
+    //    branch, which is what the user expects.
+    let out = Command::new("gh")
+        .args(["pr", "create", "--fill"])
+        .current_dir(worktree)
+        .output()
+        .with_context(|| {
+            format!(
+                "running `gh pr create --fill` in {} (is `gh` installed and authenticated? run `gh auth login` on the CLI host)",
+                worktree
+            )
+        })?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "gh pr create failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    // gh prints the PR URL on its last non-empty line of stdout.
+    let url = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .rev()
+        .find(|l| l.starts_with("http"))
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            anyhow!(
+                "gh pr create succeeded but did not print a URL: {}",
+                String::from_utf8_lossy(&out.stdout).trim()
+            )
+        })?;
+    Ok(url)
+}
+
 /// Run a `git -C <dir> <args…>` command and return its stdout on success.
 fn run_git_cd(cwd: &str, args: &[&str]) -> Result<String> {
     let out = Command::new("git")

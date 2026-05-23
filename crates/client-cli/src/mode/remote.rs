@@ -304,6 +304,7 @@ async fn run_connection(
                     | Ok(ServerToCli::InterruptPane { .. })
                     | Ok(ServerToCli::AnswerQuestion { .. })
                     | Ok(ServerToCli::RequestPaneDiff { .. })
+                    | Ok(ServerToCli::CreatePr { .. })
                     | Ok(ServerToCli::UpdatePaneRole { .. })
                     | Ok(ServerToCli::PlanReviewAnswer { .. })
                     | Ok(ServerToCli::UpdatePaneReviewMode { .. }) => {
