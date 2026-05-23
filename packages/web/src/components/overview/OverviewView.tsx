@@ -7,6 +7,7 @@ import { ScratchpadTicker } from "./ScratchpadTicker";
 import { DelegationBoard } from "./DelegationBoard";
 import { ResourceUseRollup } from "./ResourceUseRollup";
 import { AddWorkerModal } from "./AddWorkerModal";
+import { ProjectGoalBar } from "./ProjectGoalBar";
 
 /**
  * Phase 5.1 — team overview pseudo-tab.
@@ -50,6 +51,8 @@ export function OverviewView({
         <p className="mb-6 text-sm text-gray-500 dark:text-gray-400">
           Roll-up of every pane in this project. Use the regular tabs above for the per-pane chat / timeline / role views.
         </p>
+
+        <ProjectGoalBar />
 
         <OverviewSection title="Pane grid">
           <PaneGrid
