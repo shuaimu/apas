@@ -1262,6 +1262,44 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
+                Ok(WebToServer::UpdateProjectGoal { goal }) => {
+                    if let Some(sid) = session_id {
+                        tracing::info!(
+                            "Update project_goal for session {} ({} bytes)",
+                            sid,
+                            goal.len()
+                        );
+                        state
+                            .sessions
+                            .route_to_cli(
+                                &sid,
+                                ServerToCli::UpdateProjectGoal {
+                                    session_id: sid,
+                                    goal,
+                                },
+                            )
+                            .await;
+                    }
+                }
+                Ok(WebToServer::AddManagerDirective { text }) => {
+                    if let Some(sid) = session_id {
+                        tracing::info!(
+                            "Add manager directive for session {} ({} bytes)",
+                            sid,
+                            text.len()
+                        );
+                        state
+                            .sessions
+                            .route_to_cli(
+                                &sid,
+                                ServerToCli::AddManagerDirective {
+                                    session_id: sid,
+                                    text,
+                                },
+                            )
+                            .await;
+                    }
+                }
                 Ok(WebToServer::AnswerQuestion { tool_use_id, answers }) => {
                     // Relay the user's AskUserQuestion answers down to the CLI
                     // streaming worker. The worker matches by tool_use_id

@@ -353,6 +353,14 @@ pub enum ServerToCli {
     /// `CliToServer::PrCreated`.
     CreatePr { session_id: Uuid, pane_id: u32 },
 
+    /// Manager v2 — write `goal` into project_goal.md at the project
+    /// root (overwriting any existing content).
+    UpdateProjectGoal { session_id: Uuid, goal: String },
+
+    /// Manager v2 — append a `{ts, text}` line to
+    /// manager-directives.jsonl at the project root.
+    AddManagerDirective { session_id: Uuid, text: String },
+
     /// Set role/goal/backstory on the named pane and persist to .apas.
     /// Phase 2.1c.
     UpdatePaneRole {
@@ -690,6 +698,19 @@ pub enum WebToServer {
     /// `gh pr create --fill` in its worktree. Result rides
     /// `ServerToWeb::PrCreated`.
     CreatePr { pane_id: u32 },
+
+    /// Manager v2 — overwrite the project_goal.md file at the project
+    /// root with `goal`. The deadloop manager re-reads this file on
+    /// every iteration so a goal change takes effect at the next loop
+    /// boundary, not mid-iteration.
+    UpdateProjectGoal { goal: String },
+
+    /// Manager v2 — append a timestamped directive line to
+    /// manager-directives.jsonl at the project root. The deadloop
+    /// manager reads recent lines on every iteration to absorb
+    /// strategy nudges from the user without derailing in-progress
+    /// work.
+    AddManagerDirective { text: String },
 
     /// Update a pane's role/goal/backstory triple (Phase 2.1c). All three
     /// fields are optional — sending null for any of them clears that

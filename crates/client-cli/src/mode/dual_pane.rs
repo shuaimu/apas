@@ -7386,6 +7386,20 @@ async fn run_server_connection(
                                                         .await;
                                                 }
                                             }
+                                            ServerToCli::UpdateProjectGoal { session_id: _, goal } => {
+                                                let project_dir = std::path::Path::new(&working_dir).to_path_buf();
+                                                match crate::manager::write_project_goal(&project_dir, &goal) {
+                                                    Ok(()) => tracing::info!("project_goal.md updated ({} bytes)", goal.len()),
+                                                    Err(e) => tracing::warn!("failed to write project_goal.md: {}", e),
+                                                }
+                                            }
+                                            ServerToCli::AddManagerDirective { session_id: _, text } => {
+                                                let project_dir = std::path::Path::new(&working_dir).to_path_buf();
+                                                match crate::manager::append_directive(&project_dir, &text) {
+                                                    Ok(()) => tracing::info!("manager-directives.jsonl appended ({} bytes)", text.len()),
+                                                    Err(e) => tracing::warn!("failed to append manager directive: {}", e),
+                                                }
+                                            }
                                             ServerToCli::CreatePr { session_id: _, pane_id: pr_pane_id } => {
                                                 let wt: Option<String> = {
                                                     let metas = pane_metas.lock().unwrap();

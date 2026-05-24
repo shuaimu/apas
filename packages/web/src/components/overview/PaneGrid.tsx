@@ -237,19 +237,21 @@ function PaneCard({
               </span>
             )
           )}
-          {pane.pane_id !== PANE_ID_INTERACTIVE && pane.pane_id !== PANE_ID_DEADLOOP && (
-            <span
-              className="rounded border border-red-400 dark:border-red-700 bg-red-50 dark:bg-red-900/30 px-1.5 py-0.5 text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/50"
-              role="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                onRemove();
-              }}
-              title="Close this pane (worktree-cleanup prompt opens if applicable)"
-            >
-              Remove
-            </span>
-          )}
+          {pane.pane_id !== PANE_ID_INTERACTIVE &&
+            pane.pane_id !== PANE_ID_DEADLOOP &&
+            !(pane.role ?? "").toLowerCase().includes("manager") && (
+              <span
+                className="rounded border border-red-400 dark:border-red-700 bg-red-50 dark:bg-red-900/30 px-1.5 py-0.5 text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/50"
+                role="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onRemove();
+                }}
+                title="Close this pane (worktree-cleanup prompt opens if applicable)"
+              >
+                Remove
+              </span>
+            )}
           {(pane.pane_id === PANE_ID_INTERACTIVE || pane.pane_id === PANE_ID_DEADLOOP) && (
             <span
               className="rounded bg-gray-100 dark:bg-gray-700 px-1.5 py-0.5 text-[10px] text-gray-500 dark:text-gray-400"
@@ -258,6 +260,16 @@ function PaneCard({
               default
             </span>
           )}
+          {(pane.role ?? "").toLowerCase().includes("manager") &&
+            pane.pane_id !== PANE_ID_INTERACTIVE &&
+            pane.pane_id !== PANE_ID_DEADLOOP && (
+              <span
+                className="rounded bg-violet-100 dark:bg-violet-900/40 px-1.5 py-0.5 text-[10px] text-violet-700 dark:text-violet-300"
+                title="Manager pane — controlled from the Overview panel (Pause / Resume / Edit goal)"
+              >
+                manager
+              </span>
+            )}
         </span>
       </div>
     </button>

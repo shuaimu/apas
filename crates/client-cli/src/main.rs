@@ -12,6 +12,7 @@ use uuid::Uuid;
 mod auth;
 mod claude;
 mod config;
+mod manager;
 mod mode;
 mod pane_status;
 mod plan_review;

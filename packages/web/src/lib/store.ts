@@ -448,6 +448,10 @@ interface AppState {
   requestPaneDiff: (paneId: number) => void;
   paneDiffs: Record<number, PaneDiff>;
   createPanePr: (paneId: number) => void;
+  /** Manager v2 — overwrite project_goal.md at the project root. */
+  updateProjectGoal: (goal: string) => void;
+  /** Manager v2 — append a directive line to manager-directives.jsonl. */
+  addManagerDirective: (text: string) => void;
   updatePaneRole: (paneId: number, role?: string, goal?: string, backstory?: string) => void;
   teamRecords: TeamRecord[];
   planReviewPending: PlanReviewPendingItem[];
@@ -1377,6 +1381,24 @@ export const useStore = create<AppState>((set, get) => ({
       showToast("Pushing branch + creating PR…", "info");
     } else {
       showToast("Not connected — cannot create PR", "error");
+    }
+  },
+
+  updateProjectGoal: (goal: string) => {
+    const { ws, showToast } = get();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "update_project_goal", goal }));
+    } else {
+      showToast("Not connected — cannot save goal", "error");
+    }
+  },
+
+  addManagerDirective: (text: string) => {
+    const { ws, showToast } = get();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "add_manager_directive", text }));
+    } else {
+      showToast("Not connected — directive not sent", "error");
     }
   },
 

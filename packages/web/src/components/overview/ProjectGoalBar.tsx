@@ -1,42 +1,77 @@
 "use client";
 
 /**
- * Manager v1 — "Project goal" input at the top of the Overview tab.
+ * Manager v2 — two-channel manager control panel on the Overview tab.
  *
- * Finds (or creates) a Tech-Lead pane and routes the user's goal to it.
- * The manager pane uses the existing Phase 3.1b manager addendum + the
- * Phase 3.1a `delegate-to:` scratchpad protocol to drive worker panes.
+ * Decoupled from chat. The manager pane runs as a deadloop; the user
+ * never chats with it directly. Instead:
  *
- * Drive model in v1: USER input drives the manager (manager is interactive,
- * not deadloop). v2 will optionally enable deadloop self-pacing once we see
- * whether the autonomous-grind mode is worth the token cost.
+ * 1. Project goal → written to `project_goal.md` at the project root.
+ *    The deadloop's prompt re-reads this on every iteration so a goal
+ *    change takes effect at the next loop boundary (not mid-action).
+ * 2. Directives → appended to `manager-directives.jsonl`. Same idea —
+ *    the deadloop tails this file on each iteration to pick up
+ *    strategy nudges.
+ *
+ * This deliberately uses two files (not the team scratchpad
+ * `.apas-team.jsonl`) so user↔manager comms stay separate from the
+ * inter-pane delegation chatter.
+ *
+ * Manager pane controls:
+ *  - **Start manager** — only shown when no manager pane exists.
+ *    Spawns a deadloop pane with the Tech Lead template and a fixed
+ *    "read goal + tail directives + tail scratchpad + decide" prompt.
+ *  - **Pause / Resume** — already on every deadloop card (see PaneGrid).
+ *  - **Remove** — hidden on the manager pane (PaneGrid checks role).
  */
 import { useEffect, useMemo, useState } from "react";
-import { ChevronsRight } from "lucide-react";
-import { useStore, type PaneConfig } from "@/lib/store";
+import { Play, Save, Send, Pause, CheckCircle2 } from "lucide-react";
+import { useStore } from "@/lib/store";
 import { ROLE_TEMPLATES } from "@/lib/roleTemplates";
+
+/**
+ * Composed at pane-creation time. The deadloop runs this prompt every
+ * iteration; it tells the agent to re-read the file-based channel state
+ * before acting.
+ */
+const MANAGER_DEADLOOP_PROMPT = `You are the team manager / tech lead, running as an autonomous deadloop.
+
+Every iteration, in order:
+
+1. Read project_goal.md (the project goal). If missing, ask the user via AskUserQuestion and skip the rest of this iteration.
+2. Read the last ~10 lines of manager-directives.jsonl (recent user directives, oldest to newest). Treat these as the user's most recent strategy nudges — they win over your own earlier plans.
+3. Read the last ~30 records of .apas-team.jsonl (team activity: kind values "delegation" / "reply" / "diff" / "review" / "status" / "decision"). Understand what each worker pane is doing.
+4. Decide what to do this iteration:
+   - If a worker is blocked or has questions, delegate help, revise the plan, or ask the user via AskUserQuestion.
+   - If a worker completed work (kind: "diff"), hand off to the reviewer pane (if one exists) or note the PR is ready for the user to merge.
+   - If a user directive needs acting on, do that.
+   - If you've taken the same action recently with no new info, just say "Idle; waiting" and end the iteration to avoid spinning.
+
+Delegate via .apas-team.jsonl with kind: "delegation" and tags like ["delegate-to:<pane_id>", "task:<short-id>"]. Workers reply with reply-to:<task_id>.
+
+Do not write production code yourself — your job is design and orchestration. If you find yourself reaching for Write/Edit/Bash, delegate to a worker pane instead.
+
+Do not chat with the user through this pane — they communicate via project_goal.md (slow-changing goal) and manager-directives.jsonl (fast-changing nudges). Use AskUserQuestion when you genuinely need an answer to proceed.`;
 
 export function ProjectGoalBar() {
   const paneConfigs = useStore((s) => s.paneConfigs);
+  const pausedPanes = useStore((s) => s.pausedPanes);
   const addPane = useStore((s) => s.addPane);
-  const sendMessageToPane = useStore((s) => s.sendMessageToPane);
-  const updatePaneRole = useStore((s) => s.updatePaneRole);
-  const updatePaneReviewMode = useStore((s) => s.updatePaneReviewMode);
+  const updateProjectGoal = useStore((s) => s.updateProjectGoal);
+  const addManagerDirective = useStore((s) => s.addManagerDirective);
+  const pausePane = useStore((s) => s.pausePane);
+  const resumePane = useStore((s) => s.resumePane);
   const showToast = useStore((s) => s.showToast);
 
-  const [goal, setGoal] = useState("");
-  const [pending, setPending] = useState<string | null>(null);
-  // Pane IDs that existed BEFORE the user clicked "Create manager and
-  // start". Used to identify the new pane in the fallback path when the
-  // CLI is on a pre-26.05.65 binary and didn't honor role/goal/backstory
-  // on AddPane (so the role-substring match returns nothing).
-  const [knownIdsAtCreate, setKnownIdsAtCreate] = useState<Set<number> | null>(
-    null,
-  );
+  // Goal text persisted on the CLI host's filesystem; we keep a local
+  // mirror that the user is editing. There's no server→web sync for
+  // file content yet — once the user clicks Save, the value is the
+  // current value. (A v3 could fetch the current file content on
+  // attach so users see what's there.)
+  const [goalDraft, setGoalDraft] = useState("");
+  const [directive, setDirective] = useState("");
+  const [goalDirtySinceSave, setGoalDirtySinceSave] = useState(false);
 
-  // First pane whose role contains "manager" (case-insensitive). The same
-  // substring match that activates the manager system-prompt addendum in
-  // role::compose_system_prompt, so the UI and the prompt stay aligned.
   const managerPane = useMemo(
     () =>
       paneConfigs.find((p) =>
@@ -44,210 +79,205 @@ export function ProjectGoalBar() {
       ),
     [paneConfigs],
   );
+  const managerPaused = managerPane
+    ? pausedPanes.includes(managerPane.pane_id)
+    : false;
 
-  // After "Create manager and start", wait for the new pane to appear in
-  // paneConfigs, then route the queued goal there.
+  // Hydrate the goal draft from the manager pane's `goal` field on first
+  // mount — that's the closest mirror we have of the on-disk file
+  // (Tech Lead template sets a default goal; once the user edits and
+  // saves, project_goal.md is the source of truth on disk but the web
+  // doesn't currently re-read it).
   useEffect(() => {
-    if (!pending) return;
-    // Prefer a pane with proper "manager" role (CLI >= 26.05.65 path).
-    // Fall back to the newest pane we created (when CLI < 26.05.65 dropped
-    // role/goal/backstory from AddPane). The fallback also patches the
-    // role retroactively via UpdatePaneRole so the next spawn picks up
-    // the manager addendum without the user re-creating the pane.
-    let candidate = managerPane;
-    let needsRolePatch = false;
-    if (!candidate && knownIdsAtCreate) {
-      const fresh = paneConfigs.find(
-        (p) => !knownIdsAtCreate.has(p.pane_id),
-      );
-      if (fresh) {
-        candidate = fresh;
-        needsRolePatch = true;
-      }
+    if (managerPane && !goalDraft && !goalDirtySinceSave) {
+      setGoalDraft(managerPane.goal ?? "");
     }
-    if (!candidate) return;
+  }, [managerPane, goalDraft, goalDirtySinceSave]);
 
+  const handleStartManager = () => {
     const techLead = ROLE_TEMPLATES.find((t) => t.id === "tech-lead");
-    if (needsRolePatch && techLead) {
-      updatePaneRole(candidate.pane_id, techLead.role, techLead.goal, techLead.backstory);
-      updatePaneReviewMode(candidate.pane_id, techLead.planReviewMode);
-    }
-
-    // Message body: when the CLI didn't apply the manager addendum
-    // (needsRolePatch), inline the protocol so the agent knows what to
-    // do on this very first message. On properly-set-up panes, the
-    // addendum from compose_system_prompt is already in the system
-    // prompt and we don't repeat ourselves.
-    const protocolHint = needsRolePatch
-      ? "[Note: your role wasn't applied at spawn (CLI predates the AddPane wire change). You are the team manager / tech lead — break this goal into small leaves, delegate each to a worker pane via .apas-team.jsonl with tags delegate-to:<pane_id> and task:<id>, and track replies via reply-to:<id>. Don't write production code yourself. Reboot the CLI to get the proper manager addendum on next spawn.]\n\n"
-      : "";
-    const message =
-      protocolHint + composeManagerMessage(paneConfigs, candidate, pending);
-    const result = sendMessageToPane(message, candidate.pane_id);
-    if (result.success) {
-      showToast(
-        needsRolePatch
-          ? "Goal sent — role patched retroactively. Reboot the CLI for the proper addendum."
-          : "Goal sent to manager.",
-        needsRolePatch ? "info" : "success",
-      );
-      setPending(null);
-      setKnownIdsAtCreate(null);
-    } else {
-      showToast(result.error ?? "Failed to reach manager", "error");
-    }
-  }, [
-    pending,
-    managerPane,
-    paneConfigs,
-    knownIdsAtCreate,
-    sendMessageToPane,
-    updatePaneRole,
-    updatePaneReviewMode,
-    showToast,
-  ]);
-
-  const handleSubmit = () => {
-    const text = goal.trim();
-    if (!text) return;
-    if (managerPane) {
-      const message = composeManagerMessage(paneConfigs, managerPane, text);
-      const result = sendMessageToPane(message, managerPane.pane_id);
-      if (result.success) {
-        showToast("Goal sent to manager.", "success");
-        setGoal("");
-      } else {
-        showToast(result.error ?? "Failed to reach manager", "error");
-      }
-      return;
-    }
-    // No manager pane yet — create one from the Tech Lead template and
-    // queue the goal for delivery once the pane appears.
-    const techLead = ROLE_TEMPLATES.find((t) => t.id === "tech-lead");
-    if (!techLead) {
-      showToast("Tech Lead template missing — cannot create manager.", "error");
-      return;
-    }
-    // Snapshot the current pane IDs so the useEffect fallback can find
-    // the new one even if the CLI doesn't apply our requested role.
-    setKnownIdsAtCreate(new Set(paneConfigs.map((p) => p.pane_id)));
+    if (!techLead) return;
     const result = addPane(
       "claude",
-      "interactive",
+      "deadloop",
       "Manager",
-      undefined,
+      MANAGER_DEADLOOP_PROMPT,
       undefined,
       false,
       {
         role: techLead.role,
-        goal: techLead.goal,
+        goal: goalDraft.trim() || techLead.goal,
         backstory: techLead.backstory,
         planReviewMode: techLead.planReviewMode,
       },
     );
     if (result.success) {
-      setPending(text);
-      setGoal("");
-      showToast("Manager spawning — goal queued.", "info");
+      // Also persist the current goal text to project_goal.md so the
+      // deadloop's first iteration finds it.
+      if (goalDraft.trim()) {
+        updateProjectGoal(goalDraft.trim());
+      }
+      showToast("Manager started.", "success");
     } else {
-      setKnownIdsAtCreate(null);
-      showToast(result.error ?? "Failed to create manager", "error");
+      showToast(result.error ?? "Failed to start manager", "error");
     }
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    // Cmd/Ctrl+Enter submits — Enter alone inserts a newline so multi-line
-    // goals don't accidentally submit halfway through typing.
+  const handleSaveGoal = () => {
+    updateProjectGoal(goalDraft);
+    setGoalDirtySinceSave(false);
+    showToast("Project goal saved.", "success");
+  };
+
+  const handleSendDirective = () => {
+    const text = directive.trim();
+    if (!text) return;
+    addManagerDirective(text);
+    setDirective("");
+    showToast("Directive queued for the next manager iteration.", "info");
+  };
+
+  const handleDirectiveKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
-      handleSubmit();
+      handleSendDirective();
     }
   };
-
-  const buttonLabel = managerPane
-    ? "Send to manager"
-    : pending
-      ? "Waiting for manager…"
-      : "Create manager and start";
 
   return (
     <section className="mb-6 rounded border border-violet-300 bg-violet-50 p-4 dark:border-violet-800 dark:bg-violet-950/30">
-      <div className="mb-2 flex flex-wrap items-baseline gap-2">
+      <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
         <h3 className="text-sm font-semibold uppercase tracking-wide text-violet-700 dark:text-violet-300">
-          Project goal
+          Manager
         </h3>
         {managerPane ? (
-          <span className="text-xs text-violet-600 dark:text-violet-400">
-            → routed to{" "}
-            <span className="font-mono">{managerPane.label || `Pane ${managerPane.pane_id}`}</span>{" "}
-            (manager)
-          </span>
+          <div className="flex items-center gap-2 text-xs text-violet-600 dark:text-violet-400">
+            <span>
+              {managerPaused ? (
+                <>⏸ paused</>
+              ) : (
+                <>⏵ running</>
+              )}{" "}
+              ·{" "}
+              <span className="font-mono">
+                {managerPane.label || `Pane ${managerPane.pane_id}`}
+              </span>
+            </span>
+            {managerPaused ? (
+              <button
+                type="button"
+                onClick={() => resumePane(managerPane.pane_id)}
+                className="flex items-center gap-1 rounded border border-emerald-500 bg-emerald-600 px-2 py-0.5 text-xs font-medium text-white hover:bg-emerald-500"
+              >
+                <Play className="h-3 w-3" /> Resume
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => pausePane(managerPane.pane_id)}
+                className="flex items-center gap-1 rounded border border-amber-500 bg-amber-600 px-2 py-0.5 text-xs font-medium text-white hover:bg-amber-500"
+              >
+                <Pause className="h-3 w-3" /> Pause
+              </button>
+            )}
+          </div>
         ) : (
           <span className="text-xs text-violet-600 dark:text-violet-400">
-            no manager pane yet — submitting will spawn one with the Tech Lead template
+            no manager yet — start one to begin autonomous orchestration
           </span>
         )}
       </div>
-      <textarea
-        value={goal}
-        onChange={(e) => setGoal(e.target.value)}
-        onKeyDown={handleKeyDown}
-        rows={3}
-        placeholder="What does the team need to accomplish? (Cmd/Ctrl+Enter to send)"
-        className="w-full rounded border border-violet-300 bg-white p-2 text-sm text-gray-900 placeholder-gray-400 dark:border-violet-800 dark:bg-gray-900 dark:text-gray-100"
-      />
-      <div className="mt-2 flex items-center justify-between gap-2">
-        <p className="text-[11px] text-violet-700/80 dark:text-violet-300/80">
-          The manager will delegate to worker panes via{" "}
-          <span className="font-mono">.apas-team.jsonl</span>. Add workers from
-          the Add worker button or let the manager describe the team it needs.
-        </p>
-        <button
-          type="button"
-          onClick={handleSubmit}
-          disabled={!goal.trim() || !!pending}
-          className="flex items-center gap-1.5 rounded border border-violet-500 bg-violet-600 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          <ChevronsRight className="h-4 w-4" />
-          {buttonLabel}
-        </button>
+
+      {/* Goal — slow-changing, overwrites project_goal.md */}
+      <div className="mb-4">
+        <div className="mb-1 flex items-center justify-between">
+          <label className="text-[11px] font-medium uppercase tracking-wide text-violet-700/80 dark:text-violet-300/80">
+            Project goal
+            <span className="ml-1 text-violet-500/70 dark:text-violet-400/70 normal-case font-normal">
+              · written to <span className="font-mono">project_goal.md</span>
+            </span>
+          </label>
+          {goalDirtySinceSave && (
+            <span className="text-[10px] text-amber-600 dark:text-amber-400">
+              unsaved
+            </span>
+          )}
+        </div>
+        <textarea
+          value={goalDraft}
+          onChange={(e) => {
+            setGoalDraft(e.target.value);
+            setGoalDirtySinceSave(true);
+          }}
+          rows={3}
+          placeholder="What does the team need to accomplish?"
+          className="w-full rounded border border-violet-300 bg-white p-2 text-sm text-gray-900 placeholder-gray-400 dark:border-violet-800 dark:bg-gray-900 dark:text-gray-100"
+        />
+        <div className="mt-2 flex items-center justify-between gap-2">
+          <p className="text-[11px] text-violet-700/80 dark:text-violet-300/80">
+            Manager re-reads this file at the start of every loop iteration.
+          </p>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={handleSaveGoal}
+              disabled={!goalDirtySinceSave}
+              className="flex items-center gap-1 rounded border border-violet-500 bg-violet-600 px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {goalDirtySinceSave ? (
+                <>
+                  <Save className="h-3 w-3" /> Save goal
+                </>
+              ) : (
+                <>
+                  <CheckCircle2 className="h-3 w-3" /> Saved
+                </>
+              )}
+            </button>
+            {!managerPane && (
+              <button
+                type="button"
+                onClick={handleStartManager}
+                className="flex items-center gap-1 rounded border border-emerald-500 bg-emerald-600 px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-emerald-500"
+              >
+                <Play className="h-3 w-3" /> Start manager
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Directive — fast-changing, appends to manager-directives.jsonl */}
+      <div>
+        <label className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-violet-700/80 dark:text-violet-300/80">
+          Talk to manager
+          <span className="ml-1 text-violet-500/70 dark:text-violet-400/70 normal-case font-normal">
+            · appended to{" "}
+            <span className="font-mono">manager-directives.jsonl</span>
+          </span>
+        </label>
+        <textarea
+          value={directive}
+          onChange={(e) => setDirective(e.target.value)}
+          onKeyDown={handleDirectiveKey}
+          rows={2}
+          placeholder="Strategy nudge / question / correction (Cmd-Enter to send)"
+          className="w-full rounded border border-violet-300 bg-white p-2 text-sm text-gray-900 placeholder-gray-400 dark:border-violet-800 dark:bg-gray-900 dark:text-gray-100"
+        />
+        <div className="mt-2 flex items-center justify-between gap-2">
+          <p className="text-[11px] text-violet-700/80 dark:text-violet-300/80">
+            Manager tails this file each iteration — directives are absorbed at loop boundaries, not mid-action.
+          </p>
+          <button
+            type="button"
+            onClick={handleSendDirective}
+            disabled={!directive.trim()}
+            className="flex items-center gap-1 rounded border border-violet-500 bg-violet-600 px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <Send className="h-3 w-3" /> Send directive
+          </button>
+        </div>
       </div>
     </section>
   );
-}
-
-/** Builds the "[Current team: ...]" header that rides along with each
- *  goal message so the manager has up-to-date sibling info without needing
- *  a respawn. The manager addendum from Phase 3.1b is generic — this is the
- *  per-message snapshot of who's currently on the roster. */
-function composeManagerMessage(
-  panes: PaneConfig[],
-  managerPane: PaneConfig,
-  userText: string,
-): string {
-  const others = panes
-    .filter((p) => p.pane_id !== managerPane.pane_id)
-    .sort((a, b) => a.pane_id - b.pane_id);
-  let roster: string;
-  if (others.length === 0) {
-    roster =
-      "[Current team: no worker panes yet. If you need workers (developer / qa / reviewer / researcher / devops), describe the team you want and ask the user to add them — or ask the user directly via AskUserQuestion.]";
-  } else {
-    const lines = others
-      .map((p) => {
-        const label = p.label || `Pane ${p.pane_id}`;
-        const role = p.role ? `, role: ${p.role}` : "";
-        const goal = p.goal ? `, owns: ${truncate(p.goal, 120)}` : "";
-        const wt = p.worktree_path ? ", isolated worktree" : "";
-        return `  - pane_id=${p.pane_id} (${label}${role}${goal}${wt})`;
-      })
-      .join("\n");
-    roster = `[Current team:\n${lines}\nUse delegate-to:<pane_id> on .apas-team.jsonl to assign work.]`;
-  }
-  return `${roster}\n\nUSER PROJECT GOAL:\n${userText}`;
-}
-
-function truncate(s: string, max: number): string {
-  if (s.length <= max) return s;
-  return `${s.slice(0, max - 1)}…`;
 }
