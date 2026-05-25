@@ -25,7 +25,7 @@
  *  - **Remove** — hidden on the manager pane (PaneGrid checks role).
  */
 import { useEffect, useMemo, useState } from "react";
-import { Play, Save, Send, Pause, CheckCircle2 } from "lucide-react";
+import { Play, Save, Pause, CheckCircle2 } from "lucide-react";
 import { useStore } from "@/lib/store";
 import { ROLE_TEMPLATES } from "@/lib/roleTemplates";
 
@@ -58,7 +58,6 @@ export function ProjectGoalBar() {
   const pausedPanes = useStore((s) => s.pausedPanes);
   const addPane = useStore((s) => s.addPane);
   const updateProjectGoal = useStore((s) => s.updateProjectGoal);
-  const addManagerDirective = useStore((s) => s.addManagerDirective);
   const pausePane = useStore((s) => s.pausePane);
   const resumePane = useStore((s) => s.resumePane);
   const showToast = useStore((s) => s.showToast);
@@ -69,7 +68,6 @@ export function ProjectGoalBar() {
   // current value. (A v3 could fetch the current file content on
   // attach so users see what's there.)
   const [goalDraft, setGoalDraft] = useState("");
-  const [directive, setDirective] = useState("");
   const [goalDirtySinceSave, setGoalDirtySinceSave] = useState(false);
 
   const managerPane = useMemo(
@@ -127,21 +125,6 @@ export function ProjectGoalBar() {
     updateProjectGoal(goalDraft);
     setGoalDirtySinceSave(false);
     showToast("Project goal saved.", "success");
-  };
-
-  const handleSendDirective = () => {
-    const text = directive.trim();
-    if (!text) return;
-    addManagerDirective(text);
-    setDirective("");
-    showToast("Directive queued for the next manager iteration.", "info");
-  };
-
-  const handleDirectiveKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-      e.preventDefault();
-      handleSendDirective();
-    }
   };
 
   return (
@@ -247,37 +230,6 @@ export function ProjectGoalBar() {
         </div>
       </div>
 
-      {/* Directive — fast-changing, appends to manager-directives.jsonl */}
-      <div>
-        <label className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-violet-700/80 dark:text-violet-300/80">
-          Talk to manager
-          <span className="ml-1 text-violet-500/70 dark:text-violet-400/70 normal-case font-normal">
-            · appended to{" "}
-            <span className="font-mono">manager-directives.jsonl</span>
-          </span>
-        </label>
-        <textarea
-          value={directive}
-          onChange={(e) => setDirective(e.target.value)}
-          onKeyDown={handleDirectiveKey}
-          rows={2}
-          placeholder="Strategy nudge / question / correction (Cmd-Enter to send)"
-          className="w-full rounded border border-violet-300 bg-white p-2 text-sm text-gray-900 placeholder-gray-400 dark:border-violet-800 dark:bg-gray-900 dark:text-gray-100"
-        />
-        <div className="mt-2 flex items-center justify-between gap-2">
-          <p className="text-[11px] text-violet-700/80 dark:text-violet-300/80">
-            Manager tails this file each iteration — directives are absorbed at loop boundaries, not mid-action.
-          </p>
-          <button
-            type="button"
-            onClick={handleSendDirective}
-            disabled={!directive.trim()}
-            className="flex items-center gap-1 rounded border border-violet-500 bg-violet-600 px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            <Send className="h-3 w-3" /> Send directive
-          </button>
-        </div>
-      </div>
     </section>
   );
 }
