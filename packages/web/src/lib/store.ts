@@ -140,6 +140,13 @@ export interface SessionCacheEntry {
   isDualPane: boolean;
   answeredQuestions: Map<string, Record<string, string>>;
   cachedAt: number;
+  /// Server's `created_at` for the most recent message represented in this
+  /// snapshot. Persisted to IDB so that a tab restored from a previous
+  /// browser session can fire a catchup with the right watermark instead
+  /// of silently showing stale content forever (the in-memory
+  /// `sessionLastCreatedAt` is fresh on every page load and cannot recover
+  /// this on its own).
+  lastCreatedAt?: string;
 }
 
 export type PaneType = "deadloop" | "interactive";
@@ -358,6 +365,14 @@ interface AppState {
   // `route_to_web` couldn't reach the disconnected old connection_id.
   sessionLastCreatedAt: Map<string, string>;
 
+  // Frozen pre-reconnect watermark, snapshotted from `sessionLastCreatedAt`
+  // the moment the WS reauthenticates. Catchup uses this in preference to
+  // the live watermark so that a stream_message that arrives between
+  // reconnect and the user clicking a background tab can't advance the
+  // watermark past the disconnect-window messages still sitting on disk.
+  // Cleared per-session once that session's catchup reply lands.
+  reconnectWatermarks: Map<string, string>;
+
   // Legacy compat (derived from dynamic state)
   deadloopMessages: Message[];
   interactiveMessages: Message[];
@@ -448,6 +463,10 @@ interface AppState {
   requestPaneDiff: (paneId: number) => void;
   paneDiffs: Record<number, PaneDiff>;
   createPanePr: (paneId: number) => void;
+  /** v3.1 — current project_goal.md content per session id, mirrored
+   *  from the CLI's mtime poller. Used by ProjectGoalBar to hydrate the
+   *  textbox when the user isn't editing. */
+  projectGoals: Record<string, string>;
   /** Manager v2 — overwrite project_goal.md at the project root. */
   updateProjectGoal: (goal: string) => void;
   /** Manager v2 — append a directive line to manager-directives.jsonl. */
@@ -521,6 +540,7 @@ export const useStore = create<AppState>((set, get) => ({
   paneModes: {},
   pausedPanes: [],
   paneDiffs: {},
+  projectGoals: {},
   teamRecords: [],
   planReviewPending: [],
   answeredQuestions: new Map(),
@@ -528,6 +548,7 @@ export const useStore = create<AppState>((set, get) => ({
   sessionCache: new Map(),
   unreadSessions: new Set(),
   sessionLastCreatedAt: new Map(),
+  reconnectWatermarks: new Map(),
   loadingMorePane: null,
   // Legacy compat getters (populated from dynamic state)
   deadloopMessages: [],
@@ -794,7 +815,7 @@ export const useStore = create<AppState>((set, get) => ({
         currentSessionId !== sessionId &&
         (state.messages.length > 0 || Object.keys(state.paneMessages).length > 0)
       ) {
-        const entry = {
+        const entry: SessionCacheEntry = {
           messages: state.messages,
           paneMessages: state.paneMessages,
           paneHasMore: state.paneHasMore,
@@ -804,6 +825,10 @@ export const useStore = create<AppState>((set, get) => ({
           isDualPane: state.isDualPane,
           answeredQuestions: state.answeredQuestions,
           cachedAt: Date.now(),
+          // Carry the catchup watermark into the snapshot so a future
+          // page load can ask the server for messages newer than this
+          // instead of falsely trusting the stale cache forever.
+          lastCreatedAt: state.sessionLastCreatedAt.get(currentSessionId),
         };
         sessionCache.set(currentSessionId, entry);
         // Mirror the snapshot to IndexedDB so it survives a reload —
@@ -887,6 +912,15 @@ export const useStore = create<AppState>((set, get) => ({
       type: "attach_session",
       session_id: sessionId
     }));
+
+    // If we restored from cache, the live attach reply gets dedupe-skipped
+    // ("live state wins") and the gap that landed while this tab was a
+    // background session stays empty. Catchup fills it lazily — at most
+    // one per-tab attach, naturally rate-limited by user clicks rather
+    // than fired in parallel across every cached session on reconnect.
+    if (!isSameSession && !forceReload && state.sessionCache.has(sessionId)) {
+      requestCatchupIfNeeded(get, sessionId);
+    }
   },
 
   refreshCliClients: () => {
@@ -1524,7 +1558,20 @@ if (typeof window !== "undefined") {
         merged.set(k, v); // in-memory wins
       }
       newKeys = Array.from(diskCache.keys()).filter((k) => !state.sessionCache.has(k));
-      return { sessionCache: merged };
+      // Seed the catchup watermark from each persisted entry. Without
+      // this, a hydrated tab has no `sessionLastCreatedAt[sid]`, so the
+      // first attach-after-load skips its catchup query and the user
+      // sees stale messages until they hit refresh. In-memory wins on
+      // conflict (it can only be newer).
+      const seededLast = new Map(state.sessionLastCreatedAt);
+      for (const [k, v] of diskCache) {
+        if (!v.lastCreatedAt) continue;
+        const existing = seededLast.get(k);
+        if (!existing || v.lastCreatedAt > existing) {
+          seededLast.set(k, v.lastCreatedAt);
+        }
+      }
+      return { sessionCache: merged, sessionLastCreatedAt: seededLast };
     });
     // If the WS is already authenticated, subscribe to the freshly-
     // hydrated sessions so the server starts pushing for them too.
@@ -1564,17 +1611,29 @@ function updatePaneModeHint(
 /// they see exactly what claude did while they were away. No-op if the
 /// session isn't already cached (we don't synthesize a snapshot for a
 /// session we've never seen).
+///
+/// `serverCreatedAt` lets us advance the cache entry's `lastCreatedAt`
+/// watermark alongside the message — important so a tab kept open while
+/// background updates roll in still has an accurate watermark when the
+/// page eventually reloads (otherwise the IDB snapshot reflects a much
+/// older state than the visible messages do).
 function appendToCachedSession(
   set: (partial: Partial<AppState> | ((state: AppState) => Partial<AppState>)) => void,
   msgSessionId: string,
   message: Message,
   rawPaneType: string | undefined,
   rawPaneId: number | string | undefined,
+  serverCreatedAt?: string,
 ) {
   const paneId = normalizePaneId(rawPaneType, normalizeRawPaneId(rawPaneId));
   set((state) => {
     const existing = state.sessionCache.get(msgSessionId);
     if (!existing) return {};
+    const nextLastCreatedAt =
+      serverCreatedAt &&
+      (!existing.lastCreatedAt || serverCreatedAt > existing.lastCreatedAt)
+        ? serverCreatedAt
+        : existing.lastCreatedAt;
     let next: SessionCacheEntry;
     if (paneId) {
       const key = paneKey(paneId);
@@ -1584,12 +1643,14 @@ function appendToCachedSession(
         paneMessages: { ...existing.paneMessages, [key]: [...current, message] },
         isDualPane: true,
         cachedAt: Date.now(),
+        lastCreatedAt: nextLastCreatedAt,
       };
     } else {
       next = {
         ...existing,
         messages: [...existing.messages, message],
         cachedAt: Date.now(),
+        lastCreatedAt: nextLastCreatedAt,
       };
     }
     const cache = new Map(state.sessionCache);
@@ -1609,13 +1670,14 @@ function routeMessage(
   msgSessionId: string | undefined,
   rawPaneType: string | undefined,
   rawPaneId: number | string | undefined,
+  serverCreatedAt?: string,
 ) {
   const { sessionId: currentSessionId } = get();
   if (!msgSessionId || msgSessionId === currentSessionId) {
     addMessageWithPaneRouting(set, get, message, rawPaneType, rawPaneId);
     return;
   }
-  appendToCachedSession(set, msgSessionId, message, rawPaneType, rawPaneId);
+  appendToCachedSession(set, msgSessionId, message, rawPaneType, rawPaneId, serverCreatedAt);
   set((state) => {
     if (state.unreadSessions.has(msgSessionId)) return {};
     const next = new Set(state.unreadSessions);
@@ -1658,12 +1720,20 @@ function addMessageWithPaneRouting(
 }
 
 /// After WS reconnect, ask the server for every stored message with
-/// `created_at > sessionLastCreatedAt[sid]`. Sends nothing if we don't have
-/// a high-water mark for the session yet — first attach of the tab has
-/// nothing to catch up on, the regular session_messages reply covers it.
+/// `created_at > <watermark>`. Sends nothing if we have no watermark yet —
+/// first attach of the tab has nothing to catch up on, the regular
+/// session_messages reply covers it.
+///
+/// Watermark preference: `reconnectWatermarks[sid]` (frozen at reconnect
+/// time) > `sessionLastCreatedAt[sid]` (live). The frozen one matters when
+/// a stream_message arrived after reconnect but before the user clicked
+/// this tab — without it, the live watermark would skip past the
+/// disconnect-window messages still sitting on disk.
 function requestCatchupIfNeeded(get: () => AppState, sessionId: string) {
   const state = get();
-  const after = state.sessionLastCreatedAt.get(sessionId);
+  const after =
+    state.reconnectWatermarks.get(sessionId) ??
+    state.sessionLastCreatedAt.get(sessionId);
   if (!after) return;
   const ws = state.ws;
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -1698,6 +1768,14 @@ function handleServerMessage(
       get().listMachines();
       get().listSessions();
       get().startAutoRefresh();
+      // Freeze the current live watermarks before any post-reconnect
+      // stream_message can advance them. Catchup queries that fire later
+      // (either via the fan-out below or via a user click into a cached
+      // tab) use these frozen values so disconnect-window messages on
+      // disk aren't silently skipped over.
+      set((state) => ({
+        reconnectWatermarks: new Map(state.sessionLastCreatedAt),
+      }));
       {
         // Prefer the in-memory sessionId (what this tab is currently viewing)
         // over localStorage — otherwise a reconnect could hijack this tab to a
@@ -1727,17 +1805,29 @@ function handleServerMessage(
         // is what makes background tabs stay live without the user having
         // to click into them. AttachSession is multi-attach on the server
         // since the previous commit — earlier attachments aren't dropped.
+        //
+        // DO NOT fire requestCatchupIfNeeded here. Each catchup is a full
+        // jsonl scan on the server; fanning out across 12 cached sessions
+        // on every reconnect (and now on every hard refresh, since the
+        // IDB-seeded watermarks made the early-return path inert) was the
+        // OOM trigger. Click-time catchup in attachSession uses the
+        // frozen `reconnectWatermarks` snapshot so it still fetches the
+        // disconnect-window gap correctly — at the cost of background
+        // tabs being momentarily stale until the user opens them.
+        //
+        // Stagger the attach sends anyway so 12 simultaneous attaches
+        // don't pile up on the server's per-connection mpsc queue.
         const ws = get().ws;
         const cachedIds = Array.from(get().sessionCache.keys());
-        for (const sid of cachedIds) {
-          if (sid === sessionToRestore) continue; // attached above
-          setTimeout(() => {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ type: "attach_session", session_id: sid }));
-              requestCatchupIfNeeded(get, sid);
-            }
-          }, 800);
-        }
+        cachedIds
+          .filter((sid) => sid !== sessionToRestore)
+          .forEach((sid, idx) => {
+            setTimeout(() => {
+              if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: "attach_session", session_id: sid }));
+              }
+            }, 800 + idx * 150);
+          });
       }
       break;
 
@@ -1960,6 +2050,17 @@ function handleServerMessage(
               fetchedAt: Date.now(),
             },
           },
+        }));
+      }
+      break;
+    }
+
+    case "project_goal_changed": {
+      const sessionId = data.session_id as string | undefined;
+      const content = data.content as string | undefined;
+      if (sessionId && typeof content === "string") {
+        set((state) => ({
+          projectGoals: { ...state.projectGoals, [sessionId]: content },
         }));
       }
       break;
@@ -2302,6 +2403,11 @@ function handleServerMessage(
                 updates.sessionLastCreatedAt = next;
               }
             }
+            if (state.reconnectWatermarks.has(targetSid)) {
+              const nextRecon = new Map(state.reconnectWatermarks);
+              nextRecon.delete(targetSid);
+              updates.reconnectWatermarks = nextRecon;
+            }
             return updates;
           });
         } else {
@@ -2332,6 +2438,11 @@ function handleServerMessage(
                 nextSeen.set(targetSid, maxCreatedAt);
                 updates.sessionLastCreatedAt = nextSeen;
               }
+            }
+            if (state.reconnectWatermarks.has(targetSid)) {
+              const nextRecon = new Map(state.reconnectWatermarks);
+              nextRecon.delete(targetSid);
+              updates.reconnectWatermarks = nextRecon;
             }
             return updates;
           });
@@ -2513,7 +2624,7 @@ function handleServerMessage(
       if (isCurrentSession) {
         updatePaneModeHint(set, get, paneType, paneId);
       }
-      routeMessage(set, get, userMessage, msgSessionId, paneType, paneId);
+      routeMessage(set, get, userMessage, msgSessionId, paneType, paneId, serverCreatedAt);
       break;
     }
 
@@ -2555,7 +2666,7 @@ function handleServerMessage(
                 timestamp: new Date(),
                 outputType: { type: "text" },
               };
-              routeMessage(set, get, assistantMessage, msgSessionId, paneType, paneId);
+              routeMessage(set, get, assistantMessage, msgSessionId, paneType, paneId, serverCreatedAt);
             } else if (block.type === "tool_use") {
               // Store id→name mapping so tool_result can look it up
               if (block.id && block.name) {
@@ -2573,7 +2684,7 @@ function handleServerMessage(
                   toolUseId: block.id as string | undefined,
                 },
               };
-              routeMessage(set, get, toolMessage, msgSessionId, paneType, paneId);
+              routeMessage(set, get, toolMessage, msgSessionId, paneType, paneId, serverCreatedAt);
             }
           }
         }
@@ -2620,7 +2731,7 @@ function handleServerMessage(
                   success: !(block.is_error as boolean),
                 },
               };
-              routeMessage(set, get, toolResultMessage, msgSessionId, paneType, paneId);
+              routeMessage(set, get, toolResultMessage, msgSessionId, paneType, paneId, serverCreatedAt);
             }
           }
         }
@@ -2689,7 +2800,7 @@ function handleServerMessage(
           timestamp: new Date(),
           outputType: { type: "system" },
         };
-        routeMessage(set, get, resultMessage, msgSessionId, paneType, paneId);
+        routeMessage(set, get, resultMessage, msgSessionId, paneType, paneId, serverCreatedAt);
       }
       break;
     }

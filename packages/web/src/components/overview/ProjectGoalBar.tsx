@@ -76,6 +76,10 @@ function isTechLeadPane(p: PaneConfig): boolean {
 export function ProjectGoalBar() {
   const paneConfigs = useStore((s) => s.paneConfigs);
   const pausedPanes = useStore((s) => s.pausedPanes);
+  const sessionId = useStore((s) => s.sessionId);
+  const projectGoalFromCli = useStore((s) =>
+    sessionId ? s.projectGoals[sessionId] : undefined,
+  );
   const addPane = useStore((s) => s.addPane);
   const updateProjectGoal = useStore((s) => s.updateProjectGoal);
   const sendMessageToPane = useStore((s) => s.sendMessageToPane);
@@ -83,10 +87,11 @@ export function ProjectGoalBar() {
   const resumePane = useStore((s) => s.resumePane);
   const showToast = useStore((s) => s.showToast);
 
-  // Goal text persisted on the CLI host's filesystem; we keep a local
-  // mirror that the user is editing. There's no server→web sync for
-  // file content yet — once the user clicks Save, the value is the
-  // current value.
+  // Local mirror of the on-disk project_goal.md. The CLI polls the file's
+  // mtime every 3s and pushes ProjectGoalChanged when it changes; we
+  // hydrate `goalDraft` from that whenever the user isn't actively
+  // editing (`goalDirtySinceSave` tracks the "I'm editing now" state so
+  // server pushes don't clobber the user's in-progress typing).
   const [goalDraft, setGoalDraft] = useState("");
   const [goalDirtySinceSave, setGoalDirtySinceSave] = useState(false);
   // Queue an auto-generate chat message if the Manager doesn't exist
@@ -109,15 +114,16 @@ export function ProjectGoalBar() {
     ? pausedPanes.includes(techLeadPane.pane_id)
     : false;
 
-  // We deliberately do NOT hydrate goalDraft from the Manager pane's
-  // `goal` field. That field is the *agent's* purpose (the role template's
-  // description used in its system prompt) — semantically distinct from
-  // the user-facing **project goal** that gets written to project_goal.md.
-  // Hydrating from it would surface "Be the human's primary point of
-  // contact..." (the Manager template's role description) in the Project
-  // goal textbox right after spawn, which is exactly the bug we want to
-  // avoid. Properly mirroring the on-disk project_goal.md would require a
-  // server→web file echo (v4 work).
+  // Hydrate goalDraft from the CLI's mirror of project_goal.md (pushed
+  // via ProjectGoalChanged whenever the file's mtime changes). Skip the
+  // sync when the user is mid-edit so an arriving push doesn't clobber
+  // typing. We deliberately do NOT hydrate from pane.goal — that's the
+  // agent's role-description, not the project's goal.
+  useEffect(() => {
+    if (goalDirtySinceSave) return;
+    if (projectGoalFromCli === undefined) return;
+    setGoalDraft(projectGoalFromCli);
+  }, [projectGoalFromCli, goalDirtySinceSave]);
 
   // After "Auto-generate" with no Manager yet, wait for the Manager to
   // appear, then route the scan-and-write message.

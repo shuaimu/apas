@@ -700,6 +700,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     )
                                     .await;
                             }
+                            Ok(CliToServer::ProjectGoalChanged { session_id, content }) => {
+                                tracing::debug!(
+                                    "Project goal changed for session {} ({} bytes)",
+                                    session_id,
+                                    content.len()
+                                );
+                                state
+                                    .sessions
+                                    .route_to_web(
+                                        &session_id,
+                                        ServerToWeb::ProjectGoalChanged {
+                                            session_id,
+                                            content,
+                                        },
+                                    )
+                                    .await;
+                            }
                             Ok(CliToServer::PrCreated { session_id, pane_id, url, error }) => {
                                 tracing::info!(
                                     "PR created for pane {} in session {}: url={:?} error={:?}",

@@ -214,6 +214,17 @@ pub enum CliToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+
+    /// v3.1 — current contents of `project_goal.md` on the CLI host.
+    /// Pushed (a) at CLI boot once the file exists, and (b) whenever the
+    /// file's mtime changes (manager wrote to it, user clicked Save and
+    /// CLI persisted it, an outside editor touched it). The web mirrors
+    /// the latest value per session and hydrates the textbox when not
+    /// being actively edited.
+    ProjectGoalChanged {
+        session_id: Uuid,
+        content: String,
+    },
 }
 
 /// Messages sent from server to CLI client
@@ -934,6 +945,14 @@ pub enum ServerToWeb {
         url: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+
+    /// Forwarded from `CliToServer::ProjectGoalChanged`. The web caches
+    /// this per-session and refreshes the Project goal textbox when the
+    /// user isn't actively editing.
+    ProjectGoalChanged {
+        session_id: Uuid,
+        content: String,
     },
 }
 

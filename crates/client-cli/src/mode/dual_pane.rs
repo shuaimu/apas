@@ -1009,6 +1009,43 @@ async fn run_inner(
         });
     }
 
+    // v3.1: project_goal.md mtime poller. Same shape as the diff poller —
+    // stat() is cheap, re-read only on mtime change. Push the content to
+    // the server (forwarded to web) so the Overview's Project goal
+    // textbox can hydrate without the user having to refresh.
+    {
+        let server_tx_for_goal = server_tx.clone();
+        let shutdown_for_goal = shutdown.clone();
+        let working_dir_for_goal = working_dir_str.clone();
+        thread::spawn(move || {
+            let project = std::path::PathBuf::from(working_dir_for_goal);
+            let path = crate::manager::goal_path(&project);
+            let mut last_mtime: Option<std::time::SystemTime> = None;
+            // First tick fires immediately to populate fresh-attached
+            // clients; subsequent ticks only push on actual change.
+            let mut first_tick = true;
+            while !shutdown_for_goal.load(Ordering::SeqCst) {
+                let cur_mtime = std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|m| m.modified().ok());
+                let changed = cur_mtime != last_mtime;
+                if (first_tick || changed) && path.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        let _ = server_tx_for_goal.blocking_send(
+                            CliToServer::ProjectGoalChanged {
+                                session_id,
+                                content,
+                            },
+                        );
+                    }
+                }
+                last_mtime = cur_mtime;
+                first_tick = false;
+                thread::sleep(Duration::from_secs(3));
+            }
+        });
+    }
+
     // Phase 2.2b: team scratchpad watcher. Tails `.apas-team.jsonl` and
     // pushes new records to the server (which forwards to web). On
     // first tick we send the existing history so newly-attached web
