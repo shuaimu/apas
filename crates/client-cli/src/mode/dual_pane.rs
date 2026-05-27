@@ -1017,10 +1017,17 @@ async fn run_inner(
         });
     }
 
-    // v3.1: project_goal.md mtime poller. Same shape as the diff poller —
-    // stat() is cheap, re-read only on mtime change. Push the content to
-    // the server (forwarded to web) so the Overview's Project goal
-    // textbox can hydrate without the user having to refresh.
+    // v3.1: project_goal.md poller. Re-sends the file's current content
+    // on every tick so server-side cache stays fresh after restarts and
+    // newly-attaching web clients always see something. File is tiny
+    // (~1-2 KB) and the message is at most one per 3s per active CLI,
+    // so the bandwidth cost is negligible.
+    //
+    // Previous implementation gated the send on mtime change with a
+    // first_tick override — which left a "cache empty + no recent file
+    // change" gap after every server restart (the in-memory cache is
+    // wiped but the CLI doesn't know to re-send). Sending always is
+    // the simplest robust fix.
     {
         let server_tx_for_goal = server_tx.clone();
         let shutdown_for_goal = shutdown.clone();
@@ -1028,16 +1035,8 @@ async fn run_inner(
         thread::spawn(move || {
             let project = std::path::PathBuf::from(working_dir_for_goal);
             let path = crate::manager::goal_path(&project);
-            let mut last_mtime: Option<std::time::SystemTime> = None;
-            // First tick fires immediately to populate fresh-attached
-            // clients; subsequent ticks only push on actual change.
-            let mut first_tick = true;
             while !shutdown_for_goal.load(Ordering::SeqCst) {
-                let cur_mtime = std::fs::metadata(&path)
-                    .ok()
-                    .and_then(|m| m.modified().ok());
-                let changed = cur_mtime != last_mtime;
-                if (first_tick || changed) && path.exists() {
+                if path.exists() {
                     if let Ok(content) = std::fs::read_to_string(&path) {
                         let _ = server_tx_for_goal.blocking_send(
                             CliToServer::ProjectGoalChanged {
@@ -1047,8 +1046,6 @@ async fn run_inner(
                         );
                     }
                 }
-                last_mtime = cur_mtime;
-                first_tick = false;
                 thread::sleep(Duration::from_secs(3));
             }
         });

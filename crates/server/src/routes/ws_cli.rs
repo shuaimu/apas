@@ -701,25 +701,33 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     .await;
                             }
                             Ok(CliToServer::ProjectGoalChanged { session_id, content }) => {
-                                tracing::debug!(
-                                    "Project goal changed for session {} ({} bytes)",
-                                    session_id,
-                                    content.len()
-                                );
-                                // Cache so newly-attaching web clients can be
-                                // catch up on attach — the CLI's mtime poller
-                                // only re-sends on actual file change.
-                                state.sessions.set_project_goal(&session_id, content.clone());
-                                state
+                                // The CLI now sends every poll tick (~3s) so
+                                // server-side cache stays fresh across server
+                                // restarts. Dedup here so we only broadcast +
+                                // log when the content actually changed.
+                                let changed = state
                                     .sessions
-                                    .route_to_web(
-                                        &session_id,
-                                        ServerToWeb::ProjectGoalChanged {
-                                            session_id,
-                                            content,
-                                        },
-                                    )
-                                    .await;
+                                    .get_project_goal(&session_id)
+                                    .as_deref()
+                                    != Some(content.as_str());
+                                state.sessions.set_project_goal(&session_id, content.clone());
+                                if changed {
+                                    tracing::debug!(
+                                        "Project goal changed for session {} ({} bytes)",
+                                        session_id,
+                                        content.len()
+                                    );
+                                    state
+                                        .sessions
+                                        .route_to_web(
+                                            &session_id,
+                                            ServerToWeb::ProjectGoalChanged {
+                                                session_id,
+                                                content,
+                                            },
+                                        )
+                                        .await;
+                                }
                             }
                             Ok(CliToServer::PrCreated { session_id, pane_id, url, error }) => {
                                 tracing::info!(
