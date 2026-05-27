@@ -25,9 +25,30 @@
  *  - **Remove** — hidden on the manager pane (PaneGrid checks role).
  */
 import { useEffect, useMemo, useState } from "react";
-import { Play, Save, Pause, CheckCircle2 } from "lucide-react";
+import { Play, Save, Pause, CheckCircle2, Sparkles } from "lucide-react";
 import { useStore } from "@/lib/store";
 import { ROLE_TEMPLATES } from "@/lib/roleTemplates";
+
+/**
+ * Directive body sent when the user clicks "Auto-generate". Asks the
+ * manager to scan project artifacts (README, package metadata, recent
+ * commits, docs) and write a concrete project_goal.md so the user
+ * doesn't have to type one for an ongoing project.
+ */
+const AUTO_GENERATE_DIRECTIVE = `[Auto-generate goal request from the user]
+
+Scan this project and write a clear project_goal.md. project_goal.md is yours to maintain — using the Write tool to populate it is expected behaviour, not the "don't write production code" path.
+
+Read, in order:
+1. README.md (or README.rst / README.txt) at the project root if present.
+2. Whichever build/manifest file describes the project — package.json, Cargo.toml, pyproject.toml, go.mod, CMakeLists.txt, etc.
+3. \`git log --oneline -50\` for the recent activity shape.
+4. TODO.md / ROADMAP.md / CHANGELOG.md if present.
+5. The docs/ folder (skim the index or top file).
+
+Synthesize a 3–7 sentence project_goal.md: what this project IS in one sentence, what's currently in progress (based on recent commits + TODOs), and what the next meaningful milestone looks like. Be concrete — name specific subsystems, modules, or files where useful.
+
+Use Write to overwrite project_goal.md with that text. After the write, briefly summarize what you wrote (one paragraph) so the user can sanity-check it on the next directive turn.`;
 
 /**
  * Composed at pane-creation time. The deadloop runs this prompt every
@@ -58,6 +79,7 @@ export function ProjectGoalBar() {
   const pausedPanes = useStore((s) => s.pausedPanes);
   const addPane = useStore((s) => s.addPane);
   const updateProjectGoal = useStore((s) => s.updateProjectGoal);
+  const addManagerDirective = useStore((s) => s.addManagerDirective);
   const pausePane = useStore((s) => s.pausePane);
   const resumePane = useStore((s) => s.resumePane);
   const showToast = useStore((s) => s.showToast);
@@ -125,6 +147,44 @@ export function ProjectGoalBar() {
     updateProjectGoal(goalDraft);
     setGoalDirtySinceSave(false);
     showToast("Project goal saved.", "success");
+  };
+
+  // Auto-generate: if no manager exists, spawn one first, then queue
+  // the scan-and-write directive. The deadloop picks it up at the next
+  // iteration boundary. Onboards an existing project in one click.
+  const handleAutoGenerate = () => {
+    if (!managerPane) {
+      const techLead = ROLE_TEMPLATES.find((t) => t.id === "tech-lead");
+      if (!techLead) {
+        showToast("Tech Lead template missing — cannot spawn manager.", "error");
+        return;
+      }
+      const result = addPane(
+        "claude",
+        "deadloop",
+        "Manager",
+        MANAGER_DEADLOOP_PROMPT,
+        undefined,
+        false,
+        {
+          role: techLead.role,
+          goal: techLead.goal,
+          backstory: techLead.backstory,
+          planReviewMode: techLead.planReviewMode,
+        },
+      );
+      if (!result.success) {
+        showToast(result.error ?? "Failed to spawn manager", "error");
+        return;
+      }
+    }
+    addManagerDirective(AUTO_GENERATE_DIRECTIVE);
+    showToast(
+      managerPane
+        ? "Manager will scan the project + write the goal at next iteration."
+        : "Manager spawning — it will scan + write the goal on its first iteration.",
+      "info",
+    );
   };
 
   return (
@@ -200,7 +260,15 @@ export function ProjectGoalBar() {
           <p className="text-[11px] text-violet-700/80 dark:text-violet-300/80">
             Manager re-reads this file at the start of every loop iteration.
           </p>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={handleAutoGenerate}
+              className="flex items-center gap-1 rounded border border-indigo-500 bg-indigo-600 px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-indigo-500"
+              title="Ask the manager to scan README, build files, recent commits + docs and write a starter project_goal.md. Useful for onboarding an ongoing project."
+            >
+              <Sparkles className="h-3 w-3" /> Auto-generate
+            </button>
             <button
               type="button"
               onClick={handleSaveGoal}
