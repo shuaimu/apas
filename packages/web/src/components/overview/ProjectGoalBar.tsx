@@ -109,12 +109,15 @@ export function ProjectGoalBar() {
     ? pausedPanes.includes(techLeadPane.pane_id)
     : false;
 
-  // Hydrate the goal draft from the Manager's `goal` field on first mount.
-  useEffect(() => {
-    if (managerPane && !goalDraft && !goalDirtySinceSave) {
-      setGoalDraft(managerPane.goal ?? "");
-    }
-  }, [managerPane, goalDraft, goalDirtySinceSave]);
+  // We deliberately do NOT hydrate goalDraft from the Manager pane's
+  // `goal` field. That field is the *agent's* purpose (the role template's
+  // description used in its system prompt) — semantically distinct from
+  // the user-facing **project goal** that gets written to project_goal.md.
+  // Hydrating from it would surface "Be the human's primary point of
+  // contact..." (the Manager template's role description) in the Project
+  // goal textbox right after spawn, which is exactly the bug we want to
+  // avoid. Properly mirroring the on-disk project_goal.md would require a
+  // server→web file echo (v4 work).
 
   // After "Auto-generate" with no Manager yet, wait for the Manager to
   // appear, then route the scan-and-write message.
