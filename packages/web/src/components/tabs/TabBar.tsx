@@ -4,6 +4,14 @@ import { useCallback, useRef, useEffect, useState } from "react";
 import { Bot } from "lucide-react";
 import { PaneConfig, paneKey } from "@/lib/store";
 
+/** v3.3 — Manager and Tech Lead panes are always-there; hide the close
+ *  affordances on those tabs so the user can't accidentally remove them. */
+function isManagerOrTechLeadTab(role: string | undefined): boolean {
+  if (!role) return false;
+  const lower = role.toLowerCase();
+  return lower.includes("manager") || lower.includes("tech lead");
+}
+
 interface TabBarProps {
   tabs: PaneConfig[];
   activeTabId: number | null;
@@ -373,8 +381,11 @@ export function TabBar({
                 </span>
               )}
 
-              {/* Close button - visible on hover or when active */}
-              {tabs.length > 1 && (
+              {/* Close button - visible on hover or when active. v3.3:
+                  hidden for Manager and Tech Lead tabs (they're the
+                  always-there team-coordination panes; closing them
+                  doesn't make sense from the UI). */}
+              {tabs.length > 1 && !isManagerOrTechLeadTab(tab.role) && (
                 <span
                   onClick={(e) => {
                     e.stopPropagation();
@@ -412,15 +423,23 @@ export function TabBar({
               Rename
             </button>
           )}
-          <button
-            onClick={() => {
-              if (contextMenu) onCloseTab(contextMenu.paneId);
-              setContextMenu(null);
-            }}
-            className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 text-red-600 dark:text-red-400"
-          >
-            Close
-          </button>
+          {(() => {
+            const tab = contextMenu
+              ? tabs.find((t) => t.pane_id === contextMenu.paneId)
+              : undefined;
+            if (isManagerOrTechLeadTab(tab?.role)) return null;
+            return (
+              <button
+                onClick={() => {
+                  if (contextMenu) onCloseTab(contextMenu.paneId);
+                  setContextMenu(null);
+                }}
+                className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 text-red-600 dark:text-red-400"
+              >
+                Close
+              </button>
+            );
+          })()}
         </div>
       )}
 
