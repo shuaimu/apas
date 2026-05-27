@@ -7419,6 +7419,25 @@ async fn run_server_connection(
                                                         &pane_pauses,
                                                         &pane_stop_requests,
                                                     );
+                                                    // Broadcast the fresh PaneList so the web's chip
+                                                    // can flip — save_pane_configs only writes to .apas,
+                                                    // it doesn't push to the server.
+                                                    let pane_list_msg = CliToServer::PaneList {
+                                                        session_id,
+                                                        panes: build_pane_list(
+                                                            &pane_metas,
+                                                            &input_channels,
+                                                            session_id,
+                                                            &pane_sessions,
+                                                            &pane_pauses,
+                                                            &pane_stop_requests,
+                                                        ),
+                                                    };
+                                                    if let Ok(text) = serde_json::to_string(&pane_list_msg) {
+                                                        let _ = ws_sender
+                                                            .send(Message::Text(text.into()))
+                                                            .await;
+                                                    }
                                                     let hint = format!(
                                                         "[Worker mode → {}. Tech Lead will {} this pane for delegations.]",
                                                         if manual_mode { "manual" } else { "autonomous" },
