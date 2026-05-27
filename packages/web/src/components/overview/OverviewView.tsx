@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { UserPlus, LayoutDashboard, MessageSquare } from "lucide-react";
+import { UserPlus } from "lucide-react";
 import { useStore } from "@/lib/store";
 import { PaneGrid } from "./PaneGrid";
 import { ScratchpadTicker } from "./ScratchpadTicker";
@@ -9,7 +9,6 @@ import { DelegationBoard } from "./DelegationBoard";
 import { ResourceUseRollup } from "./ResourceUseRollup";
 import { AddWorkerModal } from "./AddWorkerModal";
 import { ProjectGoalBar } from "./ProjectGoalBar";
-import { ManagerChatPanel } from "./ManagerChatPanel";
 import { TechLeadStream } from "./TechLeadStream";
 
 /**
@@ -18,9 +17,14 @@ import { TechLeadStream } from "./TechLeadStream";
  * Layout:
  *  - Top: ProjectGoalBar (project goal + Start/Pause for Manager + Tech Lead).
  *  - Bottom: 2-column split on lg+ screens, stacked on mobile.
- *      Left:  tab toggle [Status | Chat with Manager].
+ *      Left:  team status (pane grid, scratchpad ticker, delegation board,
+ *             resource use roll-up).
  *      Right: TechLeadStream — embedded view of the Tech Lead pane's
  *             iterations (placeholder when no Tech Lead is running).
+ *
+ * The Manager pane has its own regular tab in the TabBar, so there's no
+ * embedded chat box here — would be redundant. Click into the Manager tab
+ * to talk to it.
  */
 interface OverviewViewProps {
   onOpenPane: (paneId: number) => void;
@@ -31,8 +35,6 @@ interface OverviewViewProps {
   onRemovePane: (paneId: number) => void;
 }
 
-type LeftTab = "status" | "chat";
-
 export function OverviewView({
   onOpenPane,
   onOpenDiff,
@@ -42,7 +44,6 @@ export function OverviewView({
   onRemovePane,
 }: OverviewViewProps) {
   const [addWorkerOpen, setAddWorkerOpen] = useState(false);
-  const [leftTab, setLeftTab] = useState<LeftTab>("chat");
   const paneConfigs = useStore((s) => s.paneConfigs);
   const techLeadPane = useMemo(
     () =>
@@ -71,70 +72,38 @@ export function OverviewView({
           </button>
         </div>
         <p className="mb-6 text-sm text-gray-500 dark:text-gray-400">
-          Project goal sits at the top. Below: switch the left side between
-          team status and the chat with your Manager; the right side mirrors
-          the Tech Lead pane&apos;s iteration stream when one is running.
+          Project goal sits at the top. Left side: team status. Right side:
+          the Tech Lead&apos;s iteration stream when one is running. Talk to
+          the Manager from its own tab.
         </p>
 
         <ProjectGoalBar />
 
         <div className="flex flex-col gap-4 lg:flex-row">
-          {/* Left column: tab toggle */}
+          {/* Left column: team status sections */}
           <div className="flex min-w-0 flex-1 flex-col">
-            <div className="mb-3 inline-flex self-start rounded border border-gray-200 bg-gray-50 p-0.5 dark:border-gray-700 dark:bg-gray-800">
-              <button
-                type="button"
-                onClick={() => setLeftTab("status")}
-                className={`flex items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium transition-colors ${
-                  leftTab === "status"
-                    ? "bg-white text-gray-900 shadow-sm dark:bg-gray-700 dark:text-gray-100"
-                    : "text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100"
-                }`}
-              >
-                <LayoutDashboard className="h-3.5 w-3.5" /> Status
-              </button>
-              <button
-                type="button"
-                onClick={() => setLeftTab("chat")}
-                className={`flex items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium transition-colors ${
-                  leftTab === "chat"
-                    ? "bg-white text-gray-900 shadow-sm dark:bg-gray-700 dark:text-gray-100"
-                    : "text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100"
-                }`}
-                title="Chat with the Manager (the interactive user-facing pane)"
-              >
-                <MessageSquare className="h-3.5 w-3.5" /> Manager
-              </button>
-            </div>
+            <OverviewSection title="Pane grid">
+              <PaneGrid
+                onOpenPane={onOpenPane}
+                onOpenDiff={onOpenDiff}
+                onOpenRole={onOpenRole}
+                onPausePane={onPausePane}
+                onResumePane={onResumePane}
+                onRemovePane={onRemovePane}
+              />
+            </OverviewSection>
 
-            {leftTab === "status" ? (
-              <>
-                <OverviewSection title="Pane grid">
-                  <PaneGrid
-                    onOpenPane={onOpenPane}
-                    onOpenDiff={onOpenDiff}
-                    onOpenRole={onOpenRole}
-                    onPausePane={onPausePane}
-                    onResumePane={onResumePane}
-                    onRemovePane={onRemovePane}
-                  />
-                </OverviewSection>
+            <OverviewSection title="Team scratchpad">
+              <ScratchpadTicker />
+            </OverviewSection>
 
-                <OverviewSection title="Team scratchpad">
-                  <ScratchpadTicker />
-                </OverviewSection>
+            <OverviewSection title="Delegation board">
+              <DelegationBoard />
+            </OverviewSection>
 
-                <OverviewSection title="Delegation board">
-                  <DelegationBoard />
-                </OverviewSection>
-
-                <OverviewSection title="Resource use">
-                  <ResourceUseRollup />
-                </OverviewSection>
-              </>
-            ) : (
-              <ManagerChatPanel />
-            )}
+            <OverviewSection title="Resource use">
+              <ResourceUseRollup />
+            </OverviewSection>
           </div>
 
           {/* Right column: Tech Lead's iteration stream */}
