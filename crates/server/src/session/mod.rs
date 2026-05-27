@@ -136,6 +136,10 @@ pub struct SessionState {
     /// re-attaching web clients — otherwise the indicator vanishes on tab
     /// switch until the CLI next reports status.
     pub pane_statuses: HashMap<u32, (PaneType, String)>,
+    /// Cached project_goal.md content (last `ProjectGoalChanged` from CLI).
+    /// Replayed to newly-attaching web clients so a hard-refresh doesn't
+    /// leave the Project goal textbox empty until the next file change.
+    pub project_goal: Option<String>,
     /// Working directory of the CLI session
     pub working_dir: Option<String>,
     /// Hostname of the CLI session
@@ -609,6 +613,7 @@ impl SessionManager {
             is_paused: false,
             panes: Vec::new(),
             pane_statuses: HashMap::new(),
+            project_goal: None,
             working_dir: None,
             hostname: None,
         };
@@ -674,6 +679,7 @@ impl SessionManager {
                 is_paused: false,
                 panes: Vec::new(),
                 pane_statuses: HashMap::new(),
+                project_goal: None,
                 working_dir,
                 hostname,
             };
@@ -743,6 +749,7 @@ impl SessionManager {
             is_paused: false,
             panes: Vec::new(),
             pane_statuses: HashMap::new(),
+            project_goal: None,
             working_dir: None,
             hostname: None,
         };
@@ -800,9 +807,26 @@ impl SessionManager {
             is_paused: s.is_paused,
             panes: s.panes.clone(),
             pane_statuses: s.pane_statuses.clone(),
+            project_goal: s.project_goal.clone(),
             working_dir: s.working_dir.clone(),
             hostname: s.hostname.clone(),
         })
+    }
+
+    /// Cache the latest `project_goal.md` content for this session so we can
+    /// replay it to newly-attaching web clients. Called from the CLI's
+    /// `ProjectGoalChanged` forwarder.
+    pub fn set_project_goal(&self, session_id: &Uuid, content: String) {
+        if let Some(mut session) = self.sessions.get_mut(session_id) {
+            session.project_goal = Some(content);
+        }
+    }
+
+    /// Read the cached project goal for replay on web-client attach.
+    pub fn get_project_goal(&self, session_id: &Uuid) -> Option<String> {
+        self.sessions
+            .get(session_id)
+            .and_then(|s| s.project_goal.clone())
     }
 
     /// Check if a session has an active CLI client connected

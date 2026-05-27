@@ -706,6 +706,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     session_id,
                                     content.len()
                                 );
+                                // Cache so newly-attaching web clients can be
+                                // catch up on attach — the CLI's mtime poller
+                                // only re-sends on actual file change.
+                                state.sessions.set_project_goal(&session_id, content.clone());
                                 state
                                     .sessions
                                     .route_to_web(

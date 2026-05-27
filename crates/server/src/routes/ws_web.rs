@@ -68,38 +68,12 @@ fn parse_stored_pane_id(raw_pane_type: Option<&str>) -> Option<u32> {
 const MAX_TRANSIT_CONTENT_BYTES: usize = 96 * 1024;
 
 fn truncate_for_transit(content: String, message_type: &str) -> String {
-    if content.len() <= MAX_TRANSIT_CONTENT_BYTES {
-        return content;
-    }
-    // tool_result content is a JSON envelope the web client parses; truncating
-    // the raw string would break JSON.parse on the client. Replace the inner
-    // payload with a stub that preserves the envelope.
-    if message_type == "tool_result" {
-        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(obj) = v.as_object_mut() {
-                let original_len = content.len();
-                if let Some(inner) = obj.get_mut("content") {
-                    if let Some(s) = inner.as_str() {
-                        let head: String = s.chars().take(8_192).collect();
-                        *inner = serde_json::Value::String(format!(
-                            "{head}\n…[truncated for transit; full size {} bytes]",
-                            original_len
-                        ));
-                    }
-                }
-                // tool_use_result holds full before/after for Edit and similar;
-                // dropping it keeps the human-visible content+is_error fields.
-                obj.remove("tool_use_result");
-                if let Ok(serialized) = serde_json::to_string(&v) {
-                    return serialized;
-                }
-            }
-        }
-    }
-    // Fallback for non-JSON content: hard-truncate with a marker.
-    let original_len = content.len();
-    let head: String = content.chars().take(8_192).collect();
-    format!("{head}\n…[truncated for transit; full size {original_len} bytes]")
+    crate::storage::truncate_message_content(
+        content,
+        message_type,
+        MAX_TRANSIT_CONTENT_BYTES,
+        "transit",
+    )
 }
 
 fn to_message_info(message: crate::storage::StoredMessage) -> MessageInfo {
@@ -1679,6 +1653,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         pane_type,
                                         pane_id: Some(pane_id),
                                         status: Some(status),
+                                    },
+                                )
+                                .await;
+                        }
+
+                        // Replay the cached project_goal so a hard-refreshed
+                        // web client sees the current goal without waiting
+                        // for the CLI's mtime poller to fire on an actual
+                        // file change (which may not happen for hours).
+                        if let Some(content) = state.sessions.get_project_goal(&sid) {
+                            state
+                                .sessions
+                                .send_to_web(
+                                    &connection_id,
+                                    ServerToWeb::ProjectGoalChanged {
+                                        session_id: sid,
+                                        content,
                                     },
                                 )
                                 .await;
