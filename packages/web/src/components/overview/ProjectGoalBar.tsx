@@ -77,7 +77,6 @@ export function ProjectGoalBar() {
   const paneConfigs = useStore((s) => s.paneConfigs);
   const pausedPanes = useStore((s) => s.pausedPanes);
   const sessionId = useStore((s) => s.sessionId);
-  const isAttached = useStore((s) => s.isAttached);
   const projectGoalFromCli = useStore((s) =>
     sessionId ? s.projectGoals[sessionId] : undefined,
   );
@@ -87,9 +86,6 @@ export function ProjectGoalBar() {
   const pausePane = useStore((s) => s.pausePane);
   const resumePane = useStore((s) => s.resumePane);
   const showToast = useStore((s) => s.showToast);
-  // Track which sessions we've already auto-spawned the Manager + Tech Lead
-  // for, so we don't keep trying every time paneConfigs ticks.
-  const autoSpawnedRef = useRef<Set<string>>(new Set());
 
   // Local mirror of the on-disk project_goal.md. The CLI polls the file's
   // mtime every 3s and pushes ProjectGoalChanged when it changes; we
@@ -142,57 +138,12 @@ export function ProjectGoalBar() {
     ta.style.height = `${Math.min(ta.scrollHeight, maxPx)}px`;
   }, [goalDraft]);
 
-  // v3.3: auto-spawn Manager + Tech Lead on first attach to a session
-  // so they're always there. Guarded by autoSpawnedRef so we only try
-  // once per session (the addPane round-trip is async; without the guard
-  // we'd re-spawn on every paneConfigs tick before the new panes land).
-  // We wait until paneConfigs has at least one entry, signaling that
-  // the initial PaneList from the CLI has arrived — otherwise we'd
-  // spawn before the existing Manager/Tech Lead show up.
-  useEffect(() => {
-    if (!sessionId || !isAttached) return;
-    if (paneConfigs.length === 0) return;
-    if (autoSpawnedRef.current.has(sessionId)) return;
-    autoSpawnedRef.current.add(sessionId);
-    if (!managerPane) {
-      const manager = ROLE_TEMPLATES.find((t) => t.id === "manager");
-      if (manager) {
-        addPane(
-          "claude",
-          "interactive",
-          "Manager",
-          undefined,
-          undefined,
-          false,
-          {
-            role: manager.role,
-            goal: manager.goal,
-            backstory: manager.backstory,
-            planReviewMode: manager.planReviewMode,
-          },
-        );
-      }
-    }
-    if (!techLeadPane) {
-      const techLead = ROLE_TEMPLATES.find((t) => t.id === "tech-lead");
-      if (techLead) {
-        addPane(
-          "claude",
-          "deadloop",
-          "Tech Lead",
-          TECH_LEAD_DEADLOOP_PROMPT,
-          undefined,
-          false,
-          {
-            role: techLead.role,
-            goal: techLead.goal,
-            backstory: techLead.backstory,
-            planReviewMode: techLead.planReviewMode,
-          },
-        );
-      }
-    }
-  }, [sessionId, isAttached, paneConfigs, managerPane, techLeadPane, addPane]);
+  // v3.4 — auto-spawn responsibility moved to the CLI (see
+  // dual_pane.rs run_inner). Web no longer auto-spawns on attach to
+  // avoid the race where CLI auto-spawn and web auto-spawn both fire
+  // before the first PaneList arrives, producing duplicate Manager
+  // panes. The Start Manager / Start Tech Lead buttons below stay as
+  // a manual fallback for old CLIs that don't have auto-spawn yet.
 
   // After "Auto-generate" with no Manager yet, wait for the Manager to
   // appear, then route the scan-and-write message.

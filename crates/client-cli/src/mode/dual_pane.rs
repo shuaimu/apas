@@ -976,6 +976,70 @@ async fn run_inner(
         })
     };
 
+    // v3.4 — auto-spawn Manager + Tech Lead if missing. Each project
+    // always has these two panes; spawning them here at CLI boot means
+    // every project (even fresh / legacy ones with no .apas entries
+    // for them) gets the team-coordination layer without the user
+    // having to click anything in the web UI. The AddTabWithConfig
+    // events are picked up by the TUI event loop later in run_inner.
+    {
+        let metas_guard = pane_metas.lock().unwrap();
+        let has_manager = metas_guard.values().any(|m| {
+            let lower = m.role.as_deref().unwrap_or("").to_ascii_lowercase();
+            lower.contains("manager")
+                && !lower.contains("tech lead")
+                && matches!(m.mode, shared::PaneMode::Interactive)
+        });
+        let has_tech_lead = metas_guard.values().any(|m| {
+            let lower = m.role.as_deref().unwrap_or("").to_ascii_lowercase();
+            lower.contains("tech lead")
+                && matches!(m.mode, shared::PaneMode::Deadloop)
+        });
+        drop(metas_guard);
+        if !has_manager {
+            let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
+            let _ = event_tx.send(TuiEvent::AddTabWithConfig {
+                pane_id,
+                label: "Manager".to_string(),
+                claude_session_id: Uuid::new_v4(),
+                mode: shared::PaneMode::Interactive,
+                provider: shared::Provider::Claude,
+                prompt: None,
+                min_iteration_interval_minutes: None,
+                model: None,
+                effort: None,
+                worktree_path: None,
+                initial_input: None,
+                role: Some(crate::role::DEFAULT_MANAGER_ROLE.to_string()),
+                goal: Some(crate::role::DEFAULT_MANAGER_GOAL.to_string()),
+                backstory: Some(crate::role::DEFAULT_MANAGER_BACKSTORY.to_string()),
+                plan_review_mode: shared::PlanReviewMode::default(),
+            });
+            tracing::info!(pane_id, "auto-spawning Manager pane (missing from .apas)");
+        }
+        if !has_tech_lead {
+            let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
+            let _ = event_tx.send(TuiEvent::AddTabWithConfig {
+                pane_id,
+                label: "Tech Lead".to_string(),
+                claude_session_id: Uuid::new_v4(),
+                mode: shared::PaneMode::Deadloop,
+                provider: shared::Provider::Claude,
+                prompt: Some(crate::role::TECH_LEAD_DEADLOOP_PROMPT.to_string()),
+                min_iteration_interval_minutes: None,
+                model: None,
+                effort: None,
+                worktree_path: None,
+                initial_input: None,
+                role: Some(crate::role::DEFAULT_TECH_LEAD_ROLE.to_string()),
+                goal: Some(crate::role::DEFAULT_TECH_LEAD_GOAL.to_string()),
+                backstory: Some(crate::role::DEFAULT_TECH_LEAD_BACKSTORY.to_string()),
+                plan_review_mode: shared::PlanReviewMode::default(),
+            });
+            tracing::info!(pane_id, "auto-spawning Tech Lead pane (missing from .apas)");
+        }
+    }
+
     // Phase 1.2b: auto-refresh diff poller. Scans pane_metas every few
     // seconds for panes with worktree_path set; when any one's branch tip
     // (HEAD in the worktree) has moved since the last tick, it recomputes
@@ -3322,6 +3386,7 @@ mod tests {
                     plan_review_mode: shared::PlanReviewMode::default(),
                     plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                     pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
+                    manual_mode: false,
                 },
             );
             metas.insert(
@@ -3346,6 +3411,7 @@ mod tests {
                     plan_review_mode: shared::PlanReviewMode::default(),
                     plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                     pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
+                    manual_mode: false,
                 },
             );
         }
@@ -3385,6 +3451,7 @@ mod tests {
                     plan_review_mode: shared::PlanReviewMode::default(),
                     plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                     pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
+                    manual_mode: false,
                 },
             );
         }
@@ -3424,6 +3491,7 @@ mod tests {
                     plan_review_mode: shared::PlanReviewMode::default(),
                     plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                     pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
+                    manual_mode: false,
                 },
             );
             metas.insert(
@@ -3448,6 +3516,7 @@ mod tests {
                     plan_review_mode: shared::PlanReviewMode::default(),
                     plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                     pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
+                    manual_mode: false,
                 },
             );
         }
@@ -3487,6 +3556,7 @@ mod tests {
                     plan_review_mode: shared::PlanReviewMode::default(),
                     plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                     pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
+                    manual_mode: false,
                 },
             );
         }
@@ -3526,6 +3596,7 @@ mod tests {
                     plan_review_mode: shared::PlanReviewMode::default(),
                     plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                     pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
+                    manual_mode: false,
                 },
             );
         }
@@ -3565,6 +3636,7 @@ mod tests {
                     plan_review_mode: shared::PlanReviewMode::default(),
                     plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                     pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
+                    manual_mode: false,
                 },
             );
         }
