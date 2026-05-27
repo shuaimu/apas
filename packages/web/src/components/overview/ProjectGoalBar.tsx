@@ -17,7 +17,7 @@
  * the project and populate project_goal.md itself — useful for
  * onboarding an ongoing project.
  */
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Play, Save, Pause, CheckCircle2, Sparkles, Bot } from "lucide-react";
 import { useStore, type PaneConfig } from "@/lib/store";
 import { ROLE_TEMPLATES } from "@/lib/roleTemplates";
@@ -124,6 +124,19 @@ export function ProjectGoalBar() {
     if (projectGoalFromCli === undefined) return;
     setGoalDraft(projectGoalFromCli);
   }, [projectGoalFromCli, goalDirtySinceSave]);
+
+  // Auto-grow the textarea to fit its content. We cap at ~60vh so a very
+  // long goal can't push the rest of the Overview off-screen — past the
+  // cap, the textarea becomes scrollable. The min (3 rows) is also the
+  // initial empty-state look.
+  const goalTextareaRef = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    const ta = goalTextareaRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    const maxPx = Math.floor(window.innerHeight * 0.6);
+    ta.style.height = `${Math.min(ta.scrollHeight, maxPx)}px`;
+  }, [goalDraft]);
 
   // After "Auto-generate" with no Manager yet, wait for the Manager to
   // appear, then route the scan-and-write message.
@@ -309,6 +322,7 @@ export function ProjectGoalBar() {
           )}
         </div>
         <textarea
+          ref={goalTextareaRef}
           value={goalDraft}
           onChange={(e) => {
             setGoalDraft(e.target.value);
@@ -316,7 +330,8 @@ export function ProjectGoalBar() {
           }}
           rows={3}
           placeholder="What does the team need to accomplish? (Manager keeps this in sync from chat.)"
-          className="w-full rounded border border-violet-300 bg-white p-2 text-sm text-gray-900 placeholder-gray-400 dark:border-violet-800 dark:bg-gray-900 dark:text-gray-100"
+          className="w-full overflow-y-auto rounded border border-violet-300 bg-white p-2 text-sm text-gray-900 placeholder-gray-400 dark:border-violet-800 dark:bg-gray-900 dark:text-gray-100"
+          style={{ resize: "none" }}
         />
         <div className="mt-2 flex items-center justify-between gap-2">
           <p className="text-[11px] text-violet-700/80 dark:text-violet-300/80">
