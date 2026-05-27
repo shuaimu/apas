@@ -1,37 +1,44 @@
 "use client";
 
 /**
- * Manager v2c — conversation view of the user↔manager channel.
+ * Manager v2c / naming pass — the "Secretary" panel.
  *
- * The user side: every directive sent in this tab is appended to
- * `manager-directives.jsonl` AND mirrored locally so it renders as a
- * "user" bubble immediately.
+ * Mental model: the manager is the deadloop agent that does the real
+ * orchestration. The *secretary* is this UI — a proxy that you talk to,
+ * which writes your notes down for the manager to read at its next
+ * iteration boundary. The metaphor explains why there's latency: you tell
+ * your secretary, your secretary leaves a note on the manager's desk, the
+ * manager reads the note when they next come up for air.
  *
- * The manager side: text-only assistant messages from the manager
- * pane's chat history are pulled in and interleaved by timestamp. We
- * skip tool_use / tool_result so the conversation doesn't drown in
- * "Reading manager-directives.jsonl" noise — the raw iteration stream
- * is still available on the right column.
+ * Under the hood it's still the same `manager-directives.jsonl` channel —
+ * the secretary metaphor is purely user-facing naming. Wire / store /
+ * file names keep their existing identifiers.
  *
- * Persistence: directives sent in earlier sessions don't appear here
- * yet (no server→web echo of the on-disk file). For now this is good
- * enough for "what did I just tell the manager + did it reply".
+ * Conversation rendering:
+ * - Your notes show as violet bubbles on the right ("you").
+ * - The manager's text replies (from its iteration stream) show as gray
+ *   bubbles on the left ("manager"). Tool calls are filtered out — those
+ *   live on the right column (ManagerStream) for the full picture.
+ *
+ * Persistence: notes sent in earlier sessions don't appear here yet (no
+ * server→web echo of the on-disk file). Manager replies do persist since
+ * they're stored as pane messages.
  */
 import { useMemo, useRef, useState, useEffect } from "react";
 import { Send } from "lucide-react";
 import { useStore, type Message, paneKey } from "@/lib/store";
 
-interface SentDirective {
+interface SentNote {
   id: string;
   ts: Date;
   text: string;
 }
 
 type Turn =
-  | { kind: "directive"; id: string; ts: Date; text: string }
+  | { kind: "note"; id: string; ts: Date; text: string }
   | { kind: "manager"; id: string; ts: Date; content: string };
 
-export function DirectivesPanel() {
+export function SecretaryPanel() {
   const addManagerDirective = useStore((s) => s.addManagerDirective);
   const showToast = useStore((s) => s.showToast);
   const paneConfigs = useStore((s) => s.paneConfigs);
@@ -48,11 +55,11 @@ export function DirectivesPanel() {
     managerPane ? s.paneMessages[paneKey(managerPane.pane_id)] ?? EMPTY_MESSAGES : EMPTY_MESSAGES,
   );
 
-  const [directive, setDirective] = useState("");
-  const [sent, setSent] = useState<SentDirective[]>([]);
+  const [note, setNote] = useState("");
+  const [sent, setSent] = useState<SentNote[]>([]);
 
   // Filter manager messages to text-only assistant replies and interleave
-  // with the directives by timestamp. Tool calls live on the right column
+  // with the notes by timestamp. Tool calls live on the right column
   // (ManagerStream) — we keep this view focused on the actual back-and-forth.
   const turns = useMemo<Turn[]>(() => {
     const managerTurns: Turn[] = managerMessages
@@ -67,13 +74,13 @@ export function DirectivesPanel() {
         ts: m.timestamp,
         content: m.content,
       }));
-    const directiveTurns: Turn[] = sent.map((d) => ({
-      kind: "directive",
+    const noteTurns: Turn[] = sent.map((d) => ({
+      kind: "note",
       id: d.id,
       ts: d.ts,
       text: d.text,
     }));
-    return [...managerTurns, ...directiveTurns].sort(
+    return [...managerTurns, ...noteTurns].sort(
       (a, b) => a.ts.getTime() - b.ts.getTime(),
     );
   }, [managerMessages, sent]);
@@ -95,8 +102,10 @@ export function DirectivesPanel() {
   }, [turns.length]);
 
   const handleSend = () => {
-    const text = directive.trim();
+    const text = note.trim();
     if (!text) return;
+    // Same wire underneath — the secretary still appends to
+    // manager-directives.jsonl for the manager to read.
     addManagerDirective(text);
     setSent((prev) => [
       ...prev,
@@ -106,9 +115,9 @@ export function DirectivesPanel() {
         text,
       },
     ]);
-    setDirective("");
-    // No toast — the directive appearing as a user bubble is its own
-    // feedback, and toasts on every send is noisy when chatting.
+    setNote("");
+    // No toast — the note appearing as a user bubble is its own feedback,
+    // and toasts on every send is noisy when chatting.
     void showToast;
   };
 
@@ -122,10 +131,11 @@ export function DirectivesPanel() {
   return (
     <div className="flex h-full min-h-[60vh] flex-col rounded border border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-900">
       <div className="border-b border-gray-200 px-3 py-2 text-xs text-gray-600 dark:border-gray-700 dark:text-gray-400">
-        Conversation with the manager. Your directives append to{" "}
-        <span className="font-mono">manager-directives.jsonl</span>; the
-        manager&apos;s text replies are pulled from its iteration stream and
-        interleaved here.
+        Talk to your <strong>secretary</strong>. Your notes get written down
+        on the manager&apos;s desk (
+        <span className="font-mono">manager-directives.jsonl</span>); the
+        manager reads them at its next iteration boundary, and its replies
+        show up here interleaved with your notes.
       </div>
 
       <div
@@ -135,12 +145,12 @@ export function DirectivesPanel() {
       >
         {turns.length === 0 ? (
           <p className="text-center text-xs italic text-gray-400">
-            No conversation yet. Type a directive below to start.
+            No conversation yet. Leave a note for the secretary below.
           </p>
         ) : (
           turns.map((t) =>
-            t.kind === "directive" ? (
-              <DirectiveBubble key={t.id} ts={t.ts} text={t.text} />
+            t.kind === "note" ? (
+              <NoteBubble key={t.id} ts={t.ts} text={t.text} />
             ) : (
               <ManagerBubble key={t.id} ts={t.ts} content={t.content} />
             ),
@@ -150,21 +160,21 @@ export function DirectivesPanel() {
 
       <div className="border-t border-gray-200 p-3 dark:border-gray-700">
         <textarea
-          value={directive}
-          onChange={(e) => setDirective(e.target.value)}
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
           onKeyDown={handleKey}
           rows={3}
-          placeholder="Strategy nudge / correction / question (Cmd-Enter to send)"
+          placeholder="Note for the secretary to leave on the manager's desk (Cmd-Enter to send)"
           className="w-full rounded border border-gray-300 bg-white p-2 text-sm text-gray-900 placeholder-gray-400 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-100"
         />
         <div className="mt-2 flex items-center justify-between gap-2">
           <p className="text-[11px] text-gray-500 dark:text-gray-400">
-            Directives are absorbed at the next loop boundary, not mid-action.
+            Notes are picked up at the next loop boundary, not mid-action.
           </p>
           <button
             type="button"
             onClick={handleSend}
-            disabled={!directive.trim()}
+            disabled={!note.trim()}
             className="flex items-center gap-1 rounded border border-violet-500 bg-violet-600 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-50"
           >
             <Send className="h-3.5 w-3.5" /> Send
@@ -181,13 +191,13 @@ function formatTime(d: Date): string {
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-function DirectiveBubble({ ts, text }: { ts: Date; text: string }) {
+function NoteBubble({ ts, text }: { ts: Date; text: string }) {
   return (
     <div className="flex justify-end">
       <div className="max-w-[85%] rounded-lg bg-violet-600 px-3 py-2 text-sm text-white shadow-sm">
         <div className="whitespace-pre-wrap break-words">{text}</div>
         <div className="mt-1 text-right text-[10px] text-violet-200">
-          {formatTime(ts)}
+          you · {formatTime(ts)}
         </div>
       </div>
     </div>

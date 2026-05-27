@@ -9,7 +9,7 @@ import { DelegationBoard } from "./DelegationBoard";
 import { ResourceUseRollup } from "./ResourceUseRollup";
 import { AddWorkerModal } from "./AddWorkerModal";
 import { ProjectGoalBar } from "./ProjectGoalBar";
-import { DirectivesPanel } from "./DirectivesPanel";
+import { SecretaryPanel } from "./SecretaryPanel";
 import { ManagerStream } from "./ManagerStream";
 
 /**
@@ -30,7 +30,7 @@ interface OverviewViewProps {
   onRemovePane: (paneId: number) => void;
 }
 
-type LeftTab = "status" | "directives";
+type LeftTab = "status" | "secretary";
 
 export function OverviewView({
   onOpenPane,
@@ -70,7 +70,7 @@ export function OverviewView({
         </div>
         <p className="mb-6 text-sm text-gray-500 dark:text-gray-400">
           Project goal sits at the top. Below: switch the left side between
-          team status and a directive composer; the right side mirrors the
+          team status and your secretary; the right side mirrors the
           manager pane&apos;s iteration stream.
         </p>
 
@@ -93,14 +93,15 @@ export function OverviewView({
               </button>
               <button
                 type="button"
-                onClick={() => setLeftTab("directives")}
+                onClick={() => setLeftTab("secretary")}
                 className={`flex items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium transition-colors ${
-                  leftTab === "directives"
+                  leftTab === "secretary"
                     ? "bg-white text-gray-900 shadow-sm dark:bg-gray-700 dark:text-gray-100"
                     : "text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100"
                 }`}
+                title="Talk to your secretary — they relay your notes to the manager's directives file"
               >
-                <MessageSquare className="h-3.5 w-3.5" /> Directives
+                <MessageSquare className="h-3.5 w-3.5" /> Secretary
               </button>
             </div>
 
@@ -130,7 +131,7 @@ export function OverviewView({
                 </OverviewSection>
               </>
             ) : (
-              <DirectivesPanel />
+              <SecretaryPanel />
             )}
           </div>
 
