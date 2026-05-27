@@ -21,26 +21,38 @@ Other panes in this project share a project-local append-only log at \
 Publish anything worth other panes seeing — diffs, reviews, decisions — by appending a line with `>>` redirection or the Write tool. \
 Read it (`tail -f` / cat) when you want to see what they've done.";
 
-/// Phase 3.1b: additional protocol paragraph injected for panes whose
-/// role is manager-shaped. Teaches the two scratchpad tag conventions
-/// that the CLI watcher actually routes on (Phase 3.1a):
-///   - `delegate-to:<pane_id>` → CLI sends `body` into that pane's input
-///   - `reply-to:<task_id>` → bookkeeping for the manager's bookkeeping
-/// We deliberately do NOT enumerate available worker pane ids here —
-/// the agent can grep the project's `.apas` file (or ask the human) for
-/// current roles. Hard-coding sibling info would force a plumbing leaf
-/// (siblings list into compose_system_prompt) and rot quickly.
+/// v3 split: the user-facing **Manager** is the primary point of contact
+/// for the human. They clarify requirements, keep `project_goal.md` in
+/// sync with the conversation, and hand off autonomous orchestration to
+/// a Tech-Lead pane via the same `delegate-to:` scratchpad protocol.
+/// Crucially, the Manager does NOT delegate directly to workers — that's
+/// the Tech Lead's responsibility — so the user has one coherent layer
+/// to talk to and one autonomous layer to grind.
 const MANAGER_NOTE: &str = "\
 # Manager protocol
-You are the manager for this project. To dispatch work to another pane, \
-append a record to `.apas-team.jsonl` with `tags` containing \
-`delegate-to:<pane_id>` and (optionally) a unique `task-id:<uuid>` tag. \
-The CLI watches the file and routes the record's `body` into the target \
-pane's input queue as if a user had typed it. \
+You are this project's manager — the user-facing role. You chat directly with the human, ask clarifying questions, and keep `project_goal.md` in sync with what the human wants. \
+When you need autonomous orchestration (workers running in the background), delegate to the Tech-Lead pane: append a record to `.apas-team.jsonl` with `kind: \"delegation\"` and `tags` containing `delegate-to:<tech_lead_pane_id>`. \
+The CLI watches the file and routes the record's `body` into the Tech Lead's input queue as if a user had typed it. \
+The Tech Lead replies via `tags: [\"reply-to:<task_id>\"]` on the same file. \
+Do NOT delegate to worker panes yourself — workers receive their assignments from the Tech Lead. Your job is conversation, not tactical orchestration. \
+You CAN use the Write tool on `project_goal.md` directly — that file is yours to maintain. \
+Read `.apas` in the project root to discover the Tech-Lead pane id (look for the pane whose role contains \"tech lead\").";
+
+/// v3 split: the autonomous **Tech Lead** is the deadloop orchestrator
+/// (this is what was previously called the "manager" role). Reads the
+/// goal + scratchpad each iteration and dispatches work to workers.
+/// Receives delegations from the Manager pane on `.apas-team.jsonl`
+/// (kind: "delegation", delegate-to:<this_pane_id>).
+const TECH_LEAD_NOTE: &str = "\
+# Tech Lead protocol
+You are this project's tech lead — the autonomous orchestrator. You read `project_goal.md` and `.apas-team.jsonl` each iteration to understand the state of the world, and dispatch work to specialist worker panes. \
+To dispatch work to a worker, append a record to `.apas-team.jsonl` with `kind: \"delegation\"` and `tags` containing `delegate-to:<worker_pane_id>` and (optionally) a unique `task-id:<uuid>` tag. \
+The CLI watches the file and routes the record's `body` into the target pane's input queue as if a user had typed it. \
 Workers reply by appending their own record with `tags: [\"reply-to:<task_id>\"]`; \
 poll the scratchpad to collect replies. \
-You can discover the available workers by reading `.apas` in the project root \
-(`panes[]` lists each pane's id, label, role, goal — Phase 2.1).";
+You also receive delegations from the Manager pane — look for records on `.apas-team.jsonl` with `tags` containing `delegate-to:<your_pane_id>`. Treat these as high-priority goal updates from the human. \
+You can discover the available workers by reading `.apas` in the project root (`panes[]` lists each pane's id, label, role, goal). \
+Do NOT chat directly with the human — that's the Manager's job. If you have a question for the human, escalate it as a `kind: \"escalation\"` record on the scratchpad and let the Manager surface it.";
 
 /// Phase 3.3a: additional protocol paragraph for panes whose role is
 /// reviewer-shaped. Teaches the diff-subscribe / review-publish loop.
@@ -60,9 +72,25 @@ each change so they can rubber-stamp common cases. \
 Do NOT publish diffs yourself unless you're also a worker — your job \
 is to react to other panes' output.";
 
+/// v3: "manager" substring → user-facing Manager. Excludes "tech lead"
+/// so the legacy role string "team manager / tech lead" routes to the
+/// Tech-Lead protocol instead (it's an orchestrator role, not a
+/// user-facing chat role).
 fn role_is_manager(role: Option<&str>) -> bool {
     role.map(str::trim)
-        .map(|r| r.to_ascii_lowercase().contains("manager"))
+        .map(|r| {
+            let lower = r.to_ascii_lowercase();
+            lower.contains("manager") && !lower.contains("tech lead")
+        })
+        .unwrap_or(false)
+}
+
+/// v3: "tech lead" substring → autonomous orchestrator. Matches both the
+/// new role string `"tech lead"` and the legacy `"team manager / tech lead"`
+/// so existing panes keep their orchestrator addendum after the split.
+fn role_is_tech_lead(role: Option<&str>) -> bool {
+    role.map(str::trim)
+        .map(|r| r.to_ascii_lowercase().contains("tech lead"))
         .unwrap_or(false)
 }
 
@@ -96,7 +124,9 @@ pub fn compose_system_prompt(
         None
     } else {
         sections.push(SCRATCHPAD_NOTE.to_string());
-        if role_is_manager(role) {
+        if role_is_tech_lead(role) {
+            sections.push(TECH_LEAD_NOTE.to_string());
+        } else if role_is_manager(role) {
             sections.push(MANAGER_NOTE.to_string());
         }
         if role_is_reviewer(role) {
@@ -164,11 +194,13 @@ mod tests {
     }
 
     #[test]
-    fn manager_role_gets_protocol_addendum() {
-        let got = compose_system_prompt(Some("manager"), None, None).unwrap();
+    fn manager_role_gets_user_facing_protocol_addendum() {
+        let got = compose_system_prompt(Some("team manager"), None, None).unwrap();
         assert!(got.contains("# Manager protocol"));
-        assert!(got.contains("delegate-to:<pane_id>"));
-        assert!(got.contains("reply-to:<task_id>"));
+        assert!(got.contains("user-facing role"));
+        assert!(got.contains("delegate-to:<tech_lead_pane_id>"));
+        // Manager owns project_goal.md.
+        assert!(got.contains("project_goal.md"));
         // Section ordering: role → scratchpad → manager
         let role_pos = got.find("# Role").unwrap();
         let scratchpad_pos = got.find("# Team scratchpad").unwrap();
@@ -178,9 +210,35 @@ mod tests {
     }
 
     #[test]
-    fn manager_detection_is_case_insensitive_and_substring() {
+    fn tech_lead_role_gets_orchestrator_protocol_addendum() {
+        let got = compose_system_prompt(Some("tech lead"), None, None).unwrap();
+        assert!(got.contains("# Tech Lead protocol"));
+        assert!(got.contains("autonomous orchestrator"));
+        assert!(got.contains("delegate-to:<worker_pane_id>"));
+        // Tech Lead does NOT get the user-facing Manager protocol — they
+        // never chat with the human.
+        assert!(!got.contains("# Manager protocol"));
+    }
+
+    #[test]
+    fn legacy_manager_tech_lead_role_routes_to_tech_lead() {
+        // Pre-v3 panes were templated with role "team manager / tech lead".
+        // The substring "tech lead" wins so the addendum behaviour matches
+        // the old orchestrator semantics for migrated panes.
+        let got = compose_system_prompt(Some("team manager / tech lead"), None, None).unwrap();
+        assert!(got.contains("# Tech Lead protocol"));
+        assert!(!got.contains("# Manager protocol"));
+    }
+
+    #[test]
+    fn manager_detection_excludes_tech_lead() {
         for r in ["manager", "Manager", "MANAGER", "team manager", "manager-agent"] {
             assert!(role_is_manager(Some(r)), "role {:?} should be manager", r);
+        }
+        // "tech lead" substring routes to tech-lead protocol, not manager.
+        for r in ["tech lead", "team manager / tech lead", "Tech Lead"] {
+            assert!(!role_is_manager(Some(r)), "role {:?} should NOT match manager", r);
+            assert!(role_is_tech_lead(Some(r)), "role {:?} should match tech lead", r);
         }
         for r in ["reviewer", "backend", "", "mgr"] {
             assert!(!role_is_manager(Some(r)), "role {:?} should NOT be manager", r);
@@ -189,9 +247,10 @@ mod tests {
     }
 
     #[test]
-    fn non_manager_role_skips_protocol_addendum() {
+    fn non_manager_non_tech_lead_role_skips_orchestration_addenda() {
         let got = compose_system_prompt(Some("backend implementer"), None, None).unwrap();
         assert!(!got.contains("# Manager protocol"));
+        assert!(!got.contains("# Tech Lead protocol"));
         assert!(!got.contains("# Reviewer protocol"));
         // But scratchpad note still rides along.
         assert!(got.contains("# Team scratchpad"));

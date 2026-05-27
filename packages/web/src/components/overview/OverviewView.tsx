@@ -9,17 +9,18 @@ import { DelegationBoard } from "./DelegationBoard";
 import { ResourceUseRollup } from "./ResourceUseRollup";
 import { AddWorkerModal } from "./AddWorkerModal";
 import { ProjectGoalBar } from "./ProjectGoalBar";
-import { SecretaryPanel } from "./SecretaryPanel";
-import { ManagerStream } from "./ManagerStream";
+import { ManagerChatPanel } from "./ManagerChatPanel";
+import { TechLeadStream } from "./TechLeadStream";
 
 /**
- * Phase 5.1 / Manager v2b — team overview pseudo-tab.
+ * Phase 5.1 / v3 split — team overview pseudo-tab.
  *
  * Layout:
- *  - Top: ProjectGoalBar (project goal + Start/Pause manager controls)
- *  - Bottom: 2-column split on lg+ screens, stacked on mobile
- *      Left:  tab toggle [Status | Directives]
- *      Right: ManagerStream — embedded view of manager pane's iterations
+ *  - Top: ProjectGoalBar (project goal + Start/Pause for Manager + Tech Lead).
+ *  - Bottom: 2-column split on lg+ screens, stacked on mobile.
+ *      Left:  tab toggle [Status | Chat with Manager].
+ *      Right: TechLeadStream — embedded view of the Tech Lead pane's
+ *             iterations (placeholder when no Tech Lead is running).
  */
 interface OverviewViewProps {
   onOpenPane: (paneId: number) => void;
@@ -30,7 +31,7 @@ interface OverviewViewProps {
   onRemovePane: (paneId: number) => void;
 }
 
-type LeftTab = "status" | "secretary";
+type LeftTab = "status" | "chat";
 
 export function OverviewView({
   onOpenPane,
@@ -41,13 +42,14 @@ export function OverviewView({
   onRemovePane,
 }: OverviewViewProps) {
   const [addWorkerOpen, setAddWorkerOpen] = useState(false);
-  const [leftTab, setLeftTab] = useState<LeftTab>("status");
+  const [leftTab, setLeftTab] = useState<LeftTab>("chat");
   const paneConfigs = useStore((s) => s.paneConfigs);
-  const managerPane = useMemo(
+  const techLeadPane = useMemo(
     () =>
-      paneConfigs.find((p) =>
-        (p.role ?? "").toLowerCase().includes("manager"),
-      ),
+      paneConfigs.find((p) => {
+        const lower = (p.role ?? "").toLowerCase();
+        return lower.includes("tech lead") && p.mode === "deadloop";
+      }),
     [paneConfigs],
   );
 
@@ -70,8 +72,8 @@ export function OverviewView({
         </div>
         <p className="mb-6 text-sm text-gray-500 dark:text-gray-400">
           Project goal sits at the top. Below: switch the left side between
-          team status and your secretary; the right side mirrors the
-          manager pane&apos;s iteration stream.
+          team status and the chat with your Manager; the right side mirrors
+          the Tech Lead pane&apos;s iteration stream when one is running.
         </p>
 
         <ProjectGoalBar />
@@ -93,15 +95,15 @@ export function OverviewView({
               </button>
               <button
                 type="button"
-                onClick={() => setLeftTab("secretary")}
+                onClick={() => setLeftTab("chat")}
                 className={`flex items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium transition-colors ${
-                  leftTab === "secretary"
+                  leftTab === "chat"
                     ? "bg-white text-gray-900 shadow-sm dark:bg-gray-700 dark:text-gray-100"
                     : "text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100"
                 }`}
-                title="Talk to your secretary — they relay your notes to the manager's directives file"
+                title="Chat with the Manager (the interactive user-facing pane)"
               >
-                <MessageSquare className="h-3.5 w-3.5" /> Secretary
+                <MessageSquare className="h-3.5 w-3.5" /> Manager
               </button>
             </div>
 
@@ -131,13 +133,13 @@ export function OverviewView({
                 </OverviewSection>
               </>
             ) : (
-              <SecretaryPanel />
+              <ManagerChatPanel />
             )}
           </div>
 
-          {/* Right column: manager's iteration stream */}
+          {/* Right column: Tech Lead's iteration stream */}
           <div className="flex min-w-0 flex-1 flex-col lg:max-w-xl lg:sticky lg:top-4 lg:self-start" style={{ minHeight: "60vh" }}>
-            <ManagerStream managerPane={managerPane} onOpenPane={onOpenPane} />
+            <TechLeadStream techLeadPane={techLeadPane} onOpenPane={onOpenPane} />
           </div>
         </div>
       </div>

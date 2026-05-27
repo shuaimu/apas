@@ -239,7 +239,7 @@ function PaneCard({
           )}
           {pane.pane_id !== PANE_ID_INTERACTIVE &&
             pane.pane_id !== PANE_ID_DEADLOOP &&
-            !(pane.role ?? "").toLowerCase().includes("manager") && (
+            !isManagerOrTechLead(pane.role) && (
               <span
                 className="rounded border border-red-400 dark:border-red-700 bg-red-50 dark:bg-red-900/30 px-1.5 py-0.5 text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/50"
                 role="button"
@@ -260,20 +260,48 @@ function PaneCard({
               default
             </span>
           )}
-          {(pane.role ?? "").toLowerCase().includes("manager") &&
+          {isManagerRole(pane.role) &&
             pane.pane_id !== PANE_ID_INTERACTIVE &&
             pane.pane_id !== PANE_ID_DEADLOOP && (
               <span
                 className="rounded bg-violet-100 dark:bg-violet-900/40 px-1.5 py-0.5 text-[10px] text-violet-700 dark:text-violet-300"
-                title="Manager pane — controlled from the Overview panel (Pause / Resume / Edit goal)"
+                title="Manager pane — user-facing role; controlled from the Overview panel"
               >
                 manager
+              </span>
+            )}
+          {isTechLeadRole(pane.role) &&
+            pane.pane_id !== PANE_ID_INTERACTIVE &&
+            pane.pane_id !== PANE_ID_DEADLOOP && (
+              <span
+                className="rounded bg-indigo-100 dark:bg-indigo-900/40 px-1.5 py-0.5 text-[10px] text-indigo-700 dark:text-indigo-300"
+                title="Tech Lead pane — autonomous orchestrator; controlled from the Overview panel"
+              >
+                tech lead
               </span>
             )}
         </span>
       </div>
     </button>
   );
+}
+
+// v3 role detection — Manager and Tech Lead panes are managed from the
+// Overview's Team panel (Pause/Resume/Edit goal), so PaneGrid hides the
+// Remove button on them to avoid accidental destruction.
+function isManagerRole(role: string | undefined): boolean {
+  if (!role) return false;
+  const lower = role.toLowerCase();
+  return lower.includes("manager") && !lower.includes("tech lead");
+}
+
+function isTechLeadRole(role: string | undefined): boolean {
+  if (!role) return false;
+  return role.toLowerCase().includes("tech lead");
+}
+
+function isManagerOrTechLead(role: string | undefined): boolean {
+  return isManagerRole(role) || isTechLeadRole(role);
 }
 
 function summarizeDiffStats(diff: string): { added: number; removed: number } {
