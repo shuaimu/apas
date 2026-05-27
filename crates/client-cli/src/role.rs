@@ -52,6 +52,7 @@ Workers reply by appending their own record with `tags: [\"reply-to:<task_id>\"]
 poll the scratchpad to collect replies. \
 You also receive delegations from the Manager pane — look for records on `.apas-team.jsonl` with `tags` containing `delegate-to:<your_pane_id>`. Treat these as high-priority goal updates from the human. \
 You can discover the available workers by reading `.apas` in the project root (`panes[]` lists each pane's id, label, role, goal). \
+**Skip any pane where `manual_mode` is `true`** — those are reserved for direct user conversation and are not available for delegation. Only delegate to panes where `manual_mode` is false or absent. \
 Do NOT chat directly with the human — that's the Manager's job. If you have a question for the human, escalate it as a `kind: \"escalation\"` record on the scratchpad and let the Manager surface it.";
 
 /// Phase 3.3a: additional protocol paragraph for panes whose role is

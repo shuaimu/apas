@@ -400,6 +400,15 @@ pub enum ServerToCli {
         pane_id: u32,
         mode: PlanReviewMode,
     },
+
+    /// v3.2: flip a worker between autonomous (`false`, default) and
+    /// manual (`true`) modes. Persisted to `.apas`. The Tech Lead reads
+    /// the field when picking delegation targets and skips manual workers.
+    UpdatePaneManualMode {
+        session_id: Uuid,
+        pane_id: u32,
+        manual_mode: bool,
+    },
 }
 
 // ============================================================================
@@ -752,6 +761,13 @@ pub enum WebToServer {
     UpdatePaneReviewMode {
         pane_id: u32,
         mode: PlanReviewMode,
+    },
+
+    /// v3.2: web → server → CLI: flip a worker between autonomous and
+    /// manual modes. CLI updates PaneMeta + PaneConfig + persists to .apas.
+    UpdatePaneManualMode {
+        pane_id: u32,
+        manual_mode: bool,
     },
 }
 
@@ -1156,6 +1172,12 @@ pub struct PaneConfig {
     /// running without prompts.
     #[serde(default)]
     pub plan_review_mode: PlanReviewMode,
+    /// v3.2 — worker mode. `false` (default) = **autonomous**: the Tech
+    /// Lead may delegate to this pane via `.apas-team.jsonl`. `true` =
+    /// **manual**: the worker only takes user chat; the Tech Lead should
+    /// skip it when picking a delegation target. Persisted to `.apas`.
+    #[serde(default)]
+    pub manual_mode: bool,
 }
 
 /// Legacy pane_id constants
@@ -1182,6 +1204,7 @@ impl PaneConfig {
             goal: None,
             backstory: None,
             plan_review_mode: PlanReviewMode::default(),
+            manual_mode: false,
         }]
     }
 

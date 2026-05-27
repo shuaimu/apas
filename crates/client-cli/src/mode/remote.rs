@@ -309,7 +309,8 @@ async fn run_connection(
                     | Ok(ServerToCli::AddManagerDirective { .. })
                     | Ok(ServerToCli::UpdatePaneRole { .. })
                     | Ok(ServerToCli::PlanReviewAnswer { .. })
-                    | Ok(ServerToCli::UpdatePaneReviewMode { .. }) => {
+                    | Ok(ServerToCli::UpdatePaneReviewMode { .. })
+                    | Ok(ServerToCli::UpdatePaneManualMode { .. }) => {
                         // Pause/resume/pane/bot management not supported in remote mode.
                         // AnswerQuestion is dual_pane-only — remote mode doesn't run
                         // the streaming worker that owns the pending_questions map.

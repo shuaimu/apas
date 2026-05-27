@@ -151,6 +151,18 @@ function PaneCard({
             {pane.role}
           </span>
         )}
+        {/* v3.2: autonomous/manual toggle. Hidden for the legacy default
+            panes and for Manager/Tech-Lead panes (those have their own
+            semantics — Manager is always user-facing, Tech Lead is the
+            orchestrator itself, not a delegation target). */}
+        {pane.pane_id !== PANE_ID_INTERACTIVE &&
+          pane.pane_id !== PANE_ID_DEADLOOP &&
+          !isManagerOrTechLead(pane.role) && (
+            <WorkerModeToggle
+              paneId={pane.pane_id}
+              manualMode={pane.manual_mode === true}
+            />
+          )}
         <span className="ml-auto rounded bg-gray-100 dark:bg-gray-700 px-1.5 py-0.5 text-[10px] font-mono text-gray-600 dark:text-gray-400">
           {providerBadge}
         </span>
@@ -302,6 +314,42 @@ function isTechLeadRole(role: string | undefined): boolean {
 
 function isManagerOrTechLead(role: string | undefined): boolean {
   return isManagerRole(role) || isTechLeadRole(role);
+}
+
+// v3.2: per-worker autonomous/manual toggle. Autonomous = Tech Lead may
+// delegate to this pane via .apas-team.jsonl. Manual = pane reserved for
+// direct user conversation; Tech Lead skips it.
+function WorkerModeToggle({
+  paneId,
+  manualMode,
+}: {
+  paneId: number;
+  manualMode: boolean;
+}) {
+  const updatePaneManualMode = useStore((s) => s.updatePaneManualMode);
+  const onClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    updatePaneManualMode(paneId, !manualMode);
+  };
+  return manualMode ? (
+    <span
+      role="button"
+      onClick={onClick}
+      className="cursor-pointer rounded border border-rose-300 bg-rose-50 px-1.5 py-0.5 text-[10px] font-medium text-rose-700 hover:bg-rose-100 dark:border-rose-800 dark:bg-rose-900/30 dark:text-rose-300 dark:hover:bg-rose-900/50"
+      title="Manual mode: only the user chats with this worker; Tech Lead won't delegate. Click to flip to autonomous."
+    >
+      👤 manual
+    </span>
+  ) : (
+    <span
+      role="button"
+      onClick={onClick}
+      className="cursor-pointer rounded border border-sky-300 bg-sky-50 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 hover:bg-sky-100 dark:border-sky-800 dark:bg-sky-900/30 dark:text-sky-300 dark:hover:bg-sky-900/50"
+      title="Autonomous mode: Tech Lead may delegate work to this pane. Click to flip to manual."
+    >
+      🤖 auto
+    </span>
+  );
 }
 
 function summarizeDiffStats(diff: string): { added: number; removed: number } {

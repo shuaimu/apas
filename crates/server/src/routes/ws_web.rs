@@ -168,6 +168,7 @@ fn infer_panes_from_messages(
                 goal: None,
                 backstory: None,
                 plan_review_mode: shared::PlanReviewMode::default(),
+                manual_mode: false,
             }
         })
         .collect()
@@ -1072,6 +1073,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             goal,
                             backstory,
                             plan_review_mode,
+                            manual_mode: false,
                         };
                         tracing::info!(
                             "Adding pane {} to session {} (isolated_worktree={})",
@@ -1180,6 +1182,25 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     session_id: sid,
                                     pane_id,
                                     mode,
+                                },
+                            )
+                            .await;
+                    }
+                }
+                Ok(WebToServer::UpdatePaneManualMode { pane_id, manual_mode }) => {
+                    if let Some(sid) = session_id {
+                        tracing::info!(
+                            "Update pane {} manual_mode for session {} → {}",
+                            pane_id, sid, manual_mode,
+                        );
+                        state
+                            .sessions
+                            .route_to_cli(
+                                &sid,
+                                ServerToCli::UpdatePaneManualMode {
+                                    session_id: sid,
+                                    pane_id,
+                                    manual_mode,
                                 },
                             )
                             .await;

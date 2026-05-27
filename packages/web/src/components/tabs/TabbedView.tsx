@@ -40,6 +40,35 @@ function getScrollKey(sessionId: string | null, paneId: number): string {
   return `${sessionId || "none"}-${paneId}`;
 }
 
+/// Decide how MessagePane should react to a `messages.length` change.
+///
+/// - "none": don't touch scroll. Pane is hidden, the user has scrolled
+///   away from the bottom, or another effect is mid-restore.
+/// - "instant": snap directly to `scrollHeight`. Used for the bulk
+///   initial cache restore on hard refresh and for catchup batches —
+///   a smooth animation across hundreds of messages takes seconds, and
+///   if anything appends mid-animation the target bottom shifts further
+///   down while the animation is still headed for the OLD bottom,
+///   stranding the user in the middle of the chat.
+/// - "smooth": eased scrollIntoView for a normal stream-message arrival
+///   so the chat slides down gracefully.
+export type AutoScrollMode = "none" | "instant" | "smooth";
+
+export function decideAutoScrollMode(args: {
+  isActive: boolean;
+  shouldAutoScroll: boolean;
+  isRestoringScroll: boolean;
+  prevCount: number;
+  newCount: number;
+}): AutoScrollMode {
+  if (!args.isActive) return "none";
+  if (!args.shouldAutoScroll) return "none";
+  if (args.isRestoringScroll) return "none";
+  const grew = args.newCount - args.prevCount;
+  if (args.prevCount === 0 || grew > 3) return "instant";
+  return "smooth";
+}
+
 // Per-project layout persistence helpers
 function getProjectLayoutKey(cliClientId: string | null, key: string): string {
   return cliClientId ? `apas_layout_${cliClientId}_${key}` : `apas_layout_global_${key}`;
@@ -1037,8 +1066,12 @@ export function TabbedView() {
         open={roleModalPaneId !== null}
         pane={roleModalPaneId !== null ? effectiveTabs.find((t) => t.pane_id === roleModalPaneId) : undefined}
         onClose={() => setRoleModalPaneId(null)}
-        onSave={(role, goal, backstory, mode) => {
+        onSave={(label, role, goal, backstory, mode) => {
           if (roleModalPaneId === null) return;
+          const pane = effectiveTabs.find((t) => t.pane_id === roleModalPaneId);
+          if (label.trim() && label.trim() !== (pane?.label ?? "")) {
+            updatePaneLabel(roleModalPaneId, label.trim());
+          }
           updatePaneRole(roleModalPaneId, role, goal, backstory);
           updatePaneReviewMode(roleModalPaneId, mode);
           setRoleModalPaneId(null);
@@ -1179,10 +1212,17 @@ interface RoleModalProps {
   open: boolean;
   pane?: PaneConfig;
   onClose: () => void;
-  onSave: (role: string, goal: string, backstory: string, mode: PlanReviewMode) => void;
+  onSave: (
+    label: string,
+    role: string,
+    goal: string,
+    backstory: string,
+    mode: PlanReviewMode,
+  ) => void;
 }
 
 function RoleModal({ open, pane, onClose, onSave }: RoleModalProps) {
+  const [label, setLabel] = useState(pane?.label ?? "");
   const [role, setRole] = useState(pane?.role ?? "");
   const [goal, setGoal] = useState(pane?.goal ?? "");
   const [backstory, setBackstory] = useState(pane?.backstory ?? "");
@@ -1190,12 +1230,13 @@ function RoleModal({ open, pane, onClose, onSave }: RoleModalProps) {
   // Reset fields when modal opens for a different pane (or re-opens).
   React.useEffect(() => {
     if (open) {
+      setLabel(pane?.label ?? "");
       setRole(pane?.role ?? "");
       setGoal(pane?.goal ?? "");
       setBackstory(pane?.backstory ?? "");
       setMode(pane?.plan_review_mode ?? "never");
     }
-  }, [open, pane?.pane_id, pane?.role, pane?.goal, pane?.backstory, pane?.plan_review_mode]);
+  }, [open, pane?.pane_id, pane?.label, pane?.role, pane?.goal, pane?.backstory, pane?.plan_review_mode]);
   if (!open) return null;
   return (
     <div
@@ -1249,6 +1290,15 @@ function RoleModal({ open, pane, onClose, onSave }: RoleModalProps) {
         </div>
         <div className="flex flex-col gap-3">
           <label className="flex flex-col gap-1 text-xs">
+            <span className="text-zinc-300">Name <span className="text-zinc-500">(label shown on the tab and pane card)</span></span>
+            <input
+              type="text"
+              value={label}
+              onChange={(e) => setLabel(e.target.value)}
+              className="rounded border border-zinc-700 bg-zinc-800 px-2 py-1 font-mono"
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-xs">
             <span className="text-zinc-300">Role <span className="text-zinc-500">(e.g. &quot;backend implementer&quot;, &quot;reviewer&quot;)</span></span>
             <input
               type="text"
@@ -1300,7 +1350,7 @@ function RoleModal({ open, pane, onClose, onSave }: RoleModalProps) {
           </button>
           <button
             type="button"
-            onClick={() => onSave(role, goal, backstory, mode)}
+            onClick={() => onSave(label, role, goal, backstory, mode)}
             className="rounded border border-purple-700 bg-purple-700 px-3 py-1.5 text-sm hover:bg-purple-600"
           >
             Save
@@ -1797,6 +1847,10 @@ function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, isActiv
   const prevScrollHeight = useRef<number>(0);
   const isRestoringScroll = useRef(false);
   const scrollThrottleRef = useRef<number>(0);
+  // Tracks `messages.length` between renders so the auto-scroll effect
+  // can tell "single new message arrived" (smooth) apart from "100
+  // messages just appeared at once" (snap to bottom).
+  const prevMessageCountRef = useRef<number>(0);
   // `null` on first render so we can distinguish "first time we see
   // isActive" from a later transition. After the effect runs once,
   // it holds the previous value.
@@ -1948,9 +2002,23 @@ function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, isActiv
   // panes accumulate messages silently; when the user comes back, the
   // becameVisible branch above restores them to wherever they were
   // (or to the bottom if they had been at the bottom on save).
+  // See decideAutoScrollMode for why "smooth" is only for small jumps.
   useEffect(() => {
-    if (!isActive) return;
-    if (shouldAutoScroll.current && !isRestoringScroll.current) {
+    const prev = prevMessageCountRef.current;
+    prevMessageCountRef.current = messages.length;
+    const mode = decideAutoScrollMode({
+      isActive,
+      shouldAutoScroll: shouldAutoScroll.current,
+      isRestoringScroll: isRestoringScroll.current,
+      prevCount: prev,
+      newCount: messages.length,
+    });
+    if (mode === "instant") {
+      requestAnimationFrame(() => {
+        const c = containerRef.current;
+        if (c) c.scrollTop = c.scrollHeight;
+      });
+    } else if (mode === "smooth") {
       messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }
   }, [messages.length, isActive]);

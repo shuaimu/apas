@@ -168,6 +168,9 @@ export interface PaneConfig {
   goal?: string;
   backstory?: string;
   plan_review_mode?: PlanReviewMode;
+  /** v3.2 — worker mode. false (default) = autonomous, available for
+   *  Tech-Lead delegation. true = manual, only the user chats with it. */
+  manual_mode?: boolean;
 }
 
 export type PaneCleanupAction = "discard" | "merge_and_remove" | "leave_as_branch";
@@ -476,6 +479,8 @@ interface AppState {
   planReviewPending: PlanReviewPendingItem[];
   answerPlanReview: (toolUseId: string, approve: boolean) => void;
   updatePaneReviewMode: (paneId: number, mode: PlanReviewMode) => void;
+  /** v3.2 — flip a worker between autonomous and manual modes. */
+  updatePaneManualMode: (paneId: number, manualMode: boolean) => void;
 }
 
 export interface PaneDiff {
@@ -1463,6 +1468,17 @@ export const useStore = create<AppState>((set, get) => ({
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "update_pane_review_mode", pane_id: paneId, mode }));
+    }
+  },
+
+  updatePaneManualMode: (paneId: number, manualMode: boolean) => {
+    const { ws } = get();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: "update_pane_manual_mode",
+        pane_id: paneId,
+        manual_mode: manualMode,
+      }));
     }
   },
 

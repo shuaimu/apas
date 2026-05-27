@@ -395,6 +395,10 @@ struct PaneMeta {
     /// worker decides to hold (per `plan_review::should_hold_tool`),
     /// drained when `ServerToCli::PlanReviewAnswer` arrives.
     pending_plan_reviews: Arc<Mutex<HashMap<String, PendingPlanReview>>>,
+    /// v3.2: worker mode. `false` (default) = autonomous, available for
+    /// Tech-Lead delegation. `true` = manual, only takes user chat.
+    /// Mirrored from `PaneConfig.manual_mode` and persisted to `.apas`.
+    manual_mode: bool,
 }
 
 /// One held tool_use waiting on user approval (Phase 3.2b2).
@@ -489,6 +493,7 @@ async fn run_inner(
         Option<String>, // goal from .apas (Phase 2.1)
         Option<String>, // backstory from .apas (Phase 2.1)
         shared::PlanReviewMode, // plan_review_mode from .apas (Phase 3.2)
+        bool,           // manual_mode from .apas (v3.2)
     )> = metadata
         .panes
         .iter()
@@ -528,6 +533,7 @@ async fn run_inner(
                 pane.goal.clone(),
                 pane.backstory.clone(),
                 pane.plan_review_mode,
+                pane.manual_mode,
             )
         })
         .collect();
@@ -608,6 +614,7 @@ async fn run_inner(
             tab_goal,
             tab_backstory,
             tab_plan_review_mode,
+            tab_manual_mode,
         ) in &tabs_to_restore
         {
             let child_proc: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
@@ -633,6 +640,7 @@ async fn run_inner(
                     plan_review_mode: *tab_plan_review_mode,
                     plan_review_mode_arc: Arc::new(Mutex::new(*tab_plan_review_mode)),
                     pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
+                    manual_mode: *tab_manual_mode,
                 },
             );
             sessions.insert(*pane_id, *pane_session_id);
@@ -738,7 +746,7 @@ async fn run_inner(
     };
 
     // Send initial messages for restored panes.
-    for (pane_id, _, label, mode, _, _, _, _, _, is_paused, _, _, _, _, _) in &tabs_to_restore {
+    for (pane_id, _, label, mode, _, _, _, _, _, is_paused, _, _, _, _, _, _) in &tabs_to_restore {
         let init_text = if *pane_id == shared::PANE_ID_DEADLOOP
             && *mode == shared::PaneMode::Deadloop
         {
@@ -1275,7 +1283,7 @@ fn save_pane_configs(
                             None,
                         )
                     };
-                let (worktree_path, role, goal, backstory, plan_review_mode) = pane_metas
+                let (worktree_path, role, goal, backstory, plan_review_mode, manual_mode) = pane_metas
                     .get(&pane_id)
                     .map(|p| (
                         p.worktree_path.clone(),
@@ -1283,8 +1291,9 @@ fn save_pane_configs(
                         p.goal.clone(),
                         p.backstory.clone(),
                         p.plan_review_mode,
+                        p.manual_mode,
                     ))
-                    .unwrap_or((None, None, None, None, shared::PlanReviewMode::default()));
+                    .unwrap_or((None, None, None, None, shared::PlanReviewMode::default(), false));
                 shared::PaneConfig {
                     pane_id,
                     provider,
@@ -1306,6 +1315,7 @@ fn save_pane_configs(
                     goal,
                     backstory,
                     plan_review_mode,
+                    manual_mode,
                 }
             })
             .collect();
@@ -1385,6 +1395,7 @@ fn handle_tui_events(
                             plan_review_mode: shared::PlanReviewMode::default(),
                             plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                             pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
+                            manual_mode: false,
                         },
                     );
                 }
@@ -1541,6 +1552,7 @@ fn handle_tui_events(
                             plan_review_mode: plan_review_mode.clone(),
                             plan_review_mode_arc: Arc::new(Mutex::new(plan_review_mode.clone())),
                             pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
+                            manual_mode: false,
                         },
                     );
                 }
@@ -1951,6 +1963,7 @@ fn handle_tui_events(
                             plan_review_mode: shared::PlanReviewMode::default(),
                             plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                             pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
+                            manual_mode: false,
                         },
                     );
                 }
@@ -2380,6 +2393,7 @@ fn handle_tui_events(
                             plan_review_mode: shared::PlanReviewMode::default(),
                             plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                             pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
+                            manual_mode: false,
                         },
                     );
                 }
@@ -2555,6 +2569,7 @@ fn build_pane_list(
             goal: meta.goal.clone(),
             backstory: meta.backstory.clone(),
             plan_review_mode: meta.plan_review_mode,
+            manual_mode: meta.manual_mode,
         });
     }
 
@@ -2579,6 +2594,7 @@ fn build_pane_list(
                 goal: None,
                 backstory: None,
                 plan_review_mode: shared::PlanReviewMode::default(),
+                manual_mode: false,
             });
         }
     }
@@ -7380,6 +7396,43 @@ async fn run_server_connection(
                                                         output_type: shared::OutputType::System,
                                                         pane_type: None,
                                                         pane_id: Some(rmode_pane_id),
+                                                    };
+                                                    if let Ok(text) = serde_json::to_string(&msg) {
+                                                        let _ = ws_sender
+                                                            .send(Message::Text(text.into()))
+                                                            .await;
+                                                    }
+                                                }
+                                            }
+                                            ServerToCli::UpdatePaneManualMode { session_id: _, pane_id: mmode_pane_id, manual_mode } => {
+                                                let updated = {
+                                                    let mut metas = pane_metas.lock().unwrap();
+                                                    if let Some(m) = metas.get_mut(&mmode_pane_id) {
+                                                        m.manual_mode = manual_mode;
+                                                        true
+                                                    } else {
+                                                        false
+                                                    }
+                                                };
+                                                if updated {
+                                                    save_pane_configs(
+                                                        &working_dir,
+                                                        &pane_sessions,
+                                                        &pane_metas,
+                                                        &pane_pauses,
+                                                        &pane_stop_requests,
+                                                    );
+                                                    let hint = format!(
+                                                        "[Worker mode → {}. Tech Lead will {} this pane for delegations.]",
+                                                        if manual_mode { "manual" } else { "autonomous" },
+                                                        if manual_mode { "skip" } else { "consider" },
+                                                    );
+                                                    let msg = CliToServer::Output {
+                                                        session_id,
+                                                        data: hint,
+                                                        output_type: shared::OutputType::System,
+                                                        pane_type: None,
+                                                        pane_id: Some(mmode_pane_id),
                                                     };
                                                     if let Ok(text) = serde_json::to_string(&msg) {
                                                         let _ = ws_sender
