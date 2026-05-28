@@ -233,6 +233,15 @@ pub enum CliToServer {
         session_id: Uuid,
         state: TeamTodoStateMsg,
     },
+
+    /// CLI's view of `suggested-workers.md`. Pushed in response to
+    /// `ServerToCli::FetchSuggestedWorkers` and after each
+    /// `DismissSuggestion`-driven mutation. Server forwards to web as
+    /// `ServerToWeb::SuggestedWorkersState`.
+    SuggestedWorkersState {
+        session_id: Uuid,
+        suggestions: Vec<SuggestedWorkerMsg>,
+    },
 }
 
 /// Messages sent from server to CLI client
@@ -301,6 +310,18 @@ pub enum ServerToCli {
         title: String,
         #[serde(default)]
         body: String,
+    },
+
+    /// Server asks the CLI to send a fresh `suggested-workers.md`
+    /// snapshot. CLI replies with `CliToServer::SuggestedWorkersState`.
+    FetchSuggestedWorkers { session_id: Uuid },
+
+    /// Web user dismissed a Manager-proposed worker suggestion. CLI
+    /// removes the section from `suggested-workers.md` and republishes
+    /// the state.
+    DismissSuggestion {
+        session_id: Uuid,
+        suggestion_id: String,
     },
 
     /// Flip a pane's `managed` field from false to true. CLI updates
@@ -828,6 +849,20 @@ pub enum WebToServer {
         body: String,
     },
 
+    /// Web requests a fresh snapshot of `suggested-workers.md`.
+    /// Forwarded as `ServerToCli::FetchSuggestedWorkers`; CLI replies
+    /// with `CliToServer::SuggestedWorkersState` which the server hands
+    /// back to web as `ServerToWeb::SuggestedWorkersState`.
+    FetchSuggestedWorkers { session_id: Uuid },
+
+    /// User dismissed a suggested worker. Forwarded as
+    /// `ServerToCli::DismissSuggestion`; CLI removes the entry and
+    /// republishes the state.
+    DismissSuggestion {
+        session_id: Uuid,
+        suggestion_id: String,
+    },
+
     /// One-way promote: flip an unmanaged side-chat pane to a managed
     /// team member. CLI sets PaneMeta.managed = true and re-broadcasts
     /// the PaneList. There's no demote — keep it simple.
@@ -1045,6 +1080,14 @@ pub enum ServerToWeb {
         session_id: Uuid,
         state: TeamTodoStateMsg,
     },
+
+    /// Snapshot of the project's suggested-workers.md state. Sent in
+    /// reply to `WebToServer::FetchSuggestedWorkers` and after every
+    /// CLI-side mutation triggered by `WebToServer::DismissSuggestion`.
+    SuggestedWorkersState {
+        session_id: Uuid,
+        suggestions: Vec<SuggestedWorkerMsg>,
+    },
 }
 
 /// Wire format for a snapshot of `team-todo.md`. Mirrors the CLI's
@@ -1083,6 +1126,20 @@ pub struct TeamTodoGlobalMsg {
 pub struct PaneTodoPrMsg {
     pub pane_id: u32,
     pub url: String,
+}
+
+/// One row in the suggested-workers queue. The Manager pane appends
+/// these as `## SUG-NNN — label` sections to `suggested-workers.md`;
+/// the Overview renders each as a card with Accept / Dismiss buttons.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SuggestedWorkerMsg {
+    pub id: String,
+    pub label: String,
+    pub role: String,
+    pub goal: String,
+    pub backstory: String,
+    #[serde(default)]
+    pub needs_worktree: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

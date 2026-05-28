@@ -29,6 +29,7 @@ Thumbs.db
 .apas-team.jsonl
 .apas-worktrees/
 team-todo.md
+suggested-workers.md
 project_goal.md
 # Per-agent scratchpad cursors (Tech Lead / Reviewer track where they
 # last read so they don't re-process — or miss — records).

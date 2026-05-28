@@ -11,6 +11,7 @@ import { ResourceUseRollup } from "./ResourceUseRollup";
 import { AddWorkerModal } from "./AddWorkerModal";
 import { ProjectGoalBar } from "./ProjectGoalBar";
 import { TeamTodoPanel } from "./TeamTodoPanel";
+import { SuggestedWorkersPanel } from "./SuggestedWorkersPanel";
 
 /**
  * Phase 5.1 / v3 split — team overview pseudo-tab.
@@ -70,10 +71,10 @@ export function OverviewView({
         return `  - pane_id=${p.pane_id} (${p.label ?? "untitled"}, ${tag})`;
       })
       .join("\n");
-    const prompt = `Given the current project goal (in project_goal.md) and the team you already have:\n\n${roster}\n\nSuggest 2-3 additional worker panes that would help advance the goal. For each, give:\n  - a short role label (developer / qa / reviewer / researcher / devops, or your own)\n  - a one-sentence goal/scope describing what they'd own\n  - whether they need an isolated git worktree (yes for developers; usually no for reviewers/researchers)\n\nKeep the suggestions tight — quality over quantity. If the current team is sufficient, say so and explain why.`;
+    const prompt = `Given the current project goal (in project_goal.md) and the team you already have:\n\n${roster}\n\nSuggest 2-3 additional worker panes that would help advance the goal. Append each suggestion as a section in **suggested-workers.md** (use the Edit/Write tool) — they'll appear in the Overview's "Suggested workers" box with one-click Accept buttons.\n\nFormat per suggestion:\n\n## SUG-NNN — short label\n- role: developer | qa | reviewer | researcher | devops | ...\n- goal: one-sentence scope describing what they'd own\n- backstory: 1-2 sentences of relevant context / expertise\n- needs_worktree: yes | no   (yes for developers; usually no for reviewers/researchers)\n\nPick NNN past the existing max (SUG-001 if the file is empty). Quality over quantity. If the current team is sufficient, say so here in chat and skip the file.`;
     const result = sendMessageToPane(prompt, managerPane.pane_id);
     if (result.success) {
-      showToast("Asked the Manager for worker suggestions — check the Manager tab.", "info");
+      showToast("Asked the Manager for suggestions — they'll appear in the Suggested workers box below.", "info");
     } else {
       showToast(result.error ?? "Failed to reach Manager", "error");
     }
@@ -128,6 +129,10 @@ export function OverviewView({
             onResumePane={onResumePane}
             onRemovePane={onRemovePane}
           />
+        </OverviewSection>
+
+        <OverviewSection title="Suggested workers">
+          <SuggestedWorkersPanel />
         </OverviewSection>
 
         <OverviewSection title="Side chats (unmanaged)">

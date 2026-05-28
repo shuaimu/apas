@@ -313,6 +313,8 @@ async fn run_connection(
                     | Ok(ServerToCli::FetchTeamTodo { .. })
                     | Ok(ServerToCli::TodoApproval { .. })
                     | Ok(ServerToCli::AddTodo { .. })
+                    | Ok(ServerToCli::FetchSuggestedWorkers { .. })
+                    | Ok(ServerToCli::DismissSuggestion { .. })
                     | Ok(ServerToCli::PromotePaneToManaged { .. }) => {
                         // Pause/resume/pane/bot management not supported in remote mode.
                         // AnswerQuestion is dual_pane-only — remote mode doesn't run

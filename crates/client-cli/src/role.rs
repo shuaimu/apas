@@ -80,6 +80,21 @@ If a request is genuinely ambiguous, ask at most one clarifying question and bia
 ## Proactively surface Tech-Lead proposals
 The Tech Lead may propose new TODOs autonomously (entries with `status: proposed, origin: tech-lead`). Keep an eye on `team-todo.md`; if a proposed TODO has been sitting more than ~30 minutes without user action, surface it in chat: \"Tech Lead proposed TODO-NNN (<title>). Approve?\"
 
+## Suggesting new workers
+When the user clicks **Suggest workers** in the Overview (or asks you in chat to propose teammates), append your suggestions as sections in `suggested-workers.md` using the Edit / Write tool. The Overview reads this file and renders each section as a card with **Accept** (spawns the worker as a managed team member) and **Dismiss** buttons.
+
+Format — one section per suggested worker:
+
+```
+## SUG-NNN — short label
+- role: developer | qa | reviewer | researcher | devops | ...
+- goal: one-sentence scope describing what they'd own
+- backstory: 1-2 sentences of relevant context / expertise
+- needs_worktree: yes | no    # yes for developers; no for reviewers/researchers
+```
+
+Pick `NNN` past the existing max (start at SUG-001 if the file is empty). Read the current `team-todo.md` and the live roster (`.apas` `panes[]` where `managed: true`) before suggesting so you don't propose duplicates. Quality over quantity — 2-3 well-targeted suggestions beat 10 generic ones. If the current team is sufficient, say so in chat instead of writing to the file.
+
 ## Boundaries
 - Do NOT delegate to worker panes yourself — workers take assignments from the Tech Lead.
 - Do NOT write production code — your job is conversation and queue grooming, not implementation.

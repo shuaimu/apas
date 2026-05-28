@@ -7822,6 +7822,52 @@ async fn run_server_connection(
                                                     }
                                                 }
                                             }
+                                            ServerToCli::FetchSuggestedWorkers { session_id: _ } => {
+                                                let project_dir = std::path::Path::new(&working_dir);
+                                                let sw = crate::suggested_workers::load(project_dir)
+                                                    .unwrap_or_default();
+                                                let msg = CliToServer::SuggestedWorkersState {
+                                                    session_id,
+                                                    suggestions: crate::suggested_workers::to_wire(&sw),
+                                                };
+                                                if let Ok(text) = serde_json::to_string(&msg) {
+                                                    let _ = ws_sender
+                                                        .send(Message::Text(text.into()))
+                                                        .await;
+                                                }
+                                            }
+                                            ServerToCli::DismissSuggestion { session_id: _, suggestion_id } => {
+                                                let project_dir = std::path::Path::new(&working_dir);
+                                                match crate::suggested_workers::load(project_dir) {
+                                                    Ok(mut sw) => {
+                                                        if sw.remove(&suggestion_id) {
+                                                            if let Err(e) =
+                                                                crate::suggested_workers::save(project_dir, &sw)
+                                                            {
+                                                                tracing::warn!(
+                                                                    "Failed to save suggested-workers.md after dismiss: {}",
+                                                                    e
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => tracing::warn!(
+                                                        "Failed to load suggested-workers.md for dismiss: {}",
+                                                        e
+                                                    ),
+                                                }
+                                                let sw = crate::suggested_workers::load(project_dir)
+                                                    .unwrap_or_default();
+                                                let msg = CliToServer::SuggestedWorkersState {
+                                                    session_id,
+                                                    suggestions: crate::suggested_workers::to_wire(&sw),
+                                                };
+                                                if let Ok(text) = serde_json::to_string(&msg) {
+                                                    let _ = ws_sender
+                                                        .send(Message::Text(text.into()))
+                                                        .await;
+                                                }
+                                            }
                                             ServerToCli::RequestPaneDiff { session_id: _, pane_id: diff_pane_id } => {
                                                 // Look up the pane's worktree path. If unset, return a polite error
                                                 // so the web UI can render guidance instead of nothing.

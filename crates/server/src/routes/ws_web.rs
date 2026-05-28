@@ -1267,6 +1267,43 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         )
                         .await;
                 }
+                Ok(WebToServer::FetchSuggestedWorkers { session_id: msg_sid }) => {
+                    let Some(sid) =
+                        resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
+                            .await
+                    else {
+                        continue;
+                    };
+                    state
+                        .sessions
+                        .route_to_cli(
+                            &sid,
+                            ServerToCli::FetchSuggestedWorkers { session_id: sid },
+                        )
+                        .await;
+                }
+                Ok(WebToServer::DismissSuggestion { session_id: msg_sid, suggestion_id }) => {
+                    let Some(sid) =
+                        resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
+                            .await
+                    else {
+                        continue;
+                    };
+                    tracing::info!(
+                        "Dismiss suggestion {} for session {}",
+                        suggestion_id, sid
+                    );
+                    state
+                        .sessions
+                        .route_to_cli(
+                            &sid,
+                            ServerToCli::DismissSuggestion {
+                                session_id: sid,
+                                suggestion_id,
+                            },
+                        )
+                        .await;
+                }
                 Ok(WebToServer::PromotePaneToManaged { session_id: msg_sid, pane_id }) => {
                     let Some(sid) =
                         resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)

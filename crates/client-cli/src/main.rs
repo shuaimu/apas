@@ -19,6 +19,7 @@ mod plan_review;
 mod project;
 mod role;
 mod scratchpad;
+mod suggested_workers;
 mod team_todo;
 mod tui;
 mod update;

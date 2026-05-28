@@ -741,6 +741,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     )
                                     .await;
                             }
+                            Ok(CliToServer::SuggestedWorkersState { session_id, suggestions }) => {
+                                state
+                                    .sessions
+                                    .route_to_web(
+                                        &session_id,
+                                        ServerToWeb::SuggestedWorkersState {
+                                            session_id,
+                                            suggestions,
+                                        },
+                                    )
+                                    .await;
+                            }
                             Ok(CliToServer::PrCreated { session_id, pane_id, url, error }) => {
                                 tracing::info!(
                                     "PR created for pane {} in session {}: url={:?} error={:?}",

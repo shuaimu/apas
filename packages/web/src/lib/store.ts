@@ -180,6 +180,17 @@ export interface TeamTodoPaneTodoPr {
   url: string;
 }
 
+/// Wire shape of one entry in suggested-workers.md. Manager pane writes
+/// these; Overview renders each as a card with Accept/Dismiss.
+export interface SuggestedWorker {
+  id: string;
+  label: string;
+  role: string;
+  goal: string;
+  backstory: string;
+  needs_worktree: boolean;
+}
+
 export interface TeamTodoWorker {
   pane_id: number;
   role_hint?: string | null;
@@ -428,6 +439,11 @@ interface AppState {
 
   // Tech-Lead-driven workflow (see docs/todo-driven-workflow.md): latest
   // snapshot of team-todo.md for the current session. Populated by
+  /** Manager-proposed worker suggestions parsed from suggested-workers.md.
+   *  Pushed by the CLI on FetchSuggestedWorkers and after Dismiss mutations.
+   *  `null` = haven't asked yet; `[]` = file empty / no suggestions. */
+  suggestedWorkers: SuggestedWorker[] | null;
+
   // ServerToWeb::TeamTodoState in response to fetchTeamTodo() or after
   // a TodoApproval mutation. Null = haven't fetched yet.
   teamTodoState: TeamTodoState | null;
@@ -550,6 +566,14 @@ interface AppState {
   rejectTodo: (todoId: string) => void;
   /** Add a new Global TODO (status: approved, origin: user). CLI assigns the id. */
   addTodo: (title: string, body: string) => void;
+
+  /** Ask the CLI for the current suggested-workers.md snapshot. Reply
+   *  lands in `suggestedWorkers` via the suggested_workers_state handler. */
+  fetchSuggestedWorkers: () => void;
+  /** Spawn the suggested worker as a managed pane + drop the section. */
+  acceptSuggestion: (suggestion: SuggestedWorker) => void;
+  /** Drop the suggestion without spawning anything. */
+  dismissSuggestion: (suggestionId: string) => void;
 }
 
 export interface PaneDiff {
@@ -624,6 +648,7 @@ export const useStore = create<AppState>((set, get) => ({
   sessionLastCreatedAt: new Map(),
   reconnectWatermarks: new Map(),
   teamTodoState: null,
+  suggestedWorkers: null,
   loadingMorePane: null,
   // Legacy compat getters (populated from dynamic state)
   deadloopMessages: [],
@@ -1571,6 +1596,66 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
+  fetchSuggestedWorkers: () => {
+    const { ws, sessionId } = get();
+    if (!sessionId) return;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(
+        JSON.stringify({
+          type: "fetch_suggested_workers",
+          session_id: sessionId,
+        }),
+      );
+    }
+  },
+
+  acceptSuggestion: (suggestion: SuggestedWorker) => {
+    const { showToast, addPane, dismissSuggestion } = get();
+    // addPane handles the actual pane creation; we mark managed=true so
+    // it lands in the Team box. Worktree comes from needs_worktree.
+    const result = addPane(
+      "claude",
+      "interactive",
+      suggestion.label || suggestion.role || "New worker",
+      undefined,
+      undefined,
+      suggestion.needs_worktree,
+      {
+        role: suggestion.role || undefined,
+        goal: suggestion.goal || undefined,
+        backstory: suggestion.backstory || undefined,
+      },
+      true,
+    );
+    if (!result.success) {
+      showToast(result.error ?? "Failed to add worker", "error");
+      return;
+    }
+    // Drop the section from suggested-workers.md so it doesn't show
+    // again next render — the CLI republishes the trimmed list.
+    dismissSuggestion(suggestion.id);
+    showToast(
+      `Accepted ${suggestion.label || suggestion.role || "suggestion"} — added to the team`,
+      "info",
+    );
+  },
+
+  dismissSuggestion: (suggestionId: string) => {
+    const { ws, sessionId, showToast } = get();
+    if (!sessionId) return;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(
+        JSON.stringify({
+          type: "dismiss_suggestion",
+          session_id: sessionId,
+          suggestion_id: suggestionId,
+        }),
+      );
+    } else {
+      showToast("Not connected — cannot dismiss", "error");
+    }
+  },
+
   updatePaneRole: (paneId: number, role?: string, goal?: string, backstory?: string) => {
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -2243,6 +2328,21 @@ function handleServerMessage(
       if (state) {
         set({ teamTodoState: state });
       }
+      break;
+    }
+
+    case "suggested_workers_state": {
+      const responseSessionId = data.session_id as string | undefined;
+      const currentSessionId = get().sessionId;
+      if (
+        responseSessionId &&
+        currentSessionId &&
+        responseSessionId !== currentSessionId
+      ) {
+        break;
+      }
+      const suggestions = data.suggestions as SuggestedWorker[] | undefined;
+      set({ suggestedWorkers: suggestions ?? [] });
       break;
     }
 
