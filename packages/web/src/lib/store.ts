@@ -155,6 +155,11 @@ export interface SessionCacheEntry {
 export interface TeamTodoState {
   globals: TeamTodoGlobal[];
   workers: TeamTodoWorker[];
+  /// Per-agent scratchpad cursor (RFC3339 timestamp of the last
+  /// scratchpad record they acted on). `null` means the cursor file
+  /// is missing — agent hasn't iterated yet (or was wiped).
+  tech_lead_cursor?: string | null;
+  reviewer_cursor?: string | null;
 }
 
 export interface TeamTodoGlobal {

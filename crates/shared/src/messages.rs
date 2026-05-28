@@ -1034,6 +1034,13 @@ pub enum ServerToWeb {
 pub struct TeamTodoStateMsg {
     pub globals: Vec<TeamTodoGlobalMsg>,
     pub workers: Vec<TeamTodoWorkerMsg>,
+    /// Per-agent scratchpad cursor (RFC3339 timestamp of the last
+    /// record acted on). `None` means the cursor file is missing —
+    /// either the agent hasn't iterated yet, or it was wiped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tech_lead_cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

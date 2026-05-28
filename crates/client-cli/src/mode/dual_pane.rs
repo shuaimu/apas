@@ -7611,7 +7611,7 @@ async fn run_server_connection(
                                                 let project_dir = std::path::Path::new(&working_dir);
                                                 let todo = crate::team_todo::load(project_dir)
                                                     .unwrap_or_default();
-                                                let state_msg = crate::team_todo::to_wire(&todo);
+                                                let state_msg = crate::team_todo::to_wire_with_cursors(&todo, project_dir);
                                                 let msg = CliToServer::TeamTodoState {
                                                     session_id,
                                                     state: state_msg,
@@ -7662,7 +7662,7 @@ async fn run_server_connection(
                                                 // web sees the result (or the unchanged state if the
                                                 // action was rejected).
                                                 let todo = crate::team_todo::load(project_dir).unwrap_or_default();
-                                                let state_msg = crate::team_todo::to_wire(&todo);
+                                                let state_msg = crate::team_todo::to_wire_with_cursors(&todo, project_dir);
                                                 let msg = CliToServer::TeamTodoState {
                                                     session_id,
                                                     state: state_msg,
@@ -7704,7 +7704,7 @@ async fn run_server_connection(
                                                 // web sees the result (or unchanged
                                                 // state on the empty/error path).
                                                 let todo = crate::team_todo::load(std::path::Path::new(&working_dir)).unwrap_or_default();
-                                                let state_msg = crate::team_todo::to_wire(&todo);
+                                                let state_msg = crate::team_todo::to_wire_with_cursors(&todo, project_dir);
                                                 let msg = CliToServer::TeamTodoState {
                                                     session_id,
                                                     state: state_msg,

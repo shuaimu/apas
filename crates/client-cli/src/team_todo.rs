@@ -176,6 +176,26 @@ pub struct WorkerSubtask {
 
 /// Convert our internal `TeamTodo` into the wire-format
 /// `shared::TeamTodoStateMsg` (statuses as strings, web-friendly).
+/// `project_dir` is used to read the agents' cursor files so the web
+/// can render "Tech Lead is processing records up to X".
+pub fn to_wire_with_cursors(todo: &TeamTodo, project_dir: &Path) -> shared::TeamTodoStateMsg {
+    let mut msg = to_wire(todo);
+    msg.tech_lead_cursor = read_cursor(project_dir, ".apas-tech-lead-cursor");
+    msg.reviewer_cursor = read_cursor(project_dir, ".apas-reviewer-cursor");
+    msg
+}
+
+fn read_cursor(project_dir: &Path, filename: &str) -> Option<String> {
+    let path = project_dir.join(filename);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 pub fn to_wire(todo: &TeamTodo) -> shared::TeamTodoStateMsg {
     shared::TeamTodoStateMsg {
         globals: todo
@@ -216,6 +236,10 @@ pub fn to_wire(todo: &TeamTodo) -> shared::TeamTodoStateMsg {
                     .collect(),
             })
             .collect(),
+        // Filled in by to_wire_with_cursors; the cursor-free helper is
+        // kept for tests + callers that don't have a project_dir handy.
+        tech_lead_cursor: None,
+        reviewer_cursor: None,
     }
 }
 

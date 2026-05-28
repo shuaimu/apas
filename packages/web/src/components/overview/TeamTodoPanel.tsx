@@ -11,12 +11,13 @@
  * Polls `fetchTeamTodo()` every 10s and on mount so the view stays
  * fresh without waiting for the Tech Lead's next iteration to push.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Check, X, Loader2, Plus } from "lucide-react";
 import {
   TeamTodoGlobal,
   TeamTodoSubtask,
   TeamTodoWorker,
+  paneKey,
   useStore,
 } from "@/lib/store";
 
@@ -45,6 +46,11 @@ export function TeamTodoPanel() {
         </h3>
         <AddTodoControl />
       </div>
+
+      <AgentStatusRow
+        techLeadCursor={state?.tech_lead_cursor ?? null}
+        reviewerCursor={state?.reviewer_cursor ?? null}
+      />
 
       {empty && (
         <p className="text-xs text-gray-500 dark:text-gray-400">
@@ -79,6 +85,137 @@ export function TeamTodoPanel() {
       )}
     </section>
   );
+}
+
+/// Bar showing Tech Lead + Reviewer status. "Last active" derives from
+/// the most-recent message in each pane (via paneMessages); "cursor"
+/// is the timestamp piped through from the cursor file by the CLI.
+/// Both numbers tick once a minute via the `now` state below so the
+/// "Xm ago" labels stay accurate without per-second re-renders.
+function AgentStatusRow({
+  techLeadCursor,
+  reviewerCursor,
+}: {
+  techLeadCursor: string | null;
+  reviewerCursor: string | null;
+}) {
+  const paneConfigs = useStore((s) => s.paneConfigs);
+  const paneMessages = useStore((s) => s.paneMessages);
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 60_000);
+    return () => clearInterval(id);
+  }, []);
+
+  const techLead = useMemo(
+    () =>
+      paneConfigs.find((p) =>
+        (p.role ?? "").toLowerCase().includes("tech lead"),
+      ),
+    [paneConfigs],
+  );
+  const reviewer = useMemo(
+    () =>
+      paneConfigs.find(
+        (p) =>
+          (p.role ?? "").toLowerCase().includes("reviewer") &&
+          !(p.role ?? "").toLowerCase().includes("tech lead"),
+      ),
+    [paneConfigs],
+  );
+
+  const techLeadLast = lastActivityTs(techLead?.pane_id, paneMessages);
+  const reviewerLast = lastActivityTs(reviewer?.pane_id, paneMessages);
+
+  return (
+    <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-gray-500 dark:text-gray-400">
+      <AgentLine
+        label="Tech Lead"
+        present={!!techLead}
+        lastActivity={techLeadLast}
+        cursor={techLeadCursor}
+        now={now}
+      />
+      <AgentLine
+        label="Reviewer"
+        present={!!reviewer}
+        lastActivity={reviewerLast}
+        cursor={reviewerCursor}
+        now={now}
+      />
+    </div>
+  );
+}
+
+function AgentLine({
+  label,
+  present,
+  lastActivity,
+  cursor,
+  now,
+}: {
+  label: string;
+  present: boolean;
+  lastActivity: number | null;
+  cursor: string | null;
+  now: number;
+}) {
+  if (!present) {
+    return (
+      <span>
+        <strong className="text-gray-700 dark:text-gray-200">{label}</strong>:{" "}
+        <span className="text-gray-400">not running</span>
+      </span>
+    );
+  }
+  const dot = activityDot(lastActivity, now);
+  return (
+    <span title={cursor ? `cursor: ${cursor}` : "no cursor (agent hasn't iterated)"}>
+      <strong className="text-gray-700 dark:text-gray-200">{label}</strong>{" "}
+      {dot} {relative(lastActivity, now)}
+      {cursor && (
+        <span className="ml-1 text-gray-400 dark:text-gray-500">
+          · cursor {relative(parseTs(cursor), now)}
+        </span>
+      )}
+    </span>
+  );
+}
+
+function activityDot(ts: number | null, now: number): string {
+  if (ts == null) return "○";
+  const ageMs = now - ts;
+  if (ageMs < 5 * 60_000) return "🟢";   // active in last 5 min
+  if (ageMs < 30 * 60_000) return "🟡";  // idle but recent
+  return "🔴";                            // stale
+}
+
+function relative(ts: number | null, now: number): string {
+  if (ts == null) return "—";
+  const ageMs = Math.max(0, now - ts);
+  const s = Math.round(ageMs / 1000);
+  if (s < 60) return `${s}s ago`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
+}
+
+function parseTs(s: string): number | null {
+  const n = Date.parse(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+function lastActivityTs(
+  paneId: number | undefined,
+  paneMessages: Record<string, { timestamp: Date }[]>,
+): number | null {
+  if (paneId == null) return null;
+  const msgs = paneMessages[paneKey(paneId)];
+  if (!msgs || msgs.length === 0) return null;
+  return msgs[msgs.length - 1].timestamp.getTime();
 }
 
 function AddTodoControl() {
