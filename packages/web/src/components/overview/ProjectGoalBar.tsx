@@ -18,7 +18,16 @@
  * onboarding an ongoing project.
  */
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Play, Save, Pause, CheckCircle2, Sparkles, Bot } from "lucide-react";
+import {
+  Play,
+  Save,
+  Pause,
+  CheckCircle2,
+  Sparkles,
+  Bot,
+  ChevronDown,
+  ChevronUp,
+} from "lucide-react";
 import { useStore, type PaneConfig } from "@/lib/store";
 import { ROLE_TEMPLATES } from "@/lib/roleTemplates";
 
@@ -94,6 +103,12 @@ export function ProjectGoalBar() {
   // server pushes don't clobber the user's in-progress typing).
   const [goalDraft, setGoalDraft] = useState("");
   const [goalDirtySinceSave, setGoalDirtySinceSave] = useState(false);
+  // Collapsed = small fixed cap with internal scroll; expanded = auto-grow
+  // up to 60vh. Default collapsed so a long goal doesn't dominate the
+  // Overview. Toggle hidden when the content fits in the collapsed cap.
+  const [goalExpanded, setGoalExpanded] = useState(false);
+  const [goalOverflows, setGoalOverflows] = useState(false);
+  const GOAL_COLLAPSED_PX = 110; // ~5 lines at default font size
   // Queue an auto-generate chat message if the Manager doesn't exist
   // yet at click-time. Sent once the Manager appears in paneConfigs.
   const [pendingAutoGenerate, setPendingAutoGenerate] = useState(false);
@@ -125,18 +140,24 @@ export function ProjectGoalBar() {
     setGoalDraft(projectGoalFromCli);
   }, [projectGoalFromCli, goalDirtySinceSave]);
 
-  // Auto-grow the textarea to fit its content. We cap at ~60vh so a very
-  // long goal can't push the rest of the Overview off-screen — past the
-  // cap, the textarea becomes scrollable. The min (3 rows) is also the
-  // initial empty-state look.
+  // Auto-grow the textarea to fit its content. Two caps: a small
+  // `GOAL_COLLAPSED_PX` for the default collapsed state (long goal stays
+  // out of the way), and ~60vh when the user clicks Expand. Past either
+  // cap the textarea becomes internally scrollable. The `goalOverflows`
+  // flag drives whether to show the toggle at all — no point in offering
+  // Expand on a 2-line goal.
   const goalTextareaRef = useRef<HTMLTextAreaElement>(null);
   useEffect(() => {
     const ta = goalTextareaRef.current;
     if (!ta) return;
     ta.style.height = "auto";
-    const maxPx = Math.floor(window.innerHeight * 0.6);
-    ta.style.height = `${Math.min(ta.scrollHeight, maxPx)}px`;
-  }, [goalDraft]);
+    const naturalPx = ta.scrollHeight;
+    setGoalOverflows(naturalPx > GOAL_COLLAPSED_PX);
+    const capPx = goalExpanded
+      ? Math.floor(window.innerHeight * 0.6)
+      : GOAL_COLLAPSED_PX;
+    ta.style.height = `${Math.min(naturalPx, capPx)}px`;
+  }, [goalDraft, goalExpanded]);
 
   // v3.4 — auto-spawn responsibility moved to the CLI (see
   // dual_pane.rs run_inner). Web no longer auto-spawns on attach to
@@ -317,18 +338,38 @@ export function ProjectGoalBar() {
 
       {/* Goal — overwrites project_goal.md */}
       <div className="mb-4">
-        <div className="mb-1 flex items-center justify-between">
+        <div className="mb-1 flex items-center justify-between gap-2">
           <label className="text-[11px] font-medium uppercase tracking-wide text-violet-700/80 dark:text-violet-300/80">
             Project goal
             <span className="ml-1 text-violet-500/70 dark:text-violet-400/70 normal-case font-normal">
               · written to <span className="font-mono">project_goal.md</span>
             </span>
           </label>
-          {goalDirtySinceSave && (
-            <span className="text-[10px] text-amber-600 dark:text-amber-400">
-              unsaved
-            </span>
-          )}
+          <div className="flex items-center gap-2">
+            {goalDirtySinceSave && (
+              <span className="text-[10px] text-amber-600 dark:text-amber-400">
+                unsaved
+              </span>
+            )}
+            {goalOverflows && (
+              <button
+                type="button"
+                onClick={() => setGoalExpanded((v) => !v)}
+                className="flex items-center gap-0.5 rounded border border-violet-300 bg-white px-1.5 py-0.5 text-[10px] font-medium text-violet-700 hover:bg-violet-100 dark:border-violet-700 dark:bg-gray-900 dark:text-violet-300 dark:hover:bg-violet-900/40"
+                title={goalExpanded ? "Collapse goal text" : "Expand goal text"}
+              >
+                {goalExpanded ? (
+                  <>
+                    <ChevronUp className="h-3 w-3" /> Shrink
+                  </>
+                ) : (
+                  <>
+                    <ChevronDown className="h-3 w-3" /> Expand
+                  </>
+                )}
+              </button>
+            )}
+          </div>
         </div>
         <textarea
           ref={goalTextareaRef}
