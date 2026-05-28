@@ -182,6 +182,26 @@ export interface TeamTodoPaneTodoPr {
 
 /// Wire shape of one entry in suggested-workers.md. Manager pane writes
 /// these; Overview renders each as a card with Accept/Dismiss.
+/// A user `input` we've sent but haven't yet seen the server echo back
+/// as `user_input`. Persisted to localStorage so refresh / reconnect
+/// can replay it. Removed once the matching echo arrives.
+export interface PendingSend {
+  /// Client-generated id. Matches the optimistic message's id (minus
+  /// the `optimistic-` prefix) so ack handlers can link them.
+  id: string;
+  /// Target session — replay is only meaningful while the user is
+  /// viewing this session.
+  sessionId: string;
+  /// Target pane within that session (null = no specific pane).
+  paneId: number | null;
+  paneType?: string;
+  text: string;
+  /// ms epoch when first enqueued.
+  createdAt: number;
+  /// How many times we've sent this. >1 means a reconnect retransmit.
+  attempts: number;
+}
+
 export interface SuggestedWorker {
   id: string;
   label: string;
@@ -437,6 +457,12 @@ interface AppState {
   // Cleared per-session once that session's catchup reply lands.
   reconnectWatermarks: Map<string, string>;
 
+  /// Outgoing sends the server hasn't acked yet (no `user_input` echo
+  /// received). Persisted to localStorage so a page refresh doesn't
+  /// lose the typed input. Replayed on every WS authenticate.
+  /// Removed when the matching `user_input` arrives.
+  pendingSends: PendingSend[];
+
   // Tech-Lead-driven workflow (see docs/todo-driven-workflow.md): latest
   // snapshot of team-todo.md for the current session. Populated by
   /** Manager-proposed worker suggestions parsed from suggested-workers.md.
@@ -647,6 +673,7 @@ export const useStore = create<AppState>((set, get) => ({
   unreadSessions: new Set(),
   sessionLastCreatedAt: new Map(),
   reconnectWatermarks: new Map(),
+  pendingSends: loadPendingSends(),
   teamTodoState: null,
   suggestedWorkers: null,
   loadingMorePane: null,
@@ -1369,6 +1396,11 @@ export const useStore = create<AppState>((set, get) => ({
     const paneId = typeof pane === "number" ? pane : normalizePaneId(pane, undefined);
     const paneType = legacyPaneType(paneId) || (typeof pane === "string" ? pane : undefined);
 
+    // One shared id for the optimistic placeholder + the pending-send
+    // queue entry — lets the `user_input` ack handler strip the
+    // optimistic prefix AND remove the pending entry in one shot.
+    const sendId = generateId();
+
     // Optimistic local render: drop the message into the pane immediately so
     // the user sees it without waiting for the server's user_input bounce.
     // The "optimistic-" id prefix is the dedupe handshake — the user_input
@@ -1376,13 +1408,46 @@ export const useStore = create<AppState>((set, get) => ({
     // pushing a duplicate.
     if (paneId != null) {
       const optimisticMsg: Message = {
-        id: `optimistic-${generateId()}`,
+        id: `optimistic-${sendId}`,
         role: "user",
         content: text,
         timestamp: new Date(),
         outputType: { type: "text" },
       };
       get().addMessageToPane(optimisticMsg, pane);
+    }
+
+    // Enqueue into the pending-send queue BEFORE the WS send. If the WS
+    // is silently stale (readyState OPEN but TCP dead), ws.send drops
+    // the frame and the heartbeat watchdog reconnects within ~35s —
+    // flushPendingSends will retransmit on the new socket. Persisted to
+    // localStorage so a page refresh during the dead window doesn't
+    // also lose the typed input.
+    if (sessionId) {
+      const entry: PendingSend = {
+        id: sendId,
+        sessionId,
+        paneId: typeof paneId === "number" ? paneId : null,
+        paneType,
+        text,
+        createdAt: Date.now(),
+        attempts: 1,
+      };
+      const nextPending = [...get().pendingSends, entry];
+      savePendingSends(nextPending);
+      set({ pendingSends: nextPending });
+
+      // Faster recovery than waiting for the 35s heartbeat watchdog: if
+      // the server doesn't echo this within 15s, the WS is probably
+      // silently broken or the broadcast dropped — fire a tail catchup
+      // for the current session so the response (if it landed on the
+      // server) shows up.
+      setTimeout(() => {
+        const stillPending = get().pendingSends.some((p) => p.id === sendId);
+        if (stillPending) {
+          requestCatchupIfNeeded(get, sessionId);
+        }
+      }, 15_000);
     }
 
     ws.send(JSON.stringify({
@@ -2012,6 +2077,72 @@ function addMessageWithPaneRouting(
 /// a stream_message arrived after reconnect but before the user clicked
 /// this tab — without it, the live watermark would skip past the
 /// disconnect-window messages still sitting on disk.
+const PENDING_SENDS_KEY = "apas_pending_sends";
+
+function loadPendingSends(): PendingSend[] {
+  if (typeof localStorage === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(PENDING_SENDS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as PendingSend[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function savePendingSends(items: PendingSend[]) {
+  if (typeof localStorage === "undefined") return;
+  try {
+    if (items.length === 0) {
+      localStorage.removeItem(PENDING_SENDS_KEY);
+    } else {
+      localStorage.setItem(PENDING_SENDS_KEY, JSON.stringify(items));
+    }
+  } catch {
+    // quota / disabled storage — best-effort, in-memory state still works.
+  }
+}
+
+/// Retransmit any unacked pending sends for the current session. Called
+/// after authenticate (and reconnect) so the server gets a second
+/// chance at sends that landed in the void during a silently-stale WS.
+/// Duplicate-arrival risk: if the server got the original send, the
+/// retry's `user_input` echo will arrive and both copies will dedup
+/// against the optimistic placeholder via content+recency match.
+function flushPendingSends(
+  set: (partial: Partial<AppState> | ((state: AppState) => Partial<AppState>)) => void,
+  get: () => AppState,
+) {
+  const state = get();
+  const ws = state.ws;
+  const currentSid = state.sessionId;
+  if (!ws || ws.readyState !== WebSocket.OPEN || !currentSid) return;
+  const toFlush = state.pendingSends.filter((p) => p.sessionId === currentSid);
+  if (toFlush.length === 0) return;
+  const now = Date.now();
+  // Drop entries older than 10 minutes; bump attempt counter on the rest.
+  const next: PendingSend[] = state.pendingSends
+    .filter((p) => p.sessionId !== currentSid || now - p.createdAt <= 10 * 60_000)
+    .map((p) =>
+      p.sessionId === currentSid ? { ...p, attempts: p.attempts + 1 } : p,
+    );
+  for (const entry of toFlush) {
+    if (now - entry.createdAt > 10 * 60_000) continue;
+    ws.send(
+      JSON.stringify({
+        type: "input",
+        session_id: entry.sessionId,
+        text: entry.text,
+        pane_type: entry.paneType,
+        pane_id: entry.paneId,
+      }),
+    );
+  }
+  savePendingSends(next);
+  set({ pendingSends: next });
+}
+
 function requestCatchupIfNeeded(get: () => AppState, sessionId: string) {
   const state = get();
   const after =
@@ -2081,6 +2212,10 @@ function handleServerMessage(
             // have messages ("live state wins" dedupe rule). The catchup
             // reply is flagged so the handler appends instead of skipping.
             requestCatchupIfNeeded(get, sessionToRestore);
+            // Retransmit any sends the user typed during the silently-stale
+            // WS window. Duplicate-arrival is fine: the user_input ack
+            // dedupes against the optimistic placeholder via content+recency.
+            flushPendingSends(set, get);
           }, 500);
         }
         // Subscribe to every other session we have a cached snapshot for
@@ -2528,6 +2663,27 @@ function handleServerMessage(
 
     case "session_messages": {
       const messages = (data.messages as Array<Record<string, unknown>>) || [];
+      // Ack pending sends whose text already shows up in this batch.
+      // Covers the post-refresh flow where the original input reached
+      // the server but the optimistic placeholder is gone: without this
+      // ack, the next reconnect would replay it and the user would see
+      // a duplicate copy of their own input.
+      const responseSidForAck = data.session_id as string | undefined;
+      if (responseSidForAck) {
+        const now = Date.now();
+        set((state) => {
+          const nextPending = state.pendingSends.filter((p) => {
+            if (p.sessionId !== responseSidForAck) return true;
+            if (now - p.createdAt > 10 * 60_000) return false;
+            return !messages.some(
+              (m) => m.role === "user" && m.content === p.text,
+            );
+          });
+          if (nextPending.length === state.pendingSends.length) return {};
+          savePendingSends(nextPending);
+          return { pendingSends: nextPending };
+        });
+      }
       const hasMore = data.has_more as boolean || false;
       const isCatchup = data.catchup === true;
 
@@ -2907,6 +3063,7 @@ function handleServerMessage(
               now - m.timestamp.getTime() < 30_000,
           );
           if (idx >= 0) {
+            const ackedSendId = bucket[idx].id.replace(/^optimistic-/, "");
             set((state) => {
               const updated = [...(state.paneMessages[key] || [])];
               const orig = updated[idx];
@@ -2916,8 +3073,15 @@ function handleServerMessage(
                   id: orig.id.replace(/^optimistic-/, ""),
                 };
               }
+              const nextPending = state.pendingSends.filter(
+                (p) => p.id !== ackedSendId,
+              );
+              if (nextPending.length !== state.pendingSends.length) {
+                savePendingSends(nextPending);
+              }
               const next: Partial<AppState> = {
                 paneMessages: { ...state.paneMessages, [key]: updated },
+                pendingSends: nextPending,
               };
               if (normalizedPaneId === PANE_ID_DEADLOOP) next.deadloopMessages = updated;
               if (normalizedPaneId === PANE_ID_INTERACTIVE) next.interactiveMessages = updated;
@@ -2943,6 +3107,25 @@ function handleServerMessage(
         updatePaneModeHint(set, get, paneType, paneId);
       }
       routeMessage(set, get, userMessage, msgSessionId, paneType, paneId, serverCreatedAt);
+      // Ack any pending-send entry that matches this echo — covers the
+      // post-refresh case where the optimistic placeholder is gone (it
+      // wasn't persisted) but the queued retry needs to be cleared so
+      // the next reconnect doesn't replay it again.
+      if (msgSessionId) {
+        const now = Date.now();
+        const nextPending = get().pendingSends.filter(
+          (p) =>
+            !(
+              p.sessionId === msgSessionId &&
+              p.text === text &&
+              now - p.createdAt < 10 * 60_000
+            ),
+        );
+        if (nextPending.length !== get().pendingSends.length) {
+          savePendingSends(nextPending);
+          set({ pendingSends: nextPending });
+        }
+      }
       break;
     }
 
