@@ -2695,7 +2695,7 @@ fn build_pane_list(
             backstory: meta.backstory.clone(),
             plan_review_mode: meta.plan_review_mode,
             manual_mode: meta.manual_mode,
-            managed: false,
+            managed: meta.managed,
         });
     }
 
