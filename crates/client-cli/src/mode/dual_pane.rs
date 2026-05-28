@@ -471,6 +471,21 @@ async fn run_inner(
     if metadata.panes.is_empty() {
         metadata.panes = shared::PaneConfig::defaults();
     }
+    // One-time migration: panes saved before the `managed` field existed
+    // deserialize as `managed: false`. Auto-promote orchestrator roles so
+    // existing Manager / Tech Lead / Reviewer panes appear in the Team box
+    // (and don't get duplicated by the auto-spawn check below).
+    for pane in metadata.panes.iter_mut() {
+        if !pane.managed {
+            let lower = pane.role.as_deref().unwrap_or("").to_ascii_lowercase();
+            if lower.contains("manager")
+                || lower.contains("tech lead")
+                || lower.contains("reviewer")
+            {
+                pane.managed = true;
+            }
+        }
+    }
     save_project(working_dir, &metadata)?;
 
     let default_prompt = DEFAULT_PROMPT.to_string();
@@ -497,6 +512,7 @@ async fn run_inner(
         Option<String>, // backstory from .apas (Phase 2.1)
         shared::PlanReviewMode, // plan_review_mode from .apas (Phase 3.2)
         bool,           // manual_mode from .apas (v3.2)
+        bool,           // managed from .apas (v3.5)
     )> = metadata
         .panes
         .iter()
@@ -537,6 +553,7 @@ async fn run_inner(
                 pane.backstory.clone(),
                 pane.plan_review_mode,
                 pane.manual_mode,
+                pane.managed,
             )
         })
         .collect();
@@ -618,6 +635,7 @@ async fn run_inner(
             tab_backstory,
             tab_plan_review_mode,
             tab_manual_mode,
+            tab_managed,
         ) in &tabs_to_restore
         {
             let child_proc: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
@@ -644,7 +662,7 @@ async fn run_inner(
                     plan_review_mode_arc: Arc::new(Mutex::new(*tab_plan_review_mode)),
                     pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                     manual_mode: *tab_manual_mode,
-                    managed: false,
+                    managed: *tab_managed,
                 },
             );
             sessions.insert(*pane_id, *pane_session_id);
@@ -750,7 +768,7 @@ async fn run_inner(
     };
 
     // Send initial messages for restored panes.
-    for (pane_id, _, label, mode, _, _, _, _, _, is_paused, _, _, _, _, _, _) in &tabs_to_restore {
+    for (pane_id, _, label, mode, _, _, _, _, _, is_paused, _, _, _, _, _, _, _) in &tabs_to_restore {
         let init_text = if *pane_id == shared::PANE_ID_DEADLOOP
             && *mode == shared::PaneMode::Deadloop
         {
@@ -1657,7 +1675,7 @@ fn handle_tui_events(
                             plan_review_mode_arc: Arc::new(Mutex::new(plan_review_mode.clone())),
                             pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                             manual_mode: false,
-                            managed: false,
+                            managed,
                         },
                     );
                 }
