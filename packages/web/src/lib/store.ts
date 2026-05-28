@@ -734,15 +734,47 @@ export const useStore = create<AppState>((set, get) => ({
 
     const ws = new WebSocket(`${WS_URL}/ws/web`);
 
+    // Liveness loop: a silently-stale WS (mobile OS throttling, NAT
+    // timeout, server-side TCP RST swallowed) keeps readyState === OPEN
+    // forever — ws.send() never throws and ws.onclose never fires. The
+    // browser thinks it's connected; the server has moved on; messages
+    // get dropped in both directions. Counter that by tracking inbound
+    // liveness: every tick, send a Heartbeat (which the server echoes)
+    // and check that we've seen *any* frame in the last `livenessMs`.
+    // If not, close — onclose drives the existing reconnect path.
+    let lastIncomingAt = Date.now();
+    const heartbeatMs = 25_000;
+    const livenessMs = 35_000; // strictly > heartbeatMs so an in-flight echo always wins
+    const heartbeatHandle = setInterval(() => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      try {
+        ws.send(JSON.stringify({ type: "heartbeat" }));
+      } catch {
+        // send throws only on rare states (CLOSING); onclose will fire shortly.
+      }
+      if (Date.now() - lastIncomingAt > livenessMs) {
+        console.warn(
+          `[ws] no inbound frame in ${Math.round((Date.now() - lastIncomingAt) / 1000)}s — closing to force reconnect`,
+        );
+        try {
+          ws.close();
+        } catch {
+          // ignore — onclose handler still runs
+        }
+      }
+    }, heartbeatMs);
+
     ws.onopen = () => {
       console.log("WebSocket connected, sending authentication...");
       // Reset reconnect attempts on successful connection
       set({ reconnectAttempts: 0 });
+      lastIncomingAt = Date.now();
       // Send token for authentication
       ws.send(JSON.stringify({ type: "authenticate", token }));
     };
 
     ws.onmessage = (event) => {
+      lastIncomingAt = Date.now();
       try {
         const data = JSON.parse(event.data);
         handleServerMessage(data, set, get);
@@ -753,6 +785,7 @@ export const useStore = create<AppState>((set, get) => ({
 
     ws.onclose = (event) => {
       console.log("WebSocket disconnected", event.code, event.reason);
+      clearInterval(heartbeatHandle);
       set({ connected: false, ws: null, cliClients: [], isAttached: false });
 
       // Auto-reconnect with exponential backoff (unless intentionally disconnected)

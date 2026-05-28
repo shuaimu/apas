@@ -636,6 +636,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
+                Ok(WebToServer::Heartbeat) => {
+                    // Round-trip: client-side liveness detector watches
+                    // for any inbound frame, this one being the cheapest
+                    // when the daemon happens to be idle. Without a
+                    // server-side responder, an idle session looks dead
+                    // to the browser's liveness timer and we'd reconnect
+                    // unnecessarily.
+                    state
+                        .sessions
+                        .send_to_web(&connection_id, ServerToWeb::Heartbeat)
+                        .await;
+                }
                 Ok(WebToServer::Signal {
                     session_id: msg_sid,
                     signal,

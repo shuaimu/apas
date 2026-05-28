@@ -870,6 +870,12 @@ pub enum WebToServer {
         session_id: Uuid,
         pane_id: u32,
     },
+
+    /// Liveness probe from the browser. Server echoes
+    /// `ServerToWeb::Heartbeat` so the client can detect silently-stale
+    /// connections (mobile OS throttling, NAT timeout, swallowed RST)
+    /// without depending on `readyState`.
+    Heartbeat,
 }
 
 /// Messages sent from server to web client
@@ -1088,6 +1094,11 @@ pub enum ServerToWeb {
         session_id: Uuid,
         suggestions: Vec<SuggestedWorkerMsg>,
     },
+
+    /// Echo of `WebToServer::Heartbeat`. The browser's liveness loop
+    /// uses any inbound frame (including this one) as proof the WS is
+    /// healthy; a missing echo within `livenessMs` triggers reconnect.
+    Heartbeat,
 }
 
 /// Wire format for a snapshot of `team-todo.md`. Mirrors the CLI's
