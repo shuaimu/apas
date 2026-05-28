@@ -24,6 +24,12 @@ Thumbs.db
 
 # Per-machine project metadata (contains unique session IDs)
 .apas
+# Per-project agent state (the apas binary writes these in any project
+# it runs in, including this repo when we dogfood)
+.apas-team.jsonl
+.apas-worktrees/
+team-todo.md
+project_goal.md
 
 # Environment
 .env

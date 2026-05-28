@@ -225,6 +225,14 @@ pub enum CliToServer {
         session_id: Uuid,
         content: String,
     },
+
+    /// CLI's view of `team-todo.md`. Pushed in response to
+    /// `ServerToCli::FetchTeamTodo` and after each `TodoApproval`-driven
+    /// mutation. Server forwards to web as `ServerToWeb::TeamTodoState`.
+    TeamTodoState {
+        session_id: Uuid,
+        state: TeamTodoStateMsg,
+    },
 }
 
 /// Messages sent from server to CLI client
@@ -270,6 +278,30 @@ pub enum ServerToCli {
 
     /// Heartbeat response
     Heartbeat,
+
+    /// Server asks the CLI to send a fresh `team-todo.md` snapshot. CLI
+    /// replies with `CliToServer::TeamTodoState`.
+    FetchTeamTodo { session_id: Uuid },
+
+    /// Server forwards a web-side approval / rejection for a Global
+    /// TODO. CLI runs the `apas todo` action in-process and republishes
+    /// the state.
+    TodoApproval {
+        session_id: Uuid,
+        todo_id: String,
+        /// "approve" | "reject"
+        action: String,
+    },
+
+    /// Server forwards a web-side request to add a new Global TODO.
+    /// CLI picks the next id, writes status=approved, origin=user, and
+    /// republishes TeamTodoState.
+    AddTodo {
+        session_id: Uuid,
+        title: String,
+        #[serde(default)]
+        body: String,
+    },
 
     /// Pause the deadloop (legacy - use PausePane for new code)
     PauseDeadloop { session_id: Uuid },
@@ -367,10 +399,6 @@ pub enum ServerToCli {
     /// Manager v2 — write `goal` into project_goal.md at the project
     /// root (overwriting any existing content).
     UpdateProjectGoal { session_id: Uuid, goal: String },
-
-    /// Manager v2 — append a `{ts, text}` line to
-    /// manager-directives.jsonl at the project root.
-    AddManagerDirective { session_id: Uuid, text: String },
 
     /// Set role/goal/backstory on the named pane and persist to .apas.
     /// Phase 2.1c.
@@ -725,13 +753,6 @@ pub enum WebToServer {
     /// boundary, not mid-iteration.
     UpdateProjectGoal { goal: String },
 
-    /// Manager v2 — append a timestamped directive line to
-    /// manager-directives.jsonl at the project root. The deadloop
-    /// manager reads recent lines on every iteration to absorb
-    /// strategy nudges from the user without derailing in-progress
-    /// work.
-    AddManagerDirective { text: String },
-
     /// Update a pane's role/goal/backstory triple (Phase 2.1c). All three
     /// fields are optional — sending null for any of them clears that
     /// piece. Takes effect on the next pane spawn (close + reopen tab,
@@ -768,6 +789,30 @@ pub enum WebToServer {
     UpdatePaneManualMode {
         pane_id: u32,
         manual_mode: bool,
+    },
+
+    /// Ask the server to fetch the current `team-todo.md` for this
+    /// session's project. Forwarded as `ServerToCli::FetchTeamTodo`;
+    /// CLI replies with `CliToServer::TeamTodoState` which the server
+    /// hands back to web as `ServerToWeb::TeamTodoState`.
+    FetchTeamTodo { session_id: Uuid },
+
+    /// User approves or rejects a Tech-Lead-proposed Global TODO from
+    /// the web Overview tab. action: "approve" | "reject".
+    TodoApproval {
+        session_id: Uuid,
+        todo_id: String,
+        action: String,
+    },
+
+    /// User adds a new Global TODO from the Overview's + Add TODO
+    /// form. CLI assigns the next id (TODO-NNN), writes status=approved,
+    /// origin=user, then publishes a fresh TeamTodoState.
+    AddTodo {
+        session_id: Uuid,
+        title: String,
+        #[serde(default)]
+        body: String,
     },
 }
 
@@ -970,6 +1015,56 @@ pub enum ServerToWeb {
         session_id: Uuid,
         content: String,
     },
+
+    /// Snapshot of the project's team-todo.md state. Sent in reply to
+    /// `WebToServer::FetchTeamTodo` and after every CLI-side mutation
+    /// triggered by `WebToServer::TodoApproval`. See
+    /// `docs/todo-driven-workflow.md`.
+    TeamTodoState {
+        session_id: Uuid,
+        state: TeamTodoStateMsg,
+    },
+}
+
+/// Wire format for a snapshot of `team-todo.md`. Mirrors the CLI's
+/// `team_todo::TeamTodo` but with status fields kept as strings so we
+/// don't have to ship the enum definitions across crate / language
+/// boundaries. The web parses these into UI state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamTodoStateMsg {
+    pub globals: Vec<TeamTodoGlobalMsg>,
+    pub workers: Vec<TeamTodoWorkerMsg>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamTodoGlobalMsg {
+    pub id: String,
+    pub title: String,
+    /// proposed | approved | in_progress | under_review | pr_open | done | rejected
+    pub status: String,
+    /// user | tech-lead
+    pub origin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<String>,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamTodoWorkerMsg {
+    pub pane_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_hint: Option<String>,
+    pub subtasks: Vec<TeamTodoSubtaskMsg>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamTodoSubtaskMsg {
+    pub id: String,
+    pub title: String,
+    /// pending | in_progress | done | reviewing | revising | approved
+    pub status: String,
+    pub parent: String,
+    pub body: String,
 }
 
 /// Information about a persisted session

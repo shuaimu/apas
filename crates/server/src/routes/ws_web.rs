@@ -1206,6 +1206,64 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
+                Ok(WebToServer::FetchTeamTodo { session_id: msg_sid }) => {
+                    let Some(sid) =
+                        resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
+                            .await
+                    else {
+                        continue;
+                    };
+                    state
+                        .sessions
+                        .route_to_cli(&sid, ServerToCli::FetchTeamTodo { session_id: sid })
+                        .await;
+                }
+                Ok(WebToServer::TodoApproval { session_id: msg_sid, todo_id, action }) => {
+                    let Some(sid) =
+                        resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
+                            .await
+                    else {
+                        continue;
+                    };
+                    tracing::info!(
+                        "Todo approval for session {}: {} → {}",
+                        sid, todo_id, action
+                    );
+                    state
+                        .sessions
+                        .route_to_cli(
+                            &sid,
+                            ServerToCli::TodoApproval {
+                                session_id: sid,
+                                todo_id,
+                                action,
+                            },
+                        )
+                        .await;
+                }
+                Ok(WebToServer::AddTodo { session_id: msg_sid, title, body }) => {
+                    let Some(sid) =
+                        resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
+                            .await
+                    else {
+                        continue;
+                    };
+                    tracing::info!(
+                        "Add TODO for session {}: {} ({} bytes)",
+                        sid, title, body.len()
+                    );
+                    state
+                        .sessions
+                        .route_to_cli(
+                            &sid,
+                            ServerToCli::AddTodo {
+                                session_id: sid,
+                                title,
+                                body,
+                            },
+                        )
+                        .await;
+                }
                 Ok(WebToServer::UpdatePaneRole { pane_id, role, goal, backstory }) => {
                     if let Some(sid) = session_id {
                         tracing::info!(
@@ -1271,25 +1329,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 ServerToCli::UpdateProjectGoal {
                                     session_id: sid,
                                     goal,
-                                },
-                            )
-                            .await;
-                    }
-                }
-                Ok(WebToServer::AddManagerDirective { text }) => {
-                    if let Some(sid) = session_id {
-                        tracing::info!(
-                            "Add manager directive for session {} ({} bytes)",
-                            sid,
-                            text.len()
-                        );
-                        state
-                            .sessions
-                            .route_to_cli(
-                                &sid,
-                                ServerToCli::AddManagerDirective {
-                                    session_id: sid,
-                                    text,
                                 },
                             )
                             .await;

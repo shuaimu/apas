@@ -149,6 +149,40 @@ export interface SessionCacheEntry {
   lastCreatedAt?: string;
 }
 
+/// Wire shape of team-todo.md (mirrors shared::TeamTodoStateMsg).
+/// Statuses are kept as strings on the wire so the web doesn't have to
+/// re-derive the enum mapping.
+export interface TeamTodoState {
+  globals: TeamTodoGlobal[];
+  workers: TeamTodoWorker[];
+}
+
+export interface TeamTodoGlobal {
+  id: string;
+  title: string;
+  /// proposed | approved | in_progress | under_review | pr_open | done | rejected
+  status: string;
+  /// user | tech-lead
+  origin: string;
+  pr?: string | null;
+  body: string;
+}
+
+export interface TeamTodoWorker {
+  pane_id: number;
+  role_hint?: string | null;
+  subtasks: TeamTodoSubtask[];
+}
+
+export interface TeamTodoSubtask {
+  id: string;
+  title: string;
+  /// pending | in_progress | done | reviewing | revising | approved
+  status: string;
+  parent: string;
+  body: string;
+}
+
 export type PaneType = "deadloop" | "interactive";
 
 export interface PaneConfig {
@@ -376,6 +410,12 @@ interface AppState {
   // Cleared per-session once that session's catchup reply lands.
   reconnectWatermarks: Map<string, string>;
 
+  // Tech-Lead-driven workflow (see docs/todo-driven-workflow.md): latest
+  // snapshot of team-todo.md for the current session. Populated by
+  // ServerToWeb::TeamTodoState in response to fetchTeamTodo() or after
+  // a TodoApproval mutation. Null = haven't fetched yet.
+  teamTodoState: TeamTodoState | null;
+
   // Legacy compat (derived from dynamic state)
   deadloopMessages: Message[];
   interactiveMessages: Message[];
@@ -472,8 +512,6 @@ interface AppState {
   projectGoals: Record<string, string>;
   /** Manager v2 — overwrite project_goal.md at the project root. */
   updateProjectGoal: (goal: string) => void;
-  /** Manager v2 — append a directive line to manager-directives.jsonl. */
-  addManagerDirective: (text: string) => void;
   updatePaneRole: (paneId: number, role?: string, goal?: string, backstory?: string) => void;
   teamRecords: TeamRecord[];
   planReviewPending: PlanReviewPendingItem[];
@@ -481,6 +519,16 @@ interface AppState {
   updatePaneReviewMode: (paneId: number, mode: PlanReviewMode) => void;
   /** v3.2 — flip a worker between autonomous and manual modes. */
   updatePaneManualMode: (paneId: number, manualMode: boolean) => void;
+
+  /** Ask the server (which asks the CLI) for the current team-todo.md.
+   *  Reply lands in `teamTodoState` via the team_todo_state handler. */
+  fetchTeamTodo: () => void;
+  /** Approve a proposed Global TODO (state machine: proposed → approved). */
+  approveTodo: (todoId: string) => void;
+  /** Reject a proposed Global TODO (state machine: proposed → rejected). */
+  rejectTodo: (todoId: string) => void;
+  /** Add a new Global TODO (status: approved, origin: user). CLI assigns the id. */
+  addTodo: (title: string, body: string) => void;
 }
 
 export interface PaneDiff {
@@ -554,6 +602,7 @@ export const useStore = create<AppState>((set, get) => ({
   unreadSessions: new Set(),
   sessionLastCreatedAt: new Map(),
   reconnectWatermarks: new Map(),
+  teamTodoState: null,
   loadingMorePane: null,
   // Legacy compat getters (populated from dynamic state)
   deadloopMessages: [],
@@ -1432,12 +1481,67 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  addManagerDirective: (text: string) => {
-    const { ws, showToast } = get();
+  fetchTeamTodo: () => {
+    const { ws, sessionId } = get();
+    if (!sessionId) return;
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "add_manager_directive", text }));
+      ws.send(JSON.stringify({ type: "fetch_team_todo", session_id: sessionId }));
+    }
+  },
+
+  approveTodo: (todoId: string) => {
+    const { ws, sessionId, showToast } = get();
+    if (!sessionId) return;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(
+        JSON.stringify({
+          type: "todo_approval",
+          session_id: sessionId,
+          todo_id: todoId,
+          action: "approve",
+        }),
+      );
     } else {
-      showToast("Not connected — directive not sent", "error");
+      showToast("Not connected — cannot approve", "error");
+    }
+  },
+
+  rejectTodo: (todoId: string) => {
+    const { ws, sessionId, showToast } = get();
+    if (!sessionId) return;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(
+        JSON.stringify({
+          type: "todo_approval",
+          session_id: sessionId,
+          todo_id: todoId,
+          action: "reject",
+        }),
+      );
+    } else {
+      showToast("Not connected — cannot reject", "error");
+    }
+  },
+
+  addTodo: (title: string, body: string) => {
+    const { ws, sessionId, showToast } = get();
+    if (!sessionId) return;
+    const t = title.trim();
+    if (!t) {
+      showToast("TODO title can't be empty", "error");
+      return;
+    }
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(
+        JSON.stringify({
+          type: "add_todo",
+          session_id: sessionId,
+          title: t,
+          body,
+        }),
+      );
+    } else {
+      showToast("Not connected — cannot add TODO", "error");
     }
   },
 
@@ -2078,6 +2182,26 @@ function handleServerMessage(
         set((state) => ({
           projectGoals: { ...state.projectGoals, [sessionId]: content },
         }));
+      }
+      break;
+    }
+
+    case "team_todo_state": {
+      const responseSessionId = data.session_id as string | undefined;
+      const currentSessionId = get().sessionId;
+      // Drop snapshots for sessions other than the one the user is
+      // currently viewing — the TODO panel in Overview is keyed off
+      // the active session.
+      if (
+        responseSessionId &&
+        currentSessionId &&
+        responseSessionId !== currentSessionId
+      ) {
+        break;
+      }
+      const state = data.state as TeamTodoState | undefined;
+      if (state) {
+        set({ teamTodoState: state });
       }
       break;
     }

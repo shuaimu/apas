@@ -19,6 +19,7 @@ mod plan_review;
 mod project;
 mod role;
 mod scratchpad;
+mod team_todo;
 mod tui;
 mod update;
 mod usage;
@@ -648,6 +649,7 @@ fn is_apas_daemon_process(pid: u32) -> bool {
     let has_daemon_arg = args.iter().any(|arg| arg == "daemon");
     has_apas_binary && has_daemon_arg
 }
+
 
 async fn handle_config_command(action: ConfigAction) -> Result<()> {
     match action {

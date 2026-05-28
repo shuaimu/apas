@@ -995,6 +995,10 @@ async fn run_inner(
             lower.contains("tech lead")
                 && matches!(m.mode, shared::PaneMode::Deadloop)
         });
+        let has_reviewer = metas_guard.values().any(|m| {
+            let lower = m.role.as_deref().unwrap_or("").to_ascii_lowercase();
+            lower.contains("reviewer")
+        });
         drop(metas_guard);
         if !has_manager {
             let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
@@ -1037,6 +1041,27 @@ async fn run_inner(
                 plan_review_mode: shared::PlanReviewMode::default(),
             });
             tracing::info!(pane_id, "auto-spawning Tech Lead pane (missing from .apas)");
+        }
+        if !has_reviewer {
+            let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
+            let _ = event_tx.send(TuiEvent::AddTabWithConfig {
+                pane_id,
+                label: "Reviewer".to_string(),
+                claude_session_id: Uuid::new_v4(),
+                mode: shared::PaneMode::Deadloop,
+                provider: shared::Provider::Claude,
+                prompt: Some(crate::role::REVIEWER_DEADLOOP_PROMPT.to_string()),
+                min_iteration_interval_minutes: None,
+                model: None,
+                effort: None,
+                worktree_path: None,
+                initial_input: None,
+                role: Some(crate::role::DEFAULT_REVIEWER_ROLE.to_string()),
+                goal: Some(crate::role::DEFAULT_REVIEWER_GOAL.to_string()),
+                backstory: Some(crate::role::DEFAULT_REVIEWER_BACKSTORY.to_string()),
+                plan_review_mode: shared::PlanReviewMode::default(),
+            });
+            tracing::info!(pane_id, "auto-spawning Reviewer pane (missing from .apas)");
         }
     }
 
@@ -5943,20 +5968,41 @@ fn run_deadloop_session_streaming(
             return;
         }
 
-        // Pause is poorly defined for /loop (the agent paces itself; we
-        // can't easily withhold the next iteration without killing the
-        // process). We surface a one-line note the first time pause is
-        // requested and otherwise let the loop run.
+        // Pause for streaming /loop bots: there's no way to ask claude
+        // "wait" mid-run, so we treat pause as "abort the current turn,
+        // reap the process, and tear down this supervisor." The pane
+        // stays in Deadloop mode with child_process cleared; ResumePane
+        // fires a fresh StartBot which spins up claude again with the
+        // saved prompt (and --resume claude_session_id so context is
+        // preserved). Previously this branch just logged a note and let
+        // the loop continue, which made Pause functionally a no-op.
         if pause.load(Ordering::SeqCst) {
             if !was_paused {
                 was_paused = true;
+                if let Some(tx) = interrupt_tx_slot
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.as_ref().cloned())
+                {
+                    let _ = tx.send(());
+                }
+                {
+                    let mut channels = input_channels.lock().unwrap();
+                    channels.remove(&pane_id);
+                }
+                if let Ok(mut child_guard) = child_process.lock() {
+                    if let Some(child) = child_guard.take() {
+                        let mut child = child;
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                }
                 let _ = output_tx.send(PaneOutput {
-                    text: "[Note: pause not directly supported for /loop bots — the agent paces itself. Use Stop to interrupt.]".to_string(),
+                    text: "[Bot paused — interrupted /loop and reaped claude. Click Resume to restart with the saved session.]".to_string(),
                     pane_id,
                 });
             }
-        } else if was_paused {
-            was_paused = false;
+            return;
         }
 
         thread::sleep(Duration::from_secs(1));
@@ -6940,6 +6986,38 @@ async fn run_server_connection(
                                                     let msg_text = serde_json::to_string(&status_msg).unwrap_or_default();
                                                     let _ = ws_sender.send(Message::Text(msg_text.into())).await;
                                                 }
+                                                // Resume a paused deadloop: if the pane is still in
+                                                // Deadloop mode but its child_process has been
+                                                // cleared (the supervisor's pause path reaps claude
+                                                // and exits), spin a fresh worker via StartBot. With
+                                                // no fields set, StartBot reuses the prompt / model /
+                                                // effort / cadence saved in pane_metas, and the
+                                                // existing claude_session_id keeps context.
+                                                let needs_restart = {
+                                                    if let Ok(metas) = pane_metas.lock() {
+                                                        if let Some(meta) = metas.get(&target_pane) {
+                                                            meta.mode == shared::PaneMode::Deadloop
+                                                                && meta
+                                                                    .child_process
+                                                                    .lock()
+                                                                    .ok()
+                                                                    .map(|g| g.is_none())
+                                                                    .unwrap_or(false)
+                                                        } else {
+                                                            false
+                                                        }
+                                                    } else {
+                                                        false
+                                                    }
+                                                };
+                                                if needs_restart {
+                                                    let _ = tui_event_tx.send(TuiEvent::StartBot {
+                                                        pane_id: target_pane,
+                                                        prompt: None,
+                                                        min_iteration_interval_minutes: None,
+                                                        effort: None,
+                                                    });
+                                                }
                                             }
                                             ServerToCli::AddPane { session_id: _, pane_config, isolated_worktree } => {
                                                 let label = pane_config.label.clone().unwrap_or_else(|| format!("Tab {}", pane_config.pane_id));
@@ -7529,6 +7607,114 @@ async fn run_server_connection(
                                                     }
                                                 }
                                             }
+                                            ServerToCli::FetchTeamTodo { session_id: _ } => {
+                                                let project_dir = std::path::Path::new(&working_dir);
+                                                let todo = crate::team_todo::load(project_dir)
+                                                    .unwrap_or_default();
+                                                let state_msg = crate::team_todo::to_wire(&todo);
+                                                let msg = CliToServer::TeamTodoState {
+                                                    session_id,
+                                                    state: state_msg,
+                                                };
+                                                if let Ok(text) = serde_json::to_string(&msg) {
+                                                    let _ = ws_sender
+                                                        .send(Message::Text(text.into()))
+                                                        .await;
+                                                }
+                                            }
+                                            ServerToCli::TodoApproval { session_id: _, todo_id, action } => {
+                                                let project_dir = std::path::Path::new(&working_dir);
+                                                let new_status = match action.as_str() {
+                                                    "approve" => Some(crate::team_todo::GlobalStatus::Approved),
+                                                    "reject" => Some(crate::team_todo::GlobalStatus::Rejected),
+                                                    _ => {
+                                                        tracing::warn!(
+                                                            "Unknown todo action '{}' for {}",
+                                                            action, todo_id
+                                                        );
+                                                        None
+                                                    }
+                                                };
+                                                if let Some(status) = new_status {
+                                                    match crate::team_todo::load(project_dir) {
+                                                        Ok(mut todo) => {
+                                                            if todo.set_global_status(&todo_id, status).is_some() {
+                                                                if let Err(e) = crate::team_todo::save(project_dir, &todo) {
+                                                                    tracing::warn!(
+                                                                        "Failed to save team-todo.md after approval: {}",
+                                                                        e
+                                                                    );
+                                                                }
+                                                            } else {
+                                                                tracing::warn!(
+                                                                    "Approval for unknown TODO id: {}",
+                                                                    todo_id
+                                                                );
+                                                            }
+                                                        }
+                                                        Err(e) => tracing::warn!(
+                                                            "Failed to load team-todo.md for approval: {}",
+                                                            e
+                                                        ),
+                                                    }
+                                                }
+                                                // Republish fresh state regardless of success so the
+                                                // web sees the result (or the unchanged state if the
+                                                // action was rejected).
+                                                let todo = crate::team_todo::load(project_dir).unwrap_or_default();
+                                                let state_msg = crate::team_todo::to_wire(&todo);
+                                                let msg = CliToServer::TeamTodoState {
+                                                    session_id,
+                                                    state: state_msg,
+                                                };
+                                                if let Ok(text) = serde_json::to_string(&msg) {
+                                                    let _ = ws_sender
+                                                        .send(Message::Text(text.into()))
+                                                        .await;
+                                                }
+                                            }
+                                            ServerToCli::AddTodo { session_id: _, title, body } => {
+                                                let project_dir = std::path::Path::new(&working_dir);
+                                                let trimmed = title.trim();
+                                                if !trimmed.is_empty() {
+                                                    match crate::team_todo::load(project_dir) {
+                                                        Ok(mut todo) => {
+                                                            let id = todo.next_global_id();
+                                                            todo.push_global(crate::team_todo::GlobalTodo {
+                                                                id,
+                                                                title: trimmed.to_string(),
+                                                                status: crate::team_todo::GlobalStatus::Approved,
+                                                                origin: crate::team_todo::Origin::User,
+                                                                pr: None,
+                                                                body,
+                                                            });
+                                                            if let Err(e) = crate::team_todo::save(project_dir, &todo) {
+                                                                tracing::warn!("Failed to save team-todo.md after AddTodo: {}", e);
+                                                            }
+                                                        }
+                                                        Err(e) => tracing::warn!(
+                                                            "Failed to load team-todo.md for AddTodo: {}",
+                                                            e
+                                                        ),
+                                                    }
+                                                } else {
+                                                    tracing::warn!("AddTodo: empty title; skipping");
+                                                }
+                                                // Always push fresh state so the
+                                                // web sees the result (or unchanged
+                                                // state on the empty/error path).
+                                                let todo = crate::team_todo::load(std::path::Path::new(&working_dir)).unwrap_or_default();
+                                                let state_msg = crate::team_todo::to_wire(&todo);
+                                                let msg = CliToServer::TeamTodoState {
+                                                    session_id,
+                                                    state: state_msg,
+                                                };
+                                                if let Ok(text) = serde_json::to_string(&msg) {
+                                                    let _ = ws_sender
+                                                        .send(Message::Text(text.into()))
+                                                        .await;
+                                                }
+                                            }
                                             ServerToCli::RequestPaneDiff { session_id: _, pane_id: diff_pane_id } => {
                                                 // Look up the pane's worktree path. If unset, return a polite error
                                                 // so the web UI can render guidance instead of nothing.
@@ -7569,13 +7755,6 @@ async fn run_server_connection(
                                                 match crate::manager::write_project_goal(&project_dir, &goal) {
                                                     Ok(()) => tracing::info!("project_goal.md updated ({} bytes)", goal.len()),
                                                     Err(e) => tracing::warn!("failed to write project_goal.md: {}", e),
-                                                }
-                                            }
-                                            ServerToCli::AddManagerDirective { session_id: _, text } => {
-                                                let project_dir = std::path::Path::new(&working_dir).to_path_buf();
-                                                match crate::manager::append_directive(&project_dir, &text) {
-                                                    Ok(()) => tracing::info!("manager-directives.jsonl appended ({} bytes)", text.len()),
-                                                    Err(e) => tracing::warn!("failed to append manager directive: {}", e),
                                                 }
                                             }
                                             ServerToCli::CreatePr { session_id: _, pane_id: pr_pane_id } => {

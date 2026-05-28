@@ -10,6 +10,7 @@ import { DelegationBoard } from "./DelegationBoard";
 import { ResourceUseRollup } from "./ResourceUseRollup";
 import { AddWorkerModal } from "./AddWorkerModal";
 import { ProjectGoalBar } from "./ProjectGoalBar";
+import { TeamTodoPanel } from "./TeamTodoPanel";
 import { TechLeadStream } from "./TechLeadStream";
 
 /**
@@ -126,6 +127,8 @@ export function OverviewView({
         </p>
 
         <ProjectGoalBar />
+
+        <TeamTodoPanel />
 
         <div className="flex flex-col gap-4 lg:flex-row">
           {/* Left column: team status sections */}
