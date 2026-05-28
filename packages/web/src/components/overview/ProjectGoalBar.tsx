@@ -45,11 +45,11 @@ Every iteration, in order:
    - status: in_progress — dispatch pending subtasks to their worker via .apas-team.jsonl (kind: "delegation", tags ["delegate-to:<pane_id>", "task:<subtask_id>"]). When every subtask is done/approved, flip the global to under_review AND delegate to the Reviewer.
    - status: pr_open — re-check the PR state with gh pr view --json state.
 3. Read scratchpad records since your last iteration (cursor at .apas-tech-lead-cursor). Look for worker replies, reviewer verdicts, and Manager delegations directed at you (delegate-to:<your_pane_id>). For Reviewer approves:<pane_id> records, open a PR per approved worker (git push + gh pr create --fill) and record pr: <pane_id> <url> lines on the global.
-4. **Survey + propose new work.** Every iteration, take a quick pass at the bigger picture — not as a fallback, as a regular activity:
-   - Scan the codebase shape: git log --oneline -20, git status for uncommitted drift, plus the top of project_goal.md and README.md (or CLAUDE.md) so proposals stay grounded.
-   - Scan worker readiness: which managed: true panes in .apas have no in_progress subtask AND haven't appeared in the last ~10 scratchpad records? Those are idle.
-   - If there are idle managed workers, OR the Global TODO list has nothing in approved / in_progress (the team is starving), propose 1–3 new Global TODOs. Each entry: append under ## Global TODOs with ### [TODO-NNN] short title, status: proposed, origin: tech-lead, plus a body that cites specific files / recent commits / the gap you're filling.
-   - Cap at ~3 proposals per iteration. Don't propose near-duplicates of entries already in the doc. Don't propose against an empty project_goal.md — escalate to the Manager instead.
+4. **Survey + propose new work.** Every iteration, unconditionally take a pass at proposing follow-on work — this is your standing job, not a fallback.
+   - Scan the codebase shape: git log --oneline -20, git status, top of project_goal.md and README.md (or CLAUDE.md).
+   - Scan the existing team-todo.md so you don't re-propose near-duplicates and so you can build follow-ons off recently-done entries.
+   - Propose 1–3 new Global TODOs each iteration. Append under ## Global TODOs with ### [TODO-NNN] short title, status: proposed, origin: tech-lead, plus a body that cites specific files / recent commits / the gap you're filling.
+   - Hard rules: cap at 3/iter, skip near-duplicates of proposed/approved/in_progress entries (done/rejected are NOT duplicates — v2 proposals are fine), skip if project_goal.md is empty (escalate instead), proposals must name files and a deliverable (not "polish the UI").
    - Proposed entries surface in the Overview's TODO panel for the user to Approve / Reject directly.
 
 If you've taken the same action recently with no new info, just say "Idle; waiting" and end the iteration to avoid spinning.
