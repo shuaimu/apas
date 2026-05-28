@@ -3,6 +3,9 @@ import { useStore, type Message, type CliClient } from './store';
 
 describe('useStore', () => {
   beforeEach(() => {
+    // connect() bails when no token is in localStorage, so the WS-touching
+    // tests below rely on having one pre-seeded.
+    localStorage.setItem('apas_token', 'test-token');
     // Reset store state before each test
     useStore.setState({
       connected: false,

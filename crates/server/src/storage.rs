@@ -4,10 +4,56 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::io::SeekFrom;
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
+
+/// Truncate `content` to roughly `max_bytes`, preserving JSON validity for
+/// `tool_result` envelopes. The web client parses these envelopes
+/// (`JSON.parse(content)`) to pull out the human-visible `content` and
+/// `is_error` fields; raw-byte truncation would leave invalid JSON and the
+/// UI would render the broken string verbatim.
+///
+/// For tool_result: parse the envelope, truncate the inner `content`
+/// string, drop the bulky `tool_use_result` (full before/after for Edit),
+/// re-serialize. For everything else: hard-truncate with a marker.
+///
+/// Shared between storage-layer reads (memory cap) and ws_web transit
+/// (wire-frame cap); each caller passes its own `max_bytes` and `reason`.
+pub fn truncate_message_content(
+    content: String,
+    message_type: &str,
+    max_bytes: usize,
+    reason: &str,
+) -> String {
+    if content.len() <= max_bytes {
+        return content;
+    }
+    if message_type == "tool_result" {
+        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(obj) = v.as_object_mut() {
+                let original_len = content.len();
+                if let Some(inner) = obj.get_mut("content") {
+                    if let Some(s) = inner.as_str() {
+                        let head: String = s.chars().take(8_192).collect();
+                        *inner = serde_json::Value::String(format!(
+                            "{head}\n…[truncated for {reason}; full size {original_len} bytes]"
+                        ));
+                    }
+                }
+                obj.remove("tool_use_result");
+                if let Ok(serialized) = serde_json::to_string(&v) {
+                    return serialized;
+                }
+            }
+        }
+    }
+    let original_len = content.len();
+    let head: String = content.chars().take(8_192).collect();
+    format!("{head}\n…[truncated for {reason}; full size {original_len} bytes]")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredMessage {
@@ -94,6 +140,10 @@ impl FileStorage {
         let mut json = serde_json::to_string(message)?;
         json.push('\n');
         file.write_all(json.as_bytes()).await?;
+        // Flush the tokio buffer so a subsequent open() sees the bytes —
+        // we don't sync to disk (that's the OS's call), but we do close
+        // out the in-process write before returning to the caller.
+        file.flush().await?;
 
         Ok(())
     }
@@ -207,51 +257,168 @@ impl FileStorage {
     /// `created_at` it has live-streamed and asks for everything newer the
     /// server has on disk. Returns an empty vec when the timestamp is at or
     /// past the tail (nothing missed).
+    ///
+    /// I/O: scans the file backward from EOF in `CHUNK_BYTES`-sized chunks
+    /// and stops as soon as it sees a run of `REORDER_SLACK_LINES` lines at
+    /// or older than the cutoff. For the common case (recent watermark,
+    /// nothing missed) this touches roughly one chunk, not the whole file —
+    /// previous forward-scan versions read the entire jsonl every call,
+    /// which is what made fan-out catchup OOM the server on big sessions.
+    ///
+    /// Memory: O(CATCHUP_LIMIT × MAX_CONTENT_BYTES) plus one chunk buffer.
     pub async fn get_messages_after(
         &self,
         session_id: &Uuid,
         after_created_at: &str,
     ) -> Result<Vec<StoredMessage>> {
-        const CATCHUP_LIMIT: usize = 5000;
+        // Catchup is meant to fill a "disconnect window" gap — typically
+        // dozens of messages, not thousands. If a user has been gone long
+        // enough that 500 messages aren't enough, the next page reload
+        // will hit the initial-load snapshot path instead.
+        const CATCHUP_LIMIT: usize = 500;
+        // Per-message content cap applied at storage-read time so the
+        // in-memory window can't blow up on a single huge tool_result. The
+        // web-side `truncate_for_transit` re-applies envelope-aware
+        // truncation on the way out; this is just a defensive byte cap.
+        const MAX_CONTENT_BYTES: usize = 64 * 1024;
+        // Read size for each backward seek. Big enough that recent-cutoff
+        // catchups finish in one read; small enough that we can stop early
+        // on the next chunk if needed.
+        const CHUNK_BYTES: usize = 64 * 1024;
+        // Tolerance for slight microsecond reordering near the cutoff. The
+        // jsonl is append-ordered, but two messages dispatched in the same
+        // tick may land out of timestamp order; keep scanning a short way
+        // past the first "too old" line before giving up.
+        const REORDER_SLACK_LINES: usize = 50;
+
         let file_path = self.messages_file(session_id);
         if !file_path.exists() {
             return Ok(Vec::new());
         }
 
-        let file = fs::File::open(&file_path).await?;
-        let reader = BufReader::new(file);
-        let mut lines = reader.lines();
-        let mut newer = Vec::new();
-        while let Some(line) = lines.next_line().await? {
-            if line.trim().is_empty() {
-                continue;
+        // Use std stat for the size: tokio's File::metadata can lag behind
+        // very recent writes by another tokio task on the same file (we hit
+        // this in the test that appends a 1 MiB message and immediately
+        // reads it back — tokio reports a short size, std reports the
+        // committed one). A backward seek using a short size truncates the
+        // result, so we read short and lose the head of the line.
+        let file_size = std::fs::metadata(&file_path)?.len();
+        if file_size == 0 {
+            return Ok(Vec::new());
+        }
+        let mut file = fs::File::open(&file_path).await?;
+
+        // We collect newest-first as the reverse scan finds them; sorted
+        // ASC at the end before returning.
+        let mut found: Vec<StoredMessage> = Vec::new();
+        let mut slack: usize = 0;
+        let mut hit_cap = false;
+        let mut pos: u64 = file_size;
+        // The leftmost bytes of each chunk usually start mid-line; that
+        // fragment is held until the previous chunk's read prepends the
+        // rest of the line to it.
+        let mut carry: Vec<u8> = Vec::new();
+        let mut stop = false;
+
+        'outer: while pos > 0 && !stop {
+            let chunk_size = pos.min(CHUNK_BYTES as u64) as usize;
+            let new_pos = pos - chunk_size as u64;
+            file.seek(SeekFrom::Start(new_pos)).await?;
+            let mut buf = vec![0u8; chunk_size];
+            file.read_exact(&mut buf).await?;
+            pos = new_pos;
+
+            // The carry from the previous (later-in-file) iteration is the
+            // tail of a line that began in this earlier chunk; glue it on.
+            if !carry.is_empty() {
+                buf.extend_from_slice(&carry);
+                carry.clear();
             }
-            match serde_json::from_str::<StoredMessage>(&line) {
-                Ok(msg) => {
-                    if msg.created_at.as_str() > after_created_at {
-                        newer.push(msg);
+
+            // Trim the trailing newline (the file's final '\n') so we don't
+            // process an empty "line" at the end.
+            let mut end = buf.len();
+            while end > 0 && buf[end - 1] == b'\n' {
+                end -= 1;
+            }
+
+            while end > 0 {
+                let nl = buf[..end].iter().rposition(|&b| b == b'\n');
+                match nl {
+                    Some(nl_idx) => {
+                        let line = &buf[nl_idx + 1..end];
+                        end = nl_idx;
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if !consume_line(
+                            line,
+                            after_created_at,
+                            MAX_CONTENT_BYTES,
+                            CATCHUP_LIMIT,
+                            REORDER_SLACK_LINES,
+                            &mut found,
+                            &mut slack,
+                            &mut hit_cap,
+                        ) {
+                            stop = true;
+                            break 'outer;
+                        }
+                    }
+                    None => {
+                        // Buffer head is a partial line that started in an
+                        // earlier chunk — save and let the next iteration
+                        // glue it on. Unless this IS the first chunk
+                        // (pos == 0), in which case it's a complete line.
+                        if pos > 0 {
+                            carry = buf[..end].to_vec();
+                        } else if end > 0 {
+                            let line = &buf[..end];
+                            let _ = consume_line(
+                                line,
+                                after_created_at,
+                                MAX_CONTENT_BYTES,
+                                CATCHUP_LIMIT,
+                                REORDER_SLACK_LINES,
+                                &mut found,
+                                &mut slack,
+                                &mut hit_cap,
+                            );
+                        }
+                        break;
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to parse message line: {}", e);
-                }
             }
         }
-        // RFC3339 timestamps are lexicographically ordered, but the file may
-        // contain late-write reorderings on the microsecond scale — sort to
-        // hand the client a clean ASC tail.
-        newer.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-        if newer.len() > CATCHUP_LIMIT {
-            let drop = newer.len() - CATCHUP_LIMIT;
-            tracing::warn!(
-                "Catchup for session {} truncated: {} messages exceeded cap, dropping oldest {}",
-                session_id,
-                newer.len(),
-                drop
+
+        // If we never finished the loop because we hit pos == 0, any leftover
+        // carry is the file's first line; consume it.
+        if !carry.is_empty() && !stop {
+            let _ = consume_line(
+                &carry,
+                after_created_at,
+                MAX_CONTENT_BYTES,
+                CATCHUP_LIMIT,
+                REORDER_SLACK_LINES,
+                &mut found,
+                &mut slack,
+                &mut hit_cap,
             );
-            newer = newer.split_off(drop);
         }
-        Ok(newer)
+
+        if hit_cap {
+            tracing::warn!(
+                "Catchup for session {} hit the {} message cap; older gap messages skipped",
+                session_id,
+                CATCHUP_LIMIT
+            );
+        }
+
+        // Reverse: we pushed newest-first; the client expects ASC. Also sort
+        // to absorb microsecond-scale reordering within the kept window.
+        found.reverse();
+        found.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(found)
     }
 
     /// Read messages for a session with pagination support
@@ -392,61 +559,127 @@ impl FileStorage {
     /// Read messages for a session, loading recent messages per pane
     /// This ensures all panes have messages included
     /// Returns (messages, has_more) where messages are sorted by created_at
+    /// Initial-load fetch: return the latest `limit_per_pane` messages for
+    /// each pane in the session, combined and sorted ASC.
+    ///
+    /// Reads the file backward from EOF in `CHUNK_BYTES` chunks and stops
+    /// once every discovered pane bucket is full (plus a small slack window
+    /// to catch any in-flight pane the recent tail hasn't surfaced yet).
+    /// On a 4 GB jsonl with a half-dozen active panes this touches roughly
+    /// a few hundred KB of the file's tail instead of all 4 GB.
+    ///
+    /// `has_more` is true when at least one pane's bucket hit the cap (so
+    /// older messages exist for pagination) or when the scan bailed on the
+    /// slack window (older messages exist somewhere in the head).
     pub async fn get_messages_per_pane(
         &self,
         session_id: &Uuid,
         limit_per_pane: usize,
     ) -> Result<(Vec<StoredMessage>, bool)> {
-        let file_path = self.messages_file(session_id);
+        const CHUNK_BYTES: usize = 64 * 1024;
+        const MAX_CONTENT_BYTES: usize = 64 * 1024;
+        // After every known pane bucket is full, keep reading this many
+        // more lines so a newly-active pane lurking just past the scan
+        // window doesn't get missed entirely.
+        const SLACK_LINES_AFTER_ALL_FULL: usize = 500;
 
+        let file_path = self.messages_file(session_id);
         if !file_path.exists() {
             return Ok((Vec::new(), false));
         }
+        let file_size = std::fs::metadata(&file_path)?.len();
+        if file_size == 0 {
+            return Ok((Vec::new(), false));
+        }
 
-        let file = fs::File::open(&file_path).await?;
-        let reader = BufReader::new(file);
-        let mut lines = reader.lines();
-
-        // Dynamic pane bucketing using HashMap instead of hardcoded categories
-        let mut pane_buckets: std::collections::HashMap<Option<String>, Vec<StoredMessage>> =
+        let mut file = fs::File::open(&file_path).await?;
+        // Per-pane bucket, newest-first as discovered by the reverse scan.
+        let mut buckets: std::collections::HashMap<Option<String>, Vec<StoredMessage>> =
             std::collections::HashMap::new();
+        let mut has_more = false;
+        let mut slack: usize = 0;
+        let mut pos: u64 = file_size;
+        let mut carry: Vec<u8> = Vec::new();
+        let mut stop = false;
 
-        while let Some(line) = lines.next_line().await? {
-            if line.trim().is_empty() {
-                continue;
+        'outer: while pos > 0 && !stop {
+            let chunk_size = pos.min(CHUNK_BYTES as u64) as usize;
+            let new_pos = pos - chunk_size as u64;
+            file.seek(SeekFrom::Start(new_pos)).await?;
+            let mut buf = vec![0u8; chunk_size];
+            file.read_exact(&mut buf).await?;
+            pos = new_pos;
+
+            if !carry.is_empty() {
+                buf.extend_from_slice(&carry);
+                carry.clear();
             }
-            match serde_json::from_str::<StoredMessage>(&line) {
-                Ok(msg) => {
-                    // Normalize pane identifiers so legacy and numeric representations
-                    // of the same pane collapse into a single bucket.
-                    let bucket_key = normalized_bucket_key(msg.pane_type.as_deref());
-                    pane_buckets.entry(bucket_key).or_default().push(msg);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to parse message line: {}", e);
+
+            let mut end = buf.len();
+            while end > 0 && buf[end - 1] == b'\n' {
+                end -= 1;
+            }
+
+            while end > 0 {
+                let nl = buf[..end].iter().rposition(|&b| b == b'\n');
+                match nl {
+                    Some(nl_idx) => {
+                        let line = &buf[nl_idx + 1..end];
+                        end = nl_idx;
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if !consume_per_pane_line(
+                            line,
+                            limit_per_pane,
+                            MAX_CONTENT_BYTES,
+                            SLACK_LINES_AFTER_ALL_FULL,
+                            &mut buckets,
+                            &mut has_more,
+                            &mut slack,
+                        ) {
+                            stop = true;
+                            break 'outer;
+                        }
+                    }
+                    None => {
+                        if pos > 0 {
+                            carry = buf[..end].to_vec();
+                        } else if end > 0 {
+                            let _ = consume_per_pane_line(
+                                &buf[..end],
+                                limit_per_pane,
+                                MAX_CONTENT_BYTES,
+                                SLACK_LINES_AFTER_ALL_FULL,
+                                &mut buckets,
+                                &mut has_more,
+                                &mut slack,
+                            );
+                        }
+                        break;
+                    }
                 }
             }
         }
 
-        // Check if there are more messages than we're returning
-        let has_more = pane_buckets
-            .values()
-            .any(|msgs| msgs.len() > limit_per_pane);
+        if !carry.is_empty() && !stop {
+            let _ = consume_per_pane_line(
+                &carry,
+                limit_per_pane,
+                MAX_CONTENT_BYTES,
+                SLACK_LINES_AFTER_ALL_FULL,
+                &mut buckets,
+                &mut has_more,
+                &mut slack,
+            );
+        }
 
-        // Take the most recent N messages from each bucket
+        // Buckets are newest-first; flatten and sort ASC for the client.
         let mut combined = Vec::new();
-        for msgs in pane_buckets.values() {
-            let recent: Vec<_> = if msgs.len() > limit_per_pane {
-                msgs[msgs.len() - limit_per_pane..].to_vec()
-            } else {
-                msgs.clone()
-            };
-            combined.extend(recent);
+        for (_pane, bucket) in buckets {
+            combined.extend(bucket);
         }
-
-        // Sort by created_at timestamp
         combined.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-
         Ok((combined, has_more))
     }
 
@@ -581,6 +814,87 @@ impl FileStorage {
 
         Ok(sessions)
     }
+}
+
+/// Process one line emitted by the tail-first reverse scan.
+///
+/// Returns `false` to signal "stop scanning" — either we've collected
+/// `CATCHUP_LIMIT` matches or we've hit the slack threshold for lines
+/// older than the cutoff. `true` means "keep going."
+fn consume_line(
+    line: &[u8],
+    after_created_at: &str,
+    max_content: usize,
+    limit: usize,
+    slack_limit: usize,
+    found: &mut Vec<StoredMessage>,
+    slack: &mut usize,
+    hit_cap: &mut bool,
+) -> bool {
+    let mut msg = match serde_json::from_slice::<StoredMessage>(line) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("Failed to parse message line ({} bytes): {}", line.len(), e);
+            return true;
+        }
+    };
+    if msg.created_at.as_str() <= after_created_at {
+        *slack += 1;
+        return *slack < slack_limit;
+    }
+    msg.content = truncate_message_content(msg.content, &msg.message_type, max_content, "catchup");
+    if found.len() >= limit {
+        *hit_cap = true;
+        return false;
+    }
+    found.push(msg);
+    true
+}
+
+/// Process one line emitted by the per-pane reverse scan in
+/// `get_messages_per_pane`. Returns `false` to signal "stop scanning"
+/// once every known pane bucket is full AND we've consumed the slack
+/// window without discovering a new pane or filling an existing one.
+fn consume_per_pane_line(
+    line: &[u8],
+    limit_per_pane: usize,
+    max_content: usize,
+    slack_limit: usize,
+    buckets: &mut HashMap<Option<String>, Vec<StoredMessage>>,
+    has_more: &mut bool,
+    slack: &mut usize,
+) -> bool {
+    let mut msg = match serde_json::from_slice::<StoredMessage>(line) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("Failed to parse message line ({} bytes): {}", line.len(), e);
+            return true;
+        }
+    };
+    let bucket_key = normalized_bucket_key(msg.pane_type.as_deref());
+    let is_new_bucket = !buckets.contains_key(&bucket_key);
+    let bucket = buckets.entry(bucket_key).or_default();
+
+    if bucket.len() >= limit_per_pane {
+        // Already have the newest `limit_per_pane` for this pane. Older
+        // messages exist, so flag has_more for the paginator.
+        *has_more = true;
+        *slack += 1;
+        let all_full = !buckets.is_empty()
+            && buckets.values().all(|b| b.len() >= limit_per_pane);
+        return !(all_full && *slack >= slack_limit);
+    }
+
+    msg.content = truncate_message_content(msg.content, &msg.message_type, max_content, "initial load");
+    bucket.push(msg);
+    // A new bucket or a fresh push extends the discovery horizon — reset
+    // the slack counter so we don't bail too early on a sparse pane.
+    if is_new_bucket {
+        *slack = 0;
+    } else {
+        *slack = 0;
+    }
+    true
 }
 
 fn normalized_bucket_key(raw_pane_type: Option<&str>) -> Option<String> {
@@ -720,6 +1034,197 @@ mod gc_tests {
         assert_eq!(got.len(), 3);
         assert_eq!(got[0].id, "a");
         assert_eq!(got[2].id, "c");
+    }
+
+    #[tokio::test]
+    async fn get_messages_after_caps_window_keeping_newest() {
+        let storage = fresh_storage();
+        let sid = Uuid::new_v4();
+        let base = Utc::now() - Duration::hours(1);
+        // Write more than the cap; expect the newest to be kept.
+        let total = 550u32;
+        for i in 0..total {
+            let ts = (base + Duration::milliseconds(i as i64)).to_rfc3339();
+            storage
+                .append_message(&sid, &make_msg(&format!("m{i}"), &ts))
+                .await
+                .unwrap();
+        }
+        let got = storage.get_messages_after(&sid, "").await.unwrap();
+        // Sliding window keeps the newest `CATCHUP_LIMIT` (500). Oldest are dropped.
+        assert_eq!(got.len(), 500);
+        let dropped = (total as usize) - got.len();
+        assert_eq!(got.first().unwrap().id, format!("m{dropped}"));
+        assert_eq!(got.last().unwrap().id, format!("m{}", total - 1));
+    }
+
+    #[tokio::test]
+    async fn get_messages_per_pane_returns_latest_per_bucket_and_flags_has_more() {
+        // 3 panes × 250 messages each, interleaved by round-robin. With
+        // limit_per_pane=100 the function should return 300 messages and
+        // flag has_more=true (older messages exist per pane).
+        let storage = fresh_storage();
+        let sid = Uuid::new_v4();
+        let base = Utc::now() - Duration::hours(1);
+        let panes = ["1", "2", "3"];
+        for i in 0..750u32 {
+            let pane = panes[(i as usize) % panes.len()].to_string();
+            let ts = (base + Duration::milliseconds(i as i64)).to_rfc3339();
+            let mut msg = make_msg(&format!("m{i}"), &ts);
+            msg.pane_type = Some(pane);
+            storage.append_message(&sid, &msg).await.unwrap();
+        }
+        let (got, has_more) = storage.get_messages_per_pane(&sid, 100).await.unwrap();
+        assert_eq!(got.len(), 300);
+        assert!(has_more);
+        // ASC by created_at; first one should be one of m{750-300}..m{750-298}
+        // (the three panes' 100th-from-newest entries).
+        let first_idx: u32 = got[0].id[1..].parse().unwrap();
+        let last_idx: u32 = got[got.len() - 1].id[1..].parse().unwrap();
+        assert!(first_idx >= 450);
+        assert_eq!(last_idx, 749);
+        // Each pane shows up with exactly 100 messages.
+        let mut per_pane: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for m in &got {
+            *per_pane.entry(m.pane_type.as_deref().unwrap()).or_insert(0) += 1;
+        }
+        assert_eq!(per_pane.values().copied().collect::<Vec<_>>(), vec![100, 100, 100]);
+    }
+
+    #[tokio::test]
+    async fn get_messages_per_pane_returns_all_when_under_cap() {
+        let storage = fresh_storage();
+        let sid = Uuid::new_v4();
+        let base = Utc::now() - Duration::hours(1);
+        for i in 0..50u32 {
+            let ts = (base + Duration::milliseconds(i as i64)).to_rfc3339();
+            let mut msg = make_msg(&format!("m{i}"), &ts);
+            msg.pane_type = Some("2".into());
+            storage.append_message(&sid, &msg).await.unwrap();
+        }
+        let (got, has_more) = storage.get_messages_per_pane(&sid, 100).await.unwrap();
+        assert_eq!(got.len(), 50);
+        assert!(!has_more);
+    }
+
+    #[tokio::test]
+    async fn get_messages_after_keeps_tool_result_json_envelope_valid_after_truncation() {
+        // Regression: a previous implementation truncated by raw byte cut
+        // ("…[truncated for catchup; full size N bytes]" appended directly
+        // to the JSON), which left invalid JSON and the web client's
+        // JSON.parse fell back to rendering the raw string. The truncation
+        // must produce a parseable JSON object.
+        let storage = fresh_storage();
+        let sid = Uuid::new_v4();
+        let now = Utc::now();
+        let ts = now.to_rfc3339();
+        // Build a tool_result envelope with a big inner content + bulky
+        // tool_use_result (mirrors what an Edit tool_result looks like on
+        // a sizable source file).
+        let big_inner = "x".repeat(200 * 1024);
+        let big_diff = "y".repeat(200 * 1024);
+        let envelope = serde_json::json!({
+            "content": big_inner,
+            "is_error": false,
+            "tool_use_id": "toolu_abc",
+            "tool_use_result": {
+                "oldString": "old",
+                "newString": "new",
+                "originalFile": big_diff,
+            },
+        })
+        .to_string();
+        let mut msg = make_msg("tr", &ts);
+        msg.message_type = "tool_result".to_string();
+        msg.content = envelope;
+        storage.append_message(&sid, &msg).await.unwrap();
+
+        let got = storage.get_messages_after(&sid, "").await.unwrap();
+        assert_eq!(got.len(), 1);
+        let returned_content = &got[0].content;
+        // The truncated content MUST still be valid JSON.
+        let parsed: serde_json::Value = serde_json::from_str(returned_content)
+            .expect("truncated tool_result must remain valid JSON");
+        // Envelope fields preserved.
+        assert_eq!(parsed["is_error"], false);
+        assert_eq!(parsed["tool_use_id"], "toolu_abc");
+        // Inner content is a truncated string, with marker.
+        let inner = parsed["content"].as_str().expect("inner content stays a string");
+        assert!(inner.contains("truncated for catchup"));
+        // The bulky tool_use_result was dropped on truncation.
+        assert!(parsed.get("tool_use_result").is_none());
+    }
+
+    #[tokio::test]
+    async fn get_messages_after_handles_lines_split_across_chunk_boundaries() {
+        // Each message body is padded so the resulting JSONL line is much
+        // bigger than the 64 KiB chunk read; this exercises the carry/glue
+        // path between successive backward chunks. Without the carry
+        // handling, we'd silently drop messages whose JSON spans a chunk
+        // boundary (since `from_slice` on a fragment fails to parse).
+        let storage = fresh_storage();
+        let sid = Uuid::new_v4();
+        let base = Utc::now() - Duration::hours(1);
+        let big_payload = "x".repeat(200 * 1024); // > 3 chunks
+        for i in 0..6u32 {
+            let ts = (base + Duration::seconds(i as i64)).to_rfc3339();
+            let mut msg = make_msg(&format!("big{i}"), &ts);
+            msg.content = big_payload.clone();
+            storage.append_message(&sid, &msg).await.unwrap();
+        }
+        // Empty cutoff → expect all six, sorted ASC by created_at, with
+        // content truncated by the per-message cap (the body is bigger
+        // than MAX_CONTENT_BYTES so the marker is added).
+        let got = storage.get_messages_after(&sid, "").await.unwrap();
+        assert_eq!(got.len(), 6);
+        for (i, msg) in got.iter().enumerate() {
+            assert_eq!(msg.id, format!("big{i}"));
+            assert!(msg.content.contains("truncated for catchup"));
+        }
+    }
+
+    #[tokio::test]
+    async fn get_messages_after_bails_early_on_recent_cutoff() {
+        // Functional sanity check on the early-bail path: with a recent
+        // cutoff most of the file should be irrelevant. We can't measure
+        // bytes-read from a unit test directly, but we can at least verify
+        // the result is correct (only the post-cutoff messages, none of
+        // the older ones) without any panics from incomplete carry handling.
+        let storage = fresh_storage();
+        let sid = Uuid::new_v4();
+        let base = Utc::now() - Duration::hours(1);
+        // 200 medium-sized messages, ascending timestamps.
+        let payload = "y".repeat(2048);
+        for i in 0..200u32 {
+            let ts = (base + Duration::seconds(i as i64)).to_rfc3339();
+            let mut msg = make_msg(&format!("m{i}"), &ts);
+            msg.content = payload.clone();
+            storage.append_message(&sid, &msg).await.unwrap();
+        }
+        // Cut at message 195 — expect 4 results (m196..m199).
+        let cutoff = (base + Duration::seconds(195)).to_rfc3339();
+        let got = storage.get_messages_after(&sid, &cutoff).await.unwrap();
+        assert_eq!(got.len(), 4);
+        assert_eq!(got[0].id, "m196");
+        assert_eq!(got[3].id, "m199");
+    }
+
+    #[tokio::test]
+    async fn get_messages_after_truncates_oversized_content_per_message() {
+        let storage = fresh_storage();
+        let sid = Uuid::new_v4();
+        let now = Utc::now();
+        let ts = now.to_rfc3339();
+        let mut huge = make_msg("huge", &ts);
+        // 1 MiB content — well past the per-message cap.
+        huge.content = "x".repeat(1024 * 1024);
+        storage.append_message(&sid, &huge).await.unwrap();
+
+        let got = storage.get_messages_after(&sid, "").await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].content.len() < 64 * 1024);
+        assert!(got[0].content.contains("truncated for catchup"));
+        assert!(got[0].content.contains(&format!("{}", 1024 * 1024)));
     }
 
     #[tokio::test]

@@ -46,13 +46,13 @@ async fn async_main() -> Result<()> {
     // Create app state
     let state = AppState::new(db, config.clone());
 
-    // Spawn the 30-day GC task. Runs once at boot to catch the backlog,
+    // Spawn the message GC task. Runs once at boot to catch the backlog,
     // then every 24h. Pure delete — drops messages with created_at older
     // than the cutoff, no archive.
     let storage_for_gc = state.storage.clone();
     tokio::spawn(async move {
         let interval = std::time::Duration::from_secs(60 * 60 * 24);
-        let retention_days: i64 = 30;
+        let retention_days: i64 = 7;
         loop {
             let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days);
             tracing::info!(
