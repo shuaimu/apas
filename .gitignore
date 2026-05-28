@@ -34,6 +34,8 @@ project_goal.md
 # last read so they don't re-process — or miss — records).
 .apas-tech-lead-cursor
 .apas-reviewer-cursor
+# Claude Code runtime state (scheduled tasks, plugins, etc.)
+.claude/
 
 # Environment
 .env
