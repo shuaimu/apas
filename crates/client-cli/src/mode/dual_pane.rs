@@ -486,6 +486,60 @@ async fn run_inner(
             }
         }
     }
+    // One-time dedup: an earlier version of the auto-spawn (before the
+    // managed-flag migration landed) could leave duplicate orchestrators
+    // — e.g. the legacy Manager came up `managed: false`, so the auto-
+    // spawn check fired and produced a second Manager. Now both have
+    // `managed: true` and the Overview's Team box shows two of each.
+    // Keep the lowest-pane_id instance per role (almost always the
+    // original) and demote the rest to `managed: false` so they land in
+    // Side chats — that way the user can review their state and remove
+    // them via the web UI rather than us silently deleting history.
+    {
+        let mut sorted: Vec<u32> = metadata.panes.iter().map(|p| p.pane_id).collect();
+        sorted.sort_unstable();
+        let mut kept_manager: Option<u32> = None;
+        let mut kept_tech_lead: Option<u32> = None;
+        let mut kept_reviewer: Option<u32> = None;
+        for pid in &sorted {
+            if let Some(p) = metadata.panes.iter().find(|p| p.pane_id == *pid) {
+                if !p.managed {
+                    continue;
+                }
+                let lower = p.role.as_deref().unwrap_or("").to_ascii_lowercase();
+                if lower.contains("tech lead") {
+                    kept_tech_lead.get_or_insert(p.pane_id);
+                } else if lower.contains("manager") {
+                    kept_manager.get_or_insert(p.pane_id);
+                } else if lower.contains("reviewer") {
+                    kept_reviewer.get_or_insert(p.pane_id);
+                }
+            }
+        }
+        for pane in metadata.panes.iter_mut() {
+            if !pane.managed {
+                continue;
+            }
+            let lower = pane.role.as_deref().unwrap_or("").to_ascii_lowercase();
+            let keep = if lower.contains("tech lead") {
+                kept_tech_lead == Some(pane.pane_id)
+            } else if lower.contains("manager") {
+                kept_manager == Some(pane.pane_id)
+            } else if lower.contains("reviewer") {
+                kept_reviewer == Some(pane.pane_id)
+            } else {
+                true
+            };
+            if !keep {
+                tracing::warn!(
+                    pane_id = pane.pane_id,
+                    role = ?pane.role,
+                    "demoting duplicate orchestrator to side chat (managed=false)"
+                );
+                pane.managed = false;
+            }
+        }
+    }
     save_project(working_dir, &metadata)?;
 
     let default_prompt = DEFAULT_PROMPT.to_string();
