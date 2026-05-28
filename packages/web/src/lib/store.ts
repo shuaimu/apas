@@ -770,8 +770,8 @@ export const useStore = create<AppState>((set, get) => ({
     // and check that we've seen *any* frame in the last `livenessMs`.
     // If not, close — onclose drives the existing reconnect path.
     let lastIncomingAt = Date.now();
-    const heartbeatMs = 25_000;
-    const livenessMs = 35_000; // strictly > heartbeatMs so an in-flight echo always wins
+    const heartbeatMs = 5_000;
+    const livenessMs = 10_000; // strictly > heartbeatMs so an in-flight echo always wins
     const heartbeatHandle = setInterval(() => {
       if (ws.readyState !== WebSocket.OPEN) return;
       try {
@@ -1437,11 +1437,46 @@ export const useStore = create<AppState>((set, get) => ({
       savePendingSends(nextPending);
       set({ pendingSends: nextPending });
 
-      // Faster recovery than waiting for the 35s heartbeat watchdog: if
-      // the server doesn't echo this within 15s, the WS is probably
-      // silently broken or the broadcast dropped — fire a tail catchup
-      // for the current session so the response (if it landed on the
-      // server) shows up.
+      // First-line retry: a server echo for a healthy WS lands in well
+      // under a second. If 3s pass without one, retransmit on the same
+      // WS — covers the rare case of a single dropped frame on an
+      // otherwise alive connection. If the WS is genuinely dead, the
+      // retry also goes to the void and the heartbeat watchdog
+      // (5s/10s) will close + reconnect, at which point
+      // flushPendingSends replays from localStorage.
+      setTimeout(() => {
+        const entry = get().pendingSends.find((p) => p.id === sendId);
+        if (!entry || entry.attempts >= 3) return;
+        const curWs = get().ws;
+        if (!curWs || curWs.readyState !== WebSocket.OPEN) return;
+        try {
+          curWs.send(
+            JSON.stringify({
+              type: "input",
+              session_id: entry.sessionId,
+              text: entry.text,
+              pane_type: entry.paneType,
+              pane_id: entry.paneId,
+            }),
+          );
+          console.warn(`[pending-send] no ack for ${sendId} in 3s — retransmit attempt ${entry.attempts + 1}`);
+          set((state) => {
+            const next = state.pendingSends.map((p) =>
+              p.id === sendId ? { ...p, attempts: p.attempts + 1 } : p,
+            );
+            savePendingSends(next);
+            return { pendingSends: next };
+          });
+        } catch {
+          // ignore — onclose will trigger reconnect path
+        }
+      }, 3_000);
+
+      // Secondary safety net: if neither the original send nor the +3s
+      // retry got acked within 15s (e.g. dead WS that hadn't yet
+      // tripped the watchdog when we sent, plus reconnect-and-replay
+      // still slow), fire a tail catchup so any response sitting on
+      // the server shows up.
       setTimeout(() => {
         const stillPending = get().pendingSends.some((p) => p.id === sendId);
         if (stillPending) {
