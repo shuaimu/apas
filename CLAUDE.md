@@ -213,8 +213,12 @@ ssh root@apas.mpaxos.com "systemctl restart apas-server"
 
 sleep 1
 
-# For web updates
-rsync -av --exclude 'node_modules' --exclude '.next' packages/web/ root@apas.mpaxos.com:/opt/apas/web/
+# For web updates. `--delete` is important: without it, files removed
+# locally (renamed/retired components) stay on the server and the next
+# `npm run build` fails because those files still reference removed
+# store actions or types. Use `-n` (dry-run) first if you're not sure
+# what will get cleaned up.
+rsync -av --delete --exclude 'node_modules' --exclude '.next' --exclude '.apas-version' packages/web/ root@apas.mpaxos.com:/opt/apas/web/
 
 # Restart apas-web (compute version locally since server lacks git history)
 month_start="$(date +%Y-%m-01) 00:00:00"
