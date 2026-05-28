@@ -1226,6 +1226,43 @@ async fn run_inner(
         });
     }
 
+    // suggested-workers.md mtime-gated poller. Pushes a fresh
+    // SuggestedWorkersState whenever the file's mtime changes so the
+    // Overview's Suggested workers panel updates without the user
+    // having to refresh. Mtime gate keeps the wire quiet when the
+    // Manager hasn't touched the file. Fires once at startup (no
+    // baseline mtime) so a newly-attached web client gets the current
+    // state even if nothing has changed recently.
+    {
+        let server_tx_for_sw = server_tx.clone();
+        let shutdown_for_sw = shutdown.clone();
+        let working_dir_for_sw = working_dir_str.clone();
+        thread::spawn(move || {
+            let project = std::path::PathBuf::from(working_dir_for_sw);
+            let path = crate::suggested_workers::path(&project);
+            let mut last_mtime: Option<std::time::SystemTime> = None;
+            let mut first_tick = true;
+            while !shutdown_for_sw.load(Ordering::SeqCst) {
+                let cur_mtime = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok();
+                let changed = first_tick || cur_mtime != last_mtime;
+                if changed {
+                    let sw = crate::suggested_workers::load(&project).unwrap_or_default();
+                    let _ = server_tx_for_sw.blocking_send(
+                        CliToServer::SuggestedWorkersState {
+                            session_id,
+                            suggestions: crate::suggested_workers::to_wire(&sw),
+                        },
+                    );
+                    last_mtime = cur_mtime;
+                    first_tick = false;
+                }
+                thread::sleep(Duration::from_secs(3));
+            }
+        });
+    }
+
     // Phase 2.2b: team scratchpad watcher. Tails `.apas-team.jsonl` and
     // pushes new records to the server (which forwards to web). On
     // first tick we send the existing history so newly-attached web
