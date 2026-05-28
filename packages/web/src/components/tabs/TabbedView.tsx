@@ -8,6 +8,7 @@ import { OverviewView } from "../overview/OverviewView";
 import { UserMessage } from "../chat/UserMessage";
 import { AssistantMessage } from "../chat/AssistantMessage";
 import { TabBar } from "./TabBar";
+import { WorkerTaskBar } from "./WorkerTaskBar";
 import { UsageLimitsDisplay } from "../UsageLimits";
 import { CodeBlock } from "../code/CodeBlock";
 
@@ -963,15 +964,18 @@ export function TabbedView() {
                   messages={msgs}
                 />
               ) : (
-                <MessagePane
-                  key={`${sessionId}-${tab.pane_id}`}
-                  paneId={tab.pane_id}
-                  messages={msgs}
-                  onLoadMore={() => loadMoreMessages(tab.pane_id)}
-                  isLoading={loadingMorePane === tab.pane_id}
-                  hasMore={paneHasMore[paneKey(tab.pane_id)] || false}
-                  isActive={isActive}
-                />
+                <>
+                  <WorkerTaskBar paneId={tab.pane_id} role={tab.role} />
+                  <MessagePane
+                    key={`${sessionId}-${tab.pane_id}`}
+                    paneId={tab.pane_id}
+                    messages={msgs}
+                    onLoadMore={() => loadMoreMessages(tab.pane_id)}
+                    isLoading={loadingMorePane === tab.pane_id}
+                    hasMore={paneHasMore[paneKey(tab.pane_id)] || false}
+                    isActive={isActive}
+                  />
+                </>
               )}
             </div>
           );
