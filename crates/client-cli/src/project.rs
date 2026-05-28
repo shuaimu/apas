@@ -104,6 +104,7 @@ impl ProjectMetadata {
                     backstory: None,
                     plan_review_mode: shared::PlanReviewMode::default(),
                     manual_mode: false,
+                    managed: false,
                 },
                 PaneConfig {
                     pane_id: shared::PANE_ID_INTERACTIVE,
@@ -123,6 +124,7 @@ impl ProjectMetadata {
                     backstory: None,
                     plan_review_mode: shared::PlanReviewMode::default(),
                     manual_mode: false,
+                    managed: false,
                 },
             ];
         }

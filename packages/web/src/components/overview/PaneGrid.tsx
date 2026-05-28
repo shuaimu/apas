@@ -42,7 +42,11 @@ export function PaneGrid({
   const paneDiffs = useStore((s) => s.paneDiffs);
 
   const sorted = useMemo(() => {
-    const arr = [...paneConfigs];
+    // Overview shows only managed panes — the auto-spawned orchestrators
+    // and any worker added via + Add Worker. TabBar-`+` side chats are
+    // intentionally excluded; they're visible in the tab bar where they
+    // were created.
+    const arr = paneConfigs.filter((p) => p.managed === true);
     arr.sort((a, b) => a.pane_id - b.pane_id);
     return arr;
   }, [paneConfigs]);
@@ -50,7 +54,9 @@ export function PaneGrid({
   if (sorted.length === 0) {
     return (
       <div className="rounded border border-dashed border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30 p-4 text-sm italic text-gray-500 dark:text-gray-400">
-        No panes in this project yet. Add one via the + button in the tab bar.
+        No team members yet. Use <strong>+ Add Worker</strong> above to add one.
+        Side chats from the tab bar <strong>+</strong> button aren't shown here
+        (they don't join the team queue).
       </div>
     );
   }

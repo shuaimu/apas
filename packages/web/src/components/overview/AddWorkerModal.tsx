@@ -74,6 +74,10 @@ export function AddWorkerModal({ open, onClose }: AddWorkerModalProps) {
         backstory: backstory.trim() || undefined,
         planReviewMode: mode,
       },
+      // managed: true — this pane joins the team queue and the Tech
+      // Lead can delegate to it. The TabBar `+` path passes managed
+      // as false (or omits it) so those panes stay as side chats.
+      true,
     );
     if (result.success) {
       showToast(

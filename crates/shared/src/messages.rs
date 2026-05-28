@@ -639,6 +639,11 @@ pub enum WebToServer {
         backstory: Option<String>,
         #[serde(default)]
         plan_review_mode: PlanReviewMode,
+        /// v3.5 — true when this pane is being added through the
+        /// Overview's **+ Add Worker** flow (part of the team), false
+        /// when it's a TabBar `+` side chat. See PaneConfig::managed.
+        #[serde(default)]
+        managed: bool,
     },
 
     /// Remove a pane. When the pane has an isolated worktree assigned
@@ -1288,6 +1293,15 @@ pub struct PaneConfig {
     /// skip it when picking a delegation target. Persisted to `.apas`.
     #[serde(default)]
     pub manual_mode: bool,
+    /// v3.5 — managed vs. unmanaged. `true` = this pane is part of the
+    /// team (auto-spawned Manager / Tech Lead / Reviewer, or a worker
+    /// added via the Overview's **+ Add Worker** flow). Such panes show
+    /// up on the Overview Pane Grid and Tech Lead considers them for
+    /// delegation. `false` (default for backward compat + the TabBar
+    /// `+` button) = side chat / experiment; not part of the team queue
+    /// and never a delegation target.
+    #[serde(default)]
+    pub managed: bool,
 }
 
 /// Legacy pane_id constants
@@ -1315,6 +1329,7 @@ impl PaneConfig {
             backstory: None,
             plan_review_mode: PlanReviewMode::default(),
             manual_mode: false,
+            managed: false,
         }]
     }
 

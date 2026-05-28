@@ -88,6 +88,10 @@ pub enum TuiEvent {
         goal: Option<String>,
         backstory: Option<String>,
         plan_review_mode: shared::PlanReviewMode,
+        /// v3.5 — managed vs unmanaged. true = part of the team
+        /// (auto-spawned orchestrators + Overview AddWorker); false =
+        /// side chat from TabBar +. See PaneConfig::managed.
+        managed: bool,
     },
     CloseTab {
         pane_id: u32,

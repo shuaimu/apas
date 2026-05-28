@@ -169,6 +169,7 @@ fn infer_panes_from_messages(
                 backstory: None,
                 plan_review_mode: shared::PlanReviewMode::default(),
                 manual_mode: false,
+                managed: false,
             }
         })
         .collect()
@@ -1052,6 +1053,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     goal,
                     backstory,
                     plan_review_mode,
+                    managed,
                 }) => {
                     if let Some(sid) = session_id {
                         // Generate a unique pane_id starting from 3 (1 and 2 are reserved for legacy deadloop/interactive)
@@ -1074,6 +1076,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             backstory,
                             plan_review_mode,
                             manual_mode: false,
+                            managed,
                         };
                         tracing::info!(
                             "Adding pane {} to session {} (isolated_worktree={})",

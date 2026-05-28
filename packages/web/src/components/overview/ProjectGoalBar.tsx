@@ -178,6 +178,7 @@ export function ProjectGoalBar() {
         backstory: manager.backstory,
         planReviewMode: manager.planReviewMode,
       },
+      true, // managed — part of the team
     );
     if (result.success) {
       if (goalDraft.trim()) updateProjectGoal(goalDraft.trim());
@@ -206,6 +207,7 @@ export function ProjectGoalBar() {
         backstory: techLead.backstory,
         planReviewMode: techLead.planReviewMode,
       },
+      true, // managed — part of the team
     );
     if (result.success) {
       showToast("Tech Lead started — autonomous orchestration online.", "success");

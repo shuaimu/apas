@@ -217,6 +217,10 @@ export interface PaneConfig {
   /** v3.2 — worker mode. false (default) = autonomous, available for
    *  Tech-Lead delegation. true = manual, only the user chats with it. */
   manual_mode?: boolean;
+  /** v3.5 — true = part of the team (Tech Lead can delegate, shows on
+   *  Overview Pane Grid). false (default for legacy / TabBar + side
+   *  chats) = not part of the team queue. */
+  managed?: boolean;
 }
 
 export type PaneCleanupAction = "discard" | "merge_and_remove" | "leave_as_branch";
@@ -500,6 +504,7 @@ interface AppState {
       backstory?: string;
       planReviewMode?: PlanReviewMode;
     },
+    managed?: boolean,
   ) => { success: boolean; error?: string };
   removePane: (paneId: number, cleanupAction?: PaneCleanupAction) => void;
   updatePaneLabel: (paneId: number, label: string) => void;
@@ -1429,6 +1434,10 @@ export const useStore = create<AppState>((set, get) => ({
       backstory?: string;
       planReviewMode?: PlanReviewMode;
     },
+    /** v3.5 — true when this pane is being added through the Overview's
+     *  + Add Worker flow (joins the team / Tech Lead can delegate to it);
+     *  false (default) when it's a TabBar + side chat / experiment. */
+    managed: boolean = false,
   ) => {
     const { ws, sessionId, isAttached } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -1452,6 +1461,7 @@ export const useStore = create<AppState>((set, get) => ({
       goal: initialRole?.goal || undefined,
       backstory: initialRole?.backstory || undefined,
       plan_review_mode: initialRole?.planReviewMode || undefined,
+      managed,
     }));
     return { success: true };
   },

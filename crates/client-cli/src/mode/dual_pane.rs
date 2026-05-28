@@ -399,6 +399,9 @@ struct PaneMeta {
     /// Tech-Lead delegation. `true` = manual, only takes user chat.
     /// Mirrored from `PaneConfig.manual_mode` and persisted to `.apas`.
     manual_mode: bool,
+    /// v3.5: managed vs unmanaged. Mirrored from `PaneConfig.managed`.
+    /// See the field doc on `shared::PaneConfig` for semantics.
+    managed: bool,
 }
 
 /// One held tool_use waiting on user approval (Phase 3.2b2).
@@ -641,6 +644,7 @@ async fn run_inner(
                     plan_review_mode_arc: Arc::new(Mutex::new(*tab_plan_review_mode)),
                     pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                     manual_mode: *tab_manual_mode,
+                    managed: false,
                 },
             );
             sessions.insert(*pane_id, *pane_session_id);
@@ -984,20 +988,27 @@ async fn run_inner(
     // events are picked up by the TUI event loop later in run_inner.
     {
         let metas_guard = pane_metas.lock().unwrap();
+        // Only consider managed panes when deciding whether to auto-spawn —
+        // a user's unmanaged side-chat pane with role "manager" or
+        // "reviewer" shouldn't suppress the auto-spawn of the team's
+        // orchestrators.
         let has_manager = metas_guard.values().any(|m| {
             let lower = m.role.as_deref().unwrap_or("").to_ascii_lowercase();
-            lower.contains("manager")
+            m.managed
+                && lower.contains("manager")
                 && !lower.contains("tech lead")
                 && matches!(m.mode, shared::PaneMode::Interactive)
         });
         let has_tech_lead = metas_guard.values().any(|m| {
             let lower = m.role.as_deref().unwrap_or("").to_ascii_lowercase();
-            lower.contains("tech lead")
+            m.managed
+                && lower.contains("tech lead")
                 && matches!(m.mode, shared::PaneMode::Deadloop)
         });
         let has_reviewer = metas_guard.values().any(|m| {
             let lower = m.role.as_deref().unwrap_or("").to_ascii_lowercase();
-            lower.contains("reviewer")
+            m.managed
+                && lower.contains("reviewer")
         });
         drop(metas_guard);
         if !has_manager {
@@ -1018,6 +1029,7 @@ async fn run_inner(
                 goal: Some(crate::role::DEFAULT_MANAGER_GOAL.to_string()),
                 backstory: Some(crate::role::DEFAULT_MANAGER_BACKSTORY.to_string()),
                 plan_review_mode: shared::PlanReviewMode::default(),
+                managed: true,
             });
             tracing::info!(pane_id, "auto-spawning Manager pane (missing from .apas)");
         }
@@ -1039,6 +1051,7 @@ async fn run_inner(
                 goal: Some(crate::role::DEFAULT_TECH_LEAD_GOAL.to_string()),
                 backstory: Some(crate::role::DEFAULT_TECH_LEAD_BACKSTORY.to_string()),
                 plan_review_mode: shared::PlanReviewMode::default(),
+                managed: true,
             });
             tracing::info!(pane_id, "auto-spawning Tech Lead pane (missing from .apas)");
         }
@@ -1060,6 +1073,7 @@ async fn run_inner(
                 goal: Some(crate::role::DEFAULT_REVIEWER_GOAL.to_string()),
                 backstory: Some(crate::role::DEFAULT_REVIEWER_BACKSTORY.to_string()),
                 plan_review_mode: shared::PlanReviewMode::default(),
+                managed: true,
             });
             tracing::info!(pane_id, "auto-spawning Reviewer pane (missing from .apas)");
         }
@@ -1369,7 +1383,7 @@ fn save_pane_configs(
                             None,
                         )
                     };
-                let (worktree_path, role, goal, backstory, plan_review_mode, manual_mode) = pane_metas
+                let (worktree_path, role, goal, backstory, plan_review_mode, manual_mode, managed) = pane_metas
                     .get(&pane_id)
                     .map(|p| (
                         p.worktree_path.clone(),
@@ -1378,8 +1392,9 @@ fn save_pane_configs(
                         p.backstory.clone(),
                         p.plan_review_mode,
                         p.manual_mode,
+                        p.managed,
                     ))
-                    .unwrap_or((None, None, None, None, shared::PlanReviewMode::default(), false));
+                    .unwrap_or((None, None, None, None, shared::PlanReviewMode::default(), false, false));
                 shared::PaneConfig {
                     pane_id,
                     provider,
@@ -1402,6 +1417,7 @@ fn save_pane_configs(
                     backstory,
                     plan_review_mode,
                     manual_mode,
+                    managed,
                 }
             })
             .collect();
@@ -1482,6 +1498,7 @@ fn handle_tui_events(
                             plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                             pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                             manual_mode: false,
+                            managed: false,
                         },
                     );
                 }
@@ -1602,6 +1619,7 @@ fn handle_tui_events(
                 goal,
                 backstory,
                 plan_review_mode,
+                managed,
             }) => {
                 let label =
                     pane_label_or_default(Some(&requested_label), pane_id, model.as_deref());
@@ -1639,6 +1657,7 @@ fn handle_tui_events(
                             plan_review_mode_arc: Arc::new(Mutex::new(plan_review_mode.clone())),
                             pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                             manual_mode: false,
+                            managed: false,
                         },
                     );
                 }
@@ -2050,6 +2069,7 @@ fn handle_tui_events(
                             plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                             pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                             manual_mode: false,
+                            managed: false,
                         },
                     );
                 }
@@ -2480,6 +2500,7 @@ fn handle_tui_events(
                             plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                             pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                             manual_mode: false,
+                            managed: false,
                         },
                     );
                 }
@@ -2656,6 +2677,7 @@ fn build_pane_list(
             backstory: meta.backstory.clone(),
             plan_review_mode: meta.plan_review_mode,
             manual_mode: meta.manual_mode,
+            managed: false,
         });
     }
 
@@ -2681,6 +2703,7 @@ fn build_pane_list(
                 backstory: None,
                 plan_review_mode: shared::PlanReviewMode::default(),
                 manual_mode: false,
+                managed: false,
             });
         }
     }
@@ -3412,6 +3435,7 @@ mod tests {
                     plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                     pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                     manual_mode: false,
+                    managed: false,
                 },
             );
             metas.insert(
@@ -3437,6 +3461,7 @@ mod tests {
                     plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                     pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                     manual_mode: false,
+                    managed: false,
                 },
             );
         }
@@ -3477,6 +3502,7 @@ mod tests {
                     plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                     pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                     manual_mode: false,
+                    managed: false,
                 },
             );
         }
@@ -3517,6 +3543,7 @@ mod tests {
                     plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                     pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                     manual_mode: false,
+                    managed: false,
                 },
             );
             metas.insert(
@@ -3542,6 +3569,7 @@ mod tests {
                     plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                     pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                     manual_mode: false,
+                    managed: false,
                 },
             );
         }
@@ -3582,6 +3610,7 @@ mod tests {
                     plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                     pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                     manual_mode: false,
+                    managed: false,
                 },
             );
         }
@@ -3622,6 +3651,7 @@ mod tests {
                     plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                     pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                     manual_mode: false,
+                    managed: false,
                 },
             );
         }
@@ -3662,6 +3692,7 @@ mod tests {
                     plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                     pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                     manual_mode: false,
+                    managed: false,
                 },
             );
         }
@@ -6823,6 +6854,7 @@ async fn run_server_connection(
                                                             goal: meta.goal,
                                                             backstory: meta.backstory,
                                                             plan_review_mode: meta.plan_review_mode,
+                                                            managed: meta.managed,
                                                         });
                                                     } else {
                                                         tracing::warn!(
@@ -7090,6 +7122,7 @@ async fn run_server_connection(
                                                     goal: pane_config.goal,
                                                     backstory: pane_config.backstory,
                                                     plan_review_mode: pane_config.plan_review_mode,
+                                                    managed: pane_config.managed,
                                                 });
                                             }
                                             ServerToCli::RemovePane { session_id: _, pane_id: remove_id, cleanup_action } => {
