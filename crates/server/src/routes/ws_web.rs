@@ -1267,6 +1267,28 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         )
                         .await;
                 }
+                Ok(WebToServer::PromotePaneToManaged { session_id: msg_sid, pane_id }) => {
+                    let Some(sid) =
+                        resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
+                            .await
+                    else {
+                        continue;
+                    };
+                    tracing::info!(
+                        "Promote pane {} → managed for session {}",
+                        pane_id, sid
+                    );
+                    state
+                        .sessions
+                        .route_to_cli(
+                            &sid,
+                            ServerToCli::PromotePaneToManaged {
+                                session_id: sid,
+                                pane_id,
+                            },
+                        )
+                        .await;
+                }
                 Ok(WebToServer::UpdatePaneRole { pane_id, role, goal, backstory }) => {
                     if let Some(sid) = session_id {
                         tracing::info!(

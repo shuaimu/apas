@@ -118,8 +118,21 @@ export function OverviewView({
 
         <TeamTodoPanel />
 
-        <OverviewSection title="Pane grid">
+        <OverviewSection title="Team (managed)">
           <PaneGrid
+            kind="managed"
+            onOpenPane={onOpenPane}
+            onOpenDiff={onOpenDiff}
+            onOpenRole={onOpenRole}
+            onPausePane={onPausePane}
+            onResumePane={onResumePane}
+            onRemovePane={onRemovePane}
+          />
+        </OverviewSection>
+
+        <OverviewSection title="Side chats (unmanaged)">
+          <PaneGrid
+            kind="unmanaged"
             onOpenPane={onOpenPane}
             onOpenDiff={onOpenDiff}
             onOpenRole={onOpenRole}

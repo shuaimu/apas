@@ -7748,6 +7748,62 @@ async fn run_server_connection(
                                                         .await;
                                                 }
                                             }
+                                            ServerToCli::PromotePaneToManaged { session_id: _, pane_id: promote_id } => {
+                                                let changed = {
+                                                    let mut metas = pane_metas.lock().unwrap();
+                                                    match metas.get_mut(&promote_id) {
+                                                        Some(m) if !m.managed => {
+                                                            m.managed = true;
+                                                            true
+                                                        }
+                                                        _ => false,
+                                                    }
+                                                };
+                                                if changed {
+                                                    save_pane_configs(
+                                                        &working_dir,
+                                                        &pane_sessions,
+                                                        &pane_metas,
+                                                        &pane_pauses,
+                                                        &pane_stop_requests,
+                                                    );
+                                                    // Broadcast fresh PaneList so the Overview moves
+                                                    // this pane from Unmanaged → Managed without a
+                                                    // full reload.
+                                                    let pane_list_msg = CliToServer::PaneList {
+                                                        session_id,
+                                                        panes: build_pane_list(
+                                                            &pane_metas,
+                                                            &input_channels,
+                                                            session_id,
+                                                            &pane_sessions,
+                                                            &pane_pauses,
+                                                            &pane_stop_requests,
+                                                        ),
+                                                    };
+                                                    if let Ok(text) = serde_json::to_string(&pane_list_msg) {
+                                                        let _ = ws_sender
+                                                            .send(Message::Text(text.into()))
+                                                            .await;
+                                                    }
+                                                    let hint = format!(
+                                                        "[Pane {} added to the team. Tech Lead may now delegate to it.]",
+                                                        promote_id,
+                                                    );
+                                                    let msg = CliToServer::Output {
+                                                        session_id,
+                                                        data: hint,
+                                                        output_type: shared::OutputType::System,
+                                                        pane_type: None,
+                                                        pane_id: Some(promote_id),
+                                                    };
+                                                    if let Ok(text) = serde_json::to_string(&msg) {
+                                                        let _ = ws_sender
+                                                            .send(Message::Text(text.into()))
+                                                            .await;
+                                                    }
+                                                }
+                                            }
                                             ServerToCli::RequestPaneDiff { session_id: _, pane_id: diff_pane_id } => {
                                                 // Look up the pane's worktree path. If unset, return a polite error
                                                 // so the web UI can render guidance instead of nothing.

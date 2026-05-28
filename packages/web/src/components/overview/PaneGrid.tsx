@@ -25,6 +25,9 @@ interface PaneGridProps {
   onPausePane: (paneId: number) => void;
   onResumePane: (paneId: number) => void;
   onRemovePane: (paneId: number) => void;
+  /** "managed" shows team members; "unmanaged" shows TabBar `+` side
+   *  chats with a one-way "Add to team" button per card. */
+  kind: "managed" | "unmanaged";
 }
 
 export function PaneGrid({
@@ -34,29 +37,34 @@ export function PaneGrid({
   onPausePane,
   onResumePane,
   onRemovePane,
+  kind,
 }: PaneGridProps) {
   const paneConfigs = useStore((s) => s.paneConfigs);
   const paneStatuses = useStore((s) => s.paneStatuses);
   const pausedPanes = useStore((s) => s.pausedPanes);
   const paneMessages = useStore((s) => s.paneMessages);
   const paneDiffs = useStore((s) => s.paneDiffs);
+  const promotePaneToManaged = useStore((s) => s.promotePaneToManaged);
 
   const sorted = useMemo(() => {
-    // Overview shows only managed panes — the auto-spawned orchestrators
-    // and any worker added via + Add Worker. TabBar-`+` side chats are
-    // intentionally excluded; they're visible in the tab bar where they
-    // were created.
-    const arr = paneConfigs.filter((p) => p.managed === true);
+    const wantManaged = kind === "managed";
+    const arr = paneConfigs.filter((p) => (p.managed === true) === wantManaged);
     arr.sort((a, b) => a.pane_id - b.pane_id);
     return arr;
-  }, [paneConfigs]);
+  }, [paneConfigs, kind]);
 
   if (sorted.length === 0) {
+    if (kind === "managed") {
+      return (
+        <div className="rounded border border-dashed border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30 p-4 text-sm italic text-gray-500 dark:text-gray-400">
+          No team members yet. Use <strong>+ Add Worker</strong> above to add one,
+          or promote an existing side chat below.
+        </div>
+      );
+    }
     return (
-      <div className="rounded border border-dashed border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30 p-4 text-sm italic text-gray-500 dark:text-gray-400">
-        No team members yet. Use <strong>+ Add Worker</strong> above to add one.
-        Side chats from the tab bar <strong>+</strong> button aren't shown here
-        (they don't join the team queue).
+      <div className="rounded border border-dashed border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30 p-3 text-xs italic text-gray-500 dark:text-gray-400">
+        No side chats. Click <strong>+</strong> in the tab bar to start one.
       </div>
     );
   }
@@ -84,6 +92,11 @@ export function PaneGrid({
             onPause={() => onPausePane(pane.pane_id)}
             onResume={() => onResumePane(pane.pane_id)}
             onRemove={() => onRemovePane(pane.pane_id)}
+            onPromote={
+              kind === "unmanaged"
+                ? () => promotePaneToManaged(pane.pane_id)
+                : undefined
+            }
           />
         );
       })}
@@ -104,6 +117,8 @@ interface PaneCardProps {
   onPause: () => void;
   onResume: () => void;
   onRemove: () => void;
+  /** Present only on unmanaged cards — one-way promote to the team. */
+  onPromote?: () => void;
 }
 
 function PaneCard({
@@ -119,6 +134,7 @@ function PaneCard({
   onPause,
   onResume,
   onRemove,
+  onPromote,
 }: PaneCardProps) {
   const isBot = pane.mode === "deadloop";
   const isThinking = !!status && !isPaused;
@@ -254,6 +270,19 @@ function PaneCard({
                 Pause
               </span>
             )
+          )}
+          {onPromote && (
+            <span
+              className="rounded border border-blue-500 bg-blue-600 px-1.5 py-0.5 text-white hover:bg-blue-500"
+              role="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onPromote();
+              }}
+              title="Promote to a team member — Tech Lead may delegate work to it. One-way; you can't demote back."
+            >
+              + Add to team
+            </span>
           )}
           {pane.pane_id !== PANE_ID_INTERACTIVE &&
             pane.pane_id !== PANE_ID_DEADLOOP &&

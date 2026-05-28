@@ -303,6 +303,14 @@ pub enum ServerToCli {
         body: String,
     },
 
+    /// Flip a pane's `managed` field from false to true. CLI updates
+    /// PaneMeta + persists to .apas + re-broadcasts the PaneList.
+    /// One-way; there's no demote.
+    PromotePaneToManaged {
+        session_id: Uuid,
+        pane_id: u32,
+    },
+
     /// Pause the deadloop (legacy - use PausePane for new code)
     PauseDeadloop { session_id: Uuid },
 
@@ -818,6 +826,14 @@ pub enum WebToServer {
         title: String,
         #[serde(default)]
         body: String,
+    },
+
+    /// One-way promote: flip an unmanaged side-chat pane to a managed
+    /// team member. CLI sets PaneMeta.managed = true and re-broadcasts
+    /// the PaneList. There's no demote — keep it simple.
+    PromotePaneToManaged {
+        session_id: Uuid,
+        pane_id: u32,
     },
 }
 

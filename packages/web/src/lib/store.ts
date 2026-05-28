@@ -537,6 +537,10 @@ interface AppState {
   /** v3.2 — flip a worker between autonomous and manual modes. */
   updatePaneManualMode: (paneId: number, manualMode: boolean) => void;
 
+  /** v3.5 — one-way promote: turn an unmanaged side-chat pane into
+   *  a team member the Tech Lead can delegate to. There's no demote. */
+  promotePaneToManaged: (paneId: number) => void;
+
   /** Ask the server (which asks the CLI) for the current team-todo.md.
    *  Reply lands in `teamTodoState` via the team_todo_state handler. */
   fetchTeamTodo: () => void;
@@ -1605,6 +1609,20 @@ export const useStore = create<AppState>((set, get) => ({
         pane_id: paneId,
         manual_mode: manualMode,
       }));
+    }
+  },
+
+  promotePaneToManaged: (paneId: number) => {
+    const { ws, sessionId, showToast } = get();
+    if (!sessionId) return;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: "promote_pane_to_managed",
+        session_id: sessionId,
+        pane_id: paneId,
+      }));
+    } else {
+      showToast("Not connected — cannot promote", "error");
     }
   },
 
