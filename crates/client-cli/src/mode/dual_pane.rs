@@ -540,6 +540,26 @@ async fn run_inner(
             }
         }
     }
+    // Force max effort for every managed Claude pane on each boot. The
+    // user wants team members (Manager / Tech Lead / Reviewer / accepted
+    // suggested workers) to always think at the highest level when
+    // running official Claude. Re-asserting on every boot also recovers
+    // any pane that was downgraded by hand or by an older binary.
+    // Non-Claude providers don't have an --effort knob so we leave them
+    // alone.
+    for pane in metadata.panes.iter_mut() {
+        if pane.managed
+            && matches!(pane.provider, shared::Provider::Claude)
+            && pane.effort.as_deref() != Some("max")
+        {
+            tracing::info!(
+                pane_id = pane.pane_id,
+                old_effort = ?pane.effort,
+                "force-setting managed Claude pane to effort=max on boot"
+            );
+            pane.effort = Some("max".to_string());
+        }
+    }
     save_project(working_dir, &metadata)?;
 
     let default_prompt = DEFAULT_PROMPT.to_string();
@@ -1094,7 +1114,7 @@ async fn run_inner(
                 prompt: None,
                 min_iteration_interval_minutes: None,
                 model: None,
-                effort: None,
+                effort: Some("max".to_string()),
                 worktree_path: None,
                 initial_input: None,
                 role: Some(crate::role::DEFAULT_MANAGER_ROLE.to_string()),
@@ -1116,7 +1136,7 @@ async fn run_inner(
                 prompt: Some(crate::role::TECH_LEAD_DEADLOOP_PROMPT.to_string()),
                 min_iteration_interval_minutes: None,
                 model: None,
-                effort: None,
+                effort: Some("max".to_string()),
                 worktree_path: None,
                 initial_input: None,
                 role: Some(crate::role::DEFAULT_TECH_LEAD_ROLE.to_string()),
@@ -1138,7 +1158,7 @@ async fn run_inner(
                 prompt: Some(crate::role::REVIEWER_DEADLOOP_PROMPT.to_string()),
                 min_iteration_interval_minutes: None,
                 model: None,
-                effort: None,
+                effort: Some("max".to_string()),
                 worktree_path: None,
                 initial_input: None,
                 role: Some(crate::role::DEFAULT_REVIEWER_ROLE.to_string()),
@@ -1732,7 +1752,17 @@ fn handle_tui_events(
             }) => {
                 let label =
                     pane_label_or_default(Some(&requested_label), pane_id, model.as_deref());
-                let normalized_effort = normalize_effort_level(effort.as_deref());
+                // Managed Claude panes default to max effort — the team
+                // (Manager / Tech Lead / Reviewer / accepted suggested
+                // workers) should always think hard. Caller-supplied
+                // effort still wins if it was set explicitly.
+                let normalized_effort = match normalize_effort_level(effort.as_deref()) {
+                    Some(e) => Some(e),
+                    None if managed && matches!(provider, shared::Provider::Claude) => {
+                        Some("max".to_string())
+                    }
+                    None => None,
+                };
                 // Track claude session and metadata for this pane
                 {
                     let mut ps = pane_sessions.lock().unwrap();
@@ -7863,6 +7893,19 @@ async fn run_server_connection(
                                                     match metas.get_mut(&promote_id) {
                                                         Some(m) if !m.managed => {
                                                             m.managed = true;
+                                                            // Bring promoted Claude panes up to the team's
+                                                            // baseline (max effort) — same default as a
+                                                            // fresh managed spawn. effort_arc is read by
+                                                            // the streaming worker before each turn, so
+                                                            // the next claude restart picks it up.
+                                                            if matches!(m.provider, shared::Provider::Claude)
+                                                                && m.effort.as_deref() != Some("max")
+                                                            {
+                                                                m.effort = Some("max".to_string());
+                                                                if let Ok(mut g) = m.effort_arc.lock() {
+                                                                    *g = Some("max".to_string());
+                                                                }
+                                                            }
                                                             true
                                                         }
                                                         _ => false,
