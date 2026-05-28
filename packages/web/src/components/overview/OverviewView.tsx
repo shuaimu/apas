@@ -60,7 +60,12 @@ export function OverviewView({
       showToast("Start the Manager first — they need to be running to suggest workers.", "error");
       return;
     }
+    // Only show managed panes — side chats are user scratch space, not
+    // part of the team the Manager should reason about when proposing
+    // additions. Empty roster (everything's unmanaged) is fine; the
+    // Manager will just propose from scratch.
     const roster = paneConfigs
+      .filter((p: PaneConfig) => p.managed === true)
       .map((p: PaneConfig) => {
         const lower = (p.role ?? "").toLowerCase();
         const tag = lower.includes("tech lead")
@@ -70,7 +75,7 @@ export function OverviewView({
             : p.role || "no-role";
         return `  - pane_id=${p.pane_id} (${p.label ?? "untitled"}, ${tag})`;
       })
-      .join("\n");
+      .join("\n") || "  (no managed team members yet)";
     const prompt = `Given the current project goal (in project_goal.md) and the team you already have:\n\n${roster}\n\nSuggest 2-3 additional worker panes that would help advance the goal. Append each suggestion as a section in **suggested-workers.md** (use the Edit/Write tool) — they'll appear in the Overview's "Suggested workers" box with one-click Accept buttons.\n\nFormat per suggestion:\n\n## SUG-NNN — short label\n- role: developer | qa | reviewer | researcher | devops | ...\n- goal: one-sentence scope describing what they'd own\n- backstory: 1-2 sentences of relevant context / expertise\n- needs_worktree: yes | no   (yes for developers; usually no for reviewers/researchers)\n\nPick NNN past the existing max (SUG-001 if the file is empty). Quality over quantity. If the current team is sufficient, say so here in chat and skip the file.`;
     const result = sendMessageToPane(prompt, managerPane.pane_id);
     if (result.success) {
