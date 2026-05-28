@@ -560,6 +560,43 @@ async fn run_inner(
             pane.effort = Some("max".to_string());
         }
     }
+    // Refresh deadloop prompts for known orchestrator roles to the
+    // current baked-in constants. The per-pane prompt was captured at
+    // spawn time, so panes spawned by an earlier binary keep using
+    // whatever prompt that binary had — meaning improvements like the
+    // Tech Lead's "survey + propose" iteration step never reach
+    // existing panes without a manual recreate. This re-asserts on
+    // every boot so updates to TECH_LEAD_DEADLOOP_PROMPT and
+    // REVIEWER_DEADLOOP_PROMPT take effect after one restart. Trade-off:
+    // users who hand-customized these panes' prompts will see them
+    // reset; acceptable since the role still wins (you wouldn't keep
+    // role=tech-lead but want a totally different loop).
+    for pane in metadata.panes.iter_mut() {
+        if !pane.managed {
+            continue;
+        }
+        if !matches!(pane.mode, shared::PaneMode::Deadloop) {
+            continue;
+        }
+        let lower = pane.role.as_deref().unwrap_or("").to_ascii_lowercase();
+        let desired: Option<&str> = if lower.contains("tech lead") {
+            Some(crate::role::TECH_LEAD_DEADLOOP_PROMPT)
+        } else if lower.contains("reviewer") {
+            Some(crate::role::REVIEWER_DEADLOOP_PROMPT)
+        } else {
+            None
+        };
+        if let Some(desired_prompt) = desired {
+            if pane.prompt.as_deref() != Some(desired_prompt) {
+                tracing::info!(
+                    pane_id = pane.pane_id,
+                    role = ?pane.role,
+                    "refreshing orchestrator deadloop prompt to current baked-in version"
+                );
+                pane.prompt = Some(desired_prompt.to_string());
+            }
+        }
+    }
     save_project(working_dir, &metadata)?;
 
     let default_prompt = DEFAULT_PROMPT.to_string();
