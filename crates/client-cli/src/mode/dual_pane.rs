@@ -1283,6 +1283,43 @@ async fn run_inner(
         });
     }
 
+    // team-todo.md mtime-gated poller. Mirrors the suggested-workers
+    // poller below. Without this, the Overview's TeamTodoPanel only
+    // sees changes on FetchTeamTodo (initial mount) — Tech-Lead-driven
+    // edits (new proposed entries, status flips, PR-link appends)
+    // never reach the web until the user refreshes.
+    {
+        let server_tx_for_tt = server_tx.clone();
+        let shutdown_for_tt = shutdown.clone();
+        let working_dir_for_tt = working_dir_str.clone();
+        thread::spawn(move || {
+            let project = std::path::PathBuf::from(working_dir_for_tt);
+            let path = crate::team_todo::team_todo_path(&project);
+            let mut last_mtime: Option<std::time::SystemTime> = None;
+            let mut first_tick = true;
+            while !shutdown_for_tt.load(Ordering::SeqCst) {
+                let cur_mtime = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok();
+                let changed = first_tick || cur_mtime != last_mtime;
+                if changed {
+                    let todo = crate::team_todo::load(&project).unwrap_or_default();
+                    let state_msg =
+                        crate::team_todo::to_wire_with_cursors(&todo, &project);
+                    let _ = server_tx_for_tt.blocking_send(
+                        CliToServer::TeamTodoState {
+                            session_id,
+                            state: state_msg,
+                        },
+                    );
+                    last_mtime = cur_mtime;
+                    first_tick = false;
+                }
+                thread::sleep(Duration::from_secs(3));
+            }
+        });
+    }
+
     // suggested-workers.md mtime-gated poller. Pushes a fresh
     // SuggestedWorkersState whenever the file's mtime changes so the
     // Overview's Suggested workers panel updates without the user
