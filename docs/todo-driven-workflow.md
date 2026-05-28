@@ -59,6 +59,16 @@ pr: (not yet)
 The current session-cookie middleware is being deprecated. Replace
 with the JWT validator from the shared auth crate.
 
+### [TODO-003] Add streaming-response to /v1/chat (multi-worker example)
+status: pr_open
+origin: user
+pr: 578 https://github.com/foo/bar/pull/42
+pr: 612 https://github.com/foo/bar/pull/43
+
+Backend (pane 578) wires SSE through the route; frontend (pane 612)
+updates the chat client to consume SSE. Two PRs for one TODO — the
+user reviews them on GitHub side-by-side.
+
 ### [TODO-002] Add streaming-response support to /v1/chat
 status: proposed
 origin: tech-lead
@@ -95,7 +105,7 @@ The test fixtures bake session cookies in; replace with a JWT minter.
 **Global TODO**:
 - `status`: `proposed` | `approved` | `in_progress` | `under_review` | `pr_open` | `done` | `rejected`
 - `origin`: `user` | `tech-lead`
-- `pr`: GitHub PR URL once opened, `(not yet)` otherwise
+- `pr`: zero or more lines, each `pr: <pane_id> <github_pr_url>`. One per contributing worker pane. `pr: (not yet)` means none yet (functionally equivalent to omitting the line). The Global flips to `pr_open` when *every* contributing worker has a PR line, and to `done` when every URL's GitHub state is `MERGED`.
 
 **Worker subtask**:
 - `status`: `pending` | `in_progress` | `done` | `reviewing` | `revising` | `approved`
@@ -354,5 +364,10 @@ Each phase is independently shippable.
   plan view on top.
 - Replacing the Manager. The Manager still owns conversation with the
   user; this protocol just gives it a structured queue to surface.
-- Multi-PR per TODO. One global TODO = one PR. If something is bigger
-  than one PR, it splits into multiple global TODOs.
+- Integration-branch merging of worker branches. A multi-worker
+  Global TODO ships as **N PRs** (one per worker), not one merged PR.
+  Workers each have their own isolated worktree on their own branch;
+  combining them into a single integration branch would mean Tech
+  Lead doing `git merge` dances and resolving conflicts on the user's
+  behalf, which is more risk than benefit. The user reviews multiple
+  related PRs in GitHub.

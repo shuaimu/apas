@@ -7685,7 +7685,7 @@ async fn run_server_connection(
                                                                 title: trimmed.to_string(),
                                                                 status: crate::team_todo::GlobalStatus::Approved,
                                                                 origin: crate::team_todo::Origin::User,
-                                                                pr: None,
+                                                                prs: Vec::new(),
                                                                 body,
                                                             });
                                                             if let Err(e) = crate::team_todo::save(project_dir, &todo) {

@@ -81,8 +81,20 @@ pub struct GlobalTodo {
     pub title: String,
     pub status: GlobalStatus,
     pub origin: Origin,
-    pub pr: Option<String>,
+    /// One PR per contributing worker pane. Per-worker because a Global
+    /// TODO can split across multiple panes — each pane has its own
+    /// branch in its own worktree, and we don't try to merge them into
+    /// a single integration branch. The user reviews N PRs in GitHub.
+    /// Empty `Vec` (or no `pr:` lines in the doc) means no PR opened
+    /// yet. Single-worker Globals just have one entry.
+    pub prs: Vec<PaneTodoPr>,
     pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneTodoPr {
+    pub pane_id: u32,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -174,7 +186,14 @@ pub fn to_wire(todo: &TeamTodo) -> shared::TeamTodoStateMsg {
                 title: g.title.clone(),
                 status: g.status.as_str().to_string(),
                 origin: g.origin.as_str().to_string(),
-                pr: g.pr.clone(),
+                prs: g
+                    .prs
+                    .iter()
+                    .map(|p| shared::PaneTodoPrMsg {
+                        pane_id: p.pane_id,
+                        url: p.url.clone(),
+                    })
+                    .collect(),
                 body: g.body.clone(),
             })
             .collect(),
@@ -436,18 +455,43 @@ fn build_global(
     };
     let status = GlobalStatus::from_str(get("status").as_deref().unwrap_or("proposed"))?;
     let origin = Origin::from_str(get("origin").as_deref().unwrap_or("tech-lead"))?;
-    let pr_raw = get("pr").unwrap_or_else(|| "(not yet)".into());
-    let pr = if pr_raw.trim() == "(not yet)" || pr_raw.trim().is_empty() {
-        None
-    } else {
-        Some(pr_raw.trim().to_string())
-    };
+
+    // Each `pr:` line is `<pane_id> <url>` (per-worker PR). For backward
+    // compat with the older single-PR schema, lines whose value is
+    // `(not yet)` / empty are skipped. A single `pr: <url>` with no
+    // leading pane_id falls through to pane_id=0 (sentinel).
+    let mut prs: Vec<PaneTodoPr> = Vec::new();
+    for (k, v) in fields {
+        if k != "pr" {
+            continue;
+        }
+        let v = v.trim();
+        if v.is_empty() || v == "(not yet)" {
+            continue;
+        }
+        if let Some((id_part, url_part)) = v.split_once(char::is_whitespace) {
+            if let Ok(pane_id) = id_part.trim().parse::<u32>() {
+                prs.push(PaneTodoPr {
+                    pane_id,
+                    url: url_part.trim().to_string(),
+                });
+                continue;
+            }
+        }
+        // Legacy: single URL with no pane_id. Keep it so we don't lose
+        // links from pre-per-worker docs.
+        prs.push(PaneTodoPr {
+            pane_id: 0,
+            url: v.to_string(),
+        });
+    }
+
     Some(GlobalTodo {
         id,
         title,
         status,
         origin,
-        pr,
+        prs,
         body: body.to_string(),
     })
 }
@@ -496,12 +540,16 @@ pub fn serialize(todo: &TeamTodo) -> String {
         let _ = writeln!(out, "### [{}] {}", g.id, g.title);
         let _ = writeln!(out, "status: {}", g.status.as_str());
         let _ = writeln!(out, "origin: {}", g.origin.as_str());
-        match &g.pr {
-            Some(url) => {
-                let _ = writeln!(out, "pr: {url}");
-            }
-            None => {
-                let _ = writeln!(out, "pr: (not yet)");
+        if g.prs.is_empty() {
+            let _ = writeln!(out, "pr: (not yet)");
+        } else {
+            for pr in &g.prs {
+                if pr.pane_id == 0 {
+                    // Legacy entry parsed from a pre-per-worker doc.
+                    let _ = writeln!(out, "pr: {}", pr.url);
+                } else {
+                    let _ = writeln!(out, "pr: {} {}", pr.pane_id, pr.url);
+                }
             }
         }
         if !g.body.is_empty() {
@@ -771,7 +819,7 @@ The test fixtures bake session cookies in; replace with a JWT minter.\n\
         assert_eq!(g1.title, "Switch the auth middleware to JWT");
         assert_eq!(g1.status, GlobalStatus::Approved);
         assert_eq!(g1.origin, Origin::User);
-        assert!(g1.pr.is_none());
+        assert!(g1.prs.is_empty());
         assert!(g1.body.contains("session-cookie"));
 
         let g2 = &t.globals[1];
@@ -898,6 +946,62 @@ The test fixtures bake session cookies in; replace with a JWT minter.\n\
     }
 
     #[test]
+    fn parses_multiple_pr_lines_per_global() {
+        let s = "# Team TODO\n\n## Global TODOs\n\n\
+### [TODO-001] Streaming chat\n\
+status: pr_open\n\
+origin: user\n\
+pr: 578 https://github.com/foo/bar/pull/42\n\
+pr: 612 https://github.com/foo/bar/pull/43\n\
+\n\
+backend + frontend split.\n";
+        let t = parse(s).unwrap();
+        let g = &t.globals[0];
+        assert_eq!(g.prs.len(), 2);
+        assert_eq!(g.prs[0].pane_id, 578);
+        assert_eq!(g.prs[0].url, "https://github.com/foo/bar/pull/42");
+        assert_eq!(g.prs[1].pane_id, 612);
+        assert_eq!(g.prs[1].url, "https://github.com/foo/bar/pull/43");
+        // Round-trip preserves order + format.
+        let rendered = serialize(&t);
+        assert!(rendered.contains("pr: 578 https://github.com/foo/bar/pull/42"));
+        assert!(rendered.contains("pr: 612 https://github.com/foo/bar/pull/43"));
+        let reparsed = parse(&rendered).unwrap();
+        assert_eq!(reparsed, t);
+    }
+
+    #[test]
+    fn parses_legacy_single_pr_line_with_pane_id_zero() {
+        let s = "# Team TODO\n\n## Global TODOs\n\n\
+### [TODO-001] Legacy one\n\
+status: pr_open\n\
+origin: user\n\
+pr: https://github.com/foo/bar/pull/7\n\
+\n\
+old format.\n";
+        let t = parse(s).unwrap();
+        assert_eq!(t.globals[0].prs.len(), 1);
+        // pane_id sentinel = 0 marks "we don't know which worker"
+        assert_eq!(t.globals[0].prs[0].pane_id, 0);
+        assert_eq!(t.globals[0].prs[0].url, "https://github.com/foo/bar/pull/7");
+    }
+
+    #[test]
+    fn empty_prs_serializes_as_not_yet() {
+        let mut t = TeamTodo::default();
+        t.push_global(GlobalTodo {
+            id: "TODO-001".into(),
+            title: "x".into(),
+            status: GlobalStatus::Proposed,
+            origin: Origin::User,
+            prs: Vec::new(),
+            body: String::new(),
+        });
+        let s = serialize(&t);
+        assert!(s.contains("pr: (not yet)"));
+    }
+
+    #[test]
     fn next_actions_picks_expand_target_and_dispatch_per_worker() {
         // TODO-001 is approved + has subtasks → not an expand candidate.
         //   - pane 578 has one in_progress and one pending → no dispatch
@@ -918,7 +1022,7 @@ The test fixtures bake session cookies in; replace with a JWT minter.\n\
             title: "fresh".into(),
             status: GlobalStatus::Approved,
             origin: Origin::User,
-            pr: None,
+            prs: Vec::new(),
             body: String::new(),
         });
         let n = t.next_actions();
@@ -954,7 +1058,7 @@ The test fixtures bake session cookies in; replace with a JWT minter.\n\
             title: "first".into(),
             status: GlobalStatus::Proposed,
             origin: Origin::TechLead,
-            pr: None,
+            prs: Vec::new(),
             body: "body".into(),
         });
         save(&tmp, &t).unwrap();

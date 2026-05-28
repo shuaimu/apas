@@ -163,20 +163,22 @@ function GlobalRow({ g }: { g: TeamTodoGlobal }) {
     <li className="rounded border border-gray-200 bg-gray-50 p-2 dark:border-gray-700 dark:bg-gray-800/40">
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <code className="text-[10px] text-gray-500 dark:text-gray-400">{g.id}</code>
             <StatusBadge status={g.status} />
             <OriginBadge origin={g.origin} />
-            {g.pr && (
+            {g.prs?.map((pr, i) => (
               <a
-                href={g.pr}
+                key={i}
+                href={pr.url}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="text-[11px] text-blue-600 hover:underline dark:text-blue-400"
+                title={pr.url}
               >
-                PR ↗
+                PR{pr.pane_id ? ` (pane ${pr.pane_id})` : ""} ↗
               </a>
-            )}
+            ))}
           </div>
           <p className="mt-0.5 text-sm font-medium text-gray-900 dark:text-gray-100">
             {g.title}

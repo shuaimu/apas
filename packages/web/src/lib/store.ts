@@ -164,8 +164,15 @@ export interface TeamTodoGlobal {
   status: string;
   /// user | tech-lead
   origin: string;
-  pr?: string | null;
+  /// One PR per contributing worker pane. Empty until any worker's
+  /// branch has been pushed and PR'd.
+  prs: TeamTodoPaneTodoPr[];
   body: string;
+}
+
+export interface TeamTodoPaneTodoPr {
+  pane_id: number;
+  url: string;
 }
 
 export interface TeamTodoWorker {

@@ -1044,9 +1044,17 @@ pub struct TeamTodoGlobalMsg {
     pub status: String,
     /// user | tech-lead
     pub origin: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pr: Option<String>,
+    /// One PR per contributing worker. Empty until any worker's branch
+    /// has been pushed and PR'd.
+    #[serde(default)]
+    pub prs: Vec<PaneTodoPrMsg>,
     pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaneTodoPrMsg {
+    pub pane_id: u32,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
