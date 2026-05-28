@@ -5,9 +5,34 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 const REPO_URL: &str = "https://github.com/shuaimu/apas.git";
 const CURRENT_VERSION: &str = env!("APAS_VERSION");
+
+/// Snapshot of `current_exe()` taken at process launch (before any
+/// binary replacement). Used by `resolve_preferred_apas_executable` so
+/// reboots exec a known-good path even after `current_exe()` starts
+/// returning an NFS silly-renamed `.nfsXXX` inode.
+static LAUNCH_BINARY_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Capture the exec path at startup. Call this from `main` before any
+/// long-running work (and definitely before the daemon could survive
+/// long enough for the binary to be replaced underneath it). Only stores
+/// the path if it looks like a real on-disk file — `/proc/self/exe`,
+/// deleted, and `.nfsXXX` paths are skipped so the existing fallback
+/// chain still applies.
+pub fn capture_launch_binary_path() {
+    if let Ok(path) = env::current_exe() {
+        if !is_proc_self_exe(&path)
+            && !is_deleted_path(&path)
+            && !is_nfs_silly_rename(&path)
+            && path.exists()
+        {
+            let _ = LAUNCH_BINARY_PATH.set(path);
+        }
+    }
+}
 
 /// Get the path to the source directory (~/.apas/source/)
 fn source_dir() -> PathBuf {
@@ -120,7 +145,18 @@ fn resolve_install_target_exe() -> Option<PathBuf> {
 
 /// Resolve the executable path we should restart/spawn.
 /// Priority is always real on-disk binaries, never /proc/self/exe.
+///
+/// The launch-time snapshot wins if it's still on disk — after an
+/// atomic binary swap, the original path now points to the *new*
+/// binary, while `current_exe()` points to the `.nfsXXX` silly-rename
+/// of the old inode. Capturing the path at launch and reusing it is
+/// the simplest way to make reboot deterministic.
 pub fn resolve_preferred_apas_executable() -> PathBuf {
+    if let Some(p) = LAUNCH_BINARY_PATH.get() {
+        if p.exists() {
+            return p.clone();
+        }
+    }
     get_current_on_disk_exe()
         .or_else(home_installed_exe)
         .or_else(path_installed_exe)

@@ -184,6 +184,14 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Snapshot the exec path while it's still a clean, real on-disk
+    // path. Later, when the binary gets replaced atomically (NFS
+    // silly-rename → `.nfsXXX`), `current_exe()` returns the stale
+    // inode and the existing fallback chain has to guess the install
+    // location. Capturing here makes `resolve_preferred_apas_executable`
+    // deterministic.
+    update::capture_launch_binary_path();
+
     // Auto-upgrade on boot if a new version is available.
     // Skip for subcommands (login, update, etc.) and for --headless:
     // headless processes are spawned by the daemon, often several at once,
