@@ -142,6 +142,31 @@ Do NOT write production code yourself — you're a reviewer, not a worker
 on this TODO. If you find yourself reaching for Write/Edit/Bash on
 production files, your output should have been a review critique instead.";
 
+/// Default protocol addendum for any role that isn't Manager / Tech Lead
+/// / Reviewer. Tells the agent how it receives delegations from the
+/// Tech Lead (and the Reviewer, who sends fix-requests directly) and
+/// how it should publish diffs so the Reviewer can find them.
+const WORKER_NOTE: &str = "\
+# Worker protocol
+You are a worker pane in this project's team. The Tech Lead reads `team-todo.md` + `.apas-team.jsonl` each iteration and dispatches subtasks to you via the standard delegation protocol; the Reviewer iterates with you on fixes after you publish a diff. You don't write `team-todo.md` directly — you receive work and ship code.
+
+## Receiving work
+- New work arrives as a `.apas-team.jsonl` record with `tags` containing `delegate-to:<your_pane_id>` and `task:<TODO-NNN · slug>`. The CLI routes the record body straight into your input queue, so a delegation appears like a user message.
+- A `revise` request from the Reviewer arrives the same way — `delegate-to:<your_pane_id>` plus `task:<TODO-NNN-fix-N>`. Treat it as priority; the Reviewer's critique is in the body.
+
+## Publishing diffs
+- When your subtask is done (committed in your worktree), append a `kind: \"diff\"` record to `.apas-team.jsonl` so the Reviewer can find it. Include `tags: [\"task:<TODO-NNN · slug>\"]` matching the original delegation so the Reviewer can pair diff↔task.
+- For the body: a short summary + the actual `git diff` output (`git -C <your_worktree> diff main...HEAD`). Keep it bounded to ~50 KB; if the diff is huge, summarize and link to the branch.
+- For revisions, publish a fresh `kind: \"diff\"` record per iteration with the new tag (e.g. `task:TODO-NNN-fix-2`). Don't try to update an old record — the scratchpad is append-only.
+
+## Replying to delegations
+- When you accept a task, optionally publish a `kind: \"reply\"` record with `tags: [\"reply-to:<task_id>\"]` and a one-line ack. Not strictly required but helps the Delegation board show \"received.\"
+
+## What you DO NOT do
+- Don't edit `team-todo.md` — that's the Tech Lead's. (You CAN read it for context.)
+- Don't talk to the human directly — escalate via `kind: \"escalation\"` and the Manager will surface it.
+- Don't delegate to other workers — that's the Tech Lead's job.";
+
 /// v3: "manager" substring → user-facing Manager. Excludes "tech lead"
 /// so the legacy role string "team manager / tech lead" routes to the
 /// Tech-Lead protocol instead (it's an orchestrator role, not a
@@ -201,6 +226,12 @@ pub fn compose_system_prompt(
         }
         if role_is_reviewer(role) {
             sections.push(REVIEWER_NOTE.to_string());
+        }
+        // Default for any pane that isn't a recognized orchestrator
+        // role: it's a worker. Teach the standard delegation protocol
+        // so it knows how to receive work + publish diffs.
+        if !role_is_manager(role) && !role_is_tech_lead(role) && !role_is_reviewer(role) {
+            sections.push(WORKER_NOTE.to_string());
         }
         Some(sections.join("\n\n"))
     }
@@ -322,8 +353,43 @@ mod tests {
         assert!(!got.contains("# Manager protocol"));
         assert!(!got.contains("# Tech Lead protocol"));
         assert!(!got.contains("# Reviewer protocol"));
-        // But scratchpad note still rides along.
+        // But scratchpad note + the worker-protocol addendum still ride along.
         assert!(got.contains("# Team scratchpad"));
+        assert!(got.contains("# Worker protocol"));
+    }
+
+    #[test]
+    fn worker_role_learns_delegation_and_diff_publish_protocol() {
+        let got = compose_system_prompt(Some("backend engineer"), None, None).unwrap();
+        assert!(got.contains("# Worker protocol"));
+        // The two contracts the Tech Lead / Reviewer rely on:
+        assert!(got.contains("delegate-to:<your_pane_id>"));
+        assert!(got.contains("kind: \"diff\""));
+        // Reviewer-spec tag for pairing diff↔task.
+        assert!(got.contains("task:<TODO-NNN"));
+    }
+
+    #[test]
+    fn manager_role_does_not_get_worker_addendum() {
+        // Manager has its own protocol; would be confusing to also tell
+        // it to publish kind:"diff" records.
+        let got = compose_system_prompt(Some("team manager"), None, None).unwrap();
+        assert!(got.contains("# Manager protocol"));
+        assert!(!got.contains("# Worker protocol"));
+    }
+
+    #[test]
+    fn tech_lead_role_does_not_get_worker_addendum() {
+        let got = compose_system_prompt(Some("tech lead"), None, None).unwrap();
+        assert!(got.contains("# Tech Lead protocol"));
+        assert!(!got.contains("# Worker protocol"));
+    }
+
+    #[test]
+    fn reviewer_role_does_not_get_worker_addendum() {
+        let got = compose_system_prompt(Some("reviewer"), None, None).unwrap();
+        assert!(got.contains("# Reviewer protocol"));
+        assert!(!got.contains("# Worker protocol"));
     }
 
     #[test]

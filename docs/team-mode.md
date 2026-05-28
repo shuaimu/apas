@@ -4,6 +4,16 @@ A short tour of the "team mode" features in APAS. Everything described here
 is opt-in — a single pane with no role and no worktree behaves like classic
 APAS.
 
+> **Looking for the TODO-driven workflow?** See
+> [`todo-driven-workflow.md`](./todo-driven-workflow.md). It's the
+> higher-level protocol layered on top of the primitives in this doc:
+> a `team-todo.md` queue the Tech Lead drives, with an auto-spawned
+> Manager + Tech Lead + Reviewer trio, user-facing Approve/Reject
+> buttons in the web Overview, and one PR per contributing worker.
+> Most users want to read both — this doc covers the pane mechanics
+> (worktrees, scratchpad, plan review); that doc covers how the team
+> coordinates around shared goals.
+
 ## Mental model
 
 - A **pane** is one teammate. Each pane has its own model/provider, optional
