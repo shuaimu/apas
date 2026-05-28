@@ -789,14 +789,19 @@ export const useStore = create<AppState>((set, get) => ({
             set({ reconnectAttempts: 0 });
             get().connect();
           } else {
-            // WS still alive — messages have been streaming the whole time
-            // (modulo any browser throttling). Just refresh ancillary
-            // state. Do NOT re-attach: forceReload would wipe
-            // paneMessages and refetch from the server, causing every
-            // mobile foreground to "snap back" mid-conversation.
+            // WS *looks* alive — but a silently-stale WS (mobile OS
+            // throttling, power saving, sleep/wake cycles) can swallow
+            // stream_messages without ever triggering onclose. Trusting
+            // readyState alone left users staring at stale tabs after
+            // unhiding. Refresh ancillary state AND fire a tail catchup
+            // for the current session so any messages we missed while
+            // backgrounded land before the user starts reading.
             console.log("Connection appears healthy, refreshing data...");
             get().refreshCliClients();
             get().listSessions();
+            if (sessionId) {
+              requestCatchupIfNeeded(get, sessionId);
+            }
             // If sessionId is set but isAttached is false (server-side
             // attachment got dropped for some reason), reattach without
             // forceReload — cache-first so the user keeps their messages.
