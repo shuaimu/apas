@@ -11,22 +11,18 @@ import { ResourceUseRollup } from "./ResourceUseRollup";
 import { AddWorkerModal } from "./AddWorkerModal";
 import { ProjectGoalBar } from "./ProjectGoalBar";
 import { TeamTodoPanel } from "./TeamTodoPanel";
-import { TechLeadStream } from "./TechLeadStream";
 
 /**
  * Phase 5.1 / v3 split — team overview pseudo-tab.
  *
- * Layout:
- *  - Top: ProjectGoalBar (project goal + Start/Pause for Manager + Tech Lead).
- *  - Bottom: 2-column split on lg+ screens, stacked on mobile.
- *      Left:  team status (pane grid, scratchpad ticker, delegation board,
- *             resource use roll-up).
- *      Right: TechLeadStream — embedded view of the Tech Lead pane's
- *             iterations (placeholder when no Tech Lead is running).
+ * Layout: single column, stacked sections.
+ *  - ProjectGoalBar (project goal + Start/Pause for Manager + Tech Lead)
+ *  - TeamTodoPanel (the TODO queue + agent status + add form)
+ *  - Pane grid + scratchpad ticker + delegation board + resource roll-up
  *
- * The Manager pane has its own regular tab in the TabBar, so there's no
- * embedded chat box here — would be redundant. Click into the Manager tab
- * to talk to it.
+ * The Manager + Tech Lead each have their own regular tabs in the TabBar,
+ * so there are no embedded chat / iteration-stream boxes here — would be
+ * redundant. Click into the pane to interact directly.
  */
 interface OverviewViewProps {
   onOpenPane: (paneId: number) => void;
@@ -49,14 +45,6 @@ export function OverviewView({
   const paneConfigs = useStore((s) => s.paneConfigs);
   const sendMessageToPane = useStore((s) => s.sendMessageToPane);
   const showToast = useStore((s) => s.showToast);
-  const techLeadPane = useMemo(
-    () =>
-      paneConfigs.find((p) => {
-        const lower = (p.role ?? "").toLowerCase();
-        return lower.includes("tech lead") && p.mode === "deadloop";
-      }),
-    [paneConfigs],
-  );
   const managerPane = useMemo(
     () =>
       paneConfigs.find((p) => {
@@ -121,47 +109,37 @@ export function OverviewView({
           </div>
         </div>
         <p className="mb-6 text-sm text-gray-500 dark:text-gray-400">
-          Project goal sits at the top. Left side: team status. Right side:
-          the Tech Lead&apos;s iteration stream when one is running. Talk to
-          the Manager from its own tab.
+          Project goal at the top, then the TODO queue, then per-pane
+          status. Talk to the Manager or watch the Tech Lead from their
+          own tabs.
         </p>
 
         <ProjectGoalBar />
 
         <TeamTodoPanel />
 
-        <div className="flex flex-col gap-4 lg:flex-row">
-          {/* Left column: team status sections */}
-          <div className="flex min-w-0 flex-1 flex-col">
-            <OverviewSection title="Pane grid">
-              <PaneGrid
-                onOpenPane={onOpenPane}
-                onOpenDiff={onOpenDiff}
-                onOpenRole={onOpenRole}
-                onPausePane={onPausePane}
-                onResumePane={onResumePane}
-                onRemovePane={onRemovePane}
-              />
-            </OverviewSection>
+        <OverviewSection title="Pane grid">
+          <PaneGrid
+            onOpenPane={onOpenPane}
+            onOpenDiff={onOpenDiff}
+            onOpenRole={onOpenRole}
+            onPausePane={onPausePane}
+            onResumePane={onResumePane}
+            onRemovePane={onRemovePane}
+          />
+        </OverviewSection>
 
-            <OverviewSection title="Team scratchpad">
-              <ScratchpadTicker />
-            </OverviewSection>
+        <OverviewSection title="Team scratchpad">
+          <ScratchpadTicker />
+        </OverviewSection>
 
-            <OverviewSection title="Delegation board">
-              <DelegationBoard />
-            </OverviewSection>
+        <OverviewSection title="Delegation board">
+          <DelegationBoard />
+        </OverviewSection>
 
-            <OverviewSection title="Resource use">
-              <ResourceUseRollup />
-            </OverviewSection>
-          </div>
-
-          {/* Right column: Tech Lead's iteration stream */}
-          <div className="flex min-w-0 flex-1 flex-col lg:max-w-xl lg:sticky lg:top-4 lg:self-start" style={{ minHeight: "60vh" }}>
-            <TechLeadStream techLeadPane={techLeadPane} onOpenPane={onOpenPane} />
-          </div>
-        </div>
+        <OverviewSection title="Resource use">
+          <ResourceUseRollup />
+        </OverviewSection>
       </div>
       <AddWorkerModal open={addWorkerOpen} onClose={() => setAddWorkerOpen(false)} />
     </div>
