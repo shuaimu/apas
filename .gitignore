@@ -30,6 +30,10 @@ Thumbs.db
 .apas-worktrees/
 team-todo.md
 project_goal.md
+# Per-agent scratchpad cursors (Tech Lead / Reviewer track where they
+# last read so they don't re-process — or miss — records).
+.apas-tech-lead-cursor
+.apas-reviewer-cursor
 
 # Environment
 .env

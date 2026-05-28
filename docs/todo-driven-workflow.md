@@ -165,6 +165,26 @@ Reviewer pushes feedback → `revising`. Worker fixes → `reviewing` again.
 Loop until `approved`. Once every subtask under a global TODO is
 `approved`, the global TODO flips `under_review` → `pr_open`.
 
+## Scratchpad cursors
+
+Tech Lead and Reviewer both iterate on a self-paced /loop cadence
+(roughly every 2 min). A busy team can easily generate more than that
+many records between iterations, so a fixed-window `tail -n 30` will
+miss things. Both agents instead maintain a per-pane cursor file:
+
+- `.apas-tech-lead-cursor` — single-line file holding the `ts` of the
+  last scratchpad record the Tech Lead acted on.
+- `.apas-reviewer-cursor` — same idea for the Reviewer.
+
+Each iteration the agent reads the cursor, queries records strictly
+newer (`jq -c 'select(.ts > "<cursor>")' .apas-team.jsonl`), acts,
+then writes back the newest `ts` it processed. First run (cursor file
+missing) falls back to `tail -n 50` as catch-up.
+
+Both files are git-ignored. Re-processing on cursor loss is safe
+because every action also updates `team-todo.md` — the state machine
+deduplicates idempotently.
+
 ## Editing the doc — agents do it directly
 
 `team-todo.md` is the source of truth. Everyone with file access reads
