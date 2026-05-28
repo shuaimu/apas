@@ -92,27 +92,6 @@ export function OverviewView({
           <h2 className="text-xl font-semibold text-gray-900 dark:text-gray-100">
             Team Overview
           </h2>
-          <div className="flex flex-wrap gap-2">
-            <button
-              type="button"
-              onClick={handleSuggestWorkers}
-              disabled={!managerPane}
-              className="flex items-center gap-1.5 rounded border border-indigo-400 bg-indigo-50 px-3 py-1.5 text-sm font-medium text-indigo-700 transition-colors hover:bg-indigo-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-300 dark:hover:bg-indigo-900/50"
-              title={managerPane ? "Ask the Manager to suggest workers for the current project goal" : "Start the Manager first — needed to generate suggestions"}
-            >
-              <Sparkles className="h-4 w-4" />
-              Suggest workers
-            </button>
-            <button
-              type="button"
-              onClick={() => setAddWorkerOpen(true)}
-              className="flex items-center gap-1.5 rounded border border-emerald-400 bg-emerald-50 px-3 py-1.5 text-sm font-medium text-emerald-700 transition-colors hover:bg-emerald-100 dark:border-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300 dark:hover:bg-emerald-900/50"
-              title="Add a new worker pane — pick a template, provider, and worktree in one modal"
-            >
-              <UserPlus className="h-4 w-4" />
-              Add worker
-            </button>
-          </div>
         </div>
         <p className="mb-6 text-sm text-gray-500 dark:text-gray-400">
           Project goal at the top, then the TODO queue, then per-pane
@@ -135,6 +114,28 @@ export function OverviewView({
             onRemovePane={onRemovePane}
           />
         </OverviewSection>
+
+        <div className="mb-4 flex flex-wrap justify-end gap-2">
+          <button
+            type="button"
+            onClick={handleSuggestWorkers}
+            disabled={!managerPane}
+            className="flex items-center gap-1.5 rounded border border-indigo-400 bg-indigo-50 px-3 py-1.5 text-sm font-medium text-indigo-700 transition-colors hover:bg-indigo-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-300 dark:hover:bg-indigo-900/50"
+            title={managerPane ? "Ask the Manager to suggest workers for the current project goal" : "Start the Manager first — needed to generate suggestions"}
+          >
+            <Sparkles className="h-4 w-4" />
+            Suggest workers
+          </button>
+          <button
+            type="button"
+            onClick={() => setAddWorkerOpen(true)}
+            className="flex items-center gap-1.5 rounded border border-emerald-400 bg-emerald-50 px-3 py-1.5 text-sm font-medium text-emerald-700 transition-colors hover:bg-emerald-100 dark:border-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300 dark:hover:bg-emerald-900/50"
+            title="Add a new worker pane — pick a template, provider, and worktree in one modal"
+          >
+            <UserPlus className="h-4 w-4" />
+            Add worker
+          </button>
+        </div>
 
         <OverviewSection title="Suggested workers">
           <SuggestedWorkersPanel />
