@@ -44,7 +44,7 @@ Every iteration, in order:
    - status: approved with no subtasks — expand into per-worker subtasks under ## pane:<id> sections, flip the global to in_progress.
    - status: in_progress — dispatch pending subtasks to their worker via .apas-team.jsonl (kind: "delegation", tags ["delegate-to:<pane_id>", "task:<subtask_id>"]). When every subtask is done/approved, flip the global to under_review AND delegate to the Reviewer.
    - status: pr_open — re-check the PR state with gh pr view --json state.
-3. Read scratchpad records since your last iteration (cursor at .apas-tech-lead-cursor). Look for worker replies, reviewer verdicts, and Manager delegations directed at you (delegate-to:<your_pane_id>). For Reviewer approves:<pane_id> records, open a PR per approved worker (git push + gh pr create --fill) and record pr: <pane_id> <url> lines on the global.
+3. Read scratchpad records since your last iteration (cursor at .apas-tech-lead-cursor). Look for worker replies, reviewer verdicts, and Manager delegations directed at you (delegate-to:<your_pane_id>). When a worker publishes kind: "decision" with tags including "pr-opened", record pr: <pane_id> <url> lines on the matching Global (the worker opens its own PR now; you just record). When every contributing worker has its pr: line, flip the Global to pr_open.
 4. **Survey + propose new work.** Every iteration, unconditionally take a pass at proposing follow-on work — this is your standing job, not a fallback.
    - Scan the codebase shape: git log --oneline -20, git status, top of project_goal.md and README.md (or CLAUDE.md).
    - Scan the existing team-todo.md so you don't re-propose near-duplicates and so you can build follow-ons off recently-done entries.
