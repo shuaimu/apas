@@ -608,6 +608,53 @@ async fn run_inner(
     }
     save_project(working_dir, &metadata)?;
 
+    // Orphan-cleanup sweep: drop `## pane:<id>` sections in team-todo.md
+    // for panes that no longer exist in .apas (typically: user removed
+    // them via the web while team-todo.md still had unfinished subtasks
+    // assigned). Mirrors the per-removal cleanup in the RemovePane
+    // handler — without this, the Tech Lead keeps trying to dispatch
+    // to ghost panes across reboots.
+    {
+        let live_pane_ids: std::collections::HashSet<u32> =
+            metadata.panes.iter().map(|p| p.pane_id).collect();
+        if let Ok(mut todo) = crate::team_todo::load(working_dir) {
+            let orphan_pane_ids: Vec<u32> = todo
+                .workers
+                .iter()
+                .map(|w| w.pane_id)
+                .filter(|id| !live_pane_ids.contains(id))
+                .collect();
+            if !orphan_pane_ids.is_empty() {
+                for orphan in orphan_pane_ids {
+                    tracing::info!(
+                        pane_id = orphan,
+                        "cleaning orphan team-todo section on boot (pane no longer in .apas)"
+                    );
+                    let orphaned_parents = todo.remove_pane_subtasks(orphan);
+                    for parent_id in &orphaned_parents {
+                        if let Some(g) = todo.find_global_mut(parent_id) {
+                            if matches!(
+                                g.status,
+                                crate::team_todo::GlobalStatus::InProgress
+                                    | crate::team_todo::GlobalStatus::UnderReview
+                            ) {
+                                tracing::info!(
+                                    todo = %parent_id,
+                                    old_status = ?g.status,
+                                    "resetting orphaned Global to approved on boot"
+                                );
+                                g.status = crate::team_todo::GlobalStatus::Approved;
+                            }
+                        }
+                    }
+                }
+                if let Err(e) = crate::team_todo::save(working_dir, &todo) {
+                    tracing::warn!("Failed to save team-todo.md after boot orphan cleanup: {}", e);
+                }
+            }
+        }
+    }
+
     let default_prompt = DEFAULT_PROMPT.to_string();
 
     let working_dir_str = working_dir.to_string_lossy().to_string();
