@@ -583,6 +583,15 @@ async fn run_inner(
             Some(crate::role::TECH_LEAD_DEADLOOP_PROMPT)
         } else if lower.contains("reviewer") {
             Some(crate::role::REVIEWER_DEADLOOP_PROMPT)
+        } else if lower.contains("developer")
+            && pane.worktree_path.is_none()
+        {
+            // Only refresh the default auto-spawned generalist (no
+            // worktree). Specialized developer panes spawned via
+            // Suggest workers tend to have a worktree_path; they're
+            // single-purpose and shouldn't have their loop prompt
+            // replaced by the generic Developer one.
+            Some(crate::role::DEFAULT_DEVELOPER_DEADLOOP_PROMPT)
         } else {
             None
         };
@@ -1139,6 +1148,14 @@ async fn run_inner(
             m.managed
                 && lower.contains("reviewer")
         });
+        // Role-only match (no mode constraint) — both auto-spawned deadloop
+        // developers AND user-spawned interactive developers count, so we
+        // never duplicate. A project with existing dev panes keeps them;
+        // a fresh project gets one default deadloop developer.
+        let has_developer = metas_guard.values().any(|m| {
+            let lower = m.role.as_deref().unwrap_or("").to_ascii_lowercase();
+            m.managed && lower.contains("developer")
+        });
         drop(metas_guard);
         if !has_manager {
             let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
@@ -1205,6 +1222,28 @@ async fn run_inner(
                 managed: true,
             });
             tracing::info!(pane_id, "auto-spawning Reviewer pane (missing from .apas)");
+        }
+        if !has_developer {
+            let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
+            let _ = event_tx.send(TuiEvent::AddTabWithConfig {
+                pane_id,
+                label: "Developer".to_string(),
+                claude_session_id: Uuid::new_v4(),
+                mode: shared::PaneMode::Deadloop,
+                provider: shared::Provider::Claude,
+                prompt: Some(crate::role::DEFAULT_DEVELOPER_DEADLOOP_PROMPT.to_string()),
+                min_iteration_interval_minutes: None,
+                model: None,
+                effort: None,
+                worktree_path: None,
+                initial_input: None,
+                role: Some(crate::role::DEFAULT_DEVELOPER_ROLE.to_string()),
+                goal: Some(crate::role::DEFAULT_DEVELOPER_GOAL.to_string()),
+                backstory: Some(crate::role::DEFAULT_DEVELOPER_BACKSTORY.to_string()),
+                plan_review_mode: shared::PlanReviewMode::default(),
+                managed: true,
+            });
+            tracing::info!(pane_id, "auto-spawning Developer pane (missing from .apas)");
         }
     }
 
