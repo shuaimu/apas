@@ -147,6 +147,14 @@ export interface SessionCacheEntry {
   /// `sessionLastCreatedAt` is fresh on every page load and cannot recover
   /// this on its own).
   lastCreatedAt?: string;
+  /// Latest `team-todo.md` snapshot for this session. Persisted so the
+  /// Overview's TODO panel renders the right content immediately on
+  /// refresh instead of going through the fetch round-trip (which can
+  /// silently fail when the CLI is briefly disconnected or slow).
+  teamTodoState?: TeamTodoState;
+  /// Latest `suggested-workers.md` snapshot for this session. Same
+  /// reasoning as `teamTodoState`.
+  suggestedWorkers?: SuggestedWorker[];
 }
 
 /// Wire shape of team-todo.md (mirrors shared::TeamTodoStateMsg).
@@ -998,6 +1006,8 @@ export const useStore = create<AppState>((set, get) => ({
           // page load can ask the server for messages newer than this
           // instead of falsely trusting the stale cache forever.
           lastCreatedAt: state.sessionLastCreatedAt.get(currentSessionId),
+          teamTodoState: state.teamTodoStates.get(currentSessionId),
+          suggestedWorkers: state.suggestedWorkersBySession.get(currentSessionId),
         };
         sessionCache.set(currentSessionId, entry);
         // Mirror the snapshot to IndexedDB so it survives a reload —
@@ -1958,7 +1968,26 @@ if (typeof window !== "undefined") {
           seededLast.set(k, v.lastCreatedAt);
         }
       }
-      return { sessionCache: merged, sessionLastCreatedAt: seededLast };
+      // Seed per-session file snapshots (team-todo, suggested-workers)
+      // so the Overview panels render immediately on refresh instead of
+      // going through a fetch round-trip (which silently does nothing
+      // when the CLI is briefly offline). In-memory wins on conflict.
+      const seededTodos = new Map(state.teamTodoStates);
+      const seededSuggested = new Map(state.suggestedWorkersBySession);
+      for (const [k, v] of diskCache) {
+        if (v.teamTodoState && !seededTodos.has(k)) {
+          seededTodos.set(k, v.teamTodoState);
+        }
+        if (v.suggestedWorkers && !seededSuggested.has(k)) {
+          seededSuggested.set(k, v.suggestedWorkers);
+        }
+      }
+      return {
+        sessionCache: merged,
+        sessionLastCreatedAt: seededLast,
+        teamTodoStates: seededTodos,
+        suggestedWorkersBySession: seededSuggested,
+      };
     });
     // Race fix: if `attachSession` already fired for the current
     // session before IDB hydration completed, it read an empty
@@ -2022,12 +2051,17 @@ if (typeof window !== "undefined") {
       state.messages === prev.messages &&
       state.paneConfigs === prev.paneConfigs &&
       state.paneHasMore === prev.paneHasMore &&
-      state.paneModes === prev.paneModes
+      state.paneModes === prev.paneModes &&
+      state.teamTodoStates === prev.teamTodoStates &&
+      state.suggestedWorkersBySession === prev.suggestedWorkersBySession
     ) {
       return;
     }
     const hasAnyData =
-      state.messages.length > 0 || Object.keys(state.paneMessages).length > 0;
+      state.messages.length > 0 ||
+      Object.keys(state.paneMessages).length > 0 ||
+      state.teamTodoStates.has(state.sessionId) ||
+      state.suggestedWorkersBySession.has(state.sessionId);
     if (!hasAnyData) return;
     if (snapshotTimer) clearTimeout(snapshotTimer);
     snapshotTimer = setTimeout(() => {
@@ -2046,6 +2080,8 @@ if (typeof window !== "undefined") {
         answeredQuestions: cur.answeredQuestions,
         cachedAt: Date.now(),
         lastCreatedAt: cur.sessionLastCreatedAt.get(sid),
+        teamTodoState: cur.teamTodoStates.get(sid),
+        suggestedWorkers: cur.suggestedWorkersBySession.get(sid),
       };
       saveSnapshotIdb(sid, entry);
     }, 1_000);
