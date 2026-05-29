@@ -446,22 +446,35 @@ fn parse_item_heading(s: &str) -> Option<(String, String)> {
 }
 
 fn parse_worker_heading(s: &str) -> Option<(u32, Option<String>)> {
-    // Expected: `pane:NNN` or `pane:NNN — role-hint` (em dash) or
-    // `pane:NNN - role-hint` (ascii dash).
+    // Canonical form is `pane:NNN — role-hint` (em dash), but tolerate
+    // anything the Tech Lead might write — ASCII dash, parens, colon,
+    // bare number. Read the leading digits, then strip common
+    // separators around whatever role-hint follows.
     let s = s.trim();
-    let after = s.strip_prefix("pane:")?;
-    // Split at the first em dash or " - ".
-    let (id_part, role_part) = if let Some(idx) = after.find('\u{2014}') {
-        (&after[..idx], Some(after[idx + '\u{2014}'.len_utf8()..].trim()))
-    } else if let Some(idx) = after.find(" - ") {
-        (&after[..idx], Some(after[idx + 3..].trim()))
+    let after = s.strip_prefix("pane:")?.trim_start();
+    let digit_end = after
+        .char_indices()
+        .take_while(|(_, c)| c.is_ascii_digit())
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    if digit_end == 0 {
+        return None;
+    }
+    let pane_id = after[..digit_end].parse::<u32>().ok()?;
+    let role_hint = after[digit_end..]
+        .trim()
+        .trim_start_matches(|c: char| {
+            c == '\u{2014}' || c == '-' || c == ':' || c == '(' || c.is_whitespace()
+        })
+        .trim_end_matches(|c: char| c == ')' || c.is_whitespace())
+        .trim()
+        .to_string();
+    let role_hint = if role_hint.is_empty() {
+        None
     } else {
-        (after, None)
+        Some(role_hint)
     };
-    let pane_id = id_part.trim().parse::<u32>().ok()?;
-    let role_hint = role_part
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
     Some((pane_id, role_hint))
 }
 
@@ -942,6 +955,32 @@ The test fixtures bake session cookies in; replace with a JWT minter.\n\
         let s = serialize(&t);
         assert!(s.contains("# Team TODO"));
         assert!(s.contains("## Global TODOs"));
+    }
+
+    #[test]
+    fn parse_worker_heading_handles_separators() {
+        assert_eq!(
+            parse_worker_heading("pane:218"),
+            Some((218, None))
+        );
+        assert_eq!(
+            parse_worker_heading("pane:218 \u{2014} Frontend developer"),
+            Some((218, Some("Frontend developer".to_string())))
+        );
+        assert_eq!(
+            parse_worker_heading("pane:218 - Frontend developer"),
+            Some((218, Some("Frontend developer".to_string())))
+        );
+        assert_eq!(
+            parse_worker_heading("pane:218 (Frontend developer)"),
+            Some((218, Some("Frontend developer".to_string())))
+        );
+        assert_eq!(
+            parse_worker_heading("pane:218: Frontend developer"),
+            Some((218, Some("Frontend developer".to_string())))
+        );
+        assert_eq!(parse_worker_heading("pane:nope"), None);
+        assert_eq!(parse_worker_heading("manager"), None);
     }
 
     #[test]
