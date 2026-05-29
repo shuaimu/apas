@@ -50,6 +50,42 @@ pub fn truncate_message_content(
             }
         }
     }
+    if message_type == "tool_use" {
+        // Envelope: {"id": "...", "name": "...", "input": <value>}. The web
+        // does JSON.parse(content) on initial load; a raw-byte truncation
+        // leaves invalid JSON, the parse throws, and the message falls back
+        // to plain text — which means tools like AskUserQuestion silently
+        // lose their UI card. Preserve envelope validity by trimming only
+        // the `input` field.
+        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(obj) = v.as_object_mut() {
+                let original_len = content.len();
+                if let Some(input) = obj.get_mut("input") {
+                    if let Some(s) = input.as_str() {
+                        // String input (e.g. Bash command) — trim to a head.
+                        let head: String = s.chars().take(8_192).collect();
+                        *input = serde_json::Value::String(format!(
+                            "{head}\n…[truncated for {reason}; full size {original_len} bytes]"
+                        ));
+                    } else {
+                        // Structured input (e.g. AskUserQuestion's
+                        // {questions: [...]}). Replace wholesale with a
+                        // marker; we can't selectively trim object trees
+                        // without breaking the tool-specific schema, and
+                        // structured inputs above the cap are pathological.
+                        *input = serde_json::json!({
+                            "_truncated": true,
+                            "_original_bytes": original_len,
+                            "_reason": reason,
+                        });
+                    }
+                }
+                if let Ok(serialized) = serde_json::to_string(&v) {
+                    return serialized;
+                }
+            }
+        }
+    }
     let original_len = content.len();
     let head: String = content.chars().take(8_192).collect();
     format!("{head}\n…[truncated for {reason}; full size {original_len} bytes]")
