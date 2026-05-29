@@ -807,7 +807,15 @@ export const useStore = create<AppState>((set, get) => ({
     // If not, close — onclose drives the existing reconnect path.
     let lastIncomingAt = Date.now();
     const heartbeatMs = 5_000;
-    const livenessMs = 10_000; // strictly > heartbeatMs so an in-flight echo always wins
+    // Liveness window has to be comfortably larger than the worst-case
+    // single-frame download — for big projects (1+ GB messages.jsonl
+    // with multi-MB tool_result dumps) a single session_messages reply
+    // can take 10-20s to arrive on cellular. The browser only fires
+    // onmessage once the full frame lands, so `lastIncomingAt` doesn't
+    // tick during the download. 30s gives headroom; truly-dead WSes
+    // still surface within that window because heartbeat pings keep
+    // round-tripping under normal conditions.
+    const livenessMs = 30_000;
     const heartbeatHandle = setInterval(() => {
       if (ws.readyState !== WebSocket.OPEN) return;
       try {
