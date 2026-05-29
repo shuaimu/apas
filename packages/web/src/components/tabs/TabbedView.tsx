@@ -380,6 +380,24 @@ export function TabbedView() {
     [effectiveTabs],
   );
 
+  // The interactive Manager pane — its tab is the preferred default
+  // landing surface for a fresh project, so the user can chat the goal
+  // before opening any worker tab. Matches the role detection used by
+  // ProjectGoalBar and OverviewView.
+  const managerTabId = useMemo(() => {
+    for (const tab of effectiveTabs) {
+      const lower = (tab.role ?? "").toLowerCase();
+      if (
+        lower.includes("manager") &&
+        !lower.includes("tech lead") &&
+        tab.mode === "interactive"
+      ) {
+        return tab.pane_id;
+      }
+    }
+    return null;
+  }, [effectiveTabs]);
+
   // Track the cliClientId we last derived activeTabId for, so a project
   // switch always re-reads the persisted preference even when the
   // outgoing project's activeTabId happens to be a valid id in the
@@ -419,10 +437,14 @@ export function TabbedView() {
       return;
     }
     // Fall through: persisted pref is gone or no longer matches a real
-    // pane. Pick the first visible tab visually but DON'T persist —
-    // we'd otherwise overwrite the user's intent on the next save.
-    if (activeTabId !== ids[0]) setActiveTabId(ids[0]);
-  }, [activeTabId, cliClientId, paneConfigs.length, tabIds]);
+    // pane. Prefer the Manager pane (chat-first landing); otherwise
+    // land on the Overview pseudo-tab — that's where Start Manager and
+    // the project-goal input live, so a brand-new project still gives
+    // the user something useful to click. Don't persist; we'd
+    // otherwise overwrite the user's intent on the next explicit click.
+    const fallback = managerTabId ?? OVERVIEW_PANE_ID;
+    if (activeTabId !== fallback) setActiveTabId(fallback);
+  }, [activeTabId, cliClientId, managerTabId, paneConfigs.length, tabIds]);
 
   // Lazy-load: when activeTabId changes (initial pick or user click),
   // fetch that pane's messages if we haven't already. Server's attach
@@ -1107,6 +1129,7 @@ export function TabbedView() {
                     isLoading={loadingMorePane === tab.pane_id}
                     hasMore={paneHasMore[paneKey(tab.pane_id)] || false}
                     isActive={isActive}
+                    role={tab.role}
                   />
                 </>
               )}
@@ -1974,9 +1997,13 @@ interface MessagePaneProps {
    * false, the pane is mounted but `display: none`. Phase: hide-not-
    * unmount switching. */
   isActive: boolean;
+  /** Pane role string used to tailor the first-run empty state. The
+   * Manager pane gets a chat-first prompt; everyone else falls back to
+   * the generic placeholder. */
+  role?: string;
 }
 
-function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, isActive }: MessagePaneProps) {
+function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, isActive, role }: MessagePaneProps) {
   const sessionId = useStore((s) => s.sessionId);
   const containerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -2161,6 +2188,29 @@ function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, isActiv
   }, [messages.length, isActive]);
 
   if (messages.length === 0) {
+    const lowerRole = (role ?? "").toLowerCase();
+    const isManager =
+      lowerRole.includes("manager") && !lowerRole.includes("tech lead");
+    if (isManager) {
+      return (
+        <div className="flex-1 flex items-center justify-center text-gray-500 dark:text-gray-400 px-4">
+          <div className="max-w-md text-center">
+            <p className="text-base font-medium text-gray-700 dark:text-gray-200">
+              Talk to your Manager
+            </p>
+            <p className="mt-2 text-xs leading-relaxed">
+              State the project goal in one or two sentences below — the
+              Manager keeps <span className="font-mono">project_goal.md</span> in
+              sync and hands work to the Tech Lead, who delegates to workers.
+            </p>
+            <p className="mt-2 text-[11px] opacity-75">
+              Tip: try <em>&ldquo;Scan the repo and draft a starter goal&rdquo;</em> or
+              describe the next milestone yourself.
+            </p>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="flex-1 flex items-center justify-center text-gray-400 px-4">
         <div className="text-center">
