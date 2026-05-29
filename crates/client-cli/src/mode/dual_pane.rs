@@ -1051,6 +1051,7 @@ async fn run_inner(
                 pending_qs,
                 effort_arc,
                 input_channels_for_dl,
+                true,
             )
         }));
     }
@@ -2072,6 +2073,7 @@ fn handle_tui_events(
                             pending_qs,
                             effort_arc,
                             input_channels_for_dl,
+                            try_resume_first,
                         )
                     });
                 } else {
@@ -2468,6 +2470,7 @@ fn handle_tui_events(
                             pending_qs,
                             effort_arc,
                             input_channels_for_dl,
+                            true,
                         )
                     });
                 }
@@ -4132,6 +4135,12 @@ fn run_deadloop_session(
     pending_questions: Arc<Mutex<HashMap<String, PendingAskQuestion>>>,
     effort_arc: Arc<Mutex<Option<String>>>,
     input_channels: InputChannels,
+    // Initial value for the legacy path's `try_resume_first`. Mirror
+    // of the same param on run_pane_session — false when the worker
+    // is being spawned with a freshly-minted session id (e.g.
+    // provider switch via UpdatePaneModel), so codex's `exec resume`
+    // doesn't fail with "no rollout found".
+    initial_try_resume: bool,
 ) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_deadloop_session_inner(
@@ -4161,6 +4170,7 @@ fn run_deadloop_session(
             pending_questions,
             effort_arc,
             input_channels,
+            initial_try_resume,
         )
     }));
 
@@ -4207,11 +4217,18 @@ fn run_deadloop_session_inner(
     pending_questions: Arc<Mutex<HashMap<String, PendingAskQuestion>>>,
     effort_arc: Arc<Mutex<Option<String>>>,
     input_channels: InputChannels,
+    // Same semantics as on run_pane_session — false skips the very
+    // first `--resume`/`exec resume` so codex / cursor don't fail
+    // against a freshly-minted session id from a provider switch.
+    initial_try_resume: bool,
 ) {
     // Provider::Claude → long-lived stream-json process driven from
     // run_deadloop_session_streaming. Other providers fall through to the
     // legacy per-iteration --print spawn below.
     if matches!(provider, Provider::Claude) {
+        // Claude streaming derives try_resume_first from on-disk
+        // session_jsonl existence; ignore the flag here.
+        let _ = initial_try_resume;
         return run_deadloop_session_streaming(
             binary_path,
             working_dir,
@@ -4268,7 +4285,7 @@ fn run_deadloop_session_inner(
 
     let mut iteration = 0;
     let mut first_message = true;
-    let mut try_resume_first = true;
+    let mut try_resume_first = initial_try_resume;
     let mut was_paused = false;
     let min_iteration_interval =
         Duration::from_secs(min_iteration_interval_minutes.saturating_mul(60));
