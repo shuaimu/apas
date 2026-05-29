@@ -1117,6 +1117,7 @@ async fn run_inner(
                 control_resp_slot,
                 pending_qs,
                 effort_arc,
+                true,
             )
         }));
     }
@@ -1223,6 +1224,7 @@ async fn run_inner(
                 backstory: Some(crate::role::DEFAULT_MANAGER_BACKSTORY.to_string()),
                 plan_review_mode: shared::PlanReviewMode::default(),
                 managed: true,
+                try_resume_first: true,
             });
             tracing::info!(pane_id, "auto-spawning Manager pane (missing from .apas)");
         }
@@ -1245,6 +1247,7 @@ async fn run_inner(
                 backstory: Some(crate::role::DEFAULT_TECH_LEAD_BACKSTORY.to_string()),
                 plan_review_mode: shared::PlanReviewMode::default(),
                 managed: true,
+                try_resume_first: true,
             });
             tracing::info!(pane_id, "auto-spawning Tech Lead pane (missing from .apas)");
         }
@@ -1267,6 +1270,7 @@ async fn run_inner(
                 backstory: Some(crate::role::DEFAULT_REVIEWER_BACKSTORY.to_string()),
                 plan_review_mode: shared::PlanReviewMode::default(),
                 managed: true,
+                try_resume_first: true,
             });
             tracing::info!(pane_id, "auto-spawning Reviewer pane (missing from .apas)");
         }
@@ -1289,6 +1293,7 @@ async fn run_inner(
                 backstory: Some(crate::role::DEFAULT_DEVELOPER_BACKSTORY.to_string()),
                 plan_review_mode: shared::PlanReviewMode::default(),
                 managed: true,
+                try_resume_first: true,
             });
             tracing::info!(pane_id, "auto-spawning Developer pane (missing from .apas)");
         }
@@ -1866,6 +1871,7 @@ fn handle_tui_events(
                             control_resp_slot,
                             pending_qs,
                             effort_arc,
+                            true,
                         )
                     });
                 }
@@ -1909,6 +1915,7 @@ fn handle_tui_events(
                 backstory,
                 plan_review_mode,
                 managed,
+                try_resume_first,
             }) => {
                 let label =
                     pane_label_or_default(Some(&requested_label), pane_id, model.as_deref());
@@ -2137,6 +2144,7 @@ fn handle_tui_events(
                             control_resp_slot,
                             pending_qs,
                             effort_arc,
+                            try_resume_first,
                         )
                     });
                 }
@@ -2899,6 +2907,7 @@ fn handle_tui_events(
                             control_resp_slot,
                             pending_qs,
                             effort_arc,
+                            true,
                         )
                     });
                 }
@@ -6364,6 +6373,12 @@ fn run_pane_session(
     control_response_tx_slot: Arc<Mutex<Option<mpsc::Sender<String>>>>,
     pending_questions: Arc<Mutex<HashMap<String, PendingAskQuestion>>>,
     effort_arc: Arc<Mutex<Option<String>>>,
+    // Initial value for the legacy path's `try_resume_first` — false
+    // when the worker is being spawned with a fresh-just-minted
+    // session id (e.g. provider switch) so codex's `exec resume <id>`
+    // doesn't error with "no rollout found". The Claude streaming
+    // path derives this from disk and ignores this knob.
+    initial_try_resume: bool,
 ) {
     // Provider::Claude → long-lived stream-json process. Other providers
     // (Codex, Cursor, OpenCode, MiniMax, GLM) → legacy per-turn --print
@@ -6408,7 +6423,7 @@ fn run_pane_session(
     let _ = effort_arc; // unused for legacy path
 
     let mut first_message = true;
-    let mut try_resume_first = true;
+    let mut try_resume_first = initial_try_resume;
     // For Codex, we need to capture the real thread_id from the first invocation
     // and use it for subsequent `codex exec resume` calls.
     let mut claude_session_id = claude_session_id;
@@ -7154,6 +7169,7 @@ async fn run_server_connection(
                                                             backstory: meta.backstory,
                                                             plan_review_mode: meta.plan_review_mode,
                                                             managed: meta.managed,
+                                                            try_resume_first: true,
                                                         });
                                                     } else {
                                                         tracing::warn!(
@@ -7422,6 +7438,7 @@ async fn run_server_connection(
                                                     backstory: pane_config.backstory,
                                                     plan_review_mode: pane_config.plan_review_mode,
                                                     managed: pane_config.managed,
+                                                    try_resume_first: true,
                                                 });
                                             }
                                             ServerToCli::RemovePane { session_id: _, pane_id: remove_id, cleanup_action } => {
@@ -7833,6 +7850,10 @@ async fn run_server_connection(
                                                     backstory,
                                                     plan_review_mode,
                                                     managed,
+                                                    // Fresh session id we just minted —
+                                                    // codex's `exec resume` would fail with
+                                                    // "no rollout found" if we tried to resume.
+                                                    try_resume_first: false,
                                                 });
 
                                                 // Persist to .apas + broadcast the fresh PaneList.

@@ -92,6 +92,15 @@ pub enum TuiEvent {
         /// (auto-spawned orchestrators + Overview AddWorker); false =
         /// side chat from TabBar +. See PaneConfig::managed.
         managed: bool,
+        // Whether the worker should attempt a `--resume`/`exec resume`
+        // on its very first agent invocation. Default `true` for the
+        // existing spawn paths (recreate after crash, AddPane, etc.)
+        // where the session_id refers to a real prior session. Set
+        // `false` when respawning under a fresh-just-minted session
+        // id (e.g. provider switch via UpdatePaneModel) — codex's
+        // `exec resume` errors out hard ("no rollout found") if the
+        // id doesn't exist on its server.
+        try_resume_first: bool,
     },
     CloseTab {
         pane_id: u32,
