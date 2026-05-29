@@ -638,6 +638,16 @@ pub enum WebToServer {
         // are ignored when this is set.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         after_created_at: Option<String>,
+        // Per-pane catchup watermarks. When set, return only messages
+        // where `created_at > pane_watermarks[pane_id]`. Lets each
+        // pane independently request its own tail without overfetching
+        // — solves the "fast pane advances the watermark past a slow
+        // pane's last-seen" bug that bit `after_created_at` (which
+        // used a single per-session timestamp). Reply is flagged
+        // `catchup: true`. Mutually exclusive with `after_created_at`;
+        // server prefers `pane_watermarks` when both are present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_watermarks: Option<std::collections::HashMap<u32, String>>,
     },
 
     /// Pause the deadloop session (legacy - use PausePane for new code)

@@ -2382,12 +2382,37 @@ function bumpWatermark(
 
 function requestCatchupIfNeeded(get: () => AppState, sessionId: string) {
   const state = get();
+  const ws = state.ws;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  // Per-pane watermarks are the preferred shape — they let the
+  // server return only the messages each pane actually missed, no
+  // overfetch. Build a {pane_id: ts} object from paneLastCreatedAt
+  // (skipping the synthetic -1 sentinel for legacy single-pane).
+  const paneMap = state.paneLastCreatedAt.get(sessionId);
+  if (paneMap && paneMap.size > 0) {
+    const wm: Record<string, string> = {};
+    for (const [pid, ts] of paneMap) {
+      if (pid < 0) continue;
+      wm[String(pid)] = ts;
+    }
+    if (Object.keys(wm).length > 0) {
+      ws.send(
+        JSON.stringify({
+          type: "get_session_messages",
+          session_id: sessionId,
+          pane_watermarks: wm,
+        }),
+      );
+      return;
+    }
+  }
+  // Fall back to the single-cutoff form when we have no per-pane
+  // history yet (e.g. fresh tab, only the session-level mark survived
+  // via an IDB snapshot). Server still handles `after_created_at`.
   const after =
     state.reconnectWatermarks.get(sessionId) ??
     state.sessionLastCreatedAt.get(sessionId);
   if (!after) return;
-  const ws = state.ws;
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
   ws.send(
     JSON.stringify({
       type: "get_session_messages",

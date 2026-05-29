@@ -1991,6 +1991,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     pane_type,
                     pane_id,
                     after_created_at,
+                    pane_watermarks,
                 }) => {
                     // Get messages for a specific session from file storage with pagination
                     let limit = limit.unwrap_or(100);
@@ -2000,18 +2001,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .as_ref()
                             .map(|p| shared::PaneConfig::pane_id_from_legacy(p))
                     });
-                    // Catchup mode: client passed an `after_created_at` high-water mark
-                    // after reconnect. Return everything newer (flat, sorted ASC, no
-                    // per-pane limit) so the client can append the missing tail to its
-                    // live state. before_id / pane filters are ignored in catchup mode.
-                    let is_catchup = after_created_at.is_some();
-                    // Initial loads (no filter, no before_id) should return `limit` messages
-                    // PER pane so every tab has history. Filtered/paginated fetches still use
-                    // the linear paginator so they behave predictably.
+                    // Catchup mode: client passed either a per-pane watermark map
+                    // (preferred) or a single after_created_at high-water mark.
+                    // Per-pane is the right shape — the legacy single-cutoff form
+                    // dropped messages for slow panes when fast panes had advanced
+                    // the watermark past their tails. Both flag `catchup: true`.
+                    let is_catchup = after_created_at.is_some() || pane_watermarks.is_some();
                     let is_initial_load = !is_catchup
                         && before_id.is_none()
                         && effective_pane_filter.is_none();
-                    let fetch_result = if let Some(after) = after_created_at.as_deref() {
+                    let fetch_result = if let Some(watermarks) = pane_watermarks.as_ref() {
+                        state
+                            .storage
+                            .get_messages_per_pane_after(&sid, watermarks)
+                            .await
+                            .map(|msgs| (msgs, false))
+                    } else if let Some(after) = after_created_at.as_deref() {
                         state
                             .storage
                             .get_messages_after(&sid, after)

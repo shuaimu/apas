@@ -421,6 +421,154 @@ impl FileStorage {
         Ok(found)
     }
 
+    /// Per-pane variant of `get_messages_after`. Each pane has its own
+    /// `created_at` watermark — a message is returned only when its
+    /// pane's watermark is satisfied. Solves the over-fetch in the
+    /// single-cutoff form: a fast-streaming pane no longer drags the
+    /// catchup window past slower panes' tails, and slower panes don't
+    /// re-receive everything they already had just because some other
+    /// pane is busy.
+    ///
+    /// Behavior:
+    ///   * Lines whose `pane_id` IS in `pane_watermarks` are kept iff
+    ///     `created_at > pane_watermarks[pane_id]`.
+    ///   * Lines whose `pane_id` is NOT in `pane_watermarks` are always
+    ///     kept — the client has never seen this pane, so every record
+    ///     is new to it.
+    ///   * Scan stops on `CATCHUP_LIMIT` matches OR on a slack window
+    ///     of lines all at-or-older than the MIN of watermarks (no
+    ///     further matches possible). MIN keeps the scan correct for
+    ///     the worst-case pane; per-line filtering keeps the result
+    ///     minimal for the others.
+    pub async fn get_messages_per_pane_after(
+        &self,
+        session_id: &Uuid,
+        pane_watermarks: &std::collections::HashMap<u32, String>,
+    ) -> Result<Vec<StoredMessage>> {
+        const CATCHUP_LIMIT: usize = 500;
+        const MAX_CONTENT_BYTES: usize = 64 * 1024;
+        const CHUNK_BYTES: usize = 64 * 1024;
+        const REORDER_SLACK_LINES: usize = 50;
+
+        let file_path = self.messages_file(session_id);
+        if !file_path.exists() {
+            return Ok(Vec::new());
+        }
+        let file_size = std::fs::metadata(&file_path)?.len();
+        if file_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Stop-condition cutoff is the MIN of provided watermarks —
+        // once we're scanning lines older than every pane's watermark,
+        // nothing newer can possibly turn up. An empty watermark map
+        // (client knows nothing) treats every line as kept; we still
+        // cap at CATCHUP_LIMIT via the per-line consumer.
+        let min_cutoff: String = pane_watermarks
+            .values()
+            .min()
+            .cloned()
+            .unwrap_or_default();
+
+        let mut file = fs::File::open(&file_path).await?;
+        let mut found: Vec<StoredMessage> = Vec::new();
+        let mut slack: usize = 0;
+        let mut hit_cap = false;
+        let mut pos: u64 = file_size;
+        let mut carry: Vec<u8> = Vec::new();
+        let mut stop = false;
+
+        'outer: while pos > 0 && !stop {
+            let chunk_size = pos.min(CHUNK_BYTES as u64) as usize;
+            let new_pos = pos - chunk_size as u64;
+            file.seek(SeekFrom::Start(new_pos)).await?;
+            let mut buf = vec![0u8; chunk_size];
+            file.read_exact(&mut buf).await?;
+            pos = new_pos;
+
+            if !carry.is_empty() {
+                buf.extend_from_slice(&carry);
+                carry.clear();
+            }
+
+            let mut end = buf.len();
+            while end > 0 && buf[end - 1] == b'\n' {
+                end -= 1;
+            }
+
+            while end > 0 {
+                let nl = buf[..end].iter().rposition(|&b| b == b'\n');
+                match nl {
+                    Some(nl_idx) => {
+                        let line = &buf[nl_idx + 1..end];
+                        end = nl_idx;
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if !consume_per_pane_after_line(
+                            line,
+                            pane_watermarks,
+                            &min_cutoff,
+                            MAX_CONTENT_BYTES,
+                            CATCHUP_LIMIT,
+                            REORDER_SLACK_LINES,
+                            &mut found,
+                            &mut slack,
+                            &mut hit_cap,
+                        ) {
+                            stop = true;
+                            break 'outer;
+                        }
+                    }
+                    None => {
+                        if pos > 0 {
+                            carry = buf[..end].to_vec();
+                        } else if end > 0 {
+                            let _ = consume_per_pane_after_line(
+                                &buf[..end],
+                                pane_watermarks,
+                                &min_cutoff,
+                                MAX_CONTENT_BYTES,
+                                CATCHUP_LIMIT,
+                                REORDER_SLACK_LINES,
+                                &mut found,
+                                &mut slack,
+                                &mut hit_cap,
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !carry.is_empty() && !stop {
+            let _ = consume_per_pane_after_line(
+                &carry,
+                pane_watermarks,
+                &min_cutoff,
+                MAX_CONTENT_BYTES,
+                CATCHUP_LIMIT,
+                REORDER_SLACK_LINES,
+                &mut found,
+                &mut slack,
+                &mut hit_cap,
+            );
+        }
+
+        if hit_cap {
+            tracing::warn!(
+                "Per-pane catchup for session {} hit the {} message cap; older gap messages skipped",
+                session_id,
+                CATCHUP_LIMIT
+            );
+        }
+
+        found.reverse();
+        found.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(found)
+    }
+
     /// Read messages for a session with pagination support
     /// Returns (messages, has_more)
     pub async fn get_messages_paginated(
@@ -848,6 +996,69 @@ fn consume_line(
         return false;
     }
     found.push(msg);
+    true
+}
+
+/// Per-line consumer for `get_messages_per_pane_after`. Filters
+/// each line by the watermark of its own pane (rather than a single
+/// session-level cutoff), so a fast pane's recent traffic doesn't
+/// drag the catchup result past a slow pane's tail.
+fn consume_per_pane_after_line(
+    line: &[u8],
+    pane_watermarks: &std::collections::HashMap<u32, String>,
+    min_cutoff: &str,
+    max_content: usize,
+    limit: usize,
+    slack_limit: usize,
+    found: &mut Vec<StoredMessage>,
+    slack: &mut usize,
+    hit_cap: &mut bool,
+) -> bool {
+    let mut msg = match serde_json::from_slice::<StoredMessage>(line) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("Failed to parse message line ({} bytes): {}", line.len(), e);
+            return true;
+        }
+    };
+    // Walk-back termination: when the line predates EVERY pane's
+    // watermark, we've left the catchup window. Bump slack to absorb
+    // microsecond reordering near the cutoff; bail when slack saturates.
+    if msg.created_at.as_str() <= min_cutoff {
+        *slack += 1;
+        return *slack < slack_limit;
+    }
+    // Per-pane inclusion. A pane the client hasn't seen at all
+    // (no watermark) is treated as a brand-new pane — every record
+    // for it is kept.
+    let pane_id = parse_stored_pane_id(msg.pane_type.as_deref());
+    let keep = match pane_id {
+        Some(pid) => match pane_watermarks.get(&pid) {
+            Some(wm) => msg.created_at.as_str() > wm.as_str(),
+            None => true,
+        },
+        None => {
+            // No pane_id on the record (legacy single-pane bucket).
+            // Keep iff watermarks map has a None-bucket sentinel, OR
+            // when the map is empty (treat as "client wants everything").
+            // We don't expose a sentinel on the wire yet, so default
+            // to keep — the client-side dedupe-by-id covers duplicates.
+            true
+        }
+    };
+    if !keep {
+        // Pane known to client and message already in client cache.
+        // Reset slack so we don't bail prematurely on a sparse pane.
+        *slack = 0;
+        return true;
+    }
+    msg.content = truncate_message_content(msg.content, &msg.message_type, max_content, "catchup");
+    if found.len() >= limit {
+        *hit_cap = true;
+        return false;
+    }
+    found.push(msg);
+    *slack = 0;
     true
 }
 
