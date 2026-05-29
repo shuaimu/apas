@@ -550,6 +550,19 @@ pub enum ServerToDaemon {
         clear_api_key: bool,
     },
 
+    /// Update machine-level DeepSeek backend API configuration. DeepSeek
+    /// ships an Anthropic-compatible endpoint at <api_base_url>/anthropic
+    /// so it reuses the Claude CLI binary with `ANTHROPIC_BASE_URL` /
+    /// `ANTHROPIC_API_KEY` env overrides, same shape as the GLM bridge.
+    SetDeepseekConfig {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<String>,
+        #[serde(default)]
+        clear_api_key: bool,
+    },
+
     /// Heartbeat response
     Heartbeat,
 }
@@ -792,6 +805,17 @@ pub enum WebToServer {
 
     /// Update machine-level GLM backend API configuration
     SetMachineGlmConfig {
+        machine_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<String>,
+        #[serde(default)]
+        clear_api_key: bool,
+    },
+
+    /// Update machine-level DeepSeek backend API configuration
+    SetMachineDeepseekConfig {
         machine_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         api_base_url: Option<String>,
@@ -1281,6 +1305,17 @@ pub struct GlmBackendInfo {
     pub api_key_configured: bool,
 }
 
+/// Machine-level DeepSeek backend status safe to expose to web UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeepseekBackendInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub api_key_configured: bool,
+}
+
 /// Information about a machine reported by a daemon
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MachineInfo {
@@ -1294,6 +1329,8 @@ pub struct MachineInfo {
     pub minimax_backend: Option<MiniMaxBackendInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub glm_backend: Option<GlmBackendInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deepseek_backend: Option<DeepseekBackendInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<String>,
 }
@@ -1350,6 +1387,7 @@ pub enum Provider {
     Codex,
     Minimax,
     Glm,
+    Deepseek,
     Opencode,
     #[serde(rename = "cursor-agent")]
     CursorAgent,

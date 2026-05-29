@@ -222,6 +222,7 @@ const PROVIDER_LABELS: Record<string, string> = {
   codex: "Codex",
   minimax: "MiniMax",
   glm: "GLM",
+  deepseek: "DeepSeek",
 };
 
 const PROVIDER_COLORS: Record<string, string> = {
@@ -229,6 +230,7 @@ const PROVIDER_COLORS: Record<string, string> = {
   codex: "border-l-blue-500",
   minimax: "border-l-cyan-500",
   glm: "border-l-emerald-500",
+  deepseek: "border-l-indigo-500",
 };
 
 export function AllProvidersUsage() {
@@ -306,6 +308,9 @@ export function UsageLimitsPanel() {
 
     if (limitsByProvider.glm) {
       return { label: "GLM Usage", limits: limitsByProvider.glm };
+    }
+    if (limitsByProvider.deepseek) {
+      return { label: "DeepSeek Usage", limits: limitsByProvider.deepseek };
     }
     if (limitsByProvider.minimax) {
       return { label: "MiniMax Usage", limits: limitsByProvider.minimax };

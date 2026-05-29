@@ -45,6 +45,8 @@ struct UsageCacheFile {
     minimax: Option<UsageLimits>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     glm: Option<UsageLimits>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deepseek: Option<UsageLimits>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -53,6 +55,7 @@ enum UsageProvider {
     Codex,
     Minimax,
     Glm,
+    Deepseek,
 }
 
 fn usage_cache_dir() -> PathBuf {
@@ -105,6 +108,7 @@ fn cache_usage_limits(provider: UsageProvider, limits: &UsageLimits) -> Result<(
         UsageProvider::Codex => cache.codex = Some(limits.clone()),
         UsageProvider::Minimax => cache.minimax = Some(limits.clone()),
         UsageProvider::Glm => cache.glm = Some(limits.clone()),
+        UsageProvider::Deepseek => cache.deepseek = Some(limits.clone()),
     }
     write_usage_cache(&cache)
 }
@@ -116,6 +120,7 @@ fn get_cached_usage_limits(provider: UsageProvider) -> Option<UsageLimits> {
         UsageProvider::Codex => cache.codex,
         UsageProvider::Minimax => cache.minimax,
         UsageProvider::Glm => cache.glm,
+        UsageProvider::Deepseek => cache.deepseek,
     }
 }
 
@@ -160,6 +165,10 @@ pub fn read_cached_minimax_usage_limits(max_age: Option<Duration>) -> Option<Usa
 
 pub fn read_cached_glm_usage_limits(max_age: Option<Duration>) -> Option<UsageLimits> {
     get_cached_usage_limits_with_max_age(UsageProvider::Glm, max_age)
+}
+
+pub fn read_cached_deepseek_usage_limits(max_age: Option<Duration>) -> Option<UsageLimits> {
+    get_cached_usage_limits_with_max_age(UsageProvider::Deepseek, max_age)
 }
 
 /// OAuth credentials from Claude's credentials file

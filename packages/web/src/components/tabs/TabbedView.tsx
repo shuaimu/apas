@@ -132,6 +132,12 @@ function isGlmModel(model?: string): boolean {
   return normalized.startsWith("glm") || normalized.includes("glm-");
 }
 
+function isDeepseekModel(model?: string): boolean {
+  if (typeof model !== "string") return false;
+  const normalized = model.trim().toLowerCase();
+  return normalized.includes("deepseek");
+}
+
 // Listed lowest → highest. xhigh sits between high and max (Opus-only
 // extra-deep tier); max is the highest level.
 const CLAUDE_EFFORT_OPTIONS = [
@@ -169,6 +175,7 @@ const PROVIDER_OPTIONS = [
   { value: "opencode", label: "OpenCode" },
   { value: "minimax", label: "MiniMax" },
   { value: "glm", label: "GLM" },
+  { value: "deepseek", label: "DeepSeek" },
 ] as const;
 type ProviderOption = (typeof PROVIDER_OPTIONS)[number]["value"];
 const PROVIDER_LABEL: Record<ProviderOption, string> = Object.fromEntries(
@@ -476,13 +483,14 @@ export function TabbedView() {
   const handleAddTab = useCallback((provider: string = "claude", model?: string, isolatedWorktree?: boolean) => {
     const isMiniMax = provider === "minimax" || (provider === "claude" && isMiniMaxModel(model));
     const isGlm = provider === "glm" || (provider === "claude" && isGlmModel(model));
+    const isDeepseek = provider === "deepseek" || (provider === "claude" && isDeepseekModel(model));
     const prefix = provider === "codex"
       ? "Codex"
       : provider === "cursor-agent"
         ? "Cursor"
         : provider === "opencode"
           ? "OpenCode"
-          : isMiniMax ? "MiniMax" : isGlm ? "GLM" : "Claude";
+          : isMiniMax ? "MiniMax" : isGlm ? "GLM" : isDeepseek ? "DeepSeek" : "Claude";
     const label = `${prefix} ${effectiveTabs.length + 1}`;
     const result = addPane(provider, "interactive", label, undefined, model, isolatedWorktree);
     if (result.success) {
@@ -562,7 +570,19 @@ export function TabbedView() {
       (typeof activeConfig?.label === "string" && activeConfig.label.toLowerCase().includes("glm"))
     )
   );
-  const activeUsageProvider = activeIsMiniMax ? "minimax" : activeIsGlm ? "glm" : activeProvider;
+  const activeIsDeepseek = activeProvider === "deepseek" || (
+    activeProvider === "claude" && (
+      isDeepseekModel(activeConfig?.model) ||
+      (typeof activeConfig?.label === "string" && activeConfig.label.toLowerCase().includes("deepseek"))
+    )
+  );
+  const activeUsageProvider = activeIsMiniMax
+    ? "minimax"
+    : activeIsGlm
+      ? "glm"
+      : activeIsDeepseek
+        ? "deepseek"
+        : activeProvider;
   const activeSupportsClaudeEffort = activeUsageProvider === "claude";
   const activeBotEffortOption = normalizeClaudeEffortOption(activeConfig?.effort);
   const activeModelOption = normalizeClaudeModelOption(activeConfig?.model);
@@ -593,6 +613,7 @@ export function TabbedView() {
     if (activeUsageProvider === "codex") return "Codex Usage";
     if (activeUsageProvider === "minimax") return "MiniMax Usage";
     if (activeUsageProvider === "glm") return "GLM Usage";
+    if (activeUsageProvider === "deepseek") return "DeepSeek Usage";
     return "Claude Usage";
   }, [activeUsageProvider]);
 

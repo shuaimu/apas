@@ -9,6 +9,7 @@ import { AllProvidersUsage } from "@/components/UsageLimits";
 
 const MINIMAX_API_BASE_URL = "https://api.minimax.io/anthropic";
 const GLM_API_BASE_URL = "https://api.z.ai/api/anthropic";
+const DEEPSEEK_API_BASE_URL = "https://api.deepseek.com/anthropic";
 
 function formatMemory(memoryKb?: number): string {
   if (memoryKb == null) return "";
@@ -33,11 +34,14 @@ export default function MachinesPage() {
     stopMachineProjectCli,
     setMachineMiniMaxConfig,
     setMachineGlmConfig,
+    setMachineDeepseekConfig,
   } = useStore();
   const [minimaxDrafts, setMinimaxDrafts] = useState<Record<string, { apiKey: string }>>({});
   const [minimaxSaved, setMinimaxSaved] = useState<Record<string, boolean>>({});
   const [glmDrafts, setGlmDrafts] = useState<Record<string, { apiKey: string }>>({});
   const [glmSaved, setGlmSaved] = useState<Record<string, boolean>>({});
+  const [deepseekDrafts, setDeepseekDrafts] = useState<Record<string, { apiKey: string }>>({});
+  const [deepseekSaved, setDeepseekSaved] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     const storedToken = localStorage.getItem("apas_token");
@@ -242,6 +246,79 @@ export default function MachinesPage() {
               </div>
               <div className="mt-2 text-xs text-gray-500">
                 {machine.glmBackend?.apiKeyConfigured ? "API key configured" : "API key not configured"}
+              </div>
+            </div>
+
+            <div className="border-b border-gray-200 px-4 py-3 dark:border-gray-800">
+              <div className="mb-2 text-sm font-medium">DeepSeek Backend (Claude Runtime)</div>
+              <div className="mb-2 text-xs text-gray-500">
+                Backend URL: <span className="font-mono">{DEEPSEEK_API_BASE_URL}</span>
+              </div>
+              <div className="grid gap-2 md:grid-cols-[1fr_auto_auto]">
+                <input
+                  type="text"
+                  value={deepseekDrafts[machine.machineId]?.apiKey ?? machine.deepseekBackend?.apiKey ?? ""}
+                  onChange={(e) => {
+                    const nextApiKey = e.target.value;
+                    setDeepseekDrafts((prev) => ({
+                      ...prev,
+                      [machine.machineId]: {
+                        apiKey: nextApiKey,
+                      },
+                    }));
+                    setDeepseekSaved((prev) => ({
+                      ...prev,
+                      [machine.machineId]: false,
+                    }));
+                  }}
+                  placeholder="DeepSeek API key"
+                  className="rounded border border-gray-300 px-3 py-2 text-sm dark:border-gray-700 dark:bg-gray-950"
+                />
+                <button
+                  onClick={() => {
+                    const draft = deepseekDrafts[machine.machineId];
+                    const apiKey = draft?.apiKey ?? machine.deepseekBackend?.apiKey ?? "";
+                    setMachineDeepseekConfig(
+                      machine.machineId,
+                      apiKey.trim().length > 0 ? apiKey : undefined,
+                      false,
+                    );
+                    setDeepseekDrafts((prev) => ({
+                      ...prev,
+                      [machine.machineId]: {
+                        apiKey,
+                      },
+                    }));
+                    setDeepseekSaved((prev) => ({
+                      ...prev,
+                      [machine.machineId]: true,
+                    }));
+                  }}
+                  className="rounded bg-indigo-600 px-3 py-2 text-sm text-white hover:bg-indigo-700"
+                >
+                  {deepseekSaved[machine.machineId] ? "Saved" : "Save"}
+                </button>
+                <button
+                  onClick={() => {
+                    setMachineDeepseekConfig(machine.machineId, undefined, true);
+                    setDeepseekDrafts((prev) => ({
+                      ...prev,
+                      [machine.machineId]: {
+                        apiKey: "",
+                      },
+                    }));
+                    setDeepseekSaved((prev) => ({
+                      ...prev,
+                      [machine.machineId]: false,
+                    }));
+                  }}
+                  className="rounded border border-gray-300 px-3 py-2 text-sm hover:bg-gray-100 dark:border-gray-700 dark:hover:bg-gray-800"
+                >
+                  Clear Key
+                </button>
+              </div>
+              <div className="mt-2 text-xs text-gray-500">
+                {machine.deepseekBackend?.apiKeyConfigured ? "API key configured" : "API key not configured"}
               </div>
             </div>
 

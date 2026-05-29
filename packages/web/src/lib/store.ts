@@ -63,7 +63,7 @@ export interface UsageLimits {
   fetchedAt?: string;
 }
 
-export type Provider = "claude" | "codex" | "minimax" | "glm" | "opencode" | "cursor-agent";
+export type Provider = "claude" | "codex" | "minimax" | "glm" | "deepseek" | "opencode" | "cursor-agent";
 
 export type UsageLimitsByProvider = Partial<Record<Provider, UsageLimits>>;
 
@@ -84,6 +84,11 @@ export interface MachineInfo {
     apiKeyConfigured: boolean;
   };
   glmBackend?: {
+    apiBaseUrl?: string;
+    apiKey?: string;
+    apiKeyConfigured: boolean;
+  };
+  deepseekBackend?: {
     apiBaseUrl?: string;
     apiKey?: string;
     apiKeyConfigured: boolean;
@@ -286,6 +291,7 @@ function normalizeProvider(raw: unknown): Provider | null {
     }
     if (normalized === "codex" || normalized === "openai" || normalized === "chatgpt") return "codex";
     if (normalized === "glm" || normalized === "zai" || normalized === "z.ai" || normalized === "zhipu") return "glm";
+    if (normalized === "deepseek" || normalized === "deep_seek" || normalized === "deep-seek") return "deepseek";
     if (normalized === "opencode") return "opencode";
     if (normalized === "cursor-agent" || normalized === "cursor_agent" || normalized === "cursor") return "cursor-agent";
   }
@@ -381,6 +387,10 @@ function inferUsageProvider(
     if (seenProviders.has("glm")) {
       usageProviderHints.set(cliClientId, "glm");
       return "glm";
+    }
+    if (seenProviders.has("deepseek")) {
+      usageProviderHints.set(cliClientId, "deepseek");
+      return "deepseek";
     }
     usageProviderHints.set(cliClientId, "claude");
     return "claude";
@@ -552,6 +562,11 @@ interface AppState {
     apiKey?: string,
     clearApiKey?: boolean,
   ) => void;
+  setMachineDeepseekConfig: (
+    machineId: string,
+    apiKey?: string,
+    clearApiKey?: boolean,
+  ) => void;
   listSessions: () => void;
   loadSessionMessages: (sessionId: string) => void;
   loadMoreMessages: (pane?: PaneType | number) => void;
@@ -680,6 +695,7 @@ export interface PlanReviewPendingItem {
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://apas.mpaxos.com:8080";
 const MINIMAX_API_BASE_URL = "https://api.minimax.io/anthropic";
 const GLM_API_BASE_URL = "https://api.z.ai/api/anthropic";
+const DEEPSEEK_API_BASE_URL = "https://api.deepseek.com/anthropic";
 
 export const useStore = create<AppState>((set, get) => ({
   // Auth state - initialize from localStorage if available
@@ -1270,6 +1286,48 @@ export const useStore = create<AppState>((set, get) => ({
       type: "set_machine_glm_config",
       machine_id: machineId,
       api_base_url: GLM_API_BASE_URL,
+      api_key: normalizedApiKey,
+      clear_api_key: clearApiKey,
+    }));
+  },
+
+  setMachineDeepseekConfig: (
+    machineId: string,
+    apiKey?: string,
+    clearApiKey: boolean = false,
+  ) => {
+    const { ws } = get();
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    const normalizedApiKey =
+      apiKey && apiKey.trim().length > 0 ? apiKey.trim() : undefined;
+
+    set((state) => ({
+      machines: state.machines.map((entry) => {
+        if (entry.machine.machineId !== machineId) return entry;
+        const existingBackend = entry.machine.deepseekBackend;
+        const nextApiKey = clearApiKey
+          ? undefined
+          : (normalizedApiKey ?? existingBackend?.apiKey);
+        return {
+          ...entry,
+          machine: {
+            ...entry.machine,
+            deepseekBackend: {
+              apiBaseUrl: DEEPSEEK_API_BASE_URL,
+              apiKey: nextApiKey,
+              apiKeyConfigured: Boolean(nextApiKey),
+            },
+          },
+        };
+      }),
+    }));
+
+    ws.send(JSON.stringify({
+      type: "set_machine_deepseek_config",
+      machine_id: machineId,
+      api_base_url: DEEPSEEK_API_BASE_URL,
       api_key: normalizedApiKey,
       clear_api_key: clearApiKey,
     }));
@@ -2660,6 +2718,15 @@ function handleServerMessage(
                   apiKey: ((machine.glm_backend as Record<string, unknown>).api_key as string | undefined),
                   apiKeyConfigured: Boolean(
                     (machine.glm_backend as Record<string, unknown>).api_key_configured
+                  ),
+                }
+              : undefined,
+            deepseekBackend: machine.deepseek_backend
+              ? {
+                  apiBaseUrl: ((machine.deepseek_backend as Record<string, unknown>).api_base_url as string | undefined),
+                  apiKey: ((machine.deepseek_backend as Record<string, unknown>).api_key as string | undefined),
+                  apiKeyConfigured: Boolean(
+                    (machine.deepseek_backend as Record<string, unknown>).api_key_configured
                   ),
                 }
               : undefined,

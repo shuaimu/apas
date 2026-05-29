@@ -165,6 +165,7 @@ function PaneCard({
     { value: "opencode", label: "OpenCode" },
     { value: "minimax", label: "MiniMax" },
     { value: "glm", label: "GLM" },
+    { value: "deepseek", label: "DeepSeek" },
   ];
   const CLAUDE_MODEL_OPTS: ReadonlyArray<{ value: string; label: string }> = [
     { value: "default", label: "Default" },

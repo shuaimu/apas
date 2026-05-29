@@ -30,6 +30,7 @@ interface TabBarProps {
 
 const MINIMAX_DEFAULT_MODEL = "MiniMax-M2.7";
 const GLM_DEFAULT_MODEL = "glm-5.1";
+const DEEPSEEK_DEFAULT_MODEL = "deepseek-chat";
 
 function isMiniMaxModel(model?: string): boolean {
   if (typeof model !== "string") return false;
@@ -43,6 +44,12 @@ function isGlmModel(model?: string): boolean {
   return normalized.startsWith("glm") || normalized.includes("glm-");
 }
 
+function isDeepseekModel(model?: string): boolean {
+  if (typeof model !== "string") return false;
+  const normalized = model.trim().toLowerCase();
+  return normalized.includes("deepseek");
+}
+
 function isMiniMaxTab(provider: string, model?: string, label?: string): boolean {
   if (provider === "minimax") return true;
   if (provider !== "claude") return false;
@@ -54,8 +61,18 @@ function isGlmTab(provider: string, model?: string, label?: string): boolean {
   if (provider === "glm") return true;
   if (provider !== "claude") return false;
   if (isMiniMaxModel(model)) return false;
+  if (isDeepseekModel(model)) return false;
   if (isGlmModel(model)) return true;
   return typeof label === "string" && label.toLowerCase().includes("glm");
+}
+
+function isDeepseekTab(provider: string, model?: string, label?: string): boolean {
+  if (provider === "deepseek") return true;
+  if (provider !== "claude") return false;
+  if (isMiniMaxModel(model)) return false;
+  if (isGlmModel(model)) return false;
+  if (isDeepseekModel(model)) return true;
+  return typeof label === "string" && label.toLowerCase().includes("deepseek");
 }
 
 function ProviderIcon({
@@ -90,6 +107,14 @@ function ProviderIcon({
     return (
       <svg className={className} viewBox="0 0 24 24" fill="currentColor" aria-label="GLM">
         <path d="M4 4h16v3H9l11 13H4v-3h11L4 4zm0 0" />
+      </svg>
+    );
+  }
+  if (isDeepseekTab(provider, model, label)) {
+    // DeepSeek logo — stylized whale silhouette (abstracted as a "D" with fin)
+    return (
+      <svg className={className} viewBox="0 0 24 24" fill="currentColor" aria-label="DeepSeek">
+        <path d="M5 7c4-3 9-3 13 0l2-2v6l-2-2c-3-3-8-3-11 0-1 1-1 3 0 4 2 2 5 2 7 0l2 2-2 2c-4 3-9 3-13 0-2-2-2-7 0-10z" />
       </svg>
     );
   }
@@ -550,6 +575,15 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
               <ProviderIcon provider="claude" model={GLM_DEFAULT_MODEL} className="w-4 h-4" />
             </span>
             GLM 5.1 Tab
+          </button>
+          <button
+            onClick={() => handlePick("claude", DEEPSEEK_DEFAULT_MODEL)}
+            className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
+          >
+            <span className="text-indigo-500 flex-shrink-0">
+              <ProviderIcon provider="claude" model={DEEPSEEK_DEFAULT_MODEL} className="w-4 h-4" />
+            </span>
+            DeepSeek Tab
           </button>
           <div className="border-t border-gray-100 dark:border-gray-700 my-0.5" />
           <button

@@ -1,8 +1,8 @@
 use dashmap::DashMap;
 use shared::{
-    CliClientInfo, CliClientStatus, GlmBackendInfo, MachineInfo, MachineProjectInfo,
-    MachineWithProjects, MiniMaxBackendInfo, PaneConfig, PaneType, Provider, ServerToCli,
-    ServerToDaemon, ServerToWeb, UsageLimits,
+    CliClientInfo, CliClientStatus, DeepseekBackendInfo, GlmBackendInfo, MachineInfo,
+    MachineProjectInfo, MachineWithProjects, MiniMaxBackendInfo, PaneConfig, PaneType, Provider,
+    ServerToCli, ServerToDaemon, ServerToWeb, UsageLimits,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -94,6 +94,37 @@ fn merge_glm_backend(
     }
 }
 
+fn merge_deepseek_backend(
+    existing: Option<DeepseekBackendInfo>,
+    incoming: Option<DeepseekBackendInfo>,
+) -> Option<DeepseekBackendInfo> {
+    match (existing, incoming) {
+        (None, None) => None,
+        (Some(existing), None) => Some(existing),
+        (None, Some(mut incoming)) => {
+            incoming.api_base_url = normalize_optional_string(incoming.api_base_url);
+            incoming.api_key = normalize_optional_string(incoming.api_key);
+            incoming.api_key_configured = incoming.api_key.is_some() || incoming.api_key_configured;
+            Some(incoming)
+        }
+        (Some(existing), Some(mut incoming)) => {
+            incoming.api_base_url = normalize_optional_string(incoming.api_base_url)
+                .or_else(|| normalize_optional_string(existing.api_base_url));
+
+            let incoming_key = normalize_optional_string(incoming.api_key);
+            incoming.api_key = incoming_key.or_else(|| {
+                if incoming.api_key_configured {
+                    normalize_optional_string(existing.api_key)
+                } else {
+                    None
+                }
+            });
+            incoming.api_key_configured = incoming.api_key.is_some() || incoming.api_key_configured;
+            Some(incoming)
+        }
+    }
+}
+
 /// Manages active sessions and routes messages between web and CLI clients
 pub struct SessionManager {
     /// Map of session ID -> session state
@@ -120,6 +151,13 @@ pub struct SessionManager {
     machine_infos: DashMap<Uuid, MachineInfo>,
     /// Map of machine ID -> project list
     machine_projects: DashMap<Uuid, Vec<MachineProjectInfo>>,
+    /// Cached shared-project access refs per user. Populated when the web
+    /// layer computes accessible machines (e.g., on `ListMachines`). Used by
+    /// the heartbeat-driven `broadcast_machines_update_for_user` so pushed
+    /// updates include shared machines too — without it, the broadcast would
+    /// only return owner machines and shared entries (like a teammate's
+    /// daemon) would visibly disappear between user-initiated refreshes.
+    shared_project_refs: DashMap<Uuid, (HashSet<(String, String)>, HashSet<String>)>,
 }
 
 #[derive(Debug)]
@@ -161,6 +199,21 @@ impl SessionManager {
             daemon_users: DashMap::new(),
             machine_infos: DashMap::new(),
             machine_projects: DashMap::new(),
+            shared_project_refs: DashMap::new(),
+        }
+    }
+
+    pub fn set_shared_project_refs_for_user(
+        &self,
+        user_id: Uuid,
+        host_path_refs: HashSet<(String, String)>,
+        wildcard_paths: HashSet<String>,
+    ) {
+        if host_path_refs.is_empty() && wildcard_paths.is_empty() {
+            self.shared_project_refs.remove(&user_id);
+        } else {
+            self.shared_project_refs
+                .insert(user_id, (host_path_refs, wildcard_paths));
         }
     }
 
@@ -243,10 +296,16 @@ impl SessionManager {
             .machine_infos
             .get(&machine_id)
             .and_then(|m| m.glm_backend.clone());
+        let existing_deepseek = self
+            .machine_infos
+            .get(&machine_id)
+            .and_then(|m| m.deepseek_backend.clone());
         machine.machine_id = machine_id;
         machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
         machine.minimax_backend = merge_minimax_backend(existing_minimax, machine.minimax_backend);
         machine.glm_backend = merge_glm_backend(existing_glm, machine.glm_backend);
+        machine.deepseek_backend =
+            merge_deepseek_backend(existing_deepseek, machine.deepseek_backend);
         self.daemon_senders.insert(machine_id, sender);
         self.daemon_users.insert(machine_id, user_id);
         self.machine_infos.insert(machine_id, machine);
@@ -323,10 +382,16 @@ impl SessionManager {
             .machine_infos
             .get(machine_id)
             .and_then(|m| m.glm_backend.clone());
+        let existing_deepseek = self
+            .machine_infos
+            .get(machine_id)
+            .and_then(|m| m.deepseek_backend.clone());
         machine.machine_id = *machine_id;
         machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
         machine.minimax_backend = merge_minimax_backend(existing_minimax, machine.minimax_backend);
         machine.glm_backend = merge_glm_backend(existing_glm, machine.glm_backend);
+        machine.deepseek_backend =
+            merge_deepseek_backend(existing_deepseek, machine.deepseek_backend);
         self.machine_infos.insert(*machine_id, machine);
         if let Some(owner) = self.daemon_users.get(machine_id).map(|entry| *entry) {
             self.broadcast_machines_update_for_user(&owner);
@@ -404,6 +469,47 @@ impl SessionManager {
             }
 
             machine.glm_backend = Some(backend);
+            machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
+        }
+
+        if let Some(user_id) = owner {
+            self.broadcast_machines_update_for_user(&user_id);
+        }
+    }
+
+    pub fn apply_web_deepseek_config(
+        &self,
+        machine_id: &Uuid,
+        api_base_url: Option<String>,
+        api_key: Option<String>,
+        clear_api_key: bool,
+    ) {
+        let owner = self.daemon_users.get(machine_id).map(|entry| *entry);
+        if let Some(mut machine) = self.machine_infos.get_mut(machine_id) {
+            let mut backend = machine
+                .deepseek_backend
+                .clone()
+                .unwrap_or(DeepseekBackendInfo {
+                    api_base_url: None,
+                    api_key: None,
+                    api_key_configured: false,
+                });
+
+            if let Some(url) = normalize_optional_string(api_base_url) {
+                backend.api_base_url = Some(url);
+            }
+
+            if clear_api_key {
+                backend.api_key = None;
+                backend.api_key_configured = false;
+            } else if let Some(key) = normalize_optional_string(api_key) {
+                backend.api_key = Some(key);
+                backend.api_key_configured = true;
+            } else {
+                backend.api_key_configured = backend.api_key.is_some();
+            }
+
+            machine.deepseek_backend = Some(backend);
             machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
         }
 
@@ -567,7 +673,23 @@ impl SessionManager {
     }
 
     fn broadcast_machines_update_for_user(&self, user_id: &Uuid) {
-        let machines = self.get_machines_for_user(user_id);
+        let mut machines = self.get_machines_for_user(user_id);
+        // Union with shared-project-access machines so pushed broadcasts match
+        // what `list_accessible_machines_for_user` returns on explicit refresh;
+        // otherwise the heartbeat-driven push would drop teammate machines and
+        // the UI would visibly flap between refresh and heartbeat.
+        if let Some(refs_entry) = self.shared_project_refs.get(user_id) {
+            let (host_path_refs, wildcard_paths) = refs_entry.value();
+            if !host_path_refs.is_empty() || !wildcard_paths.is_empty() {
+                let owner_ids: HashSet<Uuid> =
+                    machines.iter().map(|m| m.machine.machine_id).collect();
+                for machine in self.get_machines_for_project_refs(host_path_refs, wildcard_paths) {
+                    if !owner_ids.contains(&machine.machine.machine_id) {
+                        machines.push(machine);
+                    }
+                }
+            }
+        }
         let msg = ServerToWeb::Machines { machines };
 
         for web_entry in self.web_users.iter() {

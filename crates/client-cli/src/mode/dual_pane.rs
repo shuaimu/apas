@@ -76,12 +76,22 @@ fn is_glm_model(model: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+fn is_deepseek_model(model: Option<&str>) -> bool {
+    model
+        .map(|m| {
+            let normalized = m.trim().to_ascii_lowercase();
+            !normalized.is_empty() && normalized.contains("deepseek")
+        })
+        .unwrap_or(false)
+}
+
 fn default_pane_label(pane_id: u32, model: Option<&str>) -> String {
     match pane_id {
         shared::PANE_ID_DEADLOOP => "Deadloop".to_string(),
         shared::PANE_ID_INTERACTIVE => "Interactive".to_string(),
         _ if is_minimax_model(model) => format!("MiniMax {}", pane_id),
         _ if is_glm_model(model) => format!("GLM {}", pane_id),
+        _ if is_deepseek_model(model) => format!("DeepSeek {}", pane_id),
         _ => format!("Tab {}", pane_id),
     }
 }
@@ -107,6 +117,9 @@ fn pane_label_or_default(raw_label: Option<&str>, pane_id: u32, model: Option<&s
     if is_glm_model(model) && is_generic_tab_label(trimmed, pane_id) {
         return default;
     }
+    if is_deepseek_model(model) && is_generic_tab_label(trimmed, pane_id) {
+        return default;
+    }
     trimmed.to_string()
 }
 
@@ -120,7 +133,10 @@ fn resolve_pane_binary_path(
     cursor_agent_path: &str,
 ) -> String {
     match provider {
-        Provider::Claude | Provider::Minimax | Provider::Glm => claude_path.to_string(),
+        Provider::Claude
+        | Provider::Minimax
+        | Provider::Glm
+        | Provider::Deepseek => claude_path.to_string(),
         Provider::Codex => codex_path.to_string(),
         Provider::Opencode => opencode_path.to_string(),
         Provider::CursorAgent => cursor_agent_path.to_string(),
@@ -131,10 +147,12 @@ fn provider_display_name(provider: &Provider, model: Option<&str>) -> &'static s
     match provider {
         Provider::Claude if is_minimax_model(model) => "MiniMax",
         Provider::Claude if is_glm_model(model) => "GLM",
+        Provider::Claude if is_deepseek_model(model) => "DeepSeek",
         Provider::Claude => "Claude",
         Provider::Codex => "Codex",
         Provider::Minimax => "MiniMax",
         Provider::Glm => "GLM",
+        Provider::Deepseek => "DeepSeek",
         Provider::Opencode => "OpenCode",
         Provider::CursorAgent => "Cursor",
     }
@@ -147,6 +165,7 @@ fn provider_config_key(provider: &Provider, model: Option<&str>) -> &'static str
         Provider::Codex => "codex_path",
         Provider::Minimax => "claude_path",
         Provider::Glm => "claude_path",
+        Provider::Deepseek => "claude_path",
         Provider::Opencode => "opencode_path",
         Provider::CursorAgent => "cursor_agent_path",
     }
@@ -155,6 +174,8 @@ fn provider_config_key(provider: &Provider, model: Option<&str>) -> &'static str
 const MINIMAX_API_BASE_URL: &str = "https://api.minimax.io/anthropic";
 const GLM_API_BASE_URL: &str = "https://api.z.ai/api/anthropic";
 const GLM_DEFAULT_HAIKU_MODEL: &str = "glm-4.5-air";
+const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com/anthropic";
+const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-chat";
 
 fn trim_to_option(raw: Option<String>) -> Option<String> {
     raw.and_then(|value| {
@@ -236,19 +257,33 @@ fn load_glm_backend_runtime_config() -> GlmBackendRuntimeConfig {
     }
 }
 
+struct DeepseekBackendRuntimeConfig {
+    api_key: Option<String>,
+}
+
+fn load_deepseek_backend_runtime_config() -> DeepseekBackendRuntimeConfig {
+    let config = crate::config::Config::load().unwrap_or_default();
+    DeepseekBackendRuntimeConfig {
+        api_key: trim_to_option(config.local.deepseek_api_key),
+    }
+}
+
 fn build_pane_env_overrides(
     provider: &Provider,
     model: Option<&str>,
 ) -> Result<Vec<(String, String)>, String> {
     if !matches!(
         provider,
-        Provider::Claude | Provider::Minimax | Provider::Glm
+        Provider::Claude | Provider::Minimax | Provider::Glm | Provider::Deepseek
     ) {
         return Ok(Vec::new());
     }
     let is_minimax = matches!(provider, Provider::Minimax) || is_minimax_model(model);
     let is_glm = !is_minimax && (matches!(provider, Provider::Glm) || is_glm_model(model));
-    if !is_minimax && !is_glm {
+    let is_deepseek = !is_minimax
+        && !is_glm
+        && (matches!(provider, Provider::Deepseek) || is_deepseek_model(model));
+    if !is_minimax && !is_glm && !is_deepseek {
         return Ok(Vec::new());
     }
 
@@ -259,12 +294,20 @@ fn build_pane_env_overrides(
             runtime.api_key,
             "MiniMax backend is not configured (missing minimax_api_key). Update it on the Machines page or run: apas config set minimax_api_key <key>.".to_string(),
         )
-    } else {
+    } else if is_glm {
         let runtime = load_glm_backend_runtime_config();
         (
             GLM_API_BASE_URL.to_string(),
             runtime.api_key,
             "GLM backend is not configured (missing glm_api_key). Update it on the Machines page or run: apas config set glm_api_key <key>.".to_string(),
+        )
+    } else {
+        // deepseek
+        let runtime = load_deepseek_backend_runtime_config();
+        (
+            DEEPSEEK_API_BASE_URL.to_string(),
+            runtime.api_key,
+            "DeepSeek backend is not configured (missing deepseek_api_key). Update it on the Machines page or run: apas config set deepseek_api_key <key>.".to_string(),
         )
     };
     let api_key = api_key.ok_or(missing_key_message)?;
@@ -293,7 +336,19 @@ fn build_pane_env_overrides(
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
                 GLM_DEFAULT_HAIKU_MODEL.to_string(),
             ));
+        } else if is_deepseek {
+            // DeepSeek's Anthropic bridge accepts model selection via
+            // ANTHROPIC_MODEL like MiniMax.
+            env.push(("ANTHROPIC_MODEL".to_string(), model.to_string()));
         }
+    } else if is_deepseek {
+        // No explicit model — pin to the default chat model so the
+        // Claude CLI doesn't pick a Claude-named default that the
+        // DeepSeek bridge would reject.
+        env.push((
+            "ANTHROPIC_MODEL".to_string(),
+            DEEPSEEK_DEFAULT_MODEL.to_string(),
+        ));
     }
     Ok(env)
 }
@@ -3031,12 +3086,13 @@ fn build_pane_list(
     panes
 }
 
-fn active_usage_providers(pane_metas: &PaneMetas) -> (bool, bool, bool, bool) {
+fn active_usage_providers(pane_metas: &PaneMetas) -> (bool, bool, bool, bool, bool) {
     let metas = pane_metas.lock().unwrap();
     let mut has_claude = false;
     let mut has_codex = false;
     let mut has_minimax = false;
     let mut has_glm = false;
+    let mut has_deepseek = false;
 
     let looks_like_minimax_label = |label: &str| {
         let normalized = label.trim().to_ascii_lowercase();
@@ -3048,6 +3104,10 @@ fn active_usage_providers(pane_metas: &PaneMetas) -> (bool, bool, bool, bool) {
             || normalized.contains("z.ai")
             || normalized.contains("zai")
             || normalized.contains("zhipu")
+    };
+    let looks_like_deepseek_label = |label: &str| {
+        let normalized = label.trim().to_ascii_lowercase();
+        normalized.contains("deepseek")
     };
 
     for meta in metas.values() {
@@ -3066,19 +3126,26 @@ fn active_usage_providers(pane_metas: &PaneMetas) -> (bool, bool, bool, bool) {
             {
                 has_glm = true
             }
+            // DeepSeek tabs likewise.
+            Provider::Claude
+                if is_deepseek_model(meta.model.as_deref()) || looks_like_deepseek_label(&meta.label) =>
+            {
+                has_deepseek = true
+            }
             Provider::Claude => has_claude = true,
             Provider::Codex => has_codex = true,
             Provider::Minimax => has_minimax = true,
             Provider::Glm => has_glm = true,
+            Provider::Deepseek => has_deepseek = true,
             Provider::Opencode => {}
             Provider::CursorAgent => {}
         }
-        if has_claude && has_codex && has_minimax && has_glm {
+        if has_claude && has_codex && has_minimax && has_glm && has_deepseek {
             break;
         }
     }
 
-    (has_claude, has_codex, has_minimax, has_glm)
+    (has_claude, has_codex, has_minimax, has_glm, has_deepseek)
 }
 
 /// Kill any OS processes whose command line contains the given session ID.
@@ -3111,7 +3178,7 @@ fn build_agent_args(
     try_resume: bool,
 ) -> (Vec<String>, bool) {
     match provider {
-        Provider::Claude | Provider::Minimax | Provider::Glm => {
+        Provider::Claude | Provider::Minimax | Provider::Glm | Provider::Deepseek => {
             let mut base = vec![
                 "--print".to_string(),
                 "--output-format".to_string(),
@@ -3121,11 +3188,13 @@ fn build_agent_args(
             ];
             if let Some(model) = model {
                 let trimmed = model.trim();
-                // MiniMax/GLM panes use dedicated backend env configuration.
-                // Keep model selection in env (ANTHROPIC_MODEL), not CLI flags.
+                // MiniMax/GLM/DeepSeek panes use dedicated backend env
+                // configuration. Keep model selection in env
+                // (ANTHROPIC_MODEL etc), not CLI flags.
                 if !trimmed.is_empty()
                     && !is_minimax_model(Some(trimmed))
                     && !is_glm_model(Some(trimmed))
+                    && !is_deepseek_model(Some(trimmed))
                 {
                     base.extend_from_slice(&["--model".to_string(), trimmed.to_string()]);
                 }
@@ -3133,6 +3202,7 @@ fn build_agent_args(
             if matches!(provider, Provider::Claude)
                 && !is_minimax_model(model)
                 && !is_glm_model(model)
+                && !is_deepseek_model(model)
             {
                 if let Some(normalized_effort) = normalize_effort_level(effort) {
                     tracing::info!(
@@ -3488,7 +3558,7 @@ fn parse_agent_output(
     session_id_str: &str,
 ) -> Option<ClaudeStreamMessage> {
     match provider {
-        Provider::Claude | Provider::Minimax | Provider::Glm => {
+        Provider::Claude | Provider::Minimax | Provider::Glm | Provider::Deepseek => {
             serde_json::from_str::<ClaudeStreamMessage>(line).ok()
         }
         Provider::Codex => match serde_json::from_str::<CodexStreamMessage>(line) {
@@ -3787,7 +3857,7 @@ mod tests {
 
         assert_eq!(
             active_usage_providers(&pane_metas),
-            (true, true, false, false)
+            (true, true, false, false, false)
         );
     }
 
@@ -3828,7 +3898,7 @@ mod tests {
 
         assert_eq!(
             active_usage_providers(&pane_metas),
-            (false, false, true, false)
+            (false, false, true, false, false)
         );
     }
 
@@ -3936,7 +4006,7 @@ mod tests {
 
         assert_eq!(
             active_usage_providers(&pane_metas),
-            (false, false, true, false)
+            (false, false, true, false, false)
         );
     }
 
@@ -3977,7 +4047,7 @@ mod tests {
 
         assert_eq!(
             active_usage_providers(&pane_metas),
-            (false, false, false, true)
+            (false, false, false, true, false)
         );
     }
 
@@ -4018,7 +4088,7 @@ mod tests {
 
         assert_eq!(
             active_usage_providers(&pane_metas),
-            (false, false, false, true)
+            (false, false, false, true, false)
         );
     }
 
@@ -5460,12 +5530,15 @@ fn run_pane_session_streaming(
         }
         args.push(claude_session_id.to_string());
         if let Some(m) = model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            if !is_minimax_model(Some(m)) && !is_glm_model(Some(m)) {
+            if !is_minimax_model(Some(m)) && !is_glm_model(Some(m)) && !is_deepseek_model(Some(m)) {
                 args.push("--model".into());
                 args.push(m.to_string());
             }
         }
-        if !is_minimax_model(model.as_deref()) && !is_glm_model(model.as_deref()) {
+        if !is_minimax_model(model.as_deref())
+            && !is_glm_model(model.as_deref())
+            && !is_deepseek_model(model.as_deref())
+        {
             // Re-read effort from the shared cell at every spawn so a
             // UpdatePaneEffort that fires between spawns picks up the
             // latest value. The `effort` function param is the seed for
@@ -7321,14 +7394,27 @@ async fn run_server_connection(
                                                     text: format!("[Pane {} paused from web]", target_pane),
                                                     pane_id: target_pane,
                                                 });
+                                                // Persist so a CLI reboot restores this pane as paused
+                                                // — without this, managed workers would respawn on boot.
+                                                save_pane_configs(
+                                                    working_dir,
+                                                    &pane_sessions,
+                                                    &pane_metas,
+                                                    &pane_pauses,
+                                                    &pane_stop_requests,
+                                                );
                                                 let pane_msg = CliToServer::PanePaused { session_id, pane_id: target_pane, is_paused: true };
                                                 let msg_text = serde_json::to_string(&pane_msg).unwrap_or_default();
                                                 let _ = ws_sender.send(Message::Text(msg_text.into())).await;
-                                                // Legacy compat: also send DeadloopStatus for pane 1
+                                                // Legacy compat: also send DeadloopStatus for pane 1 and
+                                                // keep the legacy `metadata.is_paused` flag in sync since
+                                                // the boot path ORs it with `pane.is_paused` for pane 1.
                                                 if target_pane == shared::PANE_ID_DEADLOOP {
                                                     if let Ok(mut metadata) = get_or_create_project(std::path::Path::new(working_dir)) {
-                                                        metadata.is_paused = true;
-                                                        let _ = save_project(std::path::Path::new(working_dir), &metadata);
+                                                        if !metadata.is_paused {
+                                                            metadata.is_paused = true;
+                                                            let _ = save_project(std::path::Path::new(working_dir), &metadata);
+                                                        }
                                                     }
                                                     let status_msg = CliToServer::DeadloopStatus { session_id, is_paused: true };
                                                     let msg_text = serde_json::to_string(&status_msg).unwrap_or_default();
@@ -7345,14 +7431,24 @@ async fn run_server_connection(
                                                     text: format!("[Pane {} resumed from web]", target_pane),
                                                     pane_id: target_pane,
                                                 });
+                                                save_pane_configs(
+                                                    working_dir,
+                                                    &pane_sessions,
+                                                    &pane_metas,
+                                                    &pane_pauses,
+                                                    &pane_stop_requests,
+                                                );
                                                 let pane_msg = CliToServer::PanePaused { session_id, pane_id: target_pane, is_paused: false };
                                                 let msg_text = serde_json::to_string(&pane_msg).unwrap_or_default();
                                                 let _ = ws_sender.send(Message::Text(msg_text.into())).await;
-                                                // Legacy compat: also send DeadloopStatus for pane 1
+                                                // Legacy compat: clear `metadata.is_paused` and emit
+                                                // DeadloopStatus when pane 1 resumes.
                                                 if target_pane == shared::PANE_ID_DEADLOOP {
                                                     if let Ok(mut metadata) = get_or_create_project(std::path::Path::new(working_dir)) {
-                                                        metadata.is_paused = false;
-                                                        let _ = save_project(std::path::Path::new(working_dir), &metadata);
+                                                        if metadata.is_paused {
+                                                            metadata.is_paused = false;
+                                                            let _ = save_project(std::path::Path::new(working_dir), &metadata);
+                                                        }
                                                     }
                                                     let status_msg = CliToServer::DeadloopStatus { session_id, is_paused: false };
                                                     let msg_text = serde_json::to_string(&status_msg).unwrap_or_default();
@@ -8528,7 +8624,7 @@ async fn run_server_connection(
                             }
                         }
                         _ = usage_interval.tick() => {
-                            let (has_claude, has_codex, has_minimax, has_glm) =
+                            let (has_claude, has_codex, has_minimax, has_glm, has_deepseek) =
                                 active_usage_providers(&pane_metas);
                             let max_age = chrono::Duration::minutes(USAGE_CACHE_MAX_AGE_MINUTES);
 
@@ -8590,6 +8686,21 @@ async fn run_server_connection(
                                 }
                             } else if has_glm {
                                 tracing::debug!("No fresh cached GLM usage limits available");
+                            }
+
+                            if let Some(limits) =
+                                crate::usage::read_cached_deepseek_usage_limits(Some(max_age))
+                            {
+                                let usage_msg = CliToServer::UsageLimits {
+                                    provider: Provider::Deepseek,
+                                    limits,
+                                };
+                                let msg_text = serde_json::to_string(&usage_msg).unwrap_or_default();
+                                if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
+                                    tracing::warn!("Failed to send DeepSeek usage limits to server");
+                                }
+                            } else if has_deepseek {
+                                tracing::debug!("No fresh cached DeepSeek usage limits available");
                             }
                         }
                     }
