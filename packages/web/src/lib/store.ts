@@ -1043,6 +1043,13 @@ export const useStore = create<AppState>((set, get) => ({
           isDeadloopPaused: false,
           interactiveStatus: null,
           deadloopStatus: null,
+          // Per-session file-snapshot state: drop on switch so the
+          // panels render empty / loading until the new project's
+          // CLI pushes its TeamTodoState / SuggestedWorkersState.
+          // Without this, switching projects shows the previous
+          // project's TODOs until the new project happens to reply.
+          teamTodoState: null,
+          suggestedWorkers: null,
           sessionCache,
           unreadSessions,
         });
@@ -1065,6 +1072,8 @@ export const useStore = create<AppState>((set, get) => ({
           isDeadloopPaused: false,
           interactiveStatus: null,
           deadloopStatus: null,
+          teamTodoState: null,
+          suggestedWorkers: null,
           sessionCache,
           unreadSessions,
         });
