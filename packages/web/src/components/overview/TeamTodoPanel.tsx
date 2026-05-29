@@ -66,11 +66,24 @@ export function TeamTodoPanel() {
           No global TODOs yet.
         </p>
       ) : !empty && state ? (
-        <ul className="mb-3 space-y-2">
-          {state.globals.map((g) => (
-            <GlobalRow key={g.id} g={g} />
-          ))}
-        </ul>
+        (() => {
+          const active = state.globals.filter((g) => g.status !== "rejected");
+          const rejected = state.globals.filter((g) => g.status === "rejected");
+          return (
+            <>
+              {active.length > 0 && (
+                <ul className="mb-3 space-y-2">
+                  {active.map((g) => (
+                    <GlobalRow key={g.id} g={g} />
+                  ))}
+                </ul>
+              )}
+              {rejected.length > 0 && (
+                <RejectedFolder rejected={rejected} />
+              )}
+            </>
+          );
+        })()
       ) : null}
 
       {!empty && state && state.workers.length > 0 && (
@@ -289,6 +302,35 @@ function AddTodoControl() {
         </button>
       </div>
     </div>
+  );
+}
+
+/// Rejected TODOs aren't acted on but are useful as history (so the
+/// user remembers what was already considered and turned down).
+/// Folded under a single expandable summary at the bottom of the
+/// active list, with each entry as a one-liner — no body, no buttons.
+function RejectedFolder({ rejected }: { rejected: TeamTodoGlobal[] }) {
+  return (
+    <details className="mb-3 rounded border border-gray-200 bg-gray-50 dark:border-gray-700 dark:bg-gray-800/40">
+      <summary className="cursor-pointer select-none px-2 py-1 text-[11px] text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">
+        Rejected ({rejected.length})
+      </summary>
+      <ul className="divide-y divide-gray-200 dark:divide-gray-700">
+        {rejected.map((g) => (
+          <li key={g.id} className="flex items-baseline gap-2 px-2 py-1">
+            <code className="text-[10px] text-gray-500 dark:text-gray-400">
+              {g.id}
+            </code>
+            <span className="truncate text-xs text-gray-700 line-through decoration-gray-400 dark:text-gray-300">
+              {g.title}
+            </span>
+            <span className="ml-auto shrink-0 text-[10px] text-gray-500 dark:text-gray-400">
+              {g.origin}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </details>
   );
 }
 
