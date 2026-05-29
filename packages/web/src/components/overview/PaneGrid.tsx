@@ -152,9 +152,35 @@ function PaneCard({
     : isThinking
       ? "text-blue-500 animate-pulse"
       : "text-gray-400";
-  const providerBadge = pane.model
-    ? `${pane.provider} · ${pane.model}`
-    : pane.provider;
+  const updatePaneModel = useStore((s) => s.updatePaneModel);
+  // Inline agent switcher. Native <select>s sit where the static
+  // provider badge used to so users can swap claude → codex (or
+  // sonnet → opus) without clicking into the pane first. Selects
+  // are gated under the badge-shaped container so the row stays
+  // compact; the model select only shows for the Claude provider.
+  const PROVIDER_OPTS: ReadonlyArray<{ value: string; label: string }> = [
+    { value: "claude", label: "Claude" },
+    { value: "codex", label: "Codex" },
+    { value: "cursor-agent", label: "Cursor" },
+    { value: "opencode", label: "OpenCode" },
+    { value: "minimax", label: "MiniMax" },
+    { value: "glm", label: "GLM" },
+  ];
+  const CLAUDE_MODEL_OPTS: ReadonlyArray<{ value: string; label: string }> = [
+    { value: "default", label: "Default" },
+    { value: "sonnet", label: "Sonnet" },
+    { value: "opus", label: "Opus" },
+    { value: "haiku", label: "Haiku" },
+  ];
+  const normalizeClaudeModel = (raw?: string | null): string => {
+    if (typeof raw !== "string") return "default";
+    const v = raw.trim().toLowerCase();
+    if (CLAUDE_MODEL_OPTS.some((o) => o.value === v)) return v;
+    if (v.includes("sonnet")) return "sonnet";
+    if (v.includes("opus")) return "opus";
+    if (v.includes("haiku")) return "haiku";
+    return "default";
+  };
   const label = pane.label || `Tab ${pane.pane_id}`;
   return (
     <button
@@ -185,8 +211,60 @@ function PaneCard({
               manualMode={pane.manual_mode === true}
             />
           )}
-        <span className="ml-auto rounded bg-gray-100 dark:bg-gray-700 px-1.5 py-0.5 text-[10px] font-mono text-gray-600 dark:text-gray-400">
-          {providerBadge}
+        <span
+          className="ml-auto flex items-center gap-1"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <select
+            value={pane.provider}
+            onChange={(e) => {
+              const next = e.target.value;
+              if (next === pane.provider) return;
+              const label = PROVIDER_OPTS.find((o) => o.value === next)?.label ?? next;
+              if (
+                !confirm(
+                  `Switch agent to ${label}? The current turn will be interrupted and the agent respawns with a fresh context — chat history stays visible but is NOT in the new agent's prompt. Make sure ${label} is installed + authenticated on the host running this pane.`,
+                )
+              ) {
+                return;
+              }
+              updatePaneModel(pane.pane_id, null, next);
+            }}
+            className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-1 py-0 text-[10px] font-mono text-gray-700 dark:text-gray-300 focus:outline-none"
+            title="Agent backend — switching kills the current agent child and respawns with a fresh session id"
+          >
+            {PROVIDER_OPTS.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+          {pane.provider === "claude" && (
+            <select
+              value={normalizeClaudeModel(pane.model)}
+              onChange={(e) => {
+                const next = e.target.value;
+                const cur = normalizeClaudeModel(pane.model);
+                if (next === cur) return;
+                if (
+                  !confirm(
+                    `Switch model to ${next}? The current turn will be interrupted and the agent respawns with a fresh context.`,
+                  )
+                ) {
+                  return;
+                }
+                updatePaneModel(pane.pane_id, next === "default" ? null : next);
+              }}
+              className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-1 py-0 text-[10px] font-mono text-gray-700 dark:text-gray-300 focus:outline-none"
+              title="Claude model"
+            >
+              {CLAUDE_MODEL_OPTS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          )}
         </span>
       </div>
 
