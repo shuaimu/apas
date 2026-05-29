@@ -1753,9 +1753,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             )
                             .await;
 
-                        // Load existing messages from file storage (100 per pane type to ensure both are shown)
+                        // Initial-load size: 30 per pane keeps the attach response
+                        // small enough to traverse cellular within the heartbeat
+                        // budget. Older messages still reach the user via
+                        // loadMoreMessages (scroll-to-top in the pane) which
+                        // hits the same path with a `before_id` paginated query.
                         let (messages, has_more) =
-                            match state.storage.get_messages_per_pane(&sid, 100).await {
+                            match state.storage.get_messages_per_pane(&sid, 30).await {
                                 Ok((stored_messages, has_more)) => {
                                     let messages: Vec<MessageInfo> =
                                         stored_messages.into_iter().map(to_message_info).collect();

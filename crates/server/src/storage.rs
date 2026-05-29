@@ -725,7 +725,13 @@ impl FileStorage {
         limit_per_pane: usize,
     ) -> Result<(Vec<StoredMessage>, bool)> {
         const CHUNK_BYTES: usize = 64 * 1024;
-        const MAX_CONTENT_BYTES: usize = 64 * 1024;
+        // Tighter content cap for initial load than the per-call catchup
+        // budget. The Hashbrown-port style workers in big projects emit
+        // tool_results that include full file dumps — a single message
+        // can be hundreds of KB. At 16 KB the user still sees the head of
+        // the result (enough to know what happened); the full content is
+        // available in the agent's session JSONL if needed.
+        const MAX_CONTENT_BYTES: usize = 16 * 1024;
         // After every known pane bucket is full, keep reading this many
         // more lines so a newly-active pane lurking just past the scan
         // window doesn't get missed entirely.
