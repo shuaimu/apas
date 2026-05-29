@@ -410,7 +410,7 @@ export function TabBar({
                   hidden for Manager and Tech Lead tabs (they're the
                   always-there team-coordination panes; closing them
                   doesn't make sense from the UI). */}
-              {tabs.length > 1 && !isManagerOrTechLeadTab(tab.role) && (
+              {tabs.length > 1 && !(tab.managed && isManagerOrTechLeadTab(tab.role)) && (
                 <span
                   onClick={(e) => {
                     e.stopPropagation();
@@ -452,7 +452,7 @@ export function TabBar({
             const tab = contextMenu
               ? tabs.find((t) => t.pane_id === contextMenu.paneId)
               : undefined;
-            if (isManagerOrTechLeadTab(tab?.role)) return null;
+            if (tab?.managed && isManagerOrTechLeadTab(tab?.role)) return null;
             return (
               <button
                 onClick={() => {

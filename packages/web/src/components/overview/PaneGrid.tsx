@@ -365,7 +365,7 @@ function PaneCard({
           )}
           {pane.pane_id !== PANE_ID_INTERACTIVE &&
             pane.pane_id !== PANE_ID_DEADLOOP &&
-            !isManagerOrTechLead(pane.role) && (
+            !(pane.managed && isManagerOrTechLead(pane.role)) && (
               <span
                 className="rounded border border-red-400 dark:border-red-700 bg-red-50 dark:bg-red-900/30 px-1.5 py-0.5 text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/50"
                 role="button"
