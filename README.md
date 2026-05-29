@@ -1,12 +1,14 @@
 # APAS - Autonomous Programming Agent System
 
-APAS is an autonomous coding agent that wraps Claude Code CLI and runs in a continuous loop to work through tasks defined in a TODO.md file.
+APAS runs an autonomous programming team around your project. A Manager pane talks with the human and keeps `project_goal.md` current, a Tech Lead turns that goal into structured work in `team-todo.md`, and worker/reviewer panes implement changes in branches and open PRs for human review.
 
 ## Features
 
-- **Autonomous Mode**: Runs Claude Code in a dead loop, continuously working through tasks
-- **Customizable Prompts**: Define your workflow in the `.apas` config file
-- **Web Dashboard**: Monitor and observe Claude's work in real-time via web UI
+- **Team Mode**: Coordinate Manager, Tech Lead, Reviewer, and worker panes from one project
+- **Shared Project State**: Keep goals in `project_goal.md` and work queues in `team-todo.md`
+- **PR-Based Review**: Workers publish diffs, wait for Reviewer approval, then open pull requests for the human to merge
+- **Web Dashboard**: Use the Overview to inspect panes, manage TODOs, and observe work in real time
+- **Customizable Prompts**: Define role prompts and workflow behavior in the `.apas` config file
 - **Auto-Updates**: CLI automatically checks for updates on startup
 
 ## Installation
@@ -53,7 +55,18 @@ apas
 This will:
 1. Create a `.apas` file in your project if it doesn't exist
 2. Connect to the APAS server for web monitoring
-3. Start Claude Code in autonomous mode with the default workflow
+3. Start the local CLI session and expose the project in the web Overview
+4. Spawn or reconnect the default team panes so the Manager, Tech Lead, Reviewer, and workers can coordinate
+
+### Team Mode
+
+The Overview is the main control surface for team-mode projects:
+
+1. Start or open the Manager pane.
+2. Describe the project goal, or ask the Manager to scan the repo and draft one. The Manager keeps `project_goal.md` in sync.
+3. Start the Tech Lead. It reads `project_goal.md` and `team-todo.md`, proposes Global TODOs, and dispatches approved work to worker panes.
+4. Approve or reject proposed Global TODOs from the Overview TODO panel.
+5. Review worker PRs on GitHub. Workers wait for Reviewer approval before opening PRs, and they wait for the human to merge them.
 
 ### Configuration
 
@@ -68,15 +81,7 @@ The `.apas` file in your project directory contains:
 }
 ```
 
-If no `prompt` is specified, the default 7-step workflow is used:
-
-1. Pick a task from TODO.md
-2. Analyze and break down if needed
-3. Execute the task with a plan
-4. Run tests and fix failures
-5. Prepare for commit (check for unsafe code)
-6. Git commit and push
-7. Loop back to step 1
+If no custom `prompt` is specified, APAS uses the built-in team-mode prompts for the default Manager, Tech Lead, Reviewer, and Developer panes. You can customize pane roles, goals, backstories, and prompts in `.apas` as your workflow matures.
 
 ### CLI Options
 
