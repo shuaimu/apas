@@ -1753,27 +1753,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             )
                             .await;
 
-                        // Initial-load size: 30 per pane keeps the attach response
-                        // small enough to traverse cellular within the heartbeat
-                        // budget. Older messages still reach the user via
-                        // loadMoreMessages (scroll-to-top in the pane) which
-                        // hits the same path with a `before_id` paginated query.
-                        let (messages, has_more) =
-                            match state.storage.get_messages_per_pane(&sid, 30).await {
-                                Ok((stored_messages, has_more)) => {
-                                    let messages: Vec<MessageInfo> =
-                                        stored_messages.into_iter().map(to_message_info).collect();
-                                    (messages, has_more)
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        "Failed to load messages for session {}: {}",
-                                        sid,
-                                        e
-                                    );
-                                    (Vec::new(), false)
-                                }
-                            };
+                        // Lazy-load mode: don't ship every pane's tail on attach.
+                        // The web fetches per-pane history on demand the first
+                        // time the user opens a tab, via GetSessionMessages
+                        // with a pane_id filter. Attach response carries just
+                        // the metadata (pane list, statuses, goal) so the
+                        // payload is small even on huge sessions like rusty-cpp
+                        // (1+ GB messages.jsonl).
+                        let messages: Vec<MessageInfo> = Vec::new();
+                        let has_more = false;
 
                         // Restore pane list for inactive sessions:
                         // 1) in-memory cache, 2) persisted pane metadata, 3) inferred from messages.

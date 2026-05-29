@@ -457,6 +457,14 @@ interface AppState {
   // `route_to_web` couldn't reach the disconnected old connection_id.
   sessionLastCreatedAt: Map<string, string>;
 
+  /// Per-pane "first fetch in flight" set. The attach response no
+  /// longer carries every pane's tail (lazy-load mode) — each tab
+  /// fetches its own messages on first open via
+  /// `loadPaneMessagesIfNeeded`. Tracking in-flight prevents
+  /// double-fetch when the user clicks the same tab twice quickly
+  /// or when React effects re-fire.
+  paneLoadingInitial: Set<number>;
+
   /// Per-pane watermark map (sessionId → paneId → server created_at).
   /// Used to derive `sessionLastCreatedAt[sid]` as the MIN across
   /// panes — that's the only safe catchup point. If a fast pane (e.g.
@@ -547,6 +555,12 @@ interface AppState {
   listSessions: () => void;
   loadSessionMessages: (sessionId: string) => void;
   loadMoreMessages: (pane?: PaneType | number) => void;
+  /** Lazy-load mode: fetch this pane's messages on first tab activation
+   *  if we haven't already. Server's attach reply doesn't ship every
+   *  pane's tail anymore; this action requests only the active pane
+   *  via `get_session_messages` with `pane_id`. No-op if the pane is
+   *  already loaded or a fetch is in flight. */
+  loadPaneMessagesIfNeeded: (paneId: number) => void;
   prependMessages: (messages: Message[], hasMore: boolean) => void;
   sendMessageToPane: (text: string, pane: PaneType | number) => { success: boolean; error?: string };
   addMessageToPane: (message: Message, pane: PaneType | number) => void;
@@ -708,6 +722,7 @@ export const useStore = create<AppState>((set, get) => ({
   unreadSessions: new Set(),
   sessionLastCreatedAt: new Map(),
   paneLastCreatedAt: new Map(),
+  paneLoadingInitial: new Set(),
   reconnectWatermarks: new Map(),
   pendingSends: loadPendingSends(),
   teamTodoStates: new Map(),
@@ -1089,6 +1104,7 @@ export const useStore = create<AppState>((set, get) => ({
           isDeadloopPaused: false,
           interactiveStatus: null,
           deadloopStatus: null,
+          paneLoadingInitial: new Set(),
           sessionCache,
           unreadSessions,
         });
@@ -1372,6 +1388,52 @@ export const useStore = create<AppState>((set, get) => ({
 
   clearMessages: () => {
     set({ messages: [] });
+  },
+
+  loadPaneMessagesIfNeeded: (paneId: number) => {
+    const { ws, sessionId, paneMessages, paneLoadingInitial } = get();
+    if (!sessionId) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    // `undefined` = never fetched. An empty array `[]` means the
+    // pane was fetched and is genuinely empty — don't refetch.
+    if (paneMessages[paneKey(paneId)] !== undefined) return;
+    if (paneLoadingInitial.has(paneId)) return;
+    // Reserve the in-flight slot AND seed the bucket as []. The seed
+    // satisfies the "trust local" rule's `existing.length === 0`
+    // accept-snapshot branch (so the reply still populates), and the
+    // `!== undefined` check above blocks redundant re-fetches by
+    // re-renders.
+    set((state) => {
+      const nextLoading = new Set(state.paneLoadingInitial);
+      nextLoading.add(paneId);
+      return {
+        paneLoadingInitial: nextLoading,
+        paneMessages: { ...state.paneMessages, [paneKey(paneId)]: [] },
+      };
+    });
+    ws.send(
+      JSON.stringify({
+        type: "get_session_messages",
+        session_id: sessionId,
+        pane_id: paneId,
+        limit: 30,
+      }),
+    );
+    // Fallback: a pane that returns no messages won't appear in
+    // paneMsgBuckets so the session_messages handler can't clear
+    // its in-flight marker. Clear after 30s either way so a future
+    // refresh attempt isn't blocked.
+    const requestedSessionId = sessionId;
+    setTimeout(() => {
+      const cur = get();
+      if (cur.sessionId !== requestedSessionId) return;
+      if (!cur.paneLoadingInitial.has(paneId)) return;
+      set((state) => {
+        const next = new Set(state.paneLoadingInitial);
+        next.delete(paneId);
+        return { paneLoadingInitial: next };
+      });
+    }, 30_000);
   },
 
   loadMoreMessages: (pane?: PaneType | number) => {
@@ -3294,6 +3356,20 @@ function handleServerMessage(
             : existingPaneModes,
           isDualPane: true,
         });
+        // Clear in-flight markers for panes we just got data for.
+        // Panes the response was filtered to but returned empty don't
+        // show up in paneMsgBuckets — those get cleared by the timeout
+        // fallback set up in loadPaneMessagesIfNeeded.
+        if (Object.keys(paneMsgBuckets).length > 0) {
+          set((state) => {
+            const next = new Set(state.paneLoadingInitial);
+            for (const k of Object.keys(paneMsgBuckets)) {
+              const pid = Number.parseInt(k, 10);
+              if (Number.isFinite(pid)) next.delete(pid);
+            }
+            return { paneLoadingInitial: next };
+          });
+        }
       } else {
         // Initial load - single pane mode. Same "trust local" rule:
         // if we already have messages, ignore the server snapshot to

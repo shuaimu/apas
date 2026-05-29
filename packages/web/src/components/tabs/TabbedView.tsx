@@ -275,6 +275,7 @@ export function TabbedView() {
 
   const sendMessageToPane = useStore((s) => s.sendMessageToPane);
   const loadMoreMessages = useStore((s) => s.loadMoreMessages);
+  const loadPaneMessagesIfNeeded = useStore((s) => s.loadPaneMessagesIfNeeded);
   const addPane = useStore((s) => s.addPane);
   const removePane = useStore((s) => s.removePane);
   const pausePane = useStore((s) => s.pausePane);
@@ -415,6 +416,16 @@ export function TabbedView() {
     // we'd otherwise overwrite the user's intent on the next save.
     if (activeTabId !== ids[0]) setActiveTabId(ids[0]);
   }, [activeTabId, cliClientId, paneConfigs.length, tabIds]);
+
+  // Lazy-load: when activeTabId changes (initial pick or user click),
+  // fetch that pane's messages if we haven't already. Server's attach
+  // reply no longer ships every pane's tail, so each pane opens
+  // on-demand. Skip for the Overview pseudo-tab.
+  useEffect(() => {
+    if (activeTabId == null) return;
+    if (activeTabId === OVERVIEW_PANE_ID) return;
+    loadPaneMessagesIfNeeded(activeTabId);
+  }, [activeTabId, sessionId, loadPaneMessagesIfNeeded]);
 
   const handleSelectTab = useCallback(
     (paneId: number) => {
