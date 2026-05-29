@@ -396,15 +396,23 @@ pub enum ServerToCli {
         effort: Option<String>,
     },
 
-    /// Switch a pane's model. Kills the running claude child immediately
-    /// so any in-flight turn is dropped, then respawns the streaming
-    /// worker with a fresh claude_session_id under the new model — the
-    /// new agent starts with no prior chat context (user is warned about
-    /// this in the UI). The on-screen chat history stays visible.
-    /// `model: None` clears the override back to the user's default.
+    /// Switch a pane's agent backend (provider + model). Kills the
+    /// running agent child immediately so any in-flight turn is
+    /// dropped, then respawns the streaming worker with a fresh
+    /// session id — the new agent starts with no prior chat context
+    /// (user is warned about this in the UI). The on-screen chat
+    /// history stays visible.
+    ///
+    /// `provider: None` keeps the current provider; `model: None`
+    /// clears any model override (each provider has its own default).
+    /// Sending both lets the web swap providers + reset model in a
+    /// single round-trip — useful when moving e.g. from claude to
+    /// codex (different binary, different model namespace).
     UpdatePaneModel {
         session_id: Uuid,
         pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<Provider>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
     },
@@ -712,12 +720,14 @@ pub enum WebToServer {
         effort: Option<String>,
     },
 
-    /// Switch a pane's model. The CLI kills the current claude child and
-    /// respawns with a fresh session_id under the new model — the new
-    /// agent starts with no prior chat context. See `ServerToCli::
-    /// UpdatePaneModel` for the full semantics.
+    /// Switch a pane's agent backend (provider + model). The CLI kills
+    /// the current agent child and respawns with a fresh session id —
+    /// the new agent starts with no prior chat context. See
+    /// `ServerToCli::UpdatePaneModel` for the full semantics.
     UpdatePaneModel {
         pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<Provider>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
     },

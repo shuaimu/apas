@@ -7691,10 +7691,10 @@ async fn run_server_connection(
                                                     }
                                                 }
                                             }
-                                            ServerToCli::UpdatePaneModel { session_id: _, pane_id: target_pane, model } => {
-                                                // Snapshot current PaneMeta + kill the claude child;
-                                                // re-emit AddTabWithConfig with the new model + a
-                                                // fresh claude_session_id so the respawned worker
+                                            ServerToCli::UpdatePaneModel { session_id: _, pane_id: target_pane, provider, model } => {
+                                                // Snapshot current PaneMeta + kill the agent child;
+                                                // re-emit AddTabWithConfig with the new provider +
+                                                // model + fresh session id so the respawned worker
                                                 // doesn't --resume the old conversation. Chat
                                                 // history stays in paneMessages on the client; the
                                                 // new agent just starts with no prior context.
@@ -7712,6 +7712,9 @@ async fn run_server_connection(
                                                         );
                                                         continue;
                                                     };
+                                                    if let Some(p) = provider {
+                                                        meta.provider = p;
+                                                    }
                                                     meta.model = trimmed.clone();
                                                     Some((
                                                         meta.label.clone(),
@@ -7733,7 +7736,7 @@ async fn run_server_connection(
                                                 let Some((
                                                     label,
                                                     mode,
-                                                    provider,
+                                                    effective_provider,
                                                     prompt,
                                                     min_interval,
                                                     new_model,
@@ -7774,17 +7777,27 @@ async fn run_server_connection(
 
                                                 tracing::info!(
                                                     pane_id = target_pane,
+                                                    new_provider = ?provider,
                                                     new_model = ?new_model,
                                                     new_session = %new_session,
-                                                    "Model switch: killed old child, respawning with fresh session"
+                                                    "Agent switch: killed old child, respawning with fresh session"
                                                 );
 
                                                 // Surface the change in chat so the user sees
-                                                // the model swap and the context reset together.
-                                                let banner = format!(
-                                                    "[Model switched to {}. The new agent starts with a fresh context — chat history above is still visible but is NOT part of the new agent's prompt.]",
-                                                    new_model.as_deref().unwrap_or("default")
-                                                );
+                                                // the swap and the context reset together.
+                                                let provider_label = format!("{:?}", effective_provider).to_lowercase();
+                                                let model_label = new_model.as_deref().unwrap_or("default");
+                                                let banner = if provider.is_some() {
+                                                    format!(
+                                                        "[Agent switched to {} (model: {}). The new agent starts with a fresh context — chat history above is still visible but is NOT part of the new agent's prompt.]",
+                                                        provider_label, model_label
+                                                    )
+                                                } else {
+                                                    format!(
+                                                        "[Model switched to {}. The new agent starts with a fresh context — chat history above is still visible but is NOT part of the new agent's prompt.]",
+                                                        model_label
+                                                    )
+                                                };
                                                 let banner_msg = CliToServer::Output {
                                                     session_id,
                                                     data: banner,
@@ -7808,7 +7821,7 @@ async fn run_server_connection(
                                                     label,
                                                     claude_session_id: new_session,
                                                     mode,
-                                                    provider,
+                                                    provider: effective_provider,
                                                     prompt,
                                                     min_iteration_interval_minutes: min_interval,
                                                     model: new_model,

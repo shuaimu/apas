@@ -563,11 +563,18 @@ interface AppState {
   removePane: (paneId: number, cleanupAction?: PaneCleanupAction) => void;
   updatePaneLabel: (paneId: number, label: string) => void;
   updatePaneEffort: (paneId: number, effort: string | null) => void;
-  /** Switch a pane's Claude model. Pass `null` to clear back to the
-   *  user's default. Kills the current claude child + respawns the
-   *  worker on a fresh session_id; the chat history stays visible
-   *  client-side but is NOT part of the new agent's context. */
-  updatePaneModel: (paneId: number, model: string | null) => void;
+  /** Switch a pane's agent backend (provider + model). Pass `provider`
+   *  to swap the underlying CLI (claude / codex / cursor-agent /
+   *  opencode / minimax / glm); pass `null` to keep current. Pass
+   *  `model` to set / `null` to clear back to the provider's default.
+   *  Kills the current agent child + respawns the worker on a fresh
+   *  session id; chat history stays visible client-side but is NOT
+   *  in the new agent's prompt. */
+  updatePaneModel: (
+    paneId: number,
+    model: string | null,
+    provider?: string | null,
+  ) => void;
   interruptPane: (paneId: number) => void;
   reorderPanes: (paneIds: number[]) => void;
   startBot: (
@@ -1886,7 +1893,11 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  updatePaneModel: (paneId: number, model: string | null) => {
+  updatePaneModel: (
+    paneId: number,
+    model: string | null,
+    provider?: string | null,
+  ) => {
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(
@@ -1894,6 +1905,9 @@ export const useStore = create<AppState>((set, get) => ({
           type: "update_pane_model",
           pane_id: paneId,
           model: model ?? null,
+          // null = keep current provider; only send when explicitly
+          // changing (avoids surprise resets on a model-only swap).
+          ...(provider !== undefined ? { provider } : {}),
         }),
       );
     }

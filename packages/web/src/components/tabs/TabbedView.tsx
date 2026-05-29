@@ -157,6 +157,24 @@ const CLAUDE_MODEL_OPTIONS = [
 ] as const;
 type ClaudeModelOption = (typeof CLAUDE_MODEL_OPTIONS)[number]["value"];
 
+/// Provider switcher options. Maps to `shared::Provider` on the wire
+/// (serde rename_all=snake_case, plus `cursor-agent` serializing as
+/// that explicit string). Order: Claude first (default), then the
+/// alternatives, since most users start on Claude and reach for the
+/// switcher to spread load across other agents.
+const PROVIDER_OPTIONS = [
+  { value: "claude", label: "Claude" },
+  { value: "codex", label: "Codex" },
+  { value: "cursor-agent", label: "Cursor" },
+  { value: "opencode", label: "OpenCode" },
+  { value: "minimax", label: "MiniMax" },
+  { value: "glm", label: "GLM" },
+] as const;
+type ProviderOption = (typeof PROVIDER_OPTIONS)[number]["value"];
+const PROVIDER_LABEL: Record<ProviderOption, string> = Object.fromEntries(
+  PROVIDER_OPTIONS.map((o) => [o.value, o.label]),
+) as Record<ProviderOption, string>;
+
 function normalizeClaudeModelOption(raw?: string | null): ClaudeModelOption {
   if (typeof raw !== "string") return "default";
   const normalized = raw.trim().toLowerCase();
@@ -850,6 +868,34 @@ export function TabbedView() {
                   title="Claude thinking effort — persisted per tab"
                 >
                   {CLAUDE_EFFORT_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              )}
+              {activeTabId != null && activeProvider && (
+                <select
+                  value={activeProvider as ProviderOption}
+                  onChange={(e) => {
+                    const next = e.target.value as ProviderOption;
+                    if (next === activeProvider) return;
+                    if (
+                      !confirm(
+                        `Switch agent to ${PROVIDER_LABEL[next] ?? next}? The current turn will be interrupted and the agent respawns with a fresh context — chat history stays visible but is NOT in the new agent's prompt. Make sure ${PROVIDER_LABEL[next] ?? next} is installed + authenticated on the machine running this pane.`,
+                      )
+                    ) {
+                      return;
+                    }
+                    // Provider change resets model to default — each
+                    // backend has its own model namespace (sonnet only
+                    // makes sense for Claude).
+                    updatePaneModel(activeTabId, null, next);
+                  }}
+                  className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-1.5 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  title="Agent backend — switching kills the current agent child and respawns with a fresh session id"
+                >
+                  {PROVIDER_OPTIONS.map((option) => (
                     <option key={option.value} value={option.value}>
                       {option.label}
                     </option>

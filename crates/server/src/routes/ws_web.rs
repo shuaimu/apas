@@ -1471,7 +1471,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         }
                     }
                 }
-                Ok(WebToServer::UpdatePaneModel { pane_id, model }) => {
+                Ok(WebToServer::UpdatePaneModel { pane_id, provider, model }) => {
                     if let Some(sid) = session_id {
                         let trimmed = model
                             .as_deref()
@@ -1479,15 +1479,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .filter(|s| !s.is_empty())
                             .map(str::to_string);
                         tracing::info!(
-                            "Switching pane {} model in session {} to {:?}",
-                            pane_id, sid, trimmed
+                            "Switching pane {} agent in session {} to provider={:?} model={:?}",
+                            pane_id, sid, provider, trimmed
                         );
-                        // Update the cached PaneList so other web clients see
-                        // the change immediately — the CLI handler also
-                        // broadcasts a fresh PaneList after the respawn, but
-                        // updating here keeps the UI snappy.
                         let mut panes = state.sessions.get_session_panes(&sid);
                         if let Some(pane) = panes.iter_mut().find(|p| p.pane_id == pane_id) {
+                            if let Some(p) = provider {
+                                pane.provider = p;
+                            }
                             pane.model = trimmed.clone();
                             state.sessions.set_session_panes(&sid, panes.clone());
                             let _ = state.storage.save_pane_list(&sid, &panes).await;
@@ -1509,6 +1508,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 ServerToCli::UpdatePaneModel {
                                     session_id: sid,
                                     pane_id,
+                                    provider,
                                     model: trimmed,
                                 },
                             )
