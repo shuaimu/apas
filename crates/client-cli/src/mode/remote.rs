@@ -301,6 +301,7 @@ async fn run_connection(
                     | Ok(ServerToCli::StopBot { .. })
                     | Ok(ServerToCli::RequestPaneList { .. })
                     | Ok(ServerToCli::UpdatePaneEffort { .. })
+                    | Ok(ServerToCli::UpdatePaneModel { .. })
                     | Ok(ServerToCli::InterruptPane { .. })
                     | Ok(ServerToCli::AnswerQuestion { .. })
                     | Ok(ServerToCli::RequestPaneDiff { .. })

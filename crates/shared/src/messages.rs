@@ -396,6 +396,19 @@ pub enum ServerToCli {
         effort: Option<String>,
     },
 
+    /// Switch a pane's model. Kills the running claude child immediately
+    /// so any in-flight turn is dropped, then respawns the streaming
+    /// worker with a fresh claude_session_id under the new model — the
+    /// new agent starts with no prior chat context (user is warned about
+    /// this in the UI). The on-screen chat history stays visible.
+    /// `model: None` clears the override back to the user's default.
+    UpdatePaneModel {
+        session_id: Uuid,
+        pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
+
     /// Interrupt a pane's agent subprocess (SIGINT). Used to unwedge a turn
     /// stuck in a tool call so the queued user input can be processed.
     InterruptPane { session_id: Uuid, pane_id: u32 },
@@ -697,6 +710,16 @@ pub enum WebToServer {
         pane_id: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
+    },
+
+    /// Switch a pane's model. The CLI kills the current claude child and
+    /// respawns with a fresh session_id under the new model — the new
+    /// agent starts with no prior chat context. See `ServerToCli::
+    /// UpdatePaneModel` for the full semantics.
+    UpdatePaneModel {
+        pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
 
     /// Interrupt the agent process running for a pane (e.g. claude wedged on

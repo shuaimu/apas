@@ -1471,6 +1471,50 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         }
                     }
                 }
+                Ok(WebToServer::UpdatePaneModel { pane_id, model }) => {
+                    if let Some(sid) = session_id {
+                        let trimmed = model
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        tracing::info!(
+                            "Switching pane {} model in session {} to {:?}",
+                            pane_id, sid, trimmed
+                        );
+                        // Update the cached PaneList so other web clients see
+                        // the change immediately — the CLI handler also
+                        // broadcasts a fresh PaneList after the respawn, but
+                        // updating here keeps the UI snappy.
+                        let mut panes = state.sessions.get_session_panes(&sid);
+                        if let Some(pane) = panes.iter_mut().find(|p| p.pane_id == pane_id) {
+                            pane.model = trimmed.clone();
+                            state.sessions.set_session_panes(&sid, panes.clone());
+                            let _ = state.storage.save_pane_list(&sid, &panes).await;
+                            state
+                                .sessions
+                                .route_to_web(
+                                    &sid,
+                                    ServerToWeb::PaneList {
+                                        session_id: sid,
+                                        panes,
+                                    },
+                                )
+                                .await;
+                        }
+                        state
+                            .sessions
+                            .route_to_cli(
+                                &sid,
+                                ServerToCli::UpdatePaneModel {
+                                    session_id: sid,
+                                    pane_id,
+                                    model: trimmed,
+                                },
+                            )
+                            .await;
+                    }
+                }
                 Ok(WebToServer::ReorderPanes { pane_ids }) => {
                     if let Some(sid) = session_id {
                         tracing::info!("Reordering panes in session {}", sid);

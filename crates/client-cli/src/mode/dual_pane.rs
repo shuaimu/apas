@@ -7691,6 +7691,160 @@ async fn run_server_connection(
                                                     }
                                                 }
                                             }
+                                            ServerToCli::UpdatePaneModel { session_id: _, pane_id: target_pane, model } => {
+                                                // Snapshot current PaneMeta + kill the claude child;
+                                                // re-emit AddTabWithConfig with the new model + a
+                                                // fresh claude_session_id so the respawned worker
+                                                // doesn't --resume the old conversation. Chat
+                                                // history stays in paneMessages on the client; the
+                                                // new agent just starts with no prior context.
+                                                let trimmed = model
+                                                    .as_deref()
+                                                    .map(str::trim)
+                                                    .filter(|s| !s.is_empty())
+                                                    .map(str::to_string);
+                                                let snapshot = {
+                                                    let mut metas = pane_metas.lock().unwrap();
+                                                    let Some(meta) = metas.get_mut(&target_pane) else {
+                                                        tracing::warn!(
+                                                            pane_id = target_pane,
+                                                            "UpdatePaneModel: pane not found in metas; ignoring"
+                                                        );
+                                                        continue;
+                                                    };
+                                                    meta.model = trimmed.clone();
+                                                    Some((
+                                                        meta.label.clone(),
+                                                        meta.mode.clone(),
+                                                        meta.provider,
+                                                        meta.prompt.clone(),
+                                                        meta.min_iteration_interval_minutes,
+                                                        trimmed.clone(),
+                                                        meta.effort.clone(),
+                                                        meta.worktree_path.clone(),
+                                                        meta.role.clone(),
+                                                        meta.goal.clone(),
+                                                        meta.backstory.clone(),
+                                                        meta.plan_review_mode,
+                                                        meta.managed,
+                                                        meta.child_process.clone(),
+                                                    ))
+                                                };
+                                                let Some((
+                                                    label,
+                                                    mode,
+                                                    provider,
+                                                    prompt,
+                                                    min_interval,
+                                                    new_model,
+                                                    effort,
+                                                    worktree_path,
+                                                    role,
+                                                    goal,
+                                                    backstory,
+                                                    plan_review_mode,
+                                                    managed,
+                                                    child_process,
+                                                )) = snapshot
+                                                else {
+                                                    continue;
+                                                };
+
+                                                // Generate a fresh claude session so the new model
+                                                // doesn't try to --resume the prior conversation
+                                                // (which was bound to the old model + agent).
+                                                let new_session = Uuid::new_v4();
+                                                {
+                                                    let mut sessions = pane_sessions.lock().unwrap();
+                                                    sessions.insert(target_pane, new_session);
+                                                }
+
+                                                // Kill the running claude child so the streaming
+                                                // worker's read loop EOFs and the worker thread
+                                                // exits. The new AddTabWithConfig below replaces
+                                                // input_channels[target_pane], dropping the old
+                                                // sender — the worker's input_rx then EOFs too as
+                                                // a belt-and-suspenders.
+                                                if let Ok(mut guard) = child_process.lock() {
+                                                    if let Some(ref mut child) = *guard {
+                                                        let _ = child.kill();
+                                                    }
+                                                    *guard = None;
+                                                }
+
+                                                tracing::info!(
+                                                    pane_id = target_pane,
+                                                    new_model = ?new_model,
+                                                    new_session = %new_session,
+                                                    "Model switch: killed old child, respawning with fresh session"
+                                                );
+
+                                                // Surface the change in chat so the user sees
+                                                // the model swap and the context reset together.
+                                                let banner = format!(
+                                                    "[Model switched to {}. The new agent starts with a fresh context — chat history above is still visible but is NOT part of the new agent's prompt.]",
+                                                    new_model.as_deref().unwrap_or("default")
+                                                );
+                                                let banner_msg = CliToServer::Output {
+                                                    session_id,
+                                                    data: banner,
+                                                    output_type: shared::OutputType::System,
+                                                    pane_type: Some(match mode {
+                                                        shared::PaneMode::Deadloop => PaneType::Deadloop,
+                                                        shared::PaneMode::Interactive => PaneType::Interactive,
+                                                    }),
+                                                    pane_id: Some(target_pane),
+                                                };
+                                                if let Ok(text) = serde_json::to_string(&banner_msg) {
+                                                    let _ = ws_sender.send(Message::Text(text.into())).await;
+                                                }
+
+                                                // Re-emit the spawn event with the new model +
+                                                // fresh session. The AddTabWithConfig handler
+                                                // overwrites the PaneMeta + input_channels entries
+                                                // and spawns a new worker thread.
+                                                let _ = tui_event_tx.send(TuiEvent::AddTabWithConfig {
+                                                    pane_id: target_pane,
+                                                    label,
+                                                    claude_session_id: new_session,
+                                                    mode,
+                                                    provider,
+                                                    prompt,
+                                                    min_iteration_interval_minutes: min_interval,
+                                                    model: new_model,
+                                                    effort,
+                                                    worktree_path,
+                                                    initial_input: None,
+                                                    role,
+                                                    goal,
+                                                    backstory,
+                                                    plan_review_mode,
+                                                    managed,
+                                                });
+
+                                                // Persist to .apas + broadcast the fresh PaneList.
+                                                save_pane_configs(
+                                                    &working_dir,
+                                                    &pane_sessions,
+                                                    &pane_metas,
+                                                    &pane_pauses,
+                                                    &pane_stop_requests,
+                                                );
+                                                let pane_list_msg = CliToServer::PaneList {
+                                                    session_id,
+                                                    panes: build_pane_list(
+                                                        &pane_metas,
+                                                        &input_channels,
+                                                        session_id,
+                                                        &pane_sessions,
+                                                        &pane_pauses,
+                                                        &pane_stop_requests,
+                                                    ),
+                                                };
+                                                if let Ok(text) = serde_json::to_string(&pane_list_msg) {
+                                                    let _ = ws_sender.send(Message::Text(text.into())).await;
+                                                }
+                                            }
                                             ServerToCli::AnswerQuestion {
                                                 session_id: _,
                                                 tool_use_id,

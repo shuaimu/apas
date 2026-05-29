@@ -144,6 +144,34 @@ const CLAUDE_EFFORT_OPTIONS = [
 ] as const;
 type ClaudeEffortOption = (typeof CLAUDE_EFFORT_OPTIONS)[number]["value"];
 
+/// User-visible Claude model choices for the per-pane switcher.
+/// The `value` is what gets passed to `claude --model` (claude CLI
+/// understands short names like `sonnet` / `opus` / `haiku` plus the
+/// fully-qualified `claude-<family>-<version>` IDs). Default = let
+/// claude pick (currently sonnet).
+const CLAUDE_MODEL_OPTIONS = [
+  { value: "default", label: "Default" },
+  { value: "sonnet", label: "Sonnet" },
+  { value: "opus", label: "Opus" },
+  { value: "haiku", label: "Haiku" },
+] as const;
+type ClaudeModelOption = (typeof CLAUDE_MODEL_OPTIONS)[number]["value"];
+
+function normalizeClaudeModelOption(raw?: string | null): ClaudeModelOption {
+  if (typeof raw !== "string") return "default";
+  const normalized = raw.trim().toLowerCase();
+  for (const opt of CLAUDE_MODEL_OPTIONS) {
+    if (opt.value === normalized) return opt.value;
+  }
+  // Tolerate fully-qualified IDs like `claude-sonnet-4-6` by matching
+  // the family substring; falls back to "default" for anything truly
+  // foreign so the dropdown doesn't render a blank.
+  if (normalized.includes("sonnet")) return "sonnet";
+  if (normalized.includes("opus")) return "opus";
+  if (normalized.includes("haiku")) return "haiku";
+  return "default";
+}
+
 function normalizeClaudeEffortOption(raw?: string | null): ClaudeEffortOption {
   if (typeof raw !== "string") return "default";
   const normalized = raw.trim().toLowerCase();
@@ -235,6 +263,7 @@ export function TabbedView() {
   const resumePane = useStore((s) => s.resumePane);
   const updatePaneLabel = useStore((s) => s.updatePaneLabel);
   const updatePaneEffort = useStore((s) => s.updatePaneEffort);
+  const updatePaneModel = useStore((s) => s.updatePaneModel);
   const interruptPane = useStore((s) => s.interruptPane);
   const reorderPanes = useStore((s) => s.reorderPanes);
   const startBot = useStore((s) => s.startBot);
@@ -507,6 +536,7 @@ export function TabbedView() {
   const activeUsageProvider = activeIsMiniMax ? "minimax" : activeIsGlm ? "glm" : activeProvider;
   const activeSupportsClaudeEffort = activeUsageProvider === "claude";
   const activeBotEffortOption = normalizeClaudeEffortOption(activeConfig?.effort);
+  const activeModelOption = normalizeClaudeModelOption(activeConfig?.model);
   const activeBotPrompt = activeConfig?.prompt && activeConfig.prompt.trim().length > 0
     ? activeConfig.prompt
     : DEFAULT_BOT_LOOP_PROMPT;
@@ -820,6 +850,31 @@ export function TabbedView() {
                   title="Claude thinking effort — persisted per tab"
                 >
                   {CLAUDE_EFFORT_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              )}
+              {activeSupportsClaudeEffort && activeTabId != null && (
+                <select
+                  value={activeModelOption}
+                  onChange={(e) => {
+                    const next = e.target.value as ClaudeModelOption;
+                    if (next === activeModelOption) return;
+                    if (
+                      !confirm(
+                        `Switch model to ${next}? The current turn will be interrupted and the agent will respawn with a fresh context — chat history above stays visible but is NOT in the new agent's prompt.`,
+                      )
+                    ) {
+                      return;
+                    }
+                    updatePaneModel(activeTabId, next === "default" ? null : next);
+                  }}
+                  className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-1.5 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  title="Claude model — switching kills the current claude child and respawns with a fresh session_id"
+                >
+                  {CLAUDE_MODEL_OPTIONS.map((option) => (
                     <option key={option.value} value={option.value}>
                       {option.label}
                     </option>
