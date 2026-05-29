@@ -463,16 +463,20 @@ interface AppState {
   /// Removed when the matching `user_input` arrives.
   pendingSends: PendingSend[];
 
-  // Tech-Lead-driven workflow (see docs/todo-driven-workflow.md): latest
-  // snapshot of team-todo.md for the current session. Populated by
-  /** Manager-proposed worker suggestions parsed from suggested-workers.md.
-   *  Pushed by the CLI on FetchSuggestedWorkers and after Dismiss mutations.
-   *  `null` = haven't asked yet; `[]` = file empty / no suggestions. */
-  suggestedWorkers: SuggestedWorker[] | null;
+  /** Per-session snapshot of suggested-workers.md. Pushed by the CLI on
+   *  FetchSuggestedWorkers, after Dismiss mutations, and via the CLI's
+   *  mtime-gated poller. Keyed by session_id so switching projects shows
+   *  the right project's suggestions immediately (rather than the
+   *  previous project's data lingering until the new CLI replies). A
+   *  missing key = haven't fetched yet; `[]` = file empty / no
+   *  suggestions. */
+  suggestedWorkersBySession: Map<string, SuggestedWorker[]>;
 
-  // ServerToWeb::TeamTodoState in response to fetchTeamTodo() or after
-  // a TodoApproval mutation. Null = haven't fetched yet.
-  teamTodoState: TeamTodoState | null;
+  /** Per-session snapshot of team-todo.md. Same shape + reasoning as
+   *  `suggestedWorkersBySession`. Pushed in response to fetchTeamTodo()
+   *  and after TodoApproval / AddTodo mutations, plus the CLI's mtime
+   *  poller. Missing key = not fetched yet. */
+  teamTodoStates: Map<string, TeamTodoState>;
 
   // Legacy compat (derived from dynamic state)
   deadloopMessages: Message[];
@@ -674,8 +678,8 @@ export const useStore = create<AppState>((set, get) => ({
   sessionLastCreatedAt: new Map(),
   reconnectWatermarks: new Map(),
   pendingSends: loadPendingSends(),
-  teamTodoState: null,
-  suggestedWorkers: null,
+  teamTodoStates: new Map(),
+  suggestedWorkersBySession: new Map(),
   loadingMorePane: null,
   // Legacy compat getters (populated from dynamic state)
   deadloopMessages: [],
@@ -1043,13 +1047,6 @@ export const useStore = create<AppState>((set, get) => ({
           isDeadloopPaused: false,
           interactiveStatus: null,
           deadloopStatus: null,
-          // Per-session file-snapshot state: drop on switch so the
-          // panels render empty / loading until the new project's
-          // CLI pushes its TeamTodoState / SuggestedWorkersState.
-          // Without this, switching projects shows the previous
-          // project's TODOs until the new project happens to reply.
-          teamTodoState: null,
-          suggestedWorkers: null,
           sessionCache,
           unreadSessions,
         });
@@ -1072,8 +1069,6 @@ export const useStore = create<AppState>((set, get) => ({
           isDeadloopPaused: false,
           interactiveStatus: null,
           deadloopStatus: null,
-          teamTodoState: null,
-          suggestedWorkers: null,
           sessionCache,
           unreadSessions,
         });
@@ -2530,36 +2525,27 @@ function handleServerMessage(
 
     case "team_todo_state": {
       const responseSessionId = data.session_id as string | undefined;
-      const currentSessionId = get().sessionId;
-      // Drop snapshots for sessions other than the one the user is
-      // currently viewing — the TODO panel in Overview is keyed off
-      // the active session.
-      if (
-        responseSessionId &&
-        currentSessionId &&
-        responseSessionId !== currentSessionId
-      ) {
-        break;
-      }
-      const state = data.state as TeamTodoState | undefined;
-      if (state) {
-        set({ teamTodoState: state });
+      if (!responseSessionId) break;
+      const todoState = data.state as TeamTodoState | undefined;
+      if (todoState) {
+        set((state) => {
+          const next = new Map(state.teamTodoStates);
+          next.set(responseSessionId, todoState);
+          return { teamTodoStates: next };
+        });
       }
       break;
     }
 
     case "suggested_workers_state": {
       const responseSessionId = data.session_id as string | undefined;
-      const currentSessionId = get().sessionId;
-      if (
-        responseSessionId &&
-        currentSessionId &&
-        responseSessionId !== currentSessionId
-      ) {
-        break;
-      }
+      if (!responseSessionId) break;
       const suggestions = data.suggestions as SuggestedWorker[] | undefined;
-      set({ suggestedWorkers: suggestions ?? [] });
+      set((state) => {
+        const next = new Map(state.suggestedWorkersBySession);
+        next.set(responseSessionId, suggestions ?? []);
+        return { suggestedWorkersBySession: next };
+      });
       break;
     }
 

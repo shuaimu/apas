@@ -25,7 +25,9 @@ const POLL_MS = 10_000;
 
 export function TeamTodoPanel() {
   const sessionId = useStore((s) => s.sessionId);
-  const state = useStore((s) => s.teamTodoState);
+  const state = useStore((s) =>
+    s.sessionId ? s.teamTodoStates.get(s.sessionId) ?? null : null,
+  );
   const fetchTeamTodo = useStore((s) => s.fetchTeamTodo);
 
   useEffect(() => {

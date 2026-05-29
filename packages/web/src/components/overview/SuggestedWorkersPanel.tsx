@@ -13,7 +13,9 @@ import type { SuggestedWorker } from "@/lib/store";
  */
 export function SuggestedWorkersPanel() {
   const sessionId = useStore((s) => s.sessionId);
-  const suggestions = useStore((s) => s.suggestedWorkers);
+  const suggestions = useStore((s) =>
+    s.sessionId ? s.suggestedWorkersBySession.get(s.sessionId) ?? null : null,
+  );
   const fetchSuggestedWorkers = useStore((s) => s.fetchSuggestedWorkers);
   const acceptSuggestion = useStore((s) => s.acceptSuggestion);
   const dismissSuggestion = useStore((s) => s.dismissSuggestion);
