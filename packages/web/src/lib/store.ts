@@ -457,6 +457,17 @@ interface AppState {
   // `route_to_web` couldn't reach the disconnected old connection_id.
   sessionLastCreatedAt: Map<string, string>;
 
+  /// Per-pane watermark map (sessionId → paneId → server created_at).
+  /// Used to derive `sessionLastCreatedAt[sid]` as the MIN across
+  /// panes — that's the only safe catchup point. If a fast pane (e.g.
+  /// the Tech Lead deadloop) keeps streaming, its created_at would
+  /// dominate a session-wide MAX and a `after_created_at=MAX` catchup
+  /// query would return nothing for slower panes whose last message
+  /// is hours behind. The MIN semantics means catchup fetches all
+  /// messages since the slowest pane last spoke — the client dedupes
+  /// by id, so the extra payload is harmless.
+  paneLastCreatedAt: Map<string, Map<number, string>>;
+
   // Frozen pre-reconnect watermark, snapshotted from `sessionLastCreatedAt`
   // the moment the WS reauthenticates. Catchup uses this in preference to
   // the live watermark so that a stream_message that arrives between
@@ -696,6 +707,7 @@ export const useStore = create<AppState>((set, get) => ({
   sessionCache: new Map(),
   unreadSessions: new Set(),
   sessionLastCreatedAt: new Map(),
+  paneLastCreatedAt: new Map(),
   reconnectWatermarks: new Map(),
   pendingSends: loadPendingSends(),
   teamTodoStates: new Map(),
@@ -2326,6 +2338,48 @@ function flushPendingSends(
   set({ pendingSends: next });
 }
 
+/// Update the per-pane watermark for `(sessionId, paneId)` and
+/// recompute the session-level watermark as the MIN across all known
+/// panes. Caller passes `paneId = null` for messages that aren't
+/// pane-scoped (legacy single-pane mode) — those advance the session
+/// watermark directly under a synthetic "null" key. The MIN-semantics
+/// guarantees a `after_created_at = sessionLastCreatedAt[sid]`
+/// catchup query returns ALL missed messages for every pane, not
+/// just the fast ones.
+function bumpWatermark(
+  set: (partial: Partial<AppState> | ((state: AppState) => Partial<AppState>)) => void,
+  sessionId: string,
+  paneId: number | null,
+  serverCreatedAt: string,
+) {
+  set((state) => {
+    const sessionMap = state.paneLastCreatedAt.get(sessionId) ?? new Map<number, string>();
+    const key = paneId ?? -1; // -1 = legacy single-pane bucket
+    const prev = sessionMap.get(key);
+    if (prev && prev >= serverCreatedAt) return {};
+    const nextSession = new Map(sessionMap);
+    nextSession.set(key, serverCreatedAt);
+    const nextOuter = new Map(state.paneLastCreatedAt);
+    nextOuter.set(sessionId, nextSession);
+    // Recompute the session watermark as the MIN of per-pane maxes.
+    // A pane we haven't seen any message from has no entry, so it
+    // doesn't constrain the min. Once it sends its first message
+    // we'll start tracking it; until then a catchup that uses the
+    // current min is still safe for it (it asks for everything since
+    // a time we know we've already seen for some pane).
+    let minTs: string | undefined;
+    for (const v of nextSession.values()) {
+      if (!minTs || v < minTs) minTs = v;
+    }
+    const nextLast = new Map(state.sessionLastCreatedAt);
+    if (minTs) nextLast.set(sessionId, minTs);
+    return {
+      paneLastCreatedAt: nextOuter,
+      sessionLastCreatedAt: nextLast,
+    };
+  });
+}
+
 function requestCatchupIfNeeded(get: () => AppState, sessionId: string) {
   const state = get();
   const after =
@@ -2984,24 +3038,23 @@ function handleServerMessage(
       });
       const hasPaneModeHints = Object.keys(paneModeHints).length > 0;
 
-      // Bootstrap the reconnect high-water mark from whatever payload we
-      // got. Even initial loads need this so a tab that opens, sees its
-      // history, but receives zero live events before the WS drops can
-      // still ask for a meaningful catchup.
+      // Bootstrap per-pane watermarks from the loaded payload — find
+      // each pane's max created_at and bump. sessionLastCreatedAt
+      // re-derives as the MIN across panes inside bumpWatermark.
       if (responseSessionId) {
-        let maxAt: string | undefined;
+        const perPaneMax: Map<number | null, string> = new Map();
         for (const m of messages) {
           const ts = m.created_at as string | undefined;
-          if (ts && (!maxAt || ts > maxAt)) maxAt = ts;
+          if (!ts) continue;
+          const rawPaneType = m.pane_type as string | undefined;
+          const rawPaneId = m.pane_id as number | undefined;
+          const numericPane = normalizePaneId(rawPaneType, rawPaneId);
+          const key: number | null = typeof numericPane === "number" ? numericPane : null;
+          const prev = perPaneMax.get(key);
+          if (!prev || ts > prev) perPaneMax.set(key, ts);
         }
-        if (maxAt) {
-          set((state) => {
-            const prev = state.sessionLastCreatedAt.get(responseSessionId);
-            if (prev && prev >= maxAt!) return {};
-            const next = new Map(state.sessionLastCreatedAt);
-            next.set(responseSessionId, maxAt!);
-            return { sessionLastCreatedAt: next };
-          });
+        for (const [key, ts] of perPaneMax) {
+          bumpWatermark(set, responseSessionId, key, ts);
         }
       }
 
@@ -3043,14 +3096,8 @@ function handleServerMessage(
             if (mainTail.length > 0) {
               updates.messages = [...state.messages, ...mainTail];
             }
-            if (maxCreatedAt) {
-              const prev = state.sessionLastCreatedAt.get(targetSid);
-              if (!prev || prev < maxCreatedAt) {
-                const next = new Map(state.sessionLastCreatedAt);
-                next.set(targetSid, maxCreatedAt);
-                updates.sessionLastCreatedAt = next;
-              }
-            }
+            // Per-pane watermark bumps happen below outside this set()
+            // so the MIN re-derivation sees a consistent snapshot.
             if (state.reconnectWatermarks.has(targetSid)) {
               const nextRecon = new Map(state.reconnectWatermarks);
               nextRecon.delete(targetSid);
@@ -3058,6 +3105,26 @@ function handleServerMessage(
             }
             return updates;
           });
+          // Bump per-pane watermarks from the catchup payload (replaces
+          // the old session-level maxCreatedAt bump — using the max
+          // would advance the watermark past slower panes' tails).
+          if (targetSid) {
+            const perPaneMax: Map<number | null, string> = new Map();
+            for (const m of messages) {
+              const ts = m.created_at as string | undefined;
+              if (!ts) continue;
+              const numericPane = normalizePaneId(
+                m.pane_type as string | undefined,
+                m.pane_id as number | undefined,
+              );
+              const key: number | null = typeof numericPane === "number" ? numericPane : null;
+              const prev = perPaneMax.get(key);
+              if (!prev || ts > prev) perPaneMax.set(key, ts);
+            }
+            for (const [key, ts] of perPaneMax) {
+              bumpWatermark(set, targetSid, key, ts);
+            }
+          }
         } else {
           // Cached background session — apply tail to the snapshot so when
           // the user opens that tab next they see what claude did while
@@ -3079,14 +3146,7 @@ function handleServerMessage(
               cachedAt: Date.now(),
             });
             const updates: Partial<AppState> = { sessionCache: cache };
-            if (maxCreatedAt) {
-              const prev = state.sessionLastCreatedAt.get(targetSid);
-              if (!prev || prev < maxCreatedAt) {
-                const nextSeen = new Map(state.sessionLastCreatedAt);
-                nextSeen.set(targetSid, maxCreatedAt);
-                updates.sessionLastCreatedAt = nextSeen;
-              }
-            }
+            // Per-pane watermark bumps happen below.
             if (state.reconnectWatermarks.has(targetSid)) {
               const nextRecon = new Map(state.reconnectWatermarks);
               nextRecon.delete(targetSid);
@@ -3094,6 +3154,23 @@ function handleServerMessage(
             }
             return updates;
           });
+          if (targetSid) {
+            const perPaneMax: Map<number | null, string> = new Map();
+            for (const m of messages) {
+              const ts = m.created_at as string | undefined;
+              if (!ts) continue;
+              const numericPane = normalizePaneId(
+                m.pane_type as string | undefined,
+                m.pane_id as number | undefined,
+              );
+              const key: number | null = typeof numericPane === "number" ? numericPane : null;
+              const prev = perPaneMax.get(key);
+              if (!prev || ts > prev) perPaneMax.set(key, ts);
+            }
+            for (const [key, ts] of perPaneMax) {
+              bumpWatermark(set, targetSid, key, ts);
+            }
+          }
         }
         break;
       }
@@ -3207,16 +3284,19 @@ function handleServerMessage(
       const text = data.text as string;
       const isCurrentSession = !msgSessionId || msgSessionId === get().sessionId;
 
-      // Track the server's created_at for reconnect catchup (see stream_message).
+      // Track per-pane watermark for catchup (see stream_message).
       const serverCreatedAt = data.created_at as string | undefined;
       if (serverCreatedAt && msgSessionId) {
-        set((state) => {
-          const prev = state.sessionLastCreatedAt.get(msgSessionId);
-          if (prev && prev >= serverCreatedAt) return {};
-          const next = new Map(state.sessionLastCreatedAt);
-          next.set(msgSessionId, serverCreatedAt);
-          return { sessionLastCreatedAt: next };
-        });
+        const numericPane =
+          typeof paneId === "number"
+            ? paneId
+            : typeof paneId === "string"
+              ? Number.parseInt(paneId, 10)
+              : null;
+        const paneIdForBump = Number.isFinite(numericPane as number)
+          ? (numericPane as number)
+          : null;
+        bumpWatermark(set, msgSessionId, paneIdForBump, serverCreatedAt);
       }
 
       // Server bounce of our own input: claim the optimistic slot the
@@ -3315,17 +3395,22 @@ function handleServerMessage(
       if (isCurrentSession) {
         updatePaneModeHint(set, get, paneType, paneId);
       }
-      // Track the server's max created_at per session so we can fetch the
-      // tail with `after_created_at` after a WS reconnect.
+      // Track per-pane watermarks; sessionLastCreatedAt derives as the
+      // MIN across panes so a catchup after a WS reconnect doesn't
+      // skip over a slow pane's gap just because a fast pane has
+      // advanced. (See bumpWatermark for the why.)
       const serverCreatedAt = data.created_at as string | undefined;
       if (serverCreatedAt && msgSessionId) {
-        set((state) => {
-          const prev = state.sessionLastCreatedAt.get(msgSessionId);
-          if (prev && prev >= serverCreatedAt) return {};
-          const next = new Map(state.sessionLastCreatedAt);
-          next.set(msgSessionId, serverCreatedAt);
-          return { sessionLastCreatedAt: next };
-        });
+        const numericPane =
+          typeof paneId === "number"
+            ? paneId
+            : typeof paneId === "string"
+              ? Number.parseInt(paneId, 10)
+              : null;
+        const paneIdForBump = Number.isFinite(numericPane as number)
+          ? (numericPane as number)
+          : null;
+        bumpWatermark(set, msgSessionId, paneIdForBump, serverCreatedAt);
       }
       const msgType = msg.type as string;
       if (msgType === "assistant") {
