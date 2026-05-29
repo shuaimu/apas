@@ -91,7 +91,10 @@ export function TeamTodoPanel() {
         </p>
       ) : !empty && state ? (
         (() => {
-          const active = state.globals.filter((g) => g.status !== "rejected");
+          const active = state.globals.filter(
+            (g) => g.status !== "rejected" && g.status !== "done",
+          );
+          const done = state.globals.filter((g) => g.status === "done");
           const rejected = state.globals.filter((g) => g.status === "rejected");
           return (
             <>
@@ -102,8 +105,19 @@ export function TeamTodoPanel() {
                   ))}
                 </ul>
               )}
+              {done.length > 0 && (
+                <CollapsedFolder
+                  label="Done"
+                  entries={done}
+                  variant="done"
+                />
+              )}
               {rejected.length > 0 && (
-                <RejectedFolder rejected={rejected} />
+                <CollapsedFolder
+                  label="Rejected"
+                  entries={rejected}
+                  variant="rejected"
+                />
               )}
             </>
           );
@@ -329,25 +343,53 @@ function AddTodoControl() {
   );
 }
 
-/// Rejected TODOs aren't acted on but are useful as history (so the
-/// user remembers what was already considered and turned down).
-/// Folded under a single expandable summary at the bottom of the
-/// active list, with each entry as a one-liner — no body, no buttons.
-function RejectedFolder({ rejected }: { rejected: TeamTodoGlobal[] }) {
+/// Done + Rejected TODOs are both "no longer actionable" history.
+/// Each gets folded under a single expandable summary at the bottom
+/// of the active list, with each entry as a compact one-liner — no
+/// body, no Approve/Reject buttons. Done entries also surface their
+/// PR links (typically the merged PR) so the user can click through
+/// to the diff. The `variant` knob tints the title accordingly.
+function CollapsedFolder({
+  label,
+  entries,
+  variant,
+}: {
+  label: string;
+  entries: TeamTodoGlobal[];
+  variant: "done" | "rejected";
+}) {
+  const titleClass =
+    variant === "done"
+      ? "truncate text-xs text-gray-600 dark:text-gray-400"
+      : "truncate text-xs text-gray-700 line-through decoration-gray-400 dark:text-gray-300";
   return (
     <details className="mb-3 rounded border border-gray-200 bg-gray-50 dark:border-gray-700 dark:bg-gray-800/40">
       <summary className="cursor-pointer select-none px-2 py-1 text-[11px] text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">
-        Rejected ({rejected.length})
+        {label} ({entries.length})
       </summary>
       <ul className="divide-y divide-gray-200 dark:divide-gray-700">
-        {rejected.map((g) => (
+        {entries.map((g) => (
           <li key={g.id} className="flex items-baseline gap-2 px-2 py-1">
             <code className="text-[10px] text-gray-500 dark:text-gray-400">
               {g.id}
             </code>
-            <span className="truncate text-xs text-gray-700 line-through decoration-gray-400 dark:text-gray-300">
-              {g.title}
-            </span>
+            <span className={titleClass}>{g.title}</span>
+            {variant === "done" && g.prs?.length > 0 && (
+              <span className="ml-1 flex shrink-0 items-baseline gap-1">
+                {g.prs.map((pr, i) => (
+                  <a
+                    key={i}
+                    href={pr.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-[10px] text-blue-600 hover:underline dark:text-blue-400"
+                    title={pr.url}
+                  >
+                    PR{pr.pane_id ? ` (pane ${pr.pane_id})` : ""} ↗
+                  </a>
+                ))}
+              </span>
+            )}
             <span className="ml-auto shrink-0 text-[10px] text-gray-500 dark:text-gray-400">
               {g.origin}
             </span>
