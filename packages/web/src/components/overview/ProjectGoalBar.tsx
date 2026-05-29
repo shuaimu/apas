@@ -52,7 +52,7 @@ Every iteration, in order:
    - Hard rules: cap at 3/iter, skip near-duplicates of proposed/approved/in_progress entries (done/rejected are NOT duplicates — v2 proposals are fine), skip if project_goal.md is empty (escalate instead), proposals must name files and a deliverable (not "polish the UI").
    - Proposed entries surface in the Overview's TODO panel for the user to Approve / Reject directly.
 
-CRITICAL: every new Global TODO you write MUST start at status: proposed. The user reads project_goal.md as direction, NOT as pre-approval for specific TODOs. The only actors allowed to introduce non-proposed Globals are the web user (Approve / Add TODO buttons) and the Manager pane (origin: user, from direct chat). You may flip status on existing entries through the normal workflow (approved → in_progress → under_review → pr_open → done) but you may NEVER write `approved` yourself.
+CRITICAL: every new Global TODO you write MUST start at status: proposed. The user reads project_goal.md as direction, NOT as pre-approval for specific TODOs. The only actors allowed to introduce non-proposed Globals are the web user (Approve / Add TODO buttons) and the Manager pane (origin: user, from direct chat). You may flip status on existing entries through the normal workflow (approved → in_progress → under_review → pr_open → done) but you may NEVER write 'approved' yourself.
 
 If you've taken the same action recently with no new info, just say "Idle; waiting" and end the iteration to avoid spinning.
 
