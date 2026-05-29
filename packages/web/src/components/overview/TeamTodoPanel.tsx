@@ -23,6 +23,30 @@ import {
 
 const POLL_MS = 10_000;
 
+/// Parsed form of a `pr: <pane> <url>` line in team-todo.md. `null`
+/// when the line is malformed (not a GitHub PR URL we can poll).
+export interface ParsedPrLine {
+  pane: number;
+  url: string;
+  owner: string;
+  repo: string;
+  num: number;
+}
+
+/// Pull `pr: <pane> <url>` apart into the components needed to drive
+/// the GitHub Pulls API call. Returns null on any malformed input so
+/// callers can ignore the line without crashing.
+export function parsePrLine(line: string): ParsedPrLine | null {
+  const m = line.match(
+    /^pr:\s+(\d+)\s+(https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/(\d+))\s*$/,
+  );
+  if (!m) return null;
+  const pane = Number.parseInt(m[1], 10);
+  const num = Number.parseInt(m[5], 10);
+  if (!Number.isFinite(pane) || !Number.isFinite(num)) return null;
+  return { pane, url: m[2], owner: m[3], repo: m[4], num };
+}
+
 export function TeamTodoPanel() {
   const sessionId = useStore((s) => s.sessionId);
   const state = useStore((s) => s.teamTodoState);
@@ -296,6 +320,22 @@ function GlobalRow({ g }: { g: TeamTodoGlobal }) {
 
   const isProposed = g.status === "proposed";
 
+  /// Dedupe by URL — a Global can list the same PR twice (e.g. when
+  /// multiple workers contributed) and we only want one badge per URL.
+  /// Drop entries whose URL doesn't parse as a real GitHub PR.
+  const uniquePrs = useMemo(() => {
+    const seen = new Set<string>();
+    const out: { pane_id: number; parsed: ParsedPrLine }[] = [];
+    for (const pr of g.prs ?? []) {
+      if (seen.has(pr.url)) continue;
+      const parsed = parsePrLine(`pr: ${pr.pane_id} ${pr.url}`);
+      if (!parsed) continue;
+      seen.add(pr.url);
+      out.push({ pane_id: pr.pane_id, parsed });
+    }
+    return out;
+  }, [g.prs]);
+
   return (
     <li className="rounded border border-gray-200 bg-gray-50 p-2 dark:border-gray-700 dark:bg-gray-800/40">
       <div className="flex items-start justify-between gap-2">
@@ -304,17 +344,13 @@ function GlobalRow({ g }: { g: TeamTodoGlobal }) {
             <code className="text-[10px] text-gray-500 dark:text-gray-400">{g.id}</code>
             <StatusBadge status={g.status} />
             <OriginBadge origin={g.origin} />
-            {g.prs?.map((pr, i) => (
-              <a
-                key={i}
-                href={pr.url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-[11px] text-blue-600 hover:underline dark:text-blue-400"
-                title={pr.url}
-              >
-                PR{pr.pane_id ? ` (pane ${pr.pane_id})` : ""} ↗
-              </a>
+            {uniquePrs.map(({ pane_id, parsed }) => (
+              <PrLink
+                key={parsed.url}
+                paneId={pane_id}
+                parsed={parsed}
+                globalStatus={g.status}
+              />
             ))}
           </div>
           <p className="mt-0.5 text-sm font-medium text-gray-900 dark:text-gray-100">
@@ -348,6 +384,120 @@ function GlobalRow({ g }: { g: TeamTodoGlobal }) {
         )}
       </div>
     </li>
+  );
+}
+
+/// `loading` while the GitHub fetch is in flight; `done` when the
+/// Global is already status:done so we skip the fetch entirely (the
+/// PR landed and re-polling merged PRs forever is wasteful).
+type PrFetchState =
+  | { kind: "loading" }
+  | { kind: "open" }
+  | { kind: "merged" }
+  | { kind: "closed" }
+  | { kind: "error" }
+  | { kind: "done" };
+
+function PrLink({
+  paneId,
+  parsed,
+  globalStatus,
+}: {
+  paneId: number;
+  parsed: ParsedPrLine;
+  globalStatus: string;
+}) {
+  const skipFetch = globalStatus === "done";
+  const [state, setState] = useState<PrFetchState>(
+    skipFetch ? { kind: "done" } : { kind: "loading" },
+  );
+
+  useEffect(() => {
+    if (skipFetch) return;
+    let cancelled = false;
+    const url = `https://api.github.com/repos/${parsed.owner}/${parsed.repo}/pulls/${parsed.num}`;
+    fetch(url)
+      .then(async (r) => {
+        if (r.status === 403 || r.status === 429) {
+          throw new Error("rate-limit");
+        }
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then((j) => {
+        if (cancelled) return;
+        if (j && j.merged === true) setState({ kind: "merged" });
+        else if (j && j.state === "open") setState({ kind: "open" });
+        else if (j && j.state === "closed") setState({ kind: "closed" });
+        else setState({ kind: "error" });
+      })
+      .catch(() => {
+        if (!cancelled) setState({ kind: "error" });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [skipFetch, parsed.owner, parsed.repo, parsed.num]);
+
+  return (
+    <span className="inline-flex items-center gap-1">
+      <a
+        href={parsed.url}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="text-[11px] text-blue-600 hover:underline dark:text-blue-400"
+        title={parsed.url}
+      >
+        PR #{parsed.num}{paneId ? ` (pane ${paneId})` : ""} ↗
+      </a>
+      <PrStateBadge state={state} />
+    </span>
+  );
+}
+
+function PrStateBadge({ state }: { state: PrFetchState }) {
+  const { label, tone } = (() => {
+    switch (state.kind) {
+      case "loading":
+        return {
+          label: "…",
+          tone: "bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400",
+        };
+      case "open":
+        return {
+          label: "OPEN",
+          tone: "bg-amber-100 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300",
+        };
+      case "merged":
+        return {
+          label: "MERGED",
+          tone: "bg-emerald-100 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300",
+        };
+      case "closed":
+        return {
+          label: "CLOSED",
+          tone: "bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-300",
+        };
+      case "error":
+        return {
+          label: "—",
+          tone: "bg-rose-100 text-rose-800 dark:bg-rose-950/40 dark:text-rose-300",
+        };
+      case "done":
+        return {
+          label: "MERGED",
+          tone: "bg-emerald-100 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300",
+        };
+    }
+  })();
+  return (
+    <span
+      data-testid="pr-state-badge"
+      data-pr-state={state.kind}
+      className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${tone}`}
+    >
+      {label}
+    </span>
   );
 }
 
