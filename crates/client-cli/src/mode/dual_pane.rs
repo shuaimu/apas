@@ -1051,7 +1051,15 @@ async fn run_inner(
                 pending_qs,
                 effort_arc,
                 input_channels_for_dl,
-                true,
+                // Claude reuses its on-disk session jsonl across boots,
+                // so try_resume_first=true correctly continues prior chats.
+                // Codex/Cursor/etc. keep their session state server-side
+                // (codex thread, cursor chatId) and we don't always know
+                // whether the saved id is still valid; passing false means
+                // every reboot starts a fresh thread. Trade-off: no
+                // cross-boot continuity for those backends, but we never
+                // fail with "no rollout found" on a stale id either.
+                matches!(provider, Provider::Claude),
             )
         }));
     }
