@@ -337,16 +337,38 @@ fn build_pane_env_overrides(
                 GLM_DEFAULT_HAIKU_MODEL.to_string(),
             ));
         } else if is_deepseek {
-            // DeepSeek's Anthropic bridge accepts model selection via
-            // ANTHROPIC_MODEL like MiniMax.
-            env.push(("ANTHROPIC_MODEL".to_string(), model.to_string()));
+            // Same trap GLM hit: Claude CLI's pre-flight model check
+            // rejects non-Claude names set via ANTHROPIC_MODEL before
+            // the request reaches the bridge. Route through the
+            // ANTHROPIC_DEFAULT_*_MODEL aliases so claude self-reports
+            // as sonnet/opus/haiku and the bridge substitutes.
+            env.push((
+                "ANTHROPIC_DEFAULT_SONNET_MODEL".to_string(),
+                model.to_string(),
+            ));
+            env.push((
+                "ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(),
+                model.to_string(),
+            ));
+            env.push((
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
+                model.to_string(),
+            ));
         }
     } else if is_deepseek {
-        // No explicit model — pin to the default chat model so the
-        // Claude CLI doesn't pick a Claude-named default that the
-        // DeepSeek bridge would reject.
+        // No explicit model — pin the alias mapping to the default
+        // chat model so Claude CLI's pre-flight check sees valid
+        // sonnet/opus/haiku targets.
         env.push((
-            "ANTHROPIC_MODEL".to_string(),
+            "ANTHROPIC_DEFAULT_SONNET_MODEL".to_string(),
+            DEEPSEEK_DEFAULT_MODEL.to_string(),
+        ));
+        env.push((
+            "ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(),
+            DEEPSEEK_DEFAULT_MODEL.to_string(),
+        ));
+        env.push((
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
             DEEPSEEK_DEFAULT_MODEL.to_string(),
         ));
     }
@@ -3965,7 +3987,7 @@ mod tests {
 
         assert_eq!(
             active_usage_providers(&pane_metas),
-            (false, true, true, false)
+            (false, true, true, false, false)
         );
     }
 
