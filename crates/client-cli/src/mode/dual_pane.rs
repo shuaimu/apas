@@ -7378,6 +7378,44 @@ async fn run_server_connection(
                                                 });
                                             }
                                             ServerToCli::RemovePane { session_id: _, pane_id: remove_id, cleanup_action } => {
+                                                // Reset team-todo for this pane: drop its `## pane:<id>`
+                                                // section and, for any Global TODO that's now orphaned
+                                                // (no remaining worker subtasks across any pane), reset
+                                                // its status from in_progress / under_review back to
+                                                // approved so the Tech Lead re-expands and reassigns
+                                                // to a different pane next iteration. Globals where
+                                                // other workers still have subtasks keep their status
+                                                // — the multi-worker workflow continues with the
+                                                // remaining panes.
+                                                {
+                                                    let project_dir = std::path::Path::new(&working_dir);
+                                                    if let Ok(mut todo) = crate::team_todo::load(project_dir) {
+                                                        let orphaned = todo.remove_pane_subtasks(remove_id);
+                                                        for parent_id in &orphaned {
+                                                            if let Some(g) = todo.find_global_mut(parent_id) {
+                                                                if matches!(
+                                                                    g.status,
+                                                                    crate::team_todo::GlobalStatus::InProgress
+                                                                        | crate::team_todo::GlobalStatus::UnderReview
+                                                                ) {
+                                                                    tracing::info!(
+                                                                        pane_id = remove_id,
+                                                                        todo = %parent_id,
+                                                                        old_status = ?g.status,
+                                                                        "resetting orphaned Global to approved after worker pane removal"
+                                                                    );
+                                                                    g.status = crate::team_todo::GlobalStatus::Approved;
+                                                                }
+                                                            }
+                                                        }
+                                                        if let Err(e) = crate::team_todo::save(project_dir, &todo) {
+                                                            tracing::warn!(
+                                                                "Failed to save team-todo.md after pane {} removal: {}",
+                                                                remove_id, e
+                                                            );
+                                                        }
+                                                    }
+                                                }
                                                 // Delegate to TUI event handler
                                                 let _ = tui_event_tx.send(TuiEvent::CloseTab {
                                                     pane_id: remove_id,

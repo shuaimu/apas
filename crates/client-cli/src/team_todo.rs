@@ -668,6 +668,47 @@ impl TeamTodo {
         self.workers.last_mut().unwrap()
     }
 
+    /// Drop the worker section for `pane_id` and return the Global TODO
+    /// ids that have NO remaining subtasks across any other worker after
+    /// the removal — those globals should be reset to `approved` so the
+    /// Tech Lead re-expands and reassigns them to a different pane.
+    ///
+    /// Globals whose other workers still have subtasks are NOT returned
+    /// — the multi-worker workflow continues with the remaining panes.
+    /// Globals whose only contribution from this pane was already
+    /// `done` / `approved` (the work is committed and likely in a PR)
+    /// are also NOT returned — no reassignment needed.
+    pub fn remove_pane_subtasks(&mut self, pane_id: u32) -> Vec<String> {
+        let unfinished_parents: Vec<String> = self
+            .worker_section(pane_id)
+            .map(|w| {
+                w.subtasks
+                    .iter()
+                    .filter(|s| {
+                        !matches!(s.status, SubStatus::Done | SubStatus::Approved)
+                    })
+                    .map(|s| s.parent.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.workers.retain(|w| w.pane_id != pane_id);
+        let mut seen = std::collections::HashSet::new();
+        let mut orphaned: Vec<String> = Vec::new();
+        for parent in unfinished_parents {
+            if !seen.insert(parent.clone()) {
+                continue;
+            }
+            let still_has = self
+                .workers
+                .iter()
+                .any(|w| w.subtasks.iter().any(|s| s.parent == parent));
+            if !still_has {
+                orphaned.push(parent);
+            }
+        }
+        orphaned
+    }
+
     pub fn push_subtask(&mut self, pane_id: u32, item: WorkerSubtask) -> Result<()> {
         let w = self
             .worker_section_mut(pane_id)
@@ -901,6 +942,80 @@ The test fixtures bake session cookies in; replace with a JWT minter.\n\
         let s = serialize(&t);
         assert!(s.contains("# Team TODO"));
         assert!(s.contains("## Global TODOs"));
+    }
+
+    #[test]
+    fn remove_pane_subtasks_returns_orphaned_globals() {
+        let mut t = TeamTodo::default();
+        t.push_global(GlobalTodo {
+            id: "TODO-001".into(),
+            title: "Only one worker".into(),
+            status: GlobalStatus::InProgress,
+            origin: Origin::User,
+            prs: vec![],
+            body: String::new(),
+        });
+        t.push_global(GlobalTodo {
+            id: "TODO-002".into(),
+            title: "Two workers".into(),
+            status: GlobalStatus::InProgress,
+            origin: Origin::User,
+            prs: vec![],
+            body: String::new(),
+        });
+        // Pane 5: TODO-001 (in_progress) + TODO-002 (in_progress)
+        t.upsert_worker_section(5, None);
+        t.push_subtask(5, WorkerSubtask {
+            id: "TODO-001 · a".into(),
+            title: "x".into(),
+            status: SubStatus::InProgress,
+            parent: "TODO-001".into(),
+            body: String::new(),
+        }).unwrap();
+        t.push_subtask(5, WorkerSubtask {
+            id: "TODO-002 · a".into(),
+            title: "y".into(),
+            status: SubStatus::InProgress,
+            parent: "TODO-002".into(),
+            body: String::new(),
+        }).unwrap();
+        // Pane 7: TODO-002 (pending) — still has a contributor after pane 5 leaves
+        t.upsert_worker_section(7, None);
+        t.push_subtask(7, WorkerSubtask {
+            id: "TODO-002 · b".into(),
+            title: "z".into(),
+            status: SubStatus::Pending,
+            parent: "TODO-002".into(),
+            body: String::new(),
+        }).unwrap();
+
+        let orphaned = t.remove_pane_subtasks(5);
+        assert_eq!(orphaned, vec!["TODO-001".to_string()]);
+        assert!(t.worker_section(5).is_none(), "pane 5 section should be gone");
+        assert!(t.worker_section(7).is_some(), "pane 7 section should remain");
+    }
+
+    #[test]
+    fn remove_pane_subtasks_skips_already_done() {
+        let mut t = TeamTodo::default();
+        t.push_global(GlobalTodo {
+            id: "TODO-001".into(),
+            title: "done before removal".into(),
+            status: GlobalStatus::PrOpen,
+            origin: Origin::User,
+            prs: vec![],
+            body: String::new(),
+        });
+        t.upsert_worker_section(5, None);
+        t.push_subtask(5, WorkerSubtask {
+            id: "TODO-001 · a".into(),
+            title: "x".into(),
+            status: SubStatus::Done,
+            parent: "TODO-001".into(),
+            body: String::new(),
+        }).unwrap();
+        let orphaned = t.remove_pane_subtasks(5);
+        assert!(orphaned.is_empty(), "done subtasks don't trigger reset");
     }
 
     #[test]
