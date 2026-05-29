@@ -1960,6 +1960,38 @@ if (typeof window !== "undefined") {
       }
       return { sessionCache: merged, sessionLastCreatedAt: seededLast };
     });
+    // Race fix: if `attachSession` already fired for the current
+    // session before IDB hydration completed, it read an empty
+    // sessionCache and set paneMessages / messages to []. Now that
+    // the snapshot is loaded, restore it so the user sees their
+    // data without having to switch tabs or refresh. Skip if the
+    // user already typed / received something into this session
+    // (don't clobber live state).
+    {
+      const state = useStore.getState();
+      if (state.sessionId) {
+        const cached = diskCache.get(state.sessionId);
+        const isEmpty =
+          state.messages.length === 0 &&
+          Object.keys(state.paneMessages).length === 0;
+        if (cached && isEmpty) {
+          useStore.setState({
+            messages: cached.messages,
+            paneMessages: cached.paneMessages,
+            paneHasMore: cached.paneHasMore,
+            paneConfigs: cached.paneConfigs,
+            paneModes: cached.paneModes,
+            hasMoreMessages: cached.hasMoreMessages,
+            isDualPane: cached.isDualPane,
+            answeredQuestions: cached.answeredQuestions,
+            deadloopMessages:
+              cached.paneMessages[paneKey(PANE_ID_DEADLOOP)] ?? [],
+            interactiveMessages:
+              cached.paneMessages[paneKey(PANE_ID_INTERACTIVE)] ?? [],
+          });
+        }
+      }
+    }
     // If the WS is already authenticated, subscribe to the freshly-
     // hydrated sessions so the server starts pushing for them too.
     // (If hydration beat auth, the "authenticated" handler will do
@@ -1973,6 +2005,50 @@ if (typeof window !== "undefined") {
         ws.send(JSON.stringify({ type: "attach_session", session_id: sid }));
       }
     }
+  });
+
+  // Auto-snapshot the *active* session to IDB whenever its data
+  // changes. attachSession only snapshots on switch-away, so without
+  // this the currently-viewed session is never persisted — and a
+  // hard refresh comes back to an empty pane until the server's
+  // session_messages reply lands. Debounced 1s so a burst of
+  // stream_messages doesn't hammer IDB.
+  let snapshotTimer: ReturnType<typeof setTimeout> | null = null;
+  useStore.subscribe((state, prev) => {
+    if (!state.sessionId) return;
+    if (
+      state.sessionId === prev.sessionId &&
+      state.paneMessages === prev.paneMessages &&
+      state.messages === prev.messages &&
+      state.paneConfigs === prev.paneConfigs &&
+      state.paneHasMore === prev.paneHasMore &&
+      state.paneModes === prev.paneModes
+    ) {
+      return;
+    }
+    const hasAnyData =
+      state.messages.length > 0 || Object.keys(state.paneMessages).length > 0;
+    if (!hasAnyData) return;
+    if (snapshotTimer) clearTimeout(snapshotTimer);
+    snapshotTimer = setTimeout(() => {
+      snapshotTimer = null;
+      const cur = useStore.getState();
+      const sid = cur.sessionId;
+      if (!sid) return;
+      const entry: SessionCacheEntry = {
+        messages: cur.messages,
+        paneMessages: cur.paneMessages,
+        paneHasMore: cur.paneHasMore,
+        paneConfigs: cur.paneConfigs,
+        paneModes: cur.paneModes,
+        hasMoreMessages: cur.hasMoreMessages,
+        isDualPane: cur.isDualPane,
+        answeredQuestions: cur.answeredQuestions,
+        cachedAt: Date.now(),
+        lastCreatedAt: cur.sessionLastCreatedAt.get(sid),
+      };
+      saveSnapshotIdb(sid, entry);
+    }, 1_000);
   });
 }
 
