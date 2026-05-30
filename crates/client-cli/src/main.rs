@@ -17,7 +17,6 @@ mod mode;
 mod pane_status;
 mod plan_review;
 mod project;
-mod proxy;
 mod role;
 mod scratchpad;
 mod suggested_workers;
