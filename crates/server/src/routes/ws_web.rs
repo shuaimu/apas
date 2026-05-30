@@ -1233,7 +1233,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         tracing::info!("Updating pane {} label in session {}", pane_id, sid);
                         let mut panes = state.sessions.get_session_panes(&sid);
                         if let Some(pane) = panes.iter_mut().find(|p| p.pane_id == pane_id) {
-                            pane.label = Some(label);
+                            pane.label = Some(label.clone());
                             state.sessions.set_session_panes(&sid, panes.clone());
                             let _ = state.storage.save_pane_list(&sid, &panes).await;
                             state
@@ -1247,6 +1247,21 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 )
                                 .await;
                         }
+                        // Also forward to CLI so it updates meta.label and
+                        // persists to .apas — without this, the rename is
+                        // cache-only and gets clobbered on next CLI restart
+                        // by the CLI's PaneList carrying the on-disk label.
+                        state
+                            .sessions
+                            .route_to_cli(
+                                &sid,
+                                ServerToCli::UpdatePaneLabel {
+                                    session_id: sid,
+                                    pane_id,
+                                    label,
+                                },
+                            )
+                            .await;
                     }
                 }
                 Ok(WebToServer::InterruptPane { pane_id }) => {

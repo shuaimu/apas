@@ -7654,12 +7654,13 @@ async fn run_server_connection(
                                                 });
                                             }
                                             ServerToCli::RebootPane { session_id: _, pane_id: target } => {
-                                                // Snapshot config BEFORE the close eats the meta —
-                                                // recycle the pane in-place: close + immediate re-add
-                                                // with a fresh agent session id (don't try --resume
-                                                // on the prior session, which may be wedged or too
-                                                // large to bootstrap; that's exactly the failure
-                                                // mode this button exists to recover from).
+                                                // Snapshot meta + the pane's claude session id BEFORE
+                                                // the close eats them, then close + re-add the pane
+                                                // with the SAME session id and try_resume_first=true
+                                                // so the agent resumes its prior conversation. We
+                                                // don't reset context — that's deliberate; the user
+                                                // expects "Reboot" to recover a wedged worker, not
+                                                // erase what it knows.
                                                 let snapshot = {
                                                     let metas = pane_metas.lock().unwrap();
                                                     metas.get(&target).cloned()
@@ -7675,14 +7676,10 @@ async fn run_server_connection(
                                                     });
                                                     continue;
                                                 };
-                                                // Preserve the original is_paused so a paused pane
-                                                // boots back paused after the reboot.
-                                                let was_paused = pane_pauses
-                                                    .lock()
-                                                    .ok()
-                                                    .and_then(|p| p.get(&target).map(|f| f.load(Ordering::SeqCst)))
-                                                    .unwrap_or(false);
-                                                let _ = was_paused; // CloseTab clears the pause; re-add restores via meta below.
+                                                let prior_session_id = {
+                                                    let sessions = pane_sessions.lock().unwrap();
+                                                    sessions.get(&target).copied()
+                                                };
 
                                                 let _ = tui_event_tx.send(TuiEvent::CloseTab {
                                                     pane_id: target,
@@ -7691,7 +7688,11 @@ async fn run_server_connection(
                                                 let _ = tui_event_tx.send(TuiEvent::AddTabWithConfig {
                                                     pane_id: target,
                                                     label: meta.label.clone(),
-                                                    claude_session_id: Uuid::new_v4(),
+                                                    // Reuse the prior agent session id so --resume
+                                                    // picks up the same conversation. Falls back to
+                                                    // a fresh uuid only if the pane lost its session
+                                                    // mapping (shouldn't happen for a live pane).
+                                                    claude_session_id: prior_session_id.unwrap_or_else(Uuid::new_v4),
                                                     mode: meta.mode.clone(),
                                                     provider: meta.provider,
                                                     prompt: meta.prompt.clone(),
@@ -7705,15 +7706,16 @@ async fn run_server_connection(
                                                     backstory: meta.backstory.clone(),
                                                     plan_review_mode: meta.plan_review_mode,
                                                     managed: meta.managed,
-                                                    try_resume_first: false,
+                                                    try_resume_first: true,
                                                 });
                                                 let _ = status_tx.send(PaneOutput {
-                                                    text: "[Pane rebooted — fresh agent session]".to_string(),
+                                                    text: "[Pane rebooted — agent restarted on the same session]".to_string(),
                                                     pane_id: target,
                                                 });
                                                 tracing::info!(
                                                     pane_id = target,
-                                                    "Pane rebooted from web",
+                                                    ?prior_session_id,
+                                                    "Pane rebooted from web (resume same session)",
                                                 );
                                             }
                                             ServerToCli::RemovePane { session_id: _, pane_id: remove_id, cleanup_action } => {
@@ -8234,6 +8236,57 @@ async fn run_server_connection(
                                                     tracing::warn!(
                                                         tool_use_id = tool_use_id.as_str(),
                                                         "AnswerQuestion: no matching pending AskUserQuestion (already answered or expired)",
+                                                    );
+                                                }
+                                            }
+                                            ServerToCli::UpdatePaneLabel { session_id: _, pane_id: label_pane_id, label } => {
+                                                let trimmed = label.trim().to_string();
+                                                if trimmed.is_empty() {
+                                                    tracing::debug!(pane_id = label_pane_id, "UpdatePaneLabel: empty label ignored");
+                                                    continue;
+                                                }
+                                                let updated = {
+                                                    let mut metas = pane_metas.lock().unwrap();
+                                                    if let Some(m) = metas.get_mut(&label_pane_id) {
+                                                        m.label = trimmed.clone();
+                                                        true
+                                                    } else {
+                                                        false
+                                                    }
+                                                };
+                                                if updated {
+                                                    save_pane_configs(
+                                                        &working_dir,
+                                                        &pane_sessions,
+                                                        &pane_metas,
+                                                        &pane_pauses,
+                                                        &pane_stop_requests,
+                                                    );
+                                                    // Echo back the fresh PaneList so any web clients
+                                                    // attached now see the canonical label from disk
+                                                    // (the server already updated its own cache, but
+                                                    // this keeps the two sources of truth in sync).
+                                                    let panes = build_pane_list(
+                                                        &pane_metas,
+                                                        &input_channels,
+                                                        session_id,
+                                                        &pane_sessions,
+                                                        &pane_pauses,
+                                                        &pane_stop_requests,
+                                                    );
+                                                    let pane_list_msg = CliToServer::PaneList {
+                                                        session_id,
+                                                        panes,
+                                                    };
+                                                    if let Ok(text) = serde_json::to_string(&pane_list_msg) {
+                                                        let _ = ws_sender
+                                                            .send(Message::Text(text.into()))
+                                                            .await;
+                                                    }
+                                                    tracing::info!(
+                                                        pane_id = label_pane_id,
+                                                        label = trimmed.as_str(),
+                                                        "Pane label updated and persisted to .apas",
                                                     );
                                                 }
                                             }

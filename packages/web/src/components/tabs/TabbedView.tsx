@@ -1077,7 +1077,7 @@ export function TabbedView() {
               if (
                 typeof window !== "undefined" &&
                 !window.confirm(
-                  "Reboot this pane's agent? The running process is killed and a fresh agent session is started — context is reset (the prior session JSONL is preserved on disk).",
+                  "Reboot this pane's agent? The running process is killed and respawned on the SAME session (so the agent resumes with its prior conversation context).",
                 )
               ) {
                 return;
@@ -1085,7 +1085,7 @@ export function TabbedView() {
               rebootPane(activeTabId);
             }}
             className="inline-flex items-center px-2.5 py-1 text-xs font-medium rounded transition-colors bg-rose-600 hover:bg-rose-700 text-white"
-            title="Reboot just this pane's agent — kills the running process and respawns with a fresh agent session id. Use when a pane is wedged (e.g., claude --resume hung on a huge session) and you don't want to recycle the entire CLI."
+            title="Reboot just this pane's agent — kills the running process and respawns with --resume on the same session so prior context is preserved. Use when a pane is wedged and you don't want to recycle the entire CLI."
           >
             Reboot
           </button>

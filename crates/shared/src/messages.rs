@@ -402,6 +402,17 @@ pub enum ServerToCli {
         effort: Option<String>,
     },
 
+    /// Update a pane's display label so the CLI can persist it to .apas.
+    /// Before this existed, the server handled `WebToServer::UpdatePaneLabel`
+    /// purely in its own cache; on next CLI restart the cache was clobbered
+    /// by the CLI's PaneList carrying the unchanged on-disk label, and the
+    /// rename appeared to silently revert.
+    UpdatePaneLabel {
+        session_id: Uuid,
+        pane_id: u32,
+        label: String,
+    },
+
     /// Switch a pane's agent backend (provider + model). Kills the
     /// running agent child immediately so any in-flight turn is
     /// dropped, then respawns the streaming worker with a fresh

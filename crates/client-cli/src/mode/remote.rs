@@ -303,6 +303,7 @@ async fn run_connection(
                     | Ok(ServerToCli::RequestPaneList { .. })
                     | Ok(ServerToCli::UpdatePaneEffort { .. })
                     | Ok(ServerToCli::UpdatePaneModel { .. })
+                    | Ok(ServerToCli::UpdatePaneLabel { .. })
                     | Ok(ServerToCli::InterruptPane { .. })
                     | Ok(ServerToCli::AnswerQuestion { .. })
                     | Ok(ServerToCli::RequestPaneDiff { .. })
