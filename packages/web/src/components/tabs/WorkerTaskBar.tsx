@@ -17,9 +17,14 @@ import { useStore } from "@/lib/store";
 interface WorkerTaskBarProps {
   paneId: number;
   role?: string;
+  /** Whether this pane participates in team delegation. Unmanaged
+   *  panes (side chats from the TabBar `+` menu) never receive
+   *  Tech-Lead delegations, so the "No active task — waiting for the
+   *  Tech Lead to delegate" framing is wrong for them. */
+  managed?: boolean;
 }
 
-export function WorkerTaskBar({ paneId, role }: WorkerTaskBarProps) {
+export function WorkerTaskBar({ paneId, role, managed }: WorkerTaskBarProps) {
   const teamRecords = useStore((s) => s.teamRecords);
   const [now, setNow] = useState(() => Date.now());
 
@@ -32,9 +37,12 @@ export function WorkerTaskBar({ paneId, role }: WorkerTaskBarProps) {
 
   // Skip orchestrator roles — they receive different shapes of
   // delegations and "current task" isn't a meaningful framing for them.
+  // Also skip unmanaged panes — Tech Lead doesn't delegate to them.
   const lower = (role ?? "").toLowerCase();
   const skip =
-    lower.includes("manager") && !lower.includes("tech lead")
+    managed === false
+      ? true
+      : lower.includes("manager") && !lower.includes("tech lead")
       ? true
       : lower.includes("tech lead");
   const current = useMemo(() => {

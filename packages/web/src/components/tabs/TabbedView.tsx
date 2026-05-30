@@ -1175,7 +1175,7 @@ export function TabbedView() {
                 />
               ) : (
                 <>
-                  <WorkerTaskBar paneId={tab.pane_id} role={tab.role} />
+                  <WorkerTaskBar paneId={tab.pane_id} role={tab.role} managed={tab.managed} />
                   <MessagePane
                     key={`${sessionId}-${tab.pane_id}`}
                     paneId={tab.pane_id}
