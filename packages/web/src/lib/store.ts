@@ -585,6 +585,7 @@ interface AppState {
   resumeDeadloop: () => void;
   pausePane: (paneId: number) => void;
   resumePane: (paneId: number) => void;
+  rebootPane: (paneId: number) => void;
   addPane: (
     provider: string,
     mode: string,
@@ -1751,6 +1752,13 @@ export const useStore = create<AppState>((set, get) => ({
       if (paneId === PANE_ID_DEADLOOP) {
         ws.send(JSON.stringify({ type: "resume_deadloop" }));
       }
+    }
+  },
+
+  rebootPane: (paneId: number) => {
+    const { ws, sessionId } = get();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "reboot_pane", session_id: sessionId, pane_id: paneId }));
     }
   },
 

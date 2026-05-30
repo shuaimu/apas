@@ -295,6 +295,7 @@ async fn run_connection(
                     | Ok(ServerToCli::ResumeDeadloop { .. })
                     | Ok(ServerToCli::PausePane { .. })
                     | Ok(ServerToCli::ResumePane { .. })
+                    | Ok(ServerToCli::RebootPane { .. })
                     | Ok(ServerToCli::AddPane { .. })
                     | Ok(ServerToCli::RemovePane { .. })
                     | Ok(ServerToCli::StartBot { .. })

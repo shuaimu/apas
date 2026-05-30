@@ -344,6 +344,12 @@ pub enum ServerToCli {
     /// Resume a specific pane
     ResumePane { session_id: Uuid, pane_id: u32 },
 
+    /// Recycle a pane's agent: kill the running child process, then re-spawn
+    /// the worker with the same config but a fresh agent session id (so
+    /// `--resume` on a too-large or wedged prior session isn't tried).
+    /// Lighter-weight than `RebootCli`; targets only one pane.
+    RebootPane { session_id: Uuid, pane_id: u32 },
+
     /// Add a new pane to the session
     AddPane {
         session_id: Uuid,
@@ -678,6 +684,13 @@ pub enum WebToServer {
 
     /// Resume a specific pane. See `Input::session_id`.
     ResumePane {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
+        pane_id: u32,
+    },
+
+    /// Recycle a single pane's agent (see `ServerToCli::RebootPane`).
+    RebootPane {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<Uuid>,
         pane_id: u32,

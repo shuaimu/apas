@@ -1133,6 +1133,27 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         )
                         .await;
                 }
+                Ok(WebToServer::RebootPane {
+                    session_id: msg_sid,
+                    pane_id,
+                }) => {
+                    let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    else {
+                        continue;
+                    };
+                    tracing::info!("Rebooting pane {} for session {}", pane_id, sid);
+                    state
+                        .sessions
+                        .route_to_cli(
+                            &sid,
+                            ServerToCli::RebootPane {
+                                session_id: sid,
+                                pane_id,
+                            },
+                        )
+                        .await;
+                }
                 Ok(WebToServer::AddPane {
                     provider,
                     mode,
