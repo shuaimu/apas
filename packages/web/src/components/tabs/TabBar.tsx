@@ -488,9 +488,9 @@ export function TabBar({
               if (confirm("Are you sure you want to reboot the CLI?")) onRebootCli();
             }}
             className="px-2.5 h-8 my-1 text-xs font-medium rounded transition-colors bg-red-500 hover:bg-red-600 text-white"
-            title="Reboot CLI"
+            title="Reboot the entire CLI (all panes restart). Use the per-pane Reboot for a single agent."
           >
-            Reboot
+            Reboot CLI
           </button>
         )}
       </div>
