@@ -107,6 +107,13 @@ pub enum GlobalStatus {
     PrOpen,
     Done,
     Rejected,
+    /// Tech-Lead-only terminal state. Tech Lead may flip a `proposed`
+    /// entry to `withdrawn` when surveying surfaces evidence that the
+    /// work has already landed (manual edits, parallel PRs from other
+    /// panes, etc.). Distinct from `rejected` (a user verdict) so the
+    /// UI can fold/distinguish them. Allowed transition: proposed →
+    /// withdrawn only.
+    Withdrawn,
 }
 
 impl GlobalStatus {
@@ -119,6 +126,7 @@ impl GlobalStatus {
             Self::PrOpen => "pr_open",
             Self::Done => "done",
             Self::Rejected => "rejected",
+            Self::Withdrawn => "withdrawn",
         }
     }
     pub fn from_str(s: &str) -> Option<Self> {
@@ -130,6 +138,7 @@ impl GlobalStatus {
             "pr_open" => Self::PrOpen,
             "done" => Self::Done,
             "rejected" => Self::Rejected,
+            "withdrawn" => Self::Withdrawn,
             _ => return None,
         })
     }

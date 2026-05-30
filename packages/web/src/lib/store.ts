@@ -178,7 +178,7 @@ export interface TeamTodoState {
 export interface TeamTodoGlobal {
   id: string;
   title: string;
-  /// proposed | approved | in_progress | under_review | pr_open | done | rejected
+  /// proposed | approved | in_progress | under_review | pr_open | done | rejected | withdrawn
   status: string;
   /// user | tech-lead
   origin: string;

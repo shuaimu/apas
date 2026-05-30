@@ -92,10 +92,14 @@ export function TeamTodoPanel() {
       ) : !empty && state ? (
         (() => {
           const active = state.globals.filter(
-            (g) => g.status !== "rejected" && g.status !== "done",
+            (g) =>
+              g.status !== "rejected" &&
+              g.status !== "done" &&
+              g.status !== "withdrawn",
           );
           const done = state.globals.filter((g) => g.status === "done");
           const rejected = state.globals.filter((g) => g.status === "rejected");
+          const withdrawn = state.globals.filter((g) => g.status === "withdrawn");
           return (
             <>
               {active.length > 0 && (
@@ -117,6 +121,13 @@ export function TeamTodoPanel() {
                   label="Rejected"
                   entries={rejected}
                   variant="rejected"
+                />
+              )}
+              {withdrawn.length > 0 && (
+                <CollapsedFolder
+                  label="Withdrawn (by Tech Lead)"
+                  entries={withdrawn}
+                  variant="withdrawn"
                 />
               )}
             </>
@@ -343,12 +354,12 @@ function AddTodoControl() {
   );
 }
 
-/// Done + Rejected TODOs are both "no longer actionable" history.
-/// Each gets folded under a single expandable summary at the bottom
-/// of the active list, with each entry as a compact one-liner — no
-/// body, no Approve/Reject buttons. Done entries also surface their
-/// PR links (typically the merged PR) so the user can click through
-/// to the diff. The `variant` knob tints the title accordingly.
+/// Done + Rejected + Withdrawn TODOs are all "no longer actionable"
+/// history. Each gets folded under a single expandable summary at the
+/// bottom of the active list, with each entry as a compact one-liner
+/// — no body, no Approve/Reject buttons. Done entries also surface
+/// their PR links (typically the merged PR) so the user can click
+/// through to the diff. The `variant` knob tints the title accordingly.
 function CollapsedFolder({
   label,
   entries,
@@ -356,11 +367,13 @@ function CollapsedFolder({
 }: {
   label: string;
   entries: TeamTodoGlobal[];
-  variant: "done" | "rejected";
+  variant: "done" | "rejected" | "withdrawn";
 }) {
   const titleClass =
     variant === "done"
       ? "truncate text-xs text-gray-600 dark:text-gray-400"
+      : variant === "withdrawn"
+      ? "truncate text-xs italic text-gray-500 dark:text-gray-500"
       : "truncate text-xs text-gray-700 line-through decoration-gray-400 dark:text-gray-300";
   return (
     <details className="mb-3 rounded border border-gray-200 bg-gray-50 dark:border-gray-700 dark:bg-gray-800/40">
@@ -651,6 +664,8 @@ function StatusBadge({ status }: { status: string }) {
         return "bg-emerald-100 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300";
       case "rejected":
         return "bg-rose-100 text-rose-800 dark:bg-rose-950/40 dark:text-rose-300";
+      case "withdrawn":
+        return "bg-gray-200 text-gray-600 italic dark:bg-gray-800 dark:text-gray-400";
       default:
         return "bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-300";
     }
