@@ -127,9 +127,6 @@ export function ProjectGoalBar() {
     [paneConfigs],
   );
 
-  const managerPaused = managerPane
-    ? pausedPanes.includes(managerPane.pane_id)
-    : false;
   const techLeadPaused = techLeadPane
     ? pausedPanes.includes(techLeadPane.pane_id)
     : false;
@@ -272,33 +269,16 @@ export function ProjectGoalBar() {
           Team
         </h3>
         <div className="flex flex-wrap items-center gap-3 text-xs">
-          {/* Manager status */}
+          {/* Manager status — interactive pane, no pause/resume (always
+              "alive" waiting on user input; pause would have no meaning). */}
           {managerPane ? (
             <span className="flex items-center gap-1 text-violet-600 dark:text-violet-400">
               <span>
-                💬 Manager{" "}
-                {managerPaused ? "⏸ paused" : "⏵ running"} ·{" "}
+                💬 Manager ·{" "}
                 <span className="font-mono">
                   {managerPane.label || `pane ${managerPane.pane_id}`}
                 </span>
               </span>
-              {managerPaused ? (
-                <button
-                  type="button"
-                  onClick={() => resumePane(managerPane.pane_id)}
-                  className="rounded border border-emerald-500 bg-emerald-600 px-1.5 py-0.5 text-[11px] text-white hover:bg-emerald-500"
-                >
-                  resume
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => pausePane(managerPane.pane_id)}
-                  className="rounded border border-amber-500 bg-amber-600 px-1.5 py-0.5 text-[11px] text-white hover:bg-amber-500"
-                >
-                  pause
-                </button>
-              )}
             </span>
           ) : (
             <span className="text-violet-600 dark:text-violet-400">
