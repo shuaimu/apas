@@ -309,6 +309,14 @@ export function TabbedView() {
 
   // Active tab state, persisted per project
   const [activeTabId, setActiveTabId] = useState<number | null>(null);
+  // Lazy-mount panes. On project switch we used to eagerly mount every
+  // pane's MessagePane (visibility-toggled via `hidden`) so tab clicks
+  // were instant — but with 7+ panes × hundreds of messages each, that
+  // reconciliation pegged the main thread for 1–2 s during the switch.
+  // Now we mount only the active pane; first activation of a non-active
+  // tab pays a one-time mount cost, and the pane stays mounted after so
+  // subsequent switches are still instant. Reset on session change.
+  const [mountedPanes, setMountedPanes] = useState<Set<number>>(() => new Set());
   const [startBotModalOpen, setStartBotModalOpen] = useState(false);
   const [viewBotPromptModalOpen, setViewBotPromptModalOpen] = useState(false);
   const [startBotPaneId, setStartBotPaneId] = useState<number | null>(null);
@@ -456,6 +464,26 @@ export function TabbedView() {
     if (activeTabId === OVERVIEW_PANE_ID) return;
     loadPaneMessagesIfNeeded(activeTabId);
   }, [activeTabId, sessionId, loadPaneMessagesIfNeeded]);
+
+  // Reset the lazy-mount set on session change so a fresh project starts
+  // with zero mounted panes — the active-pane effect below mounts the
+  // landing tab immediately after.
+  useEffect(() => {
+    setMountedPanes(new Set());
+  }, [sessionId]);
+
+  // Track which panes have ever been activated for this session. We only
+  // render the bodies of mounted panes; visited ones stay mounted (hidden
+  // via CSS) so re-activating them is instant. Overview has its own path.
+  useEffect(() => {
+    if (activeTabId == null || activeTabId === OVERVIEW_PANE_ID) return;
+    setMountedPanes((prev) => {
+      if (prev.has(activeTabId)) return prev;
+      const next = new Set(prev);
+      next.add(activeTabId);
+      return next;
+    });
+  }, [activeTabId]);
 
   const handleSelectTab = useCallback(
     (paneId: number) => {
@@ -1127,6 +1155,13 @@ export function TabbedView() {
         effectiveTabs.map((tab) => {
           const isActive = tab.pane_id === activeTabId;
           const isTimeline = timelinePanes.has(tab.pane_id);
+          // Skip mounting panes the user hasn't activated yet for this
+          // session — that's the freeze fix. The container <div> still
+          // exists to keep the tab list stable; the heavy MessagePane
+          // body only mounts on first activation and stays mounted.
+          if (!mountedPanes.has(tab.pane_id)) {
+            return <div key={tab.pane_id} className="hidden" />;
+          }
           const msgs = paneMessages[paneKey(tab.pane_id)] || [];
           return (
             <div
