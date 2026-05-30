@@ -49,6 +49,12 @@ reqwest = { version = "0.12", features = ["json"] }
 # Home directory detection
 dirs = "5.0"
 
+# File-change watcher for event-driven deadloop wake-ups (replaces the
+# pure sleep between iterations so panes wake on team-todo.md /
+# .apas-team.jsonl / project_goal.md edits instead of paying tokens
+# every cycle just to confirm "nothing changed").
+notify = "6"
+
 # Unix process management
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

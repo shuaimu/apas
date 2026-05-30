@@ -809,6 +809,14 @@ async fn run_inner(
     // Shutdown flag
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    // One file watcher per project, shared across all panes. Drives
+    // event-based deadloop wake-ups so panes only consume tokens when
+    // team-todo.md / .apas-team.jsonl / project_goal.md / .apas actually
+    // change, instead of every `min_iteration_interval`.
+    let file_watcher: Arc<crate::file_watcher::ProjectFileWatcher> = Arc::new(
+        crate::file_watcher::ProjectFileWatcher::new(std::path::Path::new(&working_dir_str)),
+    );
+
     // Per-pane pause flags (for deadloop panes)
     let pane_pauses: PanePauses = Arc::new(Mutex::new(HashMap::new()));
 
@@ -1100,6 +1108,7 @@ async fn run_inner(
                 Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                 Arc::new(Mutex::new(HashMap::new())),
             ));
+        let file_watcher_for_dl = file_watcher.clone();
         pane_threads.push(thread::spawn(move || {
             run_deadloop_session(
                 &binary_path,
@@ -1137,6 +1146,7 @@ async fn run_inner(
                 // cross-boot continuity for those backends, but we never
                 // fail with "no rollout found" on a stale id either.
                 matches!(provider, Provider::Claude),
+                file_watcher_for_dl,
             )
         }));
     }
@@ -1227,6 +1237,7 @@ async fn run_inner(
         let pane_metas_event = pane_metas.clone();
         let event_tx_event = event_tx.clone();
         let default_prompt_for_events = default_prompt.clone();
+        let file_watcher_for_events = file_watcher.clone();
         thread::spawn(move || {
             handle_tui_events(
                 event_rx,
@@ -1248,6 +1259,7 @@ async fn run_inner(
                 pane_stop_requests_event,
                 pane_metas_event,
                 &default_prompt_for_events,
+                file_watcher_for_events,
             )
         })
     };
@@ -1828,6 +1840,7 @@ fn handle_tui_events(
     pane_stop_requests: PaneStopRequests,
     pane_metas: PaneMetas,
     default_prompt: &str,
+    file_watcher: Arc<crate::file_watcher::ProjectFileWatcher>,
 ) {
     while !shutdown.load(Ordering::SeqCst) {
         match event_rx.recv_timeout(Duration::from_millis(100)) {
@@ -2130,6 +2143,7 @@ fn handle_tui_events(
                             Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                             Arc::new(Mutex::new(HashMap::new())),
                         ));
+                    let file_watcher_for_dl = file_watcher.clone();
                     thread::spawn(move || {
                         run_deadloop_session(
                             &binary_path,
@@ -2159,6 +2173,7 @@ fn handle_tui_events(
                             effort_arc,
                             input_channels_for_dl,
                             try_resume_first,
+                            file_watcher_for_dl,
                         )
                     });
                 } else {
@@ -2527,6 +2542,7 @@ fn handle_tui_events(
                             Arc::new(Mutex::new(shared::PlanReviewMode::default())),
                             Arc::new(Mutex::new(HashMap::new())),
                         ));
+                    let file_watcher_for_dl = file_watcher.clone();
                     thread::spawn(move || {
                         run_deadloop_session(
                             &binary_path,
@@ -2556,6 +2572,7 @@ fn handle_tui_events(
                             effort_arc,
                             input_channels_for_dl,
                             true,
+                            file_watcher_for_dl,
                         )
                     });
                 }
@@ -4241,6 +4258,11 @@ fn run_deadloop_session(
     // provider switch via UpdatePaneModel), so codex's `exec resume`
     // doesn't fail with "no rollout found".
     initial_try_resume: bool,
+    // Project-shared file watcher; used to wake the deadloop early
+    // when team-todo.md / .apas-team.jsonl / project_goal.md / .apas
+    // change, so iterations only fire on real signal instead of
+    // burning tokens on a min-interval timer.
+    file_watcher: Arc<crate::file_watcher::ProjectFileWatcher>,
 ) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_deadloop_session_inner(
@@ -4271,6 +4293,7 @@ fn run_deadloop_session(
             effort_arc,
             input_channels,
             initial_try_resume,
+            file_watcher,
         )
     }));
 
@@ -4321,6 +4344,7 @@ fn run_deadloop_session_inner(
     // first `--resume`/`exec resume` so codex / cursor don't fail
     // against a freshly-minted session id from a provider switch.
     initial_try_resume: bool,
+    file_watcher: Arc<crate::file_watcher::ProjectFileWatcher>,
 ) {
     // Provider::Claude → long-lived stream-json process driven from
     // run_deadloop_session_streaming. Other providers fall through to the
@@ -4356,6 +4380,7 @@ fn run_deadloop_session_inner(
             pending_questions,
             effort_arc,
             input_channels,
+            file_watcher,
         );
     }
     let effective_dir: String = worktree_path
@@ -4423,39 +4448,58 @@ fn run_deadloop_session_inner(
         }
 
         if let Some(last_started_at) = last_iteration_started_at {
-            if let Some(mut remaining) =
-                min_iteration_interval.checked_sub(last_started_at.elapsed())
-            {
-                if !remaining.is_zero() {
-                    let _ = output_tx.send(PaneOutput {
-                        text: format!(
-                            "[Waiting {}s before next iteration (min interval: {}m)]",
-                            remaining.as_secs(),
-                            min_iteration_interval_minutes
-                        ),
-                        pane_id,
-                    });
-                }
-                while !remaining.is_zero() {
-                    if shutdown.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    if stop_requested.load(Ordering::SeqCst) {
-                        let _ = event_tx.send(TuiEvent::FinalizeStopBot {
+            // Event-driven wait: block until any watched project file
+            // changes after `last_started_at` (the cursor) OR the
+            // min-interval timer fires — whichever first. Replaces the
+            // pure-sleep loop that paid tokens on every cycle even
+            // when nothing had moved.
+            let remaining = min_iteration_interval
+                .checked_sub(last_started_at.elapsed())
+                .unwrap_or(Duration::ZERO);
+            if !remaining.is_zero() {
+                let _ = output_tx.send(PaneOutput {
+                    text: format!(
+                        "[Waiting for file change or {}s timeout (min interval: {}m)]",
+                        remaining.as_secs(),
+                        min_iteration_interval_minutes
+                    ),
+                    pane_id,
+                });
+                let reason = file_watcher.wait_until(
+                    Some(last_started_at),
+                    remaining,
+                    &shutdown,
+                    &pause,
+                    &stop_requested,
+                );
+                match reason {
+                    crate::file_watcher::WakeReason::FileChanged { path, .. } => {
+                        let label = path
+                            .as_ref()
+                            .and_then(|p| p.file_name())
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("(file)")
+                            .to_string();
+                        let _ = output_tx.send(PaneOutput {
+                            text: format!("[Wake: {} changed]", label),
                             pane_id,
-                            stop_flag: stop_requested.clone(),
                         });
-                        return;
                     }
-                    if pause.load(Ordering::SeqCst) {
-                        break;
+                    crate::file_watcher::WakeReason::Shutdown => return,
+                    crate::file_watcher::WakeReason::Timeout => {
+                        // Either real timeout (proceed) or pause/stop
+                        // flipped (the loop top will handle it).
                     }
-
-                    let sleep_for = std::cmp::min(remaining, Duration::from_millis(500));
-                    thread::sleep(sleep_for);
-                    remaining = min_iteration_interval
-                        .checked_sub(last_started_at.elapsed())
-                        .unwrap_or(Duration::ZERO);
+                }
+                if shutdown.load(Ordering::SeqCst) {
+                    return;
+                }
+                if stop_requested.load(Ordering::SeqCst) {
+                    let _ = event_tx.send(TuiEvent::FinalizeStopBot {
+                        pane_id,
+                        stop_flag: stop_requested.clone(),
+                    });
+                    return;
                 }
                 if pause.load(Ordering::SeqCst) {
                     continue;
@@ -6293,7 +6337,14 @@ fn run_deadloop_session_streaming(
     // only inside this function and external input hit "Pane worker
     // unavailable; restart requested. Please resend." every time.
     input_channels: InputChannels,
+    // Currently unused on the streaming path — the agent self-paces
+    // via its own ScheduleWakeup tool, so we don't drive the wait
+    // here. Kept in the signature for parity with the codex path; can
+    // be wired in if/when the streaming driver gains a between-turn
+    // wait we control.
+    file_watcher: Arc<crate::file_watcher::ProjectFileWatcher>,
 ) {
+    let _ = file_watcher; // see note above
     let _ = output_tx.send(PaneOutput {
         text: format!(
             "[Streaming /loop deadloop session: {}]",
