@@ -149,7 +149,6 @@ fn provider_display_name(provider: &Provider, model: Option<&str>) -> &'static s
         Provider::Claude if is_glm_model(model) => "GLM",
         Provider::Claude if is_deepseek_model(model) => "DeepSeek",
         Provider::Claude => "Claude",
-        Provider::Codex if is_deepseek_model(model) => "Codex DeepSeek",
         Provider::Codex => "Codex",
         Provider::Minimax => "MiniMax",
         Provider::Glm => "GLM",
@@ -176,7 +175,6 @@ const MINIMAX_API_BASE_URL: &str = "https://api.minimax.io/anthropic";
 const GLM_API_BASE_URL: &str = "https://api.z.ai/api/anthropic";
 const GLM_DEFAULT_HAIKU_MODEL: &str = "glm-4.5-air";
 const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com/anthropic";
-const DEEPSEEK_OPENAI_BASE_URL: &str = "https://api.deepseek.com/v1";
 const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-chat";
 
 fn trim_to_option(raw: Option<String>) -> Option<String> {
@@ -274,17 +272,6 @@ fn build_pane_env_overrides(
     provider: &Provider,
     model: Option<&str>,
 ) -> Result<Vec<(String, String)>, String> {
-    // Codex frontend → DeepSeek backend: codex's model_providers.deepseek
-    // entry references env_key = "DEEPSEEK_API_KEY" so we only need to
-    // export that. The base_url/wire_api/model_provider are passed via
-    // `-c` overrides in build_agent_args.
-    if matches!(provider, Provider::Codex) && is_deepseek_model(model) {
-        let runtime = load_deepseek_backend_runtime_config();
-        let api_key = runtime.api_key.ok_or_else(|| {
-            "DeepSeek backend is not configured (missing deepseek_api_key). Update it on the Machines page or run: apas config set deepseek_api_key <key>.".to_string()
-        })?;
-        return Ok(vec![("DEEPSEEK_API_KEY".to_string(), api_key)]);
-    }
     if !matches!(
         provider,
         Provider::Claude | Provider::Minimax | Provider::Glm | Provider::Deepseek
@@ -3276,31 +3263,11 @@ fn build_agent_args(
         }
         Provider::Codex => {
             // Codex uses subcommands: `codex exec --json ...` or `codex exec resume --json ... <session_id> <prompt>`
-            let mut base_flags = vec![
+            let base_flags = vec![
                 "--json".to_string(),
                 "--dangerously-bypass-approvals-and-sandbox".to_string(),
                 "--skip-git-repo-check".to_string(),
             ];
-            // Codex + DeepSeek: tell codex about the deepseek provider
-            // inline (no ~/.codex/config.toml dependency) and pick it
-            // for this run. The OpenAI-compatible chat endpoint is the
-            // wire shape DeepSeek serves. env_key matches the env var
-            // set by build_pane_env_overrides for this combo.
-            if is_deepseek_model(model) {
-                let deepseek_model = model
-                    .map(str::trim)
-                    .filter(|m| !m.is_empty())
-                    .unwrap_or(DEEPSEEK_DEFAULT_MODEL);
-                base_flags.push("-c".to_string());
-                base_flags.push(format!(
-                    "model_providers.deepseek={{ name = \"DeepSeek\", base_url = \"{}\", env_key = \"DEEPSEEK_API_KEY\", wire_api = \"chat\" }}",
-                    DEEPSEEK_OPENAI_BASE_URL,
-                ));
-                base_flags.push("-c".to_string());
-                base_flags.push("model_provider=\"deepseek\"".to_string());
-                base_flags.push("-c".to_string());
-                base_flags.push(format!("model=\"{}\"", deepseek_model));
-            }
             if first_message && try_resume {
                 let mut args = vec!["exec".to_string(), "resume".to_string()];
                 args.extend(base_flags);
@@ -3713,48 +3680,6 @@ mod tests {
         );
 
         assert!(!args.iter().any(|arg| arg == "--model"));
-    }
-
-    #[test]
-    fn build_agent_args_codex_with_deepseek_model_injects_provider_overrides() {
-        let session_id = Uuid::new_v4();
-        let (args, _) = build_agent_args(
-            &Provider::Codex,
-            &session_id,
-            FULL_PROMPT,
-            Some("deepseek-chat"),
-            None,
-            true,
-            false,
-        );
-
-        // Codex args are inline TOML overrides via repeated `-c`.
-        let joined = args.join(" ");
-        assert!(joined.contains("-c"));
-        assert!(joined.contains("model_providers.deepseek="));
-        assert!(joined.contains("base_url = \"https://api.deepseek.com/v1\""));
-        assert!(joined.contains("env_key = \"DEEPSEEK_API_KEY\""));
-        assert!(joined.contains("wire_api = \"chat\""));
-        assert!(joined.contains("model_provider=\"deepseek\""));
-        assert!(joined.contains("model=\"deepseek-chat\""));
-    }
-
-    #[test]
-    fn build_agent_args_codex_without_deepseek_omits_provider_overrides() {
-        let session_id = Uuid::new_v4();
-        let (args, _) = build_agent_args(
-            &Provider::Codex,
-            &session_id,
-            FULL_PROMPT,
-            None,
-            None,
-            true,
-            false,
-        );
-
-        let joined = args.join(" ");
-        assert!(!joined.contains("model_providers.deepseek"));
-        assert!(!joined.contains("DEEPSEEK_API_KEY"));
     }
 
     #[test]
@@ -7727,6 +7652,69 @@ async fn run_server_connection(
                                                     managed: pane_config.managed,
                                                     try_resume_first: true,
                                                 });
+                                            }
+                                            ServerToCli::RebootPane { session_id: _, pane_id: target } => {
+                                                // Snapshot config BEFORE the close eats the meta —
+                                                // recycle the pane in-place: close + immediate re-add
+                                                // with a fresh agent session id (don't try --resume
+                                                // on the prior session, which may be wedged or too
+                                                // large to bootstrap; that's exactly the failure
+                                                // mode this button exists to recover from).
+                                                let snapshot = {
+                                                    let metas = pane_metas.lock().unwrap();
+                                                    metas.get(&target).cloned()
+                                                };
+                                                let Some(meta) = snapshot else {
+                                                    tracing::warn!(
+                                                        pane_id = target,
+                                                        "RebootPane: pane not found",
+                                                    );
+                                                    let _ = status_tx.send(PaneOutput {
+                                                        text: format!("[Reboot: pane {} not found]", target),
+                                                        pane_id: target,
+                                                    });
+                                                    continue;
+                                                };
+                                                // Preserve the original is_paused so a paused pane
+                                                // boots back paused after the reboot.
+                                                let was_paused = pane_pauses
+                                                    .lock()
+                                                    .ok()
+                                                    .and_then(|p| p.get(&target).map(|f| f.load(Ordering::SeqCst)))
+                                                    .unwrap_or(false);
+                                                let _ = was_paused; // CloseTab clears the pause; re-add restores via meta below.
+
+                                                let _ = tui_event_tx.send(TuiEvent::CloseTab {
+                                                    pane_id: target,
+                                                    cleanup_action: None,
+                                                });
+                                                let _ = tui_event_tx.send(TuiEvent::AddTabWithConfig {
+                                                    pane_id: target,
+                                                    label: meta.label.clone(),
+                                                    claude_session_id: Uuid::new_v4(),
+                                                    mode: meta.mode.clone(),
+                                                    provider: meta.provider,
+                                                    prompt: meta.prompt.clone(),
+                                                    min_iteration_interval_minutes: meta.min_iteration_interval_minutes,
+                                                    model: meta.model.clone(),
+                                                    effort: meta.effort.clone(),
+                                                    worktree_path: meta.worktree_path.clone(),
+                                                    initial_input: None,
+                                                    role: meta.role.clone(),
+                                                    goal: meta.goal.clone(),
+                                                    backstory: meta.backstory.clone(),
+                                                    plan_review_mode: meta.plan_review_mode,
+                                                    managed: meta.managed,
+                                                    try_resume_first: false,
+                                                });
+                                                let _ = status_tx.send(PaneOutput {
+                                                    text: "[Pane rebooted — fresh agent session]".to_string(),
+                                                    pane_id: target,
+                                                });
+                                                tracing::info!(
+                                                    pane_id = target,
+                                                    "Pane rebooted from web",
+                                                );
                                             }
                                             ServerToCli::RemovePane { session_id: _, pane_id: remove_id, cleanup_action } => {
                                                 // Reset team-todo for this pane: drop its `## pane:<id>`

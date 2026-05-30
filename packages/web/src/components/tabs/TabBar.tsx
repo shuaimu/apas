@@ -642,15 +642,6 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
                 </span>
                 Official
               </button>
-              <button
-                onClick={() => handlePick("codex", DEEPSEEK_DEFAULT_MODEL)}
-                className="w-full text-left pl-8 pr-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
-              >
-                <span className="text-indigo-500 flex-shrink-0">
-                  <ProviderIcon provider="codex" model={DEEPSEEK_DEFAULT_MODEL} className="w-4 h-4" />
-                </span>
-                DeepSeek
-              </button>
             </div>
           )}
 
