@@ -175,7 +175,7 @@ const MINIMAX_API_BASE_URL: &str = "https://api.minimax.io/anthropic";
 const GLM_API_BASE_URL: &str = "https://api.z.ai/api/anthropic";
 const GLM_DEFAULT_HAIKU_MODEL: &str = "glm-4.5-air";
 const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com/anthropic";
-const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-chat";
+const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-v4-pro";
 
 fn trim_to_option(raw: Option<String>) -> Option<String> {
     raw.and_then(|value| {

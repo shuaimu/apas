@@ -30,7 +30,7 @@ interface TabBarProps {
 
 const MINIMAX_DEFAULT_MODEL = "MiniMax-M2.7";
 const GLM_DEFAULT_MODEL = "glm-5.1";
-const DEEPSEEK_DEFAULT_MODEL = "deepseek-chat";
+const DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-pro";
 
 function isMiniMaxModel(model?: string): boolean {
   if (typeof model !== "string") return false;
