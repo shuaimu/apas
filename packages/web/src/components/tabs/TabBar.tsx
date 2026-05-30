@@ -501,6 +501,7 @@ export function TabBar({
 function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: string, isolatedWorktree?: boolean) => void }) {
   const [showMenu, setShowMenu] = useState(false);
   const [isolatedWorktree, setIsolatedWorktree] = useState(false);
+  const [expandedGroup, setExpandedGroup] = useState<string | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -508,20 +509,35 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
     const handleClick = (e: MouseEvent) => {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
         setShowMenu(false);
+        setExpandedGroup(null);
       }
     };
     document.addEventListener("mousedown", handleClick);
     return () => document.removeEventListener("mousedown", handleClick);
   }, [showMenu]);
 
-  // Stays toggled across menu open/close (intentional — user's choice persists
-  // for a session), but new tab creation resets to false so a second tab
-  // doesn't silently get a new worktree.
+  // isolatedWorktree stays toggled while the menu is open so the user's
+  // choice persists across submenu navigation, but resets after each
+  // tab creation so a second tab doesn't silently get a new worktree.
   const handlePick = (provider: string, model?: string) => {
     onAddTab(provider, model, isolatedWorktree || undefined);
     setIsolatedWorktree(false);
     setShowMenu(false);
+    setExpandedGroup(null);
   };
+
+  // Visual disclosure caret next to grouped entries; rotates 90° when
+  // its group is expanded.
+  const Caret = ({ open }: { open: boolean }) => (
+    <svg
+      className={`w-3 h-3 ml-auto text-gray-400 transition-transform ${open ? "rotate-90" : ""}`}
+      fill="none"
+      stroke="currentColor"
+      viewBox="0 0 24 24"
+    >
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+    </svg>
+  );
 
   return (
     <div className="relative flex-shrink-0" ref={menuRef}>
@@ -535,7 +551,7 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
         </svg>
       </button>
       {showMenu && (
-        <div className="absolute right-0 top-full mt-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-lg py-1 z-50 min-w-[200px]">
+        <div className="absolute right-0 top-full mt-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-lg py-1 z-50 min-w-[220px]">
           <label
             className="flex items-center gap-2 px-3 py-2 text-xs text-gray-600 dark:text-gray-300 border-b border-gray-100 dark:border-gray-700 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700/50"
             title="When checked, the new tab spawns in a fresh git worktree (branch apas-pane-<id>) so it can't race other tabs on file edits. Requires the project to be a git repo."
@@ -549,52 +565,95 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
             />
             Isolated git worktree
           </label>
+
+          {/* Claude group */}
           <button
-            onClick={() => handlePick("claude")}
+            onClick={() => setExpandedGroup((g) => (g === "claude" ? null : "claude"))}
             className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
           >
             <span className="text-blue-500 flex-shrink-0">
               <ProviderIcon provider="claude" className="w-4 h-4" />
             </span>
-            Claude Tab
+            Claude
+            <Caret open={expandedGroup === "claude"} />
           </button>
-          <button
-            onClick={() => handlePick("claude", MINIMAX_DEFAULT_MODEL)}
-            className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
-          >
-            <span className="text-cyan-500 flex-shrink-0">
-              <ProviderIcon provider="claude" model={MINIMAX_DEFAULT_MODEL} className="w-4 h-4" />
-            </span>
-            MiniMax 2.7 Tab
-          </button>
-          <button
-            onClick={() => handlePick("claude", GLM_DEFAULT_MODEL)}
-            className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
-          >
-            <span className="text-emerald-500 flex-shrink-0">
-              <ProviderIcon provider="claude" model={GLM_DEFAULT_MODEL} className="w-4 h-4" />
-            </span>
-            GLM 5.1 Tab
-          </button>
-          <button
-            onClick={() => handlePick("claude", DEEPSEEK_DEFAULT_MODEL)}
-            className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
-          >
-            <span className="text-indigo-500 flex-shrink-0">
-              <ProviderIcon provider="claude" model={DEEPSEEK_DEFAULT_MODEL} className="w-4 h-4" />
-            </span>
-            DeepSeek Tab
-          </button>
+          {expandedGroup === "claude" && (
+            <div className="bg-gray-50 dark:bg-gray-900/40">
+              <button
+                onClick={() => handlePick("claude")}
+                className="w-full text-left pl-8 pr-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
+              >
+                <span className="text-blue-500 flex-shrink-0">
+                  <ProviderIcon provider="claude" className="w-4 h-4" />
+                </span>
+                Official
+              </button>
+              <button
+                onClick={() => handlePick("claude", MINIMAX_DEFAULT_MODEL)}
+                className="w-full text-left pl-8 pr-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
+              >
+                <span className="text-cyan-500 flex-shrink-0">
+                  <ProviderIcon provider="claude" model={MINIMAX_DEFAULT_MODEL} className="w-4 h-4" />
+                </span>
+                MiniMax 2.7
+              </button>
+              <button
+                onClick={() => handlePick("claude", GLM_DEFAULT_MODEL)}
+                className="w-full text-left pl-8 pr-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
+              >
+                <span className="text-emerald-500 flex-shrink-0">
+                  <ProviderIcon provider="claude" model={GLM_DEFAULT_MODEL} className="w-4 h-4" />
+                </span>
+                GLM 5.1
+              </button>
+              <button
+                onClick={() => handlePick("claude", DEEPSEEK_DEFAULT_MODEL)}
+                className="w-full text-left pl-8 pr-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
+              >
+                <span className="text-indigo-500 flex-shrink-0">
+                  <ProviderIcon provider="claude" model={DEEPSEEK_DEFAULT_MODEL} className="w-4 h-4" />
+                </span>
+                DeepSeek
+              </button>
+            </div>
+          )}
+
           <div className="border-t border-gray-100 dark:border-gray-700 my-0.5" />
+
+          {/* Codex group */}
           <button
-            onClick={() => handlePick("codex")}
+            onClick={() => setExpandedGroup((g) => (g === "codex" ? null : "codex"))}
             className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
           >
             <span className="text-green-500 flex-shrink-0">
               <ProviderIcon provider="codex" className="w-4 h-4" />
             </span>
-            Codex Tab
+            Codex
+            <Caret open={expandedGroup === "codex"} />
           </button>
+          {expandedGroup === "codex" && (
+            <div className="bg-gray-50 dark:bg-gray-900/40">
+              <button
+                onClick={() => handlePick("codex")}
+                className="w-full text-left pl-8 pr-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
+              >
+                <span className="text-green-500 flex-shrink-0">
+                  <ProviderIcon provider="codex" className="w-4 h-4" />
+                </span>
+                Official
+              </button>
+              <button
+                onClick={() => handlePick("codex", DEEPSEEK_DEFAULT_MODEL)}
+                className="w-full text-left pl-8 pr-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
+              >
+                <span className="text-indigo-500 flex-shrink-0">
+                  <ProviderIcon provider="codex" model={DEEPSEEK_DEFAULT_MODEL} className="w-4 h-4" />
+                </span>
+                DeepSeek
+              </button>
+            </div>
+          )}
+
           <div className="border-t border-gray-100 dark:border-gray-700 my-0.5" />
           <button
             onClick={() => handlePick("opencode")}
@@ -603,7 +662,7 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
             <span className="text-orange-500 flex-shrink-0">
               <ProviderIcon provider="opencode" className="w-4 h-4" />
             </span>
-            OpenCode Tab
+            OpenCode
           </button>
           <div className="border-t border-gray-100 dark:border-gray-700 my-0.5" />
           <button
@@ -613,7 +672,7 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
             <span className="text-sky-500 flex-shrink-0">
               <ProviderIcon provider="cursor-agent" className="w-4 h-4" />
             </span>
-            Cursor Tab
+            Cursor
           </button>
         </div>
       )}
