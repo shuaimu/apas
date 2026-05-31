@@ -153,19 +153,32 @@ function PaneCard({
       ? "text-blue-500 animate-pulse"
       : "text-gray-400";
   const updatePaneModel = useStore((s) => s.updatePaneModel);
-  // Inline agent switcher. Native <select>s sit where the static
-  // provider badge used to so users can swap claude → codex (or
-  // sonnet → opus) without clicking into the pane first. Selects
-  // are gated under the badge-shaped container so the row stays
-  // compact; the model select only shows for the Claude provider.
-  const PROVIDER_OPTS: ReadonlyArray<{ value: string; label: string }> = [
-    { value: "claude", label: "Claude" },
-    { value: "codex", label: "Codex" },
-    { value: "cursor-agent", label: "Cursor" },
-    { value: "opencode", label: "OpenCode" },
-    { value: "minimax", label: "MiniMax" },
-    { value: "glm", label: "GLM" },
-    { value: "deepseek", label: "DeepSeek" },
+  // Inline agent switcher. Mirrors the "+" new-tab menu's
+  // frontend/backend grouping: the first select picks an
+  // agent-frontend × API-backend combo (e.g. "Claude / DeepSeek" =
+  // claude CLI talking to deepseek's anthropic-compatible endpoint
+  // via the env-override path). The second select only appears for
+  // Claude/Official to pick the underlying Anthropic model
+  // (Sonnet/Opus/Haiku); MiniMax/GLM/DeepSeek backends lock in their
+  // own model string so the extra knob would be misleading.
+  const MINIMAX_DEFAULT_MODEL = "MiniMax-M2.7";
+  const GLM_DEFAULT_MODEL = "glm-5.1";
+  const DEEPSEEK_DEFAULT_MODEL = "deepseek-chat";
+  const AGENT_OPTS: ReadonlyArray<{
+    value: string;
+    label: string;
+    /// Provider sent on the wire.
+    provider: string;
+    /// Model override for backend-swap agents; null clears the override.
+    model: string | null;
+  }> = [
+    { value: "claude/official", label: "Claude / Official", provider: "claude", model: null },
+    { value: "claude/minimax", label: "Claude / MiniMax 2.7", provider: "claude", model: MINIMAX_DEFAULT_MODEL },
+    { value: "claude/glm", label: "Claude / GLM 5.1", provider: "claude", model: GLM_DEFAULT_MODEL },
+    { value: "claude/deepseek", label: "Claude / DeepSeek", provider: "claude", model: DEEPSEEK_DEFAULT_MODEL },
+    { value: "codex/official", label: "Codex / Official", provider: "codex", model: null },
+    { value: "opencode/official", label: "OpenCode / Official", provider: "opencode", model: null },
+    { value: "cursor-agent/official", label: "Cursor / Official", provider: "cursor-agent", model: null },
   ];
   const CLAUDE_MODEL_OPTS: ReadonlyArray<{ value: string; label: string }> = [
     { value: "default", label: "Default" },
@@ -182,6 +195,30 @@ function PaneCard({
     if (v.includes("haiku")) return "haiku";
     return "default";
   };
+  // Reverse mapping from (provider, model) → agent option value, so the
+  // dropdown reflects whichever combo the pane is actually running.
+  // Claude with a backend-specific model classifies into the matching
+  // sub-option even if the user typed a variant string.
+  const currentAgentValue = ((): string => {
+    const provider = pane.provider;
+    const model = (pane.model ?? "").toLowerCase();
+    if (provider === "claude") {
+      if (model.includes("minimax") || model.startsWith("m2")) return "claude/minimax";
+      if (model.startsWith("glm") || model.includes("glm-")) return "claude/glm";
+      if (model.includes("deepseek")) return "claude/deepseek";
+      return "claude/official";
+    }
+    if (provider === "codex") return "codex/official";
+    if (provider === "opencode") return "opencode/official";
+    if (provider === "cursor-agent") return "cursor-agent/official";
+    // Legacy provider strings (raw "minimax"/"glm"/"deepseek" from older
+    // panes) collapse to their Claude/backend equivalents.
+    if (provider === "minimax") return "claude/minimax";
+    if (provider === "glm") return "claude/glm";
+    if (provider === "deepseek") return "claude/deepseek";
+    return "claude/official";
+  })();
+  const isClaudeOfficial = currentAgentValue === "claude/official";
   const label = pane.label || `Tab ${pane.pane_id}`;
   return (
     <button
@@ -217,30 +254,31 @@ function PaneCard({
           onClick={(e) => e.stopPropagation()}
         >
           <select
-            value={pane.provider}
+            value={currentAgentValue}
             onChange={(e) => {
               const next = e.target.value;
-              if (next === pane.provider) return;
-              const label = PROVIDER_OPTS.find((o) => o.value === next)?.label ?? next;
+              if (next === currentAgentValue) return;
+              const picked = AGENT_OPTS.find((o) => o.value === next);
+              if (!picked) return;
               if (
                 !confirm(
-                  `Switch agent to ${label}? The current turn will be interrupted and the agent respawns with a fresh context — chat history stays visible but is NOT in the new agent's prompt. Make sure ${label} is installed + authenticated on the host running this pane.`,
+                  `Switch agent to ${picked.label}? The current turn will be interrupted and the agent respawns with a fresh context — chat history stays visible but is NOT in the new agent's prompt. Make sure the host running this pane has the required CLI installed + authenticated.`,
                 )
               ) {
                 return;
               }
-              updatePaneModel(pane.pane_id, null, next);
+              updatePaneModel(pane.pane_id, picked.model, picked.provider);
             }}
             className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-1 py-0 text-[10px] font-mono text-gray-700 dark:text-gray-300 focus:outline-none"
-            title="Agent backend — switching kills the current agent child and respawns with a fresh session id"
+            title="Agent frontend / API backend — switching kills the current agent child and respawns with a fresh session id"
           >
-            {PROVIDER_OPTS.map((o) => (
+            {AGENT_OPTS.map((o) => (
               <option key={o.value} value={o.value}>
                 {o.label}
               </option>
             ))}
           </select>
-          {pane.provider === "claude" && (
+          {isClaudeOfficial && (
             <select
               value={normalizeClaudeModel(pane.model)}
               onChange={(e) => {
@@ -257,7 +295,7 @@ function PaneCard({
                 updatePaneModel(pane.pane_id, next === "default" ? null : next);
               }}
               className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-1 py-0 text-[10px] font-mono text-gray-700 dark:text-gray-300 focus:outline-none"
-              title="Claude model"
+              title="Claude model (only meaningful for Claude / Official; backend-swap agents use the backend's own model)"
             >
               {CLAUDE_MODEL_OPTS.map((o) => (
                 <option key={o.value} value={o.value}>
