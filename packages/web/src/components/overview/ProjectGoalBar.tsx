@@ -171,15 +171,26 @@ export function ProjectGoalBar() {
     if (
       typeof window !== "undefined" &&
       !window.confirm(
-        `Interrupt the current activity of ${managedPanes.length} managed team pane(s)? Any in-flight tool call is killed; deadloop workers stay enrolled and will pick up the next iteration when their wake-up fires.`,
+        `Stop ${managedPanes.length} managed team pane(s)? Each pane's in-flight turn is interrupted; deadloop workers are also paused so they don't auto-restart on the next file event. Click "Resume team" later to bring them back online.`,
       )
     ) {
       return;
     }
+    // Interrupt every managed pane (kills the in-flight turn on
+    // deadloop + interactive workers alike). Then pause every managed
+    // deadloop pane so they stay quiet — without the pause the loop
+    // would tick again as soon as the file watcher fires on any
+    // sibling pane's write, defeating "stop".
     for (const p of managedPanes) {
       interruptPane(p.pane_id);
     }
-    showToast(`Sent interrupt to ${managedPanes.length} team pane(s)`, "info");
+    for (const p of managedDeadloopPanes) {
+      if (!pausedPanes.includes(p.pane_id)) pausePane(p.pane_id);
+    }
+    showToast(
+      `Interrupted ${managedPanes.length} pane(s) and paused ${managedDeadloopPanes.length} deadloop worker(s) — click Resume team to bring them back`,
+      "info",
+    );
   };
 
   // Hydrate goalDraft from the CLI's mirror of project_goal.md (pushed
@@ -387,7 +398,7 @@ export function ProjectGoalBar() {
                 type="button"
                 onClick={handleStopTeam}
                 className="rounded border border-rose-500 bg-rose-600 px-2 py-0.5 text-[11px] text-white hover:bg-rose-500"
-                title="Interrupt every managed pane's current turn (kills the in-flight tool call). Deadloop workers stay enrolled."
+                title="Interrupt every managed pane's current turn AND pause the deadloop workers so they stay quiet until you click Resume team."
               >
                 Stop team
               </button>
