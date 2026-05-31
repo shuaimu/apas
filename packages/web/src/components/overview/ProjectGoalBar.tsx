@@ -99,6 +99,7 @@ export function ProjectGoalBar() {
   const sendMessageToPane = useStore((s) => s.sendMessageToPane);
   const pausePane = useStore((s) => s.pausePane);
   const resumePane = useStore((s) => s.resumePane);
+  const interruptPane = useStore((s) => s.interruptPane);
   const showToast = useStore((s) => s.showToast);
 
   // Local mirror of the on-disk project_goal.md. The CLI polls the file's
@@ -130,6 +131,56 @@ export function ProjectGoalBar() {
   const techLeadPaused = techLeadPane
     ? pausedPanes.includes(techLeadPane.pane_id)
     : false;
+
+  // Team controls operate on every `managed: true` pane in the project
+  // (Manager + Tech Lead + Reviewer + Developer + any user-added
+  // workers). Pause/Resume only applies to deadloop panes — interactive
+  // ones (the Manager) are always idle-waiting-for-input, so pausing
+  // them is a no-op. Stop fans out to every managed pane regardless of
+  // mode: interrupt is safe on idle panes too.
+  const managedPanes = useMemo(
+    () => paneConfigs.filter((p) => p.managed === true),
+    [paneConfigs],
+  );
+  const managedDeadloopPanes = useMemo(
+    () => managedPanes.filter((p) => p.mode === "deadloop"),
+    [managedPanes],
+  );
+  // "Team paused" = every managed deadloop pane is in pausedPanes.
+  // Empty deadloop set → considered not paused (button stays "Pause team"
+  // but disabled below since there's nothing to pause).
+  const teamAllPaused =
+    managedDeadloopPanes.length > 0 &&
+    managedDeadloopPanes.every((p) => pausedPanes.includes(p.pane_id));
+  const teamHasAnyDeadloop = managedDeadloopPanes.length > 0;
+  const teamHasAnyManaged = managedPanes.length > 0;
+
+  const handlePauseTeam = () => {
+    for (const p of managedDeadloopPanes) {
+      if (!pausedPanes.includes(p.pane_id)) pausePane(p.pane_id);
+    }
+    showToast(`Paused ${managedDeadloopPanes.length} team worker(s)`, "info");
+  };
+  const handleResumeTeam = () => {
+    for (const p of managedDeadloopPanes) {
+      if (pausedPanes.includes(p.pane_id)) resumePane(p.pane_id);
+    }
+    showToast(`Resumed ${managedDeadloopPanes.length} team worker(s)`, "info");
+  };
+  const handleStopTeam = () => {
+    if (
+      typeof window !== "undefined" &&
+      !window.confirm(
+        `Interrupt the current activity of ${managedPanes.length} managed team pane(s)? Any in-flight tool call is killed; deadloop workers stay enrolled and will pick up the next iteration when their wake-up fires.`,
+      )
+    ) {
+      return;
+    }
+    for (const p of managedPanes) {
+      interruptPane(p.pane_id);
+    }
+    showToast(`Sent interrupt to ${managedPanes.length} team pane(s)`, "info");
+  };
 
   // Hydrate goalDraft from the CLI's mirror of project_goal.md (pushed
   // via ProjectGoalChanged whenever the file's mtime changes). Skip the
@@ -285,37 +336,61 @@ export function ProjectGoalBar() {
               💬 no Manager — start one to chat with the team
             </span>
           )}
-          {/* Tech Lead status */}
+          {/* Tech Lead presence (display only — pause/stop is a team-
+              wide control rendered next, no per-pane button here). */}
           {techLeadPane ? (
             <span className="flex items-center gap-1 text-indigo-600 dark:text-indigo-400">
               <span>
-                🧭 Tech Lead{" "}
-                {techLeadPaused ? "⏸ paused" : "⏵ running"} ·{" "}
+                🧭 Tech Lead ·{" "}
                 <span className="font-mono">
                   {techLeadPane.label || `pane ${techLeadPane.pane_id}`}
                 </span>
+                {techLeadPaused && (
+                  <span className="ml-1 text-amber-600 dark:text-amber-400">⏸</span>
+                )}
               </span>
-              {techLeadPaused ? (
-                <button
-                  type="button"
-                  onClick={() => resumePane(techLeadPane.pane_id)}
-                  className="rounded border border-emerald-500 bg-emerald-600 px-1.5 py-0.5 text-[11px] text-white hover:bg-emerald-500"
-                >
-                  resume
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => pausePane(techLeadPane.pane_id)}
-                  className="rounded border border-amber-500 bg-amber-600 px-1.5 py-0.5 text-[11px] text-white hover:bg-amber-500"
-                >
-                  pause
-                </button>
-              )}
             </span>
           ) : (
             <span className="text-indigo-600 dark:text-indigo-400">
               🧭 no Tech Lead — optional autonomous orchestration
+            </span>
+          )}
+
+          {/* Team-wide controls — fan out to every managed pane. Pause
+              only touches deadloops (interactive panes can't be paused
+              meaningfully); Stop interrupts every managed pane's
+              in-flight turn. */}
+          {teamHasAnyManaged && (
+            <span className="flex items-center gap-1">
+              {teamAllPaused ? (
+                <button
+                  type="button"
+                  onClick={handleResumeTeam}
+                  disabled={!teamHasAnyDeadloop}
+                  className="rounded border border-emerald-500 bg-emerald-600 px-2 py-0.5 text-[11px] text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
+                  title="Resume all managed deadloop workers"
+                >
+                  Resume team
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handlePauseTeam}
+                  disabled={!teamHasAnyDeadloop}
+                  className="rounded border border-amber-500 bg-amber-600 px-2 py-0.5 text-[11px] text-white hover:bg-amber-500 disabled:cursor-not-allowed disabled:opacity-50"
+                  title="Pause all managed deadloop workers (current iteration finishes, next one waits)"
+                >
+                  Pause team
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={handleStopTeam}
+                className="rounded border border-rose-500 bg-rose-600 px-2 py-0.5 text-[11px] text-white hover:bg-rose-500"
+                title="Interrupt every managed pane's current turn (kills the in-flight tool call). Deadloop workers stay enrolled."
+              >
+                Stop team
+              </button>
             </span>
           )}
         </div>
