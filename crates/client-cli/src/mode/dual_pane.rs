@@ -4545,8 +4545,39 @@ fn run_deadloop_session_inner(
             first_message = false;
         }
 
-        // Kill any lingering Claude processes that still hold this session ID.
-        // This can happen after Stop→Start when the old process wasn't fully reaped.
+        // Reap whatever child this pane spawned on the prior iteration
+        // BEFORE starting a new one. Codex `exec resume` does not exit on
+        // its own when apas decides the turn is done (apas reads the
+        // result marker on stdout, but codex may still be running a slow
+        // tool call). Without this reap the previous codex keeps running
+        // in the background, billing tokens against the user's quota,
+        // while we start another one on top — runaway codex usage was
+        // exactly this leak. SIGKILL the entire process group (deadloop
+        // spawns set pgid via pre_exec, so -pgid catches the agent's
+        // own children too), then wait() to fully release the zombie.
+        if let Ok(mut guard) = child_process.lock() {
+            if let Some(mut prior) = guard.take() {
+                let prior_pid = prior.id();
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(-(prior_pid as i32), libc::SIGKILL);
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = prior.kill();
+                }
+                let _ = prior.wait();
+                tracing::info!(
+                    pane_id,
+                    prior_pid,
+                    "Reaped prior deadloop agent child before starting new iteration",
+                );
+            }
+        }
+        // Defensive sweep for processes that escaped reap entirely
+        // (e.g., prior apas crash that lost its child_process handle).
+        // Matches by session id in argv; only catches current-session
+        // ids — codex's rotating thread_id can hide older orphans.
         kill_processes_using_session(&claude_session_id.to_string());
 
         let pane_env = match build_pane_env_overrides(provider, model.as_deref()) {
