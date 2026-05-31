@@ -12,7 +12,7 @@
  * fresh without waiting for the Tech Lead's next iteration to push.
  */
 import { useEffect, useMemo, useState } from "react";
-import { Check, X, Loader2, Plus } from "lucide-react";
+import { Check, X, Loader2, Plus, ChevronDown, ChevronRight } from "lucide-react";
 import {
   TeamTodoGlobal,
   TeamTodoSubtask,
@@ -47,12 +47,29 @@ export function parsePrLine(line: string): ParsedPrLine | null {
   return { pane, url: m[2], owner: m[3], repo: m[4], num };
 }
 
+/// localStorage key for the user's preferred fold state. Global (not
+/// per-project) so the user only sets it once. Default = expanded.
+const COLLAPSED_KEY = "apas_team_todo_collapsed";
+
 export function TeamTodoPanel() {
   const sessionId = useStore((s) => s.sessionId);
   const state = useStore((s) =>
     s.sessionId ? s.teamTodoStates.get(s.sessionId) ?? null : null,
   );
   const fetchTeamTodo = useStore((s) => s.fetchTeamTodo);
+  const [collapsed, setCollapsed] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
+    return window.localStorage.getItem(COLLAPSED_KEY) === "1";
+  });
+  const toggleCollapsed = () => {
+    setCollapsed((c) => {
+      const next = !c;
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem(COLLAPSED_KEY, next ? "1" : "0");
+      }
+      return next;
+    });
+  };
 
   useEffect(() => {
     if (!sessionId) return;
@@ -64,14 +81,50 @@ export function TeamTodoPanel() {
   if (!sessionId) return null;
 
   const empty = !state || (state.globals.length === 0 && state.workers.length === 0);
+
+  // Counts for the collapsed header summary.
+  const activeCount = state
+    ? state.globals.filter(
+        (g) =>
+          g.status !== "rejected" &&
+          g.status !== "done" &&
+          g.status !== "withdrawn",
+      ).length
+    : 0;
+  const doneCount = state
+    ? state.globals.filter((g) => g.status === "done").length
+    : 0;
+  const totalSubtasks = state
+    ? state.workers.reduce((acc, w) => acc + w.subtasks.length, 0)
+    : 0;
+
   return (
     <section className="mb-6 rounded border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-900">
       <div className="mb-2 flex items-center justify-between gap-2">
-        <h3 className="text-sm font-semibold text-gray-900 dark:text-gray-100">
+        <button
+          type="button"
+          onClick={toggleCollapsed}
+          className="flex items-center gap-1.5 text-sm font-semibold text-gray-900 hover:text-indigo-600 dark:text-gray-100 dark:hover:text-indigo-400"
+          title={collapsed ? "Expand Team TODO" : "Collapse Team TODO"}
+        >
+          {collapsed ? (
+            <ChevronRight className="h-4 w-4" />
+          ) : (
+            <ChevronDown className="h-4 w-4" />
+          )}
           Team TODO
-        </h3>
-        <AddTodoControl />
+          {collapsed && (
+            <span className="ml-1 text-xs font-normal text-gray-500 dark:text-gray-400">
+              {activeCount} active · {doneCount} done
+              {totalSubtasks > 0 ? ` · ${totalSubtasks} subtasks` : ""}
+            </span>
+          )}
+        </button>
+        {!collapsed && <AddTodoControl />}
       </div>
+
+      {collapsed ? null : (
+        <>
 
       <AgentStatusRow
         techLeadCursor={state?.tech_lead_cursor ?? null}
@@ -146,6 +199,8 @@ export function TeamTodoPanel() {
             ))}
           </ul>
         </div>
+      )}
+        </>
       )}
     </section>
   );
