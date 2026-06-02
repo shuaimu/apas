@@ -1,18 +1,25 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProjectGoalBar } from "./ProjectGoalBar";
 import { useStore, type PaneConfig } from "@/lib/store";
 
+const DEFAULT_SESSION_ID = "test-session";
+const PROJECT_GOAL_SESSION_ID = "session-project-goal";
+
 function seedProjectGoalBar(overrides: Partial<{
+  sessionId: string;
+  projectGoals: Record<string, string>;
   paneConfigs: PaneConfig[];
   pausedPanes: number[];
   addPane: ReturnType<typeof vi.fn>;
   pausePane: ReturnType<typeof vi.fn>;
   resumePane: ReturnType<typeof vi.fn>;
 }> = {}) {
+  const sessionId = overrides.sessionId ?? DEFAULT_SESSION_ID;
+
   useStore.setState({
-    sessionId: "test-session",
-    projectGoals: { "test-session": "Ship APAS team mode" },
+    sessionId,
+    projectGoals: overrides.projectGoals ?? { [sessionId]: "Ship APAS team mode" },
     paneConfigs: overrides.paneConfigs ?? [],
     pausedPanes: overrides.pausedPanes ?? [],
     addPane: overrides.addPane ?? vi.fn(() => ({ success: true })),
@@ -116,5 +123,45 @@ describe("ProjectGoalBar team role slots", () => {
     expect(screen.getAllByText("Claude / MiniMax 2.7").length).toBeGreaterThan(0);
     fireEvent.click(screen.getByTitle("Resume Tech Lead"));
     expect(resumePane).toHaveBeenCalledWith(77);
+  });
+
+  it("hydrates from projectGoals without clobbering a dirty edit", async () => {
+    seedProjectGoalBar({
+      sessionId: PROJECT_GOAL_SESSION_ID,
+      projectGoals: { [PROJECT_GOAL_SESSION_ID]: "goal from server" },
+    });
+
+    render(<ProjectGoalBar />);
+
+    const textarea = screen.getByPlaceholderText(
+      /What does the team need to accomplish/,
+    ) as HTMLTextAreaElement;
+
+    await waitFor(() => {
+      expect(textarea.value).toBe("goal from server");
+    });
+
+    act(() => {
+      useStore.setState({
+        projectGoals: { [PROJECT_GOAL_SESSION_ID]: "updated server goal" },
+      });
+    });
+
+    await waitFor(() => {
+      expect(textarea.value).toBe("updated server goal");
+    });
+
+    fireEvent.change(textarea, { target: { value: "local draft" } });
+    expect(textarea.value).toBe("local draft");
+
+    act(() => {
+      useStore.setState({
+        projectGoals: { [PROJECT_GOAL_SESSION_ID]: "late server goal" },
+      });
+    });
+
+    await waitFor(() => {
+      expect(textarea.value).toBe("local draft");
+    });
   });
 });

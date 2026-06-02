@@ -14,6 +14,7 @@ describe('useStore', () => {
       cliClients: [],
       messages: [],
       machines: [],
+      projectGoals: {},
     });
   });
 
@@ -201,6 +202,28 @@ describe('useStore', () => {
       useStore.getState().reject('tool-call-123');
 
       expect(ws?.send).toHaveBeenCalled();
+    });
+  });
+
+  describe('project_goal_changed', () => {
+    it('caches project goal content by session id from websocket messages', async () => {
+      useStore.getState().connect();
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      const ws = useStore.getState().ws as unknown as {
+        onmessage?: (event: MessageEvent) => void;
+      };
+      ws.onmessage?.(new MessageEvent('message', {
+        data: JSON.stringify({
+          type: 'project_goal_changed',
+          session_id: 'session-project-goal',
+          content: 'line one\n\nline two\n',
+        }),
+      }));
+
+      expect(useStore.getState().projectGoals['session-project-goal']).toBe(
+        'line one\n\nline two\n',
+      );
     });
   });
 });
