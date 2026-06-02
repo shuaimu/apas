@@ -8,8 +8,9 @@ APAS.
 > [`todo-driven-workflow.md`](./todo-driven-workflow.md). It's the
 > higher-level protocol layered on top of the primitives in this doc:
 > a `team-todo.md` queue the Tech Lead drives, with an auto-spawned
-> Manager + Tech Lead + Reviewer trio, user-facing Approve/Reject
-> buttons in the web Overview, and one PR per contributing worker.
+> Manager + Tech Lead + Developer + Reviewer team, user-facing
+> Approve/Reject buttons in the web Overview, and one PR per contributing
+> worker.
 > Most users want to read both — this doc covers the pane mechanics
 > (worktrees, scratchpad, plan review); that doc covers how the team
 > coordinates around shared goals.
@@ -18,11 +19,17 @@ APAS.
 
 - A **pane** is one teammate. Each pane has its own model/provider, optional
   goal, optional git worktree, and its own thinking loop.
+- The default managed team has four roles:
+  **Manager** talks with the human and keeps `project_goal.md` current,
+  **Tech Lead** turns that goal into `team-todo.md` work, **Developer**
+  panes implement approved subtasks, and **Reviewer** panes approve or
+  reject developer diffs before PRs are opened.
 - The **team scratchpad** (`<project>/.apas-team.jsonl`) is the team's shared
   whiteboard. Anything one pane appends, every other pane (and the Overview
   tab) can read. This is also how delegation and review messages flow.
 - Tabs at the top of the project are panes. The pinned **Overview** tab at
-  the front shows the whole team at a glance.
+  the front shows the Manager chat, Project Goal, Team TODO queue, pane
+  grid, scratchpad ticker, and provider usage at a glance.
 
 Two ways to get into team mode:
 
@@ -57,31 +64,49 @@ Two ways to get into team mode:
 {"ts": "...", "pane_id": 716, "tags": ["delegate-to:578", "task:abc"], "kind": "delegation", "body": "..."}
 ```
 
-Common `kind` values: `delegation` (manager → worker), `reply` (worker →
-manager), `diff` (announce a diff is ready), `review` (reviewer's verdict),
-`status`, `decision`. Tags are free-form strings; the conventions below are
-what the agent prompts know about.
+Common `kind` values: `delegation` (task handoff, usually Tech Lead →
+Developer/Reviewer), `reply` (response to a handoff or escalation), `diff`
+(announce a diff is ready), `review` (reviewer's verdict), `status`,
+`decision`. Tags are free-form strings; the conventions below are what the
+agent prompts know about.
 
 Open the amber **Team** button in any pane header to see the live timeline.
 Or use the **Overview** tab — it has a scratchpad ticker section with filter
 chips per kind.
 
-## Manager + worker pattern
+## Managed team flow
 
-Set one pane's role to include `manager` (e.g. `team manager`). On next
-spawn that pane gets a system-prompt addendum teaching it the delegation
-protocol:
+The current team-mode flow splits coordination across Manager, Tech Lead,
+Developer, and Reviewer panes instead of having one manager directly hand
+work to one worker.
 
-- To delegate work, append a record with `tags: ["delegate-to:<pane_id>"]`
-  and `kind: "delegation"`. The receiving pane gets the `body` injected
-  straight into its input queue — no user click needed.
-- The manager assigns each delegation a task id and includes it as
-  `task:<id>`; the worker replies with `tags: ["reply-to:<id>"]` so the pair
-  is recoverable later.
+1. **Manager** is the user-facing pane. It chats with the human, helps draft
+   or revise `project_goal.md`, and can translate a direct user request into
+   an approved Global TODO. Other panes escalate human-facing questions to
+   the Manager with `kind: "escalation"` and a `delegate-to:<manager_pane>`
+   tag.
+2. **Tech Lead** reads `project_goal.md`, `team-todo.md`, `.apas`, and
+   `.apas-team.jsonl`. It proposes bounded Global TODOs as
+   `status: proposed, origin: tech-lead`, waits for the user to approve or
+   reject them in Overview, then dispatches approved subtasks with
+   `kind: "delegation"` and tags such as
+   `delegate-to:<developer_pane>`, `task:TODO-014`, and
+   `task:TODO-014-team-mode-v3-guide`.
+3. **Developer** panes watch for `delegate-to:<their_pane_id>` records,
+   work in their branch/worktree, commit the subtask, and publish
+   `kind: "diff"` records tagged with the TODO id. After Reviewer approval,
+   the Developer pushes the branch, opens the GitHub PR, and publishes a
+   `kind: "decision"` record tagged `pr-opened`.
+4. **Reviewer** panes watch `kind: "diff"` records for assigned developer
+   panes. They publish `kind: "review"` records tagged
+   `approves:<developer_pane>` or `rejects:<developer_pane>` plus the
+   relevant `task:TODO-NNN` tag. Rejections go back to the Developer as a
+   fresh delegation; approvals let the Developer open the PR.
 
-The Overview tab's **Delegation board** section shows every recent
-delegate/reply pair with status (`awaiting reply`, `replied (+Δt)`,
-`untracked` when no task id).
+The Tech Lead records worker `pr-opened` decisions back into `team-todo.md`
+as `pr: <pane_id> <url>` lines and tracks PR state. Developers do not merge
+their own PRs and do not poll open PRs for comments; the Tech Lead dispatches
+new PR comments back to the PR owner with a `pr-comments:<url>` tag.
 
 ## Reviewer pattern
 
@@ -93,10 +118,10 @@ it the review loop:
   `tags: ["approves:<pane_id>"]` or `["rejects:<pane_id>"]` plus a critique
   in the body.
 
-A typical 3-pane setup: **manager** breaks down work + delegates →
-**worker** does the work in an isolated worktree, publishes `kind: "diff"`
-when ready → **reviewer** approves/rejects on the scratchpad → manager
-decides what to do next.
+In the managed team, the Reviewer usually receives review requests from the
+Tech Lead after a Developer publishes a diff. The Reviewer still reads the
+diff directly from `.apas-team.jsonl`, verifies it against the matching
+`team-todo.md` entry, and posts the verdict on the scratchpad.
 
 ## Plan review checkpoint
 
@@ -131,35 +156,45 @@ appears: **Leave as branch (safe)**, **Merge into current branch**, or
 
 ## Overview tab
 
-Pinned at the front of every project. Four sections:
+Pinned at the front of every project. It is the main team-mode control
+surface:
 
-1. **Pane grid** — one card per pane: status pill, mode icon, role chip,
+1. **Manager chat / default landing** — open or start the Manager pane and
+   talk through the project goal without hunting through worker tabs.
+2. **Project Goal** — view, edit, or generate `project_goal.md`. The Manager
+   and Tech Lead both treat this file as the high-level source of truth.
+3. **Team TODO panel** — inspect Global TODOs and per-pane subtasks,
+   approve or reject `status: proposed` work, add direct user TODOs, and use
+   PR links/status badges once workers open PRs.
+4. **Pane grid** — one card per pane: status pill, mode icon, role chip,
    provider, worktree branch + diff stats, last-activity timestamp, and a
    60-bucket last-hour activity sparkline (flat line = wedged, regular bars
    = healthy). Click a card to jump to that pane; click the inline Diff /
    Role buttons to open the modals without switching.
-2. **Team scratchpad ticker** — last 20 records with filter chips per kind.
-3. **Delegation board** — `delegate-to`/`reply-to` pairs with status.
-4. **Resource use** — UsageLimitsDisplay per provider, so you can see how
+5. **Team scratchpad ticker** — recent records with filter chips per kind,
+   useful for seeing delegations, diffs, reviews, decisions, and escalations
+   without opening the raw `.apas-team.jsonl` file.
+6. **Resource use** — UsageLimitsDisplay per provider, so you can see how
    close any provider is to its quota cap.
 
 ## Concrete starter setup
 
-A three-pane scaffold to copy:
+For a new v3 team-mode project:
 
-- **Pane 2 ("main")** — interactive, no role, no worktree. Your normal pane.
-- **Pane 716 ("manager")** — interactive, role: `team manager`, goal:
-  "Break down the user's task into small leaf jobs and delegate each to the
-  right worker." Plan review: `risky only`.
-- **Pane 578 ("worker")** — interactive, role: `frontend engineer`,
-  isolated worktree. Plan review: `never`.
-- **Pane 849 ("reviewer")** — interactive, role: `code reviewer`, no
-  worktree (just reads). Plan review: `never`.
+1. Open the **Overview** tab.
+2. Start or open the **Manager** pane. Describe the desired outcome, or ask
+   the Manager to scan the repo and draft `project_goal.md`.
+3. Start the **Tech Lead** pane. It reads the goal and proposes concrete
+   Global TODOs in `team-todo.md`.
+4. Approve or reject proposed Global TODOs in the **Team TODO panel**.
+5. Keep the default **Developer** and **Reviewer** panes running. Developers
+   implement approved subtasks in isolated worktrees; Reviewers approve or
+   reject `kind: "diff"` records.
+6. Review and merge the GitHub PRs workers open after Reviewer approval.
 
-Send your task to the manager pane. The manager will publish
-`delegate-to:578` records; the worker picks them up automatically; when the
-worker finishes a chunk it publishes `kind: "diff"` and the reviewer
-weighs in.
+You can still add manual panes with the `+` button. For a managed Developer,
+use an isolated worktree; for a Reviewer, no worktree is usually needed
+because it reads diffs and source files.
 
 ## Tips
 
