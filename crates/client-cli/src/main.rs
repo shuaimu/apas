@@ -660,113 +660,108 @@ fn is_apas_daemon_process(pid: u32) -> bool {
     has_apas_binary && has_daemon_arg
 }
 
+const CONFIG_KEYS: &str = "server, token, claude_path, minimax_path, codex_path, minimax_api_base_url, minimax_api_key, glm_api_base_url, glm_api_key, deepseek_api_base_url, deepseek_api_key, daemon_machine_id, daemon_roots";
+
+fn set_config_value(config: &mut config::Config, key: &str, value: String) -> Result<()> {
+    match key {
+        "server" => config.remote.server = Some(value),
+        "token" => config.remote.token = Some(value),
+        "claude_path" => config.local.claude_path = value,
+        "minimax_path" => config.local.minimax_path = value,
+        "codex_path" => config.local.codex_path = value,
+        "minimax_api_base_url" => config.local.minimax_api_base_url = if value.trim().is_empty() { None } else { Some(value) },
+        "minimax_api_key" => config.local.minimax_api_key = if value.trim().is_empty() { None } else { Some(value) },
+        "glm_api_base_url" => config.local.glm_api_base_url = if value.trim().is_empty() { None } else { Some(value) },
+        "glm_api_key" => config.local.glm_api_key = if value.trim().is_empty() { None } else { Some(value) },
+        "deepseek_api_base_url" => config.local.deepseek_api_base_url = if value.trim().is_empty() { None } else { Some(value) },
+        "deepseek_api_key" => config.local.deepseek_api_key = if value.trim().is_empty() { None } else { Some(value) },
+        "daemon_machine_id" => config.daemon.machine_id = Some(value),
+        "daemon_roots" => {
+            config.daemon.project_roots = value
+                .split(',')
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .collect();
+        }
+        _ => anyhow::bail!("Unknown config key: {}. Valid keys: {}", key, CONFIG_KEYS),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{get_config_value, set_config_value};
+    use crate::config;
+
+    #[test]
+    fn deepseek_config_get_masks_api_key() {
+        let mut config = config::Config::default();
+        set_config_value(&mut config, "deepseek_api_key", "sk-deepseek-secret".to_string()).unwrap();
+
+        assert_eq!(config.local.deepseek_api_key.as_deref(), Some("sk-deepseek-secret"));
+        assert_eq!(get_config_value(&config, "deepseek_api_key").unwrap(), "****");
+    }
+
+    #[test]
+    fn deepseek_config_set_blank_clears_api_key() {
+        let mut config = config::Config::default();
+        config.local.deepseek_api_key = Some("existing".to_string());
+
+        set_config_value(&mut config, "deepseek_api_key", "   ".to_string()).unwrap();
+
+        assert_eq!(config.local.deepseek_api_key, None);
+        assert_eq!(get_config_value(&config, "deepseek_api_key").unwrap(), "");
+    }
+
+    #[test]
+    fn deepseek_config_get_returns_api_base_url() {
+        let mut config = config::Config::default();
+        set_config_value(
+            &mut config,
+            "deepseek_api_base_url",
+            "https://api.deepseek.com/anthropic".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            get_config_value(&config, "deepseek_api_base_url").unwrap(),
+            "https://api.deepseek.com/anthropic"
+        );
+    }
+}
+
+fn get_config_value(config: &config::Config, key: &str) -> Result<String> {
+    let value = match key {
+        "server" => config.remote.server.clone().unwrap_or_default(),
+        "token" => config.remote.token.as_ref().map(|_| "****".to_string()).unwrap_or_default(),
+        "claude_path" => config.local.claude_path.clone(),
+        "minimax_path" => config.local.minimax_path.clone(),
+        "codex_path" => config.local.codex_path.clone(),
+        "minimax_api_base_url" => config.local.minimax_api_base_url.clone().unwrap_or_default(),
+        "minimax_api_key" => config.local.minimax_api_key.as_ref().map(|_| "****".to_string()).unwrap_or_default(),
+        "glm_api_base_url" => config.local.glm_api_base_url.clone().unwrap_or_default(),
+        "glm_api_key" => config.local.glm_api_key.as_ref().map(|_| "****".to_string()).unwrap_or_default(),
+        "deepseek_api_base_url" => config.local.deepseek_api_base_url.clone().unwrap_or_default(),
+        "deepseek_api_key" => config.local.deepseek_api_key.as_ref().map(|_| "****".to_string()).unwrap_or_default(),
+        "daemon_machine_id" => config.daemon.machine_id.clone().unwrap_or_default(),
+        "daemon_roots" => config.daemon.project_roots.join(","),
+        _ => anyhow::bail!("Unknown config key: {}. Valid keys: {}", key, CONFIG_KEYS),
+    };
+    Ok(value)
+}
+
 
 async fn handle_config_command(action: ConfigAction) -> Result<()> {
     match action {
         ConfigAction::Set { key, value } => {
             let mut config = config::Config::load().unwrap_or_default();
-            match key.as_str() {
-                "server" => config.remote.server = Some(value),
-                "token" => config.remote.token = Some(value),
-                "claude_path" => config.local.claude_path = value,
-                "minimax_path" => config.local.minimax_path = value,
-                "codex_path" => config.local.codex_path = value,
-                "minimax_api_base_url" => {
-                    config.local.minimax_api_base_url = if value.trim().is_empty() {
-                        None
-                    } else {
-                        Some(value)
-                    };
-                }
-                "minimax_api_key" => {
-                    config.local.minimax_api_key = if value.trim().is_empty() {
-                        None
-                    } else {
-                        Some(value)
-                    };
-                }
-                "glm_api_base_url" => {
-                    config.local.glm_api_base_url = if value.trim().is_empty() {
-                        None
-                    } else {
-                        Some(value)
-                    };
-                }
-                "glm_api_key" => {
-                    config.local.glm_api_key = if value.trim().is_empty() {
-                        None
-                    } else {
-                        Some(value)
-                    };
-                }
-                "deepseek_api_base_url" => {
-                    config.local.deepseek_api_base_url = if value.trim().is_empty() {
-                        None
-                    } else {
-                        Some(value)
-                    };
-                }
-                "deepseek_api_key" => {
-                    config.local.deepseek_api_key = if value.trim().is_empty() {
-                        None
-                    } else {
-                        Some(value)
-                    };
-                }
-                "daemon_machine_id" => config.daemon.machine_id = Some(value),
-                "daemon_roots" => {
-                    config.daemon.project_roots = value
-                        .split(',')
-                        .map(|v| v.trim().to_string())
-                        .filter(|v| !v.is_empty())
-                        .collect();
-                }
-                _ => anyhow::bail!(
-                    "Unknown config key: {}. Valid keys: server, token, claude_path, minimax_path, codex_path, minimax_api_base_url, minimax_api_key, glm_api_base_url, glm_api_key, deepseek_api_base_url, deepseek_api_key, daemon_machine_id, daemon_roots",
-                    key
-                ),
-            }
+            set_config_value(&mut config, &key, value)?;
             config.save()?;
             println!("Configuration saved");
         }
         ConfigAction::Get { key } => {
             let config = config::Config::load()?;
-            let value = match key.as_str() {
-                "server" => config.remote.server.unwrap_or_default(),
-                "token" => config
-                    .remote
-                    .token
-                    .map(|_| "****")
-                    .unwrap_or_default()
-                    .to_string(),
-                "claude_path" => config.local.claude_path,
-                "minimax_path" => config.local.minimax_path,
-                "codex_path" => config.local.codex_path,
-                "minimax_api_base_url" => config.local.minimax_api_base_url.unwrap_or_default(),
-                "minimax_api_key" => config
-                    .local
-                    .minimax_api_key
-                    .map(|_| "****".to_string())
-                    .unwrap_or_default(),
-                "glm_api_base_url" => config.local.glm_api_base_url.unwrap_or_default(),
-                "glm_api_key" => config
-                    .local
-                    .glm_api_key
-                    .map(|_| "****".to_string())
-                    .unwrap_or_default(),
-                "deepseek_api_base_url" => config.local.deepseek_api_base_url.unwrap_or_default(),
-                "deepseek_api_key" => config
-                    .local
-                    .deepseek_api_key
-                    .map(|_| "****".to_string())
-                    .unwrap_or_default(),
-                "daemon_machine_id" => config.daemon.machine_id.unwrap_or_default(),
-                "daemon_roots" => config.daemon.project_roots.join(","),
-                _ => anyhow::bail!(
-                    "Unknown config key: {}. Valid keys: server, token, claude_path, minimax_path, codex_path, minimax_api_base_url, minimax_api_key, glm_api_base_url, glm_api_key, deepseek_api_base_url, deepseek_api_key, daemon_machine_id, daemon_roots",
-                    key
-                ),
-            };
+            let value = get_config_value(&config, &key)?;
             println!("{}", value);
         }
         ConfigAction::Show => {

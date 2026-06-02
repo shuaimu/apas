@@ -2175,6 +2175,57 @@ mod tests {
     }
 
     #[test]
+    fn test_deepseek_provider_serializes_as_snake_case() {
+        let json = serde_json::to_string(&Provider::Deepseek).unwrap();
+        assert_eq!(json, "\"deepseek\"");
+
+        let provider: Provider = serde_json::from_str("\"deepseek\"").unwrap();
+        assert_eq!(provider, Provider::Deepseek);
+
+        let pane_json = serde_json::json!({
+            "pane_id": 7,
+            "provider": "deepseek",
+            "mode": "interactive",
+            "session_id": Uuid::new_v4(),
+        });
+        let pane: PaneConfig = serde_json::from_value(pane_json).unwrap();
+        assert_eq!(pane.provider, Provider::Deepseek);
+    }
+
+    #[test]
+    fn test_machine_info_serializes_deepseek_backend() {
+        let machine = MachineInfo {
+            machine_id: Uuid::new_v4(),
+            hostname: "devbox".to_string(),
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            daemon_version: Some("26.06.1".to_string()),
+            minimax_backend: None,
+            glm_backend: None,
+            deepseek_backend: Some(DeepseekBackendInfo {
+                api_base_url: Some("https://api.deepseek.com/anthropic".to_string()),
+                api_key: None,
+                api_key_configured: true,
+            }),
+            last_seen: None,
+        };
+
+        let json = serde_json::to_string(&machine).unwrap();
+        assert!(json.contains("\"deepseek_backend\""));
+        assert!(json.contains("\"api_base_url\":\"https://api.deepseek.com/anthropic\""));
+        assert!(json.contains("\"api_key_configured\":true"));
+
+        let decoded: MachineInfo = serde_json::from_str(&json).unwrap();
+        let backend = decoded.deepseek_backend.expect("deepseek backend");
+        assert_eq!(
+            backend.api_base_url.as_deref(),
+            Some("https://api.deepseek.com/anthropic")
+        );
+        assert!(backend.api_key_configured);
+        assert_eq!(backend.api_key, None);
+    }
+
+    #[test]
     fn test_output_type_serialization() {
         let json = serde_json::to_string(&OutputType::Text).unwrap();
         assert_eq!(json, "\"text\"");

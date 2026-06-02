@@ -13,6 +13,7 @@ describe('useStore', () => {
       ws: null,
       cliClients: [],
       messages: [],
+      machines: [],
     });
   });
 
@@ -239,5 +240,100 @@ describe('OutputType parsing', () => {
     expect(messages[0].outputType?.type).toBe('text');
     expect(messages[1].outputType?.type).toBe('code');
     expect(messages[2].outputType?.type).toBe('error');
+  });
+});
+
+describe('DeepSeek machine config', () => {
+  function makeOpenWs() {
+    return {
+      readyState: WebSocket.OPEN,
+      send: vi.fn(),
+      close: vi.fn(),
+    } as unknown as WebSocket;
+  }
+
+  it('optimistically updates machine config and sends the DeepSeek backend payload', () => {
+    const ws = makeOpenWs();
+    useStore.setState({
+      ws,
+      machines: [{
+        machine: {
+          machineId: 'machine-1',
+          hostname: 'devbox',
+          os: 'linux',
+          arch: 'x86_64',
+        },
+        projects: [],
+      }],
+    });
+
+    useStore.getState().setMachineDeepseekConfig('machine-1', ' sk-deepseek ', false);
+
+    const machine = useStore.getState().machines[0].machine;
+    expect(machine.deepseekBackend).toEqual({
+      apiBaseUrl: 'https://api.deepseek.com/anthropic',
+      apiKey: 'sk-deepseek',
+      apiKeyConfigured: true,
+    });
+    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({
+      type: 'set_machine_deepseek_config',
+      machine_id: 'machine-1',
+      api_base_url: 'https://api.deepseek.com/anthropic',
+      api_key: 'sk-deepseek',
+      clear_api_key: false,
+    }));
+  });
+
+  it('normalizes DeepSeek machine backend and preserves a masked existing key', async () => {
+    useStore.getState().connect();
+    await new Promise(resolve => setTimeout(resolve, 10));
+    const ws = useStore.getState().ws as unknown as { onmessage?: (event: MessageEvent) => void };
+
+    useStore.setState({
+      machines: [{
+        machine: {
+          machineId: 'machine-1',
+          hostname: 'devbox',
+          os: 'linux',
+          arch: 'x86_64',
+          deepseekBackend: {
+            apiBaseUrl: 'https://api.deepseek.com/anthropic',
+            apiKey: 'sk-existing',
+            apiKeyConfigured: true,
+          },
+        },
+        projects: [],
+      }],
+    });
+
+    ws.onmessage?.(new MessageEvent('message', {
+      data: JSON.stringify({
+        type: 'machines',
+        machines: [{
+          machine: {
+            machine_id: 'machine-1',
+            hostname: 'devbox',
+            os: 'linux',
+            arch: 'x86_64',
+            deepseek_backend: {
+              api_base_url: 'https://api.deepseek.com/anthropic',
+              api_key_configured: true,
+            },
+          },
+          projects: [{
+            project_id: 'project-1',
+            path: '/repo',
+            is_running: true,
+          }],
+        }],
+      }),
+    }));
+
+    const entry = useStore.getState().machines[0];
+    expect(entry.machine.deepseekBackend).toEqual({
+      apiBaseUrl: 'https://api.deepseek.com/anthropic',
+      apiKey: 'sk-existing',
+      apiKeyConfigured: true,
+    });
   });
 });
