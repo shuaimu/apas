@@ -268,9 +268,12 @@ fn load_deepseek_backend_runtime_config() -> DeepseekBackendRuntimeConfig {
     }
 }
 
-fn build_pane_env_overrides(
+fn build_pane_env_overrides_from_keys(
     provider: &Provider,
     model: Option<&str>,
+    minimax_api_key: Option<String>,
+    glm_api_key: Option<String>,
+    deepseek_api_key: Option<String>,
 ) -> Result<Vec<(String, String)>, String> {
     if !matches!(
         provider,
@@ -288,25 +291,21 @@ fn build_pane_env_overrides(
     }
 
     let (api_base_url, api_key, missing_key_message) = if is_minimax {
-        let runtime = load_minimax_backend_runtime_config();
         (
             MINIMAX_API_BASE_URL.to_string(),
-            runtime.api_key,
+            minimax_api_key,
             "MiniMax backend is not configured (missing minimax_api_key). Update it on the Machines page or run: apas config set minimax_api_key <key>.".to_string(),
         )
     } else if is_glm {
-        let runtime = load_glm_backend_runtime_config();
         (
             GLM_API_BASE_URL.to_string(),
-            runtime.api_key,
+            glm_api_key,
             "GLM backend is not configured (missing glm_api_key). Update it on the Machines page or run: apas config set glm_api_key <key>.".to_string(),
         )
     } else {
-        // deepseek
-        let runtime = load_deepseek_backend_runtime_config();
         (
             DEEPSEEK_API_BASE_URL.to_string(),
-            runtime.api_key,
+            deepseek_api_key,
             "DeepSeek backend is not configured (missing deepseek_api_key). Update it on the Machines page or run: apas config set deepseek_api_key <key>.".to_string(),
         )
     };
@@ -373,6 +372,22 @@ fn build_pane_env_overrides(
         ));
     }
     Ok(env)
+}
+
+fn build_pane_env_overrides(
+    provider: &Provider,
+    model: Option<&str>,
+) -> Result<Vec<(String, String)>, String> {
+    let minimax_runtime = load_minimax_backend_runtime_config();
+    let glm_runtime = load_glm_backend_runtime_config();
+    let deepseek_runtime = load_deepseek_backend_runtime_config();
+    build_pane_env_overrides_from_keys(
+        provider,
+        model,
+        minimax_runtime.api_key,
+        glm_runtime.api_key,
+        deepseek_runtime.api_key,
+    )
 }
 
 fn format_spawn_error(
@@ -3618,8 +3633,8 @@ fn parse_agent_output(
 #[cfg(test)]
 mod tests {
     use super::{
-        active_usage_providers, build_agent_args, pane_label_or_default, resolve_pane_binary_path,
-        PaneMeta, PaneMetas,
+        active_usage_providers, build_agent_args, build_pane_env_overrides_from_keys,
+        pane_label_or_default, resolve_pane_binary_path, PaneMeta, PaneMetas,
     };
     use shared::Provider;
     use std::collections::HashMap;
@@ -3713,6 +3728,71 @@ mod tests {
         );
 
         assert!(!args.iter().any(|arg| arg == "--model"));
+    }
+
+    #[test]
+    fn build_agent_args_claude_with_deepseek_model_omits_model_flag() {
+        let session_id = Uuid::new_v4();
+        let (args, _) = build_agent_args(
+            &Provider::Claude,
+            &session_id,
+            FULL_PROMPT,
+            Some("deepseek-v4-pro"),
+            None,
+            true,
+            false,
+        );
+
+        assert!(!args.iter().any(|arg| arg == "--model"));
+    }
+
+    #[test]
+    fn deepseek_env_overrides_require_api_key() {
+        let err = build_pane_env_overrides_from_keys(&Provider::Deepseek, None, None, None, None)
+            .unwrap_err();
+
+        assert!(err.contains("missing deepseek_api_key"));
+    }
+
+    #[test]
+    fn deepseek_env_overrides_use_claude_runtime_bridge_defaults() {
+        let env = build_pane_env_overrides_from_keys(
+            &Provider::Deepseek,
+            None,
+            None,
+            None,
+            Some("sk-deepseek".to_string()),
+        )
+        .unwrap();
+        let get = |key: &str| env.iter().find_map(|(k, v)| (k == key).then_some(v.as_str()));
+
+        assert_eq!(get("ANTHROPIC_BASE_URL"), Some("https://api.deepseek.com/anthropic"));
+        assert_eq!(get("ANTHROPIC_API_KEY"), Some("sk-deepseek"));
+        assert_eq!(get("ANTHROPIC_AUTH_TOKEN"), Some("sk-deepseek"));
+        assert_eq!(get("ANTHROPIC_DEFAULT_SONNET_MODEL"), Some("deepseek-v4-pro"));
+        assert_eq!(get("ANTHROPIC_DEFAULT_OPUS_MODEL"), Some("deepseek-v4-pro"));
+        assert_eq!(get("ANTHROPIC_DEFAULT_HAIKU_MODEL"), Some("deepseek-v4-pro"));
+        assert_eq!(get("ANTHROPIC_MODEL"), None);
+    }
+
+    #[test]
+    fn deepseek_model_hint_on_claude_provider_uses_deepseek_env() {
+        let env = build_pane_env_overrides_from_keys(
+            &Provider::Claude,
+            Some("deepseek-chat"),
+            None,
+            None,
+            Some("sk-deepseek".to_string()),
+        )
+        .unwrap();
+        let get = |key: &str| env.iter().find_map(|(k, v)| (k == key).then_some(v.as_str()));
+
+        assert_eq!(get("ANTHROPIC_BASE_URL"), Some("https://api.deepseek.com/anthropic"));
+        assert_eq!(get("ANTHROPIC_API_KEY"), Some("sk-deepseek"));
+        assert_eq!(get("ANTHROPIC_DEFAULT_SONNET_MODEL"), Some("deepseek-chat"));
+        assert_eq!(get("ANTHROPIC_DEFAULT_OPUS_MODEL"), Some("deepseek-chat"));
+        assert_eq!(get("ANTHROPIC_DEFAULT_HAIKU_MODEL"), Some("deepseek-chat"));
+        assert_eq!(get("ANTHROPIC_MODEL"), None);
     }
 
     #[test]

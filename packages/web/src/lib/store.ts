@@ -2784,12 +2784,26 @@ function handleServerMessage(
                 }
               : glmBackend;
 
+          const deepseekBackend = entry.machine.deepseekBackend;
+          const previousDeepseekKey = previous?.machine.deepseekBackend?.apiKey;
+          const mergedDeepseek =
+            deepseekBackend &&
+            deepseekBackend.apiKey === undefined &&
+            deepseekBackend.apiKeyConfigured &&
+            previousDeepseekKey
+              ? {
+                  ...deepseekBackend,
+                  apiKey: previousDeepseekKey,
+                }
+              : deepseekBackend;
+
           return {
             ...entry,
             machine: {
               ...entry.machine,
               minimaxBackend: mergedMiniMax,
               glmBackend: mergedGlm,
+              deepseekBackend: mergedDeepseek,
             },
           };
         });
