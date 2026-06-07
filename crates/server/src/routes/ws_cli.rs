@@ -476,7 +476,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 pane_type,
                                 pane_id,
                             }) => {
-                                tracing::info!("Received Output for session {} with pane_id {:?}: {}", session_id, pane_id, &data[..data.len().min(50)]);
+                                // Char-boundary-safe slice: plain byte index can panic
+                                // mid-codepoint on multibyte content (e.g. `…`).
+                                let preview_end = {
+                                    let mut end = data.len().min(50);
+                                    while end > 0 && !data.is_char_boundary(end) { end -= 1; }
+                                    end
+                                };
+                                tracing::info!("Received Output for session {} with pane_id {:?}: {}", session_id, pane_id, &data[..preview_end]);
                                 // Route output to web client (if attached)
                                 let routed = state
                                     .sessions

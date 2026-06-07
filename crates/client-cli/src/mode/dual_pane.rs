@@ -85,6 +85,21 @@ fn is_deepseek_model(model: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+/// Slice a `&str` at no more than `max_bytes` while staying on a UTF-8
+/// char boundary. Plain `&s[..max_bytes]` panics when `max_bytes` lands
+/// inside a multi-byte codepoint (e.g. a `…` U+2026 at byte 139..142
+/// crashed the streaming worker on byte-140 preview slicing).
+fn truncate_str_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn default_pane_label(pane_id: u32, model: Option<&str>) -> String {
     match pane_id {
         shared::PANE_ID_DEADLOOP => "Deadloop".to_string(),
@@ -3634,7 +3649,8 @@ fn parse_agent_output(
 mod tests {
     use super::{
         active_usage_providers, build_agent_args, build_pane_env_overrides_from_keys,
-        pane_label_or_default, resolve_pane_binary_path, PaneMeta, PaneMetas,
+        pane_label_or_default, resolve_pane_binary_path, truncate_str_at_char_boundary,
+        PaneMeta, PaneMetas,
     };
     use shared::Provider;
     use std::collections::HashMap;
@@ -3712,6 +3728,27 @@ mod tests {
         );
 
         assert!(!args.iter().any(|arg| arg == "--model"));
+    }
+
+    #[test]
+    fn truncate_str_at_char_boundary_handles_multibyte_mid_codepoint() {
+        // Regression: the streaming worker's "> {prompt}" preview used
+        // `&prompt[..140]` which panicked when byte 140 landed inside a
+        // multi-byte char. This shape ("…" = U+2026, 3 bytes E2 80 A6
+        // sitting at bytes 139..142) reproduces the exact crash a mako
+        // srpc-worker hit and froze the pane on.
+        let s = "Investigate DSL impl Trait support, then migrate Alarm. If rusty-cpp can lower impl Job for Alarm { fn Ready(&mut self)…fn Work…fn Done… } to the C++ override pattern.";
+        // Doesn't panic + returns a valid &str (chars finish cleanly).
+        let preview = truncate_str_at_char_boundary(s, 140);
+        assert!(preview.chars().last().is_some());
+        // We rounded DOWN past the broken codepoint, so length is < 140.
+        assert!(preview.len() < 140);
+        // Verify a clean (ASCII-only) prefix still truncates exactly at
+        // max_bytes when no codepoint straddles the cut.
+        let ascii = "x".repeat(200);
+        assert_eq!(truncate_str_at_char_boundary(&ascii, 50).len(), 50);
+        // Short input returned verbatim.
+        assert_eq!(truncate_str_at_char_boundary("hi", 100), "hi");
     }
 
     #[test]
@@ -4492,6 +4529,15 @@ fn run_deadloop_session_inner(
     let mut first_message = true;
     let mut try_resume_first = initial_try_resume;
     let mut was_paused = false;
+    // Set by the stderr reader thread when codex reports it can't
+    // resume the session id apas handed it ("no rollout found for
+    // thread id …"). The main loop checks this after the iteration
+    // and, if set, mints a fresh thread id, saves it to .apas, and
+    // retries without --resume — the recovery the existing
+    // `first_message && using_resume` path only triggers on the very
+    // first iteration, so a server-side rollout expiry mid-run was
+    // wedging the deadloop until manual .apas surgery.
+    let stale_session_detected = Arc::new(AtomicBool::new(false));
     let min_iteration_interval =
         Duration::from_secs(min_iteration_interval_minutes.saturating_mul(60));
     let mut last_iteration_started_at: Option<Instant> = None;
@@ -4760,12 +4806,27 @@ fn run_deadloop_session_inner(
 
                 let output_tx_stderr = output_tx.clone();
                 let server_tx_stderr = server_tx.clone();
+                let stale_flag_for_stderr = stale_session_detected.clone();
                 let stderr_thread = stderr.map(|stderr| {
                     thread::spawn(move || {
                         let reader = BufReader::new(stderr);
                         for line in reader.lines() {
                             if let Ok(line) = line {
                                 if !line.trim().is_empty() {
+                                    // Detect codex's "the session id you
+                                    // gave me doesn't exist" signal so the
+                                    // main loop can mint a fresh id and
+                                    // retry instead of crashing forever.
+                                    // Covers both the older "no rollout
+                                    // found" phrasing and the JSON-RPC
+                                    // "thread/resume failed" prefix.
+                                    let lower = line.to_lowercase();
+                                    if lower.contains("no rollout found")
+                                        || lower.contains("thread/resume failed")
+                                    {
+                                        stale_flag_for_stderr
+                                            .store(true, Ordering::SeqCst);
+                                    }
                                     let _ = output_tx_stderr.send(PaneOutput {
                                         text: format!("[stderr] {}", line),
                                         pane_id,
@@ -4965,13 +5026,36 @@ fn run_deadloop_session_inner(
                 });
 
                 if had_error || exit_was_error {
-                    if first_message && using_resume && exit_was_error && !had_error {
-                        // Process failed to start (e.g. session not found).
-                        // Generate a new session ID and create a fresh session.
+                    // Stale-session recovery applies on ANY iteration —
+                    // codex's server can drop a thread mid-run (rollout
+                    // expiry, server-side wipe), not just at startup.
+                    // The stderr reader sets stale_session_detected on
+                    // "no rollout found" / "thread/resume failed".
+                    let stale = stale_session_detected.swap(false, Ordering::SeqCst)
+                        || (first_message && using_resume && exit_was_error && !had_error);
+                    if stale {
+                        let old = claude_session_id;
                         claude_session_id = Uuid::new_v4();
                         try_resume_first = false;
+                        // Persist the fresh id straight into .apas so a
+                        // CLI reboot doesn't fall back to the dead one.
+                        // We don't have the full pane_metas / pane_pauses
+                        // Arcs in this scope, so go through the project
+                        // module directly: read .apas, mutate the matching
+                        // pane's session_id, write back.
+                        let project_dir = std::path::Path::new(working_dir);
+                        if let Ok(mut metadata) = crate::project::get_or_create_project(project_dir) {
+                            if let Some(pane) = metadata.get_pane_mut(pane_id) {
+                                pane.session_id = claude_session_id;
+                                let _ = crate::project::save_project(project_dir, &metadata);
+                            }
+                        }
                         let _ = output_tx.send(PaneOutput {
-                            text: "[Session not found, will create new session...]".to_string(),
+                            text: format!(
+                                "[Codex session {} is dead on the server; minted fresh id {} and will create a new thread next iteration]",
+                                &old.to_string()[..8],
+                                &claude_session_id.to_string()[..8],
+                            ),
                             pane_id,
                         });
                         thread::sleep(Duration::from_secs(1));
@@ -6275,7 +6359,7 @@ fn run_pane_session_streaming(
                         text: format!(
                             "{} {}",
                             display_prefix,
-                            &prompt[..std::cmp::min(140, prompt.len())]
+                            truncate_str_at_char_boundary(&prompt, 140)
                         ),
                         pane_id,
                     });
@@ -6735,7 +6819,7 @@ fn run_pane_session(
         };
 
         let _ = output_tx.send(PaneOutput {
-            text: format!("> {}", &prompt[..std::cmp::min(100, prompt.len())]),
+            text: format!("> {}", truncate_str_at_char_boundary(&prompt, 100)),
             pane_id,
         });
 
