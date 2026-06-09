@@ -359,7 +359,12 @@ fn maybe_migrate_legacy_project_registry(preferred_path: &Path) {
 
 fn write_project_registry(path: &Path, registry: &ProjectRegistry) -> Result<()> {
     let content = serde_json::to_string_pretty(registry)?;
-    let tmp_path = path.with_extension("json.tmp");
+    // PID in the tmp filename so concurrent apas processes (the daemon
+    // + per-project CLIs + spawned --headless workers, which often boot
+    // near-simultaneously) don't share a staging path. Previously they
+    // all wrote `projects.json.tmp` and raced — the late renamer hit
+    // ENOENT because an earlier process's rename had consumed the tmp.
+    let tmp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
     std::fs::write(&tmp_path, content)?;
     std::fs::rename(tmp_path, path)?;
     Ok(())
