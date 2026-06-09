@@ -1547,12 +1547,26 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::StartTeam) => {
+                Ok(WebToServer::StartTeam {
+                    manager,
+                    tech_lead,
+                    reviewer,
+                    developer,
+                }) => {
                     if let Some(sid) = session_id {
                         tracing::info!(session_id = %sid, "Start team");
                         state
                             .sessions
-                            .route_to_cli(&sid, ServerToCli::StartTeam { session_id: sid })
+                            .route_to_cli(
+                                &sid,
+                                ServerToCli::StartTeam {
+                                    session_id: sid,
+                                    manager,
+                                    tech_lead,
+                                    reviewer,
+                                    developer,
+                                },
+                            )
                             .await;
                     }
                 }

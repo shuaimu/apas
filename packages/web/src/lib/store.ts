@@ -642,8 +642,15 @@ interface AppState {
   /** Push new Tech-Lead autonomy flags to the CLI. */
   updateProjectFlags: (flags: { autoApproveTodos: boolean; autoMergePrs: boolean }) => void;
   /** Spawn the default team panes for any role that isn't already
-   *  present. Idempotent on the CLI side. */
-  startTeam: () => void;
+   *  present. Idempotent on the CLI side. Each role's `provider` /
+   *  `model` come from the Team setup card; null falls back to the
+   *  CLI default (Claude / unset). */
+  startTeam: (specs: {
+    manager: { provider: string; model: string | null };
+    techLead: { provider: string; model: string | null };
+    reviewer: { provider: string; model: string | null };
+    developer: { provider: string; model: string | null };
+  }) => void;
   updatePaneRole: (paneId: number, role?: string, goal?: string, backstory?: string) => void;
   teamRecords: TeamRecord[];
   planReviewPending: PlanReviewPendingItem[];
@@ -1875,13 +1882,25 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  startTeam: () => {
+  startTeam: (specs) => {
     const { ws, showToast } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       showToast("Not connected — cannot start team", "error");
       return;
     }
-    ws.send(JSON.stringify({ type: "start_team" }));
+    const toSpec = (s: { provider: string; model: string | null }) => ({
+      provider: s.provider,
+      ...(s.model != null ? { model: s.model } : {}),
+    });
+    ws.send(
+      JSON.stringify({
+        type: "start_team",
+        manager: toSpec(specs.manager),
+        tech_lead: toSpec(specs.techLead),
+        reviewer: toSpec(specs.reviewer),
+        developer: toSpec(specs.developer),
+      }),
+    );
     showToast("Spawning team panes…", "info");
   },
 

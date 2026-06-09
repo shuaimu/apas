@@ -104,7 +104,9 @@ fn truncate_str_at_char_boundary(s: &str, max_bytes: usize) -> &str {
 /// are missing for this project. Idempotent: each role is gated on
 /// whether a managed pane with that role already exists in
 /// `pane_metas`, so a second invocation is a no-op (or only fills in
-/// roles the user explicitly removed since last call).
+/// roles the user explicitly removed since last call). Each role
+/// honors the provider / model the user picked in the Team setup
+/// card; empty fields fall back to the CLI defaults (Claude / unset).
 ///
 /// Called from the StartTeam wire handler when the user clicks "Start
 /// team" on the Overview. Used to also run at CLI boot in v3.4 — the
@@ -112,6 +114,10 @@ fn truncate_str_at_char_boundary(s: &str, max_bytes: usize) -> &str {
 fn spawn_missing_team_panes(
     pane_metas: &PaneMetas,
     event_tx: &std::sync::mpsc::Sender<TuiEvent>,
+    manager_spec: &shared::TeamRoleSpec,
+    tech_lead_spec: &shared::TeamRoleSpec,
+    reviewer_spec: &shared::TeamRoleSpec,
+    developer_spec: &shared::TeamRoleSpec,
 ) {
     let metas_guard = pane_metas.lock().unwrap();
     // Only consider managed panes — a user's unmanaged side-chat pane
@@ -149,10 +155,10 @@ fn spawn_missing_team_panes(
             label: "Manager".to_string(),
             claude_session_id: Uuid::new_v4(),
             mode: shared::PaneMode::Interactive,
-            provider: shared::Provider::Claude,
+            provider: manager_spec.provider.unwrap_or(shared::Provider::Claude),
             prompt: None,
             min_iteration_interval_minutes: None,
-            model: None,
+            model: manager_spec.model.clone(),
             effort: Some("max".to_string()),
             worktree_path: None,
             initial_input: None,
@@ -163,7 +169,7 @@ fn spawn_missing_team_panes(
             managed: true,
             try_resume_first: true,
         });
-        tracing::info!(pane_id, "spawning Manager pane (Start team)");
+        tracing::info!(pane_id, ?manager_spec.provider, ?manager_spec.model, "spawning Manager pane (Start team)");
     }
     if !has_tech_lead {
         let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
@@ -172,10 +178,10 @@ fn spawn_missing_team_panes(
             label: "Tech Lead".to_string(),
             claude_session_id: Uuid::new_v4(),
             mode: shared::PaneMode::Deadloop,
-            provider: shared::Provider::Claude,
+            provider: tech_lead_spec.provider.unwrap_or(shared::Provider::Claude),
             prompt: Some(crate::role::TECH_LEAD_DEADLOOP_PROMPT.to_string()),
             min_iteration_interval_minutes: None,
-            model: None,
+            model: tech_lead_spec.model.clone(),
             effort: Some("max".to_string()),
             worktree_path: None,
             initial_input: None,
@@ -186,7 +192,7 @@ fn spawn_missing_team_panes(
             managed: true,
             try_resume_first: true,
         });
-        tracing::info!(pane_id, "spawning Tech Lead pane (Start team)");
+        tracing::info!(pane_id, ?tech_lead_spec.provider, ?tech_lead_spec.model, "spawning Tech Lead pane (Start team)");
     }
     if !has_reviewer {
         let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
@@ -195,10 +201,10 @@ fn spawn_missing_team_panes(
             label: "Reviewer".to_string(),
             claude_session_id: Uuid::new_v4(),
             mode: shared::PaneMode::Deadloop,
-            provider: shared::Provider::Claude,
+            provider: reviewer_spec.provider.unwrap_or(shared::Provider::Claude),
             prompt: Some(crate::role::REVIEWER_DEADLOOP_PROMPT.to_string()),
             min_iteration_interval_minutes: None,
-            model: None,
+            model: reviewer_spec.model.clone(),
             effort: Some("max".to_string()),
             worktree_path: None,
             initial_input: None,
@@ -209,7 +215,7 @@ fn spawn_missing_team_panes(
             managed: true,
             try_resume_first: true,
         });
-        tracing::info!(pane_id, "spawning Reviewer pane (Start team)");
+        tracing::info!(pane_id, ?reviewer_spec.provider, ?reviewer_spec.model, "spawning Reviewer pane (Start team)");
     }
     if !has_developer {
         let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
@@ -218,10 +224,10 @@ fn spawn_missing_team_panes(
             label: "Developer".to_string(),
             claude_session_id: Uuid::new_v4(),
             mode: shared::PaneMode::Deadloop,
-            provider: shared::Provider::Claude,
+            provider: developer_spec.provider.unwrap_or(shared::Provider::Claude),
             prompt: Some(crate::role::DEFAULT_DEVELOPER_DEADLOOP_PROMPT.to_string()),
             min_iteration_interval_minutes: None,
-            model: None,
+            model: developer_spec.model.clone(),
             effort: None,
             worktree_path: None,
             initial_input: None,
@@ -232,7 +238,7 @@ fn spawn_missing_team_panes(
             managed: true,
             try_resume_first: true,
         });
-        tracing::info!(pane_id, "spawning Developer pane (Start team)");
+        tracing::info!(pane_id, ?developer_spec.provider, ?developer_spec.model, "spawning Developer pane (Start team)");
     }
 }
 
@@ -9040,9 +9046,22 @@ async fn run_server_connection(
                                                     Err(e) => tracing::warn!("failed to write project_goal.md: {}", e),
                                                 }
                                             }
-                                            ServerToCli::StartTeam { session_id: _ } => {
+                                            ServerToCli::StartTeam {
+                                                session_id: _,
+                                                manager,
+                                                tech_lead,
+                                                reviewer,
+                                                developer,
+                                            } => {
                                                 tracing::info!("Start team requested from web — spawning missing roles");
-                                                spawn_missing_team_panes(&pane_metas, &tui_event_tx);
+                                                spawn_missing_team_panes(
+                                                    &pane_metas,
+                                                    &tui_event_tx,
+                                                    &manager,
+                                                    &tech_lead,
+                                                    &reviewer,
+                                                    &developer,
+                                                );
                                             }
                                             ServerToCli::UpdateProjectFlags {
                                                 session_id: _,

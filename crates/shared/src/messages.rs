@@ -16,6 +16,17 @@ pub struct TeamScratchpadRecord {
     pub body: String,
 }
 
+/// Per-role provider/model pair the user picks in the "Team setup"
+/// card before clicking Start team. Empty fields fall back to the
+/// CLI's defaults (Claude / unset model).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TeamRoleSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<Provider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
 /// Phase 3.2a: per-pane policy for the "editable plan checkpoint"
 /// feature. The streaming worker reads this at every turn to decide
 /// whether to gate the first tool_use behind a user-approval card.
@@ -493,8 +504,20 @@ pub enum ServerToCli {
     /// Spawn the default team (Manager, Tech Lead, Reviewer, Developer)
     /// for any role that isn't already present. Triggered by the "Start
     /// team" button on the Overview. Idempotent — extra clicks just
-    /// fill in roles the user removed.
-    StartTeam { session_id: Uuid },
+    /// fill in roles the user removed. The four `*_spec` fields carry
+    /// the per-role provider/model picks the user made in the Team
+    /// setup card; empty fields keep the CLI's defaults.
+    StartTeam {
+        session_id: Uuid,
+        #[serde(default)]
+        manager: TeamRoleSpec,
+        #[serde(default)]
+        tech_lead: TeamRoleSpec,
+        #[serde(default)]
+        reviewer: TeamRoleSpec,
+        #[serde(default)]
+        developer: TeamRoleSpec,
+    },
 
     /// Set role/goal/backstory on the named pane and persist to .apas.
     /// Phase 2.1c.
@@ -917,8 +940,19 @@ pub enum WebToServer {
 
     /// Spawn the four default team panes for any role that isn't
     /// already present. Triggered by the Overview "Start team" button.
-    /// CLI runs `spawn_missing_team_panes`. Idempotent.
-    StartTeam,
+    /// CLI runs `spawn_missing_team_panes`. Idempotent. Per-role
+    /// `*_spec` fields carry the provider/model the user picked in
+    /// the Team setup card.
+    StartTeam {
+        #[serde(default)]
+        manager: TeamRoleSpec,
+        #[serde(default)]
+        tech_lead: TeamRoleSpec,
+        #[serde(default)]
+        reviewer: TeamRoleSpec,
+        #[serde(default)]
+        developer: TeamRoleSpec,
+    },
 
     /// Update a pane's role/goal/backstory triple (Phase 2.1c). All three
     /// fields are optional — sending null for any of them clears that
