@@ -634,8 +634,13 @@ interface AppState {
    *  from the CLI's mtime poller. Used by ProjectGoalBar to hydrate the
    *  textbox when the user isn't editing. */
   projectGoals: Record<string, string>;
+  /** Tech-Lead autonomy flags per session, mirrored from the CLI's
+   *  `.apas` poller. Toggled from the Overview. */
+  projectFlags: Record<string, { autoApproveTodos: boolean; autoMergePrs: boolean }>;
   /** Manager v2 — overwrite project_goal.md at the project root. */
   updateProjectGoal: (goal: string) => void;
+  /** Push new Tech-Lead autonomy flags to the CLI. */
+  updateProjectFlags: (flags: { autoApproveTodos: boolean; autoMergePrs: boolean }) => void;
   updatePaneRole: (paneId: number, role?: string, goal?: string, backstory?: string) => void;
   teamRecords: TeamRecord[];
   planReviewPending: PlanReviewPendingItem[];
@@ -731,6 +736,7 @@ export const useStore = create<AppState>((set, get) => ({
   pausedPanes: [],
   paneDiffs: {},
   projectGoals: {},
+  projectFlags: {},
   teamRecords: [],
   planReviewPending: [],
   answeredQuestions: new Map(),
@@ -1844,6 +1850,28 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
+  updateProjectFlags: (flags) => {
+    const { ws, sessionId, showToast } = get();
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      showToast("Not connected — cannot update flags", "error");
+      return;
+    }
+    ws.send(
+      JSON.stringify({
+        type: "update_project_flags",
+        auto_approve_todos: flags.autoApproveTodos,
+        auto_merge_prs: flags.autoMergePrs,
+      }),
+    );
+    // Optimistic local update so the toggle feels instant; the CLI
+    // echo (~5s poll cycle) will reconcile if anything diverges.
+    if (sessionId) {
+      set((state) => ({
+        projectFlags: { ...state.projectFlags, [sessionId]: flags },
+      }));
+    }
+  },
+
   fetchTeamTodo: () => {
     const { ws, sessionId } = get();
     if (!sessionId) return;
@@ -2900,6 +2928,21 @@ function handleServerMessage(
       if (sessionId && typeof content === "string") {
         set((state) => ({
           projectGoals: { ...state.projectGoals, [sessionId]: content },
+        }));
+      }
+      break;
+    }
+
+    case "project_flags_changed": {
+      const sessionId = data.session_id as string | undefined;
+      const autoApproveTodos = data.auto_approve_todos === true;
+      const autoMergePrs = data.auto_merge_prs === true;
+      if (sessionId) {
+        set((state) => ({
+          projectFlags: {
+            ...state.projectFlags,
+            [sessionId]: { autoApproveTodos, autoMergePrs },
+          },
         }));
       }
       break;

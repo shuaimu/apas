@@ -37,6 +37,18 @@ pub struct ProjectMetadata {
     #[serde(default)]
     pub panes: Vec<PaneConfig>,
 
+    /// Tech-Lead autonomy: when true, the Tech Lead may flip Global
+    /// TODOs from `proposed` → `approved` without a human click in
+    /// the Overview.
+    #[serde(default)]
+    pub auto_approve_todos: bool,
+
+    /// Tech-Lead autonomy: when true, the Tech Lead may `gh pr merge`
+    /// (or close with a rejection comment, or post a "needs more work"
+    /// review) on the PRs of `pr_open` Global TODOs during its loop.
+    #[serde(default)]
+    pub auto_merge_prs: bool,
+
     // Legacy fields for backward compatibility (read-only migration)
     /// Claude session ID for the deadloop pane (legacy - use panes instead)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -57,6 +69,8 @@ impl ProjectMetadata {
             created_at: chrono::Utc::now().to_rfc3339(),
             prompt: None,
             panes: PaneConfig::defaults(),
+            auto_approve_todos: false,
+            auto_merge_prs: false,
             deadloop_claude_session_id: None,
             interactive_claude_session_id: None,
             is_paused: false,
@@ -70,6 +84,8 @@ impl ProjectMetadata {
             created_at: chrono::Utc::now().to_rfc3339(),
             prompt: None,
             panes: PaneConfig::defaults(),
+            auto_approve_todos: false,
+            auto_merge_prs: false,
             deadloop_claude_session_id: None,
             interactive_claude_session_id: None,
             is_paused: false,
@@ -439,6 +455,8 @@ pub fn get_or_create_project(dir: &Path) -> Result<ProjectMetadata> {
             created_at: chrono::Utc::now().to_rfc3339(),
             prompt: None,
             panes: PaneConfig::defaults(),
+            auto_approve_todos: false,
+            auto_merge_prs: false,
             deadloop_claude_session_id: None,
             interactive_claude_session_id: None,
             is_paused: false,

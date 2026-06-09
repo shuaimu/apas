@@ -11,6 +11,7 @@ import { ResourceUseRollup } from "./ResourceUseRollup";
 import { AddWorkerModal } from "./AddWorkerModal";
 import { ProjectGoalBar } from "./ProjectGoalBar";
 import { TeamTodoPanel } from "./TeamTodoPanel";
+import { TechLeadAutonomyToggles } from "./TechLeadAutonomyToggles";
 import { SuggestedWorkersPanel } from "./SuggestedWorkersPanel";
 
 /**
@@ -100,6 +101,8 @@ export function OverviewView({
         </p>
 
         <ProjectGoalBar />
+
+        <TechLeadAutonomyToggles />
 
         <TeamTodoPanel />
 

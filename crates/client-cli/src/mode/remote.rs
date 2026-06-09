@@ -309,6 +309,7 @@ async fn run_connection(
                     | Ok(ServerToCli::RequestPaneDiff { .. })
                     | Ok(ServerToCli::CreatePr { .. })
                     | Ok(ServerToCli::UpdateProjectGoal { .. })
+                    | Ok(ServerToCli::UpdateProjectFlags { .. })
                     | Ok(ServerToCli::UpdatePaneRole { .. })
                     | Ok(ServerToCli::PlanReviewAnswer { .. })
                     | Ok(ServerToCli::UpdatePaneReviewMode { .. })

@@ -748,6 +748,29 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     )
                                     .await;
                             }
+                            Ok(CliToServer::ProjectFlagsChanged {
+                                session_id,
+                                auto_approve_todos,
+                                auto_merge_prs,
+                            }) => {
+                                tracing::debug!(
+                                    %session_id,
+                                    auto_approve_todos,
+                                    auto_merge_prs,
+                                    "Project flags changed",
+                                );
+                                state
+                                    .sessions
+                                    .route_to_web(
+                                        &session_id,
+                                        ServerToWeb::ProjectFlagsChanged {
+                                            session_id,
+                                            auto_approve_todos,
+                                            auto_merge_prs,
+                                        },
+                                    )
+                                    .await;
+                            }
                             Ok(CliToServer::SuggestedWorkersState { session_id, suggestions }) => {
                                 state
                                     .sessions

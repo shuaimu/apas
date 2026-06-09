@@ -1523,6 +1523,30 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
+                Ok(WebToServer::UpdateProjectFlags {
+                    auto_approve_todos,
+                    auto_merge_prs,
+                }) => {
+                    if let Some(sid) = session_id {
+                        tracing::info!(
+                            session_id = %sid,
+                            auto_approve_todos,
+                            auto_merge_prs,
+                            "Update project flags"
+                        );
+                        state
+                            .sessions
+                            .route_to_cli(
+                                &sid,
+                                ServerToCli::UpdateProjectFlags {
+                                    session_id: sid,
+                                    auto_approve_todos,
+                                    auto_merge_prs,
+                                },
+                            )
+                            .await;
+                    }
+                }
                 Ok(WebToServer::AnswerQuestion { tool_use_id, answers }) => {
                     // Relay the user's AskUserQuestion answers down to the CLI
                     // streaming worker. The worker matches by tool_use_id

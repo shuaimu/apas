@@ -226,6 +226,19 @@ pub enum CliToServer {
         content: String,
     },
 
+    /// Tech-Lead autonomy flags. `auto_approve_todos` lets the Tech
+    /// Lead flip Global TODOs from `proposed` → `approved` without a
+    /// human click. `auto_merge_prs` lets it `gh pr merge` (or close
+    /// with a rejection comment / post a "work more" review) on PRs
+    /// in `pr_open` Globals. Both default false. Pushed at CLI boot
+    /// and on every flag mutation so the web mirrors the current
+    /// state per session.
+    ProjectFlagsChanged {
+        session_id: Uuid,
+        auto_approve_todos: bool,
+        auto_merge_prs: bool,
+    },
+
     /// CLI's view of `team-todo.md`. Pushed in response to
     /// `ServerToCli::FetchTeamTodo` and after each `TodoApproval`-driven
     /// mutation. Server forwards to web as `ServerToWeb::TeamTodoState`.
@@ -466,6 +479,16 @@ pub enum ServerToCli {
     /// Manager v2 — write `goal` into project_goal.md at the project
     /// root (overwriting any existing content).
     UpdateProjectGoal { session_id: Uuid, goal: String },
+
+    /// Toggle the Tech-Lead autonomy flags. Persisted into `.apas` so
+    /// they survive a CLI reboot; the Tech Lead re-reads `.apas` each
+    /// iteration and unlocks the matching capability when the flag is
+    /// true.
+    UpdateProjectFlags {
+        session_id: Uuid,
+        auto_approve_todos: bool,
+        auto_merge_prs: bool,
+    },
 
     /// Set role/goal/backstory on the named pane and persist to .apas.
     /// Phase 2.1c.
@@ -878,6 +901,14 @@ pub enum WebToServer {
     /// boundary, not mid-iteration.
     UpdateProjectGoal { goal: String },
 
+    /// Set Tech-Lead autonomy flags. CLI writes both into `.apas` and
+    /// then echoes `CliToServer::ProjectFlagsChanged` so peer web
+    /// clients stay in sync.
+    UpdateProjectFlags {
+        auto_approve_todos: bool,
+        auto_merge_prs: bool,
+    },
+
     /// Update a pane's role/goal/backstory triple (Phase 2.1c). All three
     /// fields are optional — sending null for any of them clears that
     /// piece. Takes effect on the next pane spawn (close + reopen tab,
@@ -1167,6 +1198,15 @@ pub enum ServerToWeb {
     ProjectGoalChanged {
         session_id: Uuid,
         content: String,
+    },
+
+    /// Forwarded from `CliToServer::ProjectFlagsChanged`. Web mirrors
+    /// the latest Tech-Lead autonomy flags per session for the Overview
+    /// toggles.
+    ProjectFlagsChanged {
+        session_id: Uuid,
+        auto_approve_todos: bool,
+        auto_merge_prs: bool,
     },
 
     /// Snapshot of the project's team-todo.md state. Sent in reply to

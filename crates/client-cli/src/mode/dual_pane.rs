@@ -1502,6 +1502,32 @@ async fn run_inner(
         });
     }
 
+    // Project flag poller. Re-reads .apas every ~5s and pushes the
+    // current `auto_approve_todos` / `auto_merge_prs` values upstream
+    // so the web's Overview toggles hydrate on attach and survive a
+    // server restart that wiped the in-memory cache. Cheap: .apas is
+    // a few KB and only one message per 5s per active CLI.
+    {
+        let server_tx_for_flags = server_tx.clone();
+        let shutdown_for_flags = shutdown.clone();
+        let working_dir_for_flags = working_dir_str.clone();
+        thread::spawn(move || {
+            let project = std::path::PathBuf::from(working_dir_for_flags);
+            while !shutdown_for_flags.load(Ordering::SeqCst) {
+                if let Ok(meta) = crate::project::get_or_create_project(&project) {
+                    let _ = server_tx_for_flags.blocking_send(
+                        CliToServer::ProjectFlagsChanged {
+                            session_id,
+                            auto_approve_todos: meta.auto_approve_todos,
+                            auto_merge_prs: meta.auto_merge_prs,
+                        },
+                    );
+                }
+                thread::sleep(Duration::from_secs(5));
+            }
+        });
+    }
+
     // team-todo.md mtime-gated poller. Mirrors the suggested-workers
     // poller below. Without this, the Overview's TeamTodoPanel only
     // sees changes on FetchTeamTodo (initial mount) — Tech-Lead-driven
@@ -9002,6 +9028,40 @@ async fn run_server_connection(
                                                 match crate::manager::write_project_goal(&project_dir, &goal) {
                                                     Ok(()) => tracing::info!("project_goal.md updated ({} bytes)", goal.len()),
                                                     Err(e) => tracing::warn!("failed to write project_goal.md: {}", e),
+                                                }
+                                            }
+                                            ServerToCli::UpdateProjectFlags {
+                                                session_id: _,
+                                                auto_approve_todos,
+                                                auto_merge_prs,
+                                            } => {
+                                                let project_dir = std::path::Path::new(&working_dir).to_path_buf();
+                                                match crate::project::get_or_create_project(&project_dir) {
+                                                    Ok(mut meta) => {
+                                                        meta.auto_approve_todos = auto_approve_todos;
+                                                        meta.auto_merge_prs = auto_merge_prs;
+                                                        if let Err(err) = crate::project::save_project(&project_dir, &meta) {
+                                                            tracing::warn!("failed to persist project flags: {}", err);
+                                                        } else {
+                                                            tracing::info!(
+                                                                auto_approve_todos,
+                                                                auto_merge_prs,
+                                                                "tech-lead autonomy flags updated"
+                                                            );
+                                                        }
+                                                        // Echo back so peer web clients reconcile.
+                                                        let echo = CliToServer::ProjectFlagsChanged {
+                                                            session_id,
+                                                            auto_approve_todos,
+                                                            auto_merge_prs,
+                                                        };
+                                                        if let Ok(text) = serde_json::to_string(&echo) {
+                                                            let _ = ws_sender.send(Message::Text(text.into())).await;
+                                                        }
+                                                    }
+                                                    Err(err) => {
+                                                        tracing::warn!("failed to load .apas for flag update: {}", err);
+                                                    }
                                                 }
                                             }
                                             ServerToCli::CreatePr { session_id: _, pane_id: pr_pane_id } => {
