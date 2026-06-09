@@ -19,11 +19,11 @@ import { SuggestedWorkersPanel } from "./SuggestedWorkersPanel";
  * Phase 5.1 / v3 split — team overview pseudo-tab.
  *
  * Layout: single column, stacked sections.
- *  - ProjectGoalBar (project goal + Start/Pause for Manager + Tech Lead)
+ *  - ProjectGoalBar (project goal + canonical team role slots)
  *  - TeamTodoPanel (the TODO queue + agent status + add form)
  *  - Pane grid + scratchpad ticker + delegation board + resource roll-up
  *
- * The Manager + Tech Lead each have their own regular tabs in the TabBar,
+ * Team panes each have their own regular tabs in the TabBar,
  * so there are no embedded chat / iteration-stream boxes here — would be
  * redundant. Click into the pane to interact directly.
  */

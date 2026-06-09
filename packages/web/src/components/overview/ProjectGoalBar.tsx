@@ -1,13 +1,11 @@
 "use client";
 
 /**
- * v3 — Manager + Tech Lead control panel on the Overview tab.
+ * v3 — canonical team control panel on the Overview tab.
  *
- * Two roles, two spawns:
- *   - **Manager** (interactive) — user-facing chat. Owns project_goal.md.
- *     Required for the team to function; spawn first.
- *   - **Tech Lead** (deadloop) — optional autonomous orchestrator.
- *     Spawn when you want the team to grind while you're away.
+ * Renders each canonical team role as a slot before launch, so the user can
+ * choose the agent provider/model before creating Manager, Tech Lead,
+ * Developer, or Reviewer panes.
  *
  * Project goal text is persisted to `project_goal.md` via the existing
  * UpdateProjectGoal wire. The Manager re-reads the file as needed and
@@ -29,7 +27,15 @@ import {
   ChevronUp,
 } from "lucide-react";
 import { useStore, type PaneConfig } from "@/lib/store";
-import { ROLE_TEMPLATES } from "@/lib/roleTemplates";
+import {
+  canonicalTeamRoleTemplates,
+  type RoleTemplate,
+} from "@/lib/roleTemplates";
+import {
+  PROVIDER_MODEL_OPTIONS,
+  findProviderModelOption,
+  providerModelValue,
+} from "@/lib/providerOptions";
 
 /**
  * Deadloop prompt for the Tech Lead. Read at every iteration; tells the
@@ -82,9 +88,32 @@ function isManagerPane(p: PaneConfig): boolean {
   );
 }
 
-function isTechLeadPane(p: PaneConfig): boolean {
-  const lower = (p.role ?? "").toLowerCase();
-  return lower.includes("tech lead") && p.mode === "deadloop";
+function roleText(p: PaneConfig): string {
+  return `${p.role ?? ""} ${p.label ?? ""}`.toLowerCase();
+}
+
+function isPaneForTemplate(p: PaneConfig, template: RoleTemplate): boolean {
+  if (p.managed !== true) return false;
+  const lower = roleText(p);
+  switch (template.id) {
+    case "manager":
+      return (
+        p.mode === "interactive" &&
+        lower.includes("manager") &&
+        !lower.includes("tech lead")
+      );
+    case "tech-lead":
+      return p.mode === "deadloop" && lower.includes("tech lead");
+    case "developer":
+      return p.mode === "deadloop" && lower.includes("developer");
+    case "reviewer":
+      return (
+        p.mode === "deadloop" &&
+        (lower.includes("code reviewer") || lower.includes("reviewer"))
+      );
+    default:
+      return lower.includes(template.role.toLowerCase());
+  }
 }
 
 export function ProjectGoalBar() {
@@ -118,19 +147,21 @@ export function ProjectGoalBar() {
   // Queue an auto-generate chat message if the Manager doesn't exist
   // yet at click-time. Sent once the Manager appears in paneConfigs.
   const [pendingAutoGenerate, setPendingAutoGenerate] = useState(false);
+  const [slotSelections, setSlotSelections] = useState<Record<string, string>>({});
 
   const managerPane = useMemo(
     () => paneConfigs.find(isManagerPane),
     [paneConfigs],
   );
-  const techLeadPane = useMemo(
-    () => paneConfigs.find(isTechLeadPane),
-    [paneConfigs],
+  const teamRoleTemplates = useMemo(() => canonicalTeamRoleTemplates(), []);
+  const teamRoleSlots = useMemo(
+    () =>
+      teamRoleTemplates.map((template) => ({
+        template,
+        pane: paneConfigs.find((p) => isPaneForTemplate(p, template)),
+      })),
+    [paneConfigs, teamRoleTemplates],
   );
-
-  const techLeadPaused = techLeadPane
-    ? pausedPanes.includes(techLeadPane.pane_id)
-    : false;
 
   // Team controls operate on every `managed: true` pane in the project
   // (Manager + Tech Lead + Reviewer + Developer + any user-added
@@ -227,8 +258,7 @@ export function ProjectGoalBar() {
   // dual_pane.rs run_inner). Web no longer auto-spawns on attach to
   // avoid the race where CLI auto-spawn and web auto-spawn both fire
   // before the first PaneList arrives, producing duplicate Manager
-  // panes. The Start Manager / Start Tech Lead buttons below stay as
-  // a manual fallback for old CLIs that don't have auto-spawn yet.
+  // panes. The team role slots below stay as manual launch controls.
 
   // After "Auto-generate" with no Manager yet, wait for the Manager to
   // appear, then route the scan-and-write message.
@@ -244,61 +274,56 @@ export function ProjectGoalBar() {
     }
   }, [pendingAutoGenerate, managerPane, sendMessageToPane, showToast]);
 
-  const handleStartManager = () => {
-    const manager = ROLE_TEMPLATES.find((t) => t.id === "manager");
-    if (!manager) {
-      showToast("Manager template missing — cannot spawn.", "error");
-      return;
-    }
+  const selectedProviderOption = (template: RoleTemplate) => {
+    const value =
+      slotSelections[template.id] ??
+      providerModelValue(
+        template.recommendedProvider ?? "claude",
+        template.recommendedModel,
+      );
+    return findProviderModelOption(value);
+  };
+
+  const launchTeamRole = (template: RoleTemplate): boolean => {
+    const picked = selectedProviderOption(template);
+    const mode = template.teamMode ?? (template.id === "manager" ? "interactive" : "deadloop");
+    const prompt = template.id === "tech-lead" ? TECH_LEAD_DEADLOOP_PROMPT : undefined;
+    const goal =
+      template.id === "manager"
+        ? goalDraft.trim() || template.goal
+        : template.goal;
     const result = addPane(
-      "claude",
-      "interactive",
-      "Manager",
-      undefined,
-      undefined,
-      false,
+      picked.provider,
+      mode,
+      template.label,
+      prompt,
+      picked.model,
+      template.isolatedWorktree === true,
       {
-        role: manager.role,
-        goal: goalDraft.trim() || manager.goal,
-        backstory: manager.backstory,
-        planReviewMode: manager.planReviewMode,
+        role: template.role,
+        goal,
+        backstory: template.backstory,
+        planReviewMode: template.planReviewMode,
       },
       true, // managed — part of the team
     );
     if (result.success) {
-      if (goalDraft.trim()) updateProjectGoal(goalDraft.trim());
-      showToast("Manager started — chat with them on the left.", "success");
+      if (template.id === "manager" && goalDraft.trim()) updateProjectGoal(goalDraft.trim());
+      showToast(`${template.label} launched.`, "success");
+      return true;
     } else {
-      showToast(result.error ?? "Failed to start Manager", "error");
+      showToast(result.error ?? `Failed to launch ${template.label}`, "error");
+      return false;
     }
   };
 
-  const handleStartTechLead = () => {
-    const techLead = ROLE_TEMPLATES.find((t) => t.id === "tech-lead");
-    if (!techLead) {
-      showToast("Tech Lead template missing — cannot spawn.", "error");
-      return;
+  const handleStartManager = () => {
+    const manager = teamRoleTemplates.find((t) => t.id === "manager");
+    if (!manager) {
+      showToast("Manager template missing — cannot spawn.", "error");
+      return false;
     }
-    const result = addPane(
-      "claude",
-      "deadloop",
-      "Tech Lead",
-      TECH_LEAD_DEADLOOP_PROMPT,
-      undefined,
-      false,
-      {
-        role: techLead.role,
-        goal: techLead.goal,
-        backstory: techLead.backstory,
-        planReviewMode: techLead.planReviewMode,
-      },
-      true, // managed — part of the team
-    );
-    if (result.success) {
-      showToast("Tech Lead started — autonomous orchestration online.", "success");
-    } else {
-      showToast(result.error ?? "Failed to start Tech Lead", "error");
-    }
+    return launchTeamRole(manager);
   };
 
   const handleSaveGoal = () => {
@@ -311,9 +336,10 @@ export function ProjectGoalBar() {
   // scan-and-write message. Otherwise route immediately.
   const handleAutoGenerate = () => {
     if (!managerPane) {
-      handleStartManager();
-      setPendingAutoGenerate(true);
-      showToast("Manager spawning — will scan + write the goal on first turn.", "info");
+      if (handleStartManager()) {
+        setPendingAutoGenerate(true);
+        showToast("Manager spawning — will scan + write the goal on first turn.", "info");
+      }
       return;
     }
     const result = sendMessageToPane(AUTO_GENERATE_CHAT_MESSAGE, managerPane.pane_id);
@@ -331,42 +357,6 @@ export function ProjectGoalBar() {
           Team
         </h3>
         <div className="flex flex-wrap items-center gap-3 text-xs">
-          {/* Manager status — interactive pane, no pause/resume (always
-              "alive" waiting on user input; pause would have no meaning). */}
-          {managerPane ? (
-            <span className="flex items-center gap-1 text-violet-600 dark:text-violet-400">
-              <span>
-                💬 Manager ·{" "}
-                <span className="font-mono">
-                  {managerPane.label || `pane ${managerPane.pane_id}`}
-                </span>
-              </span>
-            </span>
-          ) : (
-            <span className="text-violet-600 dark:text-violet-400">
-              💬 no Manager — start one to chat with the team
-            </span>
-          )}
-          {/* Tech Lead presence (display only — pause/stop is a team-
-              wide control rendered next, no per-pane button here). */}
-          {techLeadPane ? (
-            <span className="flex items-center gap-1 text-indigo-600 dark:text-indigo-400">
-              <span>
-                🧭 Tech Lead ·{" "}
-                <span className="font-mono">
-                  {techLeadPane.label || `pane ${techLeadPane.pane_id}`}
-                </span>
-                {techLeadPaused && (
-                  <span className="ml-1 text-amber-600 dark:text-amber-400">⏸</span>
-                )}
-              </span>
-            </span>
-          ) : (
-            <span className="text-indigo-600 dark:text-indigo-400">
-              🧭 no Tech Lead — optional autonomous orchestration
-            </span>
-          )}
-
           {/* Team-wide controls — fan out to every managed pane. Pause
               only touches deadloops (interactive panes can't be paused
               meaningfully); Stop interrupts every managed pane's
@@ -405,6 +395,30 @@ export function ProjectGoalBar() {
             </span>
           )}
         </div>
+      </div>
+
+      <div className="mb-4 grid grid-cols-1 gap-2 lg:grid-cols-2">
+        {teamRoleSlots.map(({ template, pane }) => {
+          const selected = selectedProviderOption(template);
+          return (
+            <TeamRoleSlot
+              key={template.id}
+              template={template}
+              pane={pane}
+              paused={pane ? pausedPanes.includes(pane.pane_id) : false}
+              selectionValue={selected.value}
+              onSelectionChange={(value) =>
+                setSlotSelections((current) => ({
+                  ...current,
+                  [template.id]: value,
+                }))
+              }
+              onLaunch={() => launchTeamRole(template)}
+              onPause={() => pane && pausePane(pane.pane_id)}
+              onResume={() => pane && resumePane(pane.pane_id)}
+            />
+          );
+        })}
       </div>
 
       {/* Goal — overwrites project_goal.md */}
@@ -483,28 +497,141 @@ export function ProjectGoalBar() {
                 </>
               )}
             </button>
-            {!managerPane && (
-              <button
-                type="button"
-                onClick={handleStartManager}
-                className="flex items-center gap-1 rounded border border-violet-500 bg-violet-600 px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-violet-500"
-              >
-                <Play className="h-3 w-3" /> Start Manager
-              </button>
-            )}
-            {managerPane && !techLeadPane && (
-              <button
-                type="button"
-                onClick={handleStartTechLead}
-                className="flex items-center gap-1 rounded border border-indigo-500 bg-indigo-600 px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-indigo-500"
-                title="Optional autonomous orchestrator — workers will get delegations even when you're away."
-              >
-                <Bot className="h-3 w-3" /> Start Tech Lead
-              </button>
-            )}
           </div>
         </div>
       </div>
     </section>
+  );
+}
+
+function TeamRoleSlot({
+  template,
+  pane,
+  paused,
+  selectionValue,
+  onSelectionChange,
+  onLaunch,
+  onPause,
+  onResume,
+}: {
+  template: RoleTemplate;
+  pane?: PaneConfig;
+  paused: boolean;
+  selectionValue: string;
+  onSelectionChange: (value: string) => void;
+  onLaunch: () => void;
+  onPause: () => void;
+  onResume: () => void;
+}) {
+  const launched = pane !== undefined;
+  const currentOption = launched
+    ? findProviderModelOption(providerModelValue(pane.provider, pane.model))
+    : findProviderModelOption(selectionValue);
+  const statusLabel = !pane
+    ? "not created"
+    : pane.mode === "deadloop"
+      ? paused
+        ? "paused"
+        : "running"
+      : "ready";
+
+  return (
+    <div className="flex flex-col gap-2 rounded border border-violet-200 bg-white/80 p-3 dark:border-violet-800 dark:bg-gray-950/50">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-base leading-none" aria-hidden="true">
+              {template.glyph}
+            </span>
+            <span className="font-semibold text-gray-900 dark:text-gray-100">
+              {template.label}
+            </span>
+            <span
+              className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                launched
+                  ? paused
+                    ? "bg-amber-100 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300"
+                    : "bg-emerald-100 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300"
+                  : "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300"
+              }`}
+            >
+              {statusLabel}
+            </span>
+            {template.isolatedWorktree && (
+              <span className="rounded bg-sky-100 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 dark:bg-sky-950/40 dark:text-sky-300">
+                isolated
+              </span>
+            )}
+          </div>
+          <div className="mt-1 truncate text-[11px] text-gray-600 dark:text-gray-400">
+            {pane ? (
+              <>
+                pane <span className="font-mono">{pane.pane_id}</span>
+                {" · "}
+                <span className="font-mono">{pane.label || template.label}</span>
+                {" · "}
+                {currentOption.label}
+              </>
+            ) : (
+              currentOption.label
+            )}
+          </div>
+        </div>
+
+        {pane && pane.mode === "deadloop" && (
+          paused ? (
+            <button
+              type="button"
+              onClick={onResume}
+              className="flex shrink-0 items-center gap-1 rounded border border-emerald-500 bg-emerald-600 px-2 py-1 text-[11px] font-medium text-white hover:bg-emerald-500"
+              title={`Resume ${template.label}`}
+            >
+              <Play className="h-3 w-3" /> Resume
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={onPause}
+              className="flex shrink-0 items-center gap-1 rounded border border-amber-500 bg-amber-600 px-2 py-1 text-[11px] font-medium text-white hover:bg-amber-500"
+              title={`Pause ${template.label}`}
+            >
+              <Pause className="h-3 w-3" /> Pause
+            </button>
+          )
+        )}
+      </div>
+
+      {!pane && (
+        <div className="flex flex-wrap items-end gap-2">
+          <label className="flex min-w-[13rem] flex-1 flex-col gap-1 text-[11px] font-medium text-gray-700 dark:text-gray-300">
+            Provider/model
+            <select
+              value={selectionValue}
+              onChange={(e) => onSelectionChange(e.target.value)}
+              aria-label={`${template.label} provider/model`}
+              className="rounded border border-violet-300 bg-white px-2 py-1 text-xs font-mono text-gray-900 dark:border-violet-800 dark:bg-gray-900 dark:text-gray-100"
+            >
+              {PROVIDER_MODEL_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            type="button"
+            onClick={onLaunch}
+            className="flex items-center gap-1 rounded border border-violet-500 bg-violet-600 px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-violet-500"
+          >
+            {template.id === "tech-lead" ? (
+              <Bot className="h-3 w-3" />
+            ) : (
+              <Play className="h-3 w-3" />
+            )}
+            Launch
+          </button>
+        </div>
+      )}
+    </div>
   );
 }
