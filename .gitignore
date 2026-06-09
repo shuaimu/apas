@@ -36,6 +36,9 @@ project_goal.md
 .apas-tech-lead-cursor
 .apas-reviewer-cursor
 .apas-developer-cursor
+# Tech Lead's per-PR comment cursor (added when it took over PR
+# state-tracking from Developers).
+.apas-tech-lead-pr-comments.json
 # Claude Code runtime state (scheduled tasks, plugins, etc.)
 .claude/
 

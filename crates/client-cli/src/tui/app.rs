@@ -298,7 +298,18 @@ impl App {
         if modifiers.contains(KeyModifiers::CONTROL) {
             match code {
                 KeyCode::Char('c') => {
+                    // Ctrl+C in raw mode never reaches the OS SIGINT
+                    // handler — crossterm captures it as a key event.
+                    // Set BOTH our local quit flag (to exit this draw
+                    // loop) AND the shared shutdown Arc that the
+                    // server task, deadloop workers, file watcher, and
+                    // child-killer rely on; otherwise the TUI exits
+                    // but everything else keeps running and the
+                    // process appears wedged to the user.
                     self.should_quit = true;
+                    if let Some(shutdown) = &self.shutdown {
+                        shutdown.store(true, Ordering::SeqCst);
+                    }
                 }
                 KeyCode::Char('t') => {
                     // Create new tab
