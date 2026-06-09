@@ -148,6 +148,13 @@ fn spawn_missing_team_panes(
         m.managed && lower.contains("developer")
     });
     drop(metas_guard);
+    // Helper: try_resume_first should be FALSE for any pane spawned
+    // with a brand-new Uuid::new_v4() — Codex/Cursor server-side
+    // sessions don't exist for an id we just minted, and `exec resume
+    // <fresh-id>` fails with "no rollout found". Claude streaming
+    // derives this from on-disk session jsonl existence and ignores
+    // the flag, so false is safe for Claude too.
+    let try_resume = false;
     if !has_manager {
         let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
         let _ = event_tx.send(TuiEvent::AddTabWithConfig {
@@ -167,7 +174,7 @@ fn spawn_missing_team_panes(
             backstory: Some(crate::role::DEFAULT_MANAGER_BACKSTORY.to_string()),
             plan_review_mode: shared::PlanReviewMode::default(),
             managed: true,
-            try_resume_first: true,
+            try_resume_first: try_resume,
         });
         tracing::info!(pane_id, ?manager_spec.provider, ?manager_spec.model, "spawning Manager pane (Start team)");
     }
@@ -190,7 +197,7 @@ fn spawn_missing_team_panes(
             backstory: Some(crate::role::DEFAULT_TECH_LEAD_BACKSTORY.to_string()),
             plan_review_mode: shared::PlanReviewMode::default(),
             managed: true,
-            try_resume_first: true,
+            try_resume_first: try_resume,
         });
         tracing::info!(pane_id, ?tech_lead_spec.provider, ?tech_lead_spec.model, "spawning Tech Lead pane (Start team)");
     }
@@ -213,7 +220,7 @@ fn spawn_missing_team_panes(
             backstory: Some(crate::role::DEFAULT_REVIEWER_BACKSTORY.to_string()),
             plan_review_mode: shared::PlanReviewMode::default(),
             managed: true,
-            try_resume_first: true,
+            try_resume_first: try_resume,
         });
         tracing::info!(pane_id, ?reviewer_spec.provider, ?reviewer_spec.model, "spawning Reviewer pane (Start team)");
     }
@@ -236,7 +243,7 @@ fn spawn_missing_team_panes(
             backstory: Some(crate::role::DEFAULT_DEVELOPER_BACKSTORY.to_string()),
             plan_review_mode: shared::PlanReviewMode::default(),
             managed: true,
-            try_resume_first: true,
+            try_resume_first: try_resume,
         });
         tracing::info!(pane_id, ?developer_spec.provider, ?developer_spec.model, "spawning Developer pane (Start team)");
     }
