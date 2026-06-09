@@ -641,6 +641,9 @@ interface AppState {
   updateProjectGoal: (goal: string) => void;
   /** Push new Tech-Lead autonomy flags to the CLI. */
   updateProjectFlags: (flags: { autoApproveTodos: boolean; autoMergePrs: boolean }) => void;
+  /** Spawn the default team panes for any role that isn't already
+   *  present. Idempotent on the CLI side. */
+  startTeam: () => void;
   updatePaneRole: (paneId: number, role?: string, goal?: string, backstory?: string) => void;
   teamRecords: TeamRecord[];
   planReviewPending: PlanReviewPendingItem[];
@@ -1870,6 +1873,16 @@ export const useStore = create<AppState>((set, get) => ({
         projectFlags: { ...state.projectFlags, [sessionId]: flags },
       }));
     }
+  },
+
+  startTeam: () => {
+    const { ws, showToast } = get();
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      showToast("Not connected — cannot start team", "error");
+      return;
+    }
+    ws.send(JSON.stringify({ type: "start_team" }));
+    showToast("Spawning team panes…", "info");
   },
 
   fetchTeamTodo: () => {

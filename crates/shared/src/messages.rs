@@ -490,6 +490,12 @@ pub enum ServerToCli {
         auto_merge_prs: bool,
     },
 
+    /// Spawn the default team (Manager, Tech Lead, Reviewer, Developer)
+    /// for any role that isn't already present. Triggered by the "Start
+    /// team" button on the Overview. Idempotent — extra clicks just
+    /// fill in roles the user removed.
+    StartTeam { session_id: Uuid },
+
     /// Set role/goal/backstory on the named pane and persist to .apas.
     /// Phase 2.1c.
     UpdatePaneRole {
@@ -908,6 +914,11 @@ pub enum WebToServer {
         auto_approve_todos: bool,
         auto_merge_prs: bool,
     },
+
+    /// Spawn the four default team panes for any role that isn't
+    /// already present. Triggered by the Overview "Start team" button.
+    /// CLI runs `spawn_missing_team_panes`. Idempotent.
+    StartTeam,
 
     /// Update a pane's role/goal/backstory triple (Phase 2.1c). All three
     /// fields are optional — sending null for any of them clears that

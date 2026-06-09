@@ -10,6 +10,7 @@ import { DelegationBoard } from "./DelegationBoard";
 import { ResourceUseRollup } from "./ResourceUseRollup";
 import { AddWorkerModal } from "./AddWorkerModal";
 import { ProjectGoalBar } from "./ProjectGoalBar";
+import { StartTeamBanner } from "./StartTeamBanner";
 import { TeamTodoPanel } from "./TeamTodoPanel";
 import { TechLeadAutonomyToggles } from "./TechLeadAutonomyToggles";
 import { SuggestedWorkersPanel } from "./SuggestedWorkersPanel";
@@ -99,6 +100,8 @@ export function OverviewView({
           status. Talk to the Manager or watch the Tech Lead from their
           own tabs.
         </p>
+
+        <StartTeamBanner />
 
         <ProjectGoalBar />
 

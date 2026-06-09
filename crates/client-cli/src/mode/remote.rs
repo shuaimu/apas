@@ -310,6 +310,7 @@ async fn run_connection(
                     | Ok(ServerToCli::CreatePr { .. })
                     | Ok(ServerToCli::UpdateProjectGoal { .. })
                     | Ok(ServerToCli::UpdateProjectFlags { .. })
+                    | Ok(ServerToCli::StartTeam { .. })
                     | Ok(ServerToCli::UpdatePaneRole { .. })
                     | Ok(ServerToCli::PlanReviewAnswer { .. })
                     | Ok(ServerToCli::UpdatePaneReviewMode { .. })

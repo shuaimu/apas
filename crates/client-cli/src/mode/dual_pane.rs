@@ -100,6 +100,142 @@ fn truncate_str_at_char_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Spawn whichever team panes (Manager, Tech Lead, Reviewer, Developer)
+/// are missing for this project. Idempotent: each role is gated on
+/// whether a managed pane with that role already exists in
+/// `pane_metas`, so a second invocation is a no-op (or only fills in
+/// roles the user explicitly removed since last call).
+///
+/// Called from the StartTeam wire handler when the user clicks "Start
+/// team" on the Overview. Used to also run at CLI boot in v3.4 — the
+/// auto-spawn was reverted so the user opts in explicitly.
+fn spawn_missing_team_panes(
+    pane_metas: &PaneMetas,
+    event_tx: &std::sync::mpsc::Sender<TuiEvent>,
+) {
+    let metas_guard = pane_metas.lock().unwrap();
+    // Only consider managed panes — a user's unmanaged side-chat pane
+    // with role "manager" or "reviewer" shouldn't suppress the team's
+    // orchestrator spawn.
+    let has_manager = metas_guard.values().any(|m| {
+        let lower = m.role.as_deref().unwrap_or("").to_ascii_lowercase();
+        m.managed
+            && lower.contains("manager")
+            && !lower.contains("tech lead")
+            && matches!(m.mode, shared::PaneMode::Interactive)
+    });
+    let has_tech_lead = metas_guard.values().any(|m| {
+        let lower = m.role.as_deref().unwrap_or("").to_ascii_lowercase();
+        m.managed
+            && lower.contains("tech lead")
+            && matches!(m.mode, shared::PaneMode::Deadloop)
+    });
+    let has_reviewer = metas_guard.values().any(|m| {
+        let lower = m.role.as_deref().unwrap_or("").to_ascii_lowercase();
+        m.managed && lower.contains("reviewer")
+    });
+    // Role-only match (no mode constraint) — both deadloop developers
+    // AND user-spawned interactive developers count, so a project with
+    // existing dev panes keeps them.
+    let has_developer = metas_guard.values().any(|m| {
+        let lower = m.role.as_deref().unwrap_or("").to_ascii_lowercase();
+        m.managed && lower.contains("developer")
+    });
+    drop(metas_guard);
+    if !has_manager {
+        let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
+        let _ = event_tx.send(TuiEvent::AddTabWithConfig {
+            pane_id,
+            label: "Manager".to_string(),
+            claude_session_id: Uuid::new_v4(),
+            mode: shared::PaneMode::Interactive,
+            provider: shared::Provider::Claude,
+            prompt: None,
+            min_iteration_interval_minutes: None,
+            model: None,
+            effort: Some("max".to_string()),
+            worktree_path: None,
+            initial_input: None,
+            role: Some(crate::role::DEFAULT_MANAGER_ROLE.to_string()),
+            goal: Some(crate::role::DEFAULT_MANAGER_GOAL.to_string()),
+            backstory: Some(crate::role::DEFAULT_MANAGER_BACKSTORY.to_string()),
+            plan_review_mode: shared::PlanReviewMode::default(),
+            managed: true,
+            try_resume_first: true,
+        });
+        tracing::info!(pane_id, "spawning Manager pane (Start team)");
+    }
+    if !has_tech_lead {
+        let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
+        let _ = event_tx.send(TuiEvent::AddTabWithConfig {
+            pane_id,
+            label: "Tech Lead".to_string(),
+            claude_session_id: Uuid::new_v4(),
+            mode: shared::PaneMode::Deadloop,
+            provider: shared::Provider::Claude,
+            prompt: Some(crate::role::TECH_LEAD_DEADLOOP_PROMPT.to_string()),
+            min_iteration_interval_minutes: None,
+            model: None,
+            effort: Some("max".to_string()),
+            worktree_path: None,
+            initial_input: None,
+            role: Some(crate::role::DEFAULT_TECH_LEAD_ROLE.to_string()),
+            goal: Some(crate::role::DEFAULT_TECH_LEAD_GOAL.to_string()),
+            backstory: Some(crate::role::DEFAULT_TECH_LEAD_BACKSTORY.to_string()),
+            plan_review_mode: shared::PlanReviewMode::default(),
+            managed: true,
+            try_resume_first: true,
+        });
+        tracing::info!(pane_id, "spawning Tech Lead pane (Start team)");
+    }
+    if !has_reviewer {
+        let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
+        let _ = event_tx.send(TuiEvent::AddTabWithConfig {
+            pane_id,
+            label: "Reviewer".to_string(),
+            claude_session_id: Uuid::new_v4(),
+            mode: shared::PaneMode::Deadloop,
+            provider: shared::Provider::Claude,
+            prompt: Some(crate::role::REVIEWER_DEADLOOP_PROMPT.to_string()),
+            min_iteration_interval_minutes: None,
+            model: None,
+            effort: Some("max".to_string()),
+            worktree_path: None,
+            initial_input: None,
+            role: Some(crate::role::DEFAULT_REVIEWER_ROLE.to_string()),
+            goal: Some(crate::role::DEFAULT_REVIEWER_GOAL.to_string()),
+            backstory: Some(crate::role::DEFAULT_REVIEWER_BACKSTORY.to_string()),
+            plan_review_mode: shared::PlanReviewMode::default(),
+            managed: true,
+            try_resume_first: true,
+        });
+        tracing::info!(pane_id, "spawning Reviewer pane (Start team)");
+    }
+    if !has_developer {
+        let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
+        let _ = event_tx.send(TuiEvent::AddTabWithConfig {
+            pane_id,
+            label: "Developer".to_string(),
+            claude_session_id: Uuid::new_v4(),
+            mode: shared::PaneMode::Deadloop,
+            provider: shared::Provider::Claude,
+            prompt: Some(crate::role::DEFAULT_DEVELOPER_DEADLOOP_PROMPT.to_string()),
+            min_iteration_interval_minutes: None,
+            model: None,
+            effort: None,
+            worktree_path: None,
+            initial_input: None,
+            role: Some(crate::role::DEFAULT_DEVELOPER_ROLE.to_string()),
+            goal: Some(crate::role::DEFAULT_DEVELOPER_GOAL.to_string()),
+            backstory: Some(crate::role::DEFAULT_DEVELOPER_BACKSTORY.to_string()),
+            plan_review_mode: shared::PlanReviewMode::default(),
+            managed: true,
+            try_resume_first: true,
+        });
+        tracing::info!(pane_id, "spawning Developer pane (Start team)");
+    }
+}
+
 fn default_pane_label(pane_id: u32, model: Option<&str>) -> String {
     match pane_id {
         shared::PANE_ID_DEADLOOP => "Deadloop".to_string(),
@@ -1294,138 +1430,12 @@ async fn run_inner(
         })
     };
 
-    // v3.4 — auto-spawn Manager + Tech Lead if missing. Each project
-    // always has these two panes; spawning them here at CLI boot means
-    // every project (even fresh / legacy ones with no .apas entries
-    // for them) gets the team-coordination layer without the user
-    // having to click anything in the web UI. The AddTabWithConfig
-    // events are picked up by the TUI event loop later in run_inner.
-    {
-        let metas_guard = pane_metas.lock().unwrap();
-        // Only consider managed panes when deciding whether to auto-spawn —
-        // a user's unmanaged side-chat pane with role "manager" or
-        // "reviewer" shouldn't suppress the auto-spawn of the team's
-        // orchestrators.
-        let has_manager = metas_guard.values().any(|m| {
-            let lower = m.role.as_deref().unwrap_or("").to_ascii_lowercase();
-            m.managed
-                && lower.contains("manager")
-                && !lower.contains("tech lead")
-                && matches!(m.mode, shared::PaneMode::Interactive)
-        });
-        let has_tech_lead = metas_guard.values().any(|m| {
-            let lower = m.role.as_deref().unwrap_or("").to_ascii_lowercase();
-            m.managed
-                && lower.contains("tech lead")
-                && matches!(m.mode, shared::PaneMode::Deadloop)
-        });
-        let has_reviewer = metas_guard.values().any(|m| {
-            let lower = m.role.as_deref().unwrap_or("").to_ascii_lowercase();
-            m.managed
-                && lower.contains("reviewer")
-        });
-        // Role-only match (no mode constraint) — both auto-spawned deadloop
-        // developers AND user-spawned interactive developers count, so we
-        // never duplicate. A project with existing dev panes keeps them;
-        // a fresh project gets one default deadloop developer.
-        let has_developer = metas_guard.values().any(|m| {
-            let lower = m.role.as_deref().unwrap_or("").to_ascii_lowercase();
-            m.managed && lower.contains("developer")
-        });
-        drop(metas_guard);
-        if !has_manager {
-            let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
-            let _ = event_tx.send(TuiEvent::AddTabWithConfig {
-                pane_id,
-                label: "Manager".to_string(),
-                claude_session_id: Uuid::new_v4(),
-                mode: shared::PaneMode::Interactive,
-                provider: shared::Provider::Claude,
-                prompt: None,
-                min_iteration_interval_minutes: None,
-                model: None,
-                effort: Some("max".to_string()),
-                worktree_path: None,
-                initial_input: None,
-                role: Some(crate::role::DEFAULT_MANAGER_ROLE.to_string()),
-                goal: Some(crate::role::DEFAULT_MANAGER_GOAL.to_string()),
-                backstory: Some(crate::role::DEFAULT_MANAGER_BACKSTORY.to_string()),
-                plan_review_mode: shared::PlanReviewMode::default(),
-                managed: true,
-                try_resume_first: true,
-            });
-            tracing::info!(pane_id, "auto-spawning Manager pane (missing from .apas)");
-        }
-        if !has_tech_lead {
-            let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
-            let _ = event_tx.send(TuiEvent::AddTabWithConfig {
-                pane_id,
-                label: "Tech Lead".to_string(),
-                claude_session_id: Uuid::new_v4(),
-                mode: shared::PaneMode::Deadloop,
-                provider: shared::Provider::Claude,
-                prompt: Some(crate::role::TECH_LEAD_DEADLOOP_PROMPT.to_string()),
-                min_iteration_interval_minutes: None,
-                model: None,
-                effort: Some("max".to_string()),
-                worktree_path: None,
-                initial_input: None,
-                role: Some(crate::role::DEFAULT_TECH_LEAD_ROLE.to_string()),
-                goal: Some(crate::role::DEFAULT_TECH_LEAD_GOAL.to_string()),
-                backstory: Some(crate::role::DEFAULT_TECH_LEAD_BACKSTORY.to_string()),
-                plan_review_mode: shared::PlanReviewMode::default(),
-                managed: true,
-                try_resume_first: true,
-            });
-            tracing::info!(pane_id, "auto-spawning Tech Lead pane (missing from .apas)");
-        }
-        if !has_reviewer {
-            let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
-            let _ = event_tx.send(TuiEvent::AddTabWithConfig {
-                pane_id,
-                label: "Reviewer".to_string(),
-                claude_session_id: Uuid::new_v4(),
-                mode: shared::PaneMode::Deadloop,
-                provider: shared::Provider::Claude,
-                prompt: Some(crate::role::REVIEWER_DEADLOOP_PROMPT.to_string()),
-                min_iteration_interval_minutes: None,
-                model: None,
-                effort: Some("max".to_string()),
-                worktree_path: None,
-                initial_input: None,
-                role: Some(crate::role::DEFAULT_REVIEWER_ROLE.to_string()),
-                goal: Some(crate::role::DEFAULT_REVIEWER_GOAL.to_string()),
-                backstory: Some(crate::role::DEFAULT_REVIEWER_BACKSTORY.to_string()),
-                plan_review_mode: shared::PlanReviewMode::default(),
-                managed: true,
-                try_resume_first: true,
-            });
-            tracing::info!(pane_id, "auto-spawning Reviewer pane (missing from .apas)");
-        }
-        if !has_developer {
-            let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
-            let _ = event_tx.send(TuiEvent::AddTabWithConfig {
-                pane_id,
-                label: "Developer".to_string(),
-                claude_session_id: Uuid::new_v4(),
-                mode: shared::PaneMode::Deadloop,
-                provider: shared::Provider::Claude,
-                prompt: Some(crate::role::DEFAULT_DEVELOPER_DEADLOOP_PROMPT.to_string()),
-                min_iteration_interval_minutes: None,
-                model: None,
-                effort: None,
-                worktree_path: None,
-                initial_input: None,
-                role: Some(crate::role::DEFAULT_DEVELOPER_ROLE.to_string()),
-                goal: Some(crate::role::DEFAULT_DEVELOPER_GOAL.to_string()),
-                backstory: Some(crate::role::DEFAULT_DEVELOPER_BACKSTORY.to_string()),
-                plan_review_mode: shared::PlanReviewMode::default(),
-                managed: true,
-                try_resume_first: true,
-            });
-            tracing::info!(pane_id, "auto-spawning Developer pane (missing from .apas)");
-        }
-    }
+    // Team panes (Manager / Tech Lead / Reviewer / Developer) are no
+    // longer auto-spawned at boot. The user clicks "Start team" on the
+    // Overview to trigger the same spawn logic — `spawn_missing_team_panes`
+    // is the shared helper, called from the StartTeam wire handler. It's
+    // idempotent (only spawns roles that aren't already present), so a
+    // double-click is safe.
 
     // Phase 1.2b: auto-refresh diff poller. Scans pane_metas every few
     // seconds for panes with worktree_path set; when any one's branch tip
@@ -9029,6 +9039,10 @@ async fn run_server_connection(
                                                     Ok(()) => tracing::info!("project_goal.md updated ({} bytes)", goal.len()),
                                                     Err(e) => tracing::warn!("failed to write project_goal.md: {}", e),
                                                 }
+                                            }
+                                            ServerToCli::StartTeam { session_id: _ } => {
+                                                tracing::info!("Start team requested from web — spawning missing roles");
+                                                spawn_missing_team_panes(&pane_metas, &tui_event_tx);
                                             }
                                             ServerToCli::UpdateProjectFlags {
                                                 session_id: _,

@@ -1547,6 +1547,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
+                Ok(WebToServer::StartTeam) => {
+                    if let Some(sid) = session_id {
+                        tracing::info!(session_id = %sid, "Start team");
+                        state
+                            .sessions
+                            .route_to_cli(&sid, ServerToCli::StartTeam { session_id: sid })
+                            .await;
+                    }
+                }
                 Ok(WebToServer::AnswerQuestion { tool_use_id, answers }) => {
                     // Relay the user's AskUserQuestion answers down to the CLI
                     // streaming worker. The worker matches by tool_use_id
