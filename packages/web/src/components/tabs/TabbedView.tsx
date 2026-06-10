@@ -345,14 +345,17 @@ export function TabbedView() {
 
   // Determine effective tabs: use paneConfigs from server, or synthesize from observed messages
   const effectiveTabs = useMemo(() => {
-    const applyModeHints = (tabs: PaneConfig[]) =>
-      tabs.map((tab) => {
-        const hintedMode = paneModes[paneKey(tab.pane_id)];
-        if (!hintedMode || hintedMode === tab.mode) return tab;
-        return { ...tab, mode: hintedMode };
-      });
-
-    if (paneConfigs.length > 0) return applyModeHints(paneConfigs);
+    // PaneList (paneConfigs) is authoritative for pane mode. Mode hints
+    // harvested from messages are HISTORY — a replayed SessionMessages
+    // batch re-asserts whatever mode a pane had when those messages
+    // streamed (e.g. "deadloop" for a bot that was since stopped or
+    // demoted on reboot). Letting hints override configs made such a
+    // pane render bot UI (input disabled, no Start Bot) forever, while
+    // the CLI actually had it interactive. The CLI sends a fresh
+    // PaneList on every Start/Stop/Finalize transition, so configs are
+    // never meaningfully behind; hints are only used below when no
+    // PaneList has arrived at all.
+    if (paneConfigs.length > 0) return paneConfigs;
     if (isDualPane && Object.keys(paneMessages).length > 0) {
       return synthesizeConfigs(
         paneMessages,

@@ -2244,12 +2244,24 @@ if (typeof window !== "undefined") {
           state.messages.length === 0 &&
           Object.keys(state.paneMessages).length === 0;
         if (cached && isEmpty) {
+          // The live PaneList may already have arrived even though
+          // messages haven't (attach sends PaneList alongside the
+          // SessionMessages read) — never overwrite fresh pane state
+          // with the snapshot's, which can carry modes from a CLI
+          // boot ago (stale "deadloop" rendering bot UI on a pane
+          // the CLI restored as interactive).
           useStore.setState({
             messages: cached.messages,
             paneMessages: cached.paneMessages,
             paneHasMore: cached.paneHasMore,
-            paneConfigs: cached.paneConfigs,
-            paneModes: cached.paneModes,
+            paneConfigs:
+              state.paneConfigs.length > 0
+                ? state.paneConfigs
+                : cached.paneConfigs,
+            paneModes:
+              Object.keys(state.paneModes).length > 0
+                ? state.paneModes
+                : cached.paneModes,
             hasMoreMessages: cached.hasMoreMessages,
             isDualPane: cached.isDualPane,
             answeredQuestions: cached.answeredQuestions,
