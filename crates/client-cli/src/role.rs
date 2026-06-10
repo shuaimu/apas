@@ -319,16 +319,18 @@ mod tests {
     }
 
     #[test]
-    fn default_developer_prompt_cleans_merged_worktree_only_on_merged() {
+    fn default_developer_prompt_delegates_pr_state_to_tech_lead() {
+        // PR state-tracking moved from the workers to the Tech Lead:
+        // the developer opens the PR, flips its subtask to done, and
+        // moves on — it must NOT idle-poll its own PR (that burnt
+        // tokens every iteration), and PR comments come back to it as
+        // pr-comments delegations dispatched by the Tech Lead.
         let got = DEFAULT_DEVELOPER_DEADLOOP_PROMPT;
-        let merged_pos = got.find("`MERGED`").unwrap();
-        let closed_pos = got.find("`CLOSED`").unwrap();
-        let merged_branch = &got[merged_pos..closed_pos];
-
-        assert!(merged_branch.contains("git -C <worktree> checkout master"));
-        assert!(merged_branch.contains("git -C <worktree> pull --ff-only origin master"));
-        assert!(merged_branch.contains("git -C <worktree> branch -D <branch>"));
-        assert!(!got[closed_pos..].contains("git -C <worktree> checkout master"));
+        assert!(got.contains("you do NOT idle-poll your own PR"));
+        assert!(got.contains("The Tech Lead owns PR state-tracking"));
+        assert!(got.contains("pr-comments:<url>"));
+        // The old self-polling cleanup recipe must stay gone.
+        assert!(!got.contains("git -C <worktree> checkout master"));
     }
 
     #[test]

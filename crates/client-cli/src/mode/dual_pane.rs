@@ -5159,18 +5159,25 @@ fn run_deadloop_session_inner(
 /// first spawn should `--resume` an existing session or `--session-id` a new
 /// one. Layout matches claude code's: `~/.claude/projects/<encoded-cwd>/<session_id>.jsonl`,
 /// where the cwd is encoded by replacing `/` with `-`.
-fn session_jsonl_exists(working_dir: &str, session_id: &Uuid) -> bool {
-    let Some(home) = std::env::var_os("HOME") else { return false };
+fn session_jsonl_path(working_dir: &str, session_id: &Uuid) -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
     let encoded: String = working_dir
         .chars()
         .map(|c| if c == '/' { '-' } else { c })
         .collect();
-    let path = std::path::Path::new(&home)
-        .join(".claude")
-        .join("projects")
-        .join(encoded)
-        .join(format!("{}.jsonl", session_id));
-    path.exists()
+    Some(
+        std::path::Path::new(&home)
+            .join(".claude")
+            .join("projects")
+            .join(encoded)
+            .join(format!("{}.jsonl", session_id)),
+    )
+}
+
+fn session_jsonl_exists(working_dir: &str, session_id: &Uuid) -> bool {
+    session_jsonl_path(working_dir, session_id)
+        .map(|p| p.exists())
+        .unwrap_or(false)
 }
 
 /// Per-pane background-task watcher for the streaming worker.
@@ -6696,7 +6703,39 @@ fn run_deadloop_session_streaming(
     }
 
     // Sit and watch shutdown / stop / pause. The /loop runtime drives
-    // claude on its own; we don't fire any further prompts.
+    // claude on its own; we don't fire any further prompts — EXCEPT the
+    // watchdog below.
+    //
+    // Watchdog: the agent-paced design has a single point of failure.
+    // The agent calls ScheduleWakeup and we trust claude-code's /loop
+    // runtime to fire it; in the wild that timer has been observed to
+    // die silently (wakeup accepted at 06:28, due 06:38, never fired —
+    // child alive but dormant for 11h, zero session-jsonl writes, no
+    // error anywhere). Since we deliberately don't gate iterations, no
+    // one notices. So: watch the session jsonl's mtime as the activity
+    // signal (claude appends every event while working OR when a
+    // wakeup fires) and, if the pane has been dead-quiet well past its
+    // cadence, push a resume prompt through the pane's own input
+    // channel — it lands on claude's stdin as a user turn and the
+    // /loop picks it back up.
+    //
+    // Threshold: 3× cadence, floor 30 min. ScheduleWakeup legitimately
+    // sleeps up to 60 min, so a long-sleeping agent may get nudged
+    // ~half an hour early — that just runs an iteration sooner (an
+    // "Idle; waiting" no-op at worst), which is a far better failure
+    // mode than the hours-long stalls a lost wakeup causes.
+    let watchdog_jsonl = session_jsonl_path(
+        worktree_path.as_deref().unwrap_or(working_dir),
+        &claude_session_id,
+    );
+    let idle_threshold = Duration::from_secs(
+        std::cmp::max(min_iteration_interval_minutes.saturating_mul(3), 30) * 60,
+    );
+    let mut watchdog_last_mtime: Option<std::time::SystemTime> = None;
+    let mut watchdog_last_activity = std::time::Instant::now();
+    let mut watchdog_last_nudge: Option<std::time::Instant> = None;
+    let mut watchdog_tick: u32 = 0;
+
     let mut was_paused = false;
     while !shutdown.load(Ordering::SeqCst) {
         if stop_requested.load(Ordering::SeqCst) {
@@ -6757,6 +6796,63 @@ fn run_deadloop_session_streaming(
                 });
             }
             return;
+        }
+
+        // Watchdog check every ~30s (loop ticks at 1s).
+        watchdog_tick += 1;
+        if watchdog_tick >= 30 {
+            watchdog_tick = 0;
+            if let Some(mtime) = watchdog_jsonl
+                .as_ref()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .and_then(|m| m.modified().ok())
+            {
+                if watchdog_last_mtime != Some(mtime) {
+                    watchdog_last_mtime = Some(mtime);
+                    watchdog_last_activity = std::time::Instant::now();
+                }
+            }
+            let idle = watchdog_last_activity.elapsed();
+            let nudge_cooldown_over = watchdog_last_nudge
+                .map(|t| t.elapsed() >= idle_threshold)
+                .unwrap_or(true);
+            if idle >= idle_threshold && nudge_cooldown_over {
+                watchdog_last_nudge = Some(std::time::Instant::now());
+                let idle_minutes = idle.as_secs() / 60;
+                tracing::warn!(
+                    pane_id,
+                    idle_minutes,
+                    "watchdog: /loop pane silent past threshold — nudging agent"
+                );
+                let nudge = format!(
+                    "[watchdog] No pane activity for {} minutes — the scheduled /loop wakeup appears to have been lost. \
+                     Resume the loop now: run the next iteration per the original /loop instructions, then schedule the next wakeup as usual.",
+                    idle_minutes
+                );
+                let _ = output_tx.send(PaneOutput {
+                    text: format!(
+                        "[Watchdog: no activity for {}m — nudging stalled /loop]",
+                        idle_minutes
+                    ),
+                    pane_id,
+                });
+                let _ = server_tx.try_send(CliToServer::UserInput {
+                    session_id,
+                    text: nudge.clone(),
+                    pane_type: Some(PaneType::Deadloop),
+                    pane_id: Some(pane_id),
+                });
+                if input_tx.send((nudge, false)).is_err() {
+                    // Streaming worker is gone; nothing to nudge. The
+                    // inner worker normally respawns claude itself, so
+                    // a dead channel means the pane is being torn down.
+                    let _ = output_tx.send(PaneOutput {
+                        text: "[Watchdog: streaming worker gone — cannot nudge; pane needs a Reboot.]"
+                            .to_string(),
+                        pane_id,
+                    });
+                }
+            }
         }
 
         thread::sleep(Duration::from_secs(1));
