@@ -182,6 +182,8 @@ function PaneCard({
   ];
   const CLAUDE_MODEL_OPTS: ReadonlyArray<{ value: string; label: string }> = [
     { value: "default", label: "Default" },
+    // Fable has no short alias in the claude CLI yet — pass the full ID.
+    { value: "claude-fable-5", label: "Fable" },
     { value: "sonnet", label: "Sonnet" },
     { value: "opus", label: "Opus" },
     { value: "haiku", label: "Haiku" },
@@ -190,6 +192,7 @@ function PaneCard({
     if (typeof raw !== "string") return "default";
     const v = raw.trim().toLowerCase();
     if (CLAUDE_MODEL_OPTS.some((o) => o.value === v)) return v;
+    if (v.includes("fable")) return "claude-fable-5";
     if (v.includes("sonnet")) return "sonnet";
     if (v.includes("opus")) return "opus";
     if (v.includes("haiku")) return "haiku";

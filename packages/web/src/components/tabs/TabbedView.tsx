@@ -157,6 +157,9 @@ type ClaudeEffortOption = (typeof CLAUDE_EFFORT_OPTIONS)[number]["value"];
 /// claude pick (currently sonnet).
 const CLAUDE_MODEL_OPTIONS = [
   { value: "default", label: "Default" },
+  // Fable has no short alias in the claude CLI yet, so pass the
+  // fully-qualified ID (the CLI accepts both forms).
+  { value: "claude-fable-5", label: "Fable" },
   { value: "sonnet", label: "Sonnet" },
   { value: "opus", label: "Opus" },
   { value: "haiku", label: "Haiku" },
@@ -191,6 +194,7 @@ function normalizeClaudeModelOption(raw?: string | null): ClaudeModelOption {
   // Tolerate fully-qualified IDs like `claude-sonnet-4-6` by matching
   // the family substring; falls back to "default" for anything truly
   // foreign so the dropdown doesn't render a blank.
+  if (normalized.includes("fable")) return "claude-fable-5";
   if (normalized.includes("sonnet")) return "sonnet";
   if (normalized.includes("opus")) return "opus";
   if (normalized.includes("haiku")) return "haiku";

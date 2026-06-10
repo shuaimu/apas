@@ -27,6 +27,10 @@ const AGENT_OPTS: ReadonlyArray<{
   model: string | null;
 }> = [
   { value: "claude/official", label: "Claude / Official", provider: "claude", model: null },
+  // Official Anthropic backend pinned to the Fable 5 model. Unlike the
+  // pane-level switchers there's no separate model knob here, so Fable
+  // gets its own agent option.
+  { value: "claude/fable", label: "Claude / Fable", provider: "claude", model: "claude-fable-5" },
   { value: "claude/minimax", label: "Claude / MiniMax 2.7", provider: "claude", model: MINIMAX_DEFAULT_MODEL },
   { value: "claude/glm", label: "Claude / GLM 5.1", provider: "claude", model: GLM_DEFAULT_MODEL },
   { value: "claude/deepseek", label: "Claude / DeepSeek", provider: "claude", model: DEEPSEEK_DEFAULT_MODEL },
