@@ -2258,6 +2258,14 @@ if (typeof window !== "undefined") {
             interactiveMessages:
               cached.paneMessages[paneKey(PANE_ID_INTERACTIVE)] ?? [],
           });
+          // Catchup gap fix: on the same-session page-reload path
+          // `attachSession` skipped its catchup because at the time
+          // sessionCache was still empty (its guard requires the
+          // cache to have a snapshot). Now that we just restored
+          // the snapshot, fire catchup so any messages that landed
+          // server-side AFTER the snapshot's lastCreatedAt show up
+          // — without this, user has to clear IDB to see them.
+          requestCatchupIfNeeded(useStore.getState, state.sessionId);
         }
       }
     }
