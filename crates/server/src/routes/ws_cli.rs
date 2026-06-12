@@ -552,7 +552,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     .sessions
                                     .route_to_web(
                                         &session_id,
-                                        ServerToWeb::UserInput { session_id, text, pane_type, pane_id, created_at: Some(created_at) },
+                                        ServerToWeb::UserInput { session_id, text, pane_type, pane_id, created_at: Some(created_at), client_msg_id: None },
                                     )
                                     .await;
                             }

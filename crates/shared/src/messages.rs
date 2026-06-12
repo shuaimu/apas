@@ -676,6 +676,12 @@ pub enum WebToServer {
         pane_type: Option<PaneType>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pane_id: Option<u32>,
+        // Client-generated id for this send. The web client retransmits
+        // inputs it hasn't seen acked (3s retry + reconnect replay); the
+        // server uses this id to drop retransmits of an input it already
+        // stored instead of double-storing them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_msg_id: Option<String>,
     },
 
     /// Approve a tool call. See `Input::session_id` for the multi-attach rationale.
@@ -1146,6 +1152,11 @@ pub enum ServerToWeb {
         // session opens with a user input before any stream activity.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         created_at: Option<String>,
+        // Echoes WebToServer::Input::client_msg_id so the sending client
+        // can ack its pending-send queue and dedup echoes by id instead
+        // of the content+recency heuristic. None for CLI-originated input.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_msg_id: Option<String>,
     },
 
     /// Deadloop pause status update (legacy - use PanePaused for new code)
@@ -2162,6 +2173,51 @@ mod tests {
             }
             _ => panic!("Expected SessionStart variant"),
         }
+    }
+
+    #[test]
+    fn test_web_input_client_msg_id_roundtrip_and_backcompat() {
+        // Old clients omit client_msg_id entirely — must still parse.
+        let legacy = r#"{"type":"input","text":"hi","pane_id":205}"#;
+        let parsed: WebToServer = serde_json::from_str(legacy).unwrap();
+        match parsed {
+            WebToServer::Input { client_msg_id, text, .. } => {
+                assert_eq!(client_msg_id, None);
+                assert_eq!(text, "hi");
+            }
+            _ => panic!("Expected Input variant"),
+        }
+
+        let with_id = r#"{"type":"input","text":"hi","pane_id":205,"client_msg_id":"abc123"}"#;
+        let parsed: WebToServer = serde_json::from_str(with_id).unwrap();
+        match parsed {
+            WebToServer::Input { client_msg_id, .. } => {
+                assert_eq!(client_msg_id.as_deref(), Some("abc123"));
+            }
+            _ => panic!("Expected Input variant"),
+        }
+
+        // Echo carries the id back; None must not serialize the key at all
+        // (older web bundles ignore unknown keys, but keep the wire tidy).
+        let echo = ServerToWeb::UserInput {
+            session_id: Uuid::new_v4(),
+            text: "hi".to_string(),
+            pane_type: None,
+            pane_id: Some(205),
+            created_at: None,
+            client_msg_id: Some("abc123".to_string()),
+        };
+        let json = serde_json::to_string(&echo).unwrap();
+        assert!(json.contains("\"client_msg_id\":\"abc123\""));
+        let no_id = ServerToWeb::UserInput {
+            session_id: Uuid::new_v4(),
+            text: "hi".to_string(),
+            pane_type: None,
+            pane_id: Some(205),
+            created_at: None,
+            client_msg_id: None,
+        };
+        assert!(!serde_json::to_string(&no_id).unwrap().contains("client_msg_id"));
     }
 
     #[test]

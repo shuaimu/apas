@@ -4,7 +4,7 @@ use shared::{
     MachineProjectInfo, MachineWithProjects, MiniMaxBackendInfo, PaneConfig, PaneType, Provider,
     ServerToCli, ServerToDaemon, ServerToWeb, UsageLimits,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -158,6 +158,11 @@ pub struct SessionManager {
     /// only return owner machines and shared entries (like a teammate's
     /// daemon) would visibly disappear between user-initiated refreshes.
     shared_project_refs: DashMap<Uuid, (HashSet<(String, String)>, HashSet<String>)>,
+    /// Recently stored web-input ids per session: (client_msg_id, created_at).
+    /// Idempotency guard — the web client retransmits unacked inputs (3s
+    /// retry + reconnect replay), and without this each retransmit was
+    /// stored and displayed as a fresh message. Bounded ring per session.
+    recent_input_ids: DashMap<Uuid, VecDeque<(String, String)>>,
 }
 
 #[derive(Debug)]
@@ -200,6 +205,27 @@ impl SessionManager {
             machine_infos: DashMap::new(),
             machine_projects: DashMap::new(),
             shared_project_refs: DashMap::new(),
+            recent_input_ids: DashMap::new(),
+        }
+    }
+
+    /// Returns the original `created_at` if this client_msg_id was already
+    /// stored for the session (i.e., this is a retransmit), else None.
+    pub fn seen_input_id(&self, session_id: &Uuid, client_msg_id: &str) -> Option<String> {
+        self.recent_input_ids.get(session_id).and_then(|ids| {
+            ids.iter()
+                .find(|(id, _)| id == client_msg_id)
+                .map(|(_, created_at)| created_at.clone())
+        })
+    }
+
+    /// Record a stored web input's client_msg_id for retransmit dedup.
+    pub fn record_input_id(&self, session_id: Uuid, client_msg_id: String, created_at: String) {
+        const MAX_TRACKED: usize = 64;
+        let mut ids = self.recent_input_ids.entry(session_id).or_default();
+        ids.push_back((client_msg_id, created_at));
+        while ids.len() > MAX_TRACKED {
+            ids.pop_front();
         }
     }
 
@@ -1100,8 +1126,25 @@ impl SessionManager {
                     web_id,
                     session_id
                 );
-                if self.send_to_web(web_id, msg.clone()).await {
-                    any_sent = true;
+                // try_send, never await: one stale connection with a full
+                // queue (e.g. backgrounded phone with a dead TCP) used to
+                // block every broadcast for the 5s send timeout, delaying
+                // user_input echoes past the web client's 3s retransmit
+                // deadline — the cause of duplicate stored inputs. Dropping
+                // a frame for a backlogged client is safe: it repairs via
+                // the watermark catchup on reconnect/visibility.
+                let sender = self.web_senders.get(web_id).map(|s| s.clone());
+                let Some(sender) = sender else { continue };
+                match sender.try_send(msg.clone()) {
+                    Ok(()) => any_sent = true,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            "Web client {} send queue full — dropping broadcast for session {}",
+                            web_id,
+                            session_id
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {}
                 }
             }
             return any_sent;
@@ -1238,5 +1281,29 @@ impl SessionManager {
 impl Default for SessionManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_id_dedup_remembers_and_caps() {
+        let mgr = SessionManager::new();
+        let sid = Uuid::new_v4();
+
+        assert_eq!(mgr.seen_input_id(&sid, "a"), None);
+        mgr.record_input_id(sid, "a".to_string(), "t1".to_string());
+        assert_eq!(mgr.seen_input_id(&sid, "a").as_deref(), Some("t1"));
+        // Different session is independent.
+        assert_eq!(mgr.seen_input_id(&Uuid::new_v4(), "a"), None);
+
+        // Ring is bounded: after 64 more inserts, "a" has been evicted.
+        for i in 0..64 {
+            mgr.record_input_id(sid, format!("id-{i}"), format!("t-{i}"));
+        }
+        assert_eq!(mgr.seen_input_id(&sid, "a"), None);
+        assert_eq!(mgr.seen_input_id(&sid, "id-63").as_deref(), Some("t-63"));
     }
 }

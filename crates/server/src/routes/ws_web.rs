@@ -340,8 +340,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
     let connection_id = Uuid::new_v4();
 
-    // Channel for sending messages to this web client
-    let (tx, mut rx) = mpsc::channel::<ServerToWeb>(32);
+    // Channel for sending messages to this web client. Broadcasts use
+    // try_send (route_to_web) and drop frames when this is full, so size
+    // it to absorb streaming bursts — only a genuinely stalled connection
+    // should ever fill it.
+    let (tx, mut rx) = mpsc::channel::<ServerToWeb>(256);
 
     // Register this web connection
     state.sessions.register_web(connection_id, tx);
@@ -575,12 +578,43 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     text,
                     pane_type,
                     pane_id,
+                    client_msg_id,
                 }) => {
                     let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     else {
                         continue;
                     };
+
+                    // Retransmit of an input we already stored (the web
+                    // client retries unacked sends): don't route/store it
+                    // again — just re-ack the sender so its pending-send
+                    // queue clears even if the original echo was lost.
+                    if let Some(ref cmid) = client_msg_id {
+                        if let Some(orig_created_at) = state.sessions.seen_input_id(&sid, cmid) {
+                            tracing::info!(
+                                "Dropping duplicate input retransmit for session {} (client_msg_id {})",
+                                sid,
+                                cmid
+                            );
+                            state
+                                .sessions
+                                .send_to_web(
+                                    &connection_id,
+                                    ServerToWeb::UserInput {
+                                        session_id: sid,
+                                        text,
+                                        pane_type,
+                                        pane_id,
+                                        created_at: Some(orig_created_at),
+                                        client_msg_id: client_msg_id.clone(),
+                                    },
+                                )
+                                .await;
+                            continue;
+                        }
+                    }
+
                     tracing::info!(
                         "Routing input to session {}: {:?}",
                         sid,
@@ -615,6 +649,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         if let Err(e) = state.storage.append_message(&sid, &stored_message).await {
                             tracing::error!("Failed to save user input to file: {}", e);
                         }
+                        if let Some(cmid) = client_msg_id.clone() {
+                            state.sessions.record_input_id(sid, cmid, created_at.clone());
+                        }
 
                         // Echo user input to all web clients for immediate display.
                         // The CLI skips CliToServer::UserInput for web-originated
@@ -629,6 +666,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     pane_type,
                                     pane_id,
                                     created_at: Some(created_at),
+                                    client_msg_id,
                                 },
                             )
                             .await;

@@ -1640,6 +1640,7 @@ export const useStore = create<AppState>((set, get) => ({
               text: entry.text,
               pane_type: entry.paneType,
               pane_id: entry.paneId,
+              client_msg_id: entry.id,
             }),
           );
           console.warn(`[pending-send] no ack for ${sendId} in 3s — retransmit attempt ${entry.attempts + 1}`);
@@ -1673,7 +1674,10 @@ export const useStore = create<AppState>((set, get) => ({
       session_id: sessionId,
       text,
       pane_type: paneType, // Legacy compat: must be "deadloop" or "interactive"
-      pane_id: paneId
+      pane_id: paneId,
+      // Idempotency key: retransmits (3s retry / reconnect replay) carry
+      // the same id so the server drops them instead of double-storing.
+      client_msg_id: sendId,
     }));
     return { success: true };
   },
@@ -2547,6 +2551,7 @@ function flushPendingSends(
         text: entry.text,
         pane_type: entry.paneType,
         pane_id: entry.paneId,
+        client_msg_id: entry.id,
       }),
     );
   }
@@ -3593,22 +3598,35 @@ function handleServerMessage(
       }
 
       // Server bounce of our own input: claim the optimistic slot the
-      // send handler placed locally. Match by content + recency + the
-      // "optimistic-" id prefix; strip the prefix so a later duplicate
-      // user_input with the same text doesn't re-claim this slot.
+      // send handler placed locally. Prefer exact client_msg_id match
+      // (the id we sent rides back on the echo); fall back to content +
+      // recency + the "optimistic-" id prefix for older servers. Strip
+      // the prefix so a later duplicate user_input with the same text
+      // doesn't re-claim this slot.
+      const clientMsgId = data.client_msg_id as string | undefined;
       if (isCurrentSession) {
         const normalizedPaneId = normalizePaneId(paneType, normalizeRawPaneId(paneId));
         if (normalizedPaneId != null) {
           const key = paneKey(normalizedPaneId);
           const bucket = get().paneMessages[key] || [];
+          // Duplicate echo of an already-claimed send (e.g. the server's
+          // re-ack of a retransmit): the optimistic slot was claimed and
+          // the prefix stripped, so the message id IS the client_msg_id.
+          // Drop the echo instead of appending a second copy.
+          if (clientMsgId && bucket.some((m) => m.id === clientMsgId)) {
+            const nextPending = get().pendingSends.filter((p) => p.id !== clientMsgId);
+            if (nextPending.length !== get().pendingSends.length) {
+              savePendingSends(nextPending);
+              set({ pendingSends: nextPending });
+            }
+            break;
+          }
           const now = Date.now();
-          const idx = bucket.findIndex(
-            (m) =>
-              m.role === "user" &&
-              m.id.startsWith("optimistic-") &&
-              m.content === text &&
-              now - m.timestamp.getTime() < 30_000,
-          );
+          const idx = bucket.findIndex((m) => {
+            if (m.role !== "user" || !m.id.startsWith("optimistic-")) return false;
+            if (clientMsgId) return m.id === `optimistic-${clientMsgId}`;
+            return m.content === text && now - m.timestamp.getTime() < 30_000;
+          });
           if (idx >= 0) {
             const ackedSendId = bucket[idx].id.replace(/^optimistic-/, "");
             set((state) => {
@@ -3660,14 +3678,14 @@ function handleServerMessage(
       // the next reconnect doesn't replay it again.
       if (msgSessionId) {
         const now = Date.now();
-        const nextPending = get().pendingSends.filter(
-          (p) =>
-            !(
-              p.sessionId === msgSessionId &&
-              p.text === text &&
-              now - p.createdAt < 10 * 60_000
-            ),
-        );
+        const nextPending = get().pendingSends.filter((p) => {
+          if (clientMsgId && p.id === clientMsgId) return false;
+          return !(
+            p.sessionId === msgSessionId &&
+            p.text === text &&
+            now - p.createdAt < 10 * 60_000
+          );
+        });
         if (nextPending.length !== get().pendingSends.length) {
           savePendingSends(nextPending);
           set({ pendingSends: nextPending });
