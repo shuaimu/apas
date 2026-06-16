@@ -2032,18 +2032,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         // web client sees the current goal without waiting
                         // for the CLI's mtime poller to fire on an actual
                         // file change (which may not happen for hours).
-                        if let Some(content) = state.sessions.get_project_goal(&sid) {
-                            state
-                                .sessions
-                                .send_to_web(
-                                    &connection_id,
-                                    ServerToWeb::ProjectGoalChanged {
-                                        session_id: sid,
-                                        content,
-                                    },
-                                )
-                                .await;
-                        }
+                        state
+                            .sessions
+                            .replay_project_goal_to_web(&sid, &connection_id)
+                            .await;
 
                         state
                             .sessions

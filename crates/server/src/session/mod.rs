@@ -977,6 +977,26 @@ impl SessionManager {
             .and_then(|s| s.project_goal.clone())
     }
 
+    /// Replay the cached project goal to one newly-attached web client.
+    pub async fn replay_project_goal_to_web(
+        &self,
+        session_id: &Uuid,
+        web_connection_id: &Uuid,
+    ) -> bool {
+        if let Some(content) = self.get_project_goal(session_id) {
+            self.send_to_web(
+                web_connection_id,
+                ServerToWeb::ProjectGoalChanged {
+                    session_id: *session_id,
+                    content,
+                },
+            )
+            .await
+        } else {
+            false
+        }
+    }
+
     /// Check if a session has an active CLI client connected
     pub fn is_session_active(&self, session_id: &Uuid) -> bool {
         // Check if any connected CLI client has this session as their active session
@@ -1275,6 +1295,46 @@ impl SessionManager {
             .iter()
             .map(|entry| (entry.key().0, entry.key().1.clone(), entry.value().clone()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod project_goal_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cached_project_goal_replays_to_new_web_attachment() {
+        let sessions = SessionManager::new();
+        let session_id = Uuid::new_v4();
+        let cli_id = Uuid::new_v4();
+        let web_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let (cli_tx, _cli_rx) = mpsc::channel(1);
+        let (web_tx, mut web_rx) = mpsc::channel(1);
+
+        sessions.register_cli(cli_id, user_id, cli_tx, None);
+        sessions.create_cli_session(
+            session_id,
+            cli_id,
+            Some("/work/project".to_string()),
+            Some("host".to_string()),
+        );
+        sessions.set_project_goal(&session_id, "line one\n\nline two\n".to_string());
+        sessions.register_web(web_id, web_tx);
+
+        assert!(sessions.attach_web_to_session(&session_id, web_id, Some(cli_id)));
+        assert!(sessions.replay_project_goal_to_web(&session_id, &web_id).await);
+
+        match web_rx.recv().await.expect("project goal replay") {
+            ServerToWeb::ProjectGoalChanged {
+                session_id: got_session,
+                content,
+            } => {
+                assert_eq!(got_session, session_id);
+                assert_eq!(content, "line one\n\nline two\n");
+            }
+            other => panic!("unexpected replay message: {other:?}"),
+        }
     }
 }
 

@@ -47,4 +47,15 @@ mod tests {
         write_project_goal(&dir, "actually ship it tomorrow").unwrap();
         assert_eq!(read_project_goal(&dir), "actually ship it tomorrow");
     }
+
+    #[test]
+    fn write_project_goal_preserves_exact_content() {
+        let dir = fresh_dir();
+        let goal = "line one\n\nline two with trailing spaces  \n";
+
+        write_project_goal(&dir, goal).unwrap();
+
+        assert_eq!(std::fs::read_to_string(goal_path(&dir)).unwrap(), goal);
+        assert_eq!(read_project_goal(&dir), goal);
+    }
 }

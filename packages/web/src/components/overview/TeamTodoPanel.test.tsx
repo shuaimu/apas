@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import { parsePrLine } from "./TeamTodoPanel";
 import { TeamTodoPanel } from "./TeamTodoPanel";
 import { useStore, type TeamTodoState } from "@/lib/store";
@@ -70,10 +70,13 @@ describe("parsePrLine", () => {
 // --- UI test: PrStateBadge color via stubbed fetch ----------------------
 
 function seedTeamTodo(state: TeamTodoState) {
-  useStore.setState({
-    sessionId: "test-session",
-    teamTodoState: state,
-    fetchTeamTodo: vi.fn(),
+  act(() => {
+    useStore.setState({
+      sessionId: "test-session",
+      teamTodoState: state,
+      teamTodoStates: new Map([["test-session", state]]),
+      fetchTeamTodo: vi.fn(),
+    });
   });
 }
 
@@ -105,7 +108,13 @@ describe("PrStateBadge fetch-driven color", () => {
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
-    useStore.setState({ sessionId: null, teamTodoState: null });
+    act(() => {
+      useStore.setState({
+        sessionId: null,
+        teamTodoState: null,
+        teamTodoStates: new Map(),
+      });
+    });
   });
 
   it("renders MERGED (green) when GitHub reports merged", async () => {
@@ -174,7 +183,7 @@ describe("PrStateBadge fetch-driven color", () => {
     );
   });
 
-  it("skips fetch entirely and shows MERGED when global is status: done", async () => {
+  it("skips fetch entirely and renders only the PR link when global is status: done", () => {
     seedTeamTodo(mkGlobal("done", PR_URL));
     const fetchSpy = vi.fn().mockResolvedValue({
       ok: true,
@@ -183,9 +192,11 @@ describe("PrStateBadge fetch-driven color", () => {
     });
     globalThis.fetch = fetchSpy as unknown as typeof fetch;
     render(<TeamTodoPanel />);
-    const badge = await screen.findByTestId("pr-state-badge");
-    expect(badge.getAttribute("data-pr-state")).toBe("done");
-    expect(badge.textContent).toBe("MERGED");
+    expect(screen.queryByTestId("pr-state-badge")).toBeNull();
+    const link = screen.getByRole("link", {
+      name: /PR \(pane 218\)/,
+    }) as HTMLAnchorElement;
+    expect(link.getAttribute("href")).toBe(PR_URL);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
