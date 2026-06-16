@@ -69,11 +69,15 @@ Do not write production code yourself — your job is design and orchestration. 
 const AUTO_GENERATE_CHAT_MESSAGE = `Please scan this project and write a starter project_goal.md.
 
 Read, in order:
-1. README.md at the project root (if present).
-2. Whichever build/manifest file describes the project — package.json, Cargo.toml, pyproject.toml, go.mod, CMakeLists.txt, etc.
-3. \`git log --oneline -50\` for the recent activity shape.
-4. TODO.md / ROADMAP.md / CHANGELOG.md if present.
-5. The docs/ folder (skim the index or top file).
+1. Existing project_goal.md, if present, so you preserve any user-stated direction.
+2. team-todo.md, especially Global TODOs that are proposed, approved, in_progress, pr_open, or recently done.
+3. The last ~50 records of .apas-team.jsonl, focusing on delegations, diffs, reviews, decisions, escalations, and pr-opened records.
+4. .apas, specifically the managed pane roster and the Manager / Tech Lead / Developer / Reviewer roles currently configured.
+5. README.md and CLAUDE.md at the project root, if present.
+6. docs/team-mode.md and docs/todo-driven-workflow.md, if present, because they describe the current team-mode workflow.
+7. Whichever build/manifest file describes the project — package.json, Cargo.toml, pyproject.toml, go.mod, CMakeLists.txt, etc.
+8. \`git log --oneline -50\` for the recent activity shape.
+9. TODO.md / ROADMAP.md / CHANGELOG.md only as legacy fallback context if the team-mode sources above are missing or thin.
 
 Then use Write to overwrite project_goal.md with a 3–7 sentence goal: what this project IS in one sentence, what's currently in progress (based on recent commits + TODOs), and what the next meaningful milestone looks like. Be concrete — name specific subsystems, modules, or files where useful.
 
@@ -477,7 +481,7 @@ export function ProjectGoalBar() {
               type="button"
               onClick={handleAutoGenerate}
               className="flex items-center gap-1 rounded border border-indigo-500 bg-indigo-600 px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-indigo-500"
-              title="Ask the Manager to scan README, build files, recent commits + docs and write a starter project_goal.md."
+              title="Ask the Manager to scan team-mode sources, recent commits, and docs before writing a starter project_goal.md."
             >
               <Sparkles className="h-3 w-3" /> Auto-generate
             </button>

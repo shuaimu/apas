@@ -14,6 +14,7 @@ function seedProjectGoalBar(overrides: Partial<{
   addPane: ReturnType<typeof vi.fn>;
   pausePane: ReturnType<typeof vi.fn>;
   resumePane: ReturnType<typeof vi.fn>;
+  sendMessageToPane: ReturnType<typeof vi.fn>;
 }> = {}) {
   const sessionId = overrides.sessionId ?? DEFAULT_SESSION_ID;
 
@@ -27,7 +28,7 @@ function seedProjectGoalBar(overrides: Partial<{
     resumePane: overrides.resumePane ?? vi.fn(),
     interruptPane: vi.fn(),
     updateProjectGoal: vi.fn(),
-    sendMessageToPane: vi.fn(() => ({ success: true })),
+    sendMessageToPane: overrides.sendMessageToPane ?? vi.fn(() => ({ success: true })),
     showToast: vi.fn(),
   });
 }
@@ -123,6 +124,40 @@ describe("ProjectGoalBar team role slots", () => {
     expect(screen.getAllByText("Claude / MiniMax 2.7").length).toBeGreaterThan(0);
     fireEvent.click(screen.getByTitle("Resume Tech Lead"));
     expect(resumePane).toHaveBeenCalledWith(77);
+  });
+
+  it("asks the Manager to scan team-mode sources when auto-generating the goal", () => {
+    const sendMessageToPane = vi.fn(() => ({ success: true }));
+    seedProjectGoalBar({
+      sendMessageToPane,
+      paneConfigs: [
+        {
+          pane_id: 42,
+          role: "manager",
+          mode: "interactive",
+          label: "Manager",
+          provider: "claude",
+          model: "official",
+          managed: true,
+        } as PaneConfig,
+      ],
+    });
+
+    render(<ProjectGoalBar />);
+    fireEvent.click(screen.getByText("Auto-generate"));
+
+    expect(sendMessageToPane).toHaveBeenCalledTimes(1);
+    const [prompt, paneId] = sendMessageToPane.mock.calls[0] ?? [];
+    expect(paneId).toBe(42);
+    expect(prompt).toEqual(expect.stringContaining("team-todo.md"));
+    expect(prompt).toEqual(expect.stringContaining(".apas-team.jsonl"));
+    expect(prompt).toEqual(expect.stringContaining(".apas"));
+    expect(prompt).toEqual(expect.stringContaining("docs/team-mode.md"));
+    expect(prompt).toEqual(expect.stringContaining("docs/todo-driven-workflow.md"));
+    expect(prompt).toEqual(expect.stringContaining("TODO.md / ROADMAP.md / CHANGELOG.md only as legacy fallback context"));
+    expect(String(prompt).indexOf("team-todo.md")).toBeLessThan(
+      String(prompt).indexOf("TODO.md / ROADMAP.md"),
+    );
   });
 
   it("hydrates from projectGoals without clobbering a dirty edit", async () => {
