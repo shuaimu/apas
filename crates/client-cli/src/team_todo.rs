@@ -253,7 +253,8 @@ pub fn to_wire(todo: &TeamTodo) -> shared::TeamTodoStateMsg {
 }
 
 /// What the Tech Lead's next iteration should do, derived from the
-/// current `team-todo.md`. `apas todo next` prints this as JSON.
+/// current `team-todo.md`. Used by the Tech Lead loop and web surfaces
+/// to summarize expansion, dispatch, and review handoff work.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct NextActions {
     /// Oldest `approved` global TODO with no subtasks yet — Tech Lead
