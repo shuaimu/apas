@@ -702,6 +702,29 @@ fn start_bot_preserved_fields(meta: Option<&PaneMeta>) -> StartBotPreservedField
     }
 }
 
+fn restored_pane_mode_and_pause(
+    pane: &shared::PaneConfig,
+    legacy_deadloop_paused: bool,
+) -> (shared::PaneMode, bool) {
+    let mode = if pane.mode == shared::PaneMode::Deadloop && pane.stop_requested {
+        shared::PaneMode::Interactive
+    } else {
+        pane.mode.clone()
+    };
+
+    let is_paused = if mode == shared::PaneMode::Deadloop {
+        if pane.pane_id == shared::PANE_ID_DEADLOOP {
+            pane.is_paused || legacy_deadloop_paused
+        } else {
+            pane.is_paused
+        }
+    } else {
+        false
+    };
+
+    (mode, is_paused)
+}
+
 /// One held tool_use waiting on user approval (Phase 3.2b2).
 #[derive(Clone, Debug)]
 struct PendingPlanReview {
@@ -1080,24 +1103,9 @@ async fn run_inner(
         .panes
         .iter()
         .map(|pane| {
-            // If a stop was requested but never finalized before a crash/restart,
-            // restore as interactive to avoid accidentally re-starting bot mode.
-            let mode = if pane.mode == shared::PaneMode::Deadloop && pane.stop_requested {
-                shared::PaneMode::Interactive
-            } else {
-                pane.mode.clone()
-            };
+            let (mode, is_paused) = restored_pane_mode_and_pause(pane, metadata.is_paused);
             let label =
                 pane_label_or_default(pane.label.as_deref(), pane.pane_id, pane.model.as_deref());
-            let is_paused = if mode == shared::PaneMode::Deadloop {
-                if pane.pane_id == shared::PANE_ID_DEADLOOP {
-                    pane.is_paused || metadata.is_paused
-                } else {
-                    pane.is_paused
-                }
-            } else {
-                false
-            };
 
             (
                 pane.pane_id,
@@ -3870,10 +3878,10 @@ mod tests {
         active_usage_providers, auto_cancel_pending_questions_for_new_input, build_agent_args,
         build_pane_env_overrides_from_keys, build_pane_list, pane_label_or_default,
         promote_pane_to_managed, resolve_pane_binary_path, route_web_input_to_pane,
-        run_deadloop_session_inner, save_pane_configs, start_bot_preserved_fields,
-        truncate_str_at_char_boundary, ASK_USER_QUESTION_AUTO_CANCEL_STATUS, InputChannels,
-        PaneInputRouteResult, PaneMeta, PaneMetas, PanePauses, PaneStopRequests,
-        PendingAskQuestion,
+        restored_pane_mode_and_pause, run_deadloop_session_inner, save_pane_configs,
+        start_bot_preserved_fields, truncate_str_at_char_boundary,
+        ASK_USER_QUESTION_AUTO_CANCEL_STATUS, InputChannels, PaneInputRouteResult, PaneMeta,
+        PaneMetas, PanePauses, PaneStopRequests, PendingAskQuestion,
     };
     use crate::project::get_or_create_project;
     use crate::tui::{PaneOutput, TuiEvent};
@@ -3917,6 +3925,34 @@ mod tests {
             pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
             manual_mode: true,
             managed,
+        }
+    }
+
+    fn test_pane_config(
+        pane_id: u32,
+        mode: shared::PaneMode,
+        is_paused: bool,
+        stop_requested: bool,
+    ) -> shared::PaneConfig {
+        shared::PaneConfig {
+            pane_id,
+            provider: Provider::Codex,
+            mode,
+            session_id: Uuid::new_v4(),
+            is_paused,
+            stop_requested,
+            prompt: None,
+            min_iteration_interval_minutes: None,
+            label: None,
+            model: None,
+            effort: None,
+            worktree_path: None,
+            role: None,
+            goal: None,
+            backstory: None,
+            plan_review_mode: shared::PlanReviewMode::default(),
+            manual_mode: false,
+            managed: false,
         }
     }
 
@@ -4095,6 +4131,60 @@ mod tests {
         let metadata = get_or_create_project(dir.path()).expect("metadata should reload");
         assert!(!metadata.is_paused);
         assert!(metadata.panes.iter().all(|pane| !pane.is_paused));
+    }
+
+    #[test]
+    fn restored_pane_mode_and_pause_maps_persisted_pause_state() {
+        let legacy_deadloop = test_pane_config(
+            shared::PANE_ID_DEADLOOP,
+            shared::PaneMode::Deadloop,
+            false,
+            false,
+        );
+        assert_eq!(
+            restored_pane_mode_and_pause(&legacy_deadloop, true),
+            (shared::PaneMode::Deadloop, true)
+        );
+
+        let persisted_deadloop = test_pane_config(
+            shared::PANE_ID_DEADLOOP,
+            shared::PaneMode::Deadloop,
+            true,
+            false,
+        );
+        assert_eq!(
+            restored_pane_mode_and_pause(&persisted_deadloop, false),
+            (shared::PaneMode::Deadloop, true)
+        );
+
+        let paused_worker = test_pane_config(42, shared::PaneMode::Deadloop, true, false);
+        assert_eq!(
+            restored_pane_mode_and_pause(&paused_worker, false),
+            (shared::PaneMode::Deadloop, true)
+        );
+
+        let unpaused_worker = test_pane_config(42, shared::PaneMode::Deadloop, false, false);
+        assert_eq!(
+            restored_pane_mode_and_pause(&unpaused_worker, true),
+            (shared::PaneMode::Deadloop, false)
+        );
+
+        let stopped_deadloop = test_pane_config(
+            shared::PANE_ID_DEADLOOP,
+            shared::PaneMode::Deadloop,
+            true,
+            true,
+        );
+        assert_eq!(
+            restored_pane_mode_and_pause(&stopped_deadloop, true),
+            (shared::PaneMode::Interactive, false)
+        );
+
+        let interactive = test_pane_config(2, shared::PaneMode::Interactive, true, false);
+        assert_eq!(
+            restored_pane_mode_and_pause(&interactive, true),
+            (shared::PaneMode::Interactive, false)
+        );
     }
 
     #[test]
