@@ -437,6 +437,85 @@ describe('DeepSeek machine config', () => {
   });
 });
 
+describe('pane pause state sync', () => {
+  async function connectAndDispatch(payload: Record<string, unknown>) {
+    useStore.getState().connect();
+    await new Promise(resolve => setTimeout(resolve, 10));
+    useStore.setState({ isAuthenticated: true, sessionId: 'session-pause' });
+    const ws = useStore.getState().ws as unknown as { onmessage?: (event: MessageEvent) => void };
+    ws.onmessage?.(new MessageEvent('message', {
+      data: JSON.stringify(payload),
+    }));
+  }
+
+  beforeEach(() => {
+    useStore.setState({
+      connected: false,
+      isAuthenticated: false,
+      sessionId: 'session-pause',
+      ws: null,
+      pausedPanes: [],
+      paneConfigs: [],
+      paneModes: {},
+      isDeadloopPaused: false,
+    });
+  });
+
+  it('seeds pausedPanes from PaneList is_paused flags', async () => {
+    await connectAndDispatch({
+      type: 'pane_list',
+      session_id: 'session-pause',
+      panes: [
+        {
+          pane_id: 1,
+          provider: 'claude',
+          mode: 'deadloop',
+          session_id: 'pane-1',
+          is_paused: true,
+        },
+        {
+          pane_id: 42,
+          provider: 'codex',
+          mode: 'deadloop',
+          session_id: 'pane-42',
+          is_paused: false,
+        },
+        {
+          pane_id: 99,
+          provider: 'claude',
+          mode: 'interactive',
+          session_id: 'pane-99',
+          is_paused: true,
+        },
+      ],
+    });
+
+    const state = useStore.getState();
+    expect(state.pausedPanes).toEqual([1, 99]);
+    expect(state.isDeadloopPaused).toBe(true);
+    expect(state.paneConfigs.map((pane) => pane.provider)).toEqual(['claude', 'codex', 'claude']);
+  });
+
+  it('adds and removes pane_paused events without duplicate ids', async () => {
+    useStore.setState({ pausedPanes: [5], isDeadloopPaused: false });
+
+    await connectAndDispatch({ type: 'pane_paused', pane_id: 7, is_paused: true });
+    await connectAndDispatch({ type: 'pane_paused', pane_id: 7, is_paused: true });
+    expect(useStore.getState().pausedPanes).toEqual([5, 7]);
+
+    await connectAndDispatch({ type: 'pane_paused', pane_id: 7, is_paused: false });
+    expect(useStore.getState().pausedPanes).toEqual([5]);
+
+    await connectAndDispatch({ type: 'pane_paused', pane_id: 1, is_paused: true });
+    expect(useStore.getState().pausedPanes).toEqual([5, 1]);
+    expect(useStore.getState().isDeadloopPaused).toBe(true);
+
+    await connectAndDispatch({ type: 'pane_paused', pane_id: 1, is_paused: false });
+    expect(useStore.getState().pausedPanes).toEqual([5]);
+    expect(useStore.getState().isDeadloopPaused).toBe(false);
+  });
+});
+
 describe('suggested worker accept/dismiss', () => {
   const initialStore = useStore.getInitialState();
 

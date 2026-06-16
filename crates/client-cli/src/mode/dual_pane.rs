@@ -2033,6 +2033,11 @@ fn save_pane_configs(
             })
             .collect();
         panes.sort_by_key(|p| p.pane_id);
+        metadata.is_paused = panes
+            .iter()
+            .find(|pane| pane.pane_id == shared::PANE_ID_DEADLOOP)
+            .map(|pane| pane.is_paused)
+            .unwrap_or(false);
         metadata.panes = panes;
         let _ = save_project(Path::new(working_dir), &metadata);
     }
@@ -3865,13 +3870,20 @@ mod tests {
         active_usage_providers, auto_cancel_pending_questions_for_new_input, build_agent_args,
         build_pane_env_overrides_from_keys, build_pane_list, pane_label_or_default,
         promote_pane_to_managed, resolve_pane_binary_path, route_web_input_to_pane,
-        start_bot_preserved_fields, truncate_str_at_char_boundary,
-        ASK_USER_QUESTION_AUTO_CANCEL_STATUS, InputChannels, PaneInputRouteResult, PaneMeta,
-        PaneMetas, PanePauses, PaneStopRequests, PendingAskQuestion,
+        run_deadloop_session_inner, save_pane_configs, start_bot_preserved_fields,
+        truncate_str_at_char_boundary, ASK_USER_QUESTION_AUTO_CANCEL_STATUS, InputChannels,
+        PaneInputRouteResult, PaneMeta, PaneMetas, PanePauses, PaneStopRequests,
+        PendingAskQuestion,
     };
-    use shared::Provider;
+    use crate::project::get_or_create_project;
+    use crate::tui::{PaneOutput, TuiEvent};
+    use shared::{CliToServer, Provider};
     use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
+    use tokio::sync::mpsc as tokio_mpsc;
     use uuid::Uuid;
 
     const FULL_PROMPT: &str =
@@ -4001,6 +4013,156 @@ mod tests {
         assert!(!preserved.manual_mode);
         assert!(preserved.role.is_none());
         assert_eq!(preserved.plan_review_mode, shared::PlanReviewMode::Never);
+    }
+
+    #[test]
+    fn save_pane_configs_persists_pause_flags_and_legacy_deadloop_pause() {
+        let dir = tempfile::tempdir().expect("temp project dir");
+        let working_dir = dir.path().to_string_lossy().to_string();
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+        let pane_sessions = Arc::new(Mutex::new(HashMap::new()));
+        let pane_pauses: PanePauses = Arc::new(Mutex::new(HashMap::new()));
+        let pane_stop_requests: PaneStopRequests = Arc::new(Mutex::new(HashMap::new()));
+
+        {
+            let mut metas = pane_metas.lock().unwrap();
+            metas.insert(
+                shared::PANE_ID_DEADLOOP,
+                test_pane_meta(Provider::Claude, true, None, Arc::new(Mutex::new(None))),
+            );
+            metas.insert(
+                42,
+                test_pane_meta(Provider::Codex, true, None, Arc::new(Mutex::new(None))),
+            );
+        }
+        {
+            let mut sessions = pane_sessions.lock().unwrap();
+            sessions.insert(shared::PANE_ID_DEADLOOP, Uuid::new_v4());
+            sessions.insert(42, Uuid::new_v4());
+        }
+        {
+            let mut pauses = pane_pauses.lock().unwrap();
+            pauses.insert(shared::PANE_ID_DEADLOOP, Arc::new(AtomicBool::new(true)));
+            pauses.insert(42, Arc::new(AtomicBool::new(true)));
+        }
+
+        save_pane_configs(
+            &working_dir,
+            &pane_sessions,
+            &pane_metas,
+            &pane_pauses,
+            &pane_stop_requests,
+        );
+
+        let metadata = get_or_create_project(dir.path()).expect("metadata should reload");
+        assert!(metadata.is_paused);
+        assert!(
+            metadata
+                .panes
+                .iter()
+                .find(|pane| pane.pane_id == shared::PANE_ID_DEADLOOP)
+                .expect("deadloop pane")
+                .is_paused
+        );
+        assert!(
+            metadata
+                .panes
+                .iter()
+                .find(|pane| pane.pane_id == 42)
+                .expect("managed worker pane")
+                .is_paused
+        );
+
+        {
+            let pauses = pane_pauses.lock().unwrap();
+            pauses
+                .get(&shared::PANE_ID_DEADLOOP)
+                .expect("deadloop pause flag")
+                .store(false, Ordering::SeqCst);
+            pauses
+                .get(&42)
+                .expect("worker pause flag")
+                .store(false, Ordering::SeqCst);
+        }
+        save_pane_configs(
+            &working_dir,
+            &pane_sessions,
+            &pane_metas,
+            &pane_pauses,
+            &pane_stop_requests,
+        );
+
+        let metadata = get_or_create_project(dir.path()).expect("metadata should reload");
+        assert!(!metadata.is_paused);
+        assert!(metadata.panes.iter().all(|pane| !pane.is_paused));
+    }
+
+    #[test]
+    fn paused_deadloop_session_waits_without_spawning_child() {
+        let dir = tempfile::tempdir().expect("temp project dir");
+        let working_dir = dir.path().to_string_lossy().to_string();
+        let (output_tx, output_rx) = mpsc::channel::<PaneOutput>();
+        let (event_tx, _event_rx) = mpsc::channel::<TuiEvent>();
+        let (server_tx, _server_rx) = tokio_mpsc::channel::<CliToServer>(8);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(AtomicBool::new(true));
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let child_process = Arc::new(Mutex::new(None));
+        let child_for_assert = child_process.clone();
+        let input_channels: InputChannels = Arc::new(Mutex::new(HashMap::new()));
+        let watcher = Arc::new(crate::file_watcher::ProjectFileWatcher::new(dir.path()));
+        let shutdown_for_thread = shutdown.clone();
+
+        let handle = thread::spawn(move || {
+            let provider = Provider::Codex;
+            run_deadloop_session_inner(
+                "apas-test-binary-that-must-not-run",
+                &working_dir,
+                None,
+                None,
+                Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                Arc::new(Mutex::new(HashMap::new())),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                shared::PANE_ID_DEADLOOP,
+                "test prompt",
+                None,
+                None,
+                0,
+                &provider,
+                output_tx,
+                server_tx,
+                shutdown_for_thread,
+                pause,
+                stop_requested,
+                child_process,
+                event_tx,
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(None)),
+                input_channels,
+                true,
+                watcher,
+            );
+        });
+
+        let mut saw_paused = false;
+        for _ in 0..10 {
+            if let Ok(output) = output_rx.recv_timeout(Duration::from_millis(100)) {
+                assert!(!output.text.contains("Failed to spawn"));
+                assert!(!output.text.contains("Error spawning"));
+                saw_paused |= output.text.contains("paused - waiting for resume");
+                if saw_paused {
+                    break;
+                }
+            }
+        }
+
+        assert!(saw_paused, "paused loop should report that it is waiting");
+        assert!(child_for_assert.lock().unwrap().is_none());
+        shutdown.store(true, Ordering::SeqCst);
+        handle.join().expect("paused worker should exit cleanly");
     }
 
     #[test]
