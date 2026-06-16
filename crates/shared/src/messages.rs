@@ -2253,6 +2253,29 @@ mod tests {
             ServerToCli::Registered { cli_id: cid } => assert_eq!(cid, cli_id),
             _ => panic!("Expected Registered variant"),
         }
+
+        let session_id = Uuid::new_v4();
+        let msg = ServerToCli::RebootPane {
+            session_id,
+            pane_id: 42,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["type"], "reboot_pane");
+        assert_eq!(value["session_id"], session_id.to_string());
+        assert_eq!(value["pane_id"], 42);
+
+        let deserialized: ServerToCli = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            ServerToCli::RebootPane {
+                session_id: sid,
+                pane_id,
+            } => {
+                assert_eq!(sid, session_id);
+                assert_eq!(pane_id, 42);
+            }
+            _ => panic!("Expected RebootPane variant"),
+        }
     }
 
     #[test]
@@ -2266,6 +2289,39 @@ mod tests {
         let msg = WebToServer::ListCliClients;
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"list_cli_clients\""));
+
+        let session_id = Uuid::new_v4();
+        let msg = WebToServer::RebootPane {
+            session_id: Some(session_id),
+            pane_id: 42,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["type"], "reboot_pane");
+        assert_eq!(value["session_id"], session_id.to_string());
+        assert_eq!(value["pane_id"], 42);
+
+        let deserialized: WebToServer = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            WebToServer::RebootPane {
+                session_id: sid,
+                pane_id,
+            } => {
+                assert_eq!(sid, Some(session_id));
+                assert_eq!(pane_id, 42);
+            }
+            _ => panic!("Expected RebootPane variant"),
+        }
+
+        let msg = WebToServer::RebootPane {
+            session_id: None,
+            pane_id: 7,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["type"], "reboot_pane");
+        assert!(value.get("session_id").is_none());
+        assert_eq!(value["pane_id"], 7);
     }
 
     #[test]

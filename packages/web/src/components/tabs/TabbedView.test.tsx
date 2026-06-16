@@ -1,11 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   botPromptForPane,
   CLASSIC_TODO_BOT_LOOP_PROMPT,
+  confirmedPaneRebootTarget,
   defaultBotPromptForPane,
   deriveInitialActiveTabId,
   lazyPaneMessageLoadTargets,
   OVERVIEW_PANE_ID,
+  requestConfirmedPaneReboot,
+  shouldShowPaneRebootButton,
 } from "./TabbedView";
 
 describe("deriveInitialActiveTabId", () => {
@@ -96,6 +99,45 @@ describe("lazyPaneMessageLoadTargets", () => {
         tabIds: [10, 20],
       }),
     ).toEqual([]);
+  });
+});
+
+describe("pane reboot controls", () => {
+  it("hides the per-pane reboot button on Overview and null tabs", () => {
+    expect(shouldShowPaneRebootButton(OVERVIEW_PANE_ID)).toBe(false);
+    expect(shouldShowPaneRebootButton(null)).toBe(false);
+    expect(shouldShowPaneRebootButton(42)).toBe(true);
+  });
+
+  it("returns a real pane target only after confirmation", () => {
+    const confirm = vi.fn(() => true);
+
+    expect(confirmedPaneRebootTarget(42, confirm)).toBe(42);
+    expect(confirm).toHaveBeenCalledOnce();
+
+    expect(confirmedPaneRebootTarget(OVERVIEW_PANE_ID, confirm)).toBeNull();
+    expect(confirmedPaneRebootTarget(null, confirm)).toBeNull();
+    expect(confirm).toHaveBeenCalledOnce();
+
+    expect(confirmedPaneRebootTarget(7, vi.fn(() => false))).toBeNull();
+  });
+
+  it("invokes rebootPane for real panes only after confirmation", () => {
+    const rebootPane = vi.fn();
+    const confirm = vi.fn(() => true);
+
+    requestConfirmedPaneReboot(42, confirm, rebootPane);
+
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(rebootPane).toHaveBeenCalledWith(42);
+
+    requestConfirmedPaneReboot(OVERVIEW_PANE_ID, confirm, rebootPane);
+    requestConfirmedPaneReboot(null, confirm, rebootPane);
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(rebootPane).toHaveBeenCalledOnce();
+
+    requestConfirmedPaneReboot(7, vi.fn(() => false), rebootPane);
+    expect(rebootPane).toHaveBeenCalledOnce();
   });
 });
 
