@@ -98,6 +98,29 @@ describe("ProjectGoalBar team role slots", () => {
     );
   });
 
+  it("launches a missing Tech Lead with remote-aware survey prompt", () => {
+    const addPane = vi.fn(() => ({ success: true }));
+    seedProjectGoalBar({ addPane });
+    render(<ProjectGoalBar />);
+
+    const techLeadSlot = screen
+      .getByText("Tech Lead")
+      .closest("div[class*='rounded border']");
+    const launchButton = techLeadSlot?.querySelector("button");
+    expect(launchButton).toBeTruthy();
+    fireEvent.click(launchButton as HTMLButtonElement);
+
+    expect(addPane).toHaveBeenCalledTimes(1);
+    const prompt = addPane.mock.calls[0]?.[3];
+    expect(prompt).toEqual(expect.stringContaining("fetch remote metadata"));
+    expect(prompt).toEqual(expect.stringContaining("remote/default-branch drift"));
+    expect(prompt).toEqual(expect.stringContaining("origin/HEAD"));
+    expect(prompt).toEqual(expect.stringContaining("origin/master"));
+    expect(prompt).toEqual(expect.stringContaining("preserve the worktree"));
+    expect(prompt).toEqual(expect.stringContaining("git show origin/HEAD:README.md"));
+    expect(prompt).toEqual(expect.stringContaining("git show origin/HEAD:CLAUDE.md"));
+  });
+
   it("shows launched slots with pane id and pause/resume controls", () => {
     const resumePane = vi.fn();
     seedProjectGoalBar({
