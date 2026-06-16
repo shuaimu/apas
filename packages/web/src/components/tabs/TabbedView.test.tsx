@@ -4,6 +4,7 @@ import {
   CLASSIC_TODO_BOT_LOOP_PROMPT,
   defaultBotPromptForPane,
   deriveInitialActiveTabId,
+  lazyPaneMessageLoadTargets,
   OVERVIEW_PANE_ID,
 } from "./TabbedView";
 
@@ -63,6 +64,38 @@ describe("deriveInitialActiveTabId", () => {
         savedActiveTab: "999",
       }),
     ).toBe(OVERVIEW_PANE_ID);
+  });
+});
+
+describe("lazyPaneMessageLoadTargets", () => {
+  it("requests only the active real pane", () => {
+    expect(
+      lazyPaneMessageLoadTargets({
+        activeTabId: 20,
+        tabIds: [10, 20, 30],
+      }),
+    ).toEqual([20]);
+  });
+
+  it("skips Overview, stale active tabs, and null active tabs", () => {
+    expect(
+      lazyPaneMessageLoadTargets({
+        activeTabId: OVERVIEW_PANE_ID,
+        tabIds: [10, 20],
+      }),
+    ).toEqual([]);
+    expect(
+      lazyPaneMessageLoadTargets({
+        activeTabId: 99,
+        tabIds: [10, 20],
+      }),
+    ).toEqual([]);
+    expect(
+      lazyPaneMessageLoadTargets({
+        activeTabId: null,
+        tabIds: [10, 20],
+      }),
+    ).toEqual([]);
   });
 });
 
