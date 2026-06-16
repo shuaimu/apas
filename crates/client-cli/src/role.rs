@@ -225,7 +225,7 @@ Once the Reviewer publishes `kind: \"review\"` with `approves:<your_pane_id>` fo
 After opening the PR, your job on this task is NOT done — it's *waiting*. Don't grab another task yet. Each iteration (if you're a deadloop pane):
 - `gh pr view <url> --json state -q .state` to check the PR state.
 - If `OPEN`, just say `\"Waiting for review on <url>\"` and end the iteration. Don't churn.
-- If `MERGED`, you're done. Publish `kind: \"decision\"` with `tags: [\"task:<TODO-NNN · slug>\", \"pr-merged\"]` and body `PR merged: <url>`. Now you're free to pick up another delegation.
+- If `MERGED`, you're done. Publish `kind: \"decision\"` with `tags: [\"task:<TODO-NNN · slug>\", \"pr-merged\"]` and body `PR merged: <url>`. Then clean the worktree before another delegation: `git -C <worktree> checkout master`, `git -C <worktree> pull --ff-only origin master`, and `git -C <worktree> branch -D <branch>` (where `<branch>` is the merged PR branch). Now you're free to pick up another delegation.
 - If `CLOSED` (rejected without merge), publish `kind: \"escalation\"` so the Manager can surface to the human. Don't re-push silently.
 - If review comments come in on GitHub: `gh pr view <url> --comments` to read them, address them with a follow-up commit + force-push (or new commit on the branch), then continue waiting.
 
@@ -465,6 +465,24 @@ mod tests {
         assert!(got.contains("kind: \"diff\""));
         // Reviewer-spec tag for pairing diff↔task.
         assert!(got.contains("task:<TODO-NNN"));
+    }
+
+    #[test]
+    fn worker_role_cleans_worktree_only_after_merge() {
+        let got = compose_system_prompt(Some("backend engineer"), None, None).unwrap();
+
+        let open_pos = got.find("If `OPEN`").unwrap();
+        let merged_pos = got.find("If `MERGED`").unwrap();
+        let checkout_pos = got.find("git -C <worktree> checkout master").unwrap();
+        let pull_pos = got.find("git -C <worktree> pull --ff-only origin master").unwrap();
+        let delete_pos = got.find("git -C <worktree> branch -D <branch>").unwrap();
+        let closed_pos = got.find("If `CLOSED`").unwrap();
+
+        assert!(open_pos < merged_pos);
+        assert!(merged_pos < checkout_pos);
+        assert!(checkout_pos < pull_pos);
+        assert!(pull_pos < delete_pos);
+        assert!(delete_pos < closed_pos);
     }
 
     #[test]
