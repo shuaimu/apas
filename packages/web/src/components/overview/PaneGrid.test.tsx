@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PaneGrid } from "./PaneGrid";
 import { useStore, type PaneConfig } from "@/lib/store";
+import { DEEPSEEK_DEFAULT_MODEL } from "@/lib/providerOptions";
 
 const initialStore = useStore.getState();
 
@@ -169,6 +170,18 @@ describe("PaneGrid agent and model switchers", () => {
     expect(confirm).toHaveBeenCalledWith(expect.stringContaining("Switch agent to Codex / Official?"));
     expect(updatePaneModel).toHaveBeenCalledWith(40, null, "codex");
     expect(onOpenPane).not.toHaveBeenCalled();
+  });
+
+  it("uses the shared DeepSeek default when switching provider", () => {
+    const { updatePaneModel } = seedPaneGrid([
+      pane({ pane_id: 42, label: "DeepSeek Worker", role: "developer", managed: true }),
+    ]);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderPaneGrid("managed");
+
+    fireEvent.change(agentSelect("DeepSeek Worker"), { target: { value: "claude/deepseek" } });
+
+    expect(updatePaneModel).toHaveBeenCalledWith(42, DEEPSEEK_DEFAULT_MODEL, "claude");
   });
 
   it("does not change provider when confirmation is cancelled", () => {

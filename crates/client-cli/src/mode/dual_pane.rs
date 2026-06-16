@@ -341,6 +341,8 @@ const MINIMAX_API_BASE_URL: &str = "https://api.minimax.io/anthropic";
 const GLM_API_BASE_URL: &str = "https://api.z.ai/api/anthropic";
 const GLM_DEFAULT_HAIKU_MODEL: &str = "glm-4.5-air";
 const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com/anthropic";
+// Keep in sync with packages/web/src/lib/providerOptions.ts; the
+// `deepseek_default_model_matches_web_provider_options` test guards drift.
 const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-v4-pro";
 
 fn trim_to_option(raw: Option<String>) -> Option<String> {
@@ -3979,7 +3981,7 @@ mod tests {
         route_web_input_to_pane, restored_pane_mode_and_pause, run_deadloop_session_inner,
         save_pane_configs, start_bot_preserved_fields, truncate_str_at_char_boundary,
         ASK_USER_QUESTION_AUTO_CANCEL_STATUS, InputChannels, PaneInputRouteResult, PaneMeta,
-        PaneMetas, PanePauses, PaneStopRequests, PendingAskQuestion,
+        PaneMetas, PanePauses, PaneStopRequests, PendingAskQuestion, DEEPSEEK_DEFAULT_MODEL,
     };
     use crate::project::get_or_create_project;
     use crate::tui::{PaneOutput, TuiEvent};
@@ -3994,6 +3996,25 @@ mod tests {
 
     const FULL_PROMPT: &str =
         "Work on tasks defined in TODO.md.\n1. Analyze\n2. Implement\n3. Test";
+    const WEB_PROVIDER_OPTIONS_TS: &str =
+        include_str!("../../../../packages/web/src/lib/providerOptions.ts");
+
+    fn extract_ts_string_const<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+        let prefix = format!("export const {name} = ");
+        source.lines().find_map(|line| {
+            let value = line.trim().strip_prefix(&prefix)?;
+            let value = value.strip_prefix('"')?;
+            value.split_once('"').map(|(matched, _)| matched)
+        })
+    }
+
+    #[test]
+    fn deepseek_default_model_matches_web_provider_options() {
+        let web_default = extract_ts_string_const(WEB_PROVIDER_OPTIONS_TS, "DEEPSEEK_DEFAULT_MODEL")
+            .expect("web providerOptions.ts exports DEEPSEEK_DEFAULT_MODEL");
+
+        assert_eq!(DEEPSEEK_DEFAULT_MODEL, web_default);
+    }
 
     fn test_pane_meta(
         provider: Provider,
