@@ -360,3 +360,80 @@ describe('DeepSeek machine config', () => {
     });
   });
 });
+
+describe('suggested worker accept/dismiss', () => {
+  const initialStore = useStore.getInitialState();
+
+  function makeOpenWs() {
+    return {
+      readyState: WebSocket.OPEN,
+      send: vi.fn(),
+      close: vi.fn(),
+    } as unknown as WebSocket;
+  }
+
+  beforeEach(() => {
+    useStore.setState({
+      sessionId: 'session-suggestions',
+      ws: null,
+      isAttached: true,
+      acceptSuggestion: initialStore.acceptSuggestion,
+      dismissSuggestion: initialStore.dismissSuggestion,
+      addPane: initialStore.addPane,
+      showToast: initialStore.showToast,
+    });
+  });
+
+  it('acceptSuggestion spawns a managed pane with role metadata and dismisses it', () => {
+    const addPane = vi.fn(() => ({ success: true }));
+    const showToast = vi.fn();
+    const ws = makeOpenWs();
+    useStore.setState({ addPane, showToast, ws });
+
+    useStore.getState().acceptSuggestion({
+      id: 'SUG-001',
+      label: 'Frontend Worker',
+      role: 'developer',
+      goal: 'Build the dashboard',
+      backstory: 'React specialist',
+      needs_worktree: true,
+    });
+
+    expect(addPane).toHaveBeenCalledWith(
+      'claude',
+      'interactive',
+      'Frontend Worker',
+      undefined,
+      undefined,
+      true,
+      {
+        role: 'developer',
+        goal: 'Build the dashboard',
+        backstory: 'React specialist',
+      },
+      true,
+    );
+    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({
+      type: 'dismiss_suggestion',
+      session_id: 'session-suggestions',
+      suggestion_id: 'SUG-001',
+    }));
+    expect(showToast).toHaveBeenCalledWith(
+      'Accepted Frontend Worker — added to the team',
+      'info',
+    );
+  });
+
+  it('dismissSuggestion sends the active session and suggestion id', () => {
+    const ws = makeOpenWs();
+    useStore.setState({ ws, sessionId: 'session-suggestions' });
+
+    useStore.getState().dismissSuggestion('SUG-002');
+
+    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({
+      type: 'dismiss_suggestion',
+      session_id: 'session-suggestions',
+      suggestion_id: 'SUG-002',
+    }));
+  });
+});

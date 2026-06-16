@@ -72,6 +72,14 @@ pub fn save(project_dir: &Path, sw: &SuggestedWorkers) -> Result<()> {
     Ok(())
 }
 
+pub fn dismiss(project_dir: &Path, suggestion_id: &str) -> Result<SuggestedWorkers> {
+    let mut sw = load(project_dir)?;
+    if sw.remove(suggestion_id) {
+        save(project_dir, &sw)?;
+    }
+    load(project_dir)
+}
+
 pub fn parse(src: &str) -> SuggestedWorkers {
     let mut entries: Vec<SuggestedWorker> = Vec::new();
     let mut current: Option<SuggestedWorker> = None;
@@ -209,6 +217,7 @@ pub fn to_wire(sw: &SuggestedWorkers) -> Vec<shared::SuggestedWorkerMsg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn parse_basic() {
@@ -300,6 +309,41 @@ mod tests {
         assert!(sw.remove("SUG-001"));
         assert!(sw.entries.is_empty());
         assert!(!sw.remove("SUG-001"));
+    }
+
+    #[test]
+    fn dismiss_removes_only_requested_section_from_file() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let original = SuggestedWorkers {
+            entries: vec![
+                SuggestedWorker {
+                    id: "SUG-001".into(),
+                    label: "Frontend".into(),
+                    role: "developer".into(),
+                    goal: "Build UI".into(),
+                    backstory: "React".into(),
+                    needs_worktree: true,
+                },
+                SuggestedWorker {
+                    id: "SUG-002".into(),
+                    label: "QA".into(),
+                    role: "qa".into(),
+                    goal: "Test flows".into(),
+                    backstory: "Playwright".into(),
+                    needs_worktree: false,
+                },
+            ],
+        };
+        save(tmp.path(), &original).expect("save original suggestions");
+
+        let remaining = dismiss(tmp.path(), "SUG-001").expect("dismiss suggestion");
+
+        assert_eq!(remaining.entries.len(), 1);
+        assert_eq!(remaining.entries[0].id, "SUG-002");
+        let file = std::fs::read_to_string(path(tmp.path())).expect("read suggested-workers.md");
+        assert!(!file.contains("SUG-001"));
+        assert!(file.contains("## SUG-002"));
+        assert!(file.contains("- needs_worktree: no"));
     }
 
     #[test]
