@@ -85,6 +85,11 @@ work to one worker.
    an approved Global TODO. Other panes escalate human-facing questions to
    the Manager with `kind: "escalation"` and a `delegate-to:<manager_pane>`
    tag.
+   The legacy `manager-directives.jsonl` / `AddManagerDirective` /
+   `ManagerDirective` channel is retired; Manager goal edits now flow through
+   `project_goal.md` sync via `WebToServer::UpdateProjectGoal`,
+   `ServerToCli::UpdateProjectGoal`, `CliToServer::ProjectGoalChanged`, and
+   `ServerToWeb::ProjectGoalChanged`.
 2. **Tech Lead** reads `project_goal.md`, `team-todo.md`, `.apas`, and
    `.apas-team.jsonl`. It proposes bounded Global TODOs as
    `status: proposed, origin: tech-lead`, waits for the user to approve or
