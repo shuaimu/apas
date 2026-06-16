@@ -2,6 +2,10 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TabBar } from "./TabBar";
 import type { PaneConfig } from "@/lib/store";
+import {
+  DEEPSEEK_DEFAULT_MODEL,
+  PROVIDER_MODEL_GROUPS,
+} from "@/lib/providerOptions";
 
 function pane(overrides: Partial<PaneConfig> & Pick<PaneConfig, "pane_id" | "label" | "role">): PaneConfig {
   return {
@@ -16,8 +20,9 @@ function pane(overrides: Partial<PaneConfig> & Pick<PaneConfig, "pane_id" | "lab
   };
 }
 
-function renderTabBar() {
+function renderTabBar(overrides: { onAddTab?: ReturnType<typeof vi.fn> } = {}) {
   const onCloseTab = vi.fn();
+  const onAddTab = overrides.onAddTab ?? vi.fn();
   const tabs = [
     pane({ pane_id: 10, label: "Managed Manager", role: "team manager", managed: true }),
     pane({ pane_id: 11, label: "Managed Tech Lead", role: "tech lead", managed: true }),
@@ -31,13 +36,13 @@ function renderTabBar() {
       activeTabId={12}
       onSelectTab={vi.fn()}
       onCloseTab={onCloseTab}
-      onAddTab={vi.fn()}
+      onAddTab={onAddTab}
       paneStatuses={{}}
       pausedPanes={[]}
     />,
   );
 
-  return { ...result, onCloseTab };
+  return { ...result, onAddTab, onCloseTab };
 }
 
 function closeButton(container: HTMLElement, paneId: number): Element | null {
@@ -78,5 +83,32 @@ describe("TabBar coordinator close controls", () => {
     fireEvent.click(screen.getByText("Close"));
 
     expect(onCloseTab).toHaveBeenCalledWith(13);
+  });
+
+  it("renders the add-tab provider menu from shared provider/model groups", () => {
+    const onAddTab = vi.fn();
+    renderTabBar({ onAddTab });
+
+    fireEvent.click(screen.getByTitle("New tab"));
+
+    for (const group of PROVIDER_MODEL_GROUPS) {
+      expect(screen.getByText(group.label)).toBeTruthy();
+    }
+
+    const claudeGroup = PROVIDER_MODEL_GROUPS.find((group) => group.id === "claude");
+    expect(claudeGroup).toBeTruthy();
+    fireEvent.click(screen.getByText("Claude"));
+
+    for (const option of claudeGroup?.options ?? []) {
+      expect(screen.getByText(option.label)).toBeTruthy();
+    }
+
+    fireEvent.click(screen.getByText("DeepSeek"));
+
+    expect(onAddTab).toHaveBeenCalledWith(
+      "claude",
+      DEEPSEEK_DEFAULT_MODEL,
+      undefined,
+    );
   });
 });

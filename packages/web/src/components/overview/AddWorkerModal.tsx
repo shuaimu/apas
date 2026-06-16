@@ -3,6 +3,11 @@
 import { useState } from "react";
 import { useStore, type PlanReviewMode } from "@/lib/store";
 import { ROLE_TEMPLATES, TEMPLATE_COLOR_CLASSES, type RoleTemplate } from "@/lib/roleTemplates";
+import {
+  DEFAULT_PROVIDER_MODEL_OPTION,
+  PROVIDER_MODEL_OPTIONS,
+  findProviderModelOption,
+} from "@/lib/providerOptions";
 import { X } from "lucide-react";
 
 interface AddWorkerModalProps {
@@ -10,21 +15,14 @@ interface AddWorkerModalProps {
   onClose: () => void;
 }
 
-type ProviderChoice = "claude" | "codex" | "opencode" | "cursor-agent";
-
-const PROVIDERS: Array<{ id: ProviderChoice; label: string; hint: string }> = [
-  { id: "claude", label: "Claude", hint: "Anthropic — default" },
-  { id: "codex", label: "Codex", hint: "OpenAI Codex CLI" },
-  { id: "opencode", label: "OpenCode", hint: "open-source coding agent" },
-  { id: "cursor-agent", label: "Cursor", hint: "Cursor background agent" },
-];
-
 export function AddWorkerModal({ open, onClose }: AddWorkerModalProps) {
   const addPane = useStore((s) => s.addPane);
   const showToast = useStore((s) => s.showToast);
 
   const [template, setTemplate] = useState<RoleTemplate | null>(null);
-  const [provider, setProvider] = useState<ProviderChoice>("claude");
+  const [providerOptionValue, setProviderOptionValue] = useState(
+    DEFAULT_PROVIDER_MODEL_OPTION.value,
+  );
   const [label, setLabel] = useState("");
   const [isolated, setIsolated] = useState(false);
   const [role, setRole] = useState("");
@@ -47,7 +45,7 @@ export function AddWorkerModal({ open, onClose }: AddWorkerModalProps) {
 
   const reset = () => {
     setTemplate(null);
-    setProvider("claude");
+    setProviderOptionValue(DEFAULT_PROVIDER_MODEL_OPTION.value);
     setLabel("");
     setIsolated(false);
     setRole("");
@@ -59,15 +57,16 @@ export function AddWorkerModal({ open, onClose }: AddWorkerModalProps) {
 
   const handleSubmit = () => {
     const cleanLabel = label.trim() || (template ? template.label : undefined);
+    const providerOption = findProviderModelOption(providerOptionValue);
     const result = addPane(
-      provider,
+      providerOption.provider,
       "interactive",
       cleanLabel,
       // No prompt here: managed workers get their identity from role
       // metadata/templates, while the TabBar Start Bot fallback is only
       // for classic/manual side-chat panes.
       undefined,
-      undefined,
+      providerOption.model,
       isolated || undefined,
       {
         role: role.trim() || undefined,
@@ -153,13 +152,13 @@ export function AddWorkerModal({ open, onClose }: AddWorkerModalProps) {
             <label className="flex flex-col gap-1 text-xs">
               <span className="text-zinc-300">Provider</span>
               <select
-                value={provider}
-                onChange={(e) => setProvider(e.target.value as ProviderChoice)}
+                value={providerOptionValue}
+                onChange={(e) => setProviderOptionValue(e.target.value)}
                 className="rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-zinc-100"
               >
-                {PROVIDERS.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.label} — {p.hint}
+                {PROVIDER_MODEL_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
                   </option>
                 ))}
               </select>
