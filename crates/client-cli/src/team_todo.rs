@@ -847,6 +847,36 @@ impl TeamTodo {
     }
 }
 
+pub fn apply_todo_approval(
+    todo: &mut TeamTodo,
+    todo_id: &str,
+    action: &str,
+) -> Result<Option<GlobalStatus>> {
+    let new_status = match action {
+        "approve" => GlobalStatus::Approved,
+        "reject" => GlobalStatus::Rejected,
+        _ => return Err(anyhow!("unknown todo approval action: {action}")),
+    };
+    Ok(todo.set_global_status(todo_id, new_status))
+}
+
+pub fn add_user_todo(todo: &mut TeamTodo, title: &str, body: String) -> Option<String> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let id = todo.next_global_id();
+    todo.push_global(GlobalTodo {
+        id: id.clone(),
+        title: trimmed.to_string(),
+        status: GlobalStatus::Approved,
+        origin: Origin::User,
+        prs: Vec::new(),
+        body,
+    });
+    Some(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1073,6 +1103,54 @@ The test fixtures bake session cookies in; replace with a JWT minter.\n\
         assert_eq!(prev, GlobalStatus::Proposed);
         assert_eq!(t.find_global("TODO-002").unwrap().status, GlobalStatus::Approved);
         assert!(t.set_global_status("nonexistent", GlobalStatus::Done).is_none());
+    }
+
+    #[test]
+    fn apply_todo_approval_flips_only_requested_global() {
+        let mut t = parse(sample_doc()).unwrap();
+
+        let prev = apply_todo_approval(&mut t, "TODO-002", "approve")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(prev, GlobalStatus::Proposed);
+        assert_eq!(t.find_global("TODO-002").unwrap().status, GlobalStatus::Approved);
+        assert_eq!(t.find_global("TODO-001").unwrap().status, GlobalStatus::Approved);
+
+        let prev = apply_todo_approval(&mut t, "TODO-001", "reject")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(prev, GlobalStatus::Approved);
+        assert_eq!(t.find_global("TODO-001").unwrap().status, GlobalStatus::Rejected);
+        assert_eq!(t.find_global("TODO-002").unwrap().status, GlobalStatus::Approved);
+        assert!(apply_todo_approval(&mut t, "TODO-999", "approve").unwrap().is_none());
+        assert!(apply_todo_approval(&mut t, "TODO-001", "hold").is_err());
+    }
+
+    #[test]
+    fn add_user_todo_trims_title_and_creates_approved_user_global() {
+        let mut t = parse(sample_doc()).unwrap();
+
+        let id = add_user_todo(&mut t, "  Add keyboard flow  ", "body text".into()).unwrap();
+
+        assert_eq!(id, "TODO-003");
+        let added = t.find_global("TODO-003").unwrap();
+        assert_eq!(added.title, "Add keyboard flow");
+        assert_eq!(added.status, GlobalStatus::Approved);
+        assert_eq!(added.origin, Origin::User);
+        assert!(added.prs.is_empty());
+        assert_eq!(added.body, "body text");
+    }
+
+    #[test]
+    fn add_user_todo_rejects_empty_titles_without_mutating() {
+        let mut t = parse(sample_doc()).unwrap();
+        let before = t.clone();
+
+        assert_eq!(add_user_todo(&mut t, "   ", "ignored".into()), None);
+
+        assert_eq!(t, before);
     }
 
     #[test]

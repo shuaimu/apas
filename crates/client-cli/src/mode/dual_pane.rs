@@ -8920,39 +8920,38 @@ async fn run_server_connection(
                                             }
                                             ServerToCli::TodoApproval { session_id: _, todo_id, action } => {
                                                 let project_dir = std::path::Path::new(&working_dir);
-                                                let new_status = match action.as_str() {
-                                                    "approve" => Some(crate::team_todo::GlobalStatus::Approved),
-                                                    "reject" => Some(crate::team_todo::GlobalStatus::Rejected),
-                                                    _ => {
-                                                        tracing::warn!(
-                                                            "Unknown todo action '{}' for {}",
-                                                            action, todo_id
-                                                        );
-                                                        None
-                                                    }
-                                                };
-                                                if let Some(status) = new_status {
-                                                    match crate::team_todo::load(project_dir) {
-                                                        Ok(mut todo) => {
-                                                            if todo.set_global_status(&todo_id, status).is_some() {
+                                                match crate::team_todo::load(project_dir) {
+                                                    Ok(mut todo) => {
+                                                        match crate::team_todo::apply_todo_approval(
+                                                            &mut todo,
+                                                            &todo_id,
+                                                            &action,
+                                                        ) {
+                                                            Ok(Some(_)) => {
                                                                 if let Err(e) = crate::team_todo::save(project_dir, &todo) {
                                                                     tracing::warn!(
                                                                         "Failed to save team-todo.md after approval: {}",
                                                                         e
                                                                     );
                                                                 }
-                                                            } else {
+                                                            }
+                                                            Ok(None) => {
                                                                 tracing::warn!(
                                                                     "Approval for unknown TODO id: {}",
                                                                     todo_id
                                                                 );
                                                             }
+                                                            Err(e) => tracing::warn!(
+                                                                "Invalid todo approval for {}: {}",
+                                                                todo_id,
+                                                                e
+                                                            ),
                                                         }
-                                                        Err(e) => tracing::warn!(
-                                                            "Failed to load team-todo.md for approval: {}",
-                                                            e
-                                                        ),
                                                     }
+                                                    Err(e) => tracing::warn!(
+                                                        "Failed to load team-todo.md for approval: {}",
+                                                        e
+                                                    ),
                                                 }
                                                 // Republish fresh state regardless of success so the
                                                 // web sees the result (or the unchanged state if the
@@ -8971,30 +8970,25 @@ async fn run_server_connection(
                                             }
                                             ServerToCli::AddTodo { session_id: _, title, body } => {
                                                 let project_dir = std::path::Path::new(&working_dir);
-                                                let trimmed = title.trim();
-                                                if !trimmed.is_empty() {
-                                                    match crate::team_todo::load(project_dir) {
-                                                        Ok(mut todo) => {
-                                                            let id = todo.next_global_id();
-                                                            todo.push_global(crate::team_todo::GlobalTodo {
-                                                                id,
-                                                                title: trimmed.to_string(),
-                                                                status: crate::team_todo::GlobalStatus::Approved,
-                                                                origin: crate::team_todo::Origin::User,
-                                                                prs: Vec::new(),
-                                                                body,
-                                                            });
+                                                match crate::team_todo::load(project_dir) {
+                                                    Ok(mut todo) => {
+                                                        let added = crate::team_todo::add_user_todo(
+                                                            &mut todo,
+                                                            &title,
+                                                            body,
+                                                        );
+                                                        if added.is_some() {
                                                             if let Err(e) = crate::team_todo::save(project_dir, &todo) {
                                                                 tracing::warn!("Failed to save team-todo.md after AddTodo: {}", e);
                                                             }
+                                                        } else {
+                                                            tracing::warn!("AddTodo: empty title; skipping");
                                                         }
-                                                        Err(e) => tracing::warn!(
-                                                            "Failed to load team-todo.md for AddTodo: {}",
-                                                            e
-                                                        ),
                                                     }
-                                                } else {
-                                                    tracing::warn!("AddTodo: empty title; skipping");
+                                                    Err(e) => tracing::warn!(
+                                                        "Failed to load team-todo.md for AddTodo: {}",
+                                                        e
+                                                    ),
                                                 }
                                                 // Always push fresh state so the
                                                 // web sees the result (or unchanged
