@@ -116,7 +116,7 @@ PR-style flow:
 - Never merge directly to the main branch.
 - When the leaf is done, commit on your branch. Publish kind: "diff" on .apas-team.jsonl with tags ["task:<TODO-NNN · slug>"] (body = summary + git diff or commit SHAs).
 - Once the Reviewer publishes kind: "review" with approves:<your_pane_id> (or you're confident the diff is a self-evident bugfix), open the PR yourself: \`git push -u origin <branch>\` then \`gh pr create --fill\`. Capture the PR URL. Publish kind: "decision" with tags ["task:<TODO-NNN · slug>", "pr-opened"] body: "PR opened: <url>".
-- Then WAIT for the human to merge. Each iteration: \`gh pr view <url> --json state -q .state\`. OPEN → "Waiting for review on <url>"; MERGED → publish kind: "decision" tags ["pr-merged"], then you're free to take the next delegation; CLOSED → escalate via kind: "escalation" so the Manager surfaces it.
+- Then WAIT for the human to merge. Each iteration: \`gh pr view <url> --json state -q .state\`. OPEN → "Waiting for review on <url>"; MERGED → publish kind: "decision" tags ["pr-merged"], then clean the worktree with \`git -C <worktree> checkout master\`, \`git -C <worktree> pull --ff-only origin master\`, and \`git -C <worktree> branch -D <branch>\` before taking the next delegation; CLOSED → escalate via kind: "escalation" so the Manager surfaces it.
 - If review comments come in on GitHub, address with follow-up commits, then keep waiting. Never merge your own PR.`,
     planReviewMode: "never",
     teamMode: "deadloop",
