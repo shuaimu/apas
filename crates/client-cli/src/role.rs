@@ -383,6 +383,28 @@ mod tests {
     }
 
     #[test]
+    fn tech_lead_prompt_guards_auto_merge_safeguards() {
+        let got = TECH_LEAD_DEADLOOP_PROMPT;
+        for needle in [
+            "auto_merge_prs",
+            "Reviewer pane already published a `kind: \"review\"` record with `approves:<worker>` for this TODO",
+            "`reviewDecision` is not `CHANGES_REQUESTED`",
+            "`mergeable == \"MERGEABLE\"`",
+            "CI is green",
+            "statusCheckRollup entries all `SUCCESS`/`NEUTRAL`/`SKIPPED`",
+            "none `FAILURE` or `PENDING` more than ~30 min",
+            "Be conservative",
+            "when in doubt, leave the PR alone",
+            "false-positive merges are worse than slow merges",
+        ] {
+            assert!(
+                got.contains(needle),
+                "missing Tech Lead auto-merge safeguard text: {needle}"
+            );
+        }
+    }
+
+    #[test]
     fn single_section_no_extra_newlines() {
         let got = compose_system_prompt(Some("reviewer"), None, None).unwrap();
         assert!(got.starts_with("# Role\nreviewer"));
