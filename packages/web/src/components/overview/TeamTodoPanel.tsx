@@ -158,7 +158,7 @@ export function TeamTodoPanel() {
               {active.length > 0 && (
                 <ul className="mb-3 space-y-2">
                   {active.map((g) => (
-                    <GlobalRow key={g.id} g={g} />
+                    <GlobalRow key={g.id} g={g} workers={state.workers} />
                   ))}
                 </ul>
               )}
@@ -511,11 +511,25 @@ function CollapsedFolder({
   );
 }
 
-function GlobalRow({ g }: { g: TeamTodoGlobal }) {
+function GlobalRow({
+  g,
+  workers,
+}: {
+  g: TeamTodoGlobal;
+  workers: TeamTodoWorker[];
+}) {
   const approveTodo = useStore((s) => s.approveTodo);
   const rejectTodo = useStore((s) => s.rejectTodo);
 
   const isProposed = g.status === "proposed";
+  const waitingForPrPanes =
+    g.status === "under_review" && (g.prs?.length ?? 0) === 0
+      ? workers
+          .filter((w) =>
+            w.subtasks.some((s) => s.parent === g.id && s.status === "approved"),
+          )
+          .map((w) => w.pane_id)
+      : [];
 
   /// Dedupe by URL — a Global can list the same PR twice (e.g. when
   /// multiple workers contributed) and we only want one badge per URL.
@@ -553,6 +567,14 @@ function GlobalRow({ g }: { g: TeamTodoGlobal }) {
           <p className="mt-0.5 text-sm font-medium text-gray-900 dark:text-gray-100">
             {g.title}
           </p>
+          {waitingForPrPanes.length > 0 && (
+            <p
+              data-testid="waiting-for-pr-hint"
+              className="mt-1 text-[11px] font-medium text-yellow-700 dark:text-yellow-300"
+            >
+              Reviewer approved; waiting for {formatPaneList(waitingForPrPanes)} to open PR
+            </p>
+          )}
           {g.body.trim() && (
             <p className="mt-1 whitespace-pre-wrap text-xs text-gray-600 dark:text-gray-300">
               {g.body}
@@ -582,6 +604,10 @@ function GlobalRow({ g }: { g: TeamTodoGlobal }) {
       </div>
     </li>
   );
+}
+
+function formatPaneList(panes: number[]): string {
+  return panes.length === 1 ? `pane ${panes[0]}` : `panes ${panes.join(", ")}`;
 }
 
 /// `loading` while the GitHub fetch is in flight; `done` when the

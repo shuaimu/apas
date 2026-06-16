@@ -349,3 +349,103 @@ describe("AgentStatusRow accessible indicators", () => {
     expect(screen.queryByLabelText(/Agent status:/)).toBeNull();
   });
 });
+
+describe("waiting-for-PR hint", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    act(() => {
+      useStore.setState({
+        sessionId: null,
+        teamTodoState: null,
+        teamTodoStates: new Map(),
+        paneConfigs: [],
+        paneMessages: {},
+      });
+    });
+  });
+
+  it("shows approved-worker handoff when an under-review Global has no PR", () => {
+    seedTeamTodo({
+      globals: [
+        {
+          id: "TODO-001",
+          title: "waiting for worker PR",
+          status: "under_review",
+          origin: "tech-lead",
+          prs: [],
+          body: "",
+        },
+      ],
+      workers: [
+        {
+          pane_id: 568,
+          role_hint: "Developer",
+          subtasks: [
+            {
+              id: "TODO-001 · worker",
+              title: "Do the work",
+              status: "approved",
+              parent: "TODO-001",
+              body: "",
+            },
+          ],
+        },
+      ],
+      tech_lead_cursor: null,
+      reviewer_cursor: null,
+    });
+
+    render(<TeamTodoPanel />);
+
+    expect(
+      screen.getByText("Reviewer approved; waiting for pane 568 to open PR"),
+    ).toBeTruthy();
+  });
+
+  it("hides approved-worker handoff once a PR exists", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ state: "open", merged: false }),
+    }) as unknown as typeof fetch;
+    seedTeamTodo({
+      globals: [
+        {
+          id: "TODO-001",
+          title: "already has PR",
+          status: "pr_open",
+          origin: "tech-lead",
+          prs: [{ pane_id: 568, url: "https://github.com/shuaimu/apas/pull/15" }],
+          body: "",
+        },
+      ],
+      workers: [
+        {
+          pane_id: 568,
+          role_hint: "Developer",
+          subtasks: [
+            {
+              id: "TODO-001 · worker",
+              title: "Do the work",
+              status: "approved",
+              parent: "TODO-001",
+              body: "",
+            },
+          ],
+        },
+      ],
+      tech_lead_cursor: null,
+      reviewer_cursor: null,
+    });
+
+    render(<TeamTodoPanel />);
+
+    expect(screen.queryByTestId("waiting-for-pr-hint")).toBeNull();
+    const badge = await screen.findByTestId("pr-state-badge");
+    await waitFor(() =>
+      expect(badge.getAttribute("data-pr-state")).toBe("open"),
+    );
+  });
+});
