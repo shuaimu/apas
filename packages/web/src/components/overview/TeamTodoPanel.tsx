@@ -153,15 +153,17 @@ export function TeamTodoPanel() {
           const done = state.globals.filter((g) => g.status === "done");
           const rejected = state.globals.filter((g) => g.status === "rejected");
           const withdrawn = state.globals.filter((g) => g.status === "withdrawn");
+          const activeGroups = groupActiveGlobals(active);
           return (
             <>
-              {active.length > 0 && (
-                <ul className="mb-3 space-y-2">
-                  {active.map((g) => (
-                    <GlobalRow key={g.id} g={g} workers={state.workers} />
-                  ))}
-                </ul>
-              )}
+              {activeGroups.map((group) => (
+                <ActiveGlobalGroup
+                  key={group.key}
+                  label={group.label}
+                  entries={group.entries}
+                  workers={state.workers}
+                />
+              ))}
               {done.length > 0 && (
                 <CollapsedFolder
                   label="Done"
@@ -378,6 +380,60 @@ function lastActivityTs(
   const msgs = paneMessages[paneKey(paneId)];
   if (!msgs || msgs.length === 0) return null;
   return msgs[msgs.length - 1].timestamp.getTime();
+}
+
+const ACTIVE_GROUP_ORDER = [
+  { key: "pr_open", label: "PR open" },
+  { key: "under_review", label: "Under review" },
+  { key: "in_progress", label: "In progress" },
+  { key: "approved", label: "Approved" },
+  { key: "proposed", label: "Proposed" },
+  { key: "other", label: "Other active" },
+] as const;
+
+type ActiveGroupKey = (typeof ACTIVE_GROUP_ORDER)[number]["key"];
+
+function groupActiveGlobals(globals: TeamTodoGlobal[]): Array<{
+  key: ActiveGroupKey;
+  label: string;
+  entries: TeamTodoGlobal[];
+}> {
+  const byStatus = new Map<ActiveGroupKey, TeamTodoGlobal[]>(
+    ACTIVE_GROUP_ORDER.map((group) => [group.key, []]),
+  );
+  for (const global of globals) {
+    const key = ACTIVE_GROUP_ORDER.some((group) => group.key === global.status)
+      ? (global.status as ActiveGroupKey)
+      : "other";
+    byStatus.get(key)?.push(global);
+  }
+  return ACTIVE_GROUP_ORDER.map((group) => ({
+    ...group,
+    entries: byStatus.get(group.key) ?? [],
+  })).filter((group) => group.entries.length > 0);
+}
+
+function ActiveGlobalGroup({
+  label,
+  entries,
+  workers,
+}: {
+  label: string;
+  entries: TeamTodoGlobal[];
+  workers: TeamTodoWorker[];
+}) {
+  return (
+    <section className="mb-3">
+      <h3 className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
+        {label} ({entries.length})
+      </h3>
+      <ul className="space-y-2">
+        {entries.map((g) => (
+          <GlobalRow key={g.id} g={g} workers={workers} />
+        ))}
+      </ul>
+    </section>
+  );
 }
 
 function AddTodoControl() {

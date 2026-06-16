@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import { parsePrLine } from "./TeamTodoPanel";
 import { TeamTodoPanel } from "./TeamTodoPanel";
 import { paneKey, useStore, type PaneConfig, type TeamTodoState } from "@/lib/store";
@@ -104,6 +104,22 @@ function emptyTeamTodo(): TeamTodoState {
     workers: [],
     tech_lead_cursor: null,
     reviewer_cursor: null,
+  };
+}
+
+function mkTodo(
+  id: string,
+  title: string,
+  status: string,
+  body = "",
+) {
+  return {
+    id,
+    title,
+    status,
+    origin: "tech-lead",
+    prs: [],
+    body,
   };
 }
 
@@ -288,6 +304,83 @@ describe("PrStateBadge fetch-driven color", () => {
     globalThis.fetch = vi.fn() as unknown as typeof fetch;
     render(<TeamTodoPanel />);
     expect(screen.queryByTestId("pr-state-badge")).toBeNull();
+  });
+});
+
+describe("active TODO status groups", () => {
+  afterEach(() => {
+    act(() => {
+      useStore.setState({
+        sessionId: null,
+        teamTodoState: null,
+        teamTodoStates: new Map(),
+      });
+    });
+  });
+
+  it("groups active globals by status with active work above proposed backlog", () => {
+    seedTeamTodo({
+      globals: [
+        mkTodo("TODO-005", "proposed backlog", "proposed"),
+        mkTodo("TODO-003", "implementation underway", "in_progress"),
+        mkTodo("TODO-001", "open PR waiting", "pr_open"),
+        mkTodo("TODO-004", "approved not started", "approved"),
+        mkTodo("TODO-002", "reviewing diff", "under_review"),
+        mkTodo("TODO-006", "finished work", "done"),
+        mkTodo("TODO-007", "declined work", "rejected"),
+      ],
+      workers: [],
+      tech_lead_cursor: null,
+      reviewer_cursor: null,
+    });
+
+    render(<TeamTodoPanel />);
+
+    const prOpen = screen.getByText("PR open (1)");
+    const underReview = screen.getByText("Under review (1)");
+    const inProgress = screen.getByText("In progress (1)");
+    const approved = screen.getByText("Approved (1)");
+    const proposed = screen.getByText("Proposed (1)");
+
+    expect(
+      prOpen.compareDocumentPosition(underReview) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      underReview.compareDocumentPosition(inProgress) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      inProgress.compareDocumentPosition(approved) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      approved.compareDocumentPosition(proposed) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(screen.getByText("Done (1)")).toBeTruthy();
+    expect(screen.getByText("Rejected (1)")).toBeTruthy();
+  });
+
+  it("keeps proposed Approve and Reject actions in the Proposed group", () => {
+    seedTeamTodo({
+      globals: [
+        mkTodo("TODO-010", "active work", "in_progress"),
+        mkTodo("TODO-011", "needs approval", "proposed"),
+      ],
+      workers: [],
+      tech_lead_cursor: null,
+      reviewer_cursor: null,
+    });
+
+    render(<TeamTodoPanel />);
+
+    const proposedGroup = screen.getByText("Proposed (1)").closest("section");
+    expect(proposedGroup).toBeTruthy();
+    const proposedWithin = within(proposedGroup as HTMLElement);
+    expect(proposedWithin.getByText("needs approval")).toBeTruthy();
+    expect(proposedWithin.getByTitle(/Approve/)).toBeTruthy();
+    expect(proposedWithin.getByTitle("Reject")).toBeTruthy();
   });
 });
 
