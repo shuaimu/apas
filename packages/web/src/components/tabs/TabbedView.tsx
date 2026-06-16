@@ -165,6 +165,16 @@ export function deriveInitialActiveTabId(args: {
   return args.managerTabId ?? OVERVIEW_PANE_ID;
 }
 
+export function lazyPaneMessageLoadTargets(args: {
+  activeTabId: number | null;
+  tabIds: number[];
+}): number[] {
+  if (args.activeTabId == null) return [];
+  if (args.activeTabId === OVERVIEW_PANE_ID) return [];
+  if (!args.tabIds.includes(args.activeTabId)) return [];
+  return [args.activeTabId];
+}
+
 function getInputDraftStorageKey(sessionId: string | null, paneId: number): string {
   return `apas_input_draft_${sessionId || "none"}_${paneId}`;
 }
@@ -529,10 +539,14 @@ export function TabbedView() {
   // reply no longer ships every pane's tail, so each pane opens
   // on-demand. Skip for the Overview pseudo-tab.
   useEffect(() => {
-    if (activeTabId == null) return;
-    if (activeTabId === OVERVIEW_PANE_ID) return;
-    loadPaneMessagesIfNeeded(activeTabId);
-  }, [activeTabId, sessionId, loadPaneMessagesIfNeeded]);
+    const targets = lazyPaneMessageLoadTargets({
+      activeTabId,
+      tabIds: tabIds.split(",").filter(Boolean).map(Number),
+    });
+    for (const paneId of targets) {
+      loadPaneMessagesIfNeeded(paneId);
+    }
+  }, [activeTabId, sessionId, loadPaneMessagesIfNeeded, tabIds]);
 
   // Reset the lazy-mount set on session change so a fresh project starts
   // with zero mounted panes — the active-pane effect below mounts the

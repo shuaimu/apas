@@ -6,7 +6,7 @@
 // has regressed several times in a week, so we lock the contract down
 // with focused tests rather than relying on someone to remember the
 // invariants.
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   useStore,
   type Message,
@@ -21,6 +21,17 @@ const PANE_ID = 3;
 
 function makeMsg(id: string, content = "hi"): Message {
   return { id, role: "assistant", content, timestamp: new Date(), outputType: { type: "text" } };
+}
+
+function makeStoredMsg(id: string, paneId: number, content = "hi") {
+  return {
+    id,
+    role: "assistant",
+    content,
+    message_type: "text",
+    pane_id: paneId,
+    created_at: "2026-06-16T12:00:00Z",
+  };
 }
 
 function makeCachedEntry(opts: {
@@ -57,6 +68,11 @@ function parseSent(sent: string[]): Array<Record<string, unknown>> {
   return sent.map((s) => JSON.parse(s));
 }
 
+function dispatch(payload: Record<string, unknown>) {
+  const ws = useStore.getState().ws as unknown as { onmessage?: (e: MessageEvent) => void };
+  ws.onmessage?.(new MessageEvent("message", { data: JSON.stringify(payload) }));
+}
+
 beforeEach(() => {
   // connect() bails when no token is present in localStorage; tests that
   // exercise the WS-onmessage path call connect() and need a token to
@@ -83,8 +99,98 @@ beforeEach(() => {
     sessionCache: new Map(),
     unreadSessions: new Set(),
     sessionLastCreatedAt: new Map(),
+    paneLastCreatedAt: new Map(),
+    paneLoadingInitial: new Set(),
     reconnectWatermarks: new Map(),
     answeredQuestions: new Map(),
+    pendingSends: [],
+  });
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe("lazy per-pane initial message load", () => {
+  it("requests the active pane once, seeds its bucket, and suppresses duplicates while in flight", () => {
+    vi.useFakeTimers();
+    const { ws, sent } = makeFakeWs();
+    useStore.setState({ ws, sessionId: SID_A });
+
+    useStore.getState().loadPaneMessagesIfNeeded(PANE_ID);
+    useStore.getState().loadPaneMessagesIfNeeded(PANE_ID);
+
+    const requests = parseSent(sent).filter((m) => m.type === "get_session_messages");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      session_id: SID_A,
+      pane_id: PANE_ID,
+      limit: 30,
+    });
+    expect(useStore.getState().paneMessages[paneKey(PANE_ID)]).toEqual([]);
+    expect(useStore.getState().paneLoadingInitial.has(PANE_ID)).toBe(true);
+  });
+
+  it("applies a pane-filtered response only to that pane and clears its in-flight marker", () => {
+    useStore.getState().connect();
+    return new Promise<void>((resolve) => setTimeout(() => {
+      const otherPaneId = 9;
+      const otherMsg = makeMsg("other-existing", "do not replace me");
+      useStore.setState({
+        isAuthenticated: true,
+        sessionId: SID_A,
+        isDualPane: true,
+        paneMessages: {
+          [paneKey(PANE_ID)]: [],
+          [paneKey(otherPaneId)]: [otherMsg],
+        },
+        paneLoadingInitial: new Set([PANE_ID, otherPaneId]),
+      });
+
+      dispatch({
+        type: "session_messages",
+        session_id: SID_A,
+        messages: [makeStoredMsg("target-1", PANE_ID, "target pane history")],
+        has_more: true,
+      });
+
+      const state = useStore.getState();
+      expect(state.paneMessages[paneKey(PANE_ID)]).toHaveLength(1);
+      expect(state.paneMessages[paneKey(PANE_ID)]?.[0].content).toBe("target pane history");
+      expect(state.paneMessages[paneKey(otherPaneId)]).toEqual([otherMsg]);
+      expect(state.paneHasMore[paneKey(PANE_ID)]).toBe(true);
+      expect(state.paneLoadingInitial.has(PANE_ID)).toBe(false);
+      expect(state.paneLoadingInitial.has(otherPaneId)).toBe(true);
+      resolve();
+    }, 10));
+  });
+
+  it("keeps empty pane responses safe until the timeout fallback clears loading", () => {
+    useStore.getState().connect();
+    return new Promise<void>((resolve) => setTimeout(() => {
+      vi.useFakeTimers();
+      useStore.setState({
+        isAuthenticated: true,
+        sessionId: SID_A,
+        isDualPane: true,
+      });
+
+      useStore.getState().loadPaneMessagesIfNeeded(PANE_ID);
+      dispatch({
+        type: "session_messages",
+        session_id: SID_A,
+        messages: [],
+        has_more: false,
+      });
+
+      expect(useStore.getState().paneMessages[paneKey(PANE_ID)]).toEqual([]);
+      expect(useStore.getState().paneLoadingInitial.has(PANE_ID)).toBe(true);
+
+      vi.advanceTimersByTime(30_000);
+
+      expect(useStore.getState().paneLoadingInitial.has(PANE_ID)).toBe(false);
+      resolve();
+    }, 10));
   });
 });
 
