@@ -3,6 +3,11 @@
 import { useMemo, useState } from "react";
 import { Play } from "lucide-react";
 import { useStore, type PaneConfig } from "@/lib/store";
+import {
+  DEEPSEEK_DEFAULT_MODEL,
+  GLM_DEFAULT_MODEL,
+  MINIMAX_DEFAULT_MODEL,
+} from "@/lib/providerOptions";
 
 /**
  * Pre-launch team setup. Renders 4 role rows (Manager, Tech Lead,
@@ -15,10 +20,6 @@ import { useStore, type PaneConfig } from "@/lib/store";
  * pick the model BEFORE spawning, not after, because respawning a
  * pane with a fresh provider loses the chat-history context.
  */
-
-const MINIMAX_DEFAULT_MODEL = "MiniMax-M2.7";
-const GLM_DEFAULT_MODEL = "glm-5.1";
-const DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-pro";
 
 const AGENT_OPTS: ReadonlyArray<{
   value: string;

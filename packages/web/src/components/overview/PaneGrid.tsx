@@ -16,6 +16,14 @@ import {
   PANE_ID_DEADLOOP,
   PANE_ID_INTERACTIVE,
 } from "@/lib/store";
+import {
+  DEEPSEEK_DEFAULT_MODEL,
+  GLM_DEFAULT_MODEL,
+  MINIMAX_DEFAULT_MODEL,
+  isDeepseekModel,
+  isGlmModel,
+  isMiniMaxModel,
+} from "@/lib/providerOptions";
 import { ActivitySparkline } from "./ActivitySparkline";
 
 interface PaneGridProps {
@@ -161,9 +169,6 @@ function PaneCard({
   // Claude/Official to pick the underlying Anthropic model
   // (Sonnet/Opus/Haiku); MiniMax/GLM/DeepSeek backends lock in their
   // own model string so the extra knob would be misleading.
-  const MINIMAX_DEFAULT_MODEL = "MiniMax-M2.7";
-  const GLM_DEFAULT_MODEL = "glm-5.1";
-  const DEEPSEEK_DEFAULT_MODEL = "deepseek-chat";
   const AGENT_OPTS: ReadonlyArray<{
     value: string;
     label: string;
@@ -204,11 +209,10 @@ function PaneCard({
   // sub-option even if the user typed a variant string.
   const currentAgentValue = ((): string => {
     const provider = pane.provider;
-    const model = (pane.model ?? "").toLowerCase();
     if (provider === "claude") {
-      if (model.includes("minimax") || model.startsWith("m2")) return "claude/minimax";
-      if (model.startsWith("glm") || model.includes("glm-")) return "claude/glm";
-      if (model.includes("deepseek")) return "claude/deepseek";
+      if (isMiniMaxModel(pane.model)) return "claude/minimax";
+      if (isGlmModel(pane.model)) return "claude/glm";
+      if (isDeepseekModel(pane.model)) return "claude/deepseek";
       return "claude/official";
     }
     if (provider === "codex") return "codex/official";

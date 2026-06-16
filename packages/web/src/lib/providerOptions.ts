@@ -1,5 +1,7 @@
 export const MINIMAX_DEFAULT_MODEL = "MiniMax-M2.7";
 export const GLM_DEFAULT_MODEL = "glm-5.1";
+// Keep in sync with crates/client-cli/src/mode/dual_pane.rs; the apas
+// cargo test `deepseek_default_model_matches_web_provider_options` guards drift.
 export const DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-pro";
 
 export interface ProviderModelOption {
