@@ -1409,6 +1409,87 @@ mod gc_tests {
     }
 
     #[tokio::test]
+    async fn get_messages_after_keeps_tool_use_string_input_envelope_valid_after_truncation() {
+        let storage = fresh_storage();
+        let sid = Uuid::new_v4();
+        let ts = Utc::now().to_rfc3339();
+        let big_input = "run ".repeat(60 * 1024);
+        let envelope = serde_json::json!({
+            "id": "toolu_bash",
+            "name": "Bash",
+            "input": big_input,
+        })
+        .to_string();
+        let mut msg = make_msg("tu-string", &ts);
+        msg.message_type = "tool_use".to_string();
+        msg.content = envelope;
+        storage.append_message(&sid, &msg).await.unwrap();
+
+        let got = storage.get_messages_after(&sid, "").await.unwrap();
+        assert_eq!(got.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&got[0].content)
+            .expect("truncated tool_use must remain valid JSON");
+        assert_eq!(parsed["id"], "toolu_bash");
+        assert_eq!(parsed["name"], "Bash");
+        let input = parsed["input"].as_str().expect("string input stays a string");
+        assert!(input.starts_with("run run"));
+        assert!(input.contains("truncated for catchup"));
+    }
+
+    #[tokio::test]
+    async fn get_messages_after_replaces_structured_tool_use_input_with_marker_after_truncation() {
+        let storage = fresh_storage();
+        let sid = Uuid::new_v4();
+        let ts = Utc::now().to_rfc3339();
+        let envelope = serde_json::json!({
+            "id": "toolu_question",
+            "name": "AskUserQuestion",
+            "input": {
+                "questions": [
+                    {
+                        "id": "deployment_choice",
+                        "header": "Deploy",
+                        "question": "x".repeat(200 * 1024),
+                        "options": [
+                            {"label": "Ship", "description": "Deploy now"},
+                            {"label": "Wait", "description": "Hold deployment"}
+                        ]
+                    }
+                ]
+            },
+        })
+        .to_string();
+        let original_len = envelope.len();
+        let mut msg = make_msg("tu-object", &ts);
+        msg.message_type = "tool_use".to_string();
+        msg.content = envelope;
+        storage.append_message(&sid, &msg).await.unwrap();
+
+        let got = storage.get_messages_after(&sid, "").await.unwrap();
+        assert_eq!(got.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&got[0].content)
+            .expect("truncated structured tool_use must remain valid JSON");
+        assert_eq!(parsed["id"], "toolu_question");
+        assert_eq!(parsed["name"], "AskUserQuestion");
+        let input = parsed["input"]
+            .as_object()
+            .expect("structured input is replaced by a marker object");
+        assert_eq!(
+            input.get("_truncated").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            input.get("_reason").and_then(|v| v.as_str()),
+            Some("catchup")
+        );
+        assert_eq!(
+            input.get("_original_bytes").and_then(|v| v.as_u64()),
+            Some(original_len as u64),
+        );
+        assert!(!input.contains_key("questions"));
+    }
+
+    #[tokio::test]
     async fn get_messages_after_handles_lines_split_across_chunk_boundaries() {
         // Each message body is padded so the resulting JSONL line is much
         // bigger than the 64 KiB chunk read; this exercises the carry/glue

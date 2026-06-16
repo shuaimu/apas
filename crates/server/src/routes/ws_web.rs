@@ -129,6 +129,44 @@ mod transit_truncation_tests {
         let inner = parsed["content"].as_str().expect("content stays a string");
         assert!(inner.contains("truncated for transit"));
     }
+
+    #[test]
+    fn keeps_tool_use_envelope_when_truncating() {
+        let envelope = serde_json::json!({
+            "id": "toolu_question",
+            "name": "AskUserQuestion",
+            "input": {
+                "questions": [
+                    {
+                        "id": "confirm",
+                        "header": "Confirm",
+                        "question": "x".repeat(MAX_TRANSIT_CONTENT_BYTES),
+                        "options": [
+                            {"label": "Yes", "description": "Continue"},
+                            {"label": "No", "description": "Stop"}
+                        ]
+                    }
+                ]
+            }
+        })
+        .to_string();
+        let out = truncate_for_transit(envelope, "tool_use");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("tool_use envelope must remain valid JSON");
+        assert_eq!(parsed["id"], "toolu_question");
+        assert_eq!(parsed["name"], "AskUserQuestion");
+        let input = parsed["input"]
+            .as_object()
+            .expect("structured input is replaced by a marker object");
+        assert_eq!(
+            input.get("_truncated").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            input.get("_reason").and_then(|v| v.as_str()),
+            Some("transit")
+        );
+    }
 }
 
 fn infer_panes_from_messages(
