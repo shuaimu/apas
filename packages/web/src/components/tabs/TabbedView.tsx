@@ -17,7 +17,7 @@ const PANE_ID_MAIN = 0;
 // Sentinel for the Overview pseudo-tab (Phase 5.1). Negative so it
 // can't collide with real pane ids (Rust-side u32, dynamic ids start
 // from 3) and survives the `parseInt` round-trip in localStorage.
-const OVERVIEW_PANE_ID = -1;
+export const OVERVIEW_PANE_ID = -1;
 const DEFAULT_BOT_MIN_INTERVAL_MINUTES = 15;
 const DEFAULT_BOT_LOOP_PROMPT = `Work on tasks defined in TODO.md. Do the following steps. Don't ask me for advice, just pick the best option you think that is honest, complete, and not corner-cutting:
 
@@ -88,6 +88,48 @@ function getProjectLayout(cliClientId: string | null, key: string, defaultValue:
 function setProjectLayout(cliClientId: string | null, key: string, value: string): void {
   if (typeof window === "undefined") return;
   localStorage.setItem(getProjectLayoutKey(cliClientId, key), value);
+}
+
+export function deriveInitialActiveTabId(args: {
+  activeTabId: number | null;
+  clientChanged: boolean;
+  managerTabId: number | null;
+  paneConfigsLength: number;
+  savedActiveTab: string;
+  tabIds: number[];
+}): number | null {
+  if (args.tabIds.length === 0) return null;
+
+  const isValidTab = (paneId: number) =>
+    paneId === OVERVIEW_PANE_ID || args.tabIds.includes(paneId);
+
+  // Same project, current pick is still valid -> no change.
+  if (
+    !args.clientChanged &&
+    args.activeTabId != null &&
+    isValidTab(args.activeTabId)
+  ) {
+    return args.activeTabId;
+  }
+  // Same project, pane_list is synthesized (no authoritative panes yet)
+  // -> keep current selection to avoid jumps from transient data.
+  if (
+    !args.clientChanged &&
+    args.activeTabId != null &&
+    args.paneConfigsLength === 0
+  ) {
+    return args.activeTabId;
+  }
+
+  const savedNum = args.savedActiveTab ? parseInt(args.savedActiveTab, 10) : NaN;
+  if (!isNaN(savedNum) && isValidTab(savedNum)) {
+    return savedNum;
+  }
+
+  // Persisted pref is gone or no longer matches a real pane. Prefer the
+  // Manager pane (chat-first landing); otherwise land on the Overview
+  // pseudo-tab where Start Manager and the project-goal input live.
+  return args.managerTabId ?? OVERVIEW_PANE_ID;
 }
 
 function getInputDraftStorageKey(sessionId: string | null, paneId: number): string {
@@ -435,31 +477,18 @@ export function TabbedView() {
     const clientChanged = lastDerivedForRef.current !== cliClientId;
     lastDerivedForRef.current = cliClientId;
 
-    // Same project, current pick is still valid → no change.
-    // Overview pseudo-tab (sentinel) is always valid.
-    if (!clientChanged && activeTabId != null && (activeTabId === OVERVIEW_PANE_ID || ids.includes(activeTabId))) {
-      return;
-    }
-    // Same project, pane_list is synthesized (no authoritative panes yet)
-    // → keep current selection to avoid jumps from transient data.
-    if (!clientChanged && activeTabId != null && paneConfigs.length === 0) {
-      return;
-    }
-
     const saved = getProjectLayout(cliClientId, "active_tab", "");
-    const savedNum = saved ? parseInt(saved, 10) : NaN;
-    if (!isNaN(savedNum) && (savedNum === OVERVIEW_PANE_ID || ids.includes(savedNum))) {
-      if (activeTabId !== savedNum) setActiveTabId(savedNum);
-      return;
+    const nextActiveTabId = deriveInitialActiveTabId({
+      activeTabId,
+      clientChanged,
+      managerTabId,
+      paneConfigsLength: paneConfigs.length,
+      savedActiveTab: saved,
+      tabIds: ids,
+    });
+    if (nextActiveTabId != null && activeTabId !== nextActiveTabId) {
+      setActiveTabId(nextActiveTabId);
     }
-    // Fall through: persisted pref is gone or no longer matches a real
-    // pane. Prefer the Manager pane (chat-first landing); otherwise
-    // land on the Overview pseudo-tab — that's where Start Manager and
-    // the project-goal input live, so a brand-new project still gives
-    // the user something useful to click. Don't persist; we'd
-    // otherwise overwrite the user's intent on the next explicit click.
-    const fallback = managerTabId ?? OVERVIEW_PANE_ID;
-    if (activeTabId !== fallback) setActiveTabId(fallback);
   }, [activeTabId, cliClientId, managerTabId, paneConfigs.length, tabIds]);
 
   // Lazy-load: when activeTabId changes (initial pick or user click),
