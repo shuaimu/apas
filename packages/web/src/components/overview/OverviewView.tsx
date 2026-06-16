@@ -36,6 +36,53 @@ interface OverviewViewProps {
   onRemovePane: (paneId: number) => void;
 }
 
+export function buildSuggestWorkersPrompt(paneConfigs: PaneConfig[]): string {
+  // Only show managed panes. Side chats are user scratch space, not part of
+  // the team the Manager should reason about when proposing additions.
+  const roster = paneConfigs
+    .filter((p: PaneConfig) => p.managed === true)
+    .map((p: PaneConfig) => {
+      const lower = (p.role ?? "").toLowerCase();
+      const tag = lower.includes("tech lead")
+        ? "tech-lead"
+        : lower.includes("manager")
+          ? "manager"
+          : p.role || "no-role";
+      return `  - pane_id=${p.pane_id} (${p.label ?? "untitled"}, ${tag})`;
+    })
+    .join("\n") || "  (no managed team members yet)";
+
+  return `Use the current team-mode queue before suggesting more workers.
+
+First read these project files / records:
+- project_goal.md for the current goal.
+- team-todo.md for proposed, approved, in_progress, under_review, pr_open, and done Global TODOs plus assigned pane subtasks.
+- suggested-workers.md for already-proposed worker suggestions and the next SUG-NNN id.
+- .apas for the managed pane roster and each pane's role/mode/worktree state.
+- Recent .apas-team.jsonl records, especially delegations, reviews, decisions, PR openings, and reviewer/Tech Lead feedback.
+
+Managed team currently visible in the Overview:
+
+${roster}
+
+Suggest 2-3 additional worker panes only if they would help advance the current goal and queue. Avoid duplicates:
+- Do not duplicate existing managed panes from .apas or the roster above.
+- Do not duplicate existing suggestions already present in suggested-workers.md.
+- Do not suggest a worker for proposed, approved, or in_progress Global TODOs in team-todo.md that already have an obvious owner or active worker.
+
+Append each useful suggestion as a section in **suggested-workers.md** (use the Edit/Write tool) — they'll appear in the Overview's "Suggested workers" box with one-click Accept buttons.
+
+Keep this exact schema per suggestion:
+
+## SUG-NNN — short label
+- role: developer | qa | reviewer | researcher | devops | ...
+- goal: one-sentence scope describing what they'd own
+- backstory: 1-2 sentences of relevant context / expertise
+- needs_worktree: yes | no   (yes for developers; usually no for reviewers/researchers)
+
+Pick NNN past the existing max (SUG-001 if the file is empty). Quality over quantity. If the current team is sufficient or every obvious gap is already represented by a managed pane, existing suggestion, or Global TODO owner, say so here in chat and skip the file.`;
+}
+
 export function OverviewView({
   onOpenPane,
   onOpenDiff,
@@ -62,23 +109,7 @@ export function OverviewView({
       showToast("Start the Manager first — they need to be running to suggest workers.", "error");
       return;
     }
-    // Only show managed panes — side chats are user scratch space, not
-    // part of the team the Manager should reason about when proposing
-    // additions. Empty roster (everything's unmanaged) is fine; the
-    // Manager will just propose from scratch.
-    const roster = paneConfigs
-      .filter((p: PaneConfig) => p.managed === true)
-      .map((p: PaneConfig) => {
-        const lower = (p.role ?? "").toLowerCase();
-        const tag = lower.includes("tech lead")
-          ? "tech-lead"
-          : lower.includes("manager")
-            ? "manager"
-            : p.role || "no-role";
-        return `  - pane_id=${p.pane_id} (${p.label ?? "untitled"}, ${tag})`;
-      })
-      .join("\n") || "  (no managed team members yet)";
-    const prompt = `Given the current project goal (in project_goal.md) and the team you already have:\n\n${roster}\n\nSuggest 2-3 additional worker panes that would help advance the goal. Append each suggestion as a section in **suggested-workers.md** (use the Edit/Write tool) — they'll appear in the Overview's "Suggested workers" box with one-click Accept buttons.\n\nFormat per suggestion:\n\n## SUG-NNN — short label\n- role: developer | qa | reviewer | researcher | devops | ...\n- goal: one-sentence scope describing what they'd own\n- backstory: 1-2 sentences of relevant context / expertise\n- needs_worktree: yes | no   (yes for developers; usually no for reviewers/researchers)\n\nPick NNN past the existing max (SUG-001 if the file is empty). Quality over quantity. If the current team is sufficient, say so here in chat and skip the file.`;
+    const prompt = buildSuggestWorkersPrompt(paneConfigs);
     const result = sendMessageToPane(prompt, managerPane.pane_id);
     if (result.success) {
       showToast("Asked the Manager for suggestions — they'll appear in the Suggested workers box below.", "info");
