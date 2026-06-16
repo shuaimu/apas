@@ -110,7 +110,7 @@ Working style:
 
 Worktree:
 - If you already have a worktree assigned (.apas panes[] worktree_path), live there exclusively.
-- If you don't (you were auto-spawned as a generalist), create one on your first task: pick a branch name from the task id, then \`git worktree add ../.apas-worktrees/pane-<your_id> -b <branch>\` from the project root.
+- If you don't (you were auto-spawned as a generalist), create one on your first task: pick a branch name from the task id, then run \`git fetch origin\` and \`git worktree add ../.apas-worktrees/pane-<your_id> -b <branch> origin/HEAD\` from the project root; use \`origin/master\` if this repo has no \`origin/HEAD\`.
 
 PR-style flow:
 - Never merge directly to the main branch.

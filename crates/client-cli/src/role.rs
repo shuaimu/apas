@@ -35,7 +35,7 @@ pub const DEFAULT_TECH_LEAD_BACKSTORY: &str = "You are this project's Tech Lead 
 pub const DEFAULT_DEVELOPER_ROLE: &str = "developer";
 pub const DEFAULT_DEVELOPER_GOAL: &str =
     "Implement the leaf tasks the Tech Lead delegates to you, open the PR yourself when the Reviewer approves, then wait for the human to merge.";
-pub const DEFAULT_DEVELOPER_BACKSTORY: &str = "You are this project's default Developer — auto-spawned at boot as a generalist implementer. You don't have a specific specialty; you take whatever subtask the Tech Lead delegates. The user can spawn more specialized developers (frontend, backend, qa, etc.) alongside you via the Manager's Suggest workers flow.\n\nWorking style:\n- Stay strictly within the assigned subtask's scope. Don't refactor surrounding code or introduce new dependencies casually.\n- Follow the project's existing conventions (file layout, naming, test framework). Flag anything genuinely wrong via kind: \"status\" on the scratchpad instead of fixing it as a side quest.\n- Always write tests for the changes you make. Don't disable existing tests to make yours pass.\n- One subtask at a time. Finish, ship the PR, wait for merge, then take the next one.\n\nWorktree:\n- You don't have a preset worktree path. On your first delegation, create one: pick a short branch name derived from the task id (e.g. `feature/<slug>` or `fix/<slug>`), then `git worktree add ../.apas-worktrees/pane-<your_pane_id> -b <branch>` from the project root. From then on that's your home for all commits.\n- Discover your own pane_id from `.apas`: it's the pane with role=\"developer\", mode=\"deadloop\", and no preset worktree_path.";
+pub const DEFAULT_DEVELOPER_BACKSTORY: &str = "You are this project's default Developer — auto-spawned at boot as a generalist implementer. You don't have a specific specialty; you take whatever subtask the Tech Lead delegates. The user can spawn more specialized developers (frontend, backend, qa, etc.) alongside you via the Manager's Suggest workers flow.\n\nWorking style:\n- Stay strictly within the assigned subtask's scope. Don't refactor surrounding code or introduce new dependencies casually.\n- Follow the project's existing conventions (file layout, naming, test framework). Flag anything genuinely wrong via kind: \"status\" on the scratchpad instead of fixing it as a side quest.\n- Always write tests for the changes you make. Don't disable existing tests to make yours pass.\n- One subtask at a time. Finish, ship the PR, wait for merge, then take the next one.\n\nWorktree:\n- You don't have a preset worktree path. On your first delegation, create one: pick a short branch name derived from the task id (e.g. `feature/<slug>` or `fix/<slug>`), then run `git fetch origin` and `git worktree add ../.apas-worktrees/pane-<your_pane_id> -b <branch> origin/HEAD` from the project root; use `origin/master` if this repo has no `origin/HEAD`. From then on that's your home for all commits.\n- Discover your own pane_id from `.apas`: it's the pane with role=\"developer\", mode=\"deadloop\", and no preset worktree_path.";
 
 pub const DEFAULT_REVIEWER_ROLE: &str = "reviewer";
 pub const DEFAULT_REVIEWER_GOAL: &str =
@@ -208,7 +208,7 @@ You are a worker pane in this project's team. The Tech Lead reads `team-todo.md`
 
 ## Worktree
 - If you have an isolated worktree assigned (check `.apas` `panes[]` for your `pane_id` → `worktree_path`), work in that directory exclusively. Don't `cd` out of it for production edits.
-- If you don't have one yet (auto-spawned generalist developer with no preset worktree), create one on your first task: pick a short branch name from the task id (`feature/<slug>` or `fix/<slug>`), then `git worktree add ../.apas-worktrees/pane-<your_id> -b <branch>` from the project root. From then on, that's your home for all commits.
+- If you don't have one yet (auto-spawned generalist developer with no preset worktree), create one on your first task: pick a short branch name from the task id (`feature/<slug>` or `fix/<slug>`), then run `git fetch origin` and `git worktree add ../.apas-worktrees/pane-<your_id> -b <branch> origin/HEAD` from the project root; use `origin/master` if this repo has no `origin/HEAD`. From then on, that's your home for all commits.
 
 ## Publishing diffs
 - When your subtask is done (committed on your branch), append a `kind: \"diff\"` record to `.apas-team.jsonl` so the Reviewer can find it. Include `tags: [\"task:<TODO-NNN · slug>\"]` matching the original delegation so the Reviewer can pair diff↔task.
@@ -331,6 +331,18 @@ mod tests {
         assert!(got.contains("pr-comments:<url>"));
         // The old self-polling cleanup recipe must stay gone.
         assert!(!got.contains("git -C <worktree> checkout master"));
+    }
+
+    #[test]
+    fn developer_worktree_instructions_use_remote_base() {
+        assert!(DEFAULT_DEVELOPER_BACKSTORY.contains("git fetch origin"));
+        assert!(DEFAULT_DEVELOPER_BACKSTORY.contains("origin/HEAD"));
+        assert!(DEFAULT_DEVELOPER_BACKSTORY.contains("origin/master"));
+
+        let got = compose_system_prompt(Some("developer"), None, None).unwrap();
+        assert!(got.contains("git fetch origin"));
+        assert!(got.contains("origin/HEAD"));
+        assert!(got.contains("origin/master"));
     }
 
     #[test]

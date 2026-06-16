@@ -56,6 +56,8 @@ pub fn create_for_pane(
         }
     };
 
+    let remote_base = resolve_remote_worktree_base(project_dir)?;
+
     if let Some(parent) = worktree_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -69,6 +71,7 @@ pub fn create_for_pane(
         .arg(&worktree_path)
         .arg("-b")
         .arg(branch_name)
+        .arg(&remote_base)
         .status()
         .context("running `git worktree add` — is this a git repo?")?;
 
@@ -333,23 +336,55 @@ pub fn create_pr_for_pane(worktree_path: Option<&str>) -> Result<String> {
     Ok(url)
 }
 
+fn resolve_remote_worktree_base(project_dir: &Path) -> Result<String> {
+    run_git_path(project_dir, &["fetch", "origin"])
+        .context("fetching origin before creating isolated worktree")?;
+
+    if run_git_path(
+        project_dir,
+        &["rev-parse", "--verify", "--quiet", "origin/HEAD^{commit}"],
+    )
+    .is_ok()
+    {
+        return Ok("origin/HEAD".to_string());
+    }
+
+    if run_git_path(
+        project_dir,
+        &["rev-parse", "--verify", "--quiet", "origin/master^{commit}"],
+    )
+    .is_ok()
+    {
+        return Ok("origin/master".to_string());
+    }
+
+    Err(anyhow!(
+        "could not resolve remote base after fetching origin: neither origin/HEAD nor origin/master exists",
+    ))
+}
+
 /// Run a `git -C <dir> <args…>` command and return its stdout on success.
-fn run_git_cd(cwd: &str, args: &[&str]) -> Result<String> {
+fn run_git_path(cwd: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(cwd)
         .args(args)
         .output()
-        .with_context(|| format!("running `git {}` in {}", args.join(" "), cwd))?;
+        .with_context(|| format!("running `git {}` in {}", args.join(" "), cwd.display()))?;
     if !out.status.success() {
         return Err(anyhow!(
             "git {} (in {}) failed: {}",
             args.join(" "),
-            cwd,
+            cwd.display(),
             String::from_utf8_lossy(&out.stderr).trim(),
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Run a `git -C <dir> <args…>` command and return its stdout on success.
+fn run_git_cd(cwd: &str, args: &[&str]) -> Result<String> {
+    run_git_path(Path::new(cwd), args)
 }
 
 /// Resolve the current branch in a worktree. Returns None for detached HEAD.
@@ -475,6 +510,82 @@ mod tests {
             "apas-pane-2",
         ]);
         (tmp, proj, wt)
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {} failed", args.join(" "));
+    }
+
+    fn run_git_stdout(cwd: &Path, args: &[&str]) -> String {
+        run_git_path(cwd, args).expect("git stdout").trim().to_string()
+    }
+
+    #[test]
+    fn create_for_pane_fetches_origin_and_bases_branch_on_remote_tip() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let origin = tmp.path().join("origin.git");
+        let seed = tmp.path().join("seed");
+        let proj = tmp.path().join("proj");
+
+        let status = Command::new("git")
+            .arg("init")
+            .arg("--bare")
+            .arg("-q")
+            .arg("-b")
+            .arg("master")
+            .arg(&origin)
+            .status()
+            .expect("git init bare");
+        assert!(status.success());
+
+        let status = Command::new("git")
+            .arg("clone")
+            .arg("-q")
+            .arg(&origin)
+            .arg(&seed)
+            .status()
+            .expect("git clone seed");
+        assert!(status.success());
+        run_git(&seed, &["config", "user.email", "t@e"]);
+        run_git(&seed, &["config", "user.name", "t"]);
+        std::fs::write(seed.join("initial.txt"), b"initial").unwrap();
+        run_git(&seed, &["add", "initial.txt"]);
+        run_git(&seed, &["commit", "-q", "-m", "initial"]);
+        run_git(&seed, &["push", "-q", "origin", "master"]);
+
+        let status = Command::new("git")
+            .arg("clone")
+            .arg("-q")
+            .arg(&origin)
+            .arg(&proj)
+            .status()
+            .expect("git clone proj");
+        assert!(status.success());
+        let stale_local_head = run_git_stdout(&proj, &["rev-parse", "master"]);
+
+        std::fs::write(seed.join("origin-only.txt"), b"new remote tip").unwrap();
+        run_git(&seed, &["add", "origin-only.txt"]);
+        run_git(&seed, &["commit", "-q", "-m", "origin only"]);
+        run_git(&seed, &["push", "-q", "origin", "master"]);
+        let remote_tip = run_git_stdout(&seed, &["rev-parse", "HEAD"]);
+        assert_ne!(stale_local_head, remote_tip, "local master must be stale");
+
+        let wt = create_for_pane(&proj, 7, Some("apas-pane-7"), None).expect("create worktree");
+        let created_head = run_git_cd(&wt, &["rev-parse", "HEAD"])
+            .expect("created worktree head")
+            .trim()
+            .to_string();
+        assert_eq!(created_head, remote_tip);
+        assert!(
+            Path::new(&wt).join("origin-only.txt").exists(),
+            "worktree should include the remote-only commit",
+        );
     }
 
     #[test]
