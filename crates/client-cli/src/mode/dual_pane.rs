@@ -725,6 +725,51 @@ fn restored_pane_mode_and_pause(
     (mode, is_paused)
 }
 
+fn boot_restore_try_resume_first(provider: &Provider, model: Option<&str>) -> bool {
+    matches!(provider, Provider::Claude)
+        && !is_minimax_model(model)
+        && !is_glm_model(model)
+        && !is_deepseek_model(model)
+}
+
+fn build_agent_switch_respawn_event(
+    pane_id: u32,
+    label: String,
+    claude_session_id: Uuid,
+    mode: shared::PaneMode,
+    provider: Provider,
+    prompt: Option<String>,
+    min_iteration_interval_minutes: Option<u64>,
+    model: Option<String>,
+    effort: Option<String>,
+    worktree_path: Option<String>,
+    role: Option<String>,
+    goal: Option<String>,
+    backstory: Option<String>,
+    plan_review_mode: shared::PlanReviewMode,
+    managed: bool,
+) -> TuiEvent {
+    TuiEvent::AddTabWithConfig {
+        pane_id,
+        label,
+        claude_session_id,
+        mode,
+        provider,
+        prompt,
+        min_iteration_interval_minutes,
+        model,
+        effort,
+        worktree_path,
+        initial_input: None,
+        role,
+        goal,
+        backstory,
+        plan_review_mode,
+        managed,
+        try_resume_first: false,
+    }
+}
+
 /// One held tool_use waiting on user approval (Phase 3.2b2).
 #[derive(Clone, Debug)]
 struct PendingPlanReview {
@@ -1472,7 +1517,7 @@ async fn run_inner(
                 // every reboot starts a fresh thread. Trade-off: no
                 // cross-boot continuity for those backends, but we never
                 // fail with "no rollout found" on a stale id either.
-                matches!(provider, Provider::Claude),
+                boot_restore_try_resume_first(&provider, model.as_deref()),
                 file_watcher_for_dl,
             )
         }));
@@ -3627,6 +3672,26 @@ fn build_agent_args(
     }
 }
 
+fn build_deadloop_agent_args(
+    provider: &Provider,
+    session_id: &Uuid,
+    prompt: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    first_message: bool,
+    try_resume_first: bool,
+) -> (Vec<String>, bool) {
+    build_agent_args(
+        provider,
+        session_id,
+        prompt,
+        model,
+        effort,
+        first_message,
+        try_resume_first,
+    )
+}
+
 /// Intercept claude's `control_request` envelopes on stdout. Returns
 /// `Some(true)` if the line was a control_request (caller should `continue`),
 /// `Some(false)` if it's a control_request we explicitly leave for downstream
@@ -3876,10 +3941,11 @@ fn parse_agent_output(
 mod tests {
     use super::{
         active_usage_providers, auto_cancel_pending_questions_for_new_input, build_agent_args,
-        build_pane_env_overrides_from_keys, build_pane_list, pane_label_or_default,
-        promote_pane_to_managed, resolve_pane_binary_path, route_web_input_to_pane,
-        restored_pane_mode_and_pause, run_deadloop_session_inner, save_pane_configs,
-        start_bot_preserved_fields, truncate_str_at_char_boundary,
+        build_agent_switch_respawn_event, build_deadloop_agent_args,
+        build_pane_env_overrides_from_keys, build_pane_list, boot_restore_try_resume_first,
+        pane_label_or_default, promote_pane_to_managed, resolve_pane_binary_path,
+        route_web_input_to_pane, restored_pane_mode_and_pause, run_deadloop_session_inner,
+        save_pane_configs, start_bot_preserved_fields, truncate_str_at_char_boundary,
         ASK_USER_QUESTION_AUTO_CANCEL_STATUS, InputChannels, PaneInputRouteResult, PaneMeta,
         PaneMetas, PanePauses, PaneStopRequests, PendingAskQuestion,
     };
@@ -4020,6 +4086,124 @@ mod tests {
         assert_eq!(args.get(0).map(String::as_str), Some("exec"));
         assert_eq!(args.get(1).map(String::as_str), Some("resume"));
         assert_eq!(args.last().map(String::as_str), Some(FULL_PROMPT));
+    }
+
+    #[test]
+    fn boot_restore_resume_policy_is_claude_only_without_backend_model() {
+        assert!(boot_restore_try_resume_first(&Provider::Claude, None));
+        assert!(boot_restore_try_resume_first(
+            &Provider::Claude,
+            Some("sonnet")
+        ));
+
+        assert!(!boot_restore_try_resume_first(&Provider::Codex, None));
+        assert!(!boot_restore_try_resume_first(&Provider::Opencode, None));
+        assert!(!boot_restore_try_resume_first(&Provider::CursorAgent, None));
+        assert!(!boot_restore_try_resume_first(&Provider::Minimax, None));
+        assert!(!boot_restore_try_resume_first(&Provider::Glm, None));
+        assert!(!boot_restore_try_resume_first(&Provider::Deepseek, None));
+        assert!(!boot_restore_try_resume_first(
+            &Provider::Claude,
+            Some("MiniMax-M2.7")
+        ));
+        assert!(!boot_restore_try_resume_first(
+            &Provider::Claude,
+            Some("glm-4.5-air")
+        ));
+        assert!(!boot_restore_try_resume_first(
+            &Provider::Claude,
+            Some("deepseek-chat")
+        ));
+    }
+
+    #[test]
+    fn provider_switch_respawn_event_uses_fresh_session_and_disables_resume() {
+        let previous_session = Uuid::from_u128(1);
+        let fresh_session = Uuid::from_u128(2);
+
+        let event = build_agent_switch_respawn_event(
+            42,
+            "Developer".to_string(),
+            fresh_session,
+            shared::PaneMode::Deadloop,
+            Provider::Codex,
+            Some("keep going".to_string()),
+            Some(3),
+            Some("gpt-5-codex".to_string()),
+            None,
+            Some("/tmp/apas-dev".to_string()),
+            Some("developer".to_string()),
+            Some("ship tests".to_string()),
+            Some("context".to_string()),
+            shared::PlanReviewMode::RiskyOnly,
+            true,
+        );
+
+        let TuiEvent::AddTabWithConfig {
+            claude_session_id,
+            provider,
+            model,
+            initial_input,
+            try_resume_first,
+            ..
+        } = event
+        else {
+            panic!("agent switch should respawn through AddTabWithConfig");
+        };
+
+        assert_ne!(claude_session_id, previous_session);
+        assert_eq!(claude_session_id, fresh_session);
+        assert_eq!(provider, Provider::Codex);
+        assert_eq!(model.as_deref(), Some("gpt-5-codex"));
+        assert!(initial_input.is_none());
+        assert!(!try_resume_first);
+
+        let (args, using_resume) = build_agent_args(
+            &provider,
+            &claude_session_id,
+            FULL_PROMPT,
+            model.as_deref(),
+            None,
+            true,
+            try_resume_first,
+        );
+        assert!(!using_resume);
+        assert_eq!(args.get(0).map(String::as_str), Some("exec"));
+        assert_ne!(args.get(1).map(String::as_str), Some("resume"));
+        assert!(!args.iter().any(|arg| arg == &fresh_session.to_string()));
+    }
+
+    #[test]
+    fn deadloop_initial_resume_flag_controls_codex_first_spawn_args() {
+        let session_id = Uuid::from_u128(3);
+
+        let (fresh_args, fresh_using_resume) = build_deadloop_agent_args(
+            &Provider::Codex,
+            &session_id,
+            FULL_PROMPT,
+            None,
+            None,
+            true,
+            false,
+        );
+        assert!(!fresh_using_resume);
+        assert_eq!(fresh_args.get(0).map(String::as_str), Some("exec"));
+        assert_ne!(fresh_args.get(1).map(String::as_str), Some("resume"));
+        assert!(!fresh_args.iter().any(|arg| arg == &session_id.to_string()));
+
+        let (resume_args, resume_using_resume) = build_deadloop_agent_args(
+            &Provider::Codex,
+            &session_id,
+            FULL_PROMPT,
+            None,
+            None,
+            true,
+            true,
+        );
+        assert!(resume_using_resume);
+        assert_eq!(resume_args.get(0).map(String::as_str), Some("exec"));
+        assert_eq!(resume_args.get(1).map(String::as_str), Some("resume"));
+        assert!(resume_args.iter().any(|arg| arg == &session_id.to_string()));
     }
 
     #[test]
@@ -5430,7 +5614,7 @@ fn run_deadloop_session_inner(
             status: Some("Thinking...".to_string()),
         });
 
-        let (args, using_resume) = build_agent_args(
+        let (args, using_resume) = build_deadloop_agent_args(
             provider,
             &claude_session_id,
             iteration_prompt,
@@ -9192,28 +9376,23 @@ async fn run_server_connection(
                                                 // fresh session. The AddTabWithConfig handler
                                                 // overwrites the PaneMeta + input_channels entries
                                                 // and spawns a new worker thread.
-                                                let _ = tui_event_tx.send(TuiEvent::AddTabWithConfig {
-                                                    pane_id: target_pane,
+                                                let _ = tui_event_tx.send(build_agent_switch_respawn_event(
+                                                    target_pane,
                                                     label,
-                                                    claude_session_id: new_session,
+                                                    new_session,
                                                     mode,
-                                                    provider: effective_provider,
+                                                    effective_provider,
                                                     prompt,
-                                                    min_iteration_interval_minutes: min_interval,
-                                                    model: new_model,
+                                                    min_interval,
+                                                    new_model,
                                                     effort,
                                                     worktree_path,
-                                                    initial_input: None,
                                                     role,
                                                     goal,
                                                     backstory,
                                                     plan_review_mode,
                                                     managed,
-                                                    // Fresh session id we just minted —
-                                                    // codex's `exec resume` would fail with
-                                                    // "no rollout found" if we tried to resume.
-                                                    try_resume_first: false,
-                                                });
+                                                ));
 
                                                 // Persist to .apas + broadcast the fresh PaneList.
                                                 save_pane_configs(
