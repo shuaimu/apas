@@ -205,6 +205,82 @@ describe('useStore', () => {
     });
   });
 
+  describe('team todo approval and add', () => {
+    const initialStore = useStore.getInitialState();
+
+    function makeOpenWs() {
+      const send = vi.fn();
+      return {
+        readyState: WebSocket.OPEN,
+        send,
+        close: vi.fn(),
+      } as unknown as WebSocket & { send: typeof send };
+    }
+
+    beforeEach(() => {
+      useStore.setState({
+        sessionId: 'session-team-todo',
+        approveTodo: initialStore.approveTodo,
+        rejectTodo: initialStore.rejectTodo,
+        addTodo: initialStore.addTodo,
+        showToast: initialStore.showToast,
+      });
+    });
+
+    it('approveTodo sends a todo_approval approve request for the active session', () => {
+      const ws = makeOpenWs();
+      useStore.setState({ ws });
+
+      useStore.getState().approveTodo('TODO-001');
+
+      expect(ws.send).toHaveBeenCalledWith(JSON.stringify({
+        type: 'todo_approval',
+        session_id: 'session-team-todo',
+        todo_id: 'TODO-001',
+        action: 'approve',
+      }));
+    });
+
+    it('rejectTodo sends a todo_approval reject request for the active session', () => {
+      const ws = makeOpenWs();
+      useStore.setState({ ws });
+
+      useStore.getState().rejectTodo('TODO-002');
+
+      expect(ws.send).toHaveBeenCalledWith(JSON.stringify({
+        type: 'todo_approval',
+        session_id: 'session-team-todo',
+        todo_id: 'TODO-002',
+        action: 'reject',
+      }));
+    });
+
+    it('addTodo rejects an empty trimmed title with an error toast', () => {
+      const ws = makeOpenWs();
+      const showToast = vi.fn();
+      useStore.setState({ ws, showToast });
+
+      useStore.getState().addTodo('   ', 'ignored body');
+
+      expect(showToast).toHaveBeenCalledWith("TODO title can't be empty", 'error');
+      expect(ws.send).not.toHaveBeenCalled();
+    });
+
+    it('addTodo trims the title and sends body for a valid request', () => {
+      const ws = makeOpenWs();
+      useStore.setState({ ws });
+
+      useStore.getState().addTodo('  Ship the workflow  ', 'acceptance\ncriteria');
+
+      expect(ws.send).toHaveBeenCalledWith(JSON.stringify({
+        type: 'add_todo',
+        session_id: 'session-team-todo',
+        title: 'Ship the workflow',
+        body: 'acceptance\ncriteria',
+      }));
+    });
+  });
+
   describe('project_goal_changed', () => {
     it('caches project goal content by session id from websocket messages', async () => {
       useStore.getState().connect();
