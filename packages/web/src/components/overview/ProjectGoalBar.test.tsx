@@ -169,6 +169,11 @@ describe("ProjectGoalBar team role slots", () => {
     expect(prompt).toEqual(expect.stringContaining("preserve the worktree"));
     expect(prompt).toEqual(expect.stringContaining("git show origin/HEAD:README.md"));
     expect(prompt).toEqual(expect.stringContaining("git show origin/HEAD:CLAUDE.md"));
+    expect(prompt).toEqual(expect.stringContaining("backlog backpressure"));
+    expect(prompt).toEqual(expect.stringContaining("Available managed developer capacity"));
+    expect(prompt).toEqual(expect.stringContaining("explicit queue limit"));
+    expect(prompt).toEqual(expect.stringContaining("user-approved backlog state is preserved"));
+    expect(prompt).toEqual(expect.stringContaining("configured capacity"));
     expect(addPane).toHaveBeenCalledWith(
       "claude",
       "deadloop",
