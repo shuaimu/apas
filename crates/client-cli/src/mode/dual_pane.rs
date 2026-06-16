@@ -3204,6 +3204,28 @@ fn build_pane_list(
     panes
 }
 
+fn promote_pane_to_managed(pane_metas: &PaneMetas, promote_id: u32) -> bool {
+    let mut metas = pane_metas.lock().unwrap();
+    match metas.get_mut(&promote_id) {
+        Some(m) if !m.managed => {
+            m.managed = true;
+            // Bring promoted Claude panes up to the team's baseline (max
+            // effort). effort_arc is read by the streaming worker before
+            // each turn, so the next Claude restart picks it up.
+            if matches!(m.provider, shared::Provider::Claude)
+                && m.effort.as_deref() != Some("max")
+            {
+                m.effort = Some("max".to_string());
+                if let Ok(mut guard) = m.effort_arc.lock() {
+                    *guard = Some("max".to_string());
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 fn active_usage_providers(pane_metas: &PaneMetas) -> (bool, bool, bool, bool, bool) {
     let metas = pane_metas.lock().unwrap();
     let mut has_claude = false;
@@ -3698,17 +3720,48 @@ fn parse_agent_output(
 mod tests {
     use super::{
         active_usage_providers, build_agent_args, build_pane_env_overrides_from_keys,
-        pane_label_or_default, resolve_pane_binary_path, truncate_str_at_char_boundary,
-        PaneMeta, PaneMetas,
+        build_pane_list, pane_label_or_default, promote_pane_to_managed,
+        resolve_pane_binary_path, truncate_str_at_char_boundary, InputChannels, PaneMeta,
+        PaneMetas, PanePauses, PaneStopRequests,
     };
     use shared::Provider;
     use std::collections::HashMap;
-    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
     use uuid::Uuid;
 
     const FULL_PROMPT: &str =
         "Work on tasks defined in TODO.md.\n1. Analyze\n2. Implement\n3. Test";
+
+    fn test_pane_meta(
+        provider: Provider,
+        managed: bool,
+        effort: Option<&str>,
+        effort_arc: Arc<Mutex<Option<String>>>,
+    ) -> PaneMeta {
+        PaneMeta {
+            mode: shared::PaneMode::Deadloop,
+            provider,
+            label: "Side Developer".to_string(),
+            prompt: Some("Keep helping".to_string()),
+            model: None,
+            effort: effort.map(str::to_string),
+            min_iteration_interval_minutes: Some(5),
+            child_process: Arc::new(Mutex::new(None)),
+            streaming_interrupt_tx: Arc::new(Mutex::new(None)),
+            control_response_tx: Arc::new(Mutex::new(None)),
+            pending_questions: Arc::new(Mutex::new(HashMap::new())),
+            effort_arc,
+            worktree_path: Some("/tmp/apas-side-dev".to_string()),
+            role: Some("developer".to_string()),
+            goal: Some("Ship the side quest".to_string()),
+            backstory: Some("A manually added helper pane".to_string()),
+            plan_review_mode: shared::PlanReviewMode::RiskyOnly,
+            plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::RiskyOnly)),
+            pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
+            manual_mode: true,
+            managed,
+        }
+    }
 
     #[test]
     fn build_agent_args_claude_resume_keeps_full_prompt() {
@@ -4213,6 +4266,87 @@ mod tests {
             active_usage_providers(&pane_metas),
             (false, false, true, false, false)
         );
+    }
+
+    #[test]
+    fn promote_pane_to_managed_marks_side_chat_and_pane_list_managed() {
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+        let effort_arc = Arc::new(Mutex::new(Some("low".to_string())));
+        let pane_session = Uuid::new_v4();
+
+        {
+            pane_metas.lock().unwrap().insert(
+                42,
+                test_pane_meta(Provider::Claude, false, Some("low"), effort_arc.clone()),
+            );
+        }
+
+        assert!(promote_pane_to_managed(&pane_metas, 42));
+
+        {
+            let metas = pane_metas.lock().unwrap();
+            let promoted = metas.get(&42).expect("pane should still exist");
+            assert!(promoted.managed);
+            assert_eq!(promoted.role.as_deref(), Some("developer"));
+            assert_eq!(promoted.goal.as_deref(), Some("Ship the side quest"));
+            assert_eq!(
+                promoted.backstory.as_deref(),
+                Some("A manually added helper pane"),
+            );
+            assert_eq!(promoted.effort.as_deref(), Some("max"));
+        }
+        assert_eq!(effort_arc.lock().unwrap().as_deref(), Some("max"));
+
+        let input_channels: InputChannels = Arc::new(Mutex::new(HashMap::new()));
+        let pane_sessions = Arc::new(Mutex::new(HashMap::new()));
+        pane_sessions.lock().unwrap().insert(42, pane_session);
+        let pane_pauses: PanePauses = Arc::new(Mutex::new(HashMap::new()));
+        let pane_stop_requests: PaneStopRequests = Arc::new(Mutex::new(HashMap::new()));
+
+        let panes = build_pane_list(
+            &pane_metas,
+            &input_channels,
+            Uuid::new_v4(),
+            &pane_sessions,
+            &pane_pauses,
+            &pane_stop_requests,
+        );
+        let promoted = panes
+            .into_iter()
+            .find(|pane| pane.pane_id == 42)
+            .expect("promoted pane should appear in PaneList");
+
+        assert!(promoted.managed);
+        assert_eq!(promoted.session_id, pane_session);
+        assert_eq!(promoted.role.as_deref(), Some("developer"));
+        assert_eq!(promoted.goal.as_deref(), Some("Ship the side quest"));
+        assert_eq!(
+            promoted.backstory.as_deref(),
+            Some("A manually added helper pane"),
+        );
+        assert_eq!(promoted.effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn promote_pane_to_managed_noops_for_managed_or_missing_panes() {
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+        let effort_arc = Arc::new(Mutex::new(Some("low".to_string())));
+
+        {
+            pane_metas.lock().unwrap().insert(
+                7,
+                test_pane_meta(Provider::Claude, true, Some("low"), effort_arc.clone()),
+            );
+        }
+
+        assert!(!promote_pane_to_managed(&pane_metas, 7));
+        assert!(!promote_pane_to_managed(&pane_metas, 999));
+
+        let metas = pane_metas.lock().unwrap();
+        let managed = metas.get(&7).expect("managed pane should remain");
+        assert!(managed.managed);
+        assert_eq!(managed.effort.as_deref(), Some("low"));
+        assert_eq!(effort_arc.lock().unwrap().as_deref(), Some("low"));
     }
 
     #[test]
@@ -9006,29 +9140,7 @@ async fn run_server_connection(
                                                 }
                                             }
                                             ServerToCli::PromotePaneToManaged { session_id: _, pane_id: promote_id } => {
-                                                let changed = {
-                                                    let mut metas = pane_metas.lock().unwrap();
-                                                    match metas.get_mut(&promote_id) {
-                                                        Some(m) if !m.managed => {
-                                                            m.managed = true;
-                                                            // Bring promoted Claude panes up to the team's
-                                                            // baseline (max effort) — same default as a
-                                                            // fresh managed spawn. effort_arc is read by
-                                                            // the streaming worker before each turn, so
-                                                            // the next claude restart picks it up.
-                                                            if matches!(m.provider, shared::Provider::Claude)
-                                                                && m.effort.as_deref() != Some("max")
-                                                            {
-                                                                m.effort = Some("max".to_string());
-                                                                if let Ok(mut g) = m.effort_arc.lock() {
-                                                                    *g = Some("max".to_string());
-                                                                }
-                                                            }
-                                                            true
-                                                        }
-                                                        _ => false,
-                                                    }
-                                                };
+                                                let changed = promote_pane_to_managed(&pane_metas, promote_id);
                                                 if changed {
                                                     save_pane_configs(
                                                         &working_dir,
