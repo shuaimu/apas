@@ -5086,6 +5086,16 @@ fn run_deadloop_session_inner(
                         let old = claude_session_id;
                         claude_session_id = Uuid::new_v4();
                         try_resume_first = false;
+                        // Also reset first_message so the next iteration
+                        // takes the "exec (no resume)" branch in
+                        // build_agent_args. Without this, when stale fires
+                        // mid-loop (first_message is already false), the
+                        // very next iteration still falls into the
+                        // "subsequent → always resume" branch and tries
+                        // exec resume on the just-minted id — which codex
+                        // also doesn't know about, so it loops forever
+                        // re-minting fresh ids and re-failing.
+                        first_message = true;
                         // Persist the fresh id straight into .apas so a
                         // CLI reboot doesn't fall back to the dead one.
                         // We don't have the full pane_metas / pane_pauses
