@@ -729,6 +729,104 @@ struct PendingAskQuestion {
 /// Per-pane metadata registry.
 type PaneMetas = Arc<Mutex<HashMap<u32, PaneMeta>>>;
 
+const ASK_USER_QUESTION_AUTO_CANCEL_STATUS: &str =
+    "[Pending question auto-cancelled: new message replaces it]";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CancelledAskUserQuestion {
+    tool_use_id: String,
+    request_id: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaneInputRouteResult {
+    Sent,
+    MissingChannel,
+    Disconnected,
+}
+
+fn auto_cancel_pending_questions_for_new_input(
+    pane_metas: &PaneMetas,
+    target_pane: u32,
+) -> Vec<CancelledAskUserQuestion> {
+    let pending_to_cancel: Vec<(String, String, mpsc::Sender<String>)> = {
+        let metas = pane_metas.lock().unwrap();
+        let Some(meta) = metas.get(&target_pane) else {
+            return Vec::new();
+        };
+        let sender = meta
+            .control_response_tx
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().cloned());
+        let Some(tx) = sender else {
+            return Vec::new();
+        };
+        let mut map = meta.pending_questions.lock().unwrap();
+        let drained = map
+            .iter()
+            .map(|(tool_use_id, pending)| {
+                (tool_use_id.clone(), pending.request_id.clone(), tx.clone())
+            })
+            .collect();
+        map.clear();
+        drained
+    };
+
+    let mut cancelled = Vec::new();
+    for (tool_use_id, request_id, cr_tx) in pending_to_cancel {
+        let response = serde_json::json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": request_id,
+                "response": {
+                    "behavior": "deny",
+                    "message": "User cancelled the question by sending a new prompt.",
+                    "toolUseID": tool_use_id,
+                }
+            }
+        });
+        if cr_tx.send(response.to_string()).is_err() {
+            tracing::warn!(
+                pane_id = target_pane,
+                tool_use_id = tool_use_id.as_str(),
+                "auto-cancel: streaming worker channel dead",
+            );
+            continue;
+        }
+        tracing::info!(
+            pane_id = target_pane,
+            tool_use_id = tool_use_id.as_str(),
+            "Auto-cancelled AskUserQuestion because user sent a new prompt",
+        );
+        cancelled.push(CancelledAskUserQuestion {
+            tool_use_id,
+            request_id,
+        });
+    }
+    cancelled
+}
+
+fn route_web_input_to_pane(
+    input_channels: &InputChannels,
+    target_pane: u32,
+    data: &str,
+) -> PaneInputRouteResult {
+    let target_tx = {
+        let channels = input_channels.lock().unwrap();
+        channels.get(&target_pane).cloned()
+    };
+
+    match target_tx {
+        Some(tx) => match tx.send((data.to_string(), false)) {
+            Ok(()) => PaneInputRouteResult::Sent,
+            Err(_) => PaneInputRouteResult::Disconnected,
+        },
+        None => PaneInputRouteResult::MissingChannel,
+    }
+}
+
 /// Run in tab-based mode
 pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()> {
     run_inner(server_url, token, working_dir, false).await
@@ -3764,14 +3862,16 @@ fn parse_agent_output(
 #[cfg(test)]
 mod tests {
     use super::{
-        active_usage_providers, build_agent_args, build_pane_env_overrides_from_keys,
-        build_pane_list, pane_label_or_default, promote_pane_to_managed,
-        resolve_pane_binary_path, start_bot_preserved_fields, truncate_str_at_char_boundary,
-        InputChannels, PaneMeta, PaneMetas, PanePauses, PaneStopRequests,
+        active_usage_providers, auto_cancel_pending_questions_for_new_input, build_agent_args,
+        build_pane_env_overrides_from_keys, build_pane_list, pane_label_or_default,
+        promote_pane_to_managed, resolve_pane_binary_path, route_web_input_to_pane,
+        start_bot_preserved_fields, truncate_str_at_char_boundary,
+        ASK_USER_QUESTION_AUTO_CANCEL_STATUS, InputChannels, PaneInputRouteResult, PaneMeta,
+        PaneMetas, PanePauses, PaneStopRequests, PendingAskQuestion,
     };
     use shared::Provider;
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{mpsc, Arc, Mutex};
     use uuid::Uuid;
 
     const FULL_PROMPT: &str =
@@ -3806,6 +3906,35 @@ mod tests {
             manual_mode: true,
             managed,
         }
+    }
+
+    fn seed_pending_question(meta: &PaneMeta, tool_use_id: &str, request_id: &str) {
+        meta.pending_questions.lock().unwrap().insert(
+            tool_use_id.to_string(),
+            PendingAskQuestion {
+                request_id: request_id.to_string(),
+                questions: serde_json::json!([{
+                    "question": "Proceed?",
+                    "header": "Confirm",
+                }]),
+            },
+        );
+    }
+
+    fn pending_question_ids(pane_metas: &PaneMetas, pane_id: u32) -> HashSet<String> {
+        pane_metas
+            .lock()
+            .unwrap()
+            .get(&pane_id)
+            .map(|meta| {
+                meta.pending_questions
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     #[test]
@@ -4421,6 +4550,131 @@ mod tests {
         assert!(managed.managed);
         assert_eq!(managed.effort.as_deref(), Some("low"));
         assert_eq!(effort_arc.lock().unwrap().as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn auto_cancel_pending_questions_drains_only_target_pane_with_denials() {
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+        let (target_tx, target_rx) = mpsc::channel::<String>();
+        let (other_tx, other_rx) = mpsc::channel::<String>();
+
+        let target_meta = test_pane_meta(
+            Provider::Claude,
+            true,
+            None,
+            Arc::new(Mutex::new(None)),
+        );
+        *target_meta.control_response_tx.lock().unwrap() = Some(target_tx);
+        seed_pending_question(&target_meta, "toolu-a", "req-a");
+        seed_pending_question(&target_meta, "toolu-b", "req-b");
+
+        let other_meta = test_pane_meta(
+            Provider::Claude,
+            true,
+            None,
+            Arc::new(Mutex::new(None)),
+        );
+        *other_meta.control_response_tx.lock().unwrap() = Some(other_tx);
+        seed_pending_question(&other_meta, "toolu-other", "req-other");
+
+        {
+            let mut metas = pane_metas.lock().unwrap();
+            metas.insert(7, target_meta);
+            metas.insert(8, other_meta);
+        }
+
+        let cancelled = auto_cancel_pending_questions_for_new_input(&pane_metas, 7);
+
+        assert_eq!(cancelled.len(), 2);
+        assert!(pending_question_ids(&pane_metas, 7).is_empty());
+        assert_eq!(
+            pending_question_ids(&pane_metas, 8),
+            HashSet::from(["toolu-other".to_string()])
+        );
+        assert!(other_rx.try_recv().is_err());
+
+        let mut denials = HashMap::new();
+        for _ in 0..2 {
+            let payload = target_rx
+                .try_recv()
+                .expect("target pane should receive a denial");
+            let value: serde_json::Value =
+                serde_json::from_str(&payload).expect("denial should be valid json");
+            assert_eq!(value["type"], "control_response");
+            assert_eq!(value["response"]["subtype"], "success");
+            assert_eq!(value["response"]["response"]["behavior"], "deny");
+            assert_eq!(
+                value["response"]["response"]["message"],
+                "User cancelled the question by sending a new prompt."
+            );
+            denials.insert(
+                value["response"]["response"]["toolUseID"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                value["response"]["request_id"].as_str().unwrap().to_string(),
+            );
+        }
+
+        assert_eq!(denials.get("toolu-a").map(String::as_str), Some("req-a"));
+        assert_eq!(denials.get("toolu-b").map(String::as_str), Some("req-b"));
+        assert!(target_rx.try_recv().is_err());
+        assert_eq!(
+            ASK_USER_QUESTION_AUTO_CANCEL_STATUS,
+            "[Pending question auto-cancelled: new message replaces it]"
+        );
+    }
+
+    #[test]
+    fn auto_cancel_no_sender_and_missing_meta_still_allow_input_forwarding() {
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+        let no_sender_meta = test_pane_meta(
+            Provider::Claude,
+            true,
+            None,
+            Arc::new(Mutex::new(None)),
+        );
+        seed_pending_question(&no_sender_meta, "toolu-waiting", "req-waiting");
+        pane_metas.lock().unwrap().insert(9, no_sender_meta);
+
+        let input_channels: InputChannels = Arc::new(Mutex::new(HashMap::new()));
+        let (pane_tx, pane_rx) = mpsc::channel::<(String, bool)>();
+        input_channels.lock().unwrap().insert(9, pane_tx);
+
+        let cancelled = auto_cancel_pending_questions_for_new_input(&pane_metas, 9);
+        let routed = route_web_input_to_pane(&input_channels, 9, "new prompt");
+
+        assert!(cancelled.is_empty());
+        assert_eq!(
+            pending_question_ids(&pane_metas, 9),
+            HashSet::from(["toolu-waiting".to_string()])
+        );
+        assert_eq!(routed, PaneInputRouteResult::Sent);
+        assert_eq!(
+            pane_rx.try_recv().unwrap(),
+            ("new prompt".to_string(), false)
+        );
+
+        let (missing_meta_tx, missing_meta_rx) = mpsc::channel::<(String, bool)>();
+        input_channels
+            .lock()
+            .unwrap()
+            .insert(99, missing_meta_tx);
+
+        let cancelled = auto_cancel_pending_questions_for_new_input(&pane_metas, 99);
+        let routed = route_web_input_to_pane(&input_channels, 99, "prompt for missing meta");
+
+        assert!(cancelled.is_empty());
+        assert_eq!(routed, PaneInputRouteResult::Sent);
+        assert_eq!(
+            missing_meta_rx.try_recv().unwrap(),
+            ("prompt for missing meta".to_string(), false)
+        );
+
+        assert_eq!(
+            route_web_input_to_pane(&input_channels, 100, "no receiver"),
+            PaneInputRouteResult::MissingChannel
+        );
     }
 
     #[test]
@@ -7846,75 +8100,32 @@ async fn run_server_connection(
                                                 // in the input queue while claude stays blocked
                                                 // on the canUseTool callback waiting on an answer
                                                 // the user has chosen not to give.
-                                                let pending_to_cancel: Vec<(String, String, mpsc::Sender<String>)> = {
-                                                    let metas = pane_metas.lock().unwrap();
-                                                    if let Some(meta) = metas.get(&target_pane) {
-                                                        let sender = meta
-                                                            .control_response_tx
-                                                            .lock()
-                                                            .ok()
-                                                            .and_then(|g| g.as_ref().cloned());
-                                                        if let Some(tx) = sender {
-                                                            let mut map = meta
-                                                                .pending_questions
-                                                                .lock()
-                                                                .unwrap();
-                                                            let drained: Vec<(String, String, mpsc::Sender<String>)> = map
-                                                                .iter()
-                                                                .map(|(tool_use_id, p)| (
-                                                                    tool_use_id.clone(),
-                                                                    p.request_id.clone(),
-                                                                    tx.clone(),
-                                                                ))
-                                                                .collect();
-                                                            map.clear();
-                                                            drained
-                                                        } else {
-                                                            Vec::new()
-                                                        }
-                                                    } else {
-                                                        Vec::new()
-                                                    }
-                                                };
-                                                for (tool_use_id, request_id, cr_tx) in pending_to_cancel {
-                                                    let response = serde_json::json!({
-                                                        "type": "control_response",
-                                                        "response": {
-                                                            "subtype": "success",
-                                                            "request_id": request_id,
-                                                            "response": {
-                                                                "behavior": "deny",
-                                                                "message": "User cancelled the question by sending a new prompt.",
-                                                                "toolUseID": tool_use_id,
-                                                            }
-                                                        }
+                                                let cancelled = auto_cancel_pending_questions_for_new_input(
+                                                    &pane_metas,
+                                                    target_pane,
+                                                );
+                                                for cancelled in cancelled {
+                                                    let _ = status_tx.send(PaneOutput {
+                                                        text: ASK_USER_QUESTION_AUTO_CANCEL_STATUS.to_string(),
+                                                        pane_id: target_pane,
                                                     });
-                                                    if cr_tx.send(response.to_string()).is_err() {
-                                                        tracing::warn!(
-                                                            pane_id = target_pane,
-                                                            tool_use_id = tool_use_id.as_str(),
-                                                            "auto-cancel: streaming worker channel dead",
-                                                        );
-                                                    } else {
-                                                        let _ = status_tx.send(PaneOutput {
-                                                            text: "[Pending question auto-cancelled — your new message replaces it]".to_string(),
-                                                            pane_id: target_pane,
-                                                        });
-                                                        tracing::info!(
-                                                            pane_id = target_pane,
-                                                            tool_use_id = tool_use_id.as_str(),
-                                                            "Auto-cancelled AskUserQuestion because user sent a new prompt",
-                                                        );
-                                                    }
+                                                    tracing::debug!(
+                                                        pane_id = target_pane,
+                                                        request_id = cancelled.request_id.as_str(),
+                                                        tool_use_id = cancelled.tool_use_id.as_str(),
+                                                        "Reported AskUserQuestion auto-cancel status",
+                                                    );
                                                 }
 
-                                                let target_tx = {
-                                                    let channels = input_channels.lock().unwrap();
-                                                    channels.get(&target_pane).cloned()
-                                                };
-
-                                                if let Some(tx) = target_tx {
-                                                    if tx.send((data, false)).is_err() {
+                                                match route_web_input_to_pane(
+                                                    &input_channels,
+                                                    target_pane,
+                                                    &data,
+                                                ) {
+                                                    PaneInputRouteResult::Sent => {
+                                                        continue;
+                                                    }
+                                                    PaneInputRouteResult::Disconnected => {
                                                         tracing::warn!(
                                                             pane_id = target_pane,
                                                             "Input channel disconnected for pane"
@@ -7923,8 +8134,9 @@ async fn run_server_connection(
                                                             text: "[Pane input channel disconnected. Restarting pane worker...]".to_string(),
                                                             pane_id: target_pane,
                                                         });
+                                                        continue;
                                                     }
-                                                    continue;
+                                                    PaneInputRouteResult::MissingChannel => {}
                                                 }
 
                                                 // If web explicitly targeted a pane and it is missing, do not silently
