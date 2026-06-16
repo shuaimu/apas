@@ -19,7 +19,7 @@ const PANE_ID_MAIN = 0;
 // from 3) and survives the `parseInt` round-trip in localStorage.
 export const OVERVIEW_PANE_ID = -1;
 const DEFAULT_BOT_MIN_INTERVAL_MINUTES = 15;
-const DEFAULT_BOT_LOOP_PROMPT = `Work on tasks defined in TODO.md. Do the following steps. Don't ask me for advice, just pick the best option you think that is honest, complete, and not corner-cutting:
+export const CLASSIC_TODO_BOT_LOOP_PROMPT = `Work on tasks defined in TODO.md. Do the following steps. Don't ask me for advice, just pick the best option you think that is honest, complete, and not corner-cutting:
 
 1. Do a git pull to check if there are any remote updates. Pick the top high-priority undone task, choose its first leaf task. If there are no undone TODO items left, sleep a minute and exit.
 2. Analyze the task, check if this can be done with not too many LOC (i.e., smaller than 500 lines code give or take). If not, try to analyze this task and break it down into several smaller tasks, expanding it in the TODO.md. The breakdown can be nested and hierarchical. Try to make each leaf task small enough (<500 lines LOC). You can document your analysis in the doc folder for future reference.
@@ -27,6 +27,39 @@ const DEFAULT_BOT_LOOP_PROMPT = `Work on tasks defined in TODO.md. Do the follow
 4. Make sure to add comprehensive test for the task executed. Run the whole test suites to make sure no regression happens. If tests fail, fix them using the best, honest, complete approach, run test suites again to verify fixes work. Repeat this step until no tests fail.
 5. Prepare for git commit, remove all temporary files, especially not to commit any binary files. For plan files, remove the implementation plan and keep the design rational and user manual and put it in the docs folder.
 6. Git commit the changes. First do git pull --rebase, and fix conflicts if any. Then do git push.`;
+
+type BotPromptPaneConfig = Pick<
+  PaneConfig,
+  "prompt" | "managed" | "role" | "goal" | "backstory"
+>;
+
+export function managedTeamBotPromptForPane(
+  config: BotPromptPaneConfig | undefined,
+): string | null {
+  if (config?.managed !== true) return null;
+  const role = config.role?.trim();
+  const goal = config.goal?.trim();
+  const backstory = config.backstory?.trim();
+  const roleLine = role ? `Role: ${role}` : "Role: managed team worker";
+  const goalLine = goal ? `Goal: ${goal}` : "Goal: Work only from delegated team tasks.";
+  const backstoryBlock = backstory ? `\n\nBackstory and constraints:\n${backstory}` : "";
+
+  return `You are this project's managed team worker.\n\n${roleLine}\n${goalLine}${backstoryBlock}\n\nUse the team-mode workflow: read project_goal.md, team-todo.md, and .apas-team.jsonl; act only on delegated work for this pane; publish diff/review/decision records on the team scratchpad as appropriate.`;
+}
+
+export function defaultBotPromptForPane(
+  config: BotPromptPaneConfig | undefined,
+): string {
+  return managedTeamBotPromptForPane(config) ?? CLASSIC_TODO_BOT_LOOP_PROMPT;
+}
+
+export function botPromptForPane(
+  config: BotPromptPaneConfig | undefined,
+): string {
+  const savedPrompt = config?.prompt;
+  if (savedPrompt && savedPrompt.trim().length > 0) return savedPrompt;
+  return defaultBotPromptForPane(config);
+}
 
 // Store scroll positions per session+pane combination
 interface ScrollState {
@@ -673,9 +706,7 @@ export function TabbedView() {
   const activeSupportsClaudeEffort = activeUsageProvider === "claude";
   const activeBotEffortOption = normalizeClaudeEffortOption(activeConfig?.effort);
   const activeModelOption = normalizeClaudeModelOption(activeConfig?.model);
-  const activeBotPrompt = activeConfig?.prompt && activeConfig.prompt.trim().length > 0
-    ? activeConfig.prompt
-    : DEFAULT_BOT_LOOP_PROMPT;
+  const activeBotPrompt = botPromptForPane(activeConfig);
   const activeBotMinIntervalMinutes = typeof activeConfig?.min_iteration_interval_minutes === "number"
     ? activeConfig.min_iteration_interval_minutes
     : DEFAULT_BOT_MIN_INTERVAL_MINUTES;
@@ -826,13 +857,10 @@ export function TabbedView() {
   const handleStartBot = useCallback(() => {
     if (activeTabId == null) return;
     setStartBotPaneId(activeTabId);
-    const savedPrompt = activeConfig?.prompt;
     const savedMinInterval = typeof activeConfig?.min_iteration_interval_minutes === "number"
       ? activeConfig.min_iteration_interval_minutes
       : DEFAULT_BOT_MIN_INTERVAL_MINUTES;
-    setBotPromptDraft(
-      savedPrompt && savedPrompt.trim().length > 0 ? savedPrompt : DEFAULT_BOT_LOOP_PROMPT,
-    );
+    setBotPromptDraft(botPromptForPane(activeConfig));
     setBotMinIntervalDraft(String(savedMinInterval));
     setBotEffortDraft(activeBotEffortOption);
     setStartBotModalOpen(true);
@@ -867,13 +895,13 @@ export function TabbedView() {
       : DEFAULT_BOT_MIN_INTERVAL_MINUTES;
     startBot(
       startBotPaneId,
-      trimmed.length > 0 ? botPromptDraft : DEFAULT_BOT_LOOP_PROMPT,
+      trimmed.length > 0 ? botPromptDraft : defaultBotPromptForPane(startBotTargetConfig),
       minIntervalMinutes,
       activeSupportsClaudeEffort ? botEffortDraft : undefined,
     );
     setStartBotModalOpen(false);
     setStartBotPaneId(null);
-  }, [activeSupportsClaudeEffort, botEffortDraft, botMinIntervalDraft, botPromptDraft, startBot, startBotPaneId]);
+  }, [activeSupportsClaudeEffort, botEffortDraft, botMinIntervalDraft, botPromptDraft, startBot, startBotPaneId, startBotTargetConfig]);
 
   useEffect(() => {
     if (!activeIsBot && viewBotPromptModalOpen) {
@@ -1961,7 +1989,7 @@ function StartBotPromptModal({
             Start Bot on {tabLabel}
           </h3>
           <p className="text-xs mt-1 text-gray-500 dark:text-gray-400">
-            Edit the loop prompt for this tab. This prompt is saved per tab in `.apas`.
+            Edit the loop prompt for this tab. Classic/manual side-chat tabs default to the TODO.md loop; managed team panes default to their role metadata. This prompt is saved per tab in `.apas`.
           </p>
         </div>
         <div className="p-4 space-y-4">
