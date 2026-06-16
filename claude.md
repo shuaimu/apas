@@ -1,5 +1,10 @@
 # APAS Project Notes
 
+Deployment-only operational notes. The canonical team-mode contributor/agent
+runbook is `CLAUDE.md`; keep architecture, local development, and team-role
+workflow guidance there. `AGENTS.md` is generated from this file for
+Codex-style agents that need deployment commands.
+
 ## Deployment
 
 - **Server access:** `ssh root@apas.mpaxos.com`

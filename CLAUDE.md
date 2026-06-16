@@ -1,5 +1,9 @@
 # APAS - Autonomous Programming Agent System
 
+> Canonical team-mode contributor/agent runbook. Keep architecture, local
+> development, and team-role workflow guidance here. `agent.md` is a generated
+> pointer to this file; `claude.md` and `AGENTS.md` are deployment-only notes.
+
 APAS runs a local autonomous programming team around a project. The CLI owns
 local panes and worktrees, the server brokers project/session state, and the
 web UI exposes the Overview, Manager chat, Team TODO queue, pane tabs, and

@@ -1,15 +1,22 @@
 # APAS Agent Instructions
 
-This file is generated from `claude.md` and mirrors its operational notes.
+This file is generated from `claude.md` and mirrors deployment-only operational notes.
+For the canonical team-mode contributor/agent runbook, read `CLAUDE.md`.
+
+# APAS Project Notes
+
+Deployment-only operational notes. The canonical team-mode contributor/agent
+runbook is `CLAUDE.md`; keep architecture, local development, and team-role
+workflow guidance there. `AGENTS.md` is generated from this file for
+Codex-style agents that need deployment commands.
 
 ## Deployment
 
-- Server access: `ssh root@apas.mpaxos.com`
-- Server binary location: `/opt/apas/apas-server`
-- Service management: `systemctl restart apas-server`
+- **Server access:** `ssh root@apas.mpaxos.com`
+- **Server binary location:** `/opt/apas/apas-server`
+- **Service management:** `systemctl restart apas-server`
 
-### Deploy commands
-
+### Deploy commands:
 ```bash
 # Build all Rust crates
 cargo build --release
@@ -27,4 +34,16 @@ ssh root@apas.mpaxos.com "cd /opt/apas/web && npm install && NEXT_PUBLIC_WEB_UI_
 
 ## Web UI
 
-- URL: http://apas.mpaxos.com
+- **URL:** http://apas.mpaxos.com
+
+## Versioning Rule
+
+Version is computed at build time using the format `YY.MM.N`.
+
+- `YY.MM` is the current year/month.
+- `N` is `git rev-list --count --since="<YYYY-MM-01 00:00:00>" HEAD`.
+- Web version is resolved in `packages/web/next.config.ts`.
+- CLI and server versions are resolved in Rust `build.rs` files.
+- Do not manage `packages/web/.apas-version`; it is no longer used.
+
+If building web in a directory without `.git` (for example `/opt/apas/web` on production), pass `NEXT_PUBLIC_WEB_UI_VERSION` explicitly using the deploy command above.
