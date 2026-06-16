@@ -650,6 +650,9 @@ export function TabbedView() {
   const activeBotMinIntervalMinutes = typeof activeConfig?.min_iteration_interval_minutes === "number"
     ? activeConfig.min_iteration_interval_minutes
     : DEFAULT_BOT_MIN_INTERVAL_MINUTES;
+  const diffModalPaneConfig = diffModalPaneId !== null
+    ? effectiveTabs.find((t) => t.pane_id === diffModalPaneId)
+    : undefined;
   const startBotTargetConfig = useMemo(
     () => effectiveTabs.find((t) => t.pane_id === startBotPaneId),
     [effectiveTabs, startBotPaneId],
@@ -1260,6 +1263,7 @@ export function TabbedView() {
       <PaneDiffModal
         open={diffModalPaneId !== null}
         diff={diffModalPaneId !== null ? paneDiffs[diffModalPaneId] : undefined}
+        manualPrCreationDisabled={diffModalPaneConfig?.managed === true}
         onClose={() => setDiffModalPaneId(null)}
         onRefresh={() => {
           if (diffModalPaneId !== null) requestPaneDiff(diffModalPaneId);
@@ -1597,6 +1601,7 @@ interface PaneDiffModalProps {
   onMerge: () => void;
   onDiscard: () => void;
   onCreatePr: () => void;
+  manualPrCreationDisabled?: boolean;
 }
 
 // Split a unified `git diff` output into per-file sections. Each `diff
@@ -1657,7 +1662,16 @@ function DiffFileSection({ path, body }: DiffFileSectionProps) {
   );
 }
 
-function PaneDiffModal({ open, diff, onClose, onRefresh, onMerge, onDiscard, onCreatePr }: PaneDiffModalProps) {
+export function PaneDiffModal({
+  open,
+  diff,
+  onClose,
+  onRefresh,
+  onMerge,
+  onDiscard,
+  onCreatePr,
+  manualPrCreationDisabled = false,
+}: PaneDiffModalProps) {
   if (!open) return null;
   let body: React.ReactNode;
   if (diff?.error) {
@@ -1692,14 +1706,20 @@ function PaneDiffModal({ open, diff, onClose, onRefresh, onMerge, onDiscard, onC
             >
               Refresh
             </button>
-            <button
-              type="button"
-              onClick={onCreatePr}
-              className="rounded border border-sky-600 bg-sky-900/40 px-3 py-1 text-xs text-sky-200 hover:bg-sky-900/60"
-              title="Push this branch to origin and open a GitHub PR via `gh pr create --fill`. Requires `gh` on the CLI host."
-            >
-              Create PR
-            </button>
+            {manualPrCreationDisabled ? (
+              <p className="max-w-[13rem] text-xs leading-5 text-zinc-400">
+                Managed team panes open PRs after Reviewer approval.
+              </p>
+            ) : (
+              <button
+                type="button"
+                onClick={onCreatePr}
+                className="rounded border border-sky-600 bg-sky-900/40 px-3 py-1 text-xs text-sky-200 hover:bg-sky-900/60"
+                title="Push this branch to origin and open a GitHub PR via `gh pr create --fill`. Requires `gh` on the CLI host."
+              >
+                Create PR
+              </button>
+            )}
             <button
               type="button"
               onClick={onMerge}
