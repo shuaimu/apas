@@ -243,6 +243,16 @@ impl SessionManager {
         }
     }
 
+    #[cfg(test)]
+    pub fn cached_shared_project_refs_for_user(
+        &self,
+        user_id: &Uuid,
+    ) -> Option<(HashSet<(String, String)>, HashSet<String>)> {
+        self.shared_project_refs
+            .get(user_id)
+            .map(|entry| entry.value().clone())
+    }
+
     // CLI client management
     pub fn register_cli(
         &self,
@@ -1348,6 +1358,32 @@ impl Default for SessionManager {
 mod tests {
     use super::*;
 
+    fn test_machine(machine_id: Uuid, hostname: &str) -> MachineInfo {
+        MachineInfo {
+            machine_id,
+            hostname: hostname.to_string(),
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            daemon_version: None,
+            minimax_backend: None,
+            glm_backend: None,
+            deepseek_backend: None,
+            last_seen: None,
+        }
+    }
+
+    fn test_project(project_id: &str, path: &str) -> MachineProjectInfo {
+        MachineProjectInfo {
+            project_id: project_id.to_string(),
+            name: Some(project_id.to_string()),
+            path: path.to_string(),
+            is_running: false,
+            pid: None,
+            memory_kb: None,
+            last_error: None,
+        }
+    }
+
     #[test]
     fn input_id_dedup_remembers_and_caps() {
         let mgr = SessionManager::new();
@@ -1365,5 +1401,69 @@ mod tests {
         }
         assert_eq!(mgr.seen_input_id(&sid, "a"), None);
         assert_eq!(mgr.seen_input_id(&sid, "id-63").as_deref(), Some("t-63"));
+    }
+
+    #[test]
+    fn broadcast_machines_update_includes_cached_shared_refs_without_duplicates() {
+        let mgr = SessionManager::new();
+        let viewer_id = Uuid::new_v4();
+        let teammate_id = Uuid::new_v4();
+        let owned_machine_id = Uuid::new_v4();
+        let shared_machine_id = Uuid::new_v4();
+
+        let (owned_tx, _owned_rx) = mpsc::channel(1);
+        mgr.register_daemon(
+            owned_machine_id,
+            viewer_id,
+            owned_tx,
+            test_machine(owned_machine_id, "ViewerHost"),
+            vec![test_project("owned", "/work/owned")],
+        );
+        let (shared_tx, _shared_rx) = mpsc::channel(1);
+        mgr.register_daemon(
+            shared_machine_id,
+            teammate_id,
+            shared_tx,
+            test_machine(shared_machine_id, "SharedHost"),
+            vec![
+                test_project("shared-match", "/team/shared"),
+                test_project("shared-other", "/team/other"),
+            ],
+        );
+
+        mgr.set_shared_project_refs_for_user(
+            viewer_id,
+            HashSet::from([
+                ("sharedhost".to_string(), "/team/shared".to_string()),
+                ("viewerhost".to_string(), "/work/owned".to_string()),
+            ]),
+            HashSet::new(),
+        );
+
+        let web_connection_id = Uuid::new_v4();
+        let (web_tx, mut web_rx) = mpsc::channel(1);
+        mgr.register_web(web_connection_id, web_tx);
+        mgr.set_web_user(web_connection_id, viewer_id);
+
+        mgr.broadcast_machines_update_for_user(&viewer_id);
+
+        let ServerToWeb::Machines { machines } = web_rx.try_recv().expect("machine broadcast")
+        else {
+            panic!("expected machines broadcast");
+        };
+        assert_eq!(
+            machines
+                .iter()
+                .filter(|machine| machine.machine.machine_id == owned_machine_id)
+                .count(),
+            1,
+            "owned machine should not be duplicated when it also matches shared refs"
+        );
+        let shared = machines
+            .iter()
+            .find(|machine| machine.machine.machine_id == shared_machine_id)
+            .expect("broadcast should include cached shared machine");
+        assert_eq!(shared.projects.len(), 1);
+        assert_eq!(shared.projects[0].project_id, "shared-match");
     }
 }

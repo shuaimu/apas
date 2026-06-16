@@ -322,6 +322,191 @@ async fn list_accessible_machines_for_user(
     machines
 }
 
+#[cfg(test)]
+mod machine_access_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::db::{Database, Session, User};
+
+    fn test_machine(machine_id: Uuid, hostname: &str) -> shared::MachineInfo {
+        shared::MachineInfo {
+            machine_id,
+            hostname: hostname.to_string(),
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            daemon_version: None,
+            minimax_backend: None,
+            glm_backend: None,
+            deepseek_backend: None,
+            last_seen: None,
+        }
+    }
+
+    fn test_project(project_id: &str, path: &str) -> shared::MachineProjectInfo {
+        shared::MachineProjectInfo {
+            project_id: project_id.to_string(),
+            name: Some(project_id.to_string()),
+            path: path.to_string(),
+            is_running: false,
+            pid: None,
+            memory_kb: None,
+            last_error: None,
+        }
+    }
+
+    fn test_user(user_id: Uuid, email: &str) -> User {
+        User {
+            id: user_id.to_string(),
+            email: email.to_string(),
+            password_hash: "hash".to_string(),
+            created_at: None,
+        }
+    }
+
+    fn test_session(
+        session_id: Uuid,
+        owner_id: Uuid,
+        working_dir: &str,
+        hostname: Option<&str>,
+    ) -> Session {
+        Session {
+            id: session_id.to_string(),
+            user_id: owner_id.to_string(),
+            cli_client_id: None,
+            working_dir: Some(working_dir.to_string()),
+            hostname: hostname.map(str::to_string),
+            status: "connected".to_string(),
+            created_at: None,
+            updated_at: None,
+            is_paused: false,
+            project_id: None,
+        }
+    }
+
+    async fn test_state() -> AppState {
+        let dir = std::env::temp_dir().join(format!("apas-machine-access-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp db dir");
+        let db_path = dir.join("apas.db").to_string_lossy().to_string();
+        let db = Database::new(&db_path).await.expect("create temp db");
+        db.run_migrations().await.expect("run migrations");
+        let mut config = Config::default();
+        config.database.path = db_path;
+        AppState::new(db, config)
+    }
+
+    #[tokio::test]
+    async fn list_accessible_machines_caches_host_and_wildcard_shared_refs() {
+        let state = test_state().await;
+        let viewer_id = Uuid::new_v4();
+        let teammate_id = Uuid::new_v4();
+        state
+            .db
+            .create_user(&test_user(viewer_id, "viewer@example.test"))
+            .await
+            .expect("viewer user");
+        state
+            .db
+            .create_user(&test_user(teammate_id, "teammate@example.test"))
+            .await
+            .expect("teammate user");
+
+        let host_shared_session_id = Uuid::new_v4();
+        state
+            .db
+            .create_session(&test_session(
+                host_shared_session_id,
+                teammate_id,
+                "/team/shared/",
+                Some("SharedHost"),
+            ))
+            .await
+            .expect("host shared session");
+        state
+            .db
+            .create_session_share(
+                &host_shared_session_id.to_string(),
+                &viewer_id.to_string(),
+                &teammate_id.to_string(),
+            )
+            .await
+            .expect("host shared session share");
+
+        let wildcard_shared_session_id = Uuid::new_v4();
+        state
+            .db
+            .create_session(&test_session(
+                wildcard_shared_session_id,
+                teammate_id,
+                "/team/wildcard",
+                None,
+            ))
+            .await
+            .expect("wildcard shared session");
+        state
+            .db
+            .create_session_share(
+                &wildcard_shared_session_id.to_string(),
+                &viewer_id.to_string(),
+                &teammate_id.to_string(),
+            )
+            .await
+            .expect("wildcard shared session share");
+
+        let owner_machine_id = Uuid::new_v4();
+        let host_shared_machine_id = Uuid::new_v4();
+        let wildcard_shared_machine_id = Uuid::new_v4();
+        let (owner_tx, _owner_rx) = mpsc::channel(1);
+        state.sessions.register_daemon(
+            owner_machine_id,
+            viewer_id,
+            owner_tx,
+            test_machine(owner_machine_id, "ViewerHost"),
+            vec![test_project("owned", "/viewer/project")],
+        );
+        let (host_tx, _host_rx) = mpsc::channel(1);
+        state.sessions.register_daemon(
+            host_shared_machine_id,
+            teammate_id,
+            host_tx,
+            test_machine(host_shared_machine_id, "sharedhost"),
+            vec![
+                test_project("host-match", "/team/shared"),
+                test_project("host-other", "/team/other"),
+            ],
+        );
+        let (wildcard_tx, _wildcard_rx) = mpsc::channel(1);
+        state.sessions.register_daemon(
+            wildcard_shared_machine_id,
+            teammate_id,
+            wildcard_tx,
+            test_machine(wildcard_shared_machine_id, "some-other-host"),
+            vec![test_project("wildcard-match", "/team/wildcard")],
+        );
+
+        let machines = list_accessible_machines_for_user(&state, &viewer_id).await;
+        let machine_ids: HashSet<Uuid> = machines
+            .iter()
+            .map(|machine| machine.machine.machine_id)
+            .collect();
+        assert!(machine_ids.contains(&owner_machine_id));
+        assert!(machine_ids.contains(&host_shared_machine_id));
+        assert!(machine_ids.contains(&wildcard_shared_machine_id));
+        let host_shared = machines
+            .iter()
+            .find(|machine| machine.machine.machine_id == host_shared_machine_id)
+            .expect("host shared machine");
+        assert_eq!(host_shared.projects.len(), 1);
+        assert_eq!(host_shared.projects[0].project_id, "host-match");
+
+        let (host_refs, wildcard_refs) = state
+            .sessions
+            .cached_shared_project_refs_for_user(&viewer_id)
+            .expect("shared refs cached");
+        assert!(host_refs.contains(&("sharedhost".to_string(), "/team/shared".to_string())));
+        assert!(wildcard_refs.contains("/team/wildcard"));
+    }
+}
+
 /// Pick the session a `WebToServer` message should act on.
 ///
 /// Multi-attach (commit b0c674d) lets one web connection observe several
