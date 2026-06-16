@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProjectGoalBar } from "./ProjectGoalBar";
 import { useStore, type PaneConfig } from "@/lib/store";
@@ -12,25 +12,39 @@ function seedProjectGoalBar(overrides: Partial<{
   paneConfigs: PaneConfig[];
   pausedPanes: number[];
   addPane: ReturnType<typeof vi.fn>;
+  updateProjectGoal: ReturnType<typeof vi.fn>;
   pausePane: ReturnType<typeof vi.fn>;
   resumePane: ReturnType<typeof vi.fn>;
   sendMessageToPane: ReturnType<typeof vi.fn>;
 }> = {}) {
   const sessionId = overrides.sessionId ?? DEFAULT_SESSION_ID;
 
-  useStore.setState({
-    sessionId,
-    projectGoals: overrides.projectGoals ?? { [sessionId]: "Ship APAS team mode" },
-    paneConfigs: overrides.paneConfigs ?? [],
-    pausedPanes: overrides.pausedPanes ?? [],
-    addPane: overrides.addPane ?? vi.fn(() => ({ success: true })),
-    pausePane: overrides.pausePane ?? vi.fn(),
-    resumePane: overrides.resumePane ?? vi.fn(),
-    interruptPane: vi.fn(),
-    updateProjectGoal: vi.fn(),
-    sendMessageToPane: overrides.sendMessageToPane ?? vi.fn(() => ({ success: true })),
-    showToast: vi.fn(),
+  act(() => {
+    useStore.setState({
+      sessionId,
+      projectGoals: overrides.projectGoals ?? { [sessionId]: "Ship APAS team mode" },
+      paneConfigs: overrides.paneConfigs ?? [],
+      pausedPanes: overrides.pausedPanes ?? [],
+      addPane: overrides.addPane ?? vi.fn(() => ({ success: true })),
+      updateProjectGoal: overrides.updateProjectGoal ?? vi.fn(),
+      pausePane: overrides.pausePane ?? vi.fn(),
+      resumePane: overrides.resumePane ?? vi.fn(),
+      interruptPane: vi.fn(),
+      sendMessageToPane: overrides.sendMessageToPane ?? vi.fn(() => ({ success: true })),
+      showToast: vi.fn(),
+    });
   });
+}
+
+function roleSlot(label: string): HTMLElement {
+  const labelElement =
+    screen
+      .getAllByText(label)
+      .find((element) => element.className.includes("font-semibold")) ??
+    screen.getByText(label);
+  const slot = labelElement.closest("div[class*='rounded border']");
+  expect(slot).toBeTruthy();
+  return slot as HTMLElement;
 }
 
 describe("ProjectGoalBar team role slots", () => {
@@ -39,11 +53,13 @@ describe("ProjectGoalBar team role slots", () => {
   });
 
   afterEach(() => {
-    useStore.setState({
-      sessionId: null,
-      projectGoals: {},
-      paneConfigs: [],
-      pausedPanes: [],
+    act(() => {
+      useStore.setState({
+        sessionId: null,
+        projectGoals: {},
+        paneConfigs: [],
+        pausedPanes: [],
+      });
     });
   });
 
@@ -99,6 +115,39 @@ describe("ProjectGoalBar team role slots", () => {
     );
   });
 
+  it("launches a missing Manager with the current goal and managed role metadata", async () => {
+    const addPane = vi.fn(() => ({ success: true }));
+    const updateProjectGoal = vi.fn();
+    seedProjectGoalBar({ addPane, updateProjectGoal });
+    render(<ProjectGoalBar />);
+
+    const textarea = screen.getByPlaceholderText(
+      /What does the team need to accomplish/,
+    ) as HTMLTextAreaElement;
+    await waitFor(() => {
+      expect(textarea.value).toBe("Ship APAS team mode");
+    });
+
+    fireEvent.click(within(roleSlot("Manager")).getByRole("button", { name: /launch/i }));
+
+    expect(addPane).toHaveBeenCalledWith(
+      "claude",
+      "interactive",
+      "Manager",
+      undefined,
+      undefined,
+      false,
+      expect.objectContaining({
+        role: "team manager",
+        goal: "Ship APAS team mode",
+        backstory: expect.stringContaining("user-facing role"),
+        planReviewMode: "never",
+      }),
+      true,
+    );
+    expect(updateProjectGoal).toHaveBeenCalledWith("Ship APAS team mode");
+  });
+
   it("launches a missing Tech Lead with remote-aware survey prompt", () => {
     const addPane = vi.fn(() => ({ success: true }));
     seedProjectGoalBar({ addPane });
@@ -120,6 +169,21 @@ describe("ProjectGoalBar team role slots", () => {
     expect(prompt).toEqual(expect.stringContaining("preserve the worktree"));
     expect(prompt).toEqual(expect.stringContaining("git show origin/HEAD:README.md"));
     expect(prompt).toEqual(expect.stringContaining("git show origin/HEAD:CLAUDE.md"));
+    expect(addPane).toHaveBeenCalledWith(
+      "claude",
+      "deadloop",
+      "Tech Lead",
+      expect.stringContaining("team-todo.md"),
+      undefined,
+      false,
+      expect.objectContaining({
+        role: "tech lead",
+        goal: expect.stringContaining("Autonomous orchestrator"),
+        backstory: expect.stringContaining("Tech Lead"),
+        planReviewMode: "never",
+      }),
+      true,
+    );
   });
 
   it("shows launched slots with pane id and pause/resume controls", () => {
@@ -181,6 +245,100 @@ describe("ProjectGoalBar team role slots", () => {
     expect(String(prompt).indexOf("team-todo.md")).toBeLessThan(
       String(prompt).indexOf("TODO.md / ROADMAP.md"),
     );
+  });
+
+  it("launches Manager and queues auto-generate when no Manager exists yet", async () => {
+    const addPane = vi.fn(() => ({ success: true }));
+    const sendMessageToPane = vi.fn(() => ({ success: true }));
+    seedProjectGoalBar({ addPane, sendMessageToPane });
+    render(<ProjectGoalBar />);
+
+    const textarea = screen.getByPlaceholderText(
+      /What does the team need to accomplish/,
+    ) as HTMLTextAreaElement;
+    await waitFor(() => {
+      expect(textarea.value).toBe("Ship APAS team mode");
+    });
+
+    fireEvent.click(screen.getByText("Auto-generate"));
+
+    expect(addPane).toHaveBeenCalledWith(
+      "claude",
+      "interactive",
+      "Manager",
+      undefined,
+      undefined,
+      false,
+      expect.objectContaining({
+        role: "team manager",
+        goal: "Ship APAS team mode",
+      }),
+      true,
+    );
+    expect(sendMessageToPane).not.toHaveBeenCalled();
+
+    act(() => {
+      useStore.setState({
+        paneConfigs: [
+          {
+            pane_id: 42,
+            role: "manager",
+            mode: "interactive",
+            label: "Manager",
+            provider: "claude",
+            model: "official",
+            managed: true,
+          } as PaneConfig,
+        ],
+      });
+    });
+
+    await waitFor(() => {
+      expect(sendMessageToPane).toHaveBeenCalledWith(
+        expect.stringContaining("starter project_goal.md"),
+        42,
+      );
+    });
+  });
+
+  it("does not show duplicate launches for existing Manager and Tech Lead panes", () => {
+    const addPane = vi.fn(() => ({ success: true }));
+    const pausePane = vi.fn();
+    seedProjectGoalBar({
+      addPane,
+      pausePane,
+      paneConfigs: [
+        {
+          pane_id: 41,
+          role: "manager",
+          mode: "interactive",
+          label: "Manager",
+          provider: "claude",
+          model: "official",
+          managed: true,
+        } as PaneConfig,
+        {
+          pane_id: 77,
+          role: "tech lead",
+          mode: "deadloop",
+          label: "Tech Lead",
+          provider: "claude",
+          model: "official",
+          managed: true,
+        } as PaneConfig,
+      ],
+    });
+
+    render(<ProjectGoalBar />);
+
+    expect(within(roleSlot("Manager")).queryByRole("button", { name: /launch/i })).toBeNull();
+    const techLeadSlot = roleSlot("Tech Lead");
+    expect(within(techLeadSlot).queryByRole("button", { name: /launch/i })).toBeNull();
+
+    fireEvent.click(within(techLeadSlot).getByTitle("Pause Tech Lead"));
+
+    expect(pausePane).toHaveBeenCalledWith(77);
+    expect(addPane).not.toHaveBeenCalled();
   });
 
   it("hydrates from projectGoals without clobbering a dirty edit", async () => {
