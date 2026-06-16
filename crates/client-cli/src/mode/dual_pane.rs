@@ -3977,7 +3977,7 @@ mod tests {
         active_usage_providers, auto_cancel_pending_questions_for_new_input, build_agent_args,
         build_agent_switch_respawn_event, build_deadloop_agent_args, build_pane_reboot_events,
         build_pane_env_overrides_from_keys, build_pane_list, boot_restore_try_resume_first,
-        pane_label_or_default, promote_pane_to_managed, resolve_pane_binary_path,
+        deadloop_wait_plan, pane_label_or_default, promote_pane_to_managed, resolve_pane_binary_path,
         route_web_input_to_pane, restored_pane_mode_and_pause, run_deadloop_session_inner,
         save_pane_configs, start_bot_preserved_fields, truncate_str_at_char_boundary,
         ASK_USER_QUESTION_AUTO_CANCEL_STATUS, InputChannels, PaneInputRouteResult, PaneMeta,
@@ -3990,7 +3990,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio::sync::mpsc as tokio_mpsc;
     use uuid::Uuid;
 
@@ -3998,6 +3998,25 @@ mod tests {
         "Work on tasks defined in TODO.md.\n1. Analyze\n2. Implement\n3. Test";
     const WEB_PROVIDER_OPTIONS_TS: &str =
         include_str!("../../../../packages/web/src/lib/providerOptions.ts");
+
+    #[test]
+    fn deadloop_wait_cursor_is_sampled_at_wait_entry() {
+        let last_started_at = Instant::now();
+        let self_write_at = last_started_at + Duration::from_millis(20);
+        let wait_entry_at = last_started_at + Duration::from_millis(50);
+        let min_interval = Duration::from_secs(10);
+
+        let plan = deadloop_wait_plan(last_started_at, min_interval, wait_entry_at)
+            .expect("min interval still has time remaining");
+
+        assert_eq!(plan.cursor, wait_entry_at);
+        assert!(plan.cursor > self_write_at);
+        assert_ne!(plan.cursor, last_started_at);
+        assert_eq!(
+            plan.remaining,
+            min_interval - Duration::from_millis(50)
+        );
+    }
 
     fn extract_ts_string_const<'a>(source: &'a str, name: &str) -> Option<&'a str> {
         let prefix = format!("export const {name} = ");
@@ -5494,6 +5513,33 @@ fn run_deadloop_session(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeadloopWaitPlan {
+    remaining: Duration,
+    cursor: Instant,
+}
+
+fn deadloop_wait_plan(
+    last_iteration_started_at: Instant,
+    min_iteration_interval: Duration,
+    wait_entry_at: Instant,
+) -> Option<DeadloopWaitPlan> {
+    let elapsed_since_last_start = wait_entry_at
+        .checked_duration_since(last_iteration_started_at)
+        .unwrap_or(Duration::ZERO);
+    let remaining = min_iteration_interval
+        .checked_sub(elapsed_since_last_start)
+        .unwrap_or(Duration::ZERO);
+    if remaining.is_zero() {
+        None
+    } else {
+        Some(DeadloopWaitPlan {
+            remaining,
+            cursor: wait_entry_at,
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_deadloop_session_inner(
     binary_path: &str,
@@ -5644,14 +5690,13 @@ fn run_deadloop_session_inner(
             // timer fires — whichever first. Replaces the pure-sleep
             // loop that paid tokens on every cycle even when nothing
             // had moved.
-            let remaining = min_iteration_interval
-                .checked_sub(last_started_at.elapsed())
-                .unwrap_or(Duration::ZERO);
-            if !remaining.is_zero() {
+            if let Some(wait_plan) =
+                deadloop_wait_plan(last_started_at, min_iteration_interval, Instant::now())
+            {
                 let _ = output_tx.send(PaneOutput {
                     text: format!(
                         "[Waiting for file change or {}s timeout (min interval: {}m)]",
-                        remaining.as_secs(),
+                        wait_plan.remaining.as_secs(),
                         min_iteration_interval_minutes
                     ),
                     pane_id,
@@ -5664,10 +5709,9 @@ fn run_deadloop_session_inner(
                 // the loop the instant it goes to sleep. That bug
                 // collapses the 15-minute min interval to ~0s and was
                 // the symptom of "the Tech Lead loops constantly".
-                let wait_cursor = Instant::now();
                 let reason = file_watcher.wait_until(
-                    Some(wait_cursor),
-                    remaining,
+                    Some(wait_plan.cursor),
+                    wait_plan.remaining,
                     &shutdown,
                     &pause,
                     &stop_requested,
