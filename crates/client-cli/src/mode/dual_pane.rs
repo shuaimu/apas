@@ -102,6 +102,24 @@ fn truncate_str_at_char_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+fn update_project_flags(
+    project_dir: &Path,
+    session_id: Uuid,
+    auto_approve_todos: bool,
+    auto_merge_prs: bool,
+) -> Result<CliToServer> {
+    let mut meta = get_or_create_project(project_dir)?;
+    meta.auto_approve_todos = auto_approve_todos;
+    meta.auto_merge_prs = auto_merge_prs;
+    save_project(project_dir, &meta)?;
+
+    Ok(CliToServer::ProjectFlagsChanged {
+        session_id,
+        auto_approve_todos,
+        auto_merge_prs,
+    })
+}
+
 /// Spawn whichever team panes (Manager, Tech Lead, Reviewer, Developer)
 /// are missing for this project. Idempotent: each role is gated on
 /// whether a managed pane with that role already exists in
@@ -3980,10 +3998,11 @@ mod tests {
         pane_label_or_default, promote_pane_to_managed, resolve_pane_binary_path,
         route_web_input_to_pane, restored_pane_mode_and_pause, run_deadloop_session_inner,
         save_pane_configs, start_bot_preserved_fields, truncate_str_at_char_boundary,
+        update_project_flags,
         ASK_USER_QUESTION_AUTO_CANCEL_STATUS, InputChannels, PaneInputRouteResult, PaneMeta,
         PaneMetas, PanePauses, PaneStopRequests, PendingAskQuestion, DEEPSEEK_DEFAULT_MODEL,
     };
-    use crate::project::get_or_create_project;
+    use crate::project::{get_or_create_project, save_project};
     use crate::tui::{PaneOutput, TuiEvent};
     use shared::{CliToServer, Provider};
     use std::collections::{HashMap, HashSet};
@@ -4433,6 +4452,73 @@ mod tests {
         let metadata = get_or_create_project(dir.path()).expect("metadata should reload");
         assert!(!metadata.is_paused);
         assert!(metadata.panes.iter().all(|pane| !pane.is_paused));
+    }
+
+    #[test]
+    fn update_project_flags_persists_flags_and_preserves_panes() {
+        let dir = tempfile::tempdir().expect("temp project dir");
+        let mut metadata = get_or_create_project(dir.path()).expect("metadata should initialize");
+        metadata.auto_approve_todos = false;
+        metadata.auto_merge_prs = false;
+        metadata.panes = vec![shared::PaneConfig {
+            pane_id: 42,
+            provider: Provider::Codex,
+            mode: shared::PaneMode::Deadloop,
+            session_id: Uuid::new_v4(),
+            is_paused: true,
+            stop_requested: false,
+            prompt: Some("Keep implementing".to_string()),
+            min_iteration_interval_minutes: Some(7),
+            label: Some("Developer".to_string()),
+            model: Some("gpt-5-codex".to_string()),
+            effort: Some("high".to_string()),
+            worktree_path: Some("/tmp/apas-worker".to_string()),
+            role: Some("developer".to_string()),
+            goal: Some("Ship the delegated task".to_string()),
+            backstory: Some("A managed worker".to_string()),
+            plan_review_mode: shared::PlanReviewMode::RiskyOnly,
+            manual_mode: true,
+            managed: true,
+        }];
+        let original_pane = metadata.panes[0].clone();
+        save_project(dir.path(), &metadata).expect("seed metadata");
+
+        let session_id = Uuid::new_v4();
+        let echo = update_project_flags(dir.path(), session_id, true, false)
+            .expect("flags should persist");
+
+        match echo {
+            CliToServer::ProjectFlagsChanged {
+                session_id: echoed_session_id,
+                auto_approve_todos,
+                auto_merge_prs,
+            } => {
+                assert_eq!(echoed_session_id, session_id);
+                assert!(auto_approve_todos);
+                assert!(!auto_merge_prs);
+            }
+            other => panic!("unexpected echo message: {other:?}"),
+        }
+
+        let reloaded = get_or_create_project(dir.path()).expect("metadata should reload");
+        assert!(reloaded.auto_approve_todos);
+        assert!(!reloaded.auto_merge_prs);
+        assert_eq!(reloaded.panes.len(), 1);
+        let pane = &reloaded.panes[0];
+        assert_eq!(pane.pane_id, original_pane.pane_id);
+        assert_eq!(pane.provider, original_pane.provider);
+        assert_eq!(pane.session_id, original_pane.session_id);
+        assert_eq!(pane.is_paused, original_pane.is_paused);
+        assert_eq!(pane.label, original_pane.label);
+        assert_eq!(pane.model, original_pane.model);
+        assert_eq!(pane.effort, original_pane.effort);
+        assert_eq!(pane.worktree_path, original_pane.worktree_path);
+        assert_eq!(pane.role, original_pane.role);
+        assert_eq!(pane.goal, original_pane.goal);
+        assert_eq!(pane.backstory, original_pane.backstory);
+        assert_eq!(pane.plan_review_mode, original_pane.plan_review_mode);
+        assert_eq!(pane.manual_mode, original_pane.manual_mode);
+        assert_eq!(pane.managed, original_pane.managed);
     }
 
     #[test]
@@ -10103,31 +10189,25 @@ async fn run_server_connection(
                                                 auto_merge_prs,
                                             } => {
                                                 let project_dir = std::path::Path::new(&working_dir).to_path_buf();
-                                                match crate::project::get_or_create_project(&project_dir) {
-                                                    Ok(mut meta) => {
-                                                        meta.auto_approve_todos = auto_approve_todos;
-                                                        meta.auto_merge_prs = auto_merge_prs;
-                                                        if let Err(err) = crate::project::save_project(&project_dir, &meta) {
-                                                            tracing::warn!("failed to persist project flags: {}", err);
-                                                        } else {
-                                                            tracing::info!(
-                                                                auto_approve_todos,
-                                                                auto_merge_prs,
-                                                                "tech-lead autonomy flags updated"
-                                                            );
-                                                        }
-                                                        // Echo back so peer web clients reconcile.
-                                                        let echo = CliToServer::ProjectFlagsChanged {
-                                                            session_id,
+                                                match update_project_flags(
+                                                    &project_dir,
+                                                    session_id,
+                                                    auto_approve_todos,
+                                                    auto_merge_prs,
+                                                ) {
+                                                    Ok(echo) => {
+                                                        tracing::info!(
                                                             auto_approve_todos,
                                                             auto_merge_prs,
-                                                        };
+                                                            "tech-lead autonomy flags updated"
+                                                        );
+                                                        // Echo back so peer web clients reconcile.
                                                         if let Ok(text) = serde_json::to_string(&echo) {
                                                             let _ = ws_sender.send(Message::Text(text.into())).await;
                                                         }
                                                     }
                                                     Err(err) => {
-                                                        tracing::warn!("failed to load .apas for flag update: {}", err);
+                                                        tracing::warn!("failed to persist project flags: {}", err);
                                                     }
                                                 }
                                             }
