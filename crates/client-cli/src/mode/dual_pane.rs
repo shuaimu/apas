@@ -4624,10 +4624,10 @@ fn run_deadloop_session_inner(
 
         if let Some(last_started_at) = last_iteration_started_at {
             // Event-driven wait: block until any watched project file
-            // changes after `last_started_at` (the cursor) OR the
-            // min-interval timer fires — whichever first. Replaces the
-            // pure-sleep loop that paid tokens on every cycle even
-            // when nothing had moved.
+            // changes after the wait-entry cursor OR the min-interval
+            // timer fires — whichever first. Replaces the pure-sleep
+            // loop that paid tokens on every cycle even when nothing
+            // had moved.
             let remaining = min_iteration_interval
                 .checked_sub(last_started_at.elapsed())
                 .unwrap_or(Duration::ZERO);
@@ -4640,8 +4640,17 @@ fn run_deadloop_session_inner(
                     ),
                     pane_id,
                 });
+                // Cursor must be NOW (entry to the wait), not
+                // last_started_at — otherwise the agent's own writes
+                // during the iteration just past
+                // (team-todo.md / .apas-team.jsonl mutations are this
+                // pane's job) count as "change after cursor" and wake
+                // the loop the instant it goes to sleep. That bug
+                // collapses the 15-minute min interval to ~0s and was
+                // the symptom of "the Tech Lead loops constantly".
+                let wait_cursor = Instant::now();
                 let reason = file_watcher.wait_until(
-                    Some(last_started_at),
+                    Some(wait_cursor),
                     remaining,
                     &shutdown,
                     &pause,
