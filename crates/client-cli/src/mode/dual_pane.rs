@@ -3726,6 +3726,34 @@ fn build_deadloop_agent_args(
     )
 }
 
+fn is_codex_stale_session_error(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    lower.contains("no rollout found") || lower.contains("thread/resume failed")
+}
+
+fn should_recover_deadloop_stale_session(
+    stale_session_detected: bool,
+    first_message: bool,
+    using_resume: bool,
+    exit_was_error: bool,
+    had_error: bool,
+) -> bool {
+    stale_session_detected || (first_message && using_resume && exit_was_error && !had_error)
+}
+
+fn reset_deadloop_codex_stale_session(
+    first_message: &mut bool,
+    try_resume_first: &mut bool,
+    claude_session_id: &mut Uuid,
+    fresh_session_id: Uuid,
+) -> Uuid {
+    let old = *claude_session_id;
+    *claude_session_id = fresh_session_id;
+    *try_resume_first = false;
+    *first_message = true;
+    old
+}
+
 /// Intercept claude's `control_request` envelopes on stdout. Returns
 /// `Some(true)` if the line was a control_request (caller should `continue`),
 /// `Some(false)` if it's a control_request we explicitly leave for downstream
@@ -3977,11 +4005,13 @@ mod tests {
         active_usage_providers, auto_cancel_pending_questions_for_new_input, build_agent_args,
         build_agent_switch_respawn_event, build_deadloop_agent_args, build_pane_reboot_events,
         build_pane_env_overrides_from_keys, build_pane_list, boot_restore_try_resume_first,
-        pane_label_or_default, promote_pane_to_managed, resolve_pane_binary_path,
-        route_web_input_to_pane, restored_pane_mode_and_pause, run_deadloop_session_inner,
-        save_pane_configs, start_bot_preserved_fields, truncate_str_at_char_boundary,
-        ASK_USER_QUESTION_AUTO_CANCEL_STATUS, InputChannels, PaneInputRouteResult, PaneMeta,
-        PaneMetas, PanePauses, PaneStopRequests, PendingAskQuestion, DEEPSEEK_DEFAULT_MODEL,
+        is_codex_stale_session_error, pane_label_or_default, promote_pane_to_managed,
+        reset_deadloop_codex_stale_session, resolve_pane_binary_path, route_web_input_to_pane,
+        restored_pane_mode_and_pause, run_deadloop_session_inner, save_pane_configs,
+        should_recover_deadloop_stale_session, start_bot_preserved_fields,
+        truncate_str_at_char_boundary, ASK_USER_QUESTION_AUTO_CANCEL_STATUS, InputChannels,
+        PaneInputRouteResult, PaneMeta, PaneMetas, PanePauses, PaneStopRequests,
+        PendingAskQuestion, DEEPSEEK_DEFAULT_MODEL,
     };
     use crate::project::get_or_create_project;
     use crate::tui::{PaneOutput, TuiEvent};
@@ -4139,6 +4169,99 @@ mod tests {
         assert_eq!(args.get(0).map(String::as_str), Some("exec"));
         assert_eq!(args.get(1).map(String::as_str), Some("resume"));
         assert_eq!(args.last().map(String::as_str), Some(FULL_PROMPT));
+    }
+
+    #[test]
+    fn codex_stale_session_recovery_resets_first_resumed_message_for_fresh_retry() {
+        let old_session_id =
+            Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let fresh_session_id =
+            Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
+        let mut session_id = old_session_id;
+        let mut first_message = true;
+        let mut try_resume_first = true;
+
+        assert!(should_recover_deadloop_stale_session(
+            false,
+            first_message,
+            true,
+            true,
+            false,
+        ));
+
+        let old = reset_deadloop_codex_stale_session(
+            &mut first_message,
+            &mut try_resume_first,
+            &mut session_id,
+            fresh_session_id,
+        );
+
+        assert_eq!(old, old_session_id);
+        assert_eq!(session_id, fresh_session_id);
+        assert!(first_message);
+        assert!(!try_resume_first);
+
+        let (args, using_resume) = build_deadloop_agent_args(
+            &Provider::Codex,
+            &session_id,
+            FULL_PROMPT,
+            None,
+            None,
+            first_message,
+            try_resume_first,
+        );
+
+        assert!(!using_resume);
+        assert_eq!(args.get(0).map(String::as_str), Some("exec"));
+        assert!(!args.iter().any(|arg| arg == "resume"));
+        assert_eq!(args.last().map(String::as_str), Some(FULL_PROMPT));
+        assert!(!args.iter().any(|arg| arg == &old_session_id.to_string()));
+        assert!(!args.iter().any(|arg| arg == &fresh_session_id.to_string()));
+    }
+
+    #[test]
+    fn codex_stale_session_recovery_ignores_mid_loop_ordinary_failure() {
+        let session_id = Uuid::parse_str("00000000-0000-4000-8000-000000000003")
+            .unwrap();
+        let first_message = false;
+        let try_resume_first = true;
+
+        assert!(!should_recover_deadloop_stale_session(
+            false,
+            first_message,
+            true,
+            true,
+            true,
+        ));
+
+        let (args, using_resume) = build_deadloop_agent_args(
+            &Provider::Codex,
+            &session_id,
+            FULL_PROMPT,
+            None,
+            None,
+            first_message,
+            try_resume_first,
+        );
+
+        assert!(using_resume);
+        assert_eq!(args.get(0).map(String::as_str), Some("exec"));
+        assert_eq!(args.get(1).map(String::as_str), Some("resume"));
+        assert!(args.iter().any(|arg| arg == &session_id.to_string()));
+        assert_eq!(args.last().map(String::as_str), Some(FULL_PROMPT));
+    }
+
+    #[test]
+    fn codex_stale_session_error_detects_resume_failures() {
+        assert!(is_codex_stale_session_error(
+            "ERROR no rollout found for thread id abc123"
+        ));
+        assert!(is_codex_stale_session_error(
+            "thread/resume failed: remote thread disappeared"
+        ));
+        assert!(!is_codex_stale_session_error(
+            "model returned a normal tool execution error"
+        ));
     }
 
     #[test]
@@ -5894,10 +6017,7 @@ fn run_deadloop_session_inner(
                                     // Covers both the older "no rollout
                                     // found" phrasing and the JSON-RPC
                                     // "thread/resume failed" prefix.
-                                    let lower = line.to_lowercase();
-                                    if lower.contains("no rollout found")
-                                        || lower.contains("thread/resume failed")
-                                    {
+                                    if is_codex_stale_session_error(&line) {
                                         stale_flag_for_stderr
                                             .store(true, Ordering::SeqCst);
                                     }
@@ -6105,22 +6225,26 @@ fn run_deadloop_session_inner(
                     // expiry, server-side wipe), not just at startup.
                     // The stderr reader sets stale_session_detected on
                     // "no rollout found" / "thread/resume failed".
-                    let stale = stale_session_detected.swap(false, Ordering::SeqCst)
-                        || (first_message && using_resume && exit_was_error && !had_error);
+                    let stale = should_recover_deadloop_stale_session(
+                        stale_session_detected.swap(false, Ordering::SeqCst),
+                        first_message,
+                        using_resume,
+                        exit_was_error,
+                        had_error,
+                    );
                     if stale {
-                        let old = claude_session_id;
-                        claude_session_id = Uuid::new_v4();
-                        try_resume_first = false;
-                        // Also reset first_message so the next iteration
-                        // takes the "exec (no resume)" branch in
-                        // build_agent_args. Without this, when stale fires
-                        // mid-loop (first_message is already false), the
-                        // very next iteration still falls into the
-                        // "subsequent → always resume" branch and tries
-                        // exec resume on the just-minted id — which codex
-                        // also doesn't know about, so it loops forever
-                        // re-minting fresh ids and re-failing.
-                        first_message = true;
+                        // Reset first_message so the next iteration takes
+                        // the "exec (no resume)" branch in build_agent_args.
+                        // Without this, the next turn can fall into the
+                        // "subsequent -> always resume" branch and try
+                        // exec resume on the just-minted id, which Codex
+                        // also does not know about.
+                        let old = reset_deadloop_codex_stale_session(
+                            &mut first_message,
+                            &mut try_resume_first,
+                            &mut claude_session_id,
+                            Uuid::new_v4(),
+                        );
                         // Persist the fresh id straight into .apas so a
                         // CLI reboot doesn't fall back to the dead one.
                         // We don't have the full pane_metas / pane_pauses
