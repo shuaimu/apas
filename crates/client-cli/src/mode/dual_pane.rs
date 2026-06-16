@@ -9096,26 +9096,20 @@ async fn run_server_connection(
                                             }
                                             ServerToCli::DismissSuggestion { session_id: _, suggestion_id } => {
                                                 let project_dir = std::path::Path::new(&working_dir);
-                                                match crate::suggested_workers::load(project_dir) {
-                                                    Ok(mut sw) => {
-                                                        if sw.remove(&suggestion_id) {
-                                                            if let Err(e) =
-                                                                crate::suggested_workers::save(project_dir, &sw)
-                                                            {
-                                                                tracing::warn!(
-                                                                    "Failed to save suggested-workers.md after dismiss: {}",
-                                                                    e
-                                                                );
-                                                            }
-                                                        }
+                                                let sw = match crate::suggested_workers::dismiss(
+                                                    project_dir,
+                                                    &suggestion_id,
+                                                ) {
+                                                    Ok(sw) => sw,
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            "Failed to dismiss suggestion from suggested-workers.md: {}",
+                                                            e
+                                                        );
+                                                        crate::suggested_workers::load(project_dir)
+                                                            .unwrap_or_default()
                                                     }
-                                                    Err(e) => tracing::warn!(
-                                                        "Failed to load suggested-workers.md for dismiss: {}",
-                                                        e
-                                                    ),
-                                                }
-                                                let sw = crate::suggested_workers::load(project_dir)
-                                                    .unwrap_or_default();
+                                                };
                                                 let msg = CliToServer::SuggestedWorkersState {
                                                     session_id,
                                                     suggestions: crate::suggested_workers::to_wire(&sw),
