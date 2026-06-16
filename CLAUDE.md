@@ -1,21 +1,47 @@
-# APAS - Claude Code Web Interface
+# APAS - Autonomous Programming Agent System
 
-APAS is a web interface for Claude Code that allows you to observe and interact with Claude CLI sessions from a browser.
+APAS runs a local autonomous programming team around a project. The CLI owns
+local panes and worktrees, the server brokers project/session state, and the
+web UI exposes the Overview, Manager chat, Team TODO queue, pane tabs, and
+diff/PR handoff surfaces.
+
+The current v3 operating model has four managed roles:
+
+- **Manager** chats with the human and keeps `project_goal.md` current.
+- **Tech Lead** converts the project goal into approved work in
+  `team-todo.md`, dispatches developers/reviewers through
+  `.apas-team.jsonl`, and tracks worker-opened PRs.
+- **Developer** panes implement approved subtasks in isolated worktrees,
+  publish `kind: "diff"` records, and open PRs after Reviewer approval.
+- **Reviewer** panes evaluate worker diffs and publish `approves:<pane>` or
+  `rejects:<pane>` review records.
 
 ## Architecture
 
 ```
-┌─────────────────┐     WebSocket      ┌─────────────────┐     WebSocket     ┌─────────────────┐
-│   CLI Client    │ ◄──────────────────►│     Server      │ ◄────────────────►│   Web Frontend  │
-│  (apas binary)  │   ws://host:8080    │  (apas-server)  │   ws://host:8080  │   (Next.js)     │
-└─────────────────┘                     └─────────────────┘                    └─────────────────┘
-        │                                       │
-        ▼                                       ▼
-┌─────────────────┐                     ┌─────────────────┐
-│   Claude CLI    │                     │  SQLite + Files │
-│ (stream-json)   │                     │   (data/)       │
-└─────────────────┘                     └─────────────────┘
+┌─────────────────────┐    WebSocket     ┌─────────────────┐    WebSocket    ┌─────────────────────┐
+│ CLI client          │ ◄───────────────►│ apas-server     │◄───────────────►│ Web frontend        │
+│ (apas binary)       │                  │                 │                 │ (Next.js Overview)  │
+└─────────────────────┘                  └─────────────────┘                 └─────────────────────┘
+        │                                         │
+        │                                         ▼
+        │                                ┌─────────────────┐
+        │                                │ SQLite + JSONL  │
+        │                                │ data/sessions/  │
+        │                                └─────────────────┘
+        ▼
+┌─────────────────────┐
+│ Pane processes      │
+│ Claude/Codex/etc.   │
+│ worktrees + prompts │
+└─────────────────────┘
 ```
+
+The CLI keeps project-local files such as `.apas`, `project_goal.md`,
+`team-todo.md`, `.apas-team.jsonl`, and optional worker worktrees. The server
+caches and broadcasts machine, session, TODO, suggestion, and project-goal
+state. The web UI lets the human manage goals, approve proposed TODOs,
+inspect panes, and review PR links/status.
 
 ## Project Structure
 
@@ -24,14 +50,19 @@ apas/
 ├── crates/
 │   ├── client-cli/      # CLI binary (apas)
 │   │   ├── src/
-│   │   │   ├── main.rs      # Entry point, CLI args
-│   │   │   ├── config.rs    # Config file handling
-│   │   │   ├── project.rs   # .apas file management
-│   │   │   ├── claude.rs    # Claude process wrapper
+│   │   │   ├── main.rs        # CLI entry point and config commands
+│   │   │   ├── config.rs      # User/machine config, provider API keys
+│   │   │   ├── project.rs     # .apas project metadata
+│   │   │   ├── role.rs        # Built-in Manager/Tech Lead/Developer/Reviewer prompts
+│   │   │   ├── team_todo.rs   # team-todo.md parsing/state helpers
+│   │   │   ├── manager.rs     # project_goal.md read/write helpers
+│   │   │   ├── worktree.rs    # Isolated worktree creation/diff/cleanup
+│   │   │   ├── claude.rs      # Claude process wrapper
 │   │   │   └── mode/
-│   │   │       ├── hybrid.rs  # Default: local CLI + streaming to server
-│   │   │       ├── local.rs   # Offline mode
-│   │   │       └── remote.rs  # Remote-only mode
+│   │   │       ├── dual_pane.rs # Default managed panes, deadloops, team files
+│   │   │       ├── hybrid.rs    # Legacy single-pane local CLI + streaming
+│   │   │       ├── local.rs     # Offline mode
+│   │   │       └── remote.rs    # Remote-only mode
 │   │   └── Cargo.toml
 │   │
 │   ├── server/          # WebSocket server (apas-server)
@@ -42,14 +73,14 @@ apas/
 │   │   │   ├── db/          # SQLite database
 │   │   │   ├── session/     # Session manager
 │   │   │   └── routes/
-│   │   │       ├── ws_cli.rs  # CLI WebSocket handler
-│   │   │       └── ws_web.rs  # Web WebSocket handler
+│   │   │       ├── ws_cli.rs  # CLI WebSocket handler, project-goal/TODO replay
+│   │   │       └── ws_web.rs  # Web WebSocket handler, Overview/machine actions
 │   │   └── Cargo.toml
 │   │
 │   └── shared/          # Shared types between CLI and server
 │       ├── src/
 │       │   ├── lib.rs
-│       │   └── messages.rs  # All WebSocket message types
+│       │   └── messages.rs  # Shared WebSocket/team/machine message types
 │       └── Cargo.toml
 │
 ├── packages/
@@ -59,12 +90,14 @@ apas/
 │       │   │   ├── layout.tsx
 │       │   │   └── page.tsx
 │       │   ├── components/
-│       │   │   ├── Sidebar.tsx       # Project list
+│       │   │   ├── overview/         # Manager/goal/TODO/pane-grid control surface
+│       │   │   ├── tabs/             # Pane tabs, task bars, diff modal
 │       │   │   ├── chat/             # Message display
 │       │   │   ├── code/             # Code blocks
 │       │   │   └── tools/            # Tool cards
 │       │   └── lib/
-│       │       └── store.ts          # Zustand state management
+│       │       ├── store.ts          # Zustand state, WebSocket message handling
+│       │       └── roleTemplates.ts  # Web-spawned managed-role prompt templates
 │       └── package.json
 │
 ├── data/                # Runtime data (created at runtime)
@@ -129,15 +162,46 @@ Each project directory gets a `.apas` file with project metadata:
 
 Key message types in `crates/shared/src/messages.rs`:
 
-- **CliToServer**: Register, SessionStart, StreamMessage, UserInput, Heartbeat
-- **ServerToCli**: Registered, SessionAssigned, Input, Signal
-- **WebToServer**: Authenticate, ListCliClients, AttachSession, Input
-- **ServerToWeb**: Authenticated, CliClients, SessionMessages, StreamMessage, UserInput
+- **CliToServer**: Register, SessionStart, StreamMessage, UserInput,
+  Heartbeat, ProjectGoalChanged, TeamTodoChanged, SuggestedWorkersChanged,
+  machine config/status updates.
+- **ServerToCli**: Registered, SessionAssigned, Input, Signal,
+  UpdateProjectGoal, TodoApproval, AddTodo, pane/worktree/suggestion actions.
+- **WebToServer**: Authenticate, ListCliClients, AttachSession, Input,
+  UpdateProjectGoal, TodoApproval, AddTodo, machine/provider config actions.
+- **ServerToWeb**: Authenticated, CliClients, SessionMessages, StreamMessage,
+  UserInput, ProjectGoalChanged, TeamTodoChanged, SuggestedWorkersChanged,
+  Machines, PaneDiff.
 
 ## Data Storage
 
 - **SQLite** (`data/apas.db`): Users, CLI clients, sessions metadata
 - **JSONL files** (`data/sessions/{id}/messages.jsonl`): Chat messages per session
+- **Project files** (`project_goal.md`, `team-todo.md`, `.apas-team.jsonl`):
+  team-mode goal, work queue, and append-only cross-pane scratchpad
+- **Worktrees** (`.apas-worktrees/pane-<id>/`): isolated branches for managed
+  Developer panes
+
+## Team-mode Operations
+
+The v3 team loop is driven by project-local files:
+
+- `project_goal.md` is the high-level goal. The Manager updates it from human
+  chat, and the Tech Lead reads it before proposing work.
+- `team-todo.md` contains Global TODOs plus per-pane subtasks. Tech-Lead
+  proposals start as `status: proposed, origin: tech-lead`; the human
+  approves/rejects them in the Overview Team TODO panel.
+- `.apas-team.jsonl` is the append-only scratchpad. Tech Lead uses
+  `kind: "delegation"` with `delegate-to:<pane>` and `task:TODO-NNN` tags;
+  Developers publish `kind: "diff"`; Reviewers publish `kind: "review"` with
+  `approves:<pane>` or `rejects:<pane>`; Developers publish
+  `kind: "decision"` with `pr-opened` after opening a PR.
+- Worker PRs are opened by the Developer pane after Reviewer approval. The
+  human merges or closes the PR; Tech Lead tracks PR state and dispatches PR
+  comments back to the owning Developer.
+
+For contributor work, keep task scopes narrow. If a TODO says docs-only or
+names specific files, do not combine it with adjacent team-mode cleanup.
 
 ## Development
 
@@ -228,8 +292,17 @@ ssh root@apas.mpaxos.com "cd /opt/apas/web && npm install && NEXT_PUBLIC_WEB_UI_
 
 ## Key Concepts
 
-1. **Dual-Pane Mode** (default): Split TUI with deadloop (left) and interactive (right) panes
-2. **Hybrid Mode** (legacy): Single pane with local terminal + streaming
-3. **Project-based Sessions**: Sessions identified by project directory (`.apas` file)
-4. **Stream-JSON**: Uses Claude CLI's `--output-format stream-json` for structured output
-5. **Real-time Updates**: WebSocket connections for live message streaming
+1. **Managed Team Mode** (default): Manager, Tech Lead, Developer, and
+   Reviewer panes coordinate through `project_goal.md`, `team-todo.md`, and
+   `.apas-team.jsonl`.
+2. **Dual-Pane Runtime**: The CLI restores panes from `.apas`, runs deadloop
+   or interactive processes, and can isolate Developer panes in git
+   worktrees.
+3. **Hybrid Mode** (legacy): Single pane with local terminal + streaming.
+4. **Project-based Sessions**: Sessions are identified by project directory
+   and `.apas` project metadata.
+5. **Stream-JSON**: Uses Claude CLI's `--output-format stream-json` for
+   structured Claude output; other providers are bridged through their own
+   runtime paths.
+6. **Real-time Updates**: WebSocket connections broadcast live messages,
+   project-goal changes, Team TODO state, machine config, and pane diffs.
