@@ -288,11 +288,11 @@ function AgentLine({
       </span>
     );
   }
-  const dot = activityDot(lastActivity, now);
+  const status = activityStatus(lastActivity, now);
   return (
     <span title={cursor ? `cursor: ${cursor}` : "no cursor (agent hasn't iterated)"}>
       <strong className="text-gray-700 dark:text-gray-200">{label}</strong>{" "}
-      {dot} {relative(lastActivity, now)}
+      <ActivityIndicator status={status} /> {relative(lastActivity, now)}
       {cursor && (
         <span className="ml-1 text-gray-400 dark:text-gray-500">
           · cursor {relative(parseTs(cursor), now)}
@@ -302,12 +302,55 @@ function AgentLine({
   );
 }
 
-function activityDot(ts: number | null, now: number): string {
-  if (ts == null) return "○";
+type ActivityStatus = "active" | "recent" | "stale" | "unknown";
+
+function activityStatus(ts: number | null, now: number): ActivityStatus {
+  if (ts == null) return "unknown";
   const ageMs = now - ts;
-  if (ageMs < 5 * 60_000) return "🟢";   // active in last 5 min
-  if (ageMs < 30 * 60_000) return "🟡";  // idle but recent
-  return "🔴";                            // stale
+  if (ageMs < 5 * 60_000) return "active";
+  if (ageMs < 30 * 60_000) return "recent";
+  return "stale";
+}
+
+function ActivityIndicator({ status }: { status: ActivityStatus }) {
+  const { label, tone, dot } = (() => {
+    switch (status) {
+      case "active":
+        return {
+          label: "active",
+          tone: "bg-emerald-100 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300",
+          dot: "bg-emerald-500",
+        };
+      case "recent":
+        return {
+          label: "recent",
+          tone: "bg-amber-100 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300",
+          dot: "bg-amber-500",
+        };
+      case "stale":
+        return {
+          label: "stale",
+          tone: "bg-rose-100 text-rose-800 dark:bg-rose-950/40 dark:text-rose-300",
+          dot: "bg-rose-500",
+        };
+      case "unknown":
+        return {
+          label: "unknown",
+          tone: "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300",
+          dot: "bg-gray-400",
+        };
+    }
+  })();
+  return (
+    <span
+      aria-label={`Agent status: ${label}`}
+      data-agent-status={status}
+      className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium ${tone}`}
+    >
+      <span className={`h-1.5 w-1.5 rounded-full ${dot}`} aria-hidden="true" />
+      {label}
+    </span>
+  );
 }
 
 function relative(ts: number | null, now: number): string {

@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { parsePrLine } from "./TeamTodoPanel";
 import { TeamTodoPanel } from "./TeamTodoPanel";
-import { useStore, type TeamTodoState } from "@/lib/store";
+import { paneKey, useStore, type PaneConfig, type TeamTodoState } from "@/lib/store";
 
 describe("parsePrLine", () => {
   it("parses a well-formed line", () => {
@@ -96,6 +96,57 @@ function mkGlobal(status: string, prUrl: string) {
     tech_lead_cursor: null,
     reviewer_cursor: null,
   } as TeamTodoState;
+}
+
+function emptyTeamTodo(): TeamTodoState {
+  return {
+    globals: [],
+    workers: [],
+    tech_lead_cursor: null,
+    reviewer_cursor: null,
+  };
+}
+
+function seedAgentStatus({
+  lastActivity,
+  cursor = null,
+  present = true,
+}: {
+  lastActivity: Date | null;
+  cursor?: string | null;
+  present?: boolean;
+}) {
+  const paneId = 178;
+  const messages =
+    lastActivity == null
+      ? {}
+      : { [paneKey(paneId)]: [{ timestamp: lastActivity }] };
+  const techLeadPane: PaneConfig = {
+    pane_id: paneId,
+    provider: "claude",
+    mode: "deadloop",
+    session_id: "tech-lead-session",
+    is_paused: false,
+    role: "tech lead",
+  };
+  act(() => {
+    useStore.setState({
+      sessionId: "test-session",
+      teamTodoState: emptyTeamTodo(),
+      teamTodoStates: new Map([
+        [
+          "test-session",
+          {
+            ...emptyTeamTodo(),
+            tech_lead_cursor: cursor,
+          },
+        ],
+      ]),
+      fetchTeamTodo: vi.fn(),
+      paneConfigs: present ? [techLeadPane] : [],
+      paneMessages: messages as never,
+    });
+  });
 }
 
 describe("PrStateBadge fetch-driven color", () => {
@@ -237,5 +288,64 @@ describe("PrStateBadge fetch-driven color", () => {
     globalThis.fetch = vi.fn() as unknown as typeof fetch;
     render(<TeamTodoPanel />);
     expect(screen.queryByTestId("pr-state-badge")).toBeNull();
+  });
+});
+
+describe("AgentStatusRow accessible indicators", () => {
+  const NOW = new Date("2026-06-16T12:00:00Z");
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    act(() => {
+      useStore.setState({
+        sessionId: null,
+        teamTodoState: null,
+        teamTodoStates: new Map(),
+        paneConfigs: [],
+        paneMessages: {},
+      });
+    });
+  });
+
+  it.each([
+    ["active", 60_000, /1m ago/],
+    ["recent", 10 * 60_000, /10m ago/],
+    ["stale", 45 * 60_000, /45m ago/],
+  ])("renders %s activity with an accessible status", (status, ageMs, relativeText) => {
+    seedAgentStatus({
+      lastActivity: new Date(NOW.getTime() - ageMs),
+      cursor: "2026-06-16T11:58:00Z",
+    });
+
+    render(<TeamTodoPanel />);
+
+    const badge = screen.getByLabelText(`Agent status: ${status}`);
+    expect(badge.getAttribute("data-agent-status")).toBe(status);
+    expect(screen.getByText(relativeText)).toBeTruthy();
+    expect(screen.getByText(/cursor 2m ago/)).toBeTruthy();
+  });
+
+  it("renders unknown activity when a running pane has no messages", () => {
+    seedAgentStatus({ lastActivity: null });
+
+    render(<TeamTodoPanel />);
+
+    const badge = screen.getByLabelText("Agent status: unknown");
+    expect(badge.getAttribute("data-agent-status")).toBe("unknown");
+    expect(screen.getByText("—")).toBeTruthy();
+  });
+
+  it("preserves missing-pane text without an activity indicator", () => {
+    seedAgentStatus({ lastActivity: null, present: false });
+
+    render(<TeamTodoPanel />);
+
+    expect(screen.getAllByText("not running")).toHaveLength(2);
+    expect(screen.queryByLabelText(/Agent status:/)).toBeNull();
   });
 });
