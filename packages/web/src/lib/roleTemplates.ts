@@ -17,6 +17,8 @@
  */
 import type { PlanReviewMode } from "./store";
 
+export type TeamRoleMode = "interactive" | "deadloop";
+
 export interface RoleTemplate {
   /** Stable id used as the button key and for analytics if we ever add it. */
   id: string;
@@ -29,9 +31,23 @@ export interface RoleTemplate {
   goal: string;
   backstory: string;
   planReviewMode: PlanReviewMode;
+  /** Canonical team-slot launch mode in the Overview Team box. */
+  teamMode?: TeamRoleMode;
+  /** Recommended provider/model for pre-launch team slots. */
+  recommendedProvider?: string;
+  recommendedModel?: string;
+  /** Whether this role should launch in an isolated git worktree. */
+  isolatedWorktree?: boolean;
   /** Render hint: which color family the button uses. */
   color: "indigo" | "emerald" | "amber" | "rose" | "sky" | "violet";
 }
+
+export const CANONICAL_TEAM_ROLE_IDS = [
+  "manager",
+  "tech-lead",
+  "developer",
+  "reviewer",
+] as const;
 
 export const ROLE_TEMPLATES: RoleTemplate[] = [
   {
@@ -51,6 +67,8 @@ Working style:
 - Read recent scratchpad records (kind: "diff", "review", "decision") so you can summarize team progress when the user asks.
 - Never write production code. If you find yourself reaching for Write/Edit outside of project_goal.md, you're in the wrong lane.`,
     planReviewMode: "never",
+    teamMode: "interactive",
+    recommendedProvider: "claude",
   },
   {
     id: "tech-lead",
@@ -73,6 +91,8 @@ PR-style flow:
 - Workers ship via PRs, not direct-to-main merges. When a worker publishes kind: "diff" on the scratchpad, hand off to the Reviewer pane (if one exists). When the Reviewer publishes kind: "review" with approves:<pane_id>, escalate to the Manager so the user can review and merge via the GitHub PR.
 - Track each PR's state on the scratchpad — kind: "decision" records work well for "PR opened: <url>", "review approved", "merged".`,
     planReviewMode: "never",
+    teamMode: "deadloop",
+    recommendedProvider: "claude",
   },
   {
     id: "developer",
@@ -99,6 +119,9 @@ PR-style flow:
 - Then WAIT for the human to merge. Each iteration: \`gh pr view <url> --json state -q .state\`. OPEN → "Waiting for review on <url>"; MERGED → publish kind: "decision" tags ["pr-merged"], then you're free to take the next delegation; CLOSED → escalate via kind: "escalation" so the Manager surfaces it.
 - If review comments come in on GitHub, address with follow-up commits, then keep waiting. Never merge your own PR.`,
     planReviewMode: "never",
+    teamMode: "deadloop",
+    recommendedProvider: "claude",
+    isolatedWorktree: true,
   },
   {
     id: "qa",
@@ -136,6 +159,8 @@ Don't nitpick style. Don't suggest rewriting working code "more elegantly."
 
 Publish your verdict via .apas-team.jsonl as kind: "review", with tags approves:<pane_id> or rejects:<pane_id>, and a body that quotes file:line for each point.`,
     planReviewMode: "never",
+    teamMode: "deadloop",
+    recommendedProvider: "claude",
   },
   {
     id: "researcher",
@@ -178,6 +203,12 @@ Working style:
 
 export function findTemplate(id: string): RoleTemplate | undefined {
   return ROLE_TEMPLATES.find((t) => t.id === id);
+}
+
+export function canonicalTeamRoleTemplates(): RoleTemplate[] {
+  return CANONICAL_TEAM_ROLE_IDS.map((id) => findTemplate(id)).filter(
+    (template): template is RoleTemplate => template !== undefined,
+  );
 }
 
 /** Tailwind color classes per template color family. Centralized so the

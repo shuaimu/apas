@@ -3,6 +3,12 @@
 import { useCallback, useRef, useEffect, useState } from "react";
 import { Bot } from "lucide-react";
 import { PaneConfig, paneKey } from "@/lib/store";
+import {
+  PROVIDER_MODEL_GROUPS,
+  isDeepseekModel,
+  isGlmModel,
+  isMiniMaxModel,
+} from "@/lib/providerOptions";
 
 /** v3.3 — Manager and Tech Lead panes are always-there; hide the close
  *  affordances on those tabs so the user can't accidentally remove them. */
@@ -26,28 +32,6 @@ interface TabBarProps {
   showRebootButton?: boolean;
   paneStatuses: Record<string, string | null>;
   pausedPanes: number[];
-}
-
-const MINIMAX_DEFAULT_MODEL = "MiniMax-M2.7";
-const GLM_DEFAULT_MODEL = "glm-5.1";
-const DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-pro";
-
-function isMiniMaxModel(model?: string): boolean {
-  if (typeof model !== "string") return false;
-  const normalized = model.trim().toLowerCase();
-  return normalized.includes("minimax") || normalized.startsWith("m2");
-}
-
-function isGlmModel(model?: string): boolean {
-  if (typeof model !== "string") return false;
-  const normalized = model.trim().toLowerCase();
-  return normalized.startsWith("glm") || normalized.includes("glm-");
-}
-
-function isDeepseekModel(model?: string): boolean {
-  if (typeof model !== "string") return false;
-  const normalized = model.trim().toLowerCase();
-  return normalized.includes("deepseek");
 }
 
 function isMiniMaxTab(provider: string, model?: string, label?: string): boolean {
@@ -566,105 +550,70 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
             Isolated git worktree
           </label>
 
-          {/* Claude group */}
-          <button
-            onClick={() => setExpandedGroup((g) => (g === "claude" ? null : "claude"))}
-            className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
-          >
-            <span className="text-blue-500 flex-shrink-0">
-              <ProviderIcon provider="claude" className="w-4 h-4" />
-            </span>
-            Claude
-            <Caret open={expandedGroup === "claude"} />
-          </button>
-          {expandedGroup === "claude" && (
-            <div className="bg-gray-50 dark:bg-gray-900/40">
-              <button
-                onClick={() => handlePick("claude")}
-                className="w-full text-left pl-8 pr-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
-              >
-                <span className="text-blue-500 flex-shrink-0">
-                  <ProviderIcon provider="claude" className="w-4 h-4" />
-                </span>
-                Official
-              </button>
-              <button
-                onClick={() => handlePick("claude", MINIMAX_DEFAULT_MODEL)}
-                className="w-full text-left pl-8 pr-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
-              >
-                <span className="text-cyan-500 flex-shrink-0">
-                  <ProviderIcon provider="claude" model={MINIMAX_DEFAULT_MODEL} className="w-4 h-4" />
-                </span>
-                MiniMax 2.7
-              </button>
-              <button
-                onClick={() => handlePick("claude", GLM_DEFAULT_MODEL)}
-                className="w-full text-left pl-8 pr-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
-              >
-                <span className="text-emerald-500 flex-shrink-0">
-                  <ProviderIcon provider="claude" model={GLM_DEFAULT_MODEL} className="w-4 h-4" />
-                </span>
-                GLM 5.1
-              </button>
-              <button
-                onClick={() => handlePick("claude", DEEPSEEK_DEFAULT_MODEL)}
-                className="w-full text-left pl-8 pr-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
-              >
-                <span className="text-indigo-500 flex-shrink-0">
-                  <ProviderIcon provider="claude" model={DEEPSEEK_DEFAULT_MODEL} className="w-4 h-4" />
-                </span>
-                DeepSeek
-              </button>
+          {PROVIDER_MODEL_GROUPS.map((group, i) => (
+            <div key={group.id}>
+              {i > 0 && (
+                <div className="border-t border-gray-100 dark:border-gray-700 my-0.5" />
+              )}
+              {group.options.length === 1 ? (
+                <button
+                  onClick={() => {
+                    const option = group.options[0];
+                    handlePick(option.provider, option.model);
+                  }}
+                  className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
+                >
+                  <span className={`${group.toneClass} flex-shrink-0`}>
+                    <ProviderIcon
+                      provider={group.iconProvider}
+                      model={group.iconModel}
+                      className="w-4 h-4"
+                    />
+                  </span>
+                  {group.label}
+                </button>
+              ) : (
+                <>
+                  <button
+                    onClick={() =>
+                      setExpandedGroup((g) => (g === group.id ? null : group.id))
+                    }
+                    className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
+                  >
+                    <span className={`${group.toneClass} flex-shrink-0`}>
+                      <ProviderIcon
+                        provider={group.iconProvider}
+                        model={group.iconModel}
+                        className="w-4 h-4"
+                      />
+                    </span>
+                    {group.label}
+                    <Caret open={expandedGroup === group.id} />
+                  </button>
+                  {expandedGroup === group.id && (
+                    <div className="bg-gray-50 dark:bg-gray-900/40">
+                      {group.options.map((option) => (
+                        <button
+                          key={option.value}
+                          onClick={() => handlePick(option.provider, option.model)}
+                          className="w-full text-left pl-8 pr-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
+                        >
+                          <span className={`${group.toneClass} flex-shrink-0`}>
+                            <ProviderIcon
+                              provider={option.provider}
+                              model={option.model}
+                              className="w-4 h-4"
+                            />
+                          </span>
+                          {option.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </>
+              )}
             </div>
-          )}
-
-          <div className="border-t border-gray-100 dark:border-gray-700 my-0.5" />
-
-          {/* Codex group */}
-          <button
-            onClick={() => setExpandedGroup((g) => (g === "codex" ? null : "codex"))}
-            className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
-          >
-            <span className="text-green-500 flex-shrink-0">
-              <ProviderIcon provider="codex" className="w-4 h-4" />
-            </span>
-            Codex
-            <Caret open={expandedGroup === "codex"} />
-          </button>
-          {expandedGroup === "codex" && (
-            <div className="bg-gray-50 dark:bg-gray-900/40">
-              <button
-                onClick={() => handlePick("codex")}
-                className="w-full text-left pl-8 pr-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
-              >
-                <span className="text-green-500 flex-shrink-0">
-                  <ProviderIcon provider="codex" className="w-4 h-4" />
-                </span>
-                Official
-              </button>
-            </div>
-          )}
-
-          <div className="border-t border-gray-100 dark:border-gray-700 my-0.5" />
-          <button
-            onClick={() => handlePick("opencode")}
-            className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
-          >
-            <span className="text-orange-500 flex-shrink-0">
-              <ProviderIcon provider="opencode" className="w-4 h-4" />
-            </span>
-            OpenCode
-          </button>
-          <div className="border-t border-gray-100 dark:border-gray-700 my-0.5" />
-          <button
-            onClick={() => handlePick("cursor-agent")}
-            className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
-          >
-            <span className="text-sky-500 flex-shrink-0">
-              <ProviderIcon provider="cursor-agent" className="w-4 h-4" />
-            </span>
-            Cursor
-          </button>
+          ))}
         </div>
       )}
     </div>

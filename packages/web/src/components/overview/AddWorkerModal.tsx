@@ -42,9 +42,7 @@ export function AddWorkerModal({ open, onClose }: AddWorkerModalProps) {
     setBackstory(t.backstory);
     setMode(t.planReviewMode);
     if (!label.trim()) setLabel(t.label);
-    // Developer is the only template that should default to an isolated
-    // worktree — the others mostly read or coordinate.
-    if (t.id === "developer") setIsolated(true);
+    setIsolated(t.isolatedWorktree === true);
   };
 
   const reset = () => {
