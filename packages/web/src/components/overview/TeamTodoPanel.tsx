@@ -38,7 +38,7 @@ export interface ParsedPrLine {
 /// callers can ignore the line without crashing.
 export function parsePrLine(line: string): ParsedPrLine | null {
   const m = line.match(
-    /^pr:\s+(\d+)\s+(https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/(\d+))\s*$/,
+    /^pr:\s+(\d+)\s+(https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/(\d+))(?:\s+\([^)]*\))?\s*$/,
   );
   if (!m) return null;
   const pane = Number.parseInt(m[1], 10);

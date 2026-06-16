@@ -95,6 +95,8 @@ pub struct GlobalTodo {
 pub struct PaneTodoPr {
     pub pane_id: u32,
     pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotation: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -221,6 +223,7 @@ pub fn to_wire(todo: &TeamTodo) -> shared::TeamTodoStateMsg {
                     .map(|p| shared::PaneTodoPrMsg {
                         pane_id: p.pane_id,
                         url: p.url.clone(),
+                        annotation: p.annotation.clone(),
                     })
                     .collect(),
                 body: g.body.clone(),
@@ -487,6 +490,19 @@ fn parse_worker_heading(s: &str) -> Option<(u32, Option<String>)> {
     Some((pane_id, role_hint))
 }
 
+fn split_pr_url_annotation(raw: &str) -> (String, Option<String>) {
+    let raw = raw.trim();
+    let Some((url, rest)) = raw.split_once(char::is_whitespace) else {
+        return (raw.to_string(), None);
+    };
+    let annotation = rest.trim();
+    if annotation.is_empty() {
+        (url.to_string(), None)
+    } else {
+        (url.to_string(), Some(annotation.to_string()))
+    }
+}
+
 fn build_global(
     id: String,
     title: String,
@@ -517,18 +533,22 @@ fn build_global(
         }
         if let Some((id_part, url_part)) = v.split_once(char::is_whitespace) {
             if let Ok(pane_id) = id_part.trim().parse::<u32>() {
+                let (url, annotation) = split_pr_url_annotation(url_part);
                 prs.push(PaneTodoPr {
                     pane_id,
-                    url: url_part.trim().to_string(),
+                    url,
+                    annotation,
                 });
                 continue;
             }
         }
         // Legacy: single URL with no pane_id. Keep it so we don't lose
         // links from pre-per-worker docs.
+        let (url, annotation) = split_pr_url_annotation(v);
         prs.push(PaneTodoPr {
             pane_id: 0,
-            url: v.to_string(),
+            url,
+            annotation,
         });
     }
 
@@ -590,11 +610,36 @@ pub fn serialize(todo: &TeamTodo) -> String {
             let _ = writeln!(out, "pr: (not yet)");
         } else {
             for pr in &g.prs {
+                let annotation = pr
+                    .annotation
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty());
                 if pr.pane_id == 0 {
                     // Legacy entry parsed from a pre-per-worker doc.
-                    let _ = writeln!(out, "pr: {}", pr.url);
+                    match annotation {
+                        Some(annotation) => {
+                            let _ = writeln!(out, "pr: {} {}", pr.url, annotation);
+                        }
+                        None => {
+                            let _ = writeln!(out, "pr: {}", pr.url);
+                        }
+                    }
                 } else {
-                    let _ = writeln!(out, "pr: {} {}", pr.pane_id, pr.url);
+                    match annotation {
+                        Some(annotation) => {
+                            let _ = writeln!(
+                                out,
+                                "pr: {} {} {}",
+                                pr.pane_id,
+                                pr.url,
+                                annotation
+                            );
+                        }
+                        None => {
+                            let _ = writeln!(out, "pr: {} {}", pr.pane_id, pr.url);
+                        }
+                    }
                 }
             }
         }
@@ -1225,12 +1270,41 @@ backend + frontend split.\n";
         assert_eq!(g.prs.len(), 2);
         assert_eq!(g.prs[0].pane_id, 578);
         assert_eq!(g.prs[0].url, "https://github.com/foo/bar/pull/42");
+        assert_eq!(g.prs[0].annotation, None);
         assert_eq!(g.prs[1].pane_id, 612);
         assert_eq!(g.prs[1].url, "https://github.com/foo/bar/pull/43");
+        assert_eq!(g.prs[1].annotation, None);
         // Round-trip preserves order + format.
         let rendered = serialize(&t);
         assert!(rendered.contains("pr: 578 https://github.com/foo/bar/pull/42"));
         assert!(rendered.contains("pr: 612 https://github.com/foo/bar/pull/43"));
+        let reparsed = parse(&rendered).unwrap();
+        assert_eq!(reparsed, t);
+    }
+
+    #[test]
+    fn parses_annotated_pr_line_with_clean_url_and_round_trips_annotation() {
+        let s = "# Team TODO\n\n## Global TODOs\n\n\
+### [TODO-001] Annotated\n\
+status: done\n\
+origin: tech-lead\n\
+pr: 568 https://github.com/shuaimu/apas/pull/12 (MERGED 2026-06-16T03:59:12Z 7d78b3e...)\n\
+\n\
+landed.\n";
+        let t = parse(s).unwrap();
+        let pr = &t.globals[0].prs[0];
+        assert_eq!(pr.pane_id, 568);
+        assert_eq!(pr.url, "https://github.com/shuaimu/apas/pull/12");
+        assert_eq!(
+            pr.annotation.as_deref(),
+            Some("(MERGED 2026-06-16T03:59:12Z 7d78b3e...)")
+        );
+
+        let rendered = serialize(&t);
+        assert!(rendered.contains(
+            "pr: 568 https://github.com/shuaimu/apas/pull/12 \
+(MERGED 2026-06-16T03:59:12Z 7d78b3e...)"
+        ));
         let reparsed = parse(&rendered).unwrap();
         assert_eq!(reparsed, t);
     }
@@ -1249,6 +1323,7 @@ old format.\n";
         // pane_id sentinel = 0 marks "we don't know which worker"
         assert_eq!(t.globals[0].prs[0].pane_id, 0);
         assert_eq!(t.globals[0].prs[0].url, "https://github.com/foo/bar/pull/7");
+        assert_eq!(t.globals[0].prs[0].annotation, None);
     }
 
     #[test]

@@ -191,6 +191,7 @@ export interface TeamTodoGlobal {
 export interface TeamTodoPaneTodoPr {
   pane_id: number;
   url: string;
+  annotation?: string;
 }
 
 /// Wire shape of one entry in suggested-workers.md. Manager pane writes
