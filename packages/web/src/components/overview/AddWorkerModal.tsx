@@ -63,6 +63,9 @@ export function AddWorkerModal({ open, onClose }: AddWorkerModalProps) {
       provider,
       "interactive",
       cleanLabel,
+      // No prompt here: managed workers get their identity from role
+      // metadata/templates, while the TabBar Start Bot fallback is only
+      // for classic/manual side-chat panes.
       undefined,
       undefined,
       isolated || undefined,

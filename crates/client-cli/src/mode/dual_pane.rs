@@ -24,6 +24,8 @@ use uuid::Uuid;
 use crate::project::{get_or_create_project, save_project};
 use crate::tui::{App, PaneOutput, TuiCommand, TuiEvent};
 
+/// Classic/manual single-agent fallback. Managed team panes should be created
+/// from role templates / canonical role prompts instead of this TODO.md loop.
 const DEFAULT_PROMPT: &str = r#"Work on tasks defined in TODO.md. Do the following steps. Don't ask me for advice, just pick the best option you think that is honest, complete, and not corner-cutting:
 
 1. Do a git pull to check if there are any remote updates. Pick the top high-priority undone task, choose its first leaf task. If there are no undone TODO items left, sleep a minute and exit.
@@ -658,6 +660,46 @@ struct PaneMeta {
     /// v3.5: managed vs unmanaged. Mirrored from `PaneConfig.managed`.
     /// See the field doc on `shared::PaneConfig` for semantics.
     managed: bool,
+}
+
+#[derive(Clone, Debug)]
+struct StartBotPreservedFields {
+    worktree_path: Option<String>,
+    role: Option<String>,
+    goal: Option<String>,
+    backstory: Option<String>,
+    plan_review_mode: shared::PlanReviewMode,
+    manual_mode: bool,
+    managed: bool,
+}
+
+impl Default for StartBotPreservedFields {
+    fn default() -> Self {
+        Self {
+            worktree_path: None,
+            role: None,
+            goal: None,
+            backstory: None,
+            plan_review_mode: shared::PlanReviewMode::default(),
+            manual_mode: false,
+            managed: false,
+        }
+    }
+}
+
+fn start_bot_preserved_fields(meta: Option<&PaneMeta>) -> StartBotPreservedFields {
+    match meta {
+        Some(meta) => StartBotPreservedFields {
+            worktree_path: meta.worktree_path.clone(),
+            role: meta.role.clone(),
+            goal: meta.goal.clone(),
+            backstory: meta.backstory.clone(),
+            plan_review_mode: meta.plan_review_mode,
+            manual_mode: meta.manual_mode,
+            managed: meta.managed,
+        },
+        None => StartBotPreservedFields::default(),
+    }
 }
 
 /// One held tool_use waiting on user approval (Phase 3.2b2).
@@ -2455,6 +2497,7 @@ fn handle_tui_events(
                     existing_model,
                     existing_effort,
                     existing_min_interval_minutes,
+                    preserved_fields,
                 ) = {
                     let metas = pane_metas.lock().unwrap();
                     match metas.get(&pane_id) {
@@ -2465,6 +2508,7 @@ fn handle_tui_events(
                             meta.model.clone(),
                             meta.effort.clone(),
                             meta.min_iteration_interval_minutes,
+                            start_bot_preserved_fields(Some(meta)),
                         ),
                         None => (
                             Provider::Claude,
@@ -2473,6 +2517,7 @@ fn handle_tui_events(
                             None,
                             None,
                             None,
+                            start_bot_preserved_fields(None),
                         ),
                     }
                 };
@@ -2549,15 +2594,15 @@ fn handle_tui_events(
                             control_response_tx: Arc::new(Mutex::new(None)),
                             pending_questions: Arc::new(Mutex::new(HashMap::new())),
                             effort_arc: Arc::new(Mutex::new(resolved_effort.clone())),
-                            worktree_path: None,
-                            role: None,
-                            goal: None,
-                            backstory: None,
-                            plan_review_mode: shared::PlanReviewMode::default(),
-                            plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                            worktree_path: preserved_fields.worktree_path,
+                            role: preserved_fields.role,
+                            goal: preserved_fields.goal,
+                            backstory: preserved_fields.backstory,
+                            plan_review_mode: preserved_fields.plan_review_mode,
+                            plan_review_mode_arc: Arc::new(Mutex::new(preserved_fields.plan_review_mode)),
                             pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
-                            manual_mode: false,
-                            managed: false,
+                            manual_mode: preserved_fields.manual_mode,
+                            managed: preserved_fields.managed,
                         },
                     );
                 }
@@ -3721,8 +3766,8 @@ mod tests {
     use super::{
         active_usage_providers, build_agent_args, build_pane_env_overrides_from_keys,
         build_pane_list, pane_label_or_default, promote_pane_to_managed,
-        resolve_pane_binary_path, truncate_str_at_char_boundary, InputChannels, PaneMeta,
-        PaneMetas, PanePauses, PaneStopRequests,
+        resolve_pane_binary_path, start_bot_preserved_fields, truncate_str_at_char_boundary,
+        InputChannels, PaneMeta, PaneMetas, PanePauses, PaneStopRequests,
     };
     use shared::Provider;
     use std::collections::HashMap;
@@ -3798,6 +3843,35 @@ mod tests {
         assert_eq!(args.get(0).map(String::as_str), Some("exec"));
         assert_eq!(args.get(1).map(String::as_str), Some("resume"));
         assert_eq!(args.last().map(String::as_str), Some(FULL_PROMPT));
+    }
+
+    #[test]
+    fn start_bot_preserves_managed_role_metadata() {
+        let effort_arc = Arc::new(Mutex::new(Some("max".to_string())));
+        let meta = test_pane_meta(Provider::Claude, true, Some("max"), effort_arc);
+
+        let preserved = start_bot_preserved_fields(Some(&meta));
+
+        assert!(preserved.managed);
+        assert!(preserved.manual_mode);
+        assert_eq!(preserved.worktree_path.as_deref(), Some("/tmp/apas-side-dev"));
+        assert_eq!(preserved.role.as_deref(), Some("developer"));
+        assert_eq!(preserved.goal.as_deref(), Some("Ship the side quest"));
+        assert_eq!(
+            preserved.backstory.as_deref(),
+            Some("A manually added helper pane"),
+        );
+        assert_eq!(preserved.plan_review_mode, shared::PlanReviewMode::RiskyOnly);
+    }
+
+    #[test]
+    fn start_bot_defaults_untracked_panes_to_unmanaged() {
+        let preserved = start_bot_preserved_fields(None);
+
+        assert!(!preserved.managed);
+        assert!(!preserved.manual_mode);
+        assert!(preserved.role.is_none());
+        assert_eq!(preserved.plan_review_mode, shared::PlanReviewMode::Never);
     }
 
     #[test]
