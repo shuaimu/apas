@@ -281,6 +281,30 @@ describe('useStore', () => {
     });
   });
 
+  describe('pane reboot', () => {
+    function makeOpenWs() {
+      const send = vi.fn();
+      return {
+        readyState: WebSocket.OPEN,
+        send,
+        close: vi.fn(),
+      } as unknown as WebSocket & { send: typeof send };
+    }
+
+    it('rebootPane sends a reboot_pane request for the active session and target pane', () => {
+      const ws = makeOpenWs();
+      useStore.setState({ sessionId: 'session-pane-reboot', ws });
+
+      useStore.getState().rebootPane(42);
+
+      expect(ws.send).toHaveBeenCalledWith(JSON.stringify({
+        type: 'reboot_pane',
+        session_id: 'session-pane-reboot',
+        pane_id: 42,
+      }));
+    });
+  });
+
   describe('project_goal_changed', () => {
     it('caches project goal content by session id from websocket messages', async () => {
       useStore.getState().connect();

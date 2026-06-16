@@ -770,6 +770,38 @@ fn build_agent_switch_respawn_event(
     }
 }
 
+fn build_pane_reboot_events(
+    pane_id: u32,
+    meta: &PaneMeta,
+    prior_session_id: Option<Uuid>,
+) -> (TuiEvent, TuiEvent) {
+    (
+        TuiEvent::CloseTab {
+            pane_id,
+            cleanup_action: None,
+        },
+        TuiEvent::AddTabWithConfig {
+            pane_id,
+            label: meta.label.clone(),
+            claude_session_id: prior_session_id.unwrap_or_else(Uuid::new_v4),
+            mode: meta.mode.clone(),
+            provider: meta.provider,
+            prompt: meta.prompt.clone(),
+            min_iteration_interval_minutes: meta.min_iteration_interval_minutes,
+            model: meta.model.clone(),
+            effort: meta.effort.clone(),
+            worktree_path: meta.worktree_path.clone(),
+            initial_input: None,
+            role: meta.role.clone(),
+            goal: meta.goal.clone(),
+            backstory: meta.backstory.clone(),
+            plan_review_mode: meta.plan_review_mode,
+            managed: meta.managed,
+            try_resume_first: true,
+        },
+    )
+}
+
 /// One held tool_use waiting on user approval (Phase 3.2b2).
 #[derive(Clone, Debug)]
 struct PendingPlanReview {
@@ -3941,7 +3973,7 @@ fn parse_agent_output(
 mod tests {
     use super::{
         active_usage_providers, auto_cancel_pending_questions_for_new_input, build_agent_args,
-        build_agent_switch_respawn_event, build_deadloop_agent_args,
+        build_agent_switch_respawn_event, build_deadloop_agent_args, build_pane_reboot_events,
         build_pane_env_overrides_from_keys, build_pane_list, boot_restore_try_resume_first,
         pane_label_or_default, promote_pane_to_managed, resolve_pane_binary_path,
         route_web_input_to_pane, restored_pane_mode_and_pause, run_deadloop_session_inner,
@@ -4171,6 +4203,71 @@ mod tests {
         assert_eq!(args.get(0).map(String::as_str), Some("exec"));
         assert_ne!(args.get(1).map(String::as_str), Some("resume"));
         assert!(!args.iter().any(|arg| arg == &fresh_session.to_string()));
+    }
+
+    #[test]
+    fn pane_reboot_events_respawn_requested_pane_on_same_session_with_config() {
+        let prior_session = Uuid::from_u128(7);
+        let effort_arc = Arc::new(Mutex::new(Some("high".to_string())));
+        let mut meta = test_pane_meta(Provider::Codex, true, Some("high"), effort_arc);
+        meta.mode = shared::PaneMode::Interactive;
+        meta.label = "Managed Developer".to_string();
+        meta.model = Some("gpt-5-codex".to_string());
+        meta.min_iteration_interval_minutes = Some(11);
+
+        let (close_event, add_event) = build_pane_reboot_events(42, &meta, Some(prior_session));
+
+        match close_event {
+            TuiEvent::CloseTab {
+                pane_id,
+                cleanup_action,
+            } => {
+                assert_eq!(pane_id, 42);
+                assert!(cleanup_action.is_none());
+            }
+            _ => panic!("expected CloseTab event"),
+        }
+
+        let TuiEvent::AddTabWithConfig {
+            pane_id,
+            label,
+            claude_session_id,
+            mode,
+            provider,
+            prompt,
+            min_iteration_interval_minutes,
+            model,
+            effort,
+            worktree_path,
+            initial_input,
+            role,
+            goal,
+            backstory,
+            plan_review_mode,
+            managed,
+            try_resume_first,
+        } = add_event
+        else {
+            panic!("expected AddTabWithConfig event");
+        };
+
+        assert_eq!(pane_id, 42);
+        assert_eq!(label, "Managed Developer");
+        assert_eq!(claude_session_id, prior_session);
+        assert_eq!(mode, shared::PaneMode::Interactive);
+        assert_eq!(provider, Provider::Codex);
+        assert_eq!(prompt.as_deref(), Some("Keep helping"));
+        assert_eq!(min_iteration_interval_minutes, Some(11));
+        assert_eq!(model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(effort.as_deref(), Some("high"));
+        assert_eq!(worktree_path.as_deref(), Some("/tmp/apas-side-dev"));
+        assert!(initial_input.is_none());
+        assert_eq!(role.as_deref(), Some("developer"));
+        assert_eq!(goal.as_deref(), Some("Ship the side quest"));
+        assert_eq!(backstory.as_deref(), Some("A manually added helper pane"));
+        assert_eq!(plan_review_mode, shared::PlanReviewMode::RiskyOnly);
+        assert!(managed);
+        assert!(try_resume_first);
     }
 
     #[test]
@@ -8946,34 +9043,11 @@ async fn run_server_connection(
                                                     let sessions = pane_sessions.lock().unwrap();
                                                     sessions.get(&target).copied()
                                                 };
+                                                let (close_event, add_event) =
+                                                    build_pane_reboot_events(target, &meta, prior_session_id);
 
-                                                let _ = tui_event_tx.send(TuiEvent::CloseTab {
-                                                    pane_id: target,
-                                                    cleanup_action: None,
-                                                });
-                                                let _ = tui_event_tx.send(TuiEvent::AddTabWithConfig {
-                                                    pane_id: target,
-                                                    label: meta.label.clone(),
-                                                    // Reuse the prior agent session id so --resume
-                                                    // picks up the same conversation. Falls back to
-                                                    // a fresh uuid only if the pane lost its session
-                                                    // mapping (shouldn't happen for a live pane).
-                                                    claude_session_id: prior_session_id.unwrap_or_else(Uuid::new_v4),
-                                                    mode: meta.mode.clone(),
-                                                    provider: meta.provider,
-                                                    prompt: meta.prompt.clone(),
-                                                    min_iteration_interval_minutes: meta.min_iteration_interval_minutes,
-                                                    model: meta.model.clone(),
-                                                    effort: meta.effort.clone(),
-                                                    worktree_path: meta.worktree_path.clone(),
-                                                    initial_input: None,
-                                                    role: meta.role.clone(),
-                                                    goal: meta.goal.clone(),
-                                                    backstory: meta.backstory.clone(),
-                                                    plan_review_mode: meta.plan_review_mode,
-                                                    managed: meta.managed,
-                                                    try_resume_first: true,
-                                                });
+                                                let _ = tui_event_tx.send(close_event);
+                                                let _ = tui_event_tx.send(add_event);
                                                 let _ = status_tx.send(PaneOutput {
                                                     text: "[Pane rebooted — agent restarted on the same session]".to_string(),
                                                     pane_id: target,

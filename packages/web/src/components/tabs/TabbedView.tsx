@@ -19,6 +19,8 @@ const PANE_ID_MAIN = 0;
 // from 3) and survives the `parseInt` round-trip in localStorage.
 export const OVERVIEW_PANE_ID = -1;
 const DEFAULT_BOT_MIN_INTERVAL_MINUTES = 15;
+const PANE_REBOOT_CONFIRM_MESSAGE =
+  "Reboot this pane's agent? The running process is killed and respawned on the SAME session (so the agent resumes with its prior conversation context).";
 export const CLASSIC_TODO_BOT_LOOP_PROMPT = `Work on tasks defined in TODO.md. Do the following steps. Don't ask me for advice, just pick the best option you think that is honest, complete, and not corner-cutting:
 
 1. Do a git pull to check if there are any remote updates. Pick the top high-priority undone task, choose its first leaf task. If there are no undone TODO items left, sleep a minute and exit.
@@ -173,6 +175,28 @@ export function lazyPaneMessageLoadTargets(args: {
   if (args.activeTabId === OVERVIEW_PANE_ID) return [];
   if (!args.tabIds.includes(args.activeTabId)) return [];
   return [args.activeTabId];
+}
+
+export function shouldShowPaneRebootButton(activeTabId: number | null): boolean {
+  return activeTabId != null && activeTabId !== OVERVIEW_PANE_ID;
+}
+
+export function confirmedPaneRebootTarget(
+  activeTabId: number | null,
+  confirmFn: (message: string) => boolean,
+): number | null {
+  if (!shouldShowPaneRebootButton(activeTabId)) return null;
+  return confirmFn(PANE_REBOOT_CONFIRM_MESSAGE) ? activeTabId : null;
+}
+
+export function requestConfirmedPaneReboot(
+  activeTabId: number | null,
+  confirmFn: (message: string) => boolean,
+  rebootPane: (paneId: number) => void,
+): void {
+  const target = confirmedPaneRebootTarget(activeTabId, confirmFn);
+  if (target == null) return;
+  rebootPane(target);
 }
 
 function getInputDraftStorageKey(sessionId: string | null, paneId: number): string {
@@ -1180,18 +1204,14 @@ export function TabbedView() {
         >
           Download
         </button>
-        {activeTabId != null && activeTabId !== OVERVIEW_PANE_ID && (
+        {shouldShowPaneRebootButton(activeTabId) && (
           <button
             onClick={() => {
-              if (
-                typeof window !== "undefined" &&
-                !window.confirm(
-                  "Reboot this pane's agent? The running process is killed and respawned on the SAME session (so the agent resumes with its prior conversation context).",
-                )
-              ) {
-                return;
-              }
-              rebootPane(activeTabId);
+              requestConfirmedPaneReboot(
+                activeTabId,
+                (message) => typeof window === "undefined" || window.confirm(message),
+                rebootPane,
+              );
             }}
             className="inline-flex items-center px-2.5 py-1 text-xs font-medium rounded transition-colors bg-rose-600 hover:bg-rose-700 text-white"
             title="Reboot just this pane's agent — kills the running process and respawns with --resume on the same session so prior context is preserved. Use when a pane is wedged and you don't want to recycle the entire CLI."

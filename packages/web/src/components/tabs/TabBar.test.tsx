@@ -20,7 +20,13 @@ function pane(overrides: Partial<PaneConfig> & Pick<PaneConfig, "pane_id" | "lab
   };
 }
 
-function renderTabBar(overrides: { onAddTab?: ReturnType<typeof vi.fn> } = {}) {
+function renderTabBar(
+  overrides: {
+    onAddTab?: ReturnType<typeof vi.fn>;
+    onRebootCli?: ReturnType<typeof vi.fn>;
+    showRebootButton?: boolean;
+  } = {},
+) {
   const onCloseTab = vi.fn();
   const onAddTab = overrides.onAddTab ?? vi.fn();
   const tabs = [
@@ -37,6 +43,8 @@ function renderTabBar(overrides: { onAddTab?: ReturnType<typeof vi.fn> } = {}) {
       onSelectTab={vi.fn()}
       onCloseTab={onCloseTab}
       onAddTab={onAddTab}
+      onRebootCli={overrides.onRebootCli}
+      showRebootButton={overrides.showRebootButton}
       paneStatuses={{}}
       pausedPanes={[]}
     />,
@@ -110,5 +118,17 @@ describe("TabBar coordinator close controls", () => {
       DEEPSEEK_DEFAULT_MODEL,
       undefined,
     );
+  });
+
+  it("keeps full-process reboot behind the explicit Reboot CLI control", () => {
+    const onRebootCli = vi.fn();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderTabBar({ onRebootCli, showRebootButton: true });
+
+    fireEvent.click(screen.getByText("Reboot CLI"));
+
+    expect(confirmSpy).toHaveBeenCalledWith("Are you sure you want to reboot the CLI?");
+    expect(onRebootCli).toHaveBeenCalledOnce();
+    confirmSpy.mockRestore();
   });
 });

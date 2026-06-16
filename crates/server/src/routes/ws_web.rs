@@ -559,6 +559,73 @@ async fn resolve_target_session(
     None
 }
 
+fn reboot_pane_cli_message(session_id: Uuid, pane_id: u32) -> ServerToCli {
+    ServerToCli::RebootPane {
+        session_id,
+        pane_id,
+    }
+}
+
+#[cfg(test)]
+mod reboot_pane_route_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::db::Database;
+
+    async fn test_state() -> AppState {
+        let dir = std::env::temp_dir().join(format!("apas-reboot-pane-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp db dir");
+        let db_path = dir.join("apas.db").to_string_lossy().to_string();
+        let db = Database::new(&db_path).await.expect("create temp db");
+        let mut config = Config::default();
+        config.database.path = db_path;
+        AppState::new(db, config)
+    }
+
+    #[tokio::test]
+    async fn reboot_pane_falls_back_to_active_session_and_routes_requested_pane_to_cli() {
+        let state = test_state().await;
+        let user_id = Uuid::new_v4();
+        let web_connection_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let cli_id = Uuid::new_v4();
+
+        let (web_tx, _web_rx) = mpsc::channel(4);
+        state.sessions.register_web(web_connection_id, web_tx);
+        state
+            .sessions
+            .create_session(session_id, user_id, web_connection_id);
+
+        let (cli_tx, mut cli_rx) = mpsc::channel(4);
+        state.sessions.register_cli(cli_id, user_id, cli_tx, None);
+        assert!(state.sessions.assign_cli_to_session(&session_id, cli_id));
+
+        let sid = resolve_target_session(&state, &web_connection_id, None, Some(session_id))
+            .await
+            .expect("active session fallback");
+        assert_eq!(sid, session_id);
+
+        assert!(
+            state
+                .sessions
+                .route_to_cli(&sid, reboot_pane_cli_message(sid, 42))
+                .await
+        );
+
+        let msg = cli_rx.try_recv().expect("forwarded CLI message");
+        match msg {
+            ServerToCli::RebootPane {
+                session_id: forwarded_session_id,
+                pane_id,
+            } => {
+                assert_eq!(forwarded_session_id, session_id);
+                assert_eq!(pane_id, 42);
+            }
+            other => panic!("expected RebootPane message, got {other:?}"),
+        }
+    }
+}
+
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
     let connection_id = Uuid::new_v4();
@@ -1406,13 +1473,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     tracing::info!("Rebooting pane {} for session {}", pane_id, sid);
                     state
                         .sessions
-                        .route_to_cli(
-                            &sid,
-                            ServerToCli::RebootPane {
-                                session_id: sid,
-                                pane_id,
-                            },
-                        )
+                        .route_to_cli(&sid, reboot_pane_cli_message(sid, pane_id))
                         .await;
                 }
                 Ok(WebToServer::AddPane {
