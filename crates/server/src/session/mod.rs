@@ -1466,4 +1466,55 @@ mod tests {
         assert_eq!(shared.projects.len(), 1);
         assert_eq!(shared.projects[0].project_id, "shared-match");
     }
+
+    #[tokio::test]
+    async fn route_to_web_skips_full_sender_and_delivers_to_available_clients() {
+        let mgr = SessionManager::new();
+        let session_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let full_web_id = Uuid::new_v4();
+        let available_web_id = Uuid::new_v4();
+
+        let (full_tx, mut full_rx) = mpsc::channel(1);
+        full_tx
+            .try_send(ServerToWeb::SessionStatus {
+                status: shared::SessionStatus::Pending,
+            })
+            .expect("pre-fill stale client queue");
+        mgr.register_web(full_web_id, full_tx);
+        mgr.create_session(session_id, user_id, full_web_id);
+
+        let (available_tx, mut available_rx) = mpsc::channel(1);
+        mgr.register_web(available_web_id, available_tx);
+        assert!(mgr.attach_web_to_session(&session_id, available_web_id, None));
+
+        let sent = mgr
+            .route_to_web(
+                &session_id,
+                ServerToWeb::SessionStatus {
+                    status: shared::SessionStatus::Connected,
+                },
+            )
+            .await;
+
+        assert!(sent, "available client should receive the broadcast");
+        match available_rx
+            .try_recv()
+            .expect("available client receives broadcast")
+        {
+            ServerToWeb::SessionStatus { status } => {
+                assert_eq!(status, shared::SessionStatus::Connected);
+            }
+            other => panic!("expected session status broadcast, got {other:?}"),
+        }
+        match full_rx
+            .try_recv()
+            .expect("full client keeps original queued message")
+        {
+            ServerToWeb::SessionStatus { status } => {
+                assert_eq!(status, shared::SessionStatus::Pending);
+            }
+            other => panic!("expected original session status message, got {other:?}"),
+        }
+    }
 }

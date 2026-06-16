@@ -566,6 +566,120 @@ fn reboot_pane_cli_message(session_id: Uuid, pane_id: u32) -> ServerToCli {
     }
 }
 
+async fn handle_web_input(
+    state: &AppState,
+    connection_id: &Uuid,
+    fallback_session_id: Option<Uuid>,
+    msg_sid: Option<Uuid>,
+    text: String,
+    pane_type: Option<shared::PaneType>,
+    pane_id: Option<u32>,
+    client_msg_id: Option<String>,
+) {
+    let Some(sid) =
+        resolve_target_session(state, connection_id, msg_sid, fallback_session_id).await
+    else {
+        return;
+    };
+
+    // Retransmit of an input we already stored (the web client retries
+    // unacked sends): don't route/store it again -- just re-ack the sender
+    // so its pending-send queue clears even if the original echo was lost.
+    if let Some(ref cmid) = client_msg_id {
+        if let Some(orig_created_at) = state.sessions.seen_input_id(&sid, cmid) {
+            tracing::info!(
+                "Dropping duplicate input retransmit for session {} (client_msg_id {})",
+                sid,
+                cmid
+            );
+            state
+                .sessions
+                .send_to_web(
+                    connection_id,
+                    ServerToWeb::UserInput {
+                        session_id: sid,
+                        text,
+                        pane_type,
+                        pane_id,
+                        created_at: Some(orig_created_at),
+                        client_msg_id: client_msg_id.clone(),
+                    },
+                )
+                .await;
+            return;
+        }
+    }
+
+    tracing::info!(
+        "Routing input to session {}: {:?}",
+        sid,
+        text.chars().take(50).collect::<String>()
+    );
+
+    let sent = state
+        .sessions
+        .route_to_cli(
+            &sid,
+            ServerToCli::Input {
+                session_id: sid,
+                data: text.clone(),
+                pane_id,
+            },
+        )
+        .await;
+
+    if sent {
+        let effective_pane_id =
+            pane_id.or_else(|| pane_type.map(|p| shared::PaneConfig::pane_id_from_legacy(&p)));
+        let created_at = chrono::Utc::now().to_rfc3339();
+        let stored_message = crate::storage::StoredMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: "user".to_string(),
+            content: text.clone(),
+            message_type: "text".to_string(),
+            created_at: created_at.clone(),
+            pane_type: effective_pane_id.map(|id| id.to_string()),
+        };
+        if let Err(e) = state.storage.append_message(&sid, &stored_message).await {
+            tracing::error!("Failed to save user input to file: {}", e);
+        }
+        if let Some(cmid) = client_msg_id.clone() {
+            state
+                .sessions
+                .record_input_id(sid, cmid, created_at.clone());
+        }
+
+        // Echo user input to all web clients for immediate display.
+        // The CLI skips CliToServer::UserInput for web-originated input
+        // (from_tui=false), so this is the only display path.
+        state
+            .sessions
+            .route_to_web(
+                &sid,
+                ServerToWeb::UserInput {
+                    session_id: sid,
+                    text,
+                    pane_type,
+                    pane_id,
+                    created_at: Some(created_at),
+                    client_msg_id,
+                },
+            )
+            .await;
+    } else {
+        tracing::warn!("Failed to route input to CLI for session {}", sid);
+        state
+            .sessions
+            .send_to_web(
+                connection_id,
+                ServerToWeb::Error {
+                    message: "CLI client not connected".to_string(),
+                },
+            )
+            .await;
+    }
+}
+
 #[cfg(test)]
 mod reboot_pane_route_tests {
     use super::*;
@@ -623,6 +737,213 @@ mod reboot_pane_route_tests {
             }
             other => panic!("expected RebootPane message, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod web_input_route_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::db::Database;
+
+    async fn test_state() -> AppState {
+        let dir = std::env::temp_dir().join(format!("apas-web-input-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp db dir");
+        let db_path = dir.join("apas.db").to_string_lossy().to_string();
+        let db = Database::new(&db_path).await.expect("create temp db");
+        let mut config = Config::default();
+        config.database.path = db_path;
+        AppState::new(db, config)
+    }
+
+    fn assert_cli_input(msg: ServerToCli, session_id: Uuid, text: &str, pane_id: Option<u32>) {
+        match msg {
+            ServerToCli::Input {
+                session_id: got_session_id,
+                data,
+                pane_id: got_pane_id,
+            } => {
+                assert_eq!(got_session_id, session_id);
+                assert_eq!(data, text);
+                assert_eq!(got_pane_id, pane_id);
+            }
+            other => panic!("expected Input message, got {other:?}"),
+        }
+    }
+
+    fn assert_user_input_echo(
+        msg: ServerToWeb,
+        session_id: Uuid,
+        text: &str,
+        client_msg_id: Option<&str>,
+    ) -> String {
+        match msg {
+            ServerToWeb::UserInput {
+                session_id: got_session_id,
+                text: got_text,
+                created_at,
+                client_msg_id: got_client_msg_id,
+                ..
+            } => {
+                assert_eq!(got_session_id, session_id);
+                assert_eq!(got_text, text);
+                assert_eq!(got_client_msg_id.as_deref(), client_msg_id);
+                created_at.expect("input echo should include storage timestamp")
+            }
+            other => panic!("expected UserInput echo, got {other:?}"),
+        }
+    }
+
+    async fn setup_connected_session() -> (
+        AppState,
+        Uuid,
+        Uuid,
+        mpsc::Receiver<ServerToCli>,
+        mpsc::Receiver<ServerToWeb>,
+    ) {
+        let state = test_state().await;
+        let user_id = Uuid::new_v4();
+        let web_connection_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let cli_id = Uuid::new_v4();
+
+        let (web_tx, web_rx) = mpsc::channel(8);
+        state.sessions.register_web(web_connection_id, web_tx);
+        state
+            .sessions
+            .create_session(session_id, user_id, web_connection_id);
+
+        let (cli_tx, cli_rx) = mpsc::channel(8);
+        state.sessions.register_cli(cli_id, user_id, cli_tx, None);
+        assert!(state.sessions.assign_cli_to_session(&session_id, cli_id));
+
+        (state, web_connection_id, session_id, cli_rx, web_rx)
+    }
+
+    #[tokio::test]
+    async fn duplicate_client_msg_id_is_reacked_without_forwarding_or_storing() {
+        let (state, web_connection_id, session_id, mut cli_rx, mut web_rx) =
+            setup_connected_session().await;
+
+        handle_web_input(
+            &state,
+            &web_connection_id,
+            Some(session_id),
+            None,
+            "first send".to_string(),
+            None,
+            Some(7),
+            Some("client-1".to_string()),
+        )
+        .await;
+
+        assert_cli_input(
+            cli_rx.try_recv().expect("first input routed to CLI"),
+            session_id,
+            "first send",
+            Some(7),
+        );
+        let created_at = assert_user_input_echo(
+            web_rx.try_recv().expect("first input echoed to web"),
+            session_id,
+            "first send",
+            Some("client-1"),
+        );
+        assert_eq!(
+            state
+                .sessions
+                .seen_input_id(&session_id, "client-1")
+                .as_deref(),
+            Some(created_at.as_str())
+        );
+
+        handle_web_input(
+            &state,
+            &web_connection_id,
+            Some(session_id),
+            None,
+            "first send".to_string(),
+            None,
+            Some(7),
+            Some("client-1".to_string()),
+        )
+        .await;
+
+        assert!(matches!(
+            cli_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let duplicate_created_at = assert_user_input_echo(
+            web_rx
+                .try_recv()
+                .expect("duplicate input re-acked to sender"),
+            session_id,
+            "first send",
+            Some("client-1"),
+        );
+        assert_eq!(duplicate_created_at, created_at);
+        let messages = state
+            .storage
+            .get_messages(&session_id)
+            .await
+            .expect("stored messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "first send");
+    }
+
+    #[tokio::test]
+    async fn missing_client_msg_id_uses_old_client_fallback_and_flows_normally() {
+        let (state, web_connection_id, session_id, mut cli_rx, mut web_rx) =
+            setup_connected_session().await;
+
+        for text in ["legacy one", "legacy two"] {
+            handle_web_input(
+                &state,
+                &web_connection_id,
+                Some(session_id),
+                None,
+                text.to_string(),
+                None,
+                None,
+                None,
+            )
+            .await;
+        }
+
+        assert_cli_input(
+            cli_rx.try_recv().expect("first legacy input routed"),
+            session_id,
+            "legacy one",
+            None,
+        );
+        assert_cli_input(
+            cli_rx.try_recv().expect("second legacy input routed"),
+            session_id,
+            "legacy two",
+            None,
+        );
+        assert_user_input_echo(
+            web_rx.try_recv().expect("first legacy input echoed"),
+            session_id,
+            "legacy one",
+            None,
+        );
+        assert_user_input_echo(
+            web_rx.try_recv().expect("second legacy input echoed"),
+            session_id,
+            "legacy two",
+            None,
+        );
+
+        let messages = state
+            .storage
+            .get_messages(&session_id)
+            .await
+            .expect("stored messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "legacy one");
+        assert_eq!(messages[1].content, "legacy two");
+        assert_eq!(state.sessions.seen_input_id(&session_id, "legacy"), None);
     }
 }
 
@@ -870,108 +1191,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     pane_id,
                     client_msg_id,
                 }) => {
-                    let Some(sid) =
-                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
-                    else {
-                        continue;
-                    };
-
-                    // Retransmit of an input we already stored (the web
-                    // client retries unacked sends): don't route/store it
-                    // again — just re-ack the sender so its pending-send
-                    // queue clears even if the original echo was lost.
-                    if let Some(ref cmid) = client_msg_id {
-                        if let Some(orig_created_at) = state.sessions.seen_input_id(&sid, cmid) {
-                            tracing::info!(
-                                "Dropping duplicate input retransmit for session {} (client_msg_id {})",
-                                sid,
-                                cmid
-                            );
-                            state
-                                .sessions
-                                .send_to_web(
-                                    &connection_id,
-                                    ServerToWeb::UserInput {
-                                        session_id: sid,
-                                        text,
-                                        pane_type,
-                                        pane_id,
-                                        created_at: Some(orig_created_at),
-                                        client_msg_id: client_msg_id.clone(),
-                                    },
-                                )
-                                .await;
-                            continue;
-                        }
-                    }
-
-                    tracing::info!(
-                        "Routing input to session {}: {:?}",
-                        sid,
-                        text.chars().take(50).collect::<String>()
-                    );
-
-                    let sent = state
-                        .sessions
-                        .route_to_cli(
-                            &sid,
-                            ServerToCli::Input {
-                                session_id: sid,
-                                data: text.clone(),
-                                pane_id: pane_id.clone(),
-                            },
-                        )
-                        .await;
-
-                    if sent {
-                        let effective_pane_id = pane_id.or_else(|| {
-                            pane_type.map(|p| shared::PaneConfig::pane_id_from_legacy(&p))
-                        });
-                        let created_at = chrono::Utc::now().to_rfc3339();
-                        let stored_message = crate::storage::StoredMessage {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            role: "user".to_string(),
-                            content: text.clone(),
-                            message_type: "text".to_string(),
-                            created_at: created_at.clone(),
-                            pane_type: effective_pane_id.map(|id| id.to_string()),
-                        };
-                        if let Err(e) = state.storage.append_message(&sid, &stored_message).await {
-                            tracing::error!("Failed to save user input to file: {}", e);
-                        }
-                        if let Some(cmid) = client_msg_id.clone() {
-                            state.sessions.record_input_id(sid, cmid, created_at.clone());
-                        }
-
-                        // Echo user input to all web clients for immediate display.
-                        // The CLI skips CliToServer::UserInput for web-originated
-                        // input (from_tui=false), so this is the only display path.
-                        state
-                            .sessions
-                            .route_to_web(
-                                &sid,
-                                ServerToWeb::UserInput {
-                                    session_id: sid,
-                                    text,
-                                    pane_type,
-                                    pane_id,
-                                    created_at: Some(created_at),
-                                    client_msg_id,
-                                },
-                            )
-                            .await;
-                    } else {
-                        tracing::warn!("Failed to route input to CLI for session {}", sid);
-                        state
-                            .sessions
-                            .send_to_web(
-                                &connection_id,
-                                ServerToWeb::Error {
-                                    message: "CLI client not connected".to_string(),
-                                },
-                            )
-                            .await;
-                    }
+                    handle_web_input(
+                        &state,
+                        &connection_id,
+                        session_id,
+                        msg_sid,
+                        text,
+                        pane_type,
+                        pane_id,
+                        client_msg_id,
+                    )
+                    .await;
                 }
                 Ok(WebToServer::Heartbeat) => {
                     // Round-trip: client-side liveness detector watches
