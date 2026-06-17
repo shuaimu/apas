@@ -1382,7 +1382,13 @@ export const useStore = create<AppState>((set, get) => ({
       isDualPane: false,
       isAttached: false
     });
-    ws.send(JSON.stringify({ type: "get_session_messages", session_id: sessionId }));
+    // Cap the initial all-panes load. The server returns up to `limit`
+    // messages PER pane; with 6-8 managed panes the default of 100 means
+    // 600-800 messages arrive in one frame and get parsed + markdown-
+    // rendered synchronously on attach, freezing the tab on open. 30/pane
+    // is plenty for the newest-message view; older history pages in on
+    // scroll via loadMoreMessages.
+    ws.send(JSON.stringify({ type: "get_session_messages", session_id: sessionId, limit: 30 }));
   },
 
   sendMessage: (text: string) => {
