@@ -841,7 +841,15 @@ pub enum WebToServer {
     /// Interrupt the agent process running for a pane (e.g. claude wedged on
     /// a long-running Bash tool call). The CLI signals SIGINT to its
     /// subprocess so the current turn aborts and queued input can flow.
-    InterruptPane { pane_id: u32 },
+    /// `session_id` is optional for backward compat: when present the server
+    /// validates/auto-attaches the connection to that session (so "Stop team"
+    /// interrupts survive a just-reconnected connection); when absent it falls
+    /// back to the connection's currently-attached session.
+    InterruptPane {
+        #[serde(default)]
+        session_id: Option<Uuid>,
+        pane_id: u32,
+    },
 
     /// Reorder panes (array of pane_ids in desired order)
     ReorderPanes { pane_ids: Vec<u32> },

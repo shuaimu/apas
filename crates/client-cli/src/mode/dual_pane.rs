@@ -6050,6 +6050,22 @@ fn run_deadloop_session_inner(
                         break;
                     }
 
+                    // Stop/pause requested mid-turn: kill this iteration's
+                    // agent now so a long-running (non-Claude) turn halts
+                    // immediately instead of running to completion. The loop
+                    // top re-checks both flags — pause blocks, stop finalizes.
+                    // Without this, "Stop team" / pause only took effect
+                    // between iterations, so an in-flight Codex turn kept
+                    // running and the worker appeared not to stop.
+                    if pause.load(Ordering::SeqCst) || stop_requested.load(Ordering::SeqCst) {
+                        let _ = output_tx.send(PaneOutput {
+                            text: "[Stop/pause requested - ending current turn]".to_string(),
+                            pane_id,
+                        });
+                        kill_process_group(child_pid);
+                        break;
+                    }
+
                     if !process_exited {
                         if let Ok(mut guard) = child_process.try_lock() {
                             if let Some(ref mut child) = *guard {

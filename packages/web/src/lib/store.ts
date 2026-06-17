@@ -2133,9 +2133,13 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   interruptPane: (paneId: number) => {
-    const { ws } = get();
+    const { ws, sessionId } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "interrupt_pane", pane_id: paneId }));
+      // Carry session_id so the server can validate/auto-attach this
+      // connection to the target session — without it, an interrupt sent
+      // right after a reconnect routes by the connection's loosely-tracked
+      // "current" session (or is dropped). Matters for "Stop team".
+      ws.send(JSON.stringify({ type: "interrupt_pane", session_id: sessionId, pane_id: paneId }));
     }
   },
 
@@ -2713,6 +2717,18 @@ function handleServerMessage(
         const sessionToRestore =
           currentSessionId || localStorage.getItem("apas_session_id");
         if (sessionToRestore) {
+          // Register the currently-viewed session's attachment IMMEDIATELY —
+          // before the 500ms attachSession below, the staggered background
+          // fan-out, and the IDB-hydration fan-out. Otherwise a control action
+          // (pause/interrupt from "Stop team") fired right after a reconnect
+          // can land before this session is attached and get dropped. The
+          // server auto-attaches on access as a backstop, but ordering the
+          // current session first avoids the round-trip and wrong-session
+          // routing. An extra attach_session is idempotent server-side.
+          const wsNow = get().ws;
+          if (wsNow && wsNow.readyState === WebSocket.OPEN) {
+            wsNow.send(JSON.stringify({ type: "attach_session", session_id: sessionToRestore }));
+          }
           console.log("Restoring session:", sessionToRestore);
           setTimeout(() => {
             // forceReload=false: keep the cached paneMessages visible across
