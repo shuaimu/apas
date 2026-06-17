@@ -6,7 +6,7 @@ APAS runs an autonomous programming team around your project. A Manager pane tal
 
 - **Team Mode**: Coordinate Manager, Tech Lead, Reviewer, and worker panes from one project
 - **Shared Project State**: Keep goals in `project_goal.md` and work queues in `team-todo.md`
-- **PR-Based Review**: Workers publish diffs, wait for Reviewer approval, then open pull requests for the human to merge
+- **PR-Based Review**: Workers publish diffs, wait for Reviewer approval, then open pull requests while the Tech Lead tracks PR state and routes comments
 - **Web Dashboard**: Use the Overview to inspect panes, manage TODOs, and observe work in real time
 - **Customizable Prompts**: Define role prompts and workflow behavior in the `.apas` config file
 - **Auto-Updates**: CLI automatically checks for updates on startup
@@ -66,7 +66,7 @@ The Overview is the main control surface for team-mode projects:
 2. Describe the project goal, or ask the Manager to scan the repo and draft one. The Manager keeps `project_goal.md` in sync.
 3. Start the Tech Lead. It reads `project_goal.md` and `team-todo.md`, proposes Global TODOs, and dispatches approved work to worker panes.
 4. Approve or reject proposed Global TODOs from the Overview TODO panel.
-5. Review worker PRs on GitHub. Workers wait for Reviewer approval before opening PRs, and they wait for the human to merge them.
+5. Review and merge worker PRs on GitHub. Workers wait for Reviewer approval before opening PRs; after a PR opens, the Tech Lead tracks merge or close state and routes PR comments back to the owning worker.
 
 #### Tech Lead autonomy
 
