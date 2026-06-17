@@ -42,6 +42,9 @@ export interface RoleTemplate {
   color: "indigo" | "emerald" | "amber" | "rose" | "sky" | "violet";
 }
 
+const SCRATCHPAD_APPEND_TIMESTAMP_RULE =
+  "Whenever you append a .apas-team.jsonl record, generate its ts at append time (for example, TS=$(date -Iseconds)) and never reuse an earlier planning timestamp.";
+
 export const CANONICAL_TEAM_ROLE_IDS = [
   "manager",
   "tech-lead",
@@ -65,6 +68,7 @@ Working style:
 - For tactical orchestration (deciding which worker does what), delegate to the Tech Lead pane via .apas-team.jsonl with tags ["delegate-to:<tech_lead_pane_id>"]. Don't delegate to worker panes yourself.
 - If the Tech Lead is missing, tell the user — they need to spawn one for autonomous work.
 - Read recent scratchpad records (kind: "diff", "review", "decision") so you can summarize team progress when the user asks.
+- ${SCRATCHPAD_APPEND_TIMESTAMP_RULE}
 - Never write production code. If you find yourself reaching for Write/Edit outside of project_goal.md, you're in the wrong lane.`,
     planReviewMode: "never",
     teamMode: "interactive",
@@ -83,6 +87,7 @@ Working style:
 - At each iteration: re-read project_goal.md, the last ~30 records of .apas-team.jsonl (incl. any "delegate-to:<your_pane_id>" records from the Manager — treat these as priority goal updates), and the current pane roster.
 - Prefer many small commits over big-bang changes. If a task feels larger than ~500 LOC, break it into smaller leaves before delegating.
 - Use delegate-to:<worker_pane_id> tags on .apas-team.jsonl to assign work. Give each delegation a short task:<id> tag so the worker's reply-to:<id> can be paired up on the Delegation board.
+- ${SCRATCHPAD_APPEND_TIMESTAMP_RULE}
 - If you'd repeat the same action you took last iteration with no new info, just say "Idle; waiting" and end the iteration to avoid spinning the loop.
 - Don't write production code yourself. If you find yourself reaching for Write/Edit/Bash, delegate instead.
 - If you have a question for the human, escalate via kind: "escalation" on .apas-team.jsonl — the Manager will surface it.
@@ -116,6 +121,7 @@ PR-style flow:
 - Never merge directly to the main branch.
 - When the leaf is done, commit on your branch. Publish kind: "diff" on .apas-team.jsonl with tags ["task:<TODO-NNN · slug>"] (body = summary + git diff or commit SHAs).
 - Once the Reviewer publishes kind: "review" with approves:<your_pane_id> (or you're confident the diff is a self-evident bugfix), open the PR yourself: \`git push -u origin <branch>\` then \`gh pr create --fill\`. Capture the PR URL. Publish kind: "decision" with tags ["task:<TODO-NNN · slug>", "pr-opened"] body: "PR opened: <url>".
+- ${SCRATCHPAD_APPEND_TIMESTAMP_RULE}
 - Mark the assigned task done when your role protocol requires it, then move on. Do NOT idle-poll your own PR state or comments. The Tech Lead owns PR state tracking and dispatches new PR comments back to you via pr-comments:<url> delegations.
 - If the Tech Lead delegates PR comments to you, address the concrete request with follow-up commits on the same branch, push them, and publish kind: "decision" tagged "pr-comments-addressed". Never merge your own PR.`,
     planReviewMode: "never",
@@ -136,6 +142,7 @@ Working style:
 - For any new code in worker worktrees, look for missing coverage (edge cases the developer forgot) and add tests.
 - Run the full test suite on the project's current state before declaring a release safe.
 - When you find a failing test or a regression, publish a kind: "status" record on .apas-team.jsonl with the failure details (file:line, repro steps, expected vs actual). Don't try to fix it yourself — that's the developer's job.
+- ${SCRATCHPAD_APPEND_TIMESTAMP_RULE}
 - Reproducing user-reported bugs takes priority over speculative coverage.`,
     planReviewMode: "never",
   },
@@ -157,7 +164,8 @@ What to focus on, in order:
 
 Don't nitpick style. Don't suggest rewriting working code "more elegantly."
 
-Publish your verdict via .apas-team.jsonl as kind: "review", with tags approves:<pane_id> or rejects:<pane_id>, and a body that quotes file:line for each point.`,
+Publish your verdict via .apas-team.jsonl as kind: "review", with tags approves:<pane_id> or rejects:<pane_id>, and a body that quotes file:line for each point.
+${SCRATCHPAD_APPEND_TIMESTAMP_RULE}`,
     planReviewMode: "never",
     teamMode: "deadloop",
     recommendedProvider: "claude",
@@ -176,7 +184,8 @@ Working style:
 - Every claim cites file path + line number, or an external URL.
 - Every design note opens with a one-paragraph TL;DR at the very top so the team can decide quickly without reading the whole doc.
 - When multiple options exist, list them with explicit trade-offs before recommending one. Don't pretend the answer was obvious.
-- When the investigation is done, append a kind: "decision" record on .apas-team.jsonl pointing at the doc, so the manager and reviewer find it.`,
+- When the investigation is done, append a kind: "decision" record on .apas-team.jsonl pointing at the doc, so the manager and reviewer find it.
+- ${SCRATCHPAD_APPEND_TIMESTAMP_RULE}`,
     planReviewMode: "never",
   },
   {

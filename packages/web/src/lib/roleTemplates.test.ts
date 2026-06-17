@@ -2,6 +2,16 @@ import { describe, expect, it } from "vitest";
 import { ROLE_TEMPLATES } from "./roleTemplates";
 
 describe("ROLE_TEMPLATES", () => {
+  it("scratchpad-writing templates require append-time timestamps", () => {
+    for (const id of ["manager", "tech-lead", "developer", "qa", "reviewer", "researcher"]) {
+      const template = ROLE_TEMPLATES.find((candidate) => candidate.id === id);
+      expect(template, `missing template ${id}`).toBeTruthy();
+      expect(template!.backstory).toContain("generate its ts at append time");
+      expect(template!.backstory).toContain("TS=$(date -Iseconds)");
+      expect(template!.backstory).toContain("never reuse an earlier planning timestamp");
+    }
+  });
+
   it("developer template delegates PR state tracking to the Tech Lead", () => {
     const developer = ROLE_TEMPLATES.find((template) => template.id === "developer");
     expect(developer).toBeTruthy();

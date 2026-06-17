@@ -185,6 +185,13 @@ newer (`jq -c 'select(.ts > "<cursor>")' .apas-team.jsonl`), acts,
 then writes back the newest `ts` it processed. First run (cursor file
 missing) falls back to `tail -n 50` as catch-up.
 
+Because those cursors compare the record's `ts`, every writer must stamp
+scratchpad records at append time. Generate the timestamp immediately
+before writing the JSON line (for example with `date -Iseconds`) and do
+not reuse an earlier planning timestamp; otherwise a record appended
+late with an older `ts` can fall behind another pane's cursor and be
+skipped.
+
 Both files are git-ignored. Re-processing on cursor loss is safe
 because every action also updates `team-todo.md` — the state machine
 deduplicates idempotently.
