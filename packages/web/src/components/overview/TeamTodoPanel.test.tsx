@@ -384,6 +384,106 @@ describe("active TODO status groups", () => {
   });
 });
 
+describe("worker subtask lifecycle rows", () => {
+  afterEach(() => {
+    act(() => {
+      useStore.setState({
+        sessionId: null,
+        teamTodoState: null,
+        teamTodoStates: new Map(),
+      });
+    });
+  });
+
+  it("renders each subtask status, including revising under a PR-open Global", () => {
+    seedTeamTodo({
+      globals: [
+        {
+          id: "TODO-024",
+          title: "conflicting PR",
+          status: "pr_open",
+          origin: "tech-lead",
+          prs: [],
+          body: "",
+        },
+      ],
+      workers: [
+        {
+          pane_id: 568,
+          role_hint: "Developer",
+          subtasks: [
+            {
+              id: "TODO-024 · pending",
+              title: "Queued implementation",
+              status: "pending",
+              parent: "TODO-024",
+              body: "",
+            },
+            {
+              id: "TODO-024 · active",
+              title: "Active implementation",
+              status: "in_progress",
+              parent: "TODO-024",
+              body: "",
+            },
+            {
+              id: "TODO-024 · review",
+              title: "Review submitted diff",
+              status: "reviewing",
+              parent: "TODO-024",
+              body: "",
+            },
+            {
+              id: "TODO-024 · conflict",
+              title: "Resolve PR conflict",
+              status: "revising",
+              parent: "TODO-024",
+              body: "",
+            },
+            {
+              id: "TODO-024 · approved",
+              title: "Open approved PR",
+              status: "approved",
+              parent: "TODO-024",
+              body: "",
+            },
+            {
+              id: "TODO-024 · done",
+              title: "Merged cleanup",
+              status: "done",
+              parent: "TODO-024",
+              body: "",
+            },
+          ],
+        },
+      ],
+      tech_lead_cursor: null,
+      reviewer_cursor: null,
+    });
+
+    render(<TeamTodoPanel />);
+
+    expect(screen.getByText("PR open (1)")).toBeTruthy();
+    expect(screen.getByText("conflicting PR")).toBeTruthy();
+    for (const [title, status] of [
+      ["Queued implementation", "pending"],
+      ["Active implementation", "in_progress"],
+      ["Review submitted diff", "reviewing"],
+      ["Resolve PR conflict", "revising"],
+      ["Open approved PR", "approved"],
+      ["Merged cleanup", "done"],
+    ]) {
+      expect(
+        screen.getByText((_, element) =>
+          element?.tagName.toLowerCase() === "p" &&
+          element.textContent?.replace(/\s+/g, " ") ===
+            `${title} (${status} · TODO-024)`,
+        ),
+      ).toBeTruthy();
+    }
+  });
+});
+
 describe("AgentStatusRow accessible indicators", () => {
   const NOW = new Date("2026-06-16T12:00:00Z");
 
