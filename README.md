@@ -68,6 +68,16 @@ The Overview is the main control surface for team-mode projects:
 4. Approve or reject proposed Global TODOs from the Overview TODO panel.
 5. Review worker PRs on GitHub. Workers wait for Reviewer approval before opening PRs, and they wait for the human to merge them.
 
+#### Tech Lead autonomy
+
+The Overview includes opt-in Tech Lead autonomy toggles backed by `.apas`.
+Both default to manual control: `auto_approve_todos: false` and
+`auto_merge_prs: false`. The Tech Lead re-reads these flags each loop.
+`auto_approve_todos` lets it approve its own proposed Global TODOs;
+`auto_merge_prs` remains gated by Reviewer approval, mergeability, and
+green/non-stale CI state. Leaving both off is safest; enabling either
+trades review latency for more autonomous execution.
+
 ### Configuration
 
 The `.apas` file in your project directory contains:
@@ -77,11 +87,13 @@ The `.apas` file in your project directory contains:
   "id": "uuid-of-your-project",
   "name": "project-name",
   "created_at": "timestamp",
+  "auto_approve_todos": false,
+  "auto_merge_prs": false,
   "prompt": "Your custom prompt here (optional)"
 }
 ```
 
-If no custom `prompt` is specified, APAS uses the built-in team-mode prompts for the default Manager, Tech Lead, Reviewer, and Developer panes. You can customize pane roles, goals, backstories, and prompts in `.apas` as your workflow matures.
+If no custom `prompt` is specified, APAS uses the built-in team-mode prompts for the default Manager, Tech Lead, Reviewer, and Developer panes. You can customize pane roles, goals, backstories, prompts, and Tech Lead autonomy flags in `.apas` as your workflow matures.
 
 ### CLI Options
 
