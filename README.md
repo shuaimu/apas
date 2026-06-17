@@ -56,17 +56,19 @@ This will:
 1. Create a `.apas` file in your project if it doesn't exist
 2. Connect to the APAS server for web monitoring
 3. Start the local CLI session and expose the project in the web Overview
-4. Spawn or reconnect the default team panes so the Manager, Tech Lead, Reviewer, and workers can coordinate
+4. Leave team launch under your control: use the Overview **Team setup** card to pick provider/model choices and click **Start team**
 
 ### Team Mode
 
 The Overview is the main control surface for team-mode projects:
 
-1. Start or open the Manager pane.
-2. Describe the project goal, or ask the Manager to scan the repo and draft one. The Manager keeps `project_goal.md` in sync.
-3. Start the Tech Lead. It reads `project_goal.md` and `team-todo.md`, proposes Global TODOs, and dispatches approved work to worker panes.
-4. Approve or reject proposed Global TODOs from the Overview TODO panel.
-5. Review worker PRs on GitHub. Workers wait for Reviewer approval before opening PRs, and they wait for the human to merge them.
+1. Open the **Team setup** card.
+2. Pick the provider/model for each managed role: Manager, Tech Lead, Developer, and Reviewer.
+3. Click **Start team** to launch the selected managed panes.
+4. Describe the project goal in the Manager pane, or ask the Manager to scan the repo and draft one. The Manager keeps `project_goal.md` in sync.
+5. Let the Tech Lead read `project_goal.md` and `team-todo.md`, propose Global TODOs, and dispatch approved work to worker panes.
+6. Approve or reject proposed Global TODOs from the Overview TODO panel.
+7. Review and merge worker PRs on GitHub after Reviewer approval.
 
 ### Configuration
 
