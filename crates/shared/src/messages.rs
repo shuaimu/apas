@@ -1325,6 +1325,8 @@ pub struct TeamTodoGlobalMsg {
 pub struct PaneTodoPrMsg {
     pub pane_id: u32,
     pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotation: Option<String>,
 }
 
 /// One row in the suggested-workers queue. The Manager pane appends

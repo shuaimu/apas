@@ -22,6 +22,19 @@ describe("parsePrLine", () => {
     expect(r?.owner).toBe("o");
   });
 
+  it("parses an annotated merged line with a clean pull URL", () => {
+    const r = parsePrLine(
+      "pr: 568 https://github.com/shuaimu/apas/pull/12 (MERGED 2026-06-16T03:59:12Z 7d78b3e...)",
+    );
+    expect(r).toEqual({
+      pane: 568,
+      url: "https://github.com/shuaimu/apas/pull/12",
+      owner: "shuaimu",
+      repo: "apas",
+      num: 12,
+    });
+  });
+
   it("returns null for a missing pr: prefix", () => {
     expect(parsePrLine("218 https://github.com/o/r/pull/1")).toBeNull();
   });
