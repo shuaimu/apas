@@ -21,11 +21,10 @@ function ShareRedeemForm() {
     const urlCode = searchParams.get("code");
     if (urlCode) {
       setCode(urlCode);
-      // Auto-submit if logged in
+      // Auto-submit URL codes so authenticated users redeem immediately and
+      // unauthenticated users are sent to login with the return URL.
       const token = localStorage.getItem("apas_token");
-      if (token) {
-        handleRedeem(urlCode, token);
-      }
+      handleRedeem(urlCode, token ?? undefined);
     }
   }, [searchParams]);
 
