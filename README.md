@@ -122,9 +122,14 @@ apas -d /path/to/dir     # Specify working directory
                                               +-----------------+
 ```
 
-- **APAS CLI**: Wraps Claude Code, sends structured output to server
-- **APAS Server**: Routes messages between CLI and web clients
-- **Web UI**: Displays real-time Claude output and project status
+- **APAS CLI**: Owns local panes, role prompts, isolated worktrees,
+  and the team-mode files `project_goal.md`, `team-todo.md`, and
+  `.apas-team.jsonl`.
+- **APAS Server**: Routes project/session state, pane events, TODO
+  updates, and PR/status records between CLI clients and web clients.
+- **Web UI**: Provides the Overview team controls for starting roles,
+  approving TODOs, reviewing suggested workers, and tracking worker PR
+  handoffs and status.
 
 ## Development
 
@@ -133,11 +138,18 @@ apas -d /path/to/dir     # Specify working directory
 ```
 apas/
 ├── crates/
-│   ├── client-cli/    # APAS CLI (apas binary)
-│   ├── server/        # APAS server
-│   └── shared/        # Shared types and messages
+│   ├── client-cli/    # APAS CLI: panes, role prompts, worktrees, team files
+│   │   └── src/
+│   │       ├── role.rs             # Built-in Manager/Tech Lead/worker prompts
+│   │       ├── team_todo.rs        # team-todo.md parsing and state changes
+│   │       └── mode/dual_pane.rs   # Pane spawning, Start team, team loop wiring
+│   ├── server/        # Rust/Axum server for project/session state and routing
+│   └── shared/        # Shared wire types and messages
 ├── packages/
 │   └── web/           # Next.js web dashboard
+│       └── src/
+│           ├── components/overview/ # Team setup, TODOs, suggestions, PR views
+│           └── lib/store.ts         # Websocket store and Overview actions
 └── install.sh         # Installation script
 ```
 
