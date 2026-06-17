@@ -47,6 +47,7 @@ export function InputBox() {
             className="flex-1 bg-transparent border-none outline-none resize-none text-foreground placeholder-gray-400 disabled:opacity-50"
           />
           <button
+            aria-label="Send message"
             onClick={handleSubmit}
             disabled={!input.trim() || !connected}
             className="p-2 rounded-full bg-blue-500 text-white disabled:opacity-50 disabled:cursor-not-allowed hover:bg-blue-600 transition-colors"
