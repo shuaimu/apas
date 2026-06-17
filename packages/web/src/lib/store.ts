@@ -2364,8 +2364,33 @@ function updatePaneModeHint(
   const paneId = normalizePaneId(rawPaneType, normalizeRawPaneId(rawPaneId));
   if (!paneId) return;
   const key = paneKey(paneId);
-  if (get().paneModes[key] === modeHint) return;
-  set((state) => ({ paneModes: { ...state.paneModes, [key]: modeHint } }));
+  set((state) => {
+    const paneModes = mergePaneModeHints(state, { [key]: modeHint });
+    return paneModes === state.paneModes ? {} : { paneModes };
+  });
+}
+
+function authoritativePaneMode(
+  state: Pick<AppState, "paneConfigs">,
+  key: string,
+): PaneType | undefined {
+  const paneId = Number.parseInt(key, 10);
+  if (!Number.isFinite(paneId)) return undefined;
+  return state.paneConfigs.find((pane) => pane.pane_id === paneId)?.mode;
+}
+
+function mergePaneModeHints(
+  state: Pick<AppState, "paneConfigs" | "paneModes">,
+  paneModeHints: Record<string, PaneType>,
+): Record<string, PaneType> {
+  let next = state.paneModes;
+  for (const [key, hintedMode] of Object.entries(paneModeHints)) {
+    const mode = authoritativePaneMode(state, key) ?? hintedMode;
+    if (next[key] === mode) continue;
+    if (next === state.paneModes) next = { ...state.paneModes };
+    next[key] = mode;
+  }
+  return next;
 }
 
 /// Append `message` to the in-memory `sessionCache` entry for a session
@@ -3068,7 +3093,7 @@ function handleServerMessage(
         set((state) => ({
           paneStatuses: { ...state.paneStatuses, [paneId]: status },
           paneModes: modeHint
-            ? { ...state.paneModes, [paneId]: modeHint }
+            ? mergePaneModeHints(state, { [paneKey(paneId)]: modeHint })
             : state.paneModes,
           // Legacy compat
           interactiveStatus: paneId === PANE_ID_INTERACTIVE ? status : state.interactiveStatus,
@@ -3478,7 +3503,7 @@ function handleServerMessage(
             };
 
             if (hasPaneModeHints) {
-              updates.paneModes = { ...state.paneModes, ...paneModeHints };
+              updates.paneModes = mergePaneModeHints(state, paneModeHints);
             }
 
             // Update the appropriate hasMore flag
@@ -3494,7 +3519,10 @@ function handleServerMessage(
           });
         } else {
           if (hasPaneModeHints) {
-            set((state) => ({ paneModes: { ...state.paneModes, ...paneModeHints } }));
+            set((state) => {
+              const paneModes = mergePaneModeHints(state, paneModeHints);
+              return paneModes === state.paneModes ? {} : { paneModes };
+            });
           }
           get().prependMessages(parsedMessages, hasMore);
         }
@@ -3541,7 +3569,7 @@ function handleServerMessage(
           hasMoreDeadloop: newPaneHasMore[paneKey(PANE_ID_DEADLOOP)] || false,
           hasMoreInteractive: newPaneHasMore[paneKey(PANE_ID_INTERACTIVE)] || false,
           paneModes: hasPaneModeHints
-            ? { ...existingPaneModes, ...paneModeHints }
+            ? mergePaneModeHints(get(), paneModeHints)
             : existingPaneModes,
           isDualPane: true,
         });
@@ -3568,7 +3596,7 @@ function handleServerMessage(
           messages: state.messages.length === 0 ? parsedMessages : state.messages,
           hasMoreMessages: state.messages.length === 0 ? hasMore : state.hasMoreMessages,
           paneModes: hasPaneModeHints
-            ? { ...state.paneModes, ...paneModeHints }
+            ? mergePaneModeHints(state, paneModeHints)
             : state.paneModes,
         }));
       }
