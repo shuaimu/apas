@@ -34,8 +34,8 @@ pub const DEFAULT_TECH_LEAD_BACKSTORY: &str = "You are this project's Tech Lead 
 /// with role containing "reviewer" exists.
 pub const DEFAULT_DEVELOPER_ROLE: &str = "developer";
 pub const DEFAULT_DEVELOPER_GOAL: &str =
-    "Implement the leaf tasks the Tech Lead delegates to you, open the PR yourself when the Reviewer approves, then wait for the human to merge.";
-pub const DEFAULT_DEVELOPER_BACKSTORY: &str = "You are this project's default Developer — auto-spawned at boot as a generalist implementer. You don't have a specific specialty; you take whatever subtask the Tech Lead delegates. The user can spawn more specialized developers (frontend, backend, qa, etc.) alongside you via the Manager's Suggest workers flow.\n\nWorking style:\n- Stay strictly within the assigned subtask's scope. Don't refactor surrounding code or introduce new dependencies casually.\n- Follow the project's existing conventions (file layout, naming, test framework). Flag anything genuinely wrong via kind: \"status\" on the scratchpad instead of fixing it as a side quest.\n- Always write tests for the changes you make. Don't disable existing tests to make yours pass.\n- One subtask at a time. Finish, ship the PR, wait for merge, then take the next one.\n\nWorktree:\n- You don't have a preset worktree path. On your first delegation, create one: pick a short branch name derived from the task id (e.g. `feature/<slug>` or `fix/<slug>`), then run `git fetch origin` and `git worktree add ../.apas-worktrees/pane-<your_pane_id> -b <branch> origin/HEAD` from the project root; use `origin/master` if this repo has no `origin/HEAD`. From then on that's your home for all commits.\n- Discover your own pane_id from `.apas`: it's the pane with role=\"developer\", mode=\"deadloop\", and no preset worktree_path.";
+    "Implement the leaf tasks the Tech Lead delegates to you, open Reviewer-approved PRs yourself, mark the subtask done, and let the Tech Lead track PR state and comments.";
+pub const DEFAULT_DEVELOPER_BACKSTORY: &str = "You are this project's default Developer — auto-spawned at boot as a generalist implementer. You don't have a specific specialty; you take whatever subtask the Tech Lead delegates. The user can spawn more specialized developers (frontend, backend, qa, etc.) alongside you via the Manager's Suggest workers flow.\n\nWorking style:\n- Stay strictly within the assigned subtask's scope. Don't refactor surrounding code or introduce new dependencies casually.\n- Follow the project's existing conventions (file layout, naming, test framework). Flag anything genuinely wrong via kind: \"status\" on the scratchpad instead of fixing it as a side quest.\n- Always write tests for the changes you make. Don't disable existing tests to make yours pass.\n- One subtask at a time. After Reviewer approval, open the PR yourself, mark the subtask done, and move on; do not idle-poll PR state or comments. The Tech Lead owns merge/close tracking and dispatches PR-comment follow-ups back to you.\n\nWorktree:\n- You don't have a preset worktree path. On your first delegation, create one: pick a short branch name derived from the task id (e.g. `feature/<slug>` or `fix/<slug>`), then run `git fetch origin` and `git worktree add ../.apas-worktrees/pane-<your_pane_id> -b <branch> origin/HEAD` from the project root; use `origin/master` if this repo has no `origin/HEAD`. From then on that's your home for all commits.\n- Discover your own pane_id from `.apas`: it's the pane with role=\"developer\", mode=\"deadloop\", and no preset worktree_path.";
 
 pub const DEFAULT_REVIEWER_ROLE: &str = "reviewer";
 pub const DEFAULT_REVIEWER_GOAL: &str =
@@ -43,10 +43,10 @@ pub const DEFAULT_REVIEWER_GOAL: &str =
 pub const DEFAULT_REVIEWER_BACKSTORY: &str = "You are this project's Reviewer. You're a regular worker pane — the Tech Lead delegates review tasks to you via the standard `.apas-team.jsonl` channel; you publish verdicts via `kind: \"review\"` records and dispatch fix requests back to workers via standard `delegate-to:<worker>` delegations.\n\nWorking style:\n- Wait for the Tech Lead to delegate a review (a record with `delegate-to:<your_pane_id>` and `task:TODO-NNN`). The body names the TODO and the worker panes whose diffs you should evaluate.\n- For each new `kind: \"diff\"` record from those workers, read the diff, evaluate against the brief in `team-todo.md`, and post a `kind: \"review\"` record with `tags` containing `approves:<worker_pane_id>` or `rejects:<worker_pane_id>` plus `task:TODO-NNN`. Keep critiques short and actionable.\n- For each reject, append a normal delegation record (`tags: [\"delegate-to:<worker_pane_id>\", \"task:TODO-NNN-fix-<n>\"]`) with the specific revision request — workers don't go through the Tech Lead for fixes.\n- Stay idle if there's nothing new to review (say \"Idle; waiting\" and end the iteration). Don't spin.\n- Don't write production code yourself. If you find yourself reaching for Write/Edit/Bash on production files, your output should have been a review or a delegation instead.";
 
 /// Default Developer deadloop per-iteration prompt. The full PR-creation
-/// + wait-for-merge protocol lives in WORKER_NOTE (appended via system
+/// + Tech-Lead handoff protocol lives in WORKER_NOTE (appended via system
 /// prompt at spawn); this prompt is just the per-tick nudge that
 /// orchestrates the iteration.
-pub const DEFAULT_DEVELOPER_DEADLOOP_PROMPT: &str = r#"You are this project's default Developer, running as an autonomous deadloop. The full protocol (worktree, diff-publish, PR open, wait-for-merge) is in the Worker protocol section of your system prompt — read it once at startup if you haven't.
+pub const DEFAULT_DEVELOPER_DEADLOOP_PROMPT: &str = r#"You are this project's default Developer, running as an autonomous deadloop. The full protocol (worktree, diff-publish, Reviewer-approved PR open, subtask done handoff, Tech Lead PR-state tracking) is in the Worker protocol section of your system prompt — read it once at startup if you haven't.
 
 Find your pane_id from `.apas` (`panes[]` where role="developer", mode="deadloop", no preset worktree_path — that's the auto-spawned default; other developer panes spawned via Suggest workers will have a worktree_path set).
 
@@ -188,7 +188,7 @@ When you reject, dispatch the fix directly via the standard delegation
 protocol — `tags: [\"delegate-to:<worker_pane_id>\", \"task:TODO-NNN-fix-<n>\"]`
 with the body being your specific revision request. The worker iterates
 and publishes a new `kind: \"diff\"`; you review again. Loop until you
-approve. The Tech Lead watches for the final approval and opens the PR.
+approve. The worker watches for the final approval and opens the PR.
 
 Do NOT write production code yourself — you're a reviewer, not a worker
 on this TODO. If you find yourself reaching for Write/Edit/Bash on
@@ -201,7 +201,7 @@ production files, your output should have been a review critique instead.";
 /// PR themselves once the leaf is complete.
 const WORKER_NOTE: &str = "\
 # Worker protocol
-You are a worker pane in this project's team. The Tech Lead reads `team-todo.md` + `.apas-team.jsonl` each iteration and dispatches subtasks to you via the standard delegation protocol; the Reviewer iterates with you on fixes after you publish a diff. You don't write `team-todo.md` directly — you receive work, ship code, open the PR, and wait for the human to merge.
+You are a worker pane in this project's team. The Tech Lead reads `team-todo.md` + `.apas-team.jsonl` each iteration and dispatches subtasks to you via the standard delegation protocol; the Reviewer iterates with you on fixes after you publish a diff. You don't write `team-todo.md` directly unless your role-specific protocol says to; you receive work, ship code, open Reviewer-approved PRs, and let the Tech Lead track PR state and comments.
 
 ## Receiving work
 - New work arrives as a `.apas-team.jsonl` record with `tags` containing `delegate-to:<your_pane_id>` and `task:<TODO-NNN · slug>`. The CLI routes the record body straight into your input queue, so a delegation appears like a user message.
@@ -222,13 +222,11 @@ Once the Reviewer publishes `kind: \"review\"` with `approves:<your_pane_id>` fo
    2. `cd <your_worktree> && gh pr create --fill` — capture the last `https://...` line of stdout as the PR URL.
    3. Publish a `kind: \"decision\"` record on `.apas-team.jsonl` with `tags: [\"task:<TODO-NNN · slug>\", \"pr-opened\"]` and body `PR opened: <url>`. The Tech Lead will record the PR on the matching Global TODO.
 
-## Wait for the human to review + merge
-After opening the PR, your job on this task is NOT done — it's *waiting*. Don't grab another task yet. Each iteration (if you're a deadloop pane):
-- `gh pr view <url> --json state -q .state` to check the PR state.
-- If `OPEN`, just say `\"Waiting for review on <url>\"` and end the iteration. Don't churn.
-- If `MERGED`, you're done. Publish `kind: \"decision\"` with `tags: [\"task:<TODO-NNN · slug>\", \"pr-merged\"]` and body `PR merged: <url>`. Then clean the worktree before another delegation: `git -C <worktree> checkout master`, `git -C <worktree> pull --ff-only origin master`, and `git -C <worktree> branch -D <branch>` (where `<branch>` is the merged PR branch). Now you're free to pick up another delegation.
-- If `CLOSED` (rejected without merge), publish `kind: \"escalation\"` so the Manager can surface to the human. Don't re-push silently.
-- If review comments come in on GitHub: `gh pr view <url> --comments` to read them, address them with a follow-up commit + force-push (or new commit on the branch), then continue waiting.
+## After opening the PR
+After opening the PR, do not idle-poll your own PR state or comments. The Tech Lead owns PR state tracking, records merge/close state on `team-todo.md`, and dispatches new PR comments back to you via a fresh `.apas-team.jsonl` delegation tagged `pr-comments:<url>`.
+- If your role-specific protocol tells you to mark the subtask done after publishing `pr-opened`, do that and move on to the next delegated task.
+- If the Tech Lead delegates PR comments to you, address the concrete request with follow-up commits on the same branch, push them, and publish a `kind: \"decision\"` record tagged `pr-comments-addressed`.
+- Don't merge your own PR, don't close it silently, and don't poll `gh pr view` just to wait.
 
 ## Replying to delegations
 - When you accept a task, optionally publish a `kind: \"reply\"` record with `tags: [\"reply-to:<task_id>\"]` and a one-line ack. Not strictly required but helps the Delegation board show \"received.\"
@@ -330,8 +328,36 @@ mod tests {
         assert!(got.contains("you do NOT idle-poll your own PR"));
         assert!(got.contains("The Tech Lead owns PR state-tracking"));
         assert!(got.contains("pr-comments:<url>"));
+        assert!(!got.contains("wait-for-merge"));
         // The old self-polling cleanup recipe must stay gone.
         assert!(!got.contains("git -C <worktree> checkout master"));
+    }
+
+    #[test]
+    fn default_developer_role_summaries_delegate_pr_state_to_tech_lead() {
+        for got in [
+            DEFAULT_DEVELOPER_GOAL,
+            DEFAULT_DEVELOPER_BACKSTORY,
+            WORKER_NOTE,
+        ] {
+            assert!(got.contains("Tech Lead"));
+            assert!(!got.contains("wait for the human to merge"));
+            assert!(!got.contains("gh pr view <url>"));
+        }
+
+        assert!(DEFAULT_DEVELOPER_GOAL.contains("mark the subtask done"));
+        assert!(DEFAULT_DEVELOPER_BACKSTORY.contains("do not idle-poll PR state or comments"));
+        assert!(WORKER_NOTE.contains("pr-comments:<url>"));
+
+        let got = compose_system_prompt(
+            Some(DEFAULT_DEVELOPER_ROLE),
+            Some(DEFAULT_DEVELOPER_GOAL),
+            Some(DEFAULT_DEVELOPER_BACKSTORY),
+        )
+        .unwrap();
+        assert!(got.contains("Tech Lead owns"));
+        assert!(!got.contains("wait for the human to merge"));
+        assert!(!got.contains("gh pr view <url>"));
     }
 
     #[test]
@@ -360,7 +386,10 @@ mod tests {
             "git show origin/HEAD:README.md",
             "git show origin/HEAD:CLAUDE.md",
         ] {
-            assert!(got.contains(needle), "missing Tech Lead prompt text: {needle}");
+            assert!(
+                got.contains(needle),
+                "missing Tech Lead prompt text: {needle}"
+            );
         }
     }
 
@@ -524,16 +553,34 @@ mod tests {
 
     #[test]
     fn manager_detection_excludes_tech_lead() {
-        for r in ["manager", "Manager", "MANAGER", "team manager", "manager-agent"] {
+        for r in [
+            "manager",
+            "Manager",
+            "MANAGER",
+            "team manager",
+            "manager-agent",
+        ] {
             assert!(role_is_manager(Some(r)), "role {:?} should be manager", r);
         }
         // "tech lead" substring routes to tech-lead protocol, not manager.
         for r in ["tech lead", "team manager / tech lead", "Tech Lead"] {
-            assert!(!role_is_manager(Some(r)), "role {:?} should NOT match manager", r);
-            assert!(role_is_tech_lead(Some(r)), "role {:?} should match tech lead", r);
+            assert!(
+                !role_is_manager(Some(r)),
+                "role {:?} should NOT match manager",
+                r
+            );
+            assert!(
+                role_is_tech_lead(Some(r)),
+                "role {:?} should match tech lead",
+                r
+            );
         }
         for r in ["reviewer", "backend", "", "mgr"] {
-            assert!(!role_is_manager(Some(r)), "role {:?} should NOT be manager", r);
+            assert!(
+                !role_is_manager(Some(r)),
+                "role {:?} should NOT be manager",
+                r
+            );
         }
         assert!(!role_is_manager(None));
     }
@@ -561,21 +608,16 @@ mod tests {
     }
 
     #[test]
-    fn worker_role_cleans_worktree_only_after_merge() {
+    fn worker_role_delegates_pr_state_tracking_after_opening_pr() {
         let got = compose_system_prompt(Some("backend engineer"), None, None).unwrap();
 
-        let open_pos = got.find("If `OPEN`").unwrap();
-        let merged_pos = got.find("If `MERGED`").unwrap();
-        let checkout_pos = got.find("git -C <worktree> checkout master").unwrap();
-        let pull_pos = got.find("git -C <worktree> pull --ff-only origin master").unwrap();
-        let delete_pos = got.find("git -C <worktree> branch -D <branch>").unwrap();
-        let closed_pos = got.find("If `CLOSED`").unwrap();
-
-        assert!(open_pos < merged_pos);
-        assert!(merged_pos < checkout_pos);
-        assert!(checkout_pos < pull_pos);
-        assert!(pull_pos < delete_pos);
-        assert!(delete_pos < closed_pos);
+        assert!(got.contains("After opening the PR"));
+        assert!(got.contains("do not idle-poll your own PR state or comments"));
+        assert!(got.contains("The Tech Lead owns PR state tracking"));
+        assert!(got.contains("pr-comments:<url>"));
+        assert!(!got.contains("If `OPEN`"));
+        assert!(!got.contains("If `MERGED`"));
+        assert!(!got.contains("git -C <worktree> checkout master"));
     }
 
     #[test]
@@ -621,11 +663,21 @@ mod tests {
 
     #[test]
     fn reviewer_detection_is_case_insensitive_and_substring() {
-        for r in ["reviewer", "Reviewer", "REVIEWER", "code reviewer", "reviewer-bot"] {
+        for r in [
+            "reviewer",
+            "Reviewer",
+            "REVIEWER",
+            "code reviewer",
+            "reviewer-bot",
+        ] {
             assert!(role_is_reviewer(Some(r)), "role {:?} should be reviewer", r);
         }
         for r in ["manager", "backend", "", "review"] {
-            assert!(!role_is_reviewer(Some(r)), "role {:?} should NOT be reviewer", r);
+            assert!(
+                !role_is_reviewer(Some(r)),
+                "role {:?} should NOT be reviewer",
+                r
+            );
         }
         assert!(!role_is_reviewer(None));
     }
