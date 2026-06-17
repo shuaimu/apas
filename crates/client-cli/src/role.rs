@@ -150,12 +150,13 @@ You are this project's tech lead — the autonomous orchestrator. You own `team-
 - There are no helper subcommands for this workflow. PR opening and merge-status checking go through Bash (`git push`, `gh pr create --fill`, `gh pr view --json state`); the resulting URL / state goes into `team-todo.md` via the Edit tool. See the deadloop prompt for the exact sequence.
 
 ## Workflow
-1. Each iteration, call `apas todo next`. Act on the entries in `expand_next` / `dispatch` / `ready_for_review` (see TECH_LEAD_DEADLOOP_PROMPT for the per-tick recipe).
-2. Dispatch is still done via `.apas-team.jsonl`: append a record with `kind: \"delegation\"`, `tags` including `delegate-to:<worker_pane_id>` and `task:<subtask_id>`, body = a self-contained task description. Workers reply via `reply-to:<task_id>`.
-3. You receive delegations from the Manager via the same scratchpad (`delegate-to:<your_pane_id>`). Treat these as high-priority goal updates: convert into a Global TODO (`apas todo propose`) and proceed.
-4. Discover workers from `.apas` (`panes[]` — id, label, role, goal). **Only consider panes where `managed: true`** — those are the team. Side-chat panes (TabBar `+`, `managed: false`) and panes with `manual_mode: true` (on a manual break) are not delegation targets.
-5. Do NOT chat with the human — escalate via `kind: \"escalation\"` and let the Manager surface it.
-6. Do NOT write production code — delegate.";
+1. Each iteration, read `project_goal.md` and `team-todo.md` directly. Use the current Global TODO and worker-subtask statuses to decide which entries need expansion, dispatch, review handoff, PR tracking, or no action (see TECH_LEAD_DEADLOOP_PROMPT for the per-tick recipe).
+2. Mutate orchestration state by editing `team-todo.md` directly: add/expand Global TODOs, write worker subtasks, flip `status:` lines, and record `pr:` lines there.
+3. Dispatch worker subtasks and Reviewer handoffs via `.apas-team.jsonl`: append a record with `kind: \"delegation\"`, `tags` including `delegate-to:<worker_pane_id>` or `delegate-to:<reviewer_pane_id>` and `task:<subtask_id>`, body = a self-contained task description. Workers reply via `reply-to:<task_id>`.
+4. You receive delegations from the Manager via the same scratchpad (`delegate-to:<your_pane_id>`). Treat these as high-priority goal updates: convert them into Global TODO entries by editing `team-todo.md` directly and proceed.
+5. Discover workers from `.apas` (`panes[]` — id, label, role, goal). **Only consider panes where `managed: true`** — those are the team. Side-chat panes (TabBar `+`, `managed: false`) and panes with `manual_mode: true` (on a manual break) are not delegation targets.
+6. Do NOT chat with the human — escalate via `kind: \"escalation\"` and let the Manager surface it.
+7. Do NOT write production code — delegate.";
 
 /// Phase 3.3a: additional protocol paragraph for panes whose role is
 /// reviewer-shaped. Teaches the diff-subscribe / review-publish loop.
@@ -171,8 +172,8 @@ share `.apas-team.jsonl` with everyone else; nothing special.
 When the Tech Lead sends you a delegation (`tags` includes
 `delegate-to:<your_pane_id>` and `task:TODO-NNN`), treat it as priority.
 The body names the Global TODO you're reviewing and the worker pane ids
-whose diffs to evaluate. Read `team-todo.md` (`apas todo show` or
-`cat team-todo.md`) for the full brief if you need it.
+whose diffs to evaluate. Read `team-todo.md` with a normal file read
+such as `cat team-todo.md` for the full brief if you need it.
 
 ## Reviewing
 - Subscribe to `kind: \"diff\"` records from those worker panes on the
@@ -500,6 +501,18 @@ mod tests {
     }
 
     #[test]
+    fn tech_lead_addendum_uses_direct_team_todo_workflow() {
+        let got = compose_system_prompt(Some("tech lead"), None, None).unwrap();
+        let stale_helper = ["apas", "todo"].join(" ");
+
+        assert!(got.contains("read `project_goal.md` and `team-todo.md` directly"));
+        assert!(got.contains("editing `team-todo.md` directly"));
+        assert!(got.contains("Reviewer handoffs via `.apas-team.jsonl`"));
+        assert!(got.contains("delegate-to:<reviewer_pane_id>"));
+        assert!(!got.contains(&stale_helper));
+    }
+
+    #[test]
     fn legacy_manager_tech_lead_role_routes_to_tech_lead() {
         // Pre-v3 panes were templated with role "team manager / tech lead".
         // The substring "tech lead" wins so the addendum behaviour matches
@@ -598,6 +611,10 @@ mod tests {
         // workers via the standard delegate-to: protocol.
         assert!(got.contains("approves:<worker_pane_id>"));
         assert!(got.contains("rejects:<worker_pane_id>"));
+        assert!(got.contains("Read `team-todo.md` with a normal file read"));
+        assert!(got.contains("cat team-todo.md"));
+        let stale_helper = ["apas", "todo"].join(" ");
+        assert!(!got.contains(&stale_helper));
         // And not the manager one.
         assert!(!got.contains("# Manager protocol"));
     }
