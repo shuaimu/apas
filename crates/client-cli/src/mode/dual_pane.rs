@@ -4344,6 +4344,259 @@ mod tests {
         pane
     }
 
+    fn test_team_pane_meta(
+        label: &str,
+        role: &str,
+        mode: shared::PaneMode,
+        managed: bool,
+    ) -> PaneMeta {
+        PaneMeta {
+            mode,
+            provider: Provider::Claude,
+            label: label.to_string(),
+            prompt: None,
+            model: None,
+            effort: None,
+            min_iteration_interval_minutes: None,
+            child_process: Arc::new(Mutex::new(None)),
+            streaming_interrupt_tx: Arc::new(Mutex::new(None)),
+            control_response_tx: Arc::new(Mutex::new(None)),
+            pending_questions: Arc::new(Mutex::new(HashMap::new())),
+            effort_arc: Arc::new(Mutex::new(None)),
+            worktree_path: None,
+            role: Some(role.to_string()),
+            goal: None,
+            backstory: None,
+            plan_review_mode: shared::PlanReviewMode::default(),
+            plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+            pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
+            manual_mode: false,
+            managed,
+        }
+    }
+
+    fn team_role_spec(provider: Provider, model: &str) -> shared::TeamRoleSpec {
+        shared::TeamRoleSpec {
+            provider: Some(provider),
+            model: Some(model.to_string()),
+        }
+    }
+
+    struct ExpectedTeamPane<'a> {
+        label: &'a str,
+        mode: shared::PaneMode,
+        provider: Provider,
+        model: &'a str,
+        prompt: Option<&'a str>,
+        effort: Option<&'a str>,
+        role: &'a str,
+        goal: &'a str,
+        backstory: &'a str,
+    }
+
+    fn assert_start_team_pane(event: &TuiEvent, expected: ExpectedTeamPane<'_>) {
+        let TuiEvent::AddTabWithConfig {
+            pane_id,
+            label,
+            claude_session_id,
+            mode,
+            provider,
+            prompt,
+            min_iteration_interval_minutes,
+            model,
+            effort,
+            worktree_path,
+            initial_input,
+            role,
+            goal,
+            backstory,
+            plan_review_mode,
+            managed,
+            try_resume_first,
+        } = event else {
+            panic!("Start team should emit AddTabWithConfig events");
+        };
+
+        assert!(*pane_id >= 3);
+        assert_ne!(*claude_session_id, Uuid::nil());
+        assert_eq!(label, expected.label);
+        assert_eq!(mode, &expected.mode);
+        assert_eq!(*provider, expected.provider);
+        assert_eq!(model.as_deref(), Some(expected.model));
+        assert_eq!(prompt.as_deref(), expected.prompt);
+        assert_eq!(min_iteration_interval_minutes, &None);
+        assert_eq!(effort.as_deref(), expected.effort);
+        assert_eq!(worktree_path, &None);
+        assert_eq!(initial_input, &None);
+        assert_eq!(role.as_deref(), Some(expected.role));
+        assert_eq!(goal.as_deref(), Some(expected.goal));
+        assert_eq!(backstory.as_deref(), Some(expected.backstory));
+        assert_eq!(*plan_review_mode, shared::PlanReviewMode::default());
+        assert!(*managed);
+        assert!(!*try_resume_first);
+    }
+
+    fn start_team_event_label(event: &TuiEvent) -> &str {
+        let TuiEvent::AddTabWithConfig { label, .. } = event else {
+            panic!("Start team should emit AddTabWithConfig events");
+        };
+        label.as_str()
+    }
+
+    #[test]
+    fn start_team_empty_roster_spawns_default_managed_panes() {
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+        let (event_tx, event_rx) = mpsc::channel();
+        let manager = team_role_spec(Provider::Codex, "gpt-5");
+        let tech_lead = team_role_spec(Provider::Claude, "claude-sonnet-4");
+        let reviewer = team_role_spec(Provider::Minimax, "MiniMax-M2.7");
+        let developer = team_role_spec(Provider::Glm, "glm-5.1");
+
+        super::spawn_missing_team_panes(
+            &pane_metas,
+            &event_tx,
+            &manager,
+            &tech_lead,
+            &reviewer,
+            &developer,
+        );
+
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(events.len(), 4);
+
+        assert_start_team_pane(
+            &events[0],
+            ExpectedTeamPane {
+                label: "Manager",
+                mode: shared::PaneMode::Interactive,
+                provider: Provider::Codex,
+                model: "gpt-5",
+                prompt: None,
+                effort: Some("max"),
+                role: crate::role::DEFAULT_MANAGER_ROLE,
+                goal: crate::role::DEFAULT_MANAGER_GOAL,
+                backstory: crate::role::DEFAULT_MANAGER_BACKSTORY,
+            },
+        );
+        assert_start_team_pane(
+            &events[1],
+            ExpectedTeamPane {
+                label: "Tech Lead",
+                mode: shared::PaneMode::Deadloop,
+                provider: Provider::Claude,
+                model: "claude-sonnet-4",
+                prompt: Some(crate::role::TECH_LEAD_DEADLOOP_PROMPT),
+                effort: Some("max"),
+                role: crate::role::DEFAULT_TECH_LEAD_ROLE,
+                goal: crate::role::DEFAULT_TECH_LEAD_GOAL,
+                backstory: crate::role::DEFAULT_TECH_LEAD_BACKSTORY,
+            },
+        );
+        assert_start_team_pane(
+            &events[2],
+            ExpectedTeamPane {
+                label: "Reviewer",
+                mode: shared::PaneMode::Deadloop,
+                provider: Provider::Minimax,
+                model: "MiniMax-M2.7",
+                prompt: Some(crate::role::REVIEWER_DEADLOOP_PROMPT),
+                effort: Some("max"),
+                role: crate::role::DEFAULT_REVIEWER_ROLE,
+                goal: crate::role::DEFAULT_REVIEWER_GOAL,
+                backstory: crate::role::DEFAULT_REVIEWER_BACKSTORY,
+            },
+        );
+        assert_start_team_pane(
+            &events[3],
+            ExpectedTeamPane {
+                label: "Developer",
+                mode: shared::PaneMode::Deadloop,
+                provider: Provider::Glm,
+                model: "glm-5.1",
+                prompt: Some(crate::role::DEFAULT_DEVELOPER_DEADLOOP_PROMPT),
+                effort: None,
+                role: crate::role::DEFAULT_DEVELOPER_ROLE,
+                goal: crate::role::DEFAULT_DEVELOPER_GOAL,
+                backstory: crate::role::DEFAULT_DEVELOPER_BACKSTORY,
+            },
+        );
+    }
+
+    #[test]
+    fn start_team_existing_managed_roles_suppress_only_matching_spawn() {
+        let scenarios = [
+            ("Manager", "Project Manager", shared::PaneMode::Interactive),
+            ("Tech Lead", "Tech Lead", shared::PaneMode::Deadloop),
+            ("Reviewer", "Diff Reviewer", shared::PaneMode::Deadloop),
+            ("Developer", "Default Developer", shared::PaneMode::Deadloop),
+        ];
+
+        for (suppressed_label, role, mode) in scenarios {
+            let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+            let (event_tx, event_rx) = mpsc::channel();
+
+            {
+                let mut metas = pane_metas.lock().unwrap();
+                metas.insert(
+                    10,
+                    test_team_pane_meta(suppressed_label, role, mode, true),
+                );
+                metas.insert(
+                    11,
+                    test_team_pane_meta(
+                        "Unmanaged Manager",
+                        "Manager",
+                        shared::PaneMode::Interactive,
+                        false,
+                    ),
+                );
+                metas.insert(
+                    12,
+                    test_team_pane_meta(
+                        "Unmanaged Reviewer",
+                        "Reviewer",
+                        shared::PaneMode::Deadloop,
+                        false,
+                    ),
+                );
+                metas.insert(
+                    13,
+                    test_team_pane_meta(
+                        "Unmanaged Developer",
+                        "Developer",
+                        shared::PaneMode::Deadloop,
+                        false,
+                    ),
+                );
+            }
+
+            super::spawn_missing_team_panes(
+                &pane_metas,
+                &event_tx,
+                &shared::TeamRoleSpec::default(),
+                &shared::TeamRoleSpec::default(),
+                &shared::TeamRoleSpec::default(),
+                &shared::TeamRoleSpec::default(),
+            );
+
+            let events = event_rx.try_iter().collect::<Vec<_>>();
+            let labels = events
+                .iter()
+                .map(start_team_event_label)
+                .collect::<HashSet<_>>();
+
+            assert_eq!(events.len(), 3, "scenario: {suppressed_label}");
+            assert!(!labels.contains(suppressed_label));
+            for label in ["Manager", "Tech Lead", "Reviewer", "Developer"] {
+                assert_eq!(
+                    labels.contains(label),
+                    label != suppressed_label,
+                    "scenario: {suppressed_label}, label: {label}",
+                );
+            }
+        }
+    }
+
     fn seed_pending_question(meta: &PaneMeta, tool_use_id: &str, request_id: &str) {
         meta.pending_questions.lock().unwrap().insert(
             tool_use_id.to_string(),
