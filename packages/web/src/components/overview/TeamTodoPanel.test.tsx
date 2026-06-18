@@ -22,6 +22,19 @@ describe("parsePrLine", () => {
     expect(r?.owner).toBe("o");
   });
 
+  it("parses an annotated merged line with a clean pull URL", () => {
+    const r = parsePrLine(
+      "pr: 568 https://github.com/shuaimu/apas/pull/12 (MERGED 2026-06-16T03:59:12Z 7d78b3e...)",
+    );
+    expect(r).toEqual({
+      pane: 568,
+      url: "https://github.com/shuaimu/apas/pull/12",
+      owner: "shuaimu",
+      repo: "apas",
+      num: 12,
+    });
+  });
+
   it("returns null for a missing pr: prefix", () => {
     expect(parsePrLine("218 https://github.com/o/r/pull/1")).toBeNull();
   });
@@ -127,16 +140,26 @@ function seedAgentStatus({
   lastActivity,
   cursor = null,
   present = true,
+  reviewerLastActivity = null,
+  reviewerCursor = null,
+  reviewerPresent = false,
 }: {
   lastActivity: Date | null;
   cursor?: string | null;
   present?: boolean;
+  reviewerLastActivity?: Date | null;
+  reviewerCursor?: string | null;
+  reviewerPresent?: boolean;
 }) {
   const paneId = 178;
-  const messages =
-    lastActivity == null
-      ? {}
-      : { [paneKey(paneId)]: [{ timestamp: lastActivity }] };
+  const reviewerPaneId = 4;
+  const messages: Record<string, { timestamp: Date }[]> = {};
+  if (lastActivity != null) {
+    messages[paneKey(paneId)] = [{ timestamp: lastActivity }];
+  }
+  if (reviewerLastActivity != null) {
+    messages[paneKey(reviewerPaneId)] = [{ timestamp: reviewerLastActivity }];
+  }
   const techLeadPane: PaneConfig = {
     pane_id: paneId,
     provider: "claude",
@@ -145,6 +168,18 @@ function seedAgentStatus({
     is_paused: false,
     role: "tech lead",
   };
+  const reviewerPane: PaneConfig = {
+    pane_id: reviewerPaneId,
+    provider: "claude",
+    mode: "deadloop",
+    session_id: "reviewer-session",
+    is_paused: false,
+    role: "reviewer",
+  };
+  const paneConfigs = [
+    ...(present ? [techLeadPane] : []),
+    ...(reviewerPresent ? [reviewerPane] : []),
+  ];
   act(() => {
     useStore.setState({
       sessionId: "test-session",
@@ -155,12 +190,13 @@ function seedAgentStatus({
           {
             ...emptyTeamTodo(),
             tech_lead_cursor: cursor,
+            reviewer_cursor: reviewerCursor,
           },
         ],
       ]),
       fetchTeamTodo: vi.fn(),
-      paneConfigs: present ? [techLeadPane] : [],
-      paneMessages: messages as never,
+      paneConfigs,
+      paneMessages: messages,
     });
   });
 }
@@ -384,6 +420,106 @@ describe("active TODO status groups", () => {
   });
 });
 
+describe("worker subtask lifecycle rows", () => {
+  afterEach(() => {
+    act(() => {
+      useStore.setState({
+        sessionId: null,
+        teamTodoState: null,
+        teamTodoStates: new Map(),
+      });
+    });
+  });
+
+  it("renders each subtask status, including revising under a PR-open Global", () => {
+    seedTeamTodo({
+      globals: [
+        {
+          id: "TODO-024",
+          title: "conflicting PR",
+          status: "pr_open",
+          origin: "tech-lead",
+          prs: [],
+          body: "",
+        },
+      ],
+      workers: [
+        {
+          pane_id: 568,
+          role_hint: "Developer",
+          subtasks: [
+            {
+              id: "TODO-024 · pending",
+              title: "Queued implementation",
+              status: "pending",
+              parent: "TODO-024",
+              body: "",
+            },
+            {
+              id: "TODO-024 · active",
+              title: "Active implementation",
+              status: "in_progress",
+              parent: "TODO-024",
+              body: "",
+            },
+            {
+              id: "TODO-024 · review",
+              title: "Review submitted diff",
+              status: "reviewing",
+              parent: "TODO-024",
+              body: "",
+            },
+            {
+              id: "TODO-024 · conflict",
+              title: "Resolve PR conflict",
+              status: "revising",
+              parent: "TODO-024",
+              body: "",
+            },
+            {
+              id: "TODO-024 · approved",
+              title: "Open approved PR",
+              status: "approved",
+              parent: "TODO-024",
+              body: "",
+            },
+            {
+              id: "TODO-024 · done",
+              title: "Merged cleanup",
+              status: "done",
+              parent: "TODO-024",
+              body: "",
+            },
+          ],
+        },
+      ],
+      tech_lead_cursor: null,
+      reviewer_cursor: null,
+    });
+
+    render(<TeamTodoPanel />);
+
+    expect(screen.getByText("PR open (1)")).toBeTruthy();
+    expect(screen.getByText("conflicting PR")).toBeTruthy();
+    for (const [title, status] of [
+      ["Queued implementation", "pending"],
+      ["Active implementation", "in_progress"],
+      ["Review submitted diff", "reviewing"],
+      ["Resolve PR conflict", "revising"],
+      ["Open approved PR", "approved"],
+      ["Merged cleanup", "done"],
+    ]) {
+      expect(
+        screen.getByText((_, element) =>
+          element?.tagName.toLowerCase() === "p" &&
+          element.textContent?.replace(/\s+/g, " ") ===
+            `${title} (${status} · TODO-024)`,
+        ),
+      ).toBeTruthy();
+    }
+  });
+});
+
 describe("AgentStatusRow accessible indicators", () => {
   const NOW = new Date("2026-06-16T12:00:00Z");
 
@@ -421,6 +557,27 @@ describe("AgentStatusRow accessible indicators", () => {
     expect(badge.getAttribute("data-agent-status")).toBe(status);
     expect(screen.getByText(relativeText)).toBeTruthy();
     expect(screen.getByText(/cursor 2m ago/)).toBeTruthy();
+  });
+
+  it("renders Tech Lead and Reviewer cursor ages with raw cursor titles", () => {
+    const techLeadCursor = "2026-06-16T11:58:00Z";
+    const reviewerCursor = "2026-06-16T11:45:00Z";
+    seedAgentStatus({
+      lastActivity: new Date(NOW.getTime() - 60_000),
+      cursor: techLeadCursor,
+      reviewerLastActivity: new Date(NOW.getTime() - 10 * 60_000),
+      reviewerCursor,
+      reviewerPresent: true,
+    });
+
+    render(<TeamTodoPanel />);
+
+    const techLeadLine = screen.getByTitle(`cursor: ${techLeadCursor}`);
+    const reviewerLine = screen.getByTitle(`cursor: ${reviewerCursor}`);
+    expect(techLeadLine.textContent).toContain("Tech Lead");
+    expect(techLeadLine.textContent).toContain("cursor 2m ago");
+    expect(reviewerLine.textContent).toContain("Reviewer");
+    expect(reviewerLine.textContent).toContain("cursor 15m ago");
   });
 
   it("renders unknown activity when a running pane has no messages", () => {

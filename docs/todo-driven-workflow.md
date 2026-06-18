@@ -35,7 +35,7 @@ GitHub.
 | **Manager** | user-facing | Surfaces TODO proposals to the user and turns direct user requests into approved Global TODOs |
 | **Tech Lead** | deadloop | Owns the TODO doc. Proposes items, expands approved work, dispatches per-worker subtasks, delegates review, records worker-opened PRs, and refreshes PR state |
 | **Worker** | deadloop, isolated worktree | Reads its own section; ships work, publishes `kind: "diff"` records, and opens its own PR once the Reviewer approves |
-| **Reviewer** | deadloop | A regular worker pane with role `reviewer`. Tech Lead delegates to it via the standard `.apas-team.jsonl` channel when worker diffs are ready; Reviewer iterates with workers (also via standard delegations) until approved. Set up via Overview's **+Worker** modal. |
+| **Reviewer** | deadloop | The default managed Reviewer pane/slot with role `reviewer`. Tech Lead delegates to it via the standard `.apas-team.jsonl` channel when worker diffs are ready; Reviewer iterates with workers (also via standard delegations) until approved. Users can still add extra reviewer panes manually. |
 
 ## The TODO document
 
@@ -183,6 +183,13 @@ newer (`jq -c 'select(.ts > "<cursor>")' .apas-team.jsonl`), acts,
 then writes back the newest `ts` it processed. First run (cursor file
 missing) falls back to `tail -n 50` as catch-up.
 
+Because those cursors compare the record's `ts`, every writer must stamp
+scratchpad records at append time. Generate the timestamp immediately
+before writing the JSON line (for example with `date -Iseconds`) and do
+not reuse an earlier planning timestamp; otherwise a record appended
+late with an older `ts` can fall behind another pane's cursor and be
+skipped.
+
 Both files are git-ignored. Re-processing on cursor loss is safe
 because every action also updates `team-todo.md` — the state machine
 deduplicates idempotently.
@@ -230,7 +237,8 @@ Each iteration the Tech Lead:
    - For `in_progress` items: dispatch pending subtasks. When the
      relevant worker diffs are ready, flip to `under_review` and post a
      `delegate-to:<reviewer_pane_id>` record asking the project's
-     Reviewer pane to evaluate them.
+     managed Reviewer pane to evaluate them. If no managed Reviewer
+     exists, escalate to the Manager/human to start or add one.
    - For `pr_open` items: refresh the recorded PR URLs periodically and
      flip to `done` only after every PR is merged.
 3. For each Worker section: dispatch the next `pending` subtask to that
@@ -294,7 +302,9 @@ edit the Global TODO's `pr:` lines itself.
 
 ### Reviewer loop
 
-- Reviewer is a regular worker pane (role contains `reviewer`).
+- Reviewer is normally the default managed Reviewer pane/slot (role
+  contains `reviewer`). Extra manually added reviewer panes can still be
+  used if the Tech Lead explicitly targets them.
 - Tech Lead delegates to it on `.apas-team.jsonl` with
   `tags: ["delegate-to:<reviewer_pane_id>", "task:TODO-NNN"]` and a
   body that names the TODO + worker pane ids whose diffs to review.
@@ -328,15 +338,16 @@ Overview tab AND chat-parsed approvals in the Manager pane. Both paths
 route through the same `WebToServer::TodoApproval` / Manager-edit code
 that flips the TODO's `status` field.
 
-Q3. **Reviewer lifecycle**: The Reviewer is a regular worker pane
-(role `reviewer`) the user sets up once via Overview's **+Worker**
-modal. Tech Lead delegates to it like any other worker; Reviewer
-iterates with workers via the same `.apas-team.jsonl` delegate-to
-protocol. No special spawn machinery; no special reap. If no reviewer
-pane exists when a TODO hits `under_review`, the Tech Lead escalates
-to the Manager so the human sets one up. _(Earlier draft proposed
-auto-spawning a per-TODO Reviewer; superseded by the uniform-worker
-model — fewer moving parts.)_
+Q3. **Reviewer lifecycle**: The Reviewer is the default managed
+Reviewer pane/slot (role `reviewer`) in the team. Tech Lead delegates
+to it like any other worker; Reviewer iterates with workers via the
+same `.apas-team.jsonl` delegate-to protocol. Users can still add extra
+reviewer panes manually. No special per-TODO spawn machinery; no
+special reap. If no managed Reviewer pane exists when a TODO hits
+`under_review`, the Tech Lead escalates to the Manager/human to start
+or add one. _(Earlier draft proposed auto-spawning a per-TODO
+Reviewer; superseded by the long-lived team-slot model — fewer moving
+parts.)_
 
 Q4. **PR opening**: Workers open PRs themselves after Reviewer approval.
 Each worker publishes `kind: "decision"` with `pr-opened`; the Tech Lead
@@ -373,9 +384,18 @@ breadcrumbs, not an active implementation plan:
 
 ### Code review loop
 
-- Reviewer is a regular worker pane with `role: "reviewer"`.
-- When a Global TODO reaches `under_review`, the Tech Lead records the
-  state in `team-todo.md` and delegates review through `.apas-team.jsonl`.
+- Reviewer is the default managed team slot with `role: "reviewer"`.
+  Tech Lead delegates to it on `.apas-team.jsonl` when a Global TODO
+  enters `under_review`; no per-TODO spawn machinery. If no managed
+  Reviewer exists, Tech Lead escalates to the Manager/human to start or
+  add one.
+- Reviewer's system-prompt addendum (already in
+  `crates/client-cli/src/role.rs` as `REVIEWER_NOTE`) teaches the
+  receive-delegation / review-diffs / delegate-fixes-back loop.
+- Tech Lead's `under_review` transition is a `team-todo.md` edit plus
+  the delegation record. The reviewer iterates with workers until
+  approved; Tech Lead watches for final `approves:<worker>` records and
+  then for worker `pr-opened` decisions.
 - Reviewer posts `approves:<worker>` / `rejects:<worker>` verdicts.
   Rejects go directly back to the worker as normal delegations; approvals
   let workers open their PRs.

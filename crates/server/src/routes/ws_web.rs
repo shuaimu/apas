@@ -528,6 +528,38 @@ async fn resolve_target_session(
         if state.sessions.is_web_attached_to_session(&sid, connection_id) {
             return Some(sid);
         }
+        // Not registered as attached — but the web client may legitimately
+        // own/have access to this session and simply hasn't finished its
+        // (re)attach handshake yet. This is the post-reconnect race that
+        // dropped `pause_pane` and made "Stop team" fail to stop workers: the
+        // user clicks before the current session's attach lands. Verify access
+        // with the same gate AttachSession uses, then auto-attach so the
+        // control message isn't lost.
+        if let Some(uid) = state.sessions.get_web_user(connection_id) {
+            let has_access = state
+                .db
+                .check_session_access(&sid.to_string(), &uid.to_string())
+                .await
+                .unwrap_or(false);
+            if has_access {
+                let cli_client_id = match state.db.get_session(&sid.to_string()).await {
+                    Ok(Some(db_session)) => db_session
+                        .cli_client_id
+                        .and_then(|id| Uuid::parse_str(&id).ok())
+                        .filter(|id| state.sessions.is_cli_connected(id)),
+                    _ => None,
+                };
+                state
+                    .sessions
+                    .attach_web_to_session(&sid, *connection_id, cli_client_id);
+                tracing::info!(
+                    "Auto-attached web connection {} to session {} for control message (access verified)",
+                    connection_id,
+                    sid
+                );
+                return Some(sid);
+            }
+        }
         tracing::warn!(
             "Web connection {} sent a message for session {} it is not attached to",
             connection_id,
@@ -1816,20 +1848,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::InterruptPane { pane_id }) => {
-                    if let Some(sid) = session_id {
-                        tracing::info!("Interrupting pane {} in session {}", pane_id, sid);
-                        state
-                            .sessions
-                            .route_to_cli(
-                                &sid,
-                                ServerToCli::InterruptPane {
-                                    session_id: sid,
-                                    pane_id,
-                                },
-                            )
-                            .await;
-                    }
+                Ok(WebToServer::InterruptPane { session_id: msg_sid, pane_id }) => {
+                    let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    else {
+                        continue;
+                    };
+                    tracing::info!("Interrupting pane {} in session {}", pane_id, sid);
+                    state
+                        .sessions
+                        .route_to_cli(
+                            &sid,
+                            ServerToCli::InterruptPane {
+                                session_id: sid,
+                                pane_id,
+                            },
+                        )
+                        .await;
                 }
                 Ok(WebToServer::PlanReviewAnswer { tool_use_id, approve }) => {
                     if let Some(sid) = session_id {
