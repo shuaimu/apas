@@ -306,6 +306,48 @@ describe('useStore', () => {
     });
   });
 
+  describe('session download', () => {
+    function makeWs(readyState: number = WebSocket.OPEN) {
+      const send = vi.fn();
+      return {
+        readyState,
+        send,
+        close: vi.fn(),
+      } as unknown as WebSocket & { send: typeof send };
+    }
+
+    it('downloadSession sends a download_session request for the active session', () => {
+      const ws = makeWs();
+      useStore.setState({ sessionId: 'session-download', ws });
+
+      useStore.getState().downloadSession();
+
+      expect(ws.send).toHaveBeenCalledOnce();
+      expect(ws.send).toHaveBeenCalledWith(JSON.stringify({
+        type: 'download_session',
+        session_id: 'session-download',
+      }));
+    });
+
+    it('downloadSession does not send without an active session id', () => {
+      const ws = makeWs();
+      useStore.setState({ sessionId: null, ws });
+
+      useStore.getState().downloadSession();
+
+      expect(ws.send).not.toHaveBeenCalled();
+    });
+
+    it('downloadSession does not send when the websocket is closed', () => {
+      const ws = makeWs(WebSocket.CLOSED);
+      useStore.setState({ sessionId: 'session-download', ws });
+
+      useStore.getState().downloadSession();
+
+      expect(ws.send).not.toHaveBeenCalled();
+    });
+  });
+
   describe('project_goal_changed', () => {
     it('caches project goal content by session id from websocket messages', async () => {
       useStore.getState().connect();
