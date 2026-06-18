@@ -38,8 +38,9 @@ pub struct TeamRecord {
     /// Free-form labels for filtering (`tail -f` matchers, web filters).
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Short category label ("diff", "review", "decision", "status",
-    /// "reply-to:<task_id>", etc.). Convention only — not validated.
+    /// Short category label ("delegation", "diff", "review",
+    /// "decision", "status", etc.). Task correlation belongs in tags
+    /// like `task:TODO-123`. Convention only — not validated.
     pub kind: String,
     /// Free-form payload. Kept as a string so we don't lock callers
     /// into a particular sub-shape; large bodies are fine.
@@ -254,10 +255,11 @@ mod tests {
 
     #[test]
     fn delegate_target_pane_picks_first_valid_tag() {
-        let r = TeamRecord::now(Some(1), "task", "go fix the auth tests")
+        let r = TeamRecord::now(Some(1), "delegation", "go fix the auth tests")
             .with_tag("priority:high")
+            .with_tag("task:TODO-123")
             .with_tag("delegate-to:7")
-            .with_tag("task-id:abc");
+            .with_tag("review-worker:42");
         assert_eq!(delegate_target_pane(&r), Some(7));
     }
 
