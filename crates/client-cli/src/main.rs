@@ -568,8 +568,16 @@ fn parse_version(v: &str) -> Option<u64> {
 }
 
 fn detect_running_daemon(state_path: &Path, legacy_pid_path: &Path) -> Option<RunningDaemon> {
+    detect_running_daemon_with_process_check(state_path, legacy_pid_path, is_apas_daemon_process)
+}
+
+fn detect_running_daemon_with_process_check(
+    state_path: &Path,
+    legacy_pid_path: &Path,
+    is_daemon_process: impl Fn(u32) -> bool,
+) -> Option<RunningDaemon> {
     if let Some(state) = read_daemon_state(state_path) {
-        if is_apas_daemon_process(state.pid) {
+        if is_daemon_process(state.pid) {
             return Some(RunningDaemon {
                 pid: state.pid,
                 version: Some(state.version),
@@ -579,7 +587,7 @@ fn detect_running_daemon(state_path: &Path, legacy_pid_path: &Path) -> Option<Ru
     }
 
     let legacy_pid = read_legacy_daemon_pid(legacy_pid_path)?;
-    if is_apas_daemon_process(legacy_pid) {
+    if is_daemon_process(legacy_pid) {
         return Some(RunningDaemon {
             pid: legacy_pid,
             version: None,
@@ -690,8 +698,13 @@ fn set_config_value(config: &mut config::Config, key: &str, value: String) -> Re
 
 #[cfg(test)]
 mod tests {
-    use super::{get_config_value, set_config_value, should_restart_for_version};
+    use super::{
+        detect_running_daemon_with_process_check, get_config_value, read_daemon_state,
+        read_legacy_daemon_pid, set_config_value, should_restart_for_version, write_daemon_state,
+        DaemonStateFile, DaemonStateGuard,
+    };
     use crate::config;
+    use std::fs;
 
     #[test]
     fn deepseek_config_get_masks_api_key() {
@@ -753,6 +766,128 @@ mod tests {
         assert!(!should_restart_for_version(Some("26.06.42"), "dev"));
         assert!(!should_restart_for_version(Some("26.06"), "26.06.42"));
         assert!(!should_restart_for_version(Some("26.06.42"), "26.06"));
+    }
+
+    #[test]
+    fn main_daemon_state_guard_removes_matching_state_on_drop() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state_path = dir.path().join("daemon.json");
+        write_daemon_state(
+            &state_path,
+            &DaemonStateFile {
+                pid: 42,
+                version: "26.06.7".to_string(),
+            },
+        )
+        .expect("write daemon state");
+
+        {
+            let _guard = DaemonStateGuard::new(state_path.clone(), 42);
+        }
+
+        assert!(!state_path.exists());
+    }
+
+    #[test]
+    fn main_daemon_state_guard_keeps_state_for_different_pid() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state_path = dir.path().join("daemon.json");
+        write_daemon_state(
+            &state_path,
+            &DaemonStateFile {
+                pid: 99,
+                version: "26.06.7".to_string(),
+            },
+        )
+        .expect("write daemon state");
+
+        {
+            let _guard = DaemonStateGuard::new(state_path.clone(), 42);
+        }
+
+        let state = read_daemon_state(&state_path).expect("daemon state remains");
+        assert_eq!(state.pid, 99);
+        assert_eq!(state.version, "26.06.7");
+    }
+
+    #[test]
+    fn main_read_legacy_daemon_pid_parses_valid_and_rejects_invalid_files() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pid_path = dir.path().join("daemon.pid");
+
+        fs::write(&pid_path, "12345\n").expect("write valid pid");
+        assert_eq!(read_legacy_daemon_pid(&pid_path), Some(12345));
+
+        fs::write(&pid_path, "not-a-pid\n").expect("write invalid pid");
+        assert_eq!(read_legacy_daemon_pid(&pid_path), None);
+        assert_eq!(read_legacy_daemon_pid(&dir.path().join("missing.pid")), None);
+    }
+
+    #[test]
+    fn main_detect_running_daemon_prefers_live_state_over_legacy_pid() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state_path = dir.path().join("daemon.json");
+        let legacy_pid_path = dir.path().join("daemon.pid");
+        write_daemon_state(
+            &state_path,
+            &DaemonStateFile {
+                pid: 42,
+                version: "26.06.7".to_string(),
+            },
+        )
+        .expect("write daemon state");
+        fs::write(&legacy_pid_path, "99\n").expect("write legacy pid");
+
+        let running =
+            detect_running_daemon_with_process_check(&state_path, &legacy_pid_path, |_| true)
+                .expect("detect live daemon");
+
+        assert_eq!(running.pid, 42);
+        assert_eq!(running.version.as_deref(), Some("26.06.7"));
+        assert!(state_path.exists());
+        assert!(legacy_pid_path.exists());
+    }
+
+    #[test]
+    fn main_detect_running_daemon_removes_stale_state_and_falls_back_to_legacy_pid() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state_path = dir.path().join("daemon.json");
+        let legacy_pid_path = dir.path().join("daemon.pid");
+        write_daemon_state(
+            &state_path,
+            &DaemonStateFile {
+                pid: 42,
+                version: "26.06.7".to_string(),
+            },
+        )
+        .expect("write daemon state");
+        fs::write(&legacy_pid_path, "99\n").expect("write legacy pid");
+
+        let running = detect_running_daemon_with_process_check(
+            &state_path,
+            &legacy_pid_path,
+            |pid| pid == 99,
+        )
+        .expect("detect legacy daemon");
+
+        assert_eq!(running.pid, 99);
+        assert_eq!(running.version, None);
+        assert!(!state_path.exists());
+        assert!(legacy_pid_path.exists());
+    }
+
+    #[test]
+    fn main_detect_running_daemon_removes_stale_legacy_pid_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state_path = dir.path().join("daemon.json");
+        let legacy_pid_path = dir.path().join("daemon.pid");
+        fs::write(&legacy_pid_path, "99\n").expect("write legacy pid");
+
+        let running =
+            detect_running_daemon_with_process_check(&state_path, &legacy_pid_path, |_| false);
+
+        assert!(running.is_none());
+        assert!(!legacy_pid_path.exists());
     }
 }
 
