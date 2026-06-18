@@ -8,6 +8,8 @@ const router = vi.hoisted(() => ({
 }));
 
 const fetchMock = vi.hoisted(() => vi.fn());
+const clearAllSnapshotsMock = vi.hoisted(() => vi.fn());
+const reloadWindowMock = vi.hoisted(() => vi.fn());
 
 const storeMock = vi.hoisted(() => {
   const initialState = {
@@ -54,6 +56,10 @@ vi.mock("@/lib/store", () => ({
   useStore: storeMock.useStore,
 }));
 
+vi.mock("@/lib/browserActions", () => ({
+  reloadWindow: reloadWindowMock,
+}));
+
 vi.mock("@/components/Sidebar", () => ({
   Sidebar: ({
     onCollapse,
@@ -73,7 +79,7 @@ vi.mock("@/components/tabs/TabbedView", () => ({
 }));
 
 vi.mock("@/lib/sessionCacheDb", () => ({
-  clearAllSnapshots: vi.fn(),
+  clearAllSnapshots: clearAllSnapshotsMock,
   deleteSnapshot: vi.fn(),
   loadAllSnapshots: vi.fn(() => Promise.resolve(new Map())),
   loadSnapshot: vi.fn(() => Promise.resolve(undefined)),
@@ -88,6 +94,8 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.clearAllTimers();
+  vi.useRealTimers();
   vi.clearAllMocks();
   vi.unstubAllGlobals();
   localStorage.clear();
@@ -110,7 +118,7 @@ function setDesktopWidth(width = 1024) {
   });
 }
 
-function seedAuthenticatedState(cliClientId: string | null = "project-a") {
+function seedAuthenticatedState(cliClientId: string | null = "project-a", overrides: Record<string, unknown> = {}) {
   localStorage.setItem("apas_token", "token");
   act(() => {
     useStore.setState({
@@ -135,6 +143,7 @@ function seedAuthenticatedState(cliClientId: string | null = "project-a") {
       token: "token",
       userEmail: "user@example.com",
       userId: "user-1",
+      ...overrides,
     });
   });
 }
@@ -148,6 +157,12 @@ function renderAuthenticatedHome(cliClientId: string | null = "project-a") {
   setDesktopWidth();
   seedAuthenticatedState(cliClientId);
   render(<Home />);
+}
+
+function renderDashboard(overrides: Record<string, unknown> = {}) {
+  setDesktopWidth();
+  seedAuthenticatedState("project-a", overrides);
+  return render(<Home />);
 }
 
 function sidebarWidth(): string | null {
@@ -278,6 +293,119 @@ describe("Home auth bootstrap", () => {
 
     expect(logout).toHaveBeenCalledTimes(1);
     expect(router.push).toHaveBeenCalledWith("/login");
+  });
+});
+
+describe("Home reconnect and local cache controls", () => {
+  it("runs one reconnect sequence after the intended delays", async () => {
+    const connect = vi.fn();
+    const disconnect = vi.fn();
+    renderDashboard({ connect, connected: true, disconnect });
+    await screen.findByTestId("tabbed-view");
+    connect.mockClear();
+    vi.useFakeTimers();
+
+    const reconnectButton = screen.getByTitle("Click to reconnect");
+    fireEvent.click(reconnectButton);
+
+    expect(screen.getByText("Reconnecting...")).toBeTruthy();
+    fireEvent.click(reconnectButton);
+    act(() => {
+      vi.advanceTimersByTime(49);
+    });
+    expect(disconnect).not.toHaveBeenCalled();
+
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(disconnect).toHaveBeenCalledTimes(1);
+    expect(connect).not.toHaveBeenCalled();
+
+    act(() => {
+      vi.advanceTimersByTime(499);
+    });
+    expect(connect).not.toHaveBeenCalled();
+
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(connect).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears reconnecting state when the store reports a connection", async () => {
+    const connect = vi.fn();
+    const { rerender } = renderDashboard({ connect, connected: false });
+    await screen.findByTestId("tabbed-view");
+    connect.mockClear();
+    vi.useFakeTimers();
+
+    fireEvent.click(screen.getByTitle("Click to connect"));
+    expect(screen.getByText("Reconnecting...")).toBeTruthy();
+
+    act(() => {
+      vi.advanceTimersByTime(550);
+    });
+    expect(connect).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      useStore.setState({ connected: true });
+    });
+    rerender(<Home />);
+
+    expect(screen.queryByText("Reconnecting...")).toBeNull();
+    expect(screen.getByText("Connected")).toBeTruthy();
+  });
+
+  it("clears reconnecting state after the timeout when still disconnected", async () => {
+    renderDashboard({ connected: false });
+    await screen.findByTestId("tabbed-view");
+    vi.useFakeTimers();
+
+    fireEvent.click(screen.getByTitle("Click to connect"));
+    expect(screen.getByText("Reconnecting...")).toBeTruthy();
+
+    act(() => {
+      vi.advanceTimersByTime(4999);
+    });
+    expect(screen.getByText("Reconnecting...")).toBeTruthy();
+
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(screen.queryByText("Reconnecting...")).toBeNull();
+    expect(screen.getByText("Disconnected")).toBeTruthy();
+  });
+
+  it("confirms or cancels clearing local cache from Settings", async () => {
+    let resolveClear!: () => void;
+    clearAllSnapshotsMock.mockReturnValue(new Promise<void>((resolve) => {
+      resolveClear = resolve;
+    }));
+    renderDashboard();
+    await screen.findByTestId("tabbed-view");
+
+    fireEvent.click(screen.getByTitle("Settings"));
+    fireEvent.click(screen.getByText("Clear local cache"));
+    expect(screen.getByText("Confirm clear & reload")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("Cancel"));
+    expect(screen.getByText("Clear local cache")).toBeTruthy();
+    expect(clearAllSnapshotsMock).not.toHaveBeenCalled();
+    expect(reloadWindowMock).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByText("Clear local cache"));
+    fireEvent.click(screen.getByText("Confirm clear & reload"));
+
+    expect(screen.getByText(/Clearing cache and reloading/)).toBeTruthy();
+    expect(clearAllSnapshotsMock).toHaveBeenCalledTimes(1);
+    expect(reloadWindowMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveClear();
+    });
+    await waitFor(() => {
+      expect(reloadWindowMock).toHaveBeenCalledTimes(1);
+    });
   });
 });
 
