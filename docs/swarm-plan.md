@@ -257,11 +257,13 @@ file-based-vs-MCP decision):
   contains "manager" (case-insensitive), `compose_system_prompt`
   appends a "# Manager protocol" section after the scratchpad note,
   teaching the agent the `delegate-to:<pane_id>` and
-  `reply-to:<task_id>` tag conventions and pointing it at the project
-  `.apas` file to discover available workers. Deviation: did NOT
-  enumerate sibling panes inline — would require plumbing siblings
-  into compose_system_prompt and would rot as tabs come and go. Three
-  new role tests: addendum presence on manager-role, case-insensitive
+  `task:<TODO-NNN...>` tag conventions and pointing it at the project
+  `.apas` file to discover available workers. `reply-to:<task_id>`
+  remains a compatibility tag for older scratchpad replies, but current
+  task correlation is by `task:` tags. Deviation: did NOT enumerate
+  sibling panes inline — would require plumbing siblings into
+  compose_system_prompt and would rot as tabs come and go. Three new
+  role tests: addendum presence on manager-role, case-insensitive
   substring detection, and that non-manager roles don't get it.
 - [ ] **3.1c (optional) — MCP delegate tool**: replace the JSONL
   convention with a proper MCP server when the simpler approach
@@ -324,7 +326,7 @@ Phase 3.2 is complete.
 - [ ] **3.3b — UI cross-reference** (deferred): plan-review cards
   surface recent reviewer-pane reviews for the same pane so the
   human can rubber-stamp. Loose correlation by pane id; ID-by-ID
-  matching would require threading task_ids through the
+  matching would require threading task identifiers through the
   tool_use_id → review chain which is out of scope here.
 
 ### Phase 4 — UX polish
@@ -410,12 +412,15 @@ Phase 4.2 is complete. Phase 4 (UX polish) substantively done —
   chips inline + relative timestamp; truncates body via line-clamp-3
   so the section stays compact in the Overview.
 - [x] **5.1d — delegation board**: new `DelegationBoard.tsx` builds
-  `DelegationRow { delegate, toPane, taskId, reply }` from the
-  scratchpad by scanning for `delegate-to:N` and `reply-to:<task_id>`
-  tags. Renders as a small 4-column table (from→to, task id,
-  truncated body, status chip with reply latency). "untracked"
-  status when no task-id tag, "awaiting reply" + amber when task-id
-  but no matching reply, "replied (+Δt)" + emerald when paired.
+  `DelegationRow { delegate, toPane, taskKey, reply }` from the
+  scratchpad by scanning for `delegate-to:<pane_id>` plus current
+  `task:<TODO-NNN...>` tags. Worker replies and decisions pair by the
+  same `task:` tag; legacy `task-id:<uuid>` / `reply-to:<task_id>`
+  tags are fallback correlation for older records. Renders as a small
+  4-column table (from→to, task tag, truncated body, status chip with
+  reply latency). "untracked" status when no task key exists,
+  "awaiting reply" + amber when a task key exists but no matching
+  reply has arrived, "replied (+Δt)" + emerald when paired.
 - [x] **5.1e — resource use rollup**: new `ResourceUseRollup.tsx`
   collects providers in use by this project's panes and renders
   `UsageLimitsDisplay` (the existing per-pane-header component) in

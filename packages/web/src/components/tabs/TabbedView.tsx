@@ -2176,8 +2176,23 @@ interface MessagePaneProps {
   role?: string;
 }
 
+// Initial number of messages mounted per pane. The full backlog stays in
+// state; we only render the newest slice so opening a session with hundreds
+// of cached messages doesn't block the main thread parsing markdown and
+// syntax-highlighting every one at once. "Show earlier messages" (or
+// scrolling to the top) reveals more from the local cache before paging the
+// server.
+const INITIAL_RENDER_CAP = 30;
+const RENDER_CAP_STEP = 50;
+
 function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, isActive, role }: MessagePaneProps) {
   const sessionId = useStore((s) => s.sessionId);
+  // How many newest messages to mount. Grows when the user reveals older
+  // ones. `expanded` latches once they page all the way back so server-
+  // loaded older messages (which prepend) stay rendered instead of being
+  // re-clipped by the tail window.
+  const [revealCount, setRevealCount] = useState(INITIAL_RENDER_CAP);
+  const [expanded, setExpanded] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const shouldAutoScroll = useRef(true);
@@ -2192,8 +2207,21 @@ function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, isActiv
   // isActive" from a later transition. After the effect runs once,
   // it holds the previous value.
   const wasActiveRef = useRef<boolean | null>(null);
+  // Mirror the current render-cap state into refs so the (stable) scroll
+  // handler can read them without being torn down/rebuilt on every reveal.
+  const hiddenCountRef = useRef(0);
+  const expandedRef = useRef(false);
+  expandedRef.current = expanded;
 
   const scrollKey = getScrollKey(sessionId, paneId);
+
+  // Reveal the next chunk of locally-cached older messages, preserving the
+  // viewport (the prepend-scroll effect below restores it via
+  // prevScrollHeight once the taller list commits).
+  const revealEarlier = useCallback(() => {
+    prevScrollHeight.current = containerRef.current?.scrollHeight || 0;
+    setRevealCount((n) => n + RENDER_CAP_STEP);
+  }, []);
 
   const checkIfAtBottom = useCallback(() => {
     const container = containerRef.current;
@@ -2227,11 +2255,20 @@ function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, isActiv
       });
     }
 
-    if (checkIfNearTop() && onLoadMore && !isLoading && hasMore) {
-      prevScrollHeight.current = containerRef.current?.scrollHeight || 0;
-      onLoadMore();
+    if (checkIfNearTop()) {
+      if (hiddenCountRef.current > 0) {
+        // Still more in the local cache — reveal those before hitting the
+        // server so the common case stays instant and network-free.
+        revealEarlier();
+      } else if (onLoadMore && !isLoading && hasMore) {
+        // Local cache exhausted: latch to render-all so server-prepended
+        // older messages aren't re-clipped, then page the server.
+        if (!expandedRef.current) setExpanded(true);
+        prevScrollHeight.current = containerRef.current?.scrollHeight || 0;
+        onLoadMore();
+      }
     }
-  }, [checkIfAtBottom, checkIfNearTop, onLoadMore, isLoading, hasMore, scrollKey]);
+  }, [checkIfAtBottom, checkIfNearTop, onLoadMore, isLoading, hasMore, scrollKey, revealEarlier]);
 
   // Save scroll position on unmount. With hide-not-unmount, "unmount"
   // now only fires on session change (key includes sessionId). Tab
@@ -2333,7 +2370,7 @@ function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, isActiv
       }
       prevScrollHeight.current = 0;
     }
-  }, [messages.length, isActive]);
+  }, [messages.length, revealCount, isActive]);
 
   // Auto-scroll for new messages — only for the active pane. Hidden
   // panes accumulate messages silently; when the user comes back, the
@@ -2394,6 +2431,13 @@ function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, isActiv
     );
   }
 
+  // Only mount the newest `revealCount` messages until the user expands.
+  // `expanded` latches once they've paged all the way back, so older
+  // server-loaded (prepended) messages keep rendering.
+  const hiddenCount = expanded ? 0 : Math.max(0, messages.length - revealCount);
+  hiddenCountRef.current = hiddenCount;
+  const visibleMessages = hiddenCount > 0 ? messages.slice(hiddenCount) : messages;
+
   return (
     <div
       ref={containerRef}
@@ -2403,7 +2447,17 @@ function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, isActiv
       {isLoading && (
         <div className="text-center text-gray-400 text-sm py-2">Loading...</div>
       )}
-      {messages.map((message) => (
+      {hiddenCount > 0 && (
+        <div className="text-center py-1">
+          <button
+            onClick={revealEarlier}
+            className="text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 px-3 py-1 rounded-full border border-gray-200 dark:border-gray-700 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"
+          >
+            Show earlier messages ({hiddenCount})
+          </button>
+        </div>
+      )}
+      {visibleMessages.map((message) => (
         <MessageComponent key={message.id} message={message} />
       ))}
       <div ref={messagesEndRef} />

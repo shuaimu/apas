@@ -15,6 +15,7 @@ describe('useStore', () => {
       messages: [],
       machines: [],
       projectGoals: {},
+      projectFlags: {},
     });
   });
 
@@ -324,6 +325,73 @@ describe('useStore', () => {
       expect(useStore.getState().projectGoals['session-project-goal']).toBe(
         'line one\n\nline two\n',
       );
+    });
+  });
+
+  describe('project flags', () => {
+    function makeOpenWs() {
+      const send = vi.fn();
+      return {
+        readyState: WebSocket.OPEN,
+        send,
+        close: vi.fn(),
+      } as unknown as WebSocket & { send: typeof send };
+    }
+
+    it('updateProjectFlags sends both booleans and optimistically caches the active session', () => {
+      const ws = makeOpenWs();
+      useStore.setState({
+        ws,
+        sessionId: 'session-flags-a',
+        projectFlags: {
+          'session-flags-b': { autoApproveTodos: false, autoMergePrs: true },
+        },
+      });
+
+      useStore.getState().updateProjectFlags({
+        autoApproveTodos: true,
+        autoMergePrs: false,
+      });
+
+      expect(ws.send).toHaveBeenCalledWith(JSON.stringify({
+        type: 'update_project_flags',
+        auto_approve_todos: true,
+        auto_merge_prs: false,
+      }));
+      expect(useStore.getState().projectFlags).toEqual({
+        'session-flags-a': { autoApproveTodos: true, autoMergePrs: false },
+        'session-flags-b': { autoApproveTodos: false, autoMergePrs: true },
+      });
+    });
+
+    it('caches project_flags_changed messages by session id without leaking between projects', async () => {
+      useStore.getState().connect();
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      const ws = useStore.getState().ws as unknown as {
+        onmessage?: (event: MessageEvent) => void;
+      };
+      ws.onmessage?.(new MessageEvent('message', {
+        data: JSON.stringify({
+          type: 'project_flags_changed',
+          session_id: 'session-flags-a',
+          auto_approve_todos: true,
+          auto_merge_prs: false,
+        }),
+      }));
+      ws.onmessage?.(new MessageEvent('message', {
+        data: JSON.stringify({
+          type: 'project_flags_changed',
+          session_id: 'session-flags-b',
+          auto_approve_todos: false,
+          auto_merge_prs: true,
+        }),
+      }));
+
+      expect(useStore.getState().projectFlags).toMatchObject({
+        'session-flags-a': { autoApproveTodos: true, autoMergePrs: false },
+        'session-flags-b': { autoApproveTodos: false, autoMergePrs: true },
+      });
     });
   });
 });
