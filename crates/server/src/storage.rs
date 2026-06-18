@@ -3,12 +3,16 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::io::SeekFrom;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
+
+static SESSION_GC_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Truncate `content` to roughly `max_bytes`, preserving JSON validity for
 /// `tool_result` envelopes. The web client parses these envelopes
@@ -89,6 +93,25 @@ pub fn truncate_message_content(
     let original_len = content.len();
     let head: String = content.chars().take(8_192).collect();
     format!("{head}\n…[truncated for {reason}; full size {original_len} bytes]")
+}
+
+fn session_gc_temp_path(file_path: &Path) -> PathBuf {
+    let sequence = SESSION_GC_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let file_name = file_path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "messages.jsonl".into());
+
+    file_path.with_file_name(format!(
+        "{file_name}.gc.{}.{}.{}.tmp",
+        std::process::id(),
+        nanos,
+        sequence
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -875,9 +898,10 @@ impl FileStorage {
 
     /// Drop every message with `created_at < cutoff` from a session's
     /// messages.jsonl. Reads the file, filters lines whose timestamp falls
-    /// before the cutoff, writes the survivors to `messages.jsonl.tmp`, then
-    /// atomically renames over the original. Holds the per-session lock for
-    /// the whole operation so concurrent appends queue cleanly.
+    /// before the cutoff, writes the survivors to a unique same-directory
+    /// staging file, then atomically renames over the original. Holds the
+    /// per-session lock for the whole operation so concurrent appends queue
+    /// cleanly.
     ///
     /// Returns (kept, dropped, bytes_freed). Lines that fail to parse are
     /// kept defensively so a parser regression can't silently delete data.
@@ -900,41 +924,53 @@ impl FileStorage {
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
 
-        let tmp_path = file_path.with_extension("jsonl.tmp");
-        let mut tmp = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp_path)
-            .await?;
+        let tmp_path = session_gc_temp_path(&file_path);
 
-        let mut kept: u64 = 0;
-        let mut dropped: u64 = 0;
+        let rewrite_result: Result<(u64, u64)> = async {
+            let mut tmp = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&tmp_path)
+                .await?;
 
-        while let Some(line) = lines.next_line().await? {
-            if line.trim().is_empty() {
-                continue;
-            }
-            // Parse just enough to read created_at. Unparseable lines are
-            // kept — better to retain mystery data than to silently nuke it.
-            let keep = match serde_json::from_str::<StoredMessage>(&line) {
-                Ok(msg) => match DateTime::parse_from_rfc3339(&msg.created_at) {
-                    Ok(ts) => ts.with_timezone(&Utc) >= cutoff,
+            let mut kept: u64 = 0;
+            let mut dropped: u64 = 0;
+
+            while let Some(line) = lines.next_line().await? {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                // Parse just enough to read created_at. Unparseable lines are
+                // kept — better to retain mystery data than to silently nuke it.
+                let keep = match serde_json::from_str::<StoredMessage>(&line) {
+                    Ok(msg) => match DateTime::parse_from_rfc3339(&msg.created_at) {
+                        Ok(ts) => ts.with_timezone(&Utc) >= cutoff,
+                        Err(_) => true,
+                    },
                     Err(_) => true,
-                },
-                Err(_) => true,
-            };
-            if keep {
-                tmp.write_all(line.as_bytes()).await?;
-                tmp.write_all(b"\n").await?;
-                kept += 1;
-            } else {
-                dropped += 1;
+                };
+                if keep {
+                    tmp.write_all(line.as_bytes()).await?;
+                    tmp.write_all(b"\n").await?;
+                    kept += 1;
+                } else {
+                    dropped += 1;
+                }
             }
-        }
 
-        tmp.flush().await?;
-        drop(tmp);
+            tmp.flush().await?;
+            drop(tmp);
+            Ok((kept, dropped))
+        }
+        .await;
+
+        let (kept, dropped) = match rewrite_result {
+            Ok(counts) => counts,
+            Err(err) => {
+                let _ = fs::remove_file(&tmp_path).await;
+                return Err(err);
+            }
+        };
 
         if dropped == 0 {
             // Nothing to rewrite — leave the original alone.
@@ -942,7 +978,10 @@ impl FileStorage {
             return Ok((kept, 0, 0));
         }
 
-        fs::rename(&tmp_path, &file_path).await?;
+        if let Err(err) = fs::rename(&tmp_path, &file_path).await {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(err.into());
+        }
         let new_size = fs::metadata(&file_path).await?.len();
         let bytes_freed = original_size.saturating_sub(new_size);
         Ok((kept, dropped, bytes_freed))
@@ -1195,7 +1234,7 @@ fn parse_stored_pane_id(raw_pane_type: Option<&str>) -> Option<u32> {
 
 #[cfg(test)]
 mod gc_tests {
-    use super::{FileStorage, StoredMessage};
+    use super::{session_gc_temp_path, FileStorage, StoredMessage};
     use chrono::{Duration, Utc};
     use uuid::Uuid;
 
@@ -1213,6 +1252,37 @@ mod gc_tests {
             created_at: ts_iso.into(),
             pane_type: Some("2".into()),
         }
+    }
+
+    async fn session_tmp_files(storage: &FileStorage, sid: &Uuid) -> Vec<String> {
+        let mut entries = tokio::fs::read_dir(storage.session_dir(sid)).await.unwrap();
+        let mut tmp_files = Vec::new();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".tmp") {
+                tmp_files.push(name);
+            }
+        }
+        tmp_files.sort();
+        tmp_files
+    }
+
+    #[test]
+    fn gc_temp_paths_are_unique_and_same_directory() {
+        let storage = fresh_storage();
+        let sid = Uuid::new_v4();
+        let messages = storage.messages_file(&sid);
+        let first = session_gc_temp_path(&messages);
+        let second = session_gc_temp_path(&messages);
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), messages.parent());
+        assert_eq!(second.parent(), messages.parent());
+        assert_ne!(first, messages.with_extension("jsonl.tmp"));
+
+        let file_name = first.file_name().unwrap().to_string_lossy();
+        assert!(file_name.starts_with("messages.jsonl.gc."));
+        assert!(file_name.ends_with(".tmp"));
     }
 
     #[tokio::test]
@@ -1245,6 +1315,14 @@ mod gc_tests {
         let survivors = storage.get_messages(&sid).await.unwrap();
         assert_eq!(survivors.len(), 1);
         assert_eq!(survivors[0].id, "recent1");
+        assert!(!storage
+            .messages_file(&sid)
+            .with_extension("jsonl.tmp")
+            .exists());
+        assert_eq!(
+            session_tmp_files(&storage, &sid).await,
+            Vec::<String>::new()
+        );
     }
 
     #[tokio::test]
@@ -1587,6 +1665,14 @@ mod gc_tests {
 
         let survivors = storage.get_messages(&sid).await.unwrap();
         assert_eq!(survivors.len(), 2);
+        assert!(!storage
+            .messages_file(&sid)
+            .with_extension("jsonl.tmp")
+            .exists());
+        assert_eq!(
+            session_tmp_files(&storage, &sid).await,
+            Vec::<String>::new()
+        );
     }
 
     #[tokio::test]
@@ -1619,6 +1705,10 @@ mod gc_tests {
             .unwrap();
         assert_eq!(kept, 2);
         assert_eq!(dropped, 0);
+        let raw = tokio::fs::read_to_string(storage.messages_file(&sid))
+            .await
+            .unwrap();
+        assert!(raw.contains("this is not json"));
     }
 
     #[tokio::test]
