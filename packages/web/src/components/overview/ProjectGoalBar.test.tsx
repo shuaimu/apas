@@ -207,6 +207,13 @@ describe("ProjectGoalBar team role slots", () => {
     expect(prompt).toEqual(expect.stringContaining("user-approved backlog state is preserved"));
     expect(prompt).toEqual(expect.stringContaining("configured capacity"));
     const promptText = String(prompt);
+    expect(promptText).toContain("Orphan PR reconciliation");
+    expect(promptText).toContain("legacy status: done / bare pr: https://github.com/.../pull/N shape");
+    expect(promptText).toContain("contributing pane subtask contains clear evidence");
+    expect(promptText).toContain("PR opened ... https://github.com/.../pull/N");
+    expect(promptText).toContain("canonical pr: <pane_id> <url> lines");
+    expect(promptText).toContain("Do not guess or invent PR URLs");
+    expect(promptText).toContain("without explicit pane/subtask evidence");
     expect(promptText).toContain(
       "jq '.auto_approve_todos // false, .auto_merge_prs // false' .apas",
     );
