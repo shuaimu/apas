@@ -18,7 +18,22 @@ function teamRecord(overrides: Partial<TeamRecord>): TeamRecord {
 
 function seedTeamRecords(teamRecords: TeamRecord[]) {
   act(() => {
-    useStore.setState({ teamRecords });
+    useStore.setState({
+      sessionId: null,
+      teamRecordsBySession: new Map(),
+      teamRecords,
+    });
+  });
+}
+
+function seedSessionTeamRecords(sessionId: string, recordsBySession: Record<string, TeamRecord[]>) {
+  const teamRecordsBySession = new Map(Object.entries(recordsBySession));
+  act(() => {
+    useStore.setState({
+      sessionId,
+      teamRecordsBySession,
+      teamRecords: teamRecordsBySession.get(sessionId) ?? [],
+    });
   });
 }
 
@@ -83,6 +98,30 @@ describe("DelegationBoard", () => {
     expect(screen.getByText("replied")).toBeTruthy();
     expect(screen.getByText("+10m")).toBeTruthy();
     expect(screen.queryByText("awaiting reply")).toBeNull();
+  });
+
+  it("builds delegation rows only from the active session records", () => {
+    seedSessionTeamRecords("session-a", {
+      "session-a": [
+        teamRecord({
+          tags: ["delegate-to:568", "task:TODO-127"],
+          body: "Session A work.",
+        }),
+      ],
+      "session-b": [
+        teamRecord({
+          tags: ["delegate-to:568", "task:TODO-999"],
+          body: "Session B work.",
+        }),
+      ],
+    });
+
+    render(<DelegationBoard />);
+
+    expect(screen.getByText("TODO-127")).toBeTruthy();
+    expect(screen.getByTitle("Session A work.")).toBeTruthy();
+    expect(screen.queryByText("TODO-999")).toBeNull();
+    expect(screen.queryByTitle("Session B work.")).toBeNull();
   });
 
   it("retains legacy task-id and reply-to fallback pairing", () => {

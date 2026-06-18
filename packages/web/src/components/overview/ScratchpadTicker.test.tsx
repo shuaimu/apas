@@ -18,7 +18,22 @@ function record(overrides: Partial<TeamRecord>): TeamRecord {
 
 function seedTeamRecords(teamRecords: TeamRecord[]) {
   act(() => {
-    useStore.setState({ teamRecords });
+    useStore.setState({
+      sessionId: null,
+      teamRecordsBySession: new Map(),
+      teamRecords,
+    });
+  });
+}
+
+function seedSessionTeamRecords(sessionId: string, recordsBySession: Record<string, TeamRecord[]>) {
+  const teamRecordsBySession = new Map(Object.entries(recordsBySession));
+  act(() => {
+    useStore.setState({
+      sessionId,
+      teamRecordsBySession,
+      teamRecords: teamRecordsBySession.get(sessionId) ?? [],
+    });
   });
 }
 
@@ -109,6 +124,31 @@ describe("ScratchpadTicker", () => {
     expect(within(filteredRows[0]).getByText("review")).toBeTruthy();
     expect(within(filteredRows[0]).getByText("approved diff")).toBeTruthy();
     expect(screen.queryByText("opened PR")).toBeNull();
+  });
+
+  it("renders only scratchpad records for the active session", () => {
+    seedSessionTeamRecords("session-a", {
+      "session-a": [
+        record({
+          ts: "2026-06-16T11:00:00Z",
+          kind: "decision",
+          body: "session A decision",
+        }),
+      ],
+      "session-b": [
+        record({
+          ts: "2026-06-16T11:30:00Z",
+          kind: "review",
+          body: "session B review",
+        }),
+      ],
+    });
+
+    render(<ScratchpadTicker />);
+
+    expect(screen.getByRole("button", { name: "all (1)" })).toBeTruthy();
+    expect(screen.getByText("session A decision")).toBeTruthy();
+    expect(screen.queryByText("session B review")).toBeNull();
   });
 
   it("limits the inline timeline to the newest 20 records with a summary", () => {

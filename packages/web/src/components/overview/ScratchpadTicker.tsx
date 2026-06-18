@@ -7,7 +7,7 @@
  * compact: same row shape as the full Team modal but smaller padding.
  */
 import { useMemo, useState } from "react";
-import { useStore, TeamRecord } from "@/lib/store";
+import { selectActiveTeamRecords, useStore, TeamRecord } from "@/lib/store";
 
 const KIND_FILTERS = ["all", "diff", "review", "decision", "status"] as const;
 type KindFilter = (typeof KIND_FILTERS)[number];
@@ -15,7 +15,7 @@ type KindFilter = (typeof KIND_FILTERS)[number];
 const MAX_ROWS = 20;
 
 export function ScratchpadTicker() {
-  const teamRecords = useStore((s) => s.teamRecords);
+  const teamRecords = useStore(selectActiveTeamRecords);
   const [filter, setFilter] = useState<KindFilter>("all");
 
   const filtered = useMemo(() => {
