@@ -250,7 +250,14 @@ Each iteration the Tech Lead:
      managed Reviewer pane to evaluate them. If no managed Reviewer
      exists, escalate to the Manager/human to start or add one.
    - For `pr_open` items: refresh the recorded PR URLs periodically and
-     flip to `done` only after every PR is merged.
+     flip to `done` only after every PR is merged. If GitHub reports
+     `mergeable == "CONFLICTING"`, keep the Global `pr_open`, leave the
+     PR open, and delegate the repair to the original owner from the
+     `pr: <pane_id> <url>` line using `pr-comments:<url>`. The repair
+     ask should be to rebase or merge the current default branch, resolve
+     conflicts, rerun the task verification, and push the same PR branch.
+     Mark the Global `rejected` only if the PR is actually closed without
+     merge or the worker reports that the conflict cannot be repaired.
 3. For each Worker section: dispatch the next `pending` subtask to that
    worker via `.apas-team.jsonl` (existing `delegate-to:<pane_id>`
    protocol). Mark the subtask `in_progress`.
@@ -262,9 +269,12 @@ Each iteration the Tech Lead:
    TODO. When every contributing worker has a PR line, flip the Global
    TODO to `pr_open`.
 6. Periodically (~every 10 iterations, or when a PR is stale): refresh
-   each recorded PR with `gh pr view <url> --json state`. Flip
+   each recorded PR with `gh pr view <url> --json state,mergeable`. Flip
    `pr_open` → `done` only after every PR is merged; escalate if a PR is
-   closed without merge.
+   closed without merge. A `CONFLICTING` PR is not an automatic rejection:
+   route it back to the owning worker via `pr-comments:<url>`, keep the
+   same PR/branch alive, and wait for the worker to push the conflict
+   repair.
 
 If the Tech Lead would suggest something to add to the global queue,
 it appends it as `status: proposed, origin: tech-lead`. The Manager and
@@ -419,6 +429,12 @@ breadcrumbs, not an active implementation plan:
   the Global TODO to `pr_open` once all contributing workers have PRs.
 - Tech Lead owns PR state refresh and PR-comment dispatch; workers do
   not idle-poll their own PRs.
+- If a recorded PR becomes `CONFLICTING`, the Tech Lead keeps the Global
+  `pr_open` and sends one `pr-comments:<url>` delegation to the original
+  `pr:` owner. The Developer repairs the same branch by rebasing or
+  merging the current default branch, resolving conflicts, rerunning
+  verification, and pushing the existing PR. The PR is rejected only when
+  it is closed or the owner cannot repair it.
 
 ### Migration / UI polish
 
