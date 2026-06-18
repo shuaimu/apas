@@ -1,5 +1,5 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import Home from "./page";
 import { useStore, type CliClient } from "@/lib/store";
 
@@ -7,8 +7,51 @@ const router = vi.hoisted(() => ({
   push: vi.fn(),
 }));
 
+const fetchMock = vi.hoisted(() => vi.fn());
+
+const storeMock = vi.hoisted(() => {
+  const initialState = {
+    cliClientId: null,
+    cliClients: [],
+    connect: vi.fn(),
+    connected: false,
+    disconnect: vi.fn(),
+    isAuthenticated: false,
+    logout: vi.fn(),
+    serverVersion: null,
+    sessionId: null,
+    setUserEmail: vi.fn(),
+    token: null,
+    userEmail: null,
+    userId: null,
+  };
+  const state: Record<string, unknown> = { ...initialState };
+  const useStoreMock = vi.fn(() => state);
+
+  Object.assign(useStoreMock, {
+    getInitialState: () => ({ ...initialState }),
+    setState: (partial: Record<string, unknown> | ((current: Record<string, unknown>) => Record<string, unknown>), replace?: boolean) => {
+      const nextState = typeof partial === "function" ? partial(state) : partial;
+      if (replace) {
+        for (const key of Object.keys(state)) {
+          delete state[key];
+        }
+      }
+      Object.assign(state, nextState);
+    },
+  });
+
+  return {
+    useStore: useStoreMock,
+  };
+});
+
 vi.mock("next/navigation", () => ({
   useRouter: () => router,
+}));
+
+vi.mock("@/lib/store", () => ({
+  useStore: storeMock.useStore,
 }));
 
 vi.mock("@/components/Sidebar", () => ({
@@ -38,6 +81,20 @@ vi.mock("@/lib/sessionCacheDb", () => ({
 }));
 
 const initialStore = useStore.getInitialState();
+
+beforeEach(() => {
+  vi.stubGlobal("fetch", fetchMock);
+});
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+  vi.unstubAllGlobals();
+  localStorage.clear();
+  act(() => {
+    useStore.setState(initialStore, true);
+  });
+});
 
 function makeCliClient(overrides: Partial<CliClient> & Pick<CliClient, "id">): CliClient {
   return {
@@ -97,16 +154,134 @@ function sidebarWidth(): string | null {
   return screen.getByTestId("sidebar").getAttribute("data-width");
 }
 
-describe("Home sidebar layout persistence", () => {
-  afterEach(() => {
-    vi.clearAllMocks();
-    localStorage.clear();
-    document.body.innerHTML = "";
-    act(() => {
-      useStore.setState(initialStore, true);
+function seedUnauthenticatedState(overrides: Record<string, unknown> = {}) {
+  act(() => {
+    useStore.setState({
+      cliClientId: null,
+      cliClients: [],
+      connect: vi.fn(),
+      connected: false,
+      disconnect: vi.fn(),
+      isAuthenticated: false,
+      logout: vi.fn(),
+      serverVersion: null,
+      sessionId: null,
+      setUserEmail: vi.fn(),
+      token: null,
+      userEmail: null,
+      userId: null,
+      ...overrides,
+    });
+  });
+}
+
+function jsonResponse(body: unknown, ok = true): Response {
+  return {
+    ok,
+    json: vi.fn().mockResolvedValue(body),
+  } as unknown as Response;
+}
+
+describe("Home auth bootstrap", () => {
+  it("redirects to login without calling connect when no token is stored", async () => {
+    const connect = vi.fn();
+    seedUnauthenticatedState({ connect });
+
+    render(<Home />);
+
+    await waitFor(() => {
+      expect(router.push).toHaveBeenCalledWith("/login");
+    });
+    expect(connect).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("clears the loading state and connects when a token is stored", async () => {
+    const connect = vi.fn();
+    localStorage.setItem("apas_token", "stored-token");
+    seedUnauthenticatedState({ connect, userEmail: "user@example.com" });
+
+    render(<Home />);
+
+    await screen.findByTestId("tabbed-view");
+    expect(screen.queryByText("Loading...")).toBeNull();
+    expect(connect).toHaveBeenCalledTimes(1);
+    expect(router.push).not.toHaveBeenCalledWith("/login");
+  });
+
+  it("hydrates missing user email using the stored bearer token", async () => {
+    const setUserEmail = vi.fn();
+    localStorage.setItem("apas_token", "stored-token");
+    fetchMock.mockResolvedValueOnce(jsonResponse({ user_email: "user@example.com" }));
+    seedUnauthenticatedState({
+      connect: vi.fn(),
+      connected: true,
+      isAuthenticated: true,
+      setUserEmail,
+      token: "stored-token",
+      userEmail: null,
+      userId: "user-1",
+    });
+
+    render(<Home />);
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://apas.mpaxos.com:8080/auth/me",
+        expect.objectContaining({
+          headers: { Authorization: "Bearer stored-token" },
+        }),
+      );
+    });
+    await waitFor(() => {
+      expect(setUserEmail).toHaveBeenCalledWith("user@example.com");
     });
   });
 
+  it.each([
+    ["non-OK", () => Promise.resolve(jsonResponse({ user_email: "ignored@example.com" }, false))],
+    ["rejected", () => Promise.reject(new Error("network unavailable"))],
+  ])("ignores %s user-email hydration without breaking dashboard render", async (_name, authMeResult) => {
+    const setUserEmail = vi.fn();
+    localStorage.setItem("apas_token", "stored-token");
+    fetchMock.mockImplementationOnce(authMeResult);
+    seedUnauthenticatedState({
+      connect: vi.fn(),
+      connected: true,
+      isAuthenticated: true,
+      setUserEmail,
+      token: "stored-token",
+      userEmail: null,
+      userId: "user-1",
+    });
+
+    render(<Home />);
+
+    expect(await screen.findByTestId("tabbed-view")).toBeTruthy();
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalled();
+    });
+    expect(setUserEmail).not.toHaveBeenCalled();
+    expect(router.push).not.toHaveBeenCalledWith("/login");
+  });
+
+  it("logs out and routes back to login", async () => {
+    const logout = vi.fn();
+    seedAuthenticatedState();
+    act(() => {
+      useStore.setState({ logout });
+    });
+
+    render(<Home />);
+
+    fireEvent.click(await screen.findByTitle("Logout"));
+
+    expect(logout).toHaveBeenCalledTimes(1);
+    expect(router.push).toHaveBeenCalledWith("/login");
+  });
+});
+
+describe("Home sidebar layout persistence", () => {
   it("hydrates sidebar width from global layout when no project is selected", async () => {
     localStorage.setItem("apas_layout_global_sidebar_width", "288");
 
