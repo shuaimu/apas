@@ -2159,7 +2159,7 @@ function TimelinePane({ messages }: TimelinePaneProps) {
 
 // --- MessagePane ---
 
-interface MessagePaneProps {
+export interface MessagePaneProps {
   paneId: number;
   messages: Message[];
   onLoadMore?: () => void;
@@ -2182,10 +2182,10 @@ interface MessagePaneProps {
 // syntax-highlighting every one at once. "Show earlier messages" (or
 // scrolling to the top) reveals more from the local cache before paging the
 // server.
-const INITIAL_RENDER_CAP = 30;
-const RENDER_CAP_STEP = 50;
+export const INITIAL_RENDER_CAP = 30;
+export const RENDER_CAP_STEP = 50;
 
-function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, isActive, role }: MessagePaneProps) {
+export function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, isActive, role }: MessagePaneProps) {
   const sessionId = useStore((s) => s.sessionId);
   // How many newest messages to mount. Grows when the user reveals older
   // ones. `expanded` latches once they page all the way back so server-
@@ -2441,6 +2441,7 @@ function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, isActiv
   return (
     <div
       ref={containerRef}
+      data-testid={`message-pane-${paneId}`}
       onScroll={handleScroll}
       className="flex-1 overflow-y-auto overflow-x-hidden px-2 sm:px-4 py-4 space-y-3 min-h-0"
     >

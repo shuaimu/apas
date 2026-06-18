@@ -180,6 +180,33 @@ describe("PaneList-authoritative pane modes", () => {
 });
 
 describe("lazy per-pane initial message load", () => {
+  it("caps the initial all-pane session load to the newest 30 messages per pane", () => {
+    const { ws, sent } = makeFakeWs();
+    useStore.setState({
+      ws,
+      sessionId: SID_B,
+      messages: [makeMsg("existing-session")],
+      paneMessages: { [paneKey(PANE_ID)]: [makeMsg("existing-pane")] },
+      paneHasMore: { [paneKey(PANE_ID)]: true },
+      paneStatuses: { [PANE_ID]: "running" },
+      paneModes: { [paneKey(PANE_ID)]: "interactive" },
+      paneConfigs: [makePaneConfig("interactive")],
+    });
+
+    useStore.getState().loadSessionMessages(SID_A);
+
+    const requests = parseSent(sent).filter((m) => m.type === "get_session_messages");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      session_id: SID_A,
+      limit: 30,
+    });
+    expect(requests[0]).not.toHaveProperty("pane_id");
+    expect(useStore.getState().messages).toEqual([]);
+    expect(useStore.getState().paneMessages).toEqual({});
+    expect(useStore.getState().sessionId).toBe(SID_A);
+  });
+
   it("requests the active pane once, seeds its bucket, and suppresses duplicates while in flight", () => {
     vi.useFakeTimers();
     const { ws, sent } = makeFakeWs();
