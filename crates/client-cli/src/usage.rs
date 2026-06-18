@@ -49,6 +49,28 @@ struct UsageCacheFile {
     deepseek: Option<UsageLimits>,
 }
 
+impl UsageCacheFile {
+    fn get(&self, provider: UsageProvider) -> Option<UsageLimits> {
+        match provider {
+            UsageProvider::Claude => self.claude.clone(),
+            UsageProvider::Codex => self.codex.clone(),
+            UsageProvider::Minimax => self.minimax.clone(),
+            UsageProvider::Glm => self.glm.clone(),
+            UsageProvider::Deepseek => self.deepseek.clone(),
+        }
+    }
+
+    fn set(&mut self, provider: UsageProvider, limits: UsageLimits) {
+        match provider {
+            UsageProvider::Claude => self.claude = Some(limits),
+            UsageProvider::Codex => self.codex = Some(limits),
+            UsageProvider::Minimax => self.minimax = Some(limits),
+            UsageProvider::Glm => self.glm = Some(limits),
+            UsageProvider::Deepseek => self.deepseek = Some(limits),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum UsageProvider {
     Claude,
@@ -76,16 +98,18 @@ fn read_usage_cache_file(path: &Path) -> Result<UsageCacheFile> {
     Ok(cache)
 }
 
-fn read_usage_cache() -> Result<UsageCacheFile> {
-    let path = usage_cache_path();
+fn read_usage_cache_file_or_default(path: &Path) -> Result<UsageCacheFile> {
     if !path.exists() {
         return Ok(UsageCacheFile::default());
     }
-    read_usage_cache_file(&path)
+    read_usage_cache_file(path)
 }
 
-fn write_usage_cache(cache: &UsageCacheFile) -> Result<()> {
-    let path = usage_cache_path();
+fn read_usage_cache() -> Result<UsageCacheFile> {
+    read_usage_cache_file_or_default(&usage_cache_path())
+}
+
+fn write_usage_cache_file(path: &Path, cache: &UsageCacheFile) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| {
             anyhow::anyhow!(
@@ -101,27 +125,33 @@ fn write_usage_cache(cache: &UsageCacheFile) -> Result<()> {
     Ok(())
 }
 
+fn write_usage_cache(cache: &UsageCacheFile) -> Result<()> {
+    write_usage_cache_file(&usage_cache_path(), cache)
+}
+
+fn cache_usage_limits_file(
+    path: &Path,
+    provider: UsageProvider,
+    limits: &UsageLimits,
+) -> Result<()> {
+    let mut cache = read_usage_cache_file_or_default(path).unwrap_or_default();
+    cache.set(provider, limits.clone());
+    write_usage_cache_file(path, &cache)
+}
+
 fn cache_usage_limits(provider: UsageProvider, limits: &UsageLimits) -> Result<()> {
     let mut cache = read_usage_cache().unwrap_or_default();
-    match provider {
-        UsageProvider::Claude => cache.claude = Some(limits.clone()),
-        UsageProvider::Codex => cache.codex = Some(limits.clone()),
-        UsageProvider::Minimax => cache.minimax = Some(limits.clone()),
-        UsageProvider::Glm => cache.glm = Some(limits.clone()),
-        UsageProvider::Deepseek => cache.deepseek = Some(limits.clone()),
-    }
+    cache.set(provider, limits.clone());
     write_usage_cache(&cache)
 }
 
+fn get_cached_usage_limits_file(path: &Path, provider: UsageProvider) -> Option<UsageLimits> {
+    let cache = read_usage_cache_file_or_default(path).ok()?;
+    cache.get(provider)
+}
+
 fn get_cached_usage_limits(provider: UsageProvider) -> Option<UsageLimits> {
-    let cache = read_usage_cache().ok()?;
-    match provider {
-        UsageProvider::Claude => cache.claude,
-        UsageProvider::Codex => cache.codex,
-        UsageProvider::Minimax => cache.minimax,
-        UsageProvider::Glm => cache.glm,
-        UsageProvider::Deepseek => cache.deepseek,
-    }
+    get_cached_usage_limits_file(&usage_cache_path(), provider)
 }
 
 fn parse_fetched_at(limits: &UsageLimits) -> Option<DateTime<Utc>> {
@@ -144,7 +174,15 @@ fn get_cached_usage_limits_with_max_age(
     provider: UsageProvider,
     max_age: Option<Duration>,
 ) -> Option<UsageLimits> {
-    let cached = get_cached_usage_limits(provider)?;
+    get_cached_usage_limits_with_max_age_file(&usage_cache_path(), provider, max_age)
+}
+
+fn get_cached_usage_limits_with_max_age_file(
+    path: &Path,
+    provider: UsageProvider,
+    max_age: Option<Duration>,
+) -> Option<UsageLimits> {
+    let cached = get_cached_usage_limits_file(path, provider)?;
     match max_age {
         Some(max_age) if !is_cache_fresh(&cached, max_age) => None,
         _ => Some(cached),
@@ -1556,6 +1594,27 @@ async fn fetch_minimax_usage_limits_remote() -> Result<UsageLimits> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    fn test_limits(five_hour_utilization: f64, seven_day_utilization: f64) -> UsageLimits {
+        UsageLimits {
+            five_hour: Some(UsageLimitWindow {
+                utilization: five_hour_utilization,
+                resets_at: Some("2026-06-18T12:00:00Z".to_string()),
+            }),
+            seven_day: Some(UsageLimitWindow {
+                utilization: seven_day_utilization,
+                resets_at: Some("2026-06-25T12:00:00Z".to_string()),
+            }),
+            fetched_at: Some(Utc::now().to_rfc3339()),
+        }
+    }
+
+    fn cache_file_path() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempdir().expect("creates temp dir");
+        let path = dir.path().join("usage_limits_cache.json");
+        (dir, path)
+    }
 
     #[test]
     fn test_credentials_path() {
@@ -1586,6 +1645,112 @@ mod tests {
             fetched_at: None,
         };
         assert!(!is_cache_fresh(&unknown, Duration::minutes(45)));
+    }
+
+    #[test]
+    fn usage_cache_keeps_provider_slots_isolated() {
+        let (_dir, path) = cache_file_path();
+        let claude = test_limits(0.11, 0.12);
+        let codex = test_limits(0.21, 0.22);
+        let deepseek = test_limits(0.31, 0.32);
+
+        cache_usage_limits_file(&path, UsageProvider::Claude, &claude).expect("caches Claude");
+        cache_usage_limits_file(&path, UsageProvider::Codex, &codex).expect("caches Codex");
+        cache_usage_limits_file(&path, UsageProvider::Deepseek, &deepseek)
+            .expect("caches DeepSeek");
+
+        assert_eq!(
+            get_cached_usage_limits_file(&path, UsageProvider::Claude),
+            Some(claude)
+        );
+        assert_eq!(
+            get_cached_usage_limits_file(&path, UsageProvider::Codex),
+            Some(codex)
+        );
+        assert_eq!(
+            get_cached_usage_limits_file(&path, UsageProvider::Deepseek),
+            Some(deepseek)
+        );
+        assert_eq!(
+            get_cached_usage_limits_file(&path, UsageProvider::Glm),
+            None
+        );
+        assert_eq!(
+            get_cached_usage_limits_file(&path, UsageProvider::Minimax),
+            None
+        );
+    }
+
+    #[test]
+    fn usage_cache_update_preserves_other_provider_slots() {
+        let (_dir, path) = cache_file_path();
+        let claude = test_limits(0.11, 0.12);
+        let codex = test_limits(0.21, 0.22);
+        let updated_codex = test_limits(0.91, 0.92);
+        let deepseek = test_limits(0.31, 0.32);
+
+        cache_usage_limits_file(&path, UsageProvider::Claude, &claude).expect("caches Claude");
+        cache_usage_limits_file(&path, UsageProvider::Codex, &codex).expect("caches Codex");
+        cache_usage_limits_file(&path, UsageProvider::Deepseek, &deepseek)
+            .expect("caches DeepSeek");
+        cache_usage_limits_file(&path, UsageProvider::Codex, &updated_codex)
+            .expect("updates Codex");
+
+        assert_eq!(
+            get_cached_usage_limits_file(&path, UsageProvider::Claude),
+            Some(claude)
+        );
+        assert_eq!(
+            get_cached_usage_limits_file(&path, UsageProvider::Codex),
+            Some(updated_codex)
+        );
+        assert_eq!(
+            get_cached_usage_limits_file(&path, UsageProvider::Deepseek),
+            Some(deepseek)
+        );
+    }
+
+    #[test]
+    fn usage_cache_freshness_filter_is_provider_specific() {
+        let (_dir, path) = cache_file_path();
+        let stale_claude = UsageLimits {
+            fetched_at: Some((Utc::now() - Duration::hours(3)).to_rfc3339()),
+            ..test_limits(0.11, 0.12)
+        };
+        let fresh_codex = test_limits(0.21, 0.22);
+        let fresh_deepseek = test_limits(0.31, 0.32);
+
+        cache_usage_limits_file(&path, UsageProvider::Claude, &stale_claude)
+            .expect("caches stale Claude");
+        cache_usage_limits_file(&path, UsageProvider::Codex, &fresh_codex)
+            .expect("caches fresh Codex");
+        cache_usage_limits_file(&path, UsageProvider::Deepseek, &fresh_deepseek)
+            .expect("caches fresh DeepSeek");
+
+        assert_eq!(
+            get_cached_usage_limits_with_max_age_file(
+                &path,
+                UsageProvider::Claude,
+                Some(Duration::minutes(45))
+            ),
+            None
+        );
+        assert_eq!(
+            get_cached_usage_limits_with_max_age_file(
+                &path,
+                UsageProvider::Codex,
+                Some(Duration::minutes(45))
+            ),
+            Some(fresh_codex)
+        );
+        assert_eq!(
+            get_cached_usage_limits_with_max_age_file(
+                &path,
+                UsageProvider::Deepseek,
+                Some(Duration::minutes(45))
+            ),
+            Some(fresh_deepseek)
+        );
     }
 
     #[test]
