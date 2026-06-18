@@ -283,17 +283,17 @@ describe('useStore', () => {
   });
 
   describe('pane reboot', () => {
-    function makeOpenWs() {
+    function makeWs(readyState: number = WebSocket.OPEN) {
       const send = vi.fn();
       return {
-        readyState: WebSocket.OPEN,
+        readyState,
         send,
         close: vi.fn(),
       } as unknown as WebSocket & { send: typeof send };
     }
 
     it('rebootPane sends a reboot_pane request for the active session and target pane', () => {
-      const ws = makeOpenWs();
+      const ws = makeWs();
       useStore.setState({ sessionId: 'session-pane-reboot', ws });
 
       useStore.getState().rebootPane(42);
@@ -303,6 +303,27 @@ describe('useStore', () => {
         session_id: 'session-pane-reboot',
         pane_id: 42,
       }));
+    });
+
+    it('rebootCli sends only the full CLI reboot request over an open websocket', () => {
+      const ws = makeWs();
+      useStore.setState({ sessionId: 'session-cli-reboot', ws });
+
+      useStore.getState().rebootCli();
+
+      expect(ws.send).toHaveBeenCalledOnce();
+      expect(ws.send).toHaveBeenCalledWith(JSON.stringify({
+        type: 'reboot_cli',
+      }));
+    });
+
+    it('rebootCli does not send when the websocket is closed', () => {
+      const ws = makeWs(WebSocket.CLOSED);
+      useStore.setState({ sessionId: 'session-cli-reboot', ws });
+
+      useStore.getState().rebootCli();
+
+      expect(ws.send).not.toHaveBeenCalled();
     });
   });
 
