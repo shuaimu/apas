@@ -32,6 +32,25 @@ describe("ROLE_TEMPLATES", () => {
     expect(backstory).not.toContain("git -C <worktree> checkout master");
   });
 
+  it("manager template turns direct user requests into approved team todos", () => {
+    const manager = ROLE_TEMPLATES.find((template) => template.id === "manager");
+    expect(manager).toBeTruthy();
+
+    const goal = manager!.goal;
+    const backstory = manager!.backstory;
+    const text = `${goal}\n${backstory}`;
+
+    expect(text).toContain("team-todo.md");
+    expect(text).toContain("status: approved");
+    expect(text).toContain("origin: user");
+    expect(backstory).toContain("Direct implementation requests");
+    expect(backstory).toContain("project_goal.md");
+    expect(backstory).toContain("Tech Lead expands it into worker subtasks");
+    expect(backstory).toContain("Don't delegate to worker panes yourself");
+    expect(backstory).toContain("Never write production code");
+    expect(backstory).not.toContain("outside of project_goal.md, you're in the wrong lane");
+  });
+
   it("tech lead template records worker-opened PRs in team todo", () => {
     const techLead = ROLE_TEMPLATES.find((template) => template.id === "tech-lead");
     expect(techLead).toBeTruthy();
