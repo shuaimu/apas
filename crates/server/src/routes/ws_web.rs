@@ -90,6 +90,47 @@ fn to_message_info(message: crate::storage::StoredMessage) -> MessageInfo {
     }
 }
 
+async fn session_download_response(state: &AppState, sid: Uuid) -> ServerToWeb {
+    let (project_id, working_dir, hostname, created_at) =
+        match state.db.get_session(&sid.to_string()).await {
+            Ok(Some(session)) => {
+                let project_id = session
+                    .project_id
+                    .as_deref()
+                    .and_then(|p| Uuid::parse_str(p).ok())
+                    .or(Some(sid));
+                (
+                    project_id,
+                    session.working_dir,
+                    session.hostname,
+                    session.created_at,
+                )
+            }
+            _ => (Some(sid), None, None, None),
+        };
+
+    match state.storage.get_messages(&sid).await {
+        Ok(stored_messages) => {
+            let messages: Vec<MessageInfo> =
+                stored_messages.into_iter().map(to_message_info).collect();
+            ServerToWeb::SessionDownload {
+                session_id: sid,
+                project_id,
+                messages,
+                working_dir,
+                hostname,
+                created_at,
+            }
+        }
+        Err(e) => {
+            tracing::error!("Failed to get messages for download: {}", e);
+            ServerToWeb::Error {
+                message: "Failed to download session data".to_string(),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod transit_truncation_tests {
     use super::*;
@@ -320,6 +361,153 @@ async fn list_accessible_machines_for_user(
     }
 
     machines
+}
+
+#[cfg(test)]
+mod session_download_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::db::{Database, Session, User};
+    use crate::storage::StoredMessage;
+    use std::path::Path;
+
+    fn test_user(user_id: Uuid) -> User {
+        User {
+            id: user_id.to_string(),
+            email: format!("{user_id}@example.test"),
+            password_hash: "hash".to_string(),
+            created_at: None,
+        }
+    }
+
+    fn test_session(
+        session_id: Uuid,
+        owner_id: Uuid,
+        project_id: Uuid,
+        working_dir: &str,
+        hostname: &str,
+    ) -> Session {
+        Session {
+            id: session_id.to_string(),
+            user_id: owner_id.to_string(),
+            cli_client_id: None,
+            working_dir: Some(working_dir.to_string()),
+            hostname: Some(hostname.to_string()),
+            status: "connected".to_string(),
+            created_at: None,
+            updated_at: None,
+            is_paused: false,
+            project_id: Some(project_id.to_string()),
+        }
+    }
+
+    async fn test_state() -> AppState {
+        let dir = std::env::temp_dir().join(format!("apas-session-download-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp db dir");
+        let db_path = dir.join("apas.db").to_string_lossy().to_string();
+        let db = Database::new(&db_path).await.expect("create temp db");
+        db.run_migrations().await.expect("run migrations");
+        let mut config = Config::default();
+        config.database.path = db_path;
+        AppState::new(db, config)
+    }
+
+    fn stored_message() -> StoredMessage {
+        StoredMessage {
+            id: "msg-1".to_string(),
+            role: "assistant".to_string(),
+            content: "export me".to_string(),
+            message_type: "text".to_string(),
+            created_at: "2026-06-18T00:31:00Z".to_string(),
+            pane_type: Some("42".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn download_session_response_includes_metadata_and_stored_messages() {
+        let state = test_state().await;
+        let user_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+
+        state
+            .db
+            .create_user(&test_user(user_id))
+            .await
+            .expect("create user");
+        state
+            .db
+            .create_session(&test_session(
+                session_id,
+                user_id,
+                project_id,
+                "/workspace/apas",
+                "dev-host",
+            ))
+            .await
+            .expect("create session");
+        state
+            .storage
+            .append_message(&session_id, &stored_message())
+            .await
+            .expect("store message");
+
+        let response = session_download_response(&state, session_id).await;
+
+        match response {
+            ServerToWeb::SessionDownload {
+                session_id: response_session_id,
+                project_id: response_project_id,
+                messages,
+                working_dir,
+                hostname,
+                created_at,
+            } => {
+                assert_eq!(response_session_id, session_id);
+                assert_eq!(response_project_id, Some(project_id));
+                assert_eq!(working_dir.as_deref(), Some("/workspace/apas"));
+                assert_eq!(hostname.as_deref(), Some("dev-host"));
+                assert!(created_at.is_some());
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].id, "msg-1");
+                assert_eq!(messages[0].role, "assistant");
+                assert_eq!(messages[0].content, "export me");
+                assert_eq!(messages[0].message_type, "text");
+                assert_eq!(
+                    messages[0].created_at.as_deref(),
+                    Some("2026-06-18T00:31:00Z")
+                );
+                assert_eq!(messages[0].pane_type.as_deref(), Some("42"));
+                assert_eq!(messages[0].pane_id, Some(42));
+            }
+            other => panic!("expected SessionDownload response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn download_session_response_returns_existing_error_on_storage_failure() {
+        let state = test_state().await;
+        let session_id = Uuid::new_v4();
+        let storage_root = Path::new(&state.config.database.path)
+            .parent()
+            .expect("db parent");
+        let messages_path = storage_root
+            .join("sessions")
+            .join(session_id.to_string())
+            .join("messages.jsonl");
+        tokio::fs::create_dir_all(&messages_path)
+            .await
+            .expect("messages path as directory");
+
+        let response = session_download_response(&state, session_id).await;
+
+        match response {
+            ServerToWeb::Error { message } => {
+                assert_eq!(message, "Failed to download session data");
+            }
+            other => panic!("expected download error response, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2884,61 +3072,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                 }
                 Ok(WebToServer::DownloadSession { session_id: sid }) => {
-                    // Get all messages for download (no pagination limit)
                     tracing::info!("Downloading session data for {}", sid);
-
-                    // Get session metadata from database
-                    let (project_id, working_dir, hostname, created_at) =
-                        match state.db.get_session(&sid.to_string()).await {
-                            Ok(Some(session)) => {
-                                let project_id = session
-                                    .project_id
-                                    .as_deref()
-                                    .and_then(|p| Uuid::parse_str(p).ok())
-                                    .or(Some(sid));
-                                (
-                                    project_id,
-                                    session.working_dir,
-                                    session.hostname,
-                                    session.created_at,
-                                )
-                            }
-                            _ => (Some(sid), None, None, None),
-                        };
-
-                    // Get all messages without limit
-                    match state.storage.get_messages(&sid).await {
-                        Ok(stored_messages) => {
-                            let messages: Vec<MessageInfo> =
-                                stored_messages.into_iter().map(to_message_info).collect();
-                            state
-                                .sessions
-                                .send_to_web(
-                                    &connection_id,
-                                    ServerToWeb::SessionDownload {
-                                        session_id: sid,
-                                        project_id,
-                                        messages,
-                                        working_dir,
-                                        hostname,
-                                        created_at,
-                                    },
-                                )
-                                .await;
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to get messages for download: {}", e);
-                            state
-                                .sessions
-                                .send_to_web(
-                                    &connection_id,
-                                    ServerToWeb::Error {
-                                        message: "Failed to download session data".to_string(),
-                                    },
-                                )
-                                .await;
-                        }
-                    }
+                    let response = session_download_response(&state, sid).await;
+                    state.sessions.send_to_web(&connection_id, response).await;
                 }
                 Err(e) => {
                     tracing::warn!("Failed to parse message: {}", e);

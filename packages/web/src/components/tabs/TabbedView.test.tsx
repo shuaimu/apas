@@ -1,4 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { paneKey, useStore, type PaneConfig } from "@/lib/store";
 import {
   botPromptForPane,
   CLASSIC_TODO_BOT_LOOP_PROMPT,
@@ -9,7 +11,73 @@ import {
   OVERVIEW_PANE_ID,
   requestConfirmedPaneReboot,
   shouldShowPaneRebootButton,
+  TabbedView,
 } from "./TabbedView";
+
+type StoreState = ReturnType<typeof useStore.getState>;
+
+const initialStore = useStore.getInitialState();
+const DOWNLOAD_SESSION_ID = "session-tabbed-download";
+const DOWNLOAD_CLI_CLIENT_ID = "cli-tabbed-download";
+const DOWNLOAD_PANE_ID = 42;
+
+function activeTabKey(): string {
+  return `apas_layout_${DOWNLOAD_CLI_CLIENT_ID}_active_tab`;
+}
+
+function downloadPane(overrides: Partial<PaneConfig> & Pick<PaneConfig, "pane_id" | "label">): PaneConfig {
+  return {
+    pane_id: overrides.pane_id,
+    provider: overrides.provider ?? "claude",
+    mode: overrides.mode ?? "interactive",
+    session_id: overrides.session_id ?? `${DOWNLOAD_SESSION_ID}-pane-${overrides.pane_id}`,
+    is_paused: overrides.is_paused ?? false,
+    label: overrides.label,
+    role: overrides.role,
+    managed: overrides.managed,
+  };
+}
+
+function seedDownloadTabbedView({
+  downloadSession = vi.fn(),
+  rebootPane = vi.fn(),
+  requestPaneDiff = vi.fn(),
+}: {
+  downloadSession?: StoreState["downloadSession"];
+  rebootPane?: StoreState["rebootPane"];
+  requestPaneDiff?: StoreState["requestPaneDiff"];
+} = {}) {
+  const panes = [downloadPane({ pane_id: DOWNLOAD_PANE_ID, label: "Worker" })];
+  localStorage.setItem(activeTabKey(), String(DOWNLOAD_PANE_ID));
+
+  act(() => {
+    useStore.setState({
+      connected: true,
+      isAttached: true,
+      isDualPane: true,
+      sessionId: DOWNLOAD_SESSION_ID,
+      cliClientId: DOWNLOAD_CLI_CLIENT_ID,
+      messages: [],
+      paneConfigs: panes,
+      paneMessages: Object.fromEntries(panes.map((item) => [paneKey(item.pane_id), []])),
+      paneHasMore: {},
+      paneStatuses: {},
+      paneModes: {},
+      pausedPanes: [],
+      loadingMorePane: null,
+      hasMoreMessages: false,
+      isLoadingMore: false,
+      teamRecords: [],
+      loadPaneMessagesIfNeeded: vi.fn(),
+      loadMoreMessages: vi.fn(),
+      downloadSession,
+      rebootPane,
+      requestPaneDiff,
+    });
+  });
+
+  return { downloadSession, rebootPane, requestPaneDiff };
+}
 
 describe("deriveInitialActiveTabId", () => {
   const base = {
@@ -99,6 +167,38 @@ describe("lazyPaneMessageLoadTargets", () => {
         tabIds: [10, 20],
       }),
     ).toEqual([]);
+  });
+});
+
+describe("TabbedView session download actions", () => {
+  beforeEach(() => {
+    Element.prototype.scrollIntoView = vi.fn();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    localStorage.clear();
+    act(() => {
+      useStore.setState(initialStore, true);
+    });
+  });
+
+  it("calls downloadSession from the toolbar without opening Team or active-tab actions", () => {
+    const downloadSession = vi.fn();
+    const rebootPane = vi.fn();
+    const requestPaneDiff = vi.fn();
+    seedDownloadTabbedView({ downloadSession, rebootPane, requestPaneDiff });
+
+    render(<TabbedView />);
+
+    expect(screen.getByRole("button", { name: "Team" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Download" }));
+
+    expect(downloadSession).toHaveBeenCalledOnce();
+    expect(screen.queryByText(/Team scratchpad/)).toBeNull();
+    expect(rebootPane).not.toHaveBeenCalled();
+    expect(requestPaneDiff).not.toHaveBeenCalled();
+    expect(localStorage.getItem(activeTabKey())).toBe(String(DOWNLOAD_PANE_ID));
   });
 });
 
