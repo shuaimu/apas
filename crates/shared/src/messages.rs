@@ -368,9 +368,9 @@ pub enum ServerToCli {
     /// Resume a specific pane
     ResumePane { session_id: Uuid, pane_id: u32 },
 
-    /// Recycle a pane's agent: kill the running child process, then re-spawn
-    /// the worker with the same config but a fresh agent session id (so
-    /// `--resume` on a too-large or wedged prior session isn't tried).
+    /// Soft-restart a pane's agent: kill the running child process, then
+    /// re-spawn the worker with the same config and current agent session id
+    /// when available, so `--resume` can preserve prior context.
     /// Lighter-weight than `RebootCli`; targets only one pane.
     RebootPane { session_id: Uuid, pane_id: u32 },
 
@@ -758,7 +758,8 @@ pub enum WebToServer {
         pane_id: u32,
     },
 
-    /// Recycle a single pane's agent (see `ServerToCli::RebootPane`).
+    /// Soft-restart a single pane's agent on its existing session when
+    /// possible (see `ServerToCli::RebootPane`).
     RebootPane {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<Uuid>,
@@ -840,7 +841,15 @@ pub enum WebToServer {
     /// Interrupt the agent process running for a pane (e.g. claude wedged on
     /// a long-running Bash tool call). The CLI signals SIGINT to its
     /// subprocess so the current turn aborts and queued input can flow.
-    InterruptPane { pane_id: u32 },
+    /// `session_id` is optional for backward compat: when present the server
+    /// validates/auto-attaches the connection to that session (so "Stop team"
+    /// interrupts survive a just-reconnected connection); when absent it falls
+    /// back to the connection's currently-attached session.
+    InterruptPane {
+        #[serde(default)]
+        session_id: Option<Uuid>,
+        pane_id: u32,
+    },
 
     /// Reorder panes (array of pane_ids in desired order)
     ReorderPanes { pane_ids: Vec<u32> },
@@ -1324,6 +1333,8 @@ pub struct TeamTodoGlobalMsg {
 pub struct PaneTodoPrMsg {
     pub pane_id: u32,
     pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotation: Option<String>,
 }
 
 /// One row in the suggested-workers queue. The Manager pane appends
@@ -2128,6 +2139,36 @@ impl ServerToWeb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reboot_pane_docs_do_not_describe_fresh_sessions() {
+        let source = include_str!("messages.rs");
+        let lines: Vec<&str> = source.lines().collect();
+        let target = ["Reboot", "Pane"].concat();
+        let forbidden = [
+            ["fresh agent", " session"].concat(),
+            ["fresh", " session"].concat(),
+        ];
+
+        for (idx, line) in lines.iter().enumerate() {
+            if !line.contains(&target) {
+                continue;
+            }
+            let start = idx.saturating_sub(4);
+            let end = (idx + 5).min(lines.len());
+            let window = lines[start..end].join("\n").to_ascii_lowercase();
+
+            for phrase in &forbidden {
+                assert!(
+                    !window.contains(phrase),
+                    "{target} docs near line {} mention `{}`:\n{}",
+                    idx + 1,
+                    phrase,
+                    window
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_cli_to_server_register_serialization() {

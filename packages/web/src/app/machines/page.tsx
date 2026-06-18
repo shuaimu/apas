@@ -71,6 +71,7 @@ export default function MachinesPage() {
             <h1 className="text-xl font-semibold">Machines</h1>
           </div>
           <button
+            aria-label="Refresh machines"
             onClick={listMachines}
             className="inline-flex items-center gap-1 rounded border border-gray-300 px-3 py-1.5 text-sm hover:bg-gray-100 dark:border-gray-700 dark:hover:bg-gray-800"
           >
@@ -110,6 +111,7 @@ export default function MachinesPage() {
               </div>
               <div className="grid gap-2 md:grid-cols-[1fr_auto_auto]">
                 <input
+                  aria-label={`MiniMax API key for ${machine.hostname}`}
                   type="text"
                   value={minimaxDrafts[machine.machineId]?.apiKey ?? machine.minimaxBackend?.apiKey ?? ""}
                   onChange={(e) => {
@@ -129,18 +131,20 @@ export default function MachinesPage() {
                   className="rounded border border-gray-300 px-3 py-2 text-sm dark:border-gray-700 dark:bg-gray-950"
                 />
                 <button
+                  aria-label={`Save MiniMax API key for ${machine.hostname}`}
                   onClick={() => {
                     const draft = minimaxDrafts[machine.machineId];
                     const apiKey = draft?.apiKey ?? machine.minimaxBackend?.apiKey ?? "";
+                    const trimmedApiKey = apiKey.trim();
                     setMachineMiniMaxConfig(
                       machine.machineId,
-                      apiKey.trim().length > 0 ? apiKey : undefined,
+                      trimmedApiKey.length > 0 ? trimmedApiKey : undefined,
                       false,
                     );
                     setMinimaxDrafts((prev) => ({
                       ...prev,
                       [machine.machineId]: {
-                        apiKey,
+                        apiKey: trimmedApiKey,
                       },
                     }));
                     setMinimaxSaved((prev) => ({
@@ -153,6 +157,7 @@ export default function MachinesPage() {
                   {minimaxSaved[machine.machineId] ? "Saved" : "Save"}
                 </button>
                 <button
+                  aria-label={`Clear MiniMax API key for ${machine.hostname}`}
                   onClick={() => {
                     setMachineMiniMaxConfig(machine.machineId, undefined, true);
                     setMinimaxDrafts((prev) => ({
@@ -183,6 +188,7 @@ export default function MachinesPage() {
               </div>
               <div className="grid gap-2 md:grid-cols-[1fr_auto_auto]">
                 <input
+                  aria-label={`GLM API key for ${machine.hostname}`}
                   type="text"
                   value={glmDrafts[machine.machineId]?.apiKey ?? machine.glmBackend?.apiKey ?? ""}
                   onChange={(e) => {
@@ -202,18 +208,20 @@ export default function MachinesPage() {
                   className="rounded border border-gray-300 px-3 py-2 text-sm dark:border-gray-700 dark:bg-gray-950"
                 />
                 <button
+                  aria-label={`Save GLM API key for ${machine.hostname}`}
                   onClick={() => {
                     const draft = glmDrafts[machine.machineId];
                     const apiKey = draft?.apiKey ?? machine.glmBackend?.apiKey ?? "";
+                    const trimmedApiKey = apiKey.trim();
                     setMachineGlmConfig(
                       machine.machineId,
-                      apiKey.trim().length > 0 ? apiKey : undefined,
+                      trimmedApiKey.length > 0 ? trimmedApiKey : undefined,
                       false,
                     );
                     setGlmDrafts((prev) => ({
                       ...prev,
                       [machine.machineId]: {
-                        apiKey,
+                        apiKey: trimmedApiKey,
                       },
                     }));
                     setGlmSaved((prev) => ({
@@ -226,6 +234,7 @@ export default function MachinesPage() {
                   {glmSaved[machine.machineId] ? "Saved" : "Save"}
                 </button>
                 <button
+                  aria-label={`Clear GLM API key for ${machine.hostname}`}
                   onClick={() => {
                     setMachineGlmConfig(machine.machineId, undefined, true);
                     setGlmDrafts((prev) => ({
@@ -256,6 +265,7 @@ export default function MachinesPage() {
               </div>
               <div className="grid gap-2 md:grid-cols-[1fr_auto_auto]">
                 <input
+                  aria-label={`DeepSeek API key for ${machine.hostname}`}
                   type="text"
                   value={deepseekDrafts[machine.machineId]?.apiKey ?? machine.deepseekBackend?.apiKey ?? ""}
                   onChange={(e) => {
@@ -275,18 +285,20 @@ export default function MachinesPage() {
                   className="rounded border border-gray-300 px-3 py-2 text-sm dark:border-gray-700 dark:bg-gray-950"
                 />
                 <button
+                  aria-label={`Save DeepSeek API key for ${machine.hostname}`}
                   onClick={() => {
                     const draft = deepseekDrafts[machine.machineId];
                     const apiKey = draft?.apiKey ?? machine.deepseekBackend?.apiKey ?? "";
+                    const trimmedApiKey = apiKey.trim();
                     setMachineDeepseekConfig(
                       machine.machineId,
-                      apiKey.trim().length > 0 ? apiKey : undefined,
+                      trimmedApiKey.length > 0 ? trimmedApiKey : undefined,
                       false,
                     );
                     setDeepseekDrafts((prev) => ({
                       ...prev,
                       [machine.machineId]: {
-                        apiKey,
+                        apiKey: trimmedApiKey,
                       },
                     }));
                     setDeepseekSaved((prev) => ({
@@ -299,6 +311,7 @@ export default function MachinesPage() {
                   {deepseekSaved[machine.machineId] ? "Saved" : "Save"}
                 </button>
                 <button
+                  aria-label={`Clear DeepSeek API key for ${machine.hostname}`}
                   onClick={() => {
                     setMachineDeepseekConfig(machine.machineId, undefined, true);
                     setDeepseekDrafts((prev) => ({
@@ -354,6 +367,7 @@ export default function MachinesPage() {
                     </span>
                     {project.isRunning ? (
                       <button
+                        aria-label={`Stop ${project.name || project.path} on ${machine.hostname}`}
                         onClick={() => stopMachineProjectCli(machine.machineId, project.projectId)}
                         className="inline-flex items-center gap-1 rounded bg-red-600 px-3 py-1.5 text-sm text-white hover:bg-red-700"
                       >
@@ -362,6 +376,7 @@ export default function MachinesPage() {
                       </button>
                     ) : (
                       <button
+                        aria-label={`Start ${project.name || project.path} on ${machine.hostname}`}
                         onClick={() => startMachineProjectCli(machine.machineId, project.projectId)}
                         className="inline-flex items-center gap-1 rounded bg-blue-600 px-3 py-1.5 text-sm text-white hover:bg-blue-700"
                       >

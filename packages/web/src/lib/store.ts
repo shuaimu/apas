@@ -191,6 +191,7 @@ export interface TeamTodoGlobal {
 export interface TeamTodoPaneTodoPr {
   pane_id: number;
   url: string;
+  annotation?: string;
 }
 
 /// Wire shape of one entry in suggested-workers.md. Manager pane writes
@@ -1382,7 +1383,13 @@ export const useStore = create<AppState>((set, get) => ({
       isDualPane: false,
       isAttached: false
     });
-    ws.send(JSON.stringify({ type: "get_session_messages", session_id: sessionId }));
+    // Cap the initial all-panes load. The server returns up to `limit`
+    // messages PER pane; with 6-8 managed panes the default of 100 means
+    // 600-800 messages arrive in one frame and get parsed + markdown-
+    // rendered synchronously on attach, freezing the tab on open. 30/pane
+    // is plenty for the newest-message view; older history pages in on
+    // scroll via loadMoreMessages.
+    ws.send(JSON.stringify({ type: "get_session_messages", session_id: sessionId, limit: 30 }));
   },
 
   sendMessage: (text: string) => {
@@ -2126,9 +2133,13 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   interruptPane: (paneId: number) => {
-    const { ws } = get();
+    const { ws, sessionId } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "interrupt_pane", pane_id: paneId }));
+      // Carry session_id so the server can validate/auto-attach this
+      // connection to the target session — without it, an interrupt sent
+      // right after a reconnect routes by the connection's loosely-tracked
+      // "current" session (or is dropped). Matters for "Stop team".
+      ws.send(JSON.stringify({ type: "interrupt_pane", session_id: sessionId, pane_id: paneId }));
     }
   },
 
@@ -2364,8 +2375,33 @@ function updatePaneModeHint(
   const paneId = normalizePaneId(rawPaneType, normalizeRawPaneId(rawPaneId));
   if (!paneId) return;
   const key = paneKey(paneId);
-  if (get().paneModes[key] === modeHint) return;
-  set((state) => ({ paneModes: { ...state.paneModes, [key]: modeHint } }));
+  set((state) => {
+    const paneModes = mergePaneModeHints(state, { [key]: modeHint });
+    return paneModes === state.paneModes ? {} : { paneModes };
+  });
+}
+
+function authoritativePaneMode(
+  state: Pick<AppState, "paneConfigs">,
+  key: string,
+): PaneType | undefined {
+  const paneId = Number.parseInt(key, 10);
+  if (!Number.isFinite(paneId)) return undefined;
+  return state.paneConfigs.find((pane) => pane.pane_id === paneId)?.mode;
+}
+
+function mergePaneModeHints(
+  state: Pick<AppState, "paneConfigs" | "paneModes">,
+  paneModeHints: Record<string, PaneType>,
+): Record<string, PaneType> {
+  let next = state.paneModes;
+  for (const [key, hintedMode] of Object.entries(paneModeHints)) {
+    const mode = authoritativePaneMode(state, key) ?? hintedMode;
+    if (next[key] === mode) continue;
+    if (next === state.paneModes) next = { ...state.paneModes };
+    next[key] = mode;
+  }
+  return next;
 }
 
 /// Append `message` to the in-memory `sessionCache` entry for a session
@@ -2681,6 +2717,18 @@ function handleServerMessage(
         const sessionToRestore =
           currentSessionId || localStorage.getItem("apas_session_id");
         if (sessionToRestore) {
+          // Register the currently-viewed session's attachment IMMEDIATELY —
+          // before the 500ms attachSession below, the staggered background
+          // fan-out, and the IDB-hydration fan-out. Otherwise a control action
+          // (pause/interrupt from "Stop team") fired right after a reconnect
+          // can land before this session is attached and get dropped. The
+          // server auto-attaches on access as a backstop, but ordering the
+          // current session first avoids the round-trip and wrong-session
+          // routing. An extra attach_session is idempotent server-side.
+          const wsNow = get().ws;
+          if (wsNow && wsNow.readyState === WebSocket.OPEN) {
+            wsNow.send(JSON.stringify({ type: "attach_session", session_id: sessionToRestore }));
+          }
           console.log("Restoring session:", sessionToRestore);
           setTimeout(() => {
             // forceReload=false: keep the cached paneMessages visible across
@@ -3068,7 +3116,7 @@ function handleServerMessage(
         set((state) => ({
           paneStatuses: { ...state.paneStatuses, [paneId]: status },
           paneModes: modeHint
-            ? { ...state.paneModes, [paneId]: modeHint }
+            ? mergePaneModeHints(state, { [paneKey(paneId)]: modeHint })
             : state.paneModes,
           // Legacy compat
           interactiveStatus: paneId === PANE_ID_INTERACTIVE ? status : state.interactiveStatus,
@@ -3478,7 +3526,7 @@ function handleServerMessage(
             };
 
             if (hasPaneModeHints) {
-              updates.paneModes = { ...state.paneModes, ...paneModeHints };
+              updates.paneModes = mergePaneModeHints(state, paneModeHints);
             }
 
             // Update the appropriate hasMore flag
@@ -3494,7 +3542,10 @@ function handleServerMessage(
           });
         } else {
           if (hasPaneModeHints) {
-            set((state) => ({ paneModes: { ...state.paneModes, ...paneModeHints } }));
+            set((state) => {
+              const paneModes = mergePaneModeHints(state, paneModeHints);
+              return paneModes === state.paneModes ? {} : { paneModes };
+            });
           }
           get().prependMessages(parsedMessages, hasMore);
         }
@@ -3541,7 +3592,7 @@ function handleServerMessage(
           hasMoreDeadloop: newPaneHasMore[paneKey(PANE_ID_DEADLOOP)] || false,
           hasMoreInteractive: newPaneHasMore[paneKey(PANE_ID_INTERACTIVE)] || false,
           paneModes: hasPaneModeHints
-            ? { ...existingPaneModes, ...paneModeHints }
+            ? mergePaneModeHints(get(), paneModeHints)
             : existingPaneModes,
           isDualPane: true,
         });
@@ -3568,7 +3619,7 @@ function handleServerMessage(
           messages: state.messages.length === 0 ? parsedMessages : state.messages,
           hasMoreMessages: state.messages.length === 0 ? hasMore : state.hasMoreMessages,
           paneModes: hasPaneModeHints
-            ? { ...state.paneModes, ...paneModeHints }
+            ? mergePaneModeHints(state, paneModeHints)
             : state.paneModes,
         }));
       }
