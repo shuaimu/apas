@@ -1391,6 +1391,15 @@ mod tests {
         }
     }
 
+    fn sorted_pane_statuses(
+        mgr: &SessionManager,
+        session_id: &Uuid,
+    ) -> Vec<(PaneType, u32, String)> {
+        let mut statuses = mgr.get_pane_statuses(session_id);
+        statuses.sort_by_key(|(_, pane_id, _)| *pane_id);
+        statuses
+    }
+
     #[test]
     fn input_id_dedup_remembers_and_caps() {
         let mgr = SessionManager::new();
@@ -1408,6 +1417,60 @@ mod tests {
         }
         assert_eq!(mgr.seen_input_id(&sid, "a"), None);
         assert_eq!(mgr.seen_input_id(&sid, "id-63").as_deref(), Some("t-63"));
+    }
+
+    #[test]
+    fn pane_status_cache_replays_latest_statuses_and_clears_idle_panes() {
+        let mgr = SessionManager::new();
+        let sid = Uuid::new_v4();
+        mgr.create_session(sid, Uuid::new_v4(), Uuid::new_v4());
+
+        assert!(mgr.get_pane_statuses(&sid).is_empty());
+
+        mgr.set_pane_status(
+            &sid,
+            PaneType::Deadloop,
+            11,
+            Some("Thinking...".to_string()),
+        );
+        mgr.set_pane_status(
+            &sid,
+            PaneType::Interactive,
+            22,
+            Some("Waiting for input".to_string()),
+        );
+
+        assert_eq!(
+            sorted_pane_statuses(&mgr, &sid),
+            vec![
+                (PaneType::Deadloop, 11, "Thinking...".to_string()),
+                (PaneType::Interactive, 22, "Waiting for input".to_string()),
+            ]
+        );
+
+        mgr.set_pane_status(
+            &sid,
+            PaneType::Interactive,
+            11,
+            Some("Running tool".to_string()),
+        );
+
+        assert_eq!(
+            sorted_pane_statuses(&mgr, &sid),
+            vec![
+                (PaneType::Interactive, 11, "Running tool".to_string()),
+                (PaneType::Interactive, 22, "Waiting for input".to_string()),
+            ],
+            "latest status and PaneType should replace the previous entry for that pane_id"
+        );
+
+        mgr.set_pane_status(&sid, PaneType::Interactive, 11, None);
+
+        assert_eq!(
+            sorted_pane_statuses(&mgr, &sid),
+            vec![(PaneType::Interactive, 22, "Waiting for input".to_string())],
+            "None status clears only the matching pane entry"
+        );
     }
 
     #[test]
