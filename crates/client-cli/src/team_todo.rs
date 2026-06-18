@@ -938,6 +938,7 @@ pub fn add_user_todo(todo: &mut TeamTodo, title: &str, body: String) -> Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     fn sample_doc() -> &'static str {
         // Includes both kinds of section, the optional role hint syntax,
@@ -1025,6 +1026,56 @@ The test fixtures bake session cookies in; replace with a JWT minter.\n\
             rendered, rendered_again,
             "serialize must be idempotent on a parsed-then-serialized doc"
         );
+    }
+
+    #[test]
+    fn to_wire_with_cursors_trims_agent_cursor_files() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".apas-tech-lead-cursor"),
+            "  2026-06-17T10:00:00-04:00\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join(".apas-reviewer-cursor"),
+            "\n2026-06-17T10:05:00-04:00  \n",
+        )
+        .unwrap();
+
+        let got = to_wire_with_cursors(&parse(sample_doc()).unwrap(), tmp.path());
+
+        assert_eq!(
+            got.tech_lead_cursor.as_deref(),
+            Some("2026-06-17T10:00:00-04:00")
+        );
+        assert_eq!(
+            got.reviewer_cursor.as_deref(),
+            Some("2026-06-17T10:05:00-04:00")
+        );
+    }
+
+    #[test]
+    fn to_wire_with_cursors_returns_none_for_missing_or_blank_cursor_files() {
+        let tmp = TempDir::new().unwrap();
+        let todo = parse(sample_doc()).unwrap();
+
+        let missing = to_wire_with_cursors(&todo, tmp.path());
+        assert_eq!(missing.tech_lead_cursor, None);
+        assert_eq!(missing.reviewer_cursor, None);
+
+        std::fs::write(tmp.path().join(".apas-tech-lead-cursor"), "  \n\t").unwrap();
+        std::fs::write(tmp.path().join(".apas-reviewer-cursor"), "\n\n").unwrap();
+        let blank = to_wire_with_cursors(&todo, tmp.path());
+        assert_eq!(blank.tech_lead_cursor, None);
+        assert_eq!(blank.reviewer_cursor, None);
+    }
+
+    #[test]
+    fn to_wire_keeps_cursor_metadata_empty() {
+        let got = to_wire(&parse(sample_doc()).unwrap());
+
+        assert_eq!(got.tech_lead_cursor, None);
+        assert_eq!(got.reviewer_cursor, None);
     }
 
     #[test]

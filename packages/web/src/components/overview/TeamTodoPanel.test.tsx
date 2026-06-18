@@ -140,16 +140,26 @@ function seedAgentStatus({
   lastActivity,
   cursor = null,
   present = true,
+  reviewerLastActivity = null,
+  reviewerCursor = null,
+  reviewerPresent = false,
 }: {
   lastActivity: Date | null;
   cursor?: string | null;
   present?: boolean;
+  reviewerLastActivity?: Date | null;
+  reviewerCursor?: string | null;
+  reviewerPresent?: boolean;
 }) {
   const paneId = 178;
-  const messages =
-    lastActivity == null
-      ? {}
-      : { [paneKey(paneId)]: [{ timestamp: lastActivity }] };
+  const reviewerPaneId = 4;
+  const messages: Record<string, { timestamp: Date }[]> = {};
+  if (lastActivity != null) {
+    messages[paneKey(paneId)] = [{ timestamp: lastActivity }];
+  }
+  if (reviewerLastActivity != null) {
+    messages[paneKey(reviewerPaneId)] = [{ timestamp: reviewerLastActivity }];
+  }
   const techLeadPane: PaneConfig = {
     pane_id: paneId,
     provider: "claude",
@@ -158,6 +168,18 @@ function seedAgentStatus({
     is_paused: false,
     role: "tech lead",
   };
+  const reviewerPane: PaneConfig = {
+    pane_id: reviewerPaneId,
+    provider: "claude",
+    mode: "deadloop",
+    session_id: "reviewer-session",
+    is_paused: false,
+    role: "reviewer",
+  };
+  const paneConfigs = [
+    ...(present ? [techLeadPane] : []),
+    ...(reviewerPresent ? [reviewerPane] : []),
+  ];
   act(() => {
     useStore.setState({
       sessionId: "test-session",
@@ -168,12 +190,13 @@ function seedAgentStatus({
           {
             ...emptyTeamTodo(),
             tech_lead_cursor: cursor,
+            reviewer_cursor: reviewerCursor,
           },
         ],
       ]),
       fetchTeamTodo: vi.fn(),
-      paneConfigs: present ? [techLeadPane] : [],
-      paneMessages: messages as never,
+      paneConfigs,
+      paneMessages: messages,
     });
   });
 }
@@ -534,6 +557,27 @@ describe("AgentStatusRow accessible indicators", () => {
     expect(badge.getAttribute("data-agent-status")).toBe(status);
     expect(screen.getByText(relativeText)).toBeTruthy();
     expect(screen.getByText(/cursor 2m ago/)).toBeTruthy();
+  });
+
+  it("renders Tech Lead and Reviewer cursor ages with raw cursor titles", () => {
+    const techLeadCursor = "2026-06-16T11:58:00Z";
+    const reviewerCursor = "2026-06-16T11:45:00Z";
+    seedAgentStatus({
+      lastActivity: new Date(NOW.getTime() - 60_000),
+      cursor: techLeadCursor,
+      reviewerLastActivity: new Date(NOW.getTime() - 10 * 60_000),
+      reviewerCursor,
+      reviewerPresent: true,
+    });
+
+    render(<TeamTodoPanel />);
+
+    const techLeadLine = screen.getByTitle(`cursor: ${techLeadCursor}`);
+    const reviewerLine = screen.getByTitle(`cursor: ${reviewerCursor}`);
+    expect(techLeadLine.textContent).toContain("Tech Lead");
+    expect(techLeadLine.textContent).toContain("cursor 2m ago");
+    expect(reviewerLine.textContent).toContain("Reviewer");
+    expect(reviewerLine.textContent).toContain("cursor 15m ago");
   });
 
   it("renders unknown activity when a running pane has no messages", () => {
