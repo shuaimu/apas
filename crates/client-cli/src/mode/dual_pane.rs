@@ -102,6 +102,24 @@ fn truncate_str_at_char_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+fn update_project_flags(
+    project_dir: &Path,
+    session_id: Uuid,
+    auto_approve_todos: bool,
+    auto_merge_prs: bool,
+) -> Result<CliToServer> {
+    let mut meta = get_or_create_project(project_dir)?;
+    meta.auto_approve_todos = auto_approve_todos;
+    meta.auto_merge_prs = auto_merge_prs;
+    save_project(project_dir, &meta)?;
+
+    Ok(CliToServer::ProjectFlagsChanged {
+        session_id,
+        auto_approve_todos,
+        auto_merge_prs,
+    })
+}
+
 /// Spawn whichever team panes (Manager, Tech Lead, Reviewer, Developer)
 /// are missing for this project. Idempotent: each role is gated on
 /// whether a managed pane with that role already exists in
@@ -833,6 +851,8 @@ type PaneMetas = Arc<Mutex<HashMap<u32, PaneMeta>>>;
 
 const ASK_USER_QUESTION_AUTO_CANCEL_STATUS: &str =
     "[Pending question auto-cancelled: new message replaces it]";
+const MANAGED_PANE_CREATE_PR_ERROR: &str =
+    "Managed team panes open PRs through the Reviewer-approved Team TODO flow; manual PR creation is disabled for this pane.";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CancelledAskUserQuestion {
@@ -908,6 +928,18 @@ fn auto_cancel_pending_questions_for_new_input(
         });
     }
     cancelled
+}
+
+fn manual_create_pr_worktree_path(
+    pane_metas: &PaneMetas,
+    target_pane: u32,
+) -> Result<Option<String>, String> {
+    let metas = pane_metas.lock().unwrap();
+    match metas.get(&target_pane) {
+        Some(meta) if meta.managed => Err(MANAGED_PANE_CREATE_PR_ERROR.to_string()),
+        Some(meta) => Ok(meta.worktree_path.clone()),
+        None => Ok(None),
+    }
 }
 
 fn route_web_input_to_pane(
@@ -4000,22 +4032,24 @@ mod tests {
         active_usage_providers, auto_cancel_pending_questions_for_new_input, build_agent_args,
         build_agent_switch_respawn_event, build_deadloop_agent_args, build_pane_reboot_events,
         build_pane_env_overrides_from_keys, build_pane_list, boot_restore_try_resume_first,
-        is_codex_stale_session_error, pane_label_or_default, promote_pane_to_managed,
-        reset_deadloop_codex_stale_session, resolve_pane_binary_path, route_web_input_to_pane,
-        restored_pane_mode_and_pause, run_deadloop_session_inner, save_pane_configs,
-        should_recover_deadloop_stale_session, start_bot_preserved_fields,
-        truncate_str_at_char_boundary, ASK_USER_QUESTION_AUTO_CANCEL_STATUS, InputChannels,
-        PaneInputRouteResult, PaneMeta, PaneMetas, PanePauses, PaneStopRequests,
-        PendingAskQuestion, DEEPSEEK_DEFAULT_MODEL,
+        deadloop_wait_plan, is_codex_stale_session_error, manual_create_pr_worktree_path,
+        pane_label_or_default, promote_pane_to_managed, reset_deadloop_codex_stale_session,
+        resolve_pane_binary_path,
+        route_web_input_to_pane, restored_pane_mode_and_pause, run_deadloop_session_inner,
+        save_pane_configs, should_recover_deadloop_stale_session, start_bot_preserved_fields,
+        truncate_str_at_char_boundary, update_project_flags,
+        ASK_USER_QUESTION_AUTO_CANCEL_STATUS, InputChannels, PaneInputRouteResult, PaneMeta,
+        PaneMetas, PanePauses, PaneStopRequests, PendingAskQuestion, DEEPSEEK_DEFAULT_MODEL,
+        MANAGED_PANE_CREATE_PR_ERROR,
     };
-    use crate::project::get_or_create_project;
+    use crate::project::{get_or_create_project, save_project};
     use crate::tui::{PaneOutput, TuiEvent};
     use shared::{CliToServer, Provider};
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio::sync::mpsc as tokio_mpsc;
     use uuid::Uuid;
 
@@ -4023,6 +4057,25 @@ mod tests {
         "Work on tasks defined in TODO.md.\n1. Analyze\n2. Implement\n3. Test";
     const WEB_PROVIDER_OPTIONS_TS: &str =
         include_str!("../../../../packages/web/src/lib/providerOptions.ts");
+
+    #[test]
+    fn deadloop_wait_cursor_is_sampled_at_wait_entry() {
+        let last_started_at = Instant::now();
+        let self_write_at = last_started_at + Duration::from_millis(20);
+        let wait_entry_at = last_started_at + Duration::from_millis(50);
+        let min_interval = Duration::from_secs(10);
+
+        let plan = deadloop_wait_plan(last_started_at, min_interval, wait_entry_at)
+            .expect("min interval still has time remaining");
+
+        assert_eq!(plan.cursor, wait_entry_at);
+        assert!(plan.cursor > self_write_at);
+        assert_ne!(plan.cursor, last_started_at);
+        assert_eq!(
+            plan.remaining,
+            min_interval - Duration::from_millis(50)
+        );
+    }
 
     fn extract_ts_string_const<'a>(source: &'a str, name: &str) -> Option<&'a str> {
         let prefix = format!("export const {name} = ");
@@ -4127,6 +4180,51 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn manual_create_pr_rejects_managed_pane() {
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+        pane_metas.lock().unwrap().insert(
+            42,
+            test_pane_meta(
+                Provider::Claude,
+                true,
+                None,
+                Arc::new(Mutex::new(None)),
+            ),
+        );
+
+        let err = manual_create_pr_worktree_path(&pane_metas, 42).unwrap_err();
+
+        assert_eq!(err, MANAGED_PANE_CREATE_PR_ERROR);
+    }
+
+    #[test]
+    fn manual_create_pr_preserves_unmanaged_worktree_path() {
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+        pane_metas.lock().unwrap().insert(
+            42,
+            test_pane_meta(
+                Provider::Claude,
+                false,
+                None,
+                Arc::new(Mutex::new(None)),
+            ),
+        );
+
+        let worktree_path = manual_create_pr_worktree_path(&pane_metas, 42).unwrap();
+
+        assert_eq!(worktree_path.as_deref(), Some("/tmp/apas-side-dev"));
+    }
+
+    #[test]
+    fn manual_create_pr_preserves_missing_pane_fallback() {
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+
+        let worktree_path = manual_create_pr_worktree_path(&pane_metas, 404).unwrap();
+
+        assert_eq!(worktree_path, None);
     }
 
     #[test]
@@ -4551,6 +4649,73 @@ mod tests {
         let metadata = get_or_create_project(dir.path()).expect("metadata should reload");
         assert!(!metadata.is_paused);
         assert!(metadata.panes.iter().all(|pane| !pane.is_paused));
+    }
+
+    #[test]
+    fn update_project_flags_persists_flags_and_preserves_panes() {
+        let dir = tempfile::tempdir().expect("temp project dir");
+        let mut metadata = get_or_create_project(dir.path()).expect("metadata should initialize");
+        metadata.auto_approve_todos = false;
+        metadata.auto_merge_prs = false;
+        metadata.panes = vec![shared::PaneConfig {
+            pane_id: 42,
+            provider: Provider::Codex,
+            mode: shared::PaneMode::Deadloop,
+            session_id: Uuid::new_v4(),
+            is_paused: true,
+            stop_requested: false,
+            prompt: Some("Keep implementing".to_string()),
+            min_iteration_interval_minutes: Some(7),
+            label: Some("Developer".to_string()),
+            model: Some("gpt-5-codex".to_string()),
+            effort: Some("high".to_string()),
+            worktree_path: Some("/tmp/apas-worker".to_string()),
+            role: Some("developer".to_string()),
+            goal: Some("Ship the delegated task".to_string()),
+            backstory: Some("A managed worker".to_string()),
+            plan_review_mode: shared::PlanReviewMode::RiskyOnly,
+            manual_mode: true,
+            managed: true,
+        }];
+        let original_pane = metadata.panes[0].clone();
+        save_project(dir.path(), &metadata).expect("seed metadata");
+
+        let session_id = Uuid::new_v4();
+        let echo = update_project_flags(dir.path(), session_id, true, false)
+            .expect("flags should persist");
+
+        match echo {
+            CliToServer::ProjectFlagsChanged {
+                session_id: echoed_session_id,
+                auto_approve_todos,
+                auto_merge_prs,
+            } => {
+                assert_eq!(echoed_session_id, session_id);
+                assert!(auto_approve_todos);
+                assert!(!auto_merge_prs);
+            }
+            other => panic!("unexpected echo message: {other:?}"),
+        }
+
+        let reloaded = get_or_create_project(dir.path()).expect("metadata should reload");
+        assert!(reloaded.auto_approve_todos);
+        assert!(!reloaded.auto_merge_prs);
+        assert_eq!(reloaded.panes.len(), 1);
+        let pane = &reloaded.panes[0];
+        assert_eq!(pane.pane_id, original_pane.pane_id);
+        assert_eq!(pane.provider, original_pane.provider);
+        assert_eq!(pane.session_id, original_pane.session_id);
+        assert_eq!(pane.is_paused, original_pane.is_paused);
+        assert_eq!(pane.label, original_pane.label);
+        assert_eq!(pane.model, original_pane.model);
+        assert_eq!(pane.effort, original_pane.effort);
+        assert_eq!(pane.worktree_path, original_pane.worktree_path);
+        assert_eq!(pane.role, original_pane.role);
+        assert_eq!(pane.goal, original_pane.goal);
+        assert_eq!(pane.backstory, original_pane.backstory);
+        assert_eq!(pane.plan_review_mode, original_pane.plan_review_mode);
+        assert_eq!(pane.manual_mode, original_pane.manual_mode);
+        assert_eq!(pane.managed, original_pane.managed);
     }
 
     #[test]
@@ -5612,6 +5777,33 @@ fn run_deadloop_session(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeadloopWaitPlan {
+    remaining: Duration,
+    cursor: Instant,
+}
+
+fn deadloop_wait_plan(
+    last_iteration_started_at: Instant,
+    min_iteration_interval: Duration,
+    wait_entry_at: Instant,
+) -> Option<DeadloopWaitPlan> {
+    let elapsed_since_last_start = wait_entry_at
+        .checked_duration_since(last_iteration_started_at)
+        .unwrap_or(Duration::ZERO);
+    let remaining = min_iteration_interval
+        .checked_sub(elapsed_since_last_start)
+        .unwrap_or(Duration::ZERO);
+    if remaining.is_zero() {
+        None
+    } else {
+        Some(DeadloopWaitPlan {
+            remaining,
+            cursor: wait_entry_at,
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_deadloop_session_inner(
     binary_path: &str,
@@ -5762,14 +5954,13 @@ fn run_deadloop_session_inner(
             // timer fires — whichever first. Replaces the pure-sleep
             // loop that paid tokens on every cycle even when nothing
             // had moved.
-            let remaining = min_iteration_interval
-                .checked_sub(last_started_at.elapsed())
-                .unwrap_or(Duration::ZERO);
-            if !remaining.is_zero() {
+            if let Some(wait_plan) =
+                deadloop_wait_plan(last_started_at, min_iteration_interval, Instant::now())
+            {
                 let _ = output_tx.send(PaneOutput {
                     text: format!(
                         "[Waiting for file change or {}s timeout (min interval: {}m)]",
-                        remaining.as_secs(),
+                        wait_plan.remaining.as_secs(),
                         min_iteration_interval_minutes
                     ),
                     pane_id,
@@ -5782,10 +5973,9 @@ fn run_deadloop_session_inner(
                 // the loop the instant it goes to sleep. That bug
                 // collapses the 15-minute min interval to ~0s and was
                 // the symptom of "the Tech Lead loops constantly".
-                let wait_cursor = Instant::now();
                 let reason = file_watcher.wait_until(
-                    Some(wait_cursor),
-                    remaining,
+                    Some(wait_plan.cursor),
+                    wait_plan.remaining,
                     &shutdown,
                     &pause,
                     &stop_requested,
@@ -10238,46 +10428,46 @@ async fn run_server_connection(
                                                 auto_merge_prs,
                                             } => {
                                                 let project_dir = std::path::Path::new(&working_dir).to_path_buf();
-                                                match crate::project::get_or_create_project(&project_dir) {
-                                                    Ok(mut meta) => {
-                                                        meta.auto_approve_todos = auto_approve_todos;
-                                                        meta.auto_merge_prs = auto_merge_prs;
-                                                        if let Err(err) = crate::project::save_project(&project_dir, &meta) {
-                                                            tracing::warn!("failed to persist project flags: {}", err);
-                                                        } else {
-                                                            tracing::info!(
-                                                                auto_approve_todos,
-                                                                auto_merge_prs,
-                                                                "tech-lead autonomy flags updated"
-                                                            );
-                                                        }
-                                                        // Echo back so peer web clients reconcile.
-                                                        let echo = CliToServer::ProjectFlagsChanged {
-                                                            session_id,
+                                                match update_project_flags(
+                                                    &project_dir,
+                                                    session_id,
+                                                    auto_approve_todos,
+                                                    auto_merge_prs,
+                                                ) {
+                                                    Ok(echo) => {
+                                                        tracing::info!(
                                                             auto_approve_todos,
                                                             auto_merge_prs,
-                                                        };
+                                                            "tech-lead autonomy flags updated"
+                                                        );
+                                                        // Echo back so peer web clients reconcile.
                                                         if let Ok(text) = serde_json::to_string(&echo) {
                                                             let _ = ws_sender.send(Message::Text(text.into())).await;
                                                         }
                                                     }
                                                     Err(err) => {
-                                                        tracing::warn!("failed to load .apas for flag update: {}", err);
+                                                        tracing::warn!("failed to persist project flags: {}", err);
                                                     }
                                                 }
                                             }
                                             ServerToCli::CreatePr { session_id: _, pane_id: pr_pane_id } => {
-                                                let wt: Option<String> = {
-                                                    let metas = pane_metas.lock().unwrap();
-                                                    metas.get(&pr_pane_id).and_then(|m| m.worktree_path.clone())
+                                                let result = match manual_create_pr_worktree_path(
+                                                    &pane_metas,
+                                                    pr_pane_id,
+                                                ) {
+                                                    Ok(wt) => {
+                                                        // gh pr create + git push are blocking on a network call;
+                                                        // run in spawn_blocking so the WS reader loop stays responsive.
+                                                        tokio::task::spawn_blocking(move || {
+                                                            crate::worktree::create_pr_for_pane(wt.as_deref())
+                                                        })
+                                                        .await
+                                                        .unwrap_or_else(|e| {
+                                                            Err(anyhow::anyhow!("task join: {}", e))
+                                                        })
+                                                    }
+                                                    Err(err) => Err(anyhow::anyhow!("{}", err)),
                                                 };
-                                                // gh pr create + git push are blocking on a network call;
-                                                // run in spawn_blocking so the WS reader loop stays responsive.
-                                                let result = tokio::task::spawn_blocking(move || {
-                                                    crate::worktree::create_pr_for_pane(wt.as_deref())
-                                                })
-                                                .await
-                                                .unwrap_or_else(|e| Err(anyhow::anyhow!("task join: {}", e)));
                                                 let pr_msg = match result {
                                                     Ok(url) => CliToServer::PrCreated {
                                                         session_id,
