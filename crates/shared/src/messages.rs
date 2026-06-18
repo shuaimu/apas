@@ -317,8 +317,8 @@ pub enum ServerToCli {
     FetchTeamTodo { session_id: Uuid },
 
     /// Server forwards a web-side approval / rejection for a Global
-    /// TODO. CLI runs the `apas todo` action in-process and republishes
-    /// the state.
+    /// TODO. CLI applies it through in-process `team_todo` helpers and
+    /// republishes `CliToServer::TeamTodoState`.
     TodoApproval {
         session_id: Uuid,
         todo_id: String,
