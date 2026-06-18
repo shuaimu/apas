@@ -671,11 +671,41 @@ function formatPaneList(panes: number[]): string {
 /// PR landed and re-polling merged PRs forever is wasteful).
 type PrFetchState =
   | { kind: "loading" }
-  | { kind: "open" }
+  | { kind: "open"; readiness?: PrReadiness }
   | { kind: "merged" }
   | { kind: "closed" }
   | { kind: "error" }
   | { kind: "done" };
+
+type PrReadiness =
+  | "review_requested"
+  | "changes_requested"
+  | "checks_pending"
+  | "checks_failing"
+  | "merge_conflict"
+  | "ready";
+
+interface PullRequestJson {
+  state?: string;
+  merged?: boolean;
+  draft?: boolean;
+  mergeable?: boolean | null;
+  mergeable_state?: string | null;
+  requested_reviewers?: unknown[];
+  statuses_url?: string;
+}
+
+interface CommitStatusJson {
+  state?: string;
+  context?: string;
+}
+
+type CommitStatusState = "success" | "pending" | "failure" | "error";
+
+interface PullReviewJson {
+  state?: string;
+  submitted_at?: string | null;
+}
 
 function PrLink({
   paneId,
@@ -695,24 +725,35 @@ function PrLink({
     if (skipFetch) return;
     let cancelled = false;
     const url = `https://api.github.com/repos/${parsed.owner}/${parsed.repo}/pulls/${parsed.num}`;
-    fetch(url)
-      .then(async (r) => {
-        if (r.status === 403 || r.status === 429) {
-          throw new Error("rate-limit");
+    const load = async () => {
+      try {
+        const pull = (await fetchJson(url)) as PullRequestJson;
+        let statusState: CommitStatusState | undefined;
+        let reviewState: "APPROVED" | "CHANGES_REQUESTED" | undefined;
+        if (pull.state === "open" && pull.statuses_url) {
+          try {
+            statusState = commitStatusState(await fetchJson(pull.statuses_url));
+          } catch {
+            statusState = undefined;
+          }
         }
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.json();
-      })
-      .then((j) => {
-        if (cancelled) return;
-        if (j && j.merged === true) setState({ kind: "merged" });
-        else if (j && j.state === "open") setState({ kind: "open" });
-        else if (j && j.state === "closed") setState({ kind: "closed" });
-        else setState({ kind: "error" });
-      })
-      .catch(() => {
+        if (pull.state === "open") {
+          try {
+            reviewState = latestReviewState(
+              await fetchJson(`${url}/reviews`),
+            );
+          } catch {
+            reviewState = undefined;
+          }
+        }
+        if (!cancelled) {
+          setState(prFetchStateFromPull(pull, statusState, reviewState));
+        }
+      } catch {
         if (!cancelled) setState({ kind: "error" });
-      });
+      }
+    };
+    load();
     return () => {
       cancelled = true;
     };
@@ -730,8 +771,112 @@ function PrLink({
         PR #{parsed.num}{paneId ? ` (pane ${paneId})` : ""} ↗
       </a>
       <PrStateBadge state={state} />
+      <PrReadinessBadge readiness={state.kind === "open" ? state.readiness : undefined} />
     </span>
   );
+}
+
+async function fetchJson(url: string): Promise<unknown> {
+  const r = await fetch(url);
+  if (r.status === 403 || r.status === 429) {
+    throw new Error("rate-limit");
+  }
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
+function prFetchStateFromPull(
+  pull: PullRequestJson | null,
+  statusState: CommitStatusState | undefined,
+  reviewState: "APPROVED" | "CHANGES_REQUESTED" | undefined,
+): PrFetchState {
+  if (!pull) return { kind: "error" };
+  if (pull.merged === true) return { kind: "merged" };
+  if (pull.state === "closed") return { kind: "closed" };
+  if (pull.state !== "open") return { kind: "error" };
+  return { kind: "open", readiness: prReadiness(pull, statusState, reviewState) };
+}
+
+function commitStatusState(statusPayload: unknown): CommitStatusState | undefined {
+  if (!Array.isArray(statusPayload)) {
+    const state = (statusPayload as CommitStatusJson | null)?.state;
+    return normalizeCommitStatusState(state);
+  }
+  const latestByContext = new Map<string, CommitStatusState>();
+  statusPayload.forEach((entry, index) => {
+    const status = entry as CommitStatusJson | null;
+    const state = normalizeCommitStatusState(status?.state);
+    if (!state) return;
+    const context = status?.context ?? `status-${index}`;
+    if (!latestByContext.has(context)) latestByContext.set(context, state);
+  });
+  const states = Array.from(latestByContext.values());
+  if (states.length === 0) return undefined;
+  if (states.some((state) => state === "failure" || state === "error")) {
+    return "failure";
+  }
+  if (states.some((state) => state === "pending")) return "pending";
+  return "success";
+}
+
+function normalizeCommitStatusState(
+  state: string | undefined,
+): CommitStatusState | undefined {
+  const normalized = state?.toLowerCase();
+  if (
+    normalized === "success" ||
+    normalized === "pending" ||
+    normalized === "failure" ||
+    normalized === "error"
+  ) {
+    return normalized;
+  }
+  return undefined;
+}
+
+function latestReviewState(
+  reviewsPayload: unknown,
+): "APPROVED" | "CHANGES_REQUESTED" | undefined {
+  if (!Array.isArray(reviewsPayload)) return undefined;
+  return [...reviewsPayload]
+    .sort((a, b) => {
+      const aTs = Date.parse((a as PullReviewJson).submitted_at ?? "");
+      const bTs = Date.parse((b as PullReviewJson).submitted_at ?? "");
+      return (Number.isFinite(bTs) ? bTs : 0) - (Number.isFinite(aTs) ? aTs : 0);
+    })
+    .map((review) => ((review as PullReviewJson).state ?? "").toUpperCase())
+    .find(
+      (state): state is "APPROVED" | "CHANGES_REQUESTED" =>
+        state === "APPROVED" || state === "CHANGES_REQUESTED",
+    );
+}
+
+function prReadiness(
+  pull: PullRequestJson,
+  checkState: CommitStatusState | undefined,
+  reviewState: "APPROVED" | "CHANGES_REQUESTED" | undefined,
+): PrReadiness | undefined {
+  const mergeState = (pull.mergeable_state ?? "").toString().toLowerCase();
+
+  if (reviewState === "CHANGES_REQUESTED") return "changes_requested";
+  if (checkState === "failure" || checkState === "error") return "checks_failing";
+  if (checkState === "pending") return "checks_pending";
+  if (pull.mergeable === false || mergeState === "dirty") return "merge_conflict";
+  if (
+    pull.draft === true ||
+    (pull.requested_reviewers?.length ?? 0) > 0
+  ) {
+    return "review_requested";
+  }
+  if (
+    reviewState === "APPROVED" &&
+    (checkState === "success" || checkState === undefined) &&
+    pull.mergeable !== false &&
+    mergeState !== "dirty"
+  ) {
+    return "ready";
+  }
+  return undefined;
 }
 
 function PrStateBadge({ state }: { state: PrFetchState }) {
@@ -773,6 +918,60 @@ function PrStateBadge({ state }: { state: PrFetchState }) {
     <span
       data-testid="pr-state-badge"
       data-pr-state={state.kind}
+      className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${tone}`}
+    >
+      {label}
+    </span>
+  );
+}
+
+function PrReadinessBadge({ readiness }: { readiness?: PrReadiness }) {
+  if (!readiness) return null;
+  const { label, tone, title } = (() => {
+    switch (readiness) {
+      case "review_requested":
+        return {
+          label: "review requested",
+          title: "This PR is still waiting on review.",
+          tone: "bg-blue-100 text-blue-800 dark:bg-blue-950/40 dark:text-blue-300",
+        };
+      case "changes_requested":
+        return {
+          label: "changes requested",
+          title: "A reviewer requested changes on this PR.",
+          tone: "bg-rose-100 text-rose-800 dark:bg-rose-950/40 dark:text-rose-300",
+        };
+      case "checks_pending":
+        return {
+          label: "checks pending",
+          title: "GitHub commit statuses are still pending.",
+          tone: "bg-amber-100 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300",
+        };
+      case "checks_failing":
+        return {
+          label: "checks failing",
+          title: "GitHub commit statuses are failing.",
+          tone: "bg-rose-100 text-rose-800 dark:bg-rose-950/40 dark:text-rose-300",
+        };
+      case "merge_conflict":
+        return {
+          label: "merge conflict",
+          title: "GitHub reports the PR is not currently mergeable.",
+          tone: "bg-orange-100 text-orange-800 dark:bg-orange-950/40 dark:text-orange-300",
+        };
+      case "ready":
+        return {
+          label: "ready",
+          title: "Review, checks, and mergeability look ready from GitHub data.",
+          tone: "bg-emerald-100 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300",
+        };
+    }
+  })();
+  return (
+    <span
+      data-testid="pr-readiness-badge"
+      data-pr-readiness={readiness}
+      title={title}
       className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${tone}`}
     >
       {label}
