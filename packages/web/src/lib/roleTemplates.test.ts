@@ -19,12 +19,15 @@ describe("ROLE_TEMPLATES", () => {
     const goal = developer!.goal;
     const backstory = developer!.backstory;
 
-    expect(goal).toContain("mark the task done");
-    expect(goal).toContain("let the Tech Lead track PR state and comments");
+    expect(goal).toContain("publish the pr-opened decision");
+    expect(goal).toContain("let the Tech Lead track PR state, comments, and team-todo status");
     expect(backstory).toContain("Do NOT idle-poll your own PR state or comments");
-    expect(backstory).toContain("The Tech Lead owns PR state tracking");
+    expect(backstory).toContain("Do not edit team-todo.md");
+    expect(backstory).toContain("mark the assigned task done yourself");
+    expect(backstory).toContain("The Tech Lead owns PR state tracking, team-todo status");
     expect(backstory).toContain("pr-comments:<url>");
     expect(`${goal}\n${backstory}`).not.toContain("wait for the human to merge");
+    expect(`${goal}\n${backstory}`).not.toContain("mark the task done");
     expect(backstory).not.toContain("gh pr view <url>");
     expect(backstory).not.toContain("git -C <worktree> checkout master");
   });
