@@ -745,6 +745,95 @@ fn restored_pane_mode_and_pause(
     (mode, is_paused)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagedBuiltInPromptKind {
+    Manager,
+    TechLead,
+    Reviewer,
+    DefaultDeveloper,
+}
+
+fn managed_builtin_prompt_kind(pane: &shared::PaneConfig) -> Option<ManagedBuiltInPromptKind> {
+    if !pane.managed {
+        return None;
+    }
+
+    let lower = pane.role.as_deref().unwrap_or("").to_ascii_lowercase();
+    if lower.contains("manager") && !lower.contains("tech lead") {
+        return Some(ManagedBuiltInPromptKind::Manager);
+    }
+    if lower.contains("tech lead") {
+        return Some(ManagedBuiltInPromptKind::TechLead);
+    }
+    if lower.contains("reviewer") {
+        return Some(ManagedBuiltInPromptKind::Reviewer);
+    }
+    if lower.contains("developer") && pane.worktree_path.is_none() {
+        return Some(ManagedBuiltInPromptKind::DefaultDeveloper);
+    }
+    None
+}
+
+fn current_managed_builtin_prompt(kind: ManagedBuiltInPromptKind) -> Option<&'static str> {
+    match kind {
+        // Manager panes are interactive and currently do not store a
+        // built-in prompt in PaneConfig.
+        ManagedBuiltInPromptKind::Manager => None,
+        ManagedBuiltInPromptKind::TechLead => Some(crate::role::TECH_LEAD_DEADLOOP_PROMPT),
+        ManagedBuiltInPromptKind::Reviewer => Some(crate::role::REVIEWER_DEADLOOP_PROMPT),
+        ManagedBuiltInPromptKind::DefaultDeveloper => Some(
+            crate::role::DEFAULT_DEVELOPER_DEADLOOP_PROMPT,
+        ),
+    }
+}
+
+fn prompt_matches_known_stale_builtin(kind: ManagedBuiltInPromptKind, prompt: &str) -> bool {
+    match kind {
+        ManagedBuiltInPromptKind::TechLead => {
+            prompt.starts_with(
+                "You are this project's Tech Lead, running as an autonomous deadloop.",
+            ) && prompt.contains("Every iteration, in order:")
+                && prompt.contains("2. Walk the Global TODOs and act on each.")
+                && prompt.contains("`status: approved` with no subtasks under it")
+                && prompt.contains("expand: write per-worker subtask entries")
+                && !prompt.contains("backlog backpressure")
+                && !prompt.contains("one additional `pending` subtask")
+        }
+        ManagedBuiltInPromptKind::Manager
+        | ManagedBuiltInPromptKind::Reviewer
+        | ManagedBuiltInPromptKind::DefaultDeveloper => false,
+    }
+}
+
+fn refresh_stale_managed_builtin_prompts(panes: &mut [shared::PaneConfig]) -> usize {
+    let mut refreshed = 0;
+    for pane in panes {
+        let Some(kind) = managed_builtin_prompt_kind(pane) else {
+            continue;
+        };
+        let Some(current_prompt) = current_managed_builtin_prompt(kind) else {
+            continue;
+        };
+        let Some(saved_prompt) = pane.prompt.as_deref() else {
+            continue;
+        };
+        if saved_prompt == current_prompt {
+            continue;
+        }
+        if prompt_matches_known_stale_builtin(kind, saved_prompt) {
+            tracing::info!(
+                pane_id = pane.pane_id,
+                role = ?pane.role,
+                ?kind,
+                "refreshing stale managed built-in prompt"
+            );
+            pane.prompt = Some(current_prompt.to_string());
+            refreshed += 1;
+        }
+    }
+    refreshed
+}
+
 fn boot_restore_try_resume_first(provider: &Provider, model: Option<&str>) -> bool {
     matches!(provider, Provider::Claude)
         && !is_minimax_model(model)
@@ -1090,51 +1179,14 @@ async fn run_inner(
             pane.effort = Some("max".to_string());
         }
     }
-    // Refresh deadloop prompts for known orchestrator roles to the
-    // current baked-in constants. The per-pane prompt was captured at
-    // spawn time, so panes spawned by an earlier binary keep using
-    // whatever prompt that binary had — meaning improvements like the
-    // Tech Lead's "survey + propose" iteration step never reach
-    // existing panes without a manual recreate. This re-asserts on
-    // every boot so updates to TECH_LEAD_DEADLOOP_PROMPT and
-    // REVIEWER_DEADLOOP_PROMPT take effect after one restart. Trade-off:
-    // users who hand-customized these panes' prompts will see them
-    // reset; acceptable since the role still wins (you wouldn't keep
-    // role=tech-lead but want a totally different loop).
-    for pane in metadata.panes.iter_mut() {
-        if !pane.managed {
-            continue;
-        }
-        if !matches!(pane.mode, shared::PaneMode::Deadloop) {
-            continue;
-        }
-        let lower = pane.role.as_deref().unwrap_or("").to_ascii_lowercase();
-        let desired: Option<&str> = if lower.contains("tech lead") {
-            Some(crate::role::TECH_LEAD_DEADLOOP_PROMPT)
-        } else if lower.contains("reviewer") {
-            Some(crate::role::REVIEWER_DEADLOOP_PROMPT)
-        } else if lower.contains("developer")
-            && pane.worktree_path.is_none()
-        {
-            // Only refresh the default auto-spawned generalist (no
-            // worktree). Specialized developer panes spawned via
-            // Suggest workers tend to have a worktree_path; they're
-            // single-purpose and shouldn't have their loop prompt
-            // replaced by the generic Developer one.
-            Some(crate::role::DEFAULT_DEVELOPER_DEADLOOP_PROMPT)
-        } else {
-            None
-        };
-        if let Some(desired_prompt) = desired {
-            if pane.prompt.as_deref() != Some(desired_prompt) {
-                tracing::info!(
-                    pane_id = pane.pane_id,
-                    role = ?pane.role,
-                    "refreshing orchestrator deadloop prompt to current baked-in version"
-                );
-                pane.prompt = Some(desired_prompt.to_string());
-            }
-        }
+    // Refresh only prompts that match known stale built-in signatures.
+    // Unmatched prompts may be human customizations, so preserve them.
+    let refreshed_prompt_count = refresh_stale_managed_builtin_prompts(&mut metadata.panes);
+    if refreshed_prompt_count > 0 {
+        tracing::info!(
+            refreshed_prompt_count,
+            "refreshed stale managed built-in prompts on boot"
+        );
     }
     save_project(working_dir, &metadata)?;
 
@@ -4035,8 +4087,9 @@ mod tests {
         deadloop_wait_plan, evaluate_deadloop_watchdog, is_codex_stale_session_error,
         manual_create_pr_worktree_path, pane_label_or_default, promote_pane_to_managed,
         reset_deadloop_codex_stale_session, resolve_pane_binary_path, route_web_input_to_pane,
-        restored_pane_mode_and_pause, run_deadloop_session_inner, save_pane_configs,
-        should_recover_deadloop_stale_session, start_bot_preserved_fields,
+        refresh_stale_managed_builtin_prompts, restored_pane_mode_and_pause,
+        run_deadloop_session_inner, save_pane_configs, should_recover_deadloop_stale_session,
+        start_bot_preserved_fields,
         truncate_str_at_char_boundary, update_project_flags, DeadloopWatchdogDecision,
         DeadloopWatchdogState, ASK_USER_QUESTION_AUTO_CANCEL_STATUS, InputChannels,
         PaneInputRouteResult, PaneMeta, PaneMetas, PanePauses, PaneStopRequests,
@@ -4274,6 +4327,21 @@ mod tests {
             manual_mode: false,
             managed: false,
         }
+    }
+
+    fn test_managed_role_pane(
+        pane_id: u32,
+        role: &str,
+        mode: shared::PaneMode,
+        prompt: Option<&str>,
+        worktree_path: Option<&str>,
+    ) -> shared::PaneConfig {
+        let mut pane = test_pane_config(pane_id, mode, false, false);
+        pane.managed = true;
+        pane.role = Some(role.to_string());
+        pane.prompt = prompt.map(str::to_string);
+        pane.worktree_path = worktree_path.map(str::to_string);
+        pane
     }
 
     fn seed_pending_question(meta: &PaneMeta, tool_use_id: &str, request_id: &str) {
@@ -4893,6 +4961,95 @@ mod tests {
             restored_pane_mode_and_pause(&interactive, true),
             (shared::PaneMode::Interactive, false)
         );
+    }
+
+    #[test]
+    fn refresh_stale_managed_builtin_prompts_updates_only_known_stale_defaults() {
+        const STALE_TECH_LEAD_PROMPT: &str =
+            "You are this project's Tech Lead, running as an autonomous deadloop.\n\n\
+Every iteration, in order:\n\n\
+1. Read `project_goal.md` and `team-todo.md` UNCONDITIONALLY every iteration.\n\
+2. Walk the Global TODOs and act on each.\n\
+   - `status: approved` with no subtasks under it - expand: write per-worker subtask entries into the appropriate `## pane:<id>` section.\n";
+        const CUSTOM_TECH_LEAD_PROMPT: &str =
+            "You are this project's Tech Lead, running as an autonomous deadloop.\n\
+Use a project-specific custom dispatch loop.";
+        const CUSTOM_REVIEWER_PROMPT: &str = "Reviewer custom loop";
+        const CUSTOM_MANAGER_PROMPT: &str = "Manager custom prompt";
+
+        let dir = tempfile::tempdir().expect("temp project dir");
+        let mut metadata = get_or_create_project(dir.path()).expect("metadata should initialize");
+        metadata.panes = vec![
+            test_managed_role_pane(
+                10,
+                "tech lead",
+                shared::PaneMode::Deadloop,
+                Some(STALE_TECH_LEAD_PROMPT),
+                None,
+            ),
+            test_managed_role_pane(
+                11,
+                "tech lead",
+                shared::PaneMode::Deadloop,
+                Some(CUSTOM_TECH_LEAD_PROMPT),
+                None,
+            ),
+            test_managed_role_pane(
+                12,
+                "reviewer",
+                shared::PaneMode::Deadloop,
+                Some(CUSTOM_REVIEWER_PROMPT),
+                None,
+            ),
+            test_managed_role_pane(
+                13,
+                "team manager",
+                shared::PaneMode::Interactive,
+                Some(CUSTOM_MANAGER_PROMPT),
+                None,
+            ),
+            test_managed_role_pane(
+                14,
+                "developer",
+                shared::PaneMode::Deadloop,
+                Some("specialized developer custom loop"),
+                Some("/tmp/apas-specialist"),
+            ),
+        ];
+        let mut unmanaged_stale = test_managed_role_pane(
+            15,
+            "tech lead",
+            shared::PaneMode::Deadloop,
+            Some(STALE_TECH_LEAD_PROMPT),
+            None,
+        );
+        unmanaged_stale.managed = false;
+        metadata.panes.push(unmanaged_stale);
+        save_project(dir.path(), &metadata).expect("seed metadata");
+
+        let mut reloaded = get_or_create_project(dir.path()).expect("metadata should reload");
+        assert_eq!(
+            refresh_stale_managed_builtin_prompts(&mut reloaded.panes),
+            1
+        );
+        save_project(dir.path(), &reloaded).expect("persist refreshed metadata");
+
+        let persisted = get_or_create_project(dir.path()).expect("metadata should reload");
+        let prompt_for = |pane_id| {
+            persisted
+                .panes
+                .iter()
+                .find(|pane| pane.pane_id == pane_id)
+                .and_then(|pane| pane.prompt.as_deref())
+                .expect("pane prompt")
+        };
+        assert_eq!(prompt_for(10), crate::role::TECH_LEAD_DEADLOOP_PROMPT);
+        assert!(prompt_for(10).contains("backlog backpressure"));
+        assert_eq!(prompt_for(11), CUSTOM_TECH_LEAD_PROMPT);
+        assert_eq!(prompt_for(12), CUSTOM_REVIEWER_PROMPT);
+        assert_eq!(prompt_for(13), CUSTOM_MANAGER_PROMPT);
+        assert_eq!(prompt_for(14), "specialized developer custom loop");
+        assert_eq!(prompt_for(15), STALE_TECH_LEAD_PROMPT);
     }
 
     #[test]
