@@ -851,6 +851,8 @@ type PaneMetas = Arc<Mutex<HashMap<u32, PaneMeta>>>;
 
 const ASK_USER_QUESTION_AUTO_CANCEL_STATUS: &str =
     "[Pending question auto-cancelled: new message replaces it]";
+const MANAGED_PANE_CREATE_PR_ERROR: &str =
+    "Managed team panes open PRs through the Reviewer-approved Team TODO flow; manual PR creation is disabled for this pane.";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CancelledAskUserQuestion {
@@ -926,6 +928,18 @@ fn auto_cancel_pending_questions_for_new_input(
         });
     }
     cancelled
+}
+
+fn manual_create_pr_worktree_path(
+    pane_metas: &PaneMetas,
+    target_pane: u32,
+) -> Result<Option<String>, String> {
+    let metas = pane_metas.lock().unwrap();
+    match metas.get(&target_pane) {
+        Some(meta) if meta.managed => Err(MANAGED_PANE_CREATE_PR_ERROR.to_string()),
+        Some(meta) => Ok(meta.worktree_path.clone()),
+        None => Ok(None),
+    }
 }
 
 fn route_web_input_to_pane(
@@ -4018,13 +4032,14 @@ mod tests {
         active_usage_providers, auto_cancel_pending_questions_for_new_input, build_agent_args,
         build_agent_switch_respawn_event, build_deadloop_agent_args, build_pane_reboot_events,
         build_pane_env_overrides_from_keys, build_pane_list, boot_restore_try_resume_first,
-        is_codex_stale_session_error, pane_label_or_default, promote_pane_to_managed,
-        reset_deadloop_codex_stale_session, resolve_pane_binary_path, route_web_input_to_pane,
-        restored_pane_mode_and_pause, run_deadloop_session_inner, save_pane_configs,
-        should_recover_deadloop_stale_session, start_bot_preserved_fields,
+        is_codex_stale_session_error, manual_create_pr_worktree_path, pane_label_or_default,
+        promote_pane_to_managed, reset_deadloop_codex_stale_session, resolve_pane_binary_path,
+        route_web_input_to_pane, restored_pane_mode_and_pause, run_deadloop_session_inner,
+        save_pane_configs, should_recover_deadloop_stale_session, start_bot_preserved_fields,
         truncate_str_at_char_boundary, update_project_flags,
         ASK_USER_QUESTION_AUTO_CANCEL_STATUS, InputChannels, PaneInputRouteResult, PaneMeta,
         PaneMetas, PanePauses, PaneStopRequests, PendingAskQuestion, DEEPSEEK_DEFAULT_MODEL,
+        MANAGED_PANE_CREATE_PR_ERROR,
     };
     use crate::project::{get_or_create_project, save_project};
     use crate::tui::{PaneOutput, TuiEvent};
@@ -4145,6 +4160,51 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn manual_create_pr_rejects_managed_pane() {
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+        pane_metas.lock().unwrap().insert(
+            42,
+            test_pane_meta(
+                Provider::Claude,
+                true,
+                None,
+                Arc::new(Mutex::new(None)),
+            ),
+        );
+
+        let err = manual_create_pr_worktree_path(&pane_metas, 42).unwrap_err();
+
+        assert_eq!(err, MANAGED_PANE_CREATE_PR_ERROR);
+    }
+
+    #[test]
+    fn manual_create_pr_preserves_unmanaged_worktree_path() {
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+        pane_metas.lock().unwrap().insert(
+            42,
+            test_pane_meta(
+                Provider::Claude,
+                false,
+                None,
+                Arc::new(Mutex::new(None)),
+            ),
+        );
+
+        let worktree_path = manual_create_pr_worktree_path(&pane_metas, 42).unwrap();
+
+        assert_eq!(worktree_path.as_deref(), Some("/tmp/apas-side-dev"));
+    }
+
+    #[test]
+    fn manual_create_pr_preserves_missing_pane_fallback() {
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+
+        let worktree_path = manual_create_pr_worktree_path(&pane_metas, 404).unwrap();
+
+        assert_eq!(worktree_path, None);
     }
 
     #[test]
@@ -10346,17 +10406,23 @@ async fn run_server_connection(
                                                 }
                                             }
                                             ServerToCli::CreatePr { session_id: _, pane_id: pr_pane_id } => {
-                                                let wt: Option<String> = {
-                                                    let metas = pane_metas.lock().unwrap();
-                                                    metas.get(&pr_pane_id).and_then(|m| m.worktree_path.clone())
+                                                let result = match manual_create_pr_worktree_path(
+                                                    &pane_metas,
+                                                    pr_pane_id,
+                                                ) {
+                                                    Ok(wt) => {
+                                                        // gh pr create + git push are blocking on a network call;
+                                                        // run in spawn_blocking so the WS reader loop stays responsive.
+                                                        tokio::task::spawn_blocking(move || {
+                                                            crate::worktree::create_pr_for_pane(wt.as_deref())
+                                                        })
+                                                        .await
+                                                        .unwrap_or_else(|e| {
+                                                            Err(anyhow::anyhow!("task join: {}", e))
+                                                        })
+                                                    }
+                                                    Err(err) => Err(anyhow::anyhow!("{}", err)),
                                                 };
-                                                // gh pr create + git push are blocking on a network call;
-                                                // run in spawn_blocking so the WS reader loop stays responsive.
-                                                let result = tokio::task::spawn_blocking(move || {
-                                                    crate::worktree::create_pr_for_pane(wt.as_deref())
-                                                })
-                                                .await
-                                                .unwrap_or_else(|e| Err(anyhow::anyhow!("task join: {}", e)));
                                                 let pr_msg = match result {
                                                     Ok(url) => CliToServer::PrCreated {
                                                         session_id,
