@@ -366,10 +366,14 @@ fn write_project_registry(path: &Path, registry: &ProjectRegistry) -> Result<()>
     // near-simultaneously) don't share a staging path. Previously they
     // all wrote `projects.json.tmp` and raced — the late renamer hit
     // ENOENT because an earlier process's rename had consumed the tmp.
-    let tmp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let tmp_path = project_registry_tmp_path(path);
     std::fs::write(&tmp_path, content)?;
     std::fs::rename(tmp_path, path)?;
     Ok(())
+}
+
+fn project_registry_tmp_path(path: &Path) -> PathBuf {
+    path.with_extension(format!("json.{}.tmp", std::process::id()))
 }
 
 fn normalize_project_path(path: &Path) -> PathBuf {
@@ -567,6 +571,137 @@ mod tests {
             Ok(value) => value,
             Err(payload) => std::panic::resume_unwind(payload),
         }
+    }
+
+    fn metadata_with_id(id: Uuid, name: &str) -> ProjectMetadata {
+        let mut metadata = ProjectMetadata::with_name(name.to_string());
+        metadata.id = id;
+        metadata
+    }
+
+    #[test]
+    fn project_registry_tmp_path_includes_process_id() {
+        let path = unique_temp_dir("tmp-path").join(USER_PROJECTS_FILE);
+        let tmp_path = project_registry_tmp_path(&path);
+        let expected_name = format!("projects.json.{}.tmp", std::process::id());
+
+        assert_eq!(
+            tmp_path.file_name().and_then(|name| name.to_str()),
+            Some(expected_name.as_str())
+        );
+        assert_ne!(tmp_path, path.with_extension("json.tmp"));
+    }
+
+    #[test]
+    fn write_project_registry_writes_wrapped_json_without_shared_tmp() {
+        let dir = unique_temp_dir("write-registry");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join(USER_PROJECTS_FILE);
+        let shared_tmp_path = path.with_extension("json.tmp");
+        let pid_tmp_path = project_registry_tmp_path(&path);
+        let expected_project = RegisteredProject {
+            project_id: Uuid::new_v4().to_string(),
+            name: Some("demo".to_string()),
+            path: dir.join("demo").to_string_lossy().to_string(),
+        };
+        let registry = ProjectRegistry {
+            projects: vec![expected_project.clone()],
+        };
+
+        write_project_registry(&path, &registry).expect("write registry");
+
+        assert!(
+            !shared_tmp_path.exists(),
+            "shared projects.json.tmp should not remain"
+        );
+        assert!(
+            !pid_tmp_path.exists(),
+            "pid-scoped temp file should be renamed away"
+        );
+
+        let content = std::fs::read_to_string(&path).expect("read registry");
+        let value: serde_json::Value = serde_json::from_str(&content).expect("valid json");
+        assert!(value
+            .get("projects")
+            .and_then(|projects| projects.as_array())
+            .is_some());
+
+        let written: ProjectRegistry = serde_json::from_str(&content).expect("wrapped registry");
+        assert_eq!(written.projects.len(), 1);
+        assert_eq!(written.projects[0].project_id, expected_project.project_id);
+        assert_eq!(written.projects[0].path, expected_project.path);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn register_project_deduplicates_by_id_and_path_and_sorts_output() {
+        with_isolated_config(|| {
+            let projects_root = tempfile::tempdir().expect("temp projects root");
+            let a_dir = projects_root.path().join("a-project");
+            let m_dir = projects_root.path().join("m-project");
+            let z_dir = projects_root.path().join("z-project");
+            for dir in [&a_dir, &m_dir, &z_dir] {
+                std::fs::create_dir_all(dir).expect("create project dir");
+            }
+
+            let duplicate_id = Uuid::new_v4();
+            let old_path_id = Uuid::new_v4();
+            let replacement_path_id = Uuid::new_v4();
+
+            register_project(&z_dir, &metadata_with_id(duplicate_id, "old duplicate id"))
+                .expect("register old duplicate id");
+            register_project(&a_dir, &metadata_with_id(duplicate_id, "new duplicate id"))
+                .expect("replace duplicate id");
+            register_project(&m_dir, &metadata_with_id(old_path_id, "old path"))
+                .expect("register old path");
+            register_project(&m_dir, &metadata_with_id(replacement_path_id, "new path"))
+                .expect("replace duplicate path");
+
+            let registry_path = project_registry_path().expect("registry path");
+            let registry = read_project_registry(&registry_path).expect("read registry");
+            assert_eq!(registry.projects.len(), 2);
+
+            let a_path = std::fs::canonicalize(&a_dir)
+                .expect("canonical a")
+                .to_string_lossy()
+                .to_string();
+            let m_path = std::fs::canonicalize(&m_dir)
+                .expect("canonical m")
+                .to_string_lossy()
+                .to_string();
+            let z_path = std::fs::canonicalize(&z_dir)
+                .expect("canonical z")
+                .to_string_lossy()
+                .to_string();
+
+            assert_eq!(
+                registry
+                    .projects
+                    .iter()
+                    .map(|project| project.path.as_str())
+                    .collect::<Vec<_>>(),
+                vec![a_path.as_str(), m_path.as_str()]
+            );
+            assert!(registry
+                .projects
+                .iter()
+                .any(|project| project.project_id == duplicate_id.to_string()
+                    && project.path == a_path
+                    && project.name.as_deref() == Some("new duplicate id")));
+            assert!(registry.projects.iter().any(|project| project.project_id
+                == replacement_path_id.to_string()
+                && project.path == m_path
+                && project.name.as_deref() == Some("new path")));
+            assert!(!registry
+                .projects
+                .iter()
+                .any(|project| project.project_id == old_path_id.to_string()));
+            assert!(!registry
+                .projects
+                .iter()
+                .any(|project| project.path == z_path));
+        });
     }
 
     #[test]

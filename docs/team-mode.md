@@ -7,8 +7,8 @@ APAS.
 > **Looking for the TODO-driven workflow?** See
 > [`todo-driven-workflow.md`](./todo-driven-workflow.md). It's the
 > higher-level protocol layered on top of the primitives in this doc:
-> a `team-todo.md` queue the Tech Lead drives, with an auto-spawned
-> Manager + Tech Lead + Developer + Reviewer team, user-facing
+> a `team-todo.md` queue the Tech Lead drives, an opt-in **Start team**
+> setup for Manager + Tech Lead + Developer + Reviewer panes, user-facing
 > Approve/Reject buttons in the web Overview, and one PR per contributing
 > worker.
 > Most users want to read both — this doc covers the pane mechanics
@@ -19,7 +19,7 @@ APAS.
 
 - A **pane** is one teammate. Each pane has its own model/provider, optional
   goal, optional git worktree, and its own thinking loop.
-- The default managed team has four roles:
+- Once launched, the default managed team has four roles:
   **Manager** talks with the human and keeps `project_goal.md` current,
   **Tech Lead** turns that goal into `team-todo.md` work, **Developer**
   panes implement approved subtasks, and **Reviewer** panes approve or
@@ -31,12 +31,26 @@ APAS.
   the front shows the Manager chat, Project Goal, Team TODO queue, pane
   grid, scratchpad ticker, and provider usage at a glance.
 
-Two ways to get into team mode:
+Three ways to get into team mode:
 
-1. **Add more panes** with the `+` button in the tab bar. Each gets its own
-   provider/model/role.
-2. **Open an existing project** that already has panes saved in `.apas` —
+1. **Start the managed team** from the Overview **Team setup** card. Pick
+   the provider/model for Manager, Tech Lead, Developer, and Reviewer, then
+   click **Start team**.
+2. **Add manual panes** with the `+` button in the tab bar. Each gets its
+   own provider/model/role.
+3. **Open an existing project** that already has panes saved in `.apas` —
    those auto-restore on CLI boot.
+
+## Starting the managed team
+
+On a new project, running `apas` creates or reuses `.apas`, connects the
+project to the web Overview, and waits for you to choose when to launch the
+team. In the Overview **Team setup** card, each managed role has its own
+provider/model picker. Review or adjust the defaults, then click **Start
+team** to create the Manager, Tech Lead, Developer, and Reviewer panes.
+
+If you prefer a smaller setup, leave the team unstarted and add manual panes
+with the `+` button instead.
 
 ## Setting up a teammate
 
@@ -166,20 +180,23 @@ surface:
 
 1. **Manager chat / default landing** — open or start the Manager pane and
    talk through the project goal without hunting through worker tabs.
-2. **Project Goal** — view, edit, or generate `project_goal.md`. The Manager
+2. **Team setup / Start team** — pick provider/model choices for each
+   managed role and launch the Manager, Tech Lead, Developer, and Reviewer
+   panes when you're ready.
+3. **Project Goal** — view, edit, or generate `project_goal.md`. The Manager
    and Tech Lead both treat this file as the high-level source of truth.
-3. **Team TODO panel** — inspect Global TODOs and per-pane subtasks,
+4. **Team TODO panel** — inspect Global TODOs and per-pane subtasks,
    approve or reject `status: proposed` work, add direct user TODOs, and use
    PR links/status badges once workers open PRs.
-4. **Pane grid** — one card per pane: status pill, mode icon, role chip,
+5. **Pane grid** — one card per pane: status pill, mode icon, role chip,
    provider, worktree branch + diff stats, last-activity timestamp, and a
    60-bucket last-hour activity sparkline (flat line = wedged, regular bars
    = healthy). Click a card to jump to that pane; click the inline Diff /
    Role buttons to open the modals without switching.
-5. **Team scratchpad ticker** — recent records with filter chips per kind,
+6. **Team scratchpad ticker** — recent records with filter chips per kind,
    useful for seeing delegations, diffs, reviews, decisions, and escalations
    without opening the raw `.apas-team.jsonl` file.
-6. **Resource use** — UsageLimitsDisplay per provider, so you can see how
+7. **Resource use** — UsageLimitsDisplay per provider, so you can see how
    close any provider is to its quota cap.
 
 ## Concrete starter setup
@@ -187,15 +204,18 @@ surface:
 For a new v3 team-mode project:
 
 1. Open the **Overview** tab.
-2. Start or open the **Manager** pane. Describe the desired outcome, or ask
+2. In **Team setup**, choose the provider/model for Manager, Tech Lead,
+   Developer, and Reviewer.
+3. Click **Start team** to launch the managed panes.
+4. Start or open the **Manager** pane. Describe the desired outcome, or ask
    the Manager to scan the repo and draft `project_goal.md`.
-3. Start the **Tech Lead** pane. It reads the goal and proposes concrete
+5. Start or open the **Tech Lead** pane. It reads the goal and proposes concrete
    Global TODOs in `team-todo.md`.
-4. Approve or reject proposed Global TODOs in the **Team TODO panel**.
-5. Keep the default **Developer** and **Reviewer** panes running. Developers
+6. Approve or reject proposed Global TODOs in the **Team TODO panel**.
+7. Keep the default **Developer** and **Reviewer** panes running. Developers
    implement approved subtasks in isolated worktrees; Reviewers approve or
    reject `kind: "diff"` records.
-6. Review and merge the GitHub PRs workers open after Reviewer approval.
+8. Review and merge the GitHub PRs workers open after Reviewer approval.
 
 You can still add manual panes with the `+` button. For a managed Developer,
 use an isolated worktree; for a Reviewer, no worktree is usually needed
