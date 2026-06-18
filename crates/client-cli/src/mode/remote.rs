@@ -1,11 +1,13 @@
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
 use shared::{ClaudeStreamMessage, CliToServer, PaneType, ServerToCli};
+use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
 
@@ -15,6 +17,203 @@ const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const VERSION: &str = env!("APAS_VERSION");
+
+type PaneInputs = Arc<Mutex<HashMap<u32, mpsc::Sender<String>>>>;
+type ActiveRemoteChildren = Arc<Mutex<HashMap<u32, ActiveRemoteChild>>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveRemoteChild {
+    session_id: Uuid,
+    pane_id: u32,
+    pid: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteProcessSignal {
+    SigInt,
+    SigTerm,
+}
+
+impl RemoteProcessSignal {
+    #[cfg(unix)]
+    fn libc_signal(self) -> libc::c_int {
+        match self {
+            RemoteProcessSignal::SigInt => libc::SIGINT,
+            RemoteProcessSignal::SigTerm => libc::SIGTERM,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            RemoteProcessSignal::SigInt => "SIGINT",
+            RemoteProcessSignal::SigTerm => "SIGTERM",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteSignalRoute {
+    Forward {
+        pane_id: u32,
+        pid: u32,
+        signal: RemoteProcessSignal,
+    },
+    UnsupportedSignal {
+        signal: String,
+    },
+    NoActiveChild {
+        session_id: Uuid,
+    },
+    WrongSession {
+        requested_session_id: Uuid,
+        active_session_ids: Vec<Uuid>,
+    },
+    Ambiguous {
+        session_id: Uuid,
+        pane_ids: Vec<u32>,
+    },
+}
+
+fn parse_supported_remote_signal(signal: &str) -> Option<RemoteProcessSignal> {
+    match signal.trim().to_ascii_uppercase().as_str() {
+        "SIGINT" | "INT" | "2" => Some(RemoteProcessSignal::SigInt),
+        "SIGTERM" | "TERM" | "15" => Some(RemoteProcessSignal::SigTerm),
+        _ => None,
+    }
+}
+
+fn route_remote_signal(
+    children: &HashMap<u32, ActiveRemoteChild>,
+    session_id: Uuid,
+    signal: &str,
+) -> RemoteSignalRoute {
+    let Some(signal) = parse_supported_remote_signal(signal) else {
+        return RemoteSignalRoute::UnsupportedSignal {
+            signal: signal.to_string(),
+        };
+    };
+
+    let mut matching: Vec<&ActiveRemoteChild> = children
+        .values()
+        .filter(|child| child.session_id == session_id)
+        .collect();
+    matching.sort_by_key(|child| child.pane_id);
+
+    match matching.as_slice() {
+        [child] => RemoteSignalRoute::Forward {
+            pane_id: child.pane_id,
+            pid: child.pid,
+            signal,
+        },
+        [] if children.is_empty() => RemoteSignalRoute::NoActiveChild { session_id },
+        [] => {
+            let mut active_session_ids: Vec<Uuid> =
+                children.values().map(|child| child.session_id).collect();
+            active_session_ids.sort();
+            active_session_ids.dedup();
+            RemoteSignalRoute::WrongSession {
+                requested_session_id: session_id,
+                active_session_ids,
+            }
+        }
+        _ => RemoteSignalRoute::Ambiguous {
+            session_id,
+            pane_ids: matching.iter().map(|child| child.pane_id).collect(),
+        },
+    }
+}
+
+#[cfg(unix)]
+fn send_remote_process_signal(pid: u32, signal: RemoteProcessSignal) -> Result<()> {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, signal.libc_signal()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().into())
+    }
+}
+
+#[cfg(not(unix))]
+fn send_remote_process_signal(_pid: u32, signal: RemoteProcessSignal) -> Result<()> {
+    anyhow::bail!(
+        "remote-mode {} forwarding is unsupported on this platform",
+        signal.label()
+    )
+}
+
+async fn handle_remote_signal(
+    active_children: &ActiveRemoteChildren,
+    session_id: Uuid,
+    signal: &str,
+) {
+    let route = {
+        let children = active_children.lock().await;
+        route_remote_signal(&children, session_id, signal)
+    };
+
+    match route {
+        RemoteSignalRoute::Forward {
+            pane_id,
+            pid,
+            signal,
+        } => match send_remote_process_signal(pid, signal) {
+            Ok(()) => {
+                tracing::info!(
+                    "Forwarded remote-mode {} to session {} pane {} child pid {}",
+                    signal.label(),
+                    session_id,
+                    pane_id,
+                    pid
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to forward remote-mode {} to session {} pane {} child pid {}: {}",
+                    signal.label(),
+                    session_id,
+                    pane_id,
+                    pid,
+                    err
+                );
+            }
+        },
+        RemoteSignalRoute::UnsupportedSignal { signal } => {
+            tracing::warn!(
+                "Remote mode received unsupported signal {}; supported signals: SIGINT, SIGTERM",
+                signal
+            );
+        }
+        RemoteSignalRoute::NoActiveChild { session_id } => {
+            tracing::warn!(
+                "Remote mode received signal {} for session {} but no Claude child is active",
+                signal,
+                session_id
+            );
+        }
+        RemoteSignalRoute::WrongSession {
+            requested_session_id,
+            active_session_ids,
+        } => {
+            tracing::warn!(
+                "Remote mode received signal {} for session {} but active Claude children belong to sessions {:?}",
+                signal,
+                requested_session_id,
+                active_session_ids
+            );
+        }
+        RemoteSignalRoute::Ambiguous {
+            session_id,
+            pane_ids,
+        } => {
+            tracing::warn!(
+                "Remote mode received session-scoped signal {} for session {} with multiple active pane children {:?}; refusing ambiguous signal",
+                signal,
+                session_id,
+                pane_ids
+            );
+        }
+    }
+}
 
 /// Run in remote mode - connect to backend server and stream I/O
 /// Automatically reconnects on connection loss with exponential backoff
@@ -140,9 +339,8 @@ async fn run_connection(
     let (ws_tx, mut ws_rx) = mpsc::channel::<CliToServer>(32);
 
     // Input channels per pane_id — each pane gets its own handler
-    let pane_inputs: std::sync::Arc<
-        tokio::sync::Mutex<std::collections::HashMap<u32, mpsc::Sender<String>>>,
-    > = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let pane_inputs: PaneInputs = Arc::new(Mutex::new(HashMap::new()));
+    let active_children: ActiveRemoteChildren = Arc::new(Mutex::new(HashMap::new()));
 
     // If we have a project in the working directory, send SessionStart
     // so the server associates this CLI with the project's session,
@@ -173,6 +371,7 @@ async fn run_connection(
             let dir = working_dir.to_path_buf();
             let spawn_tx = ws_tx.clone();
             let spawn_inputs = pane_inputs.clone();
+            let spawn_active_children = active_children.clone();
             let spawn_claude_path = claude_path.to_string();
             tokio::spawn(async move {
                 if let Err(e) = handle_pane(
@@ -183,6 +382,7 @@ async fn run_connection(
                     &dir,
                     spawn_tx,
                     spawn_inputs,
+                    spawn_active_children,
                 )
                 .await
                 {
@@ -216,6 +416,7 @@ async fn run_connection(
 
     // Handle incoming messages from server
     let inputs = pane_inputs.clone();
+    let signal_children = active_children.clone();
     let ws_tx_clone = ws_tx.clone();
     let claude_path_owned = claude_path.to_string();
     let working_dir_owned = working_dir.to_path_buf();
@@ -239,6 +440,7 @@ async fn run_connection(
                         let ws_tx = ws_tx_clone.clone();
                         let claude_path = claude_path_owned.clone();
                         let pane_inputs = inputs.clone();
+                        let active_children = signal_children.clone();
                         let claude_session_id = Uuid::new_v4();
 
                         tokio::spawn(async move {
@@ -250,6 +452,7 @@ async fn run_connection(
                                 &dir,
                                 ws_tx,
                                 pane_inputs,
+                                active_children,
                             )
                             .await
                             {
@@ -277,7 +480,7 @@ async fn run_connection(
                     }
                     Ok(ServerToCli::Signal { session_id, signal }) => {
                         tracing::info!("Received signal {} for session {}", signal, session_id);
-                        // TODO: Forward signal to Claude process
+                        handle_remote_signal(&signal_children, session_id, &signal).await;
                     }
                     Ok(ServerToCli::SessionDisconnected { session_id }) => {
                         tracing::info!("Session {} disconnected from web", session_id);
@@ -337,10 +540,7 @@ async fn run_connection(
                             "\n[APAS] Server rejected session {}: {}\n",
                             rejected_id, reason
                         );
-                        tracing::error!(
-                            "Server rejected session {}: {}",
-                            rejected_id, reason
-                        );
+                        tracing::error!("Server rejected session {}: {}", rejected_id, reason);
                         std::process::exit(2);
                     }
                     Err(e) => {
@@ -380,9 +580,8 @@ async fn handle_pane(
     claude_path: &str,
     working_dir: &Path,
     ws_tx: mpsc::Sender<CliToServer>,
-    pane_inputs: std::sync::Arc<
-        tokio::sync::Mutex<std::collections::HashMap<u32, mpsc::Sender<String>>>,
-    >,
+    pane_inputs: PaneInputs,
+    active_children: ActiveRemoteChildren,
 ) -> Result<()> {
     tracing::info!(
         "Pane handler ready: session={}, claude_session={}, pane={}",
@@ -462,6 +661,19 @@ async fn handle_pane(
             .spawn()
         {
             Ok(mut child) => {
+                let child_pid = child.id();
+                {
+                    let mut children = active_children.lock().await;
+                    children.insert(
+                        pane_id,
+                        ActiveRemoteChild {
+                            session_id,
+                            pane_id,
+                            pid: child_pid,
+                        },
+                    );
+                }
+
                 let stdout = child.stdout.take().unwrap();
                 let stderr = child.stderr.take().unwrap();
 
@@ -514,6 +726,16 @@ async fn handle_pane(
                 let exit_status = child.wait();
                 let _ = stdout_handle.join();
                 let _ = stderr_handle.join();
+                {
+                    let mut children = active_children.lock().await;
+                    if children
+                        .get(&pane_id)
+                        .map(|child| child.session_id == session_id && child.pid == child_pid)
+                        .unwrap_or(false)
+                    {
+                        children.remove(&pane_id);
+                    }
+                }
 
                 // Clear status
                 let _ = ws_tx
@@ -548,4 +770,92 @@ async fn handle_pane(
 
     tracing::info!("Pane {} for session {} ended", pane_id, session_id);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn uuid(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
+    fn active_child(session_id: Uuid, pane_id: u32, pid: u32) -> ActiveRemoteChild {
+        ActiveRemoteChild {
+            session_id,
+            pane_id,
+            pid,
+        }
+    }
+
+    #[test]
+    fn remote_signal_routes_supported_signal_to_only_active_child_for_session() {
+        let session_id = uuid(1);
+        let children = HashMap::from([(7, active_child(session_id, 7, 4242))]);
+
+        assert_eq!(
+            route_remote_signal(&children, session_id, "SIGINT"),
+            RemoteSignalRoute::Forward {
+                pane_id: 7,
+                pid: 4242,
+                signal: RemoteProcessSignal::SigInt,
+            }
+        );
+    }
+
+    #[test]
+    fn remote_signal_reports_wrong_session_instead_of_disappearing() {
+        let active_session_id = uuid(1);
+        let requested_session_id = uuid(2);
+        let children = HashMap::from([(7, active_child(active_session_id, 7, 4242))]);
+
+        assert_eq!(
+            route_remote_signal(&children, requested_session_id, "SIGINT"),
+            RemoteSignalRoute::WrongSession {
+                requested_session_id,
+                active_session_ids: vec![active_session_id],
+            }
+        );
+    }
+
+    #[test]
+    fn remote_signal_reports_no_active_child_for_missing_pane_state() {
+        let session_id = uuid(1);
+        let children = HashMap::new();
+
+        assert_eq!(
+            route_remote_signal(&children, session_id, "SIGINT"),
+            RemoteSignalRoute::NoActiveChild { session_id }
+        );
+    }
+
+    #[test]
+    fn remote_signal_refuses_ambiguous_session_scoped_signal() {
+        let session_id = uuid(1);
+        let children = HashMap::from([
+            (3, active_child(session_id, 3, 3003)),
+            (7, active_child(session_id, 7, 7007)),
+        ]);
+
+        assert_eq!(
+            route_remote_signal(&children, session_id, "SIGINT"),
+            RemoteSignalRoute::Ambiguous {
+                session_id,
+                pane_ids: vec![3, 7],
+            }
+        );
+    }
+
+    #[test]
+    fn remote_signal_rejects_unsupported_signal_before_routing() {
+        let session_id = uuid(1);
+        let children = HashMap::from([(7, active_child(session_id, 7, 4242))]);
+
+        assert_eq!(
+            route_remote_signal(&children, session_id, "SIGHUP"),
+            RemoteSignalRoute::UnsupportedSignal {
+                signal: "SIGHUP".to_string(),
+            }
+        );
+    }
 }
