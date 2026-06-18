@@ -37,19 +37,32 @@ function makeStoredMsg(id: string, paneId: number, content = "hi") {
 function makeCachedEntry(opts: {
   messages?: Message[];
   paneMessages?: Record<string, Message[]>;
+  paneConfigs?: PaneConfig[];
+  paneModes?: Record<string, "deadloop" | "interactive">;
   lastCreatedAt?: string;
 } = {}): SessionCacheEntry {
   return {
     messages: opts.messages ?? [],
     paneMessages: opts.paneMessages ?? {},
     paneHasMore: {},
-    paneConfigs: [],
-    paneModes: {},
+    paneConfigs: opts.paneConfigs ?? [],
+    paneModes: opts.paneModes ?? {},
     hasMoreMessages: false,
     isDualPane: false,
     answeredQuestions: new Map(),
     cachedAt: Date.now(),
     lastCreatedAt: opts.lastCreatedAt,
+  };
+}
+
+function makePaneConfig(mode: "deadloop" | "interactive"): PaneConfig {
+  return {
+    pane_id: PANE_ID,
+    provider: "claude",
+    mode,
+    session_id: `pane-${PANE_ID}`,
+    is_paused: false,
+    label: "Worker",
   };
 }
 
@@ -109,6 +122,61 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+});
+
+describe("PaneList-authoritative pane modes", () => {
+  it("keeps a fresh interactive PaneList mode over replayed deadloop message and status hints", async () => {
+    useStore.getState().connect();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    useStore.setState({
+      isAuthenticated: true,
+      sessionId: SID_A,
+      isDualPane: true,
+    });
+
+    dispatch({
+      type: "session_messages",
+      session_id: SID_A,
+      messages: [{
+        ...makeStoredMsg("old-deadloop-1", PANE_ID, "historical bot output"),
+        pane_type: "deadloop",
+      }],
+      has_more: false,
+    });
+
+    expect(useStore.getState().paneModes[paneKey(PANE_ID)]).toBe("deadloop");
+
+    dispatch({
+      type: "pane_list",
+      session_id: SID_A,
+      panes: [makePaneConfig("interactive")],
+    });
+
+    expect(useStore.getState().paneConfigs[0]?.mode).toBe("interactive");
+    expect(useStore.getState().paneModes[paneKey(PANE_ID)]).toBe("interactive");
+
+    dispatch({
+      type: "session_messages",
+      session_id: SID_A,
+      messages: [{
+        ...makeStoredMsg("old-deadloop-2", PANE_ID, "another historical bot output"),
+        pane_type: "deadloop",
+      }],
+      has_more: false,
+    });
+    dispatch({
+      type: "pane_status",
+      session_id: SID_A,
+      pane_id: PANE_ID,
+      pane_type: "deadloop",
+      status: "replayed stale bot status",
+    });
+
+    const state = useStore.getState();
+    expect(state.paneConfigs[0]?.mode).toBe("interactive");
+    expect(state.paneModes[paneKey(PANE_ID)]).toBe("interactive");
+    expect(state.paneStatuses[PANE_ID]).toBe("replayed stale bot status");
+  });
 });
 
 describe("lazy per-pane initial message load", () => {
@@ -354,6 +422,59 @@ describe("background stream_message keeps the cached watermark fresh", () => {
       expect(entry?.lastCreatedAt).toBe("2026-05-26T10:00:00Z");
       resolve();
     }, 10));
+  });
+});
+
+describe("IDB hydration preserves live PaneList modes", () => {
+  it("restores cached messages without clobbering live pane configs or modes", () => {
+    const livePane = makePaneConfig("interactive");
+    const stalePane = makePaneConfig("deadloop");
+    const cached = makeCachedEntry({
+      paneMessages: { [paneKey(PANE_ID)]: [makeMsg("cached-1", "cached history")] },
+      paneConfigs: [stalePane],
+      paneModes: { [paneKey(PANE_ID)]: "deadloop" },
+    });
+
+    useStore.setState({
+      sessionId: SID_A,
+      messages: [],
+      paneMessages: {},
+      paneConfigs: [livePane],
+      paneModes: { [paneKey(PANE_ID)]: "interactive" },
+    });
+
+    // Mirrors the same-session restore branch that runs after
+    // loadAllSnapshotsIdb() resolves. The live PaneList may already have
+    // arrived before disk messages hydrate, so paneConfigs/paneModes win.
+    const state = useStore.getState();
+    const isEmpty =
+      state.messages.length === 0 &&
+      Object.keys(state.paneMessages).length === 0;
+    if (isEmpty) {
+      useStore.setState({
+        messages: cached.messages,
+        paneMessages: cached.paneMessages,
+        paneHasMore: cached.paneHasMore,
+        paneConfigs:
+          state.paneConfigs.length > 0
+            ? state.paneConfigs
+            : cached.paneConfigs,
+        paneModes:
+          Object.keys(state.paneModes).length > 0
+            ? state.paneModes
+            : cached.paneModes,
+        hasMoreMessages: cached.hasMoreMessages,
+        isDualPane: cached.isDualPane,
+        answeredQuestions: cached.answeredQuestions,
+        deadloopMessages: cached.paneMessages[paneKey(1)] ?? [],
+        interactiveMessages: cached.paneMessages[paneKey(2)] ?? [],
+      });
+    }
+
+    const hydrated = useStore.getState();
+    expect(hydrated.paneMessages[paneKey(PANE_ID)]?.[0].content).toBe("cached history");
+    expect(hydrated.paneConfigs).toEqual([livePane]);
+    expect(hydrated.paneModes[paneKey(PANE_ID)]).toBe("interactive");
   });
 });
 
