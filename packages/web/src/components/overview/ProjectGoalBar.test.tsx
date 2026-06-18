@@ -228,6 +228,17 @@ describe("ProjectGoalBar team role slots", () => {
     expect(promptText).toContain("reviewDecision is not CHANGES_REQUESTED");
     expect(promptText).toContain('mergeable == "MERGEABLE"');
     expect(promptText).toContain("CI is green with no pending checks");
+    expect(promptText).toContain('mergeable == "CONFLICTING"');
+    expect(promptText).toContain("leave the Global pr_open");
+    expect(promptText).toContain("do not close the PR");
+    expect(promptText).toContain("pr-comments:<url> delegation");
+    expect(promptText).toContain("original owner from the pr: <pane_id> <url> line");
+    expect(promptText).toContain("rebase/merge the current default branch");
+    expect(promptText).toContain("resolve conflicts");
+    expect(promptText).toContain("rerun verification");
+    expect(promptText).toContain("push the same branch");
+    expect(promptText).toContain("not already revising / in_progress");
+    expect(promptText).toContain("avoid duplicate conflict delegations");
     expect(promptText).toContain("enablePullRequestAutoMerge");
     expect(promptText).toContain("Auto merge is not allowed for this repository");
     expect(promptText).toContain(
