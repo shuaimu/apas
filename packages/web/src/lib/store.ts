@@ -653,6 +653,9 @@ interface AppState {
     developer: { provider: string; model: string | null };
   }) => void;
   updatePaneRole: (paneId: number, role?: string, goal?: string, backstory?: string) => void;
+  /** Scratchpad records keyed by server session id. `teamRecords` is the
+   *  active-session projection retained for existing components/tests. */
+  teamRecordsBySession: Map<string, TeamRecord[]>;
   teamRecords: TeamRecord[];
   planReviewPending: PlanReviewPendingItem[];
   answerPlanReview: (toolUseId: string, approve: boolean) => void;
@@ -697,6 +700,15 @@ export interface TeamRecord {
   tags: string[];
   kind: string;
   body: string;
+}
+
+export function selectActiveTeamRecords(state: {
+  sessionId: string | null;
+  teamRecordsBySession: Map<string, TeamRecord[]>;
+  teamRecords: TeamRecord[];
+}): TeamRecord[] {
+  if (!state.sessionId) return state.teamRecords;
+  return state.teamRecordsBySession.get(state.sessionId) ?? state.teamRecords;
 }
 
 export type PlanReviewMode = "always" | "risky_only" | "never";
@@ -748,6 +760,7 @@ export const useStore = create<AppState>((set, get) => ({
   paneDiffs: {},
   projectGoals: {},
   projectFlags: {},
+  teamRecordsBySession: new Map(),
   teamRecords: [],
   planReviewPending: [],
   answeredQuestions: new Map(),
@@ -813,6 +826,8 @@ export const useStore = create<AppState>((set, get) => ({
       connected: false,
       ws: null,
       sessionId: null,
+      teamRecordsBySession: new Map(),
+      teamRecords: [],
       serverVersion: null,
       cliClients: [],
       sessions: [],
@@ -991,6 +1006,7 @@ export const useStore = create<AppState>((set, get) => ({
       connected: false,
       ws: null,
       sessionId: null,
+      teamRecords: [],
       serverVersion: null,
       cliClients: [],
       machines: [],
@@ -1012,6 +1028,7 @@ export const useStore = create<AppState>((set, get) => ({
     set({
       messages: [],
       sessionId: null,
+      teamRecords: [],
       paneMessages: {},
       paneHasMore: {},
       paneStatuses: {},
@@ -1121,6 +1138,7 @@ export const useStore = create<AppState>((set, get) => ({
         set({
           sessionId,
           cliClientId: newCliClientId,
+          teamRecords: state.teamRecordsBySession.get(sessionId) ?? [],
           messages: cached.messages,
           paneMessages: cached.paneMessages,
           paneHasMore: cached.paneHasMore,
@@ -1146,6 +1164,7 @@ export const useStore = create<AppState>((set, get) => ({
         set({
           sessionId,
           cliClientId: newCliClientId,
+          teamRecords: state.teamRecordsBySession.get(sessionId) ?? [],
           messages: [],
           paneMessages: {},
           paneHasMore: {},
@@ -1166,7 +1185,11 @@ export const useStore = create<AppState>((set, get) => ({
         });
       }
     } else {
-      set({ isAttached: hasActiveClient, cliClientId: newCliClientId });
+      set((state) => ({
+        isAttached: hasActiveClient,
+        cliClientId: newCliClientId,
+        teamRecords: state.teamRecordsBySession.get(sessionId) ?? [],
+      }));
     }
 
     ws.send(JSON.stringify({
@@ -3000,10 +3023,17 @@ function handleServerMessage(
 
     case "team_record": {
       const record = data.record as TeamRecord | undefined;
-      if (record && typeof record.ts === "string") {
-        set((state) => ({
-          teamRecords: [...state.teamRecords, record],
-        }));
+      const sessionId = data.session_id as string | undefined;
+      if (sessionId && record && typeof record.ts === "string") {
+        set((state) => {
+          const records = [...(state.teamRecordsBySession.get(sessionId) ?? []), record];
+          const bySession = new Map(state.teamRecordsBySession);
+          bySession.set(sessionId, records);
+          return {
+            teamRecordsBySession: bySession,
+            teamRecords: state.sessionId === sessionId ? records : state.teamRecords,
+          };
+        });
       }
       break;
     }

@@ -12,7 +12,7 @@
  */
 import { useEffect, useMemo, useState } from "react";
 import { ClipboardList } from "lucide-react";
-import { useStore } from "@/lib/store";
+import { selectActiveTeamRecords, useStore } from "@/lib/store";
 
 interface WorkerTaskBarProps {
   paneId: number;
@@ -25,7 +25,7 @@ interface WorkerTaskBarProps {
 }
 
 export function WorkerTaskBar({ paneId, role, managed }: WorkerTaskBarProps) {
-  const teamRecords = useStore((s) => s.teamRecords);
+  const teamRecords = useStore(selectActiveTeamRecords);
   const [now, setNow] = useState(() => Date.now());
 
   // Re-render every minute so the "Xm ago" stays accurate without

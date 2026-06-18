@@ -10,7 +10,7 @@
  * watcher; no new wire types).
  */
 import { useMemo } from "react";
-import { useStore, TeamRecord } from "@/lib/store";
+import { selectActiveTeamRecords, useStore, TeamRecord } from "@/lib/store";
 
 interface DelegationRow {
   delegate: TeamRecord;
@@ -25,7 +25,7 @@ interface DelegationRow {
 const MAX_ROWS = 20;
 
 export function DelegationBoard() {
-  const teamRecords = useStore((s) => s.teamRecords);
+  const teamRecords = useStore(selectActiveTeamRecords);
 
   const rows = useMemo(() => buildRows(teamRecords), [teamRecords]);
 

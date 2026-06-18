@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useRef, useCallback, useEffect, useState, useMemo, memo } from "react";
-import { useStore, Message, PaneConfig, PaneCleanupAction, PlanReviewMode, TeamRecord, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, paneKey } from "@/lib/store";
+import { useStore, Message, PaneConfig, PaneCleanupAction, PlanReviewMode, TeamRecord, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, paneKey, selectActiveTeamRecords } from "@/lib/store";
 import { ROLE_TEMPLATES, TEMPLATE_COLOR_CLASSES } from "@/lib/roleTemplates";
 import { extractTimeline, TimelineEntry } from "@/lib/timeline";
 import { OverviewView } from "../overview/OverviewView";
@@ -415,7 +415,7 @@ export function TabbedView() {
   const createPanePr = useStore((s) => s.createPanePr);
   const paneDiffs = useStore((s) => s.paneDiffs);
   const updatePaneRole = useStore((s) => s.updatePaneRole);
-  const teamRecords = useStore((s) => s.teamRecords);
+  const teamRecords = useStore(selectActiveTeamRecords);
   const planReviewPending = useStore((s) => s.planReviewPending);
   const answerPlanReview = useStore((s) => s.answerPlanReview);
   const updatePaneReviewMode = useStore((s) => s.updatePaneReviewMode);

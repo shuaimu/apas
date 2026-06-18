@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { useStore, type Message, type CliClient } from './store';
+import { useStore, type Message, type CliClient, type TeamRecord } from './store';
 
 describe('useStore', () => {
   beforeEach(() => {
@@ -16,6 +16,8 @@ describe('useStore', () => {
       machines: [],
       projectGoals: {},
       projectFlags: {},
+      teamRecords: [],
+      teamRecordsBySession: new Map(),
     });
   });
 
@@ -388,6 +390,70 @@ describe('useStore', () => {
       expect(useStore.getState().projectGoals['session-project-goal']).toBe(
         'line one\n\nline two\n',
       );
+    });
+  });
+
+  describe('team_record', () => {
+    function teamRecord(body: string): TeamRecord {
+      return {
+        ts: '2026-06-18T12:00:00Z',
+        pane_id: 178,
+        kind: 'status',
+        tags: ['task:TODO-127'],
+        body,
+      };
+    }
+
+    async function connectForTeamRecords(activeSession: string) {
+      useStore.getState().connect();
+      await new Promise(resolve => setTimeout(resolve, 10));
+      useStore.setState({
+        sessionId: activeSession,
+        teamRecords: [],
+        teamRecordsBySession: new Map(),
+      });
+      return useStore.getState().ws as unknown as {
+        onmessage?: (event: MessageEvent) => void;
+        send: ReturnType<typeof vi.fn>;
+      };
+    }
+
+    function dispatchTeamRecord(
+      ws: { onmessage?: (event: MessageEvent) => void },
+      sessionId: string,
+      record: TeamRecord,
+    ) {
+      ws.onmessage?.(new MessageEvent('message', {
+        data: JSON.stringify({
+          type: 'team_record',
+          session_id: sessionId,
+          record,
+        }),
+      }));
+    }
+
+    it('stores scratchpad records by session and switches the active view', async () => {
+      const ws = await connectForTeamRecords('session-a');
+
+      dispatchTeamRecord(ws, 'session-a', teamRecord('record from session A'));
+      dispatchTeamRecord(ws, 'session-b', teamRecord('record from session B'));
+
+      expect(useStore.getState().teamRecords.map((r) => r.body)).toEqual([
+        'record from session A',
+      ]);
+      expect(useStore.getState().teamRecordsBySession.get('session-b')?.map((r) => r.body)).toEqual([
+        'record from session B',
+      ]);
+
+      useStore.getState().attachSession('session-b');
+      expect(useStore.getState().teamRecords.map((r) => r.body)).toEqual([
+        'record from session B',
+      ]);
+
+      useStore.getState().attachSession('session-a');
+      expect(useStore.getState().teamRecords.map((r) => r.body)).toEqual([
+        'record from session A',
+      ]);
     });
   });
 
