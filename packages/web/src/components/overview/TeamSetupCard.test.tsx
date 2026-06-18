@@ -1,7 +1,10 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TeamSetupCard } from "./TeamSetupCard";
-import { DEEPSEEK_DEFAULT_MODEL } from "@/lib/providerOptions";
+import {
+  DEEPSEEK_DEFAULT_MODEL,
+  PROVIDER_MODEL_OPTIONS,
+} from "@/lib/providerOptions";
 import { useStore, type PaneConfig } from "@/lib/store";
 
 const initialStore = useStore.getState();
@@ -41,6 +44,14 @@ function roleSelects(): HTMLSelectElement[] {
   return screen.getAllByTitle("Agent frontend × API backend") as HTMLSelectElement[];
 }
 
+function optionLabels(select: HTMLSelectElement): string[] {
+  return Array.from(select.options).map((option) => option.textContent ?? "");
+}
+
+function optionValues(select: HTMLSelectElement): string[] {
+  return Array.from(select.options).map((option) => option.value);
+}
+
 describe("TeamSetupCard", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -67,6 +78,21 @@ describe("TeamSetupCard", () => {
       "claude/official",
       "claude/official",
     ]);
+  });
+
+  it("uses the shared provider options for every role select", () => {
+    seedTeamSetupCard();
+
+    render(<TeamSetupCard />);
+
+    for (const select of roleSelects()) {
+      expect(optionLabels(select)).toEqual(
+        PROVIDER_MODEL_OPTIONS.map((option) => option.label),
+      );
+      expect(optionValues(select)).toEqual(
+        PROVIDER_MODEL_OPTIONS.map((option) => option.value),
+      );
+    }
   });
 
   it("starts the team with selected provider and model specs per role", () => {
