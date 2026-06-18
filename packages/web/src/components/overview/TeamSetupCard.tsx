@@ -4,9 +4,9 @@ import { useMemo, useState } from "react";
 import { Play } from "lucide-react";
 import { useStore, type PaneConfig } from "@/lib/store";
 import {
-  DEEPSEEK_DEFAULT_MODEL,
-  GLM_DEFAULT_MODEL,
-  MINIMAX_DEFAULT_MODEL,
+  DEFAULT_PROVIDER_MODEL_OPTION,
+  PROVIDER_MODEL_OPTIONS,
+  findProviderModelOption,
 } from "@/lib/providerOptions";
 
 /**
@@ -20,25 +20,6 @@ import {
  * pick the model BEFORE spawning, not after, because respawning a
  * pane with a fresh provider loses the chat-history context.
  */
-
-const AGENT_OPTS: ReadonlyArray<{
-  value: string;
-  label: string;
-  provider: string;
-  model: string | null;
-}> = [
-  { value: "claude/official", label: "Claude / Official", provider: "claude", model: null },
-  // Official Anthropic backend pinned to the Fable 5 model. Unlike the
-  // pane-level switchers there's no separate model knob here, so Fable
-  // gets its own agent option.
-  { value: "claude/fable", label: "Claude / Fable", provider: "claude", model: "claude-fable-5" },
-  { value: "claude/minimax", label: "Claude / MiniMax 2.7", provider: "claude", model: MINIMAX_DEFAULT_MODEL },
-  { value: "claude/glm", label: "Claude / GLM 5.1", provider: "claude", model: GLM_DEFAULT_MODEL },
-  { value: "claude/deepseek", label: "Claude / DeepSeek", provider: "claude", model: DEEPSEEK_DEFAULT_MODEL },
-  { value: "codex/official", label: "Codex / Official", provider: "codex", model: null },
-  { value: "opencode/official", label: "OpenCode / Official", provider: "opencode", model: null },
-  { value: "cursor-agent/official", label: "Cursor / Official", provider: "cursor-agent", model: null },
-];
 
 type RoleKey = "manager" | "techLead" | "reviewer" | "developer";
 
@@ -69,28 +50,26 @@ export function TeamSetupCard() {
   const startTeam = useStore((s) => s.startTeam);
 
   const [picks, setPicks] = useState<Record<RoleKey, string>>({
-    manager: "claude/official",
-    techLead: "claude/official",
-    reviewer: "claude/official",
-    developer: "claude/official",
+    manager: DEFAULT_PROVIDER_MODEL_OPTION.value,
+    techLead: DEFAULT_PROVIDER_MODEL_OPTION.value,
+    reviewer: DEFAULT_PROVIDER_MODEL_OPTION.value,
+    developer: DEFAULT_PROVIDER_MODEL_OPTION.value,
   });
 
   const teamPresent = useMemo(() => paneConfigs.some(isTeamRole), [paneConfigs]);
   if (teamPresent) return null;
 
-  const optByValue = (v: string) =>
-    AGENT_OPTS.find((o) => o.value === v) ?? AGENT_OPTS[0];
+  const specForValue = (value: string) => {
+    const option = findProviderModelOption(value);
+    return { provider: option.provider, model: option.model ?? null };
+  };
 
   const handleStart = () => {
-    const m = optByValue(picks.manager);
-    const t = optByValue(picks.techLead);
-    const r = optByValue(picks.reviewer);
-    const d = optByValue(picks.developer);
     startTeam({
-      manager: { provider: m.provider, model: m.model },
-      techLead: { provider: t.provider, model: t.model },
-      reviewer: { provider: r.provider, model: r.model },
-      developer: { provider: d.provider, model: d.model },
+      manager: specForValue(picks.manager),
+      techLead: specForValue(picks.techLead),
+      reviewer: specForValue(picks.reviewer),
+      developer: specForValue(picks.developer),
     });
   };
 
@@ -139,7 +118,7 @@ export function TeamSetupCard() {
               className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-2 py-0.5 text-xs font-mono text-gray-700 dark:text-gray-300 focus:outline-none focus:ring-1 focus:ring-indigo-400"
               title="Agent frontend × API backend"
             >
-              {AGENT_OPTS.map((o) => (
+              {PROVIDER_MODEL_OPTIONS.map((o) => (
                 <option key={o.value} value={o.value}>
                   {o.label}
                 </option>
