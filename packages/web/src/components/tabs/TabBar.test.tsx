@@ -113,6 +113,14 @@ function mockRect(element: Element, left: number, width: number) {
   });
 }
 
+function openNewTabMenu() {
+  fireEvent.click(screen.getByTitle("New tab"));
+}
+
+function isolatedWorktreeCheckbox(): HTMLInputElement {
+  return screen.getByLabelText("Isolated git worktree") as HTMLInputElement;
+}
+
 describe("TabBar coordinator close controls", () => {
   beforeEach(() => {
     Element.prototype.scrollIntoView = vi.fn();
@@ -265,5 +273,55 @@ describe("TabBar rename and reorder controls", () => {
     fireEvent.drop(gamma, { dataTransfer: dataTransfer() });
 
     expect(onReorderTabs).toHaveBeenLastCalledWith([2, 3, 1]);
+  });
+});
+
+describe("TabBar add-tab worktree controls", () => {
+  beforeEach(() => {
+    Element.prototype.scrollIntoView = vi.fn();
+  });
+
+  it("passes undefined isolated-worktree mode for an untouched default provider pick", () => {
+    const onAddTab = vi.fn();
+    renderTabBar({ onAddTab });
+
+    openNewTabMenu();
+    fireEvent.click(screen.getByText("Claude"));
+    fireEvent.click(screen.getByText("Official"));
+
+    expect(onAddTab).toHaveBeenCalledWith("claude", undefined, undefined);
+  });
+
+  it("passes true when isolated worktree is checked and resets it after picking", () => {
+    const onAddTab = vi.fn();
+    renderTabBar({ onAddTab });
+
+    openNewTabMenu();
+    fireEvent.click(isolatedWorktreeCheckbox());
+    fireEvent.click(screen.getByText("Claude"));
+    fireEvent.click(screen.getByText("Official"));
+
+    expect(onAddTab).toHaveBeenCalledWith("claude", undefined, true);
+
+    openNewTabMenu();
+    expect(isolatedWorktreeCheckbox().checked).toBe(false);
+    fireEvent.click(screen.getByText("Codex"));
+
+    expect(onAddTab).toHaveBeenLastCalledWith("codex", undefined, undefined);
+  });
+
+  it("closes the menu from an outside click and collapses expanded provider submenus", () => {
+    renderTabBar();
+
+    openNewTabMenu();
+    fireEvent.click(screen.getByText("Claude"));
+    expect(screen.getByText("Official")).toBeTruthy();
+
+    fireEvent.mouseDown(document.body);
+
+    expect(screen.queryByText("Official")).toBeNull();
+
+    openNewTabMenu();
+    expect(screen.queryByText("Official")).toBeNull();
   });
 });
