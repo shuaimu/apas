@@ -241,9 +241,18 @@ describe("ProjectGoalBar team role slots", () => {
     expect(promptText).toContain("avoid duplicate conflict delegations");
     expect(promptText).toContain("enablePullRequestAutoMerge");
     expect(promptText).toContain("Auto merge is not allowed for this repository");
-    expect(promptText).toContain("repository-level blocker");
-    expect(promptText).toContain("escalate once with the affected PR URL list");
-    expect(promptText).toContain("leave later eligible PRs in that same repo open");
+    expect(promptText).toContain(
+      "gh pr view <url> --json state,statusCheckRollup,reviewDecision,mergeable",
+    );
+    expect(promptText).toContain('state == "OPEN"');
+    expect(promptText).toContain("CI is clean with no stale or long-pending checks");
+    expect(promptText).toContain("gh pr merge <url> --squash");
+    expect(promptText).toContain("without `--auto`");
+    expect(promptText).toContain("refresh PR state before marking done");
+    expect(promptText).toContain("never use this fallback for CONFLICTING, UNKNOWN");
+    expect(promptText).toContain(
+      "do not close or repeatedly escalate solely because auto-merge is disabled",
+    );
     expect(promptText).toContain(".apas-tech-lead-pr-comments.json");
     expect(promptText).toContain("gh pr view <url> --json comments,reviews");
     expect(promptText).toContain("createdAt > cursor[url]");
