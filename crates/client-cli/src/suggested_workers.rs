@@ -26,8 +26,10 @@
 use anyhow::{Context, Result};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const SUGGESTED_WORKERS_FILENAME: &str = "suggested-workers.md";
+static SUGGESTED_WORKERS_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn path(project_dir: &Path) -> PathBuf {
     project_dir.join(SUGGESTED_WORKERS_FILENAME)
@@ -64,12 +66,29 @@ pub fn save(project_dir: &Path, sw: &SuggestedWorkers) -> Result<()> {
         std::fs::create_dir_all(parent).ok();
     }
     let body = serialize(sw);
-    let tmp = p.with_extension("md.tmp");
+    let tmp = suggested_workers_tmp_path(&p);
     std::fs::write(&tmp, body)
         .with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, &p)
-        .with_context(|| format!("renaming {} -> {}", tmp.display(), p.display()))?;
+    if let Err(err) = std::fs::rename(&tmp, &p) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err)
+            .with_context(|| format!("renaming {} -> {}", tmp.display(), p.display()));
+    }
     Ok(())
+}
+
+fn suggested_workers_tmp_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(SUGGESTED_WORKERS_FILENAME);
+    let counter = SUGGESTED_WORKERS_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(
+        "{}.{}.{}.tmp",
+        file_name,
+        std::process::id(),
+        counter
+    ))
 }
 
 pub fn dismiss(project_dir: &Path, suggestion_id: &str) -> Result<SuggestedWorkers> {
@@ -219,6 +238,52 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn suggested_workers_tmp_entries(dir: &Path) -> Vec<String> {
+        let mut entries: Vec<String> = std::fs::read_dir(dir)
+            .expect("read temp project dir")
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().into_string().ok()?;
+                (name.starts_with("suggested-workers.md.") && name.ends_with(".tmp"))
+                    .then_some(name)
+            })
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    fn sample_suggestions() -> SuggestedWorkers {
+        SuggestedWorkers {
+            entries: vec![SuggestedWorker {
+                id: "SUG-001".into(),
+                label: "Frontend".into(),
+                role: "developer".into(),
+                goal: "Build UI".into(),
+                backstory: "React".into(),
+                needs_worktree: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn suggested_workers_tmp_path_is_unique_and_not_legacy_shared_name() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let p = tmp.path().join(SUGGESTED_WORKERS_FILENAME);
+        let first = suggested_workers_tmp_path(&p);
+        let second = suggested_workers_tmp_path(&p);
+
+        assert_ne!(first, second);
+        assert_ne!(first, p.with_extension("md.tmp"));
+        assert_eq!(first.parent(), Some(tmp.path()));
+
+        let tmp_name = first
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("utf-8 temp filename");
+        assert!(tmp_name.starts_with("suggested-workers.md."));
+        assert!(tmp_name.contains(&format!(".{}.", std::process::id())));
+        assert!(tmp_name.ends_with(".tmp"));
+    }
+
     #[test]
     fn parse_basic() {
         let s = "# Suggested Workers\n\n\
@@ -340,10 +405,51 @@ mod tests {
 
         assert_eq!(remaining.entries.len(), 1);
         assert_eq!(remaining.entries[0].id, "SUG-002");
+        let reloaded = load(tmp.path()).expect("load suggestions after dismiss");
+        assert_eq!(reloaded, remaining);
         let file = std::fs::read_to_string(path(tmp.path())).expect("read suggested-workers.md");
         assert!(!file.contains("SUG-001"));
         assert!(file.contains("## SUG-002"));
         assert!(file.contains("- needs_worktree: no"));
+        assert!(!tmp.path().join("suggested-workers.md.tmp").exists());
+        assert!(suggested_workers_tmp_entries(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn save_round_trips_valid_suggestions_without_shared_tmp() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let original = sample_suggestions();
+
+        save(tmp.path(), &original).expect("save suggestions");
+
+        let reloaded = load(tmp.path()).expect("load suggestions");
+        assert_eq!(reloaded, original);
+        assert!(!tmp.path().join("suggested-workers.md.tmp").exists());
+        assert!(suggested_workers_tmp_entries(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn repeated_saves_write_readable_markdown_without_stale_temp_files() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let legacy_tmp = tmp.path().join("suggested-workers.md.tmp");
+        let mut suggestions = sample_suggestions();
+
+        for idx in 0..3 {
+            suggestions.entries[0].goal = format!("Build UI {idx}");
+            save(tmp.path(), &suggestions).expect("save suggestions");
+
+            let reloaded = load(tmp.path()).expect("load suggestions");
+            assert_eq!(reloaded, suggestions);
+            assert!(
+                !legacy_tmp.exists(),
+                "shared suggested-workers.md.tmp should not remain"
+            );
+            let stale_tmp_entries = suggested_workers_tmp_entries(tmp.path());
+            assert!(
+                stale_tmp_entries.is_empty(),
+                "stale suggested-workers temp files remained: {stale_tmp_entries:?}"
+            );
+        }
     }
 
     #[test]
