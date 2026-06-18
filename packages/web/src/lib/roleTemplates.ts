@@ -93,8 +93,9 @@ Working style:
 - If you have a question for the human, escalate via kind: "escalation" on .apas-team.jsonl — the Manager will surface it.
 
 PR-style flow:
-- Workers ship via PRs, not direct-to-main merges. When a worker publishes kind: "diff" on the scratchpad, hand off to the Reviewer pane (if one exists). When the Reviewer publishes kind: "review" with approves:<pane_id>, escalate to the Manager so the user can review and merge via the GitHub PR.
-- Track each PR's state on the scratchpad — kind: "decision" records work well for "PR opened: <url>", "review approved", "merged".`,
+- Workers ship via PRs, not direct-to-main merges. When a worker publishes kind: "diff" on the scratchpad, record branch/commit details on the pane subtask, set it to reviewing in team-todo.md, and hand off to the Reviewer pane when the contributing subtasks are ready.
+- Once the Reviewer publishes kind: "review" with approves:<pane_id>, the worker opens its own PR and publishes a kind: "decision" record tagged "pr-opened". Record that decision on the matching Global TODO in team-todo.md as a canonical pr: <pane_id> <url> line; when every contributing worker has a PR line, flip the Global to pr_open.
+- You own PR state refresh and PR-comment dispatch: check pr_open PRs, update team-todo.md on MERGED / CLOSED, and delegate new PR comments back to the PR owner via pr-comments:<url>.`,
     planReviewMode: "never",
     teamMode: "deadloop",
     recommendedProvider: "claude",

@@ -31,4 +31,26 @@ describe("ROLE_TEMPLATES", () => {
     expect(backstory).not.toContain("gh pr view <url>");
     expect(backstory).not.toContain("git -C <worktree> checkout master");
   });
+
+  it("tech lead template records worker-opened PRs in team todo", () => {
+    const techLead = ROLE_TEMPLATES.find((template) => template.id === "tech-lead");
+    expect(techLead).toBeTruthy();
+
+    const backstory = techLead!.backstory;
+
+    expect(backstory).toContain('kind: "diff"');
+    expect(backstory).toContain("hand off to the Reviewer pane");
+    expect(backstory).toContain("worker opens its own PR");
+    expect(backstory).toContain('kind: "decision"');
+    expect(backstory).toContain("pr-opened");
+    expect(backstory).toContain("team-todo.md");
+    expect(backstory).toContain("canonical pr: <pane_id> <url>");
+    expect(backstory).toContain("pr_open");
+    expect(backstory).toContain("PR state refresh");
+    expect(backstory).toContain("pr-comments:<url>");
+    expect(backstory).not.toContain(
+      "escalate to the Manager so the user can review and merge via the GitHub PR",
+    );
+    expect(backstory).not.toContain("Track each PR's state on the scratchpad");
+  });
 });
