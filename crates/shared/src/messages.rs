@@ -795,9 +795,9 @@ pub enum WebToServer {
         backstory: Option<String>,
         #[serde(default)]
         plan_review_mode: PlanReviewMode,
-        /// v3.5 — true when this pane is being added through the
-        /// Overview's **+ Add Worker** flow (part of the team), false
-        /// when it's a TabBar `+` side chat. See PaneConfig::managed.
+        /// v3.5 — true when this pane is being added as part of the
+        /// project team, false when it's a TabBar `+` side chat. See
+        /// PaneConfig::managed.
         #[serde(default)]
         managed: bool,
     },
@@ -1590,12 +1590,12 @@ pub struct PaneConfig {
     #[serde(default)]
     pub manual_mode: bool,
     /// v3.5 — managed vs. unmanaged. `true` = this pane is part of the
-    /// team (auto-spawned Manager / Tech Lead / Reviewer, or a worker
-    /// added via the Overview's **+ Add Worker** flow). Such panes show
-    /// up on the Overview Pane Grid and Tech Lead considers them for
-    /// delegation. `false` (default for backward compat + the TabBar
-    /// `+` button) = side chat / experiment; not part of the team queue
-    /// and never a delegation target.
+    /// project team, usually created by the Overview Start team role
+    /// slots or by accepted worker suggestions / manual managed-worker
+    /// flows. Such panes show up on the Overview Pane Grid and the Tech
+    /// Lead may consider them for delegation. `false` (default for
+    /// backward compat + the TabBar `+` button) = side chat / experiment;
+    /// not part of the team queue and never a Tech Lead delegation target.
     #[serde(default)]
     pub managed: bool,
 }
