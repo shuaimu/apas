@@ -4032,15 +4032,15 @@ mod tests {
         active_usage_providers, auto_cancel_pending_questions_for_new_input, build_agent_args,
         build_agent_switch_respawn_event, build_deadloop_agent_args, build_pane_reboot_events,
         build_pane_env_overrides_from_keys, build_pane_list, boot_restore_try_resume_first,
-        deadloop_wait_plan, is_codex_stale_session_error, manual_create_pr_worktree_path,
-        pane_label_or_default, promote_pane_to_managed, reset_deadloop_codex_stale_session,
-        resolve_pane_binary_path,
-        route_web_input_to_pane, restored_pane_mode_and_pause, run_deadloop_session_inner,
-        save_pane_configs, should_recover_deadloop_stale_session, start_bot_preserved_fields,
-        truncate_str_at_char_boundary, update_project_flags,
-        ASK_USER_QUESTION_AUTO_CANCEL_STATUS, InputChannels, PaneInputRouteResult, PaneMeta,
-        PaneMetas, PanePauses, PaneStopRequests, PendingAskQuestion, DEEPSEEK_DEFAULT_MODEL,
-        MANAGED_PANE_CREATE_PR_ERROR,
+        deadloop_wait_plan, evaluate_deadloop_watchdog, is_codex_stale_session_error,
+        manual_create_pr_worktree_path, pane_label_or_default, promote_pane_to_managed,
+        reset_deadloop_codex_stale_session, resolve_pane_binary_path, route_web_input_to_pane,
+        restored_pane_mode_and_pause, run_deadloop_session_inner, save_pane_configs,
+        should_recover_deadloop_stale_session, start_bot_preserved_fields,
+        truncate_str_at_char_boundary, update_project_flags, DeadloopWatchdogDecision,
+        DeadloopWatchdogState, ASK_USER_QUESTION_AUTO_CANCEL_STATUS, InputChannels,
+        PaneInputRouteResult, PaneMeta, PaneMetas, PanePauses, PaneStopRequests,
+        PendingAskQuestion, DEEPSEEK_DEFAULT_MODEL, MANAGED_PANE_CREATE_PR_ERROR,
     };
     use crate::project::{get_or_create_project, save_project};
     use crate::tui::{PaneOutput, TuiEvent};
@@ -4049,7 +4049,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime};
     use tokio::sync::mpsc as tokio_mpsc;
     use uuid::Uuid;
 
@@ -4092,6 +4092,129 @@ mod tests {
             .expect("web providerOptions.ts exports DEEPSEEK_DEFAULT_MODEL");
 
         assert_eq!(DEEPSEEK_DEFAULT_MODEL, web_default);
+    }
+
+    #[test]
+    fn deadloop_watchdog_mtime_updates_reset_activity_clock() {
+        let start = Instant::now();
+        let idle_threshold = Duration::from_secs(30 * 60);
+        let previous_activity = start
+            .checked_sub(idle_threshold + Duration::from_secs(60))
+            .expect("start should support test subtraction");
+        let mut state = DeadloopWatchdogState::new(start);
+        state.last_activity = previous_activity;
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(123);
+
+        let decision = evaluate_deadloop_watchdog(
+            &mut state,
+            start,
+            idle_threshold,
+            Some(mtime),
+            true,
+            true,
+        );
+
+        assert_eq!(decision, DeadloopWatchdogDecision::Noop);
+        assert_eq!(state.last_mtime, Some(mtime));
+        assert_eq!(state.last_activity, start);
+        assert_eq!(state.last_nudge, None);
+
+        let before_threshold = start + idle_threshold - Duration::from_secs(1);
+        let decision = evaluate_deadloop_watchdog(
+            &mut state,
+            before_threshold,
+            idle_threshold,
+            Some(mtime),
+            true,
+            true,
+        );
+
+        assert_eq!(decision, DeadloopWatchdogDecision::Noop);
+        assert_eq!(state.last_nudge, None);
+    }
+
+    #[test]
+    fn deadloop_watchdog_stale_activity_nudges_once_until_cooldown_expires() {
+        let start = Instant::now();
+        let idle_threshold = Duration::from_secs(30 * 60);
+        let mut state = DeadloopWatchdogState::new(start);
+
+        let first_nudge_at = start + idle_threshold;
+        let decision = evaluate_deadloop_watchdog(
+            &mut state,
+            first_nudge_at,
+            idle_threshold,
+            None,
+            true,
+            true,
+        );
+
+        assert_eq!(
+            decision,
+            DeadloopWatchdogDecision::Nudge { idle_minutes: 30 }
+        );
+        assert_eq!(state.last_nudge, Some(first_nudge_at));
+
+        let inside_cooldown = first_nudge_at + idle_threshold - Duration::from_secs(1);
+        let decision = evaluate_deadloop_watchdog(
+            &mut state,
+            inside_cooldown,
+            idle_threshold,
+            None,
+            true,
+            true,
+        );
+
+        assert_eq!(decision, DeadloopWatchdogDecision::Noop);
+        assert_eq!(state.last_nudge, Some(first_nudge_at));
+
+        let cooldown_expired = first_nudge_at + idle_threshold;
+        let decision = evaluate_deadloop_watchdog(
+            &mut state,
+            cooldown_expired,
+            idle_threshold,
+            None,
+            true,
+            true,
+        );
+
+        assert_eq!(
+            decision,
+            DeadloopWatchdogDecision::Nudge { idle_minutes: 60 }
+        );
+        assert_eq!(state.last_nudge, Some(cooldown_expired));
+    }
+
+    #[test]
+    fn deadloop_watchdog_skips_inactive_supervisor_or_missing_jsonl_path() {
+        let start = Instant::now();
+        let idle_threshold = Duration::from_secs(30 * 60);
+        let mut state = DeadloopWatchdogState::new(start);
+        let stale_at = start + idle_threshold;
+
+        let decision = evaluate_deadloop_watchdog(
+            &mut state,
+            stale_at,
+            idle_threshold,
+            None,
+            true,
+            false,
+        );
+
+        assert_eq!(decision, DeadloopWatchdogDecision::Noop);
+        assert_eq!(state.last_nudge, None);
+
+        let decision = evaluate_deadloop_watchdog(
+            &mut state,
+            stale_at,
+            idle_threshold,
+            None,
+            false,
+            true,
+        );
+
+        assert_eq!(decision, DeadloopWatchdogDecision::Noop);
+        assert_eq!(state.last_nudge, None);
     }
 
     fn test_pane_meta(
@@ -6540,6 +6663,64 @@ fn session_jsonl_exists(working_dir: &str, session_id: &Uuid) -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Debug, Clone)]
+struct DeadloopWatchdogState {
+    last_mtime: Option<std::time::SystemTime>,
+    last_activity: Instant,
+    last_nudge: Option<Instant>,
+}
+
+impl DeadloopWatchdogState {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_mtime: None,
+            last_activity: now,
+            last_nudge: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeadloopWatchdogDecision {
+    Noop,
+    Nudge { idle_minutes: u64 },
+}
+
+fn evaluate_deadloop_watchdog(
+    state: &mut DeadloopWatchdogState,
+    now: Instant,
+    idle_threshold: Duration,
+    session_mtime: Option<std::time::SystemTime>,
+    session_jsonl_path_known: bool,
+    supervisor_active: bool,
+) -> DeadloopWatchdogDecision {
+    if !supervisor_active || !session_jsonl_path_known {
+        return DeadloopWatchdogDecision::Noop;
+    }
+
+    if let Some(mtime) = session_mtime {
+        if state.last_mtime != Some(mtime) {
+            state.last_mtime = Some(mtime);
+            state.last_activity = now;
+            return DeadloopWatchdogDecision::Noop;
+        }
+    }
+
+    let idle = now.saturating_duration_since(state.last_activity);
+    let nudge_cooldown_over = state
+        .last_nudge
+        .map(|last_nudge| now.saturating_duration_since(last_nudge) >= idle_threshold)
+        .unwrap_or(true);
+    if idle >= idle_threshold && nudge_cooldown_over {
+        state.last_nudge = Some(now);
+        DeadloopWatchdogDecision::Nudge {
+            idle_minutes: idle.as_secs() / 60,
+        }
+    } else {
+        DeadloopWatchdogDecision::Noop
+    }
+}
+
 /// Per-pane background-task watcher for the streaming worker.
 ///
 /// Claude code stores Bash background-task output at
@@ -8091,9 +8272,7 @@ fn run_deadloop_session_streaming(
     let idle_threshold = Duration::from_secs(
         std::cmp::max(min_iteration_interval_minutes.saturating_mul(3), 30) * 60,
     );
-    let mut watchdog_last_mtime: Option<std::time::SystemTime> = None;
-    let mut watchdog_last_activity = std::time::Instant::now();
-    let mut watchdog_last_nudge: Option<std::time::Instant> = None;
+    let mut watchdog_state = DeadloopWatchdogState::new(Instant::now());
     let mut watchdog_tick: u32 = 0;
 
     let mut was_paused = false;
@@ -8162,23 +8341,21 @@ fn run_deadloop_session_streaming(
         watchdog_tick += 1;
         if watchdog_tick >= 30 {
             watchdog_tick = 0;
-            if let Some(mtime) = watchdog_jsonl
+            let now = Instant::now();
+            let session_mtime = watchdog_jsonl
                 .as_ref()
                 .and_then(|p| std::fs::metadata(p).ok())
-                .and_then(|m| m.modified().ok())
+                .and_then(|m| m.modified().ok());
+            if let DeadloopWatchdogDecision::Nudge { idle_minutes } =
+                evaluate_deadloop_watchdog(
+                    &mut watchdog_state,
+                    now,
+                    idle_threshold,
+                    session_mtime,
+                    watchdog_jsonl.is_some(),
+                    true,
+                )
             {
-                if watchdog_last_mtime != Some(mtime) {
-                    watchdog_last_mtime = Some(mtime);
-                    watchdog_last_activity = std::time::Instant::now();
-                }
-            }
-            let idle = watchdog_last_activity.elapsed();
-            let nudge_cooldown_over = watchdog_last_nudge
-                .map(|t| t.elapsed() >= idle_threshold)
-                .unwrap_or(true);
-            if idle >= idle_threshold && nudge_cooldown_over {
-                watchdog_last_nudge = Some(std::time::Instant::now());
-                let idle_minutes = idle.as_secs() / 60;
                 tracing::warn!(
                     pane_id,
                     idle_minutes,
