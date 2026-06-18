@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useState, useCallback, useMemo } from "react";
+import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { createPortal } from "react-dom";
 import { TabbedView } from "@/components/tabs/TabbedView";
 import { Sidebar } from "@/components/Sidebar";
 import { ResizeHandle } from "@/components/ResizeHandle";
 import { useStore } from "@/lib/store";
+import { reloadWindow } from "@/lib/browserActions";
 import { clearAllSnapshots } from "@/lib/sessionCacheDb";
 import { Settings, Wifi, WifiOff, LogOut, Menu, X, RefreshCw, Trash2 } from "lucide-react";
 
@@ -47,6 +48,7 @@ export default function Home() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [isReconnecting, setIsReconnecting] = useState(false);
   const [clearCacheState, setClearCacheState] = useState<"idle" | "confirm" | "clearing">("idle");
+  const reconnectConnectAttemptedRef = useRef(false);
 
   // Sidebar width state - per-project
   const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
@@ -149,6 +151,7 @@ export default function Home() {
 
   const handleReconnect = () => {
     if (isReconnecting) return; // Prevent double-clicks
+    reconnectConnectAttemptedRef.current = false;
     setIsReconnecting(true);
     // Use setTimeout(0) to let React update the UI first (show spinner)
     // before we disconnect (which also triggers a re-render)
@@ -156,6 +159,7 @@ export default function Home() {
       disconnect();
       // Then reconnect after a delay to let the old connection close
       setTimeout(() => {
+        reconnectConnectAttemptedRef.current = true;
         connect();
       }, 500);
     }, 50);
@@ -163,7 +167,8 @@ export default function Home() {
 
   // Clear reconnecting state when connection is established
   useEffect(() => {
-    if (isReconnecting && connected) {
+    if (isReconnecting && connected && reconnectConnectAttemptedRef.current) {
+      reconnectConnectAttemptedRef.current = false;
       setIsReconnecting(false);
     }
   }, [connected, isReconnecting]);
@@ -172,6 +177,7 @@ export default function Home() {
   useEffect(() => {
     if (isReconnecting) {
       const timeout = setTimeout(() => {
+        reconnectConnectAttemptedRef.current = false;
         setIsReconnecting(false);
       }, 5000); // 5 second timeout
       return () => clearTimeout(timeout);
@@ -403,7 +409,7 @@ export default function Home() {
                         onClick={async () => {
                           setClearCacheState("clearing");
                           await clearAllSnapshots();
-                          window.location.reload();
+                          reloadWindow();
                         }}
                         className="flex-1 px-3 py-2 bg-red-500 hover:bg-red-600 text-white rounded text-sm font-medium transition-colors"
                       >

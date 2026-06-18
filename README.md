@@ -6,7 +6,7 @@ APAS runs an autonomous programming team around your project. A Manager pane tal
 
 - **Team Mode**: Coordinate Manager, Tech Lead, Reviewer, and worker panes from one project
 - **Shared Project State**: Keep goals in `project_goal.md` and work queues in `team-todo.md`
-- **PR-Based Review**: Workers publish diffs, wait for Reviewer approval, then open pull requests for the human to merge
+- **PR-Based Review**: Workers publish diffs, wait for Reviewer approval, then open pull requests while the Tech Lead tracks PR state and routes comments
 - **Web Dashboard**: Use the Overview to inspect panes, manage TODOs, and observe work in real time
 - **Customizable Prompts**: Define role prompts and workflow behavior in the `.apas` config file
 - **Auto-Updates**: CLI automatically checks for updates on startup
@@ -66,7 +66,17 @@ The Overview is the main control surface for team-mode projects:
 2. Describe the project goal, or ask the Manager to scan the repo and draft one. The Manager keeps `project_goal.md` in sync.
 3. Start the Tech Lead. It reads `project_goal.md` and `team-todo.md`, proposes Global TODOs, and dispatches approved work to worker panes.
 4. Approve or reject proposed Global TODOs from the Overview TODO panel.
-5. Review worker PRs on GitHub. Workers wait for Reviewer approval before opening PRs, and they wait for the human to merge them.
+5. Review and merge worker PRs on GitHub. Workers wait for Reviewer approval before opening PRs; after a PR opens, the Tech Lead tracks merge or close state and routes PR comments back to the owning worker.
+
+#### Tech Lead autonomy
+
+The Overview includes opt-in Tech Lead autonomy toggles backed by `.apas`.
+Both default to manual control: `auto_approve_todos: false` and
+`auto_merge_prs: false`. The Tech Lead re-reads these flags each loop.
+`auto_approve_todos` lets it approve its own proposed Global TODOs;
+`auto_merge_prs` remains gated by Reviewer approval, mergeability, and
+green/non-stale CI state. Leaving both off is safest; enabling either
+trades review latency for more autonomous execution.
 
 ### Configuration
 
@@ -77,11 +87,13 @@ The `.apas` file in your project directory contains:
   "id": "uuid-of-your-project",
   "name": "project-name",
   "created_at": "timestamp",
+  "auto_approve_todos": false,
+  "auto_merge_prs": false,
   "prompt": "Your custom prompt here (optional)"
 }
 ```
 
-If no custom `prompt` is specified, APAS uses the built-in team-mode prompts for the default Manager, Tech Lead, Reviewer, and Developer panes. You can customize pane roles, goals, backstories, and prompts in `.apas` as your workflow matures.
+If no custom `prompt` is specified, APAS uses the built-in team-mode prompts for the default Manager, Tech Lead, Reviewer, and Developer panes. You can customize pane roles, goals, backstories, prompts, and Tech Lead autonomy flags in `.apas` as your workflow matures.
 
 ### CLI Options
 
@@ -110,9 +122,14 @@ apas -d /path/to/dir     # Specify working directory
                                               +-----------------+
 ```
 
-- **APAS CLI**: Wraps Claude Code, sends structured output to server
-- **APAS Server**: Routes messages between CLI and web clients
-- **Web UI**: Displays real-time Claude output and project status
+- **APAS CLI**: Owns local panes, role prompts, isolated worktrees,
+  and the team-mode files `project_goal.md`, `team-todo.md`, and
+  `.apas-team.jsonl`.
+- **APAS Server**: Routes project/session state, pane events, TODO
+  updates, and PR/status records between CLI clients and web clients.
+- **Web UI**: Provides the Overview team controls for starting roles,
+  approving TODOs, reviewing suggested workers, and tracking worker PR
+  handoffs and status.
 
 ## Development
 
@@ -121,11 +138,18 @@ apas -d /path/to/dir     # Specify working directory
 ```
 apas/
 ├── crates/
-│   ├── client-cli/    # APAS CLI (apas binary)
-│   ├── server/        # APAS server
-│   └── shared/        # Shared types and messages
+│   ├── client-cli/    # APAS CLI: panes, role prompts, worktrees, team files
+│   │   └── src/
+│   │       ├── role.rs             # Built-in Manager/Tech Lead/worker prompts
+│   │       ├── team_todo.rs        # team-todo.md parsing and state changes
+│   │       └── mode/dual_pane.rs   # Pane spawning, Start team, team loop wiring
+│   ├── server/        # Rust/Axum server for project/session state and routing
+│   └── shared/        # Shared wire types and messages
 ├── packages/
 │   └── web/           # Next.js web dashboard
+│       └── src/
+│           ├── components/overview/ # Team setup, TODOs, suggestions, PR views
+│           └── lib/store.ts         # Websocket store and Overview actions
 └── install.sh         # Installation script
 ```
 
