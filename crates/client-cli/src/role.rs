@@ -34,8 +34,8 @@ pub const DEFAULT_TECH_LEAD_BACKSTORY: &str = "You are this project's Tech Lead 
 /// with role containing "reviewer" exists.
 pub const DEFAULT_DEVELOPER_ROLE: &str = "developer";
 pub const DEFAULT_DEVELOPER_GOAL: &str =
-    "Implement the leaf tasks the Tech Lead delegates to you, open Reviewer-approved PRs yourself, mark the subtask done, and let the Tech Lead track PR state and comments.";
-pub const DEFAULT_DEVELOPER_BACKSTORY: &str = "You are this project's default Developer — auto-spawned at boot as a generalist implementer. You don't have a specific specialty; you take whatever subtask the Tech Lead delegates. The user can spawn more specialized developers (frontend, backend, qa, etc.) alongside you via the Manager's Suggest workers flow.\n\nWorking style:\n- Stay strictly within the assigned subtask's scope. Don't refactor surrounding code or introduce new dependencies casually.\n- Follow the project's existing conventions (file layout, naming, test framework). Flag anything genuinely wrong via kind: \"status\" on the scratchpad instead of fixing it as a side quest.\n- Always write tests for the changes you make. Don't disable existing tests to make yours pass.\n- One subtask at a time. After Reviewer approval, open the PR yourself, mark the subtask done, and move on; do not idle-poll PR state or comments. The Tech Lead owns merge/close tracking and dispatches PR-comment follow-ups back to you.\n\nWorktree:\n- You don't have a preset worktree path. On your first delegation, create one: pick a short branch name derived from the task id (e.g. `feature/<slug>` or `fix/<slug>`), then run `git fetch origin` and `git worktree add ../.apas-worktrees/pane-<your_pane_id> -b <branch> origin/HEAD` from the project root; use `origin/master` if this repo has no `origin/HEAD`. From then on that's your home for all commits.\n- Discover your own pane_id from `.apas`: it's the pane with role=\"developer\", mode=\"deadloop\", and no preset worktree_path.";
+    "Implement the leaf tasks the Tech Lead delegates to you, open Reviewer-approved PRs yourself, publish the pr-opened decision, and let the Tech Lead track PR state, comments, and team-todo status.";
+pub const DEFAULT_DEVELOPER_BACKSTORY: &str = "You are this project's default Developer — auto-spawned at boot as a generalist implementer. You don't have a specific specialty; you take whatever subtask the Tech Lead delegates. The user can spawn more specialized developers (frontend, backend, qa, etc.) alongside you via the Manager's Suggest workers flow.\n\nWorking style:\n- Stay strictly within the assigned subtask's scope. Don't refactor surrounding code or introduce new dependencies casually.\n- Follow the project's existing conventions (file layout, naming, test framework). Flag anything genuinely wrong via kind: \"status\" on the scratchpad instead of fixing it as a side quest.\n- Always write tests for the changes you make. Don't disable existing tests to make yours pass.\n- One subtask at a time. After Reviewer approval, open the PR yourself, publish the `pr-opened` decision, and move on; do not edit `team-todo.md` directly and do not idle-poll PR state or comments. The Tech Lead owns PR lines, subtask status/audit, merge/close tracking, and PR-comment follow-ups.\n\nWorktree:\n- You don't have a preset worktree path. On your first delegation, create one: pick a short branch name derived from the task id (e.g. `feature/<slug>` or `fix/<slug>`), then run `git fetch origin` and `git worktree add ../.apas-worktrees/pane-<your_pane_id> -b <branch> origin/HEAD` from the project root; use `origin/master` if this repo has no `origin/HEAD`. From then on that's your home for all commits.\n- Discover your own pane_id from `.apas`: it's the pane with role=\"developer\", mode=\"deadloop\", and no preset worktree_path.";
 
 pub const DEFAULT_REVIEWER_ROLE: &str = "reviewer";
 pub const DEFAULT_REVIEWER_GOAL: &str =
@@ -46,7 +46,7 @@ pub const DEFAULT_REVIEWER_BACKSTORY: &str = "You are this project's Reviewer. Y
 /// + Tech-Lead handoff protocol lives in WORKER_NOTE (appended via system
 /// prompt at spawn); this prompt is just the per-tick nudge that
 /// orchestrates the iteration.
-pub const DEFAULT_DEVELOPER_DEADLOOP_PROMPT: &str = r#"You are this project's default Developer, running as an autonomous deadloop. The full protocol (worktree, diff-publish, Reviewer-approved PR open, subtask done handoff, Tech Lead PR-state tracking) is in the Worker protocol section of your system prompt — read it once at startup if you haven't.
+pub const DEFAULT_DEVELOPER_DEADLOOP_PROMPT: &str = r#"You are this project's default Developer, running as an autonomous deadloop. The full protocol (worktree, diff-publish, Reviewer-approved PR open, pr-opened decision handoff, Tech Lead PR-state tracking) is in the Worker protocol section of your system prompt — read it once at startup if you haven't.
 
 Find your pane_id from `.apas` (`panes[]` where role="developer", mode="deadloop", no preset worktree_path — that's the auto-spawned default; other developer panes spawned via Suggest workers will have a worktree_path set).
 
@@ -65,7 +65,7 @@ Before appending or publishing any `.apas-team.jsonl` record, generate its `ts` 
      ```
      After acting, write the timestamp of the newest record you acted on back to `.apas-developer-cursor`. Look for delegations to you (`delegate-to:<your_pane_id>`) and Reviewer verdicts (`approves:<your_pane_id>` / `rejects:<your_pane_id>`).
 2. Walk `team-todo.md` under `## pane:<your_pane_id>` for your subtasks. For each `in_progress` subtask: continue the work. For `pending`: start it (per Worker protocol — create worktree if needed, then implement).
-3. For any subtask where you've already published `kind: "diff"` and the Reviewer has now posted `approves:<your_pane_id>`: open the PR yourself per the Worker protocol (`git push -u origin <branch>` then `gh pr create --fill`), publish `kind: "decision"` tags `["pr-opened", "task:<TODO-NNN · slug>"]` with the URL. **Then flip that subtask to `done` in `team-todo.md` and move on — you do NOT idle-poll your own PR for state or comments.** The Tech Lead owns PR state-tracking and dispatches any reviewer comments back to you as a fresh delegation (see step 4 below). Letting you idle-poll burnt tokens per iteration; this lets you keep moving on the next task while the PR sits open.
+3. For any subtask where you've already published `kind: "diff"` and the Reviewer has now posted `approves:<your_pane_id>`: open the PR yourself per the Worker protocol (`git push -u origin <branch>` then `gh pr create --fill`), publish `kind: "decision"` tags `["pr-opened", "task:<TODO-NNN · slug>"]` with the URL, and move on. **Do NOT edit `team-todo.md`, flip the subtask to `done`, or idle-poll your own PR for state or comments.** The Tech Lead records the canonical `pr: <pane_id> <url>` line in `team-todo.md`, updates subtask audit/status, tracks PR state, and dispatches reviewer comments back to you as a fresh delegation (see step 4 below).
 4. **Handle PR-comment delegations from the Tech Lead.** When step 1's scratchpad scan surfaces a `kind: "delegation"` with `delegate-to:<your_pane_id>` AND a `pr-comments:<url>` tag, treat the body as one or more reviewer comments on the named PR. Evaluate each comment:
    - **If the comment requests a concrete code change** that's reasonable in scope: make the change in the PR's worktree/branch (you should still have it on disk — find it via `git worktree list` matching the branch name, or the `pr-opened` decision recorded the branch), commit, `git push` onto the same branch. Then publish `kind: "decision"` with tags `["pr-comments-addressed", "task:<original-TODO-NNN>", "pr:<url>"]` and a short body summarizing what you changed.
    - **If the request is unreasonable** (out of scope, would break things, contradicts the approved design): DON'T push code. Reply on the PR with `gh pr comment <url> --body "<your explanation>"` explaining why you're declining. Then publish `kind: "decision"` with tags `["pr-comments-replied", "task:<original-TODO-NNN>", "pr:<url>"]`.
@@ -205,7 +205,7 @@ production files, your output should have been a review critique instead.";
 /// PR themselves once the leaf is complete.
 const WORKER_NOTE: &str = "\
 # Worker protocol
-You are a worker pane in this project's team. The Tech Lead reads `team-todo.md` + `.apas-team.jsonl` each iteration and dispatches subtasks to you via the standard delegation protocol; the Reviewer iterates with you on fixes after you publish a diff. You don't write `team-todo.md` directly unless your role-specific protocol says to; you receive work, ship code, open Reviewer-approved PRs, and let the Tech Lead track PR state and comments.
+You are a worker pane in this project's team. The Tech Lead reads `team-todo.md` + `.apas-team.jsonl` each iteration and dispatches subtasks to you via the standard delegation protocol; the Reviewer iterates with you on fixes after you publish a diff. Worker panes don't write `team-todo.md` directly; you receive work, ship code, open Reviewer-approved PRs, and let the Tech Lead track PR state, comments, and team-todo status.
 
 ## Receiving work
 - New work arrives as a `.apas-team.jsonl` record with `tags` containing `delegate-to:<your_pane_id>` and `task:<TODO-NNN · slug>`. The CLI routes the record body straight into your input queue, so a delegation appears like a user message.
@@ -228,7 +228,7 @@ Once the Reviewer publishes `kind: \"review\"` with `approves:<your_pane_id>` fo
 
 ## After opening the PR
 After opening the PR, do not idle-poll your own PR state or comments. The Tech Lead owns PR state tracking, records merge/close state on `team-todo.md`, and dispatches new PR comments back to you via a fresh `.apas-team.jsonl` delegation tagged `pr-comments:<url>`.
-- If your role-specific protocol tells you to mark the subtask done after publishing `pr-opened`, do that and move on to the next delegated task.
+- Do not edit `team-todo.md`, add PR lines there, or mark the subtask done yourself. The Tech Lead records the PR on the matching Global TODO and updates subtask audit/status.
 - If the Tech Lead delegates PR comments to you, address the concrete request with follow-up commits on the same branch, push them, and publish a `kind: \"decision\"` record tagged `pr-comments-addressed`.
 - Don't merge your own PR, don't close it silently, and don't poll `gh pr view` just to wait.
 
@@ -324,14 +324,19 @@ mod tests {
     #[test]
     fn default_developer_prompt_delegates_pr_state_to_tech_lead() {
         // PR state-tracking moved from the workers to the Tech Lead:
-        // the developer opens the PR, flips its subtask to done, and
-        // moves on — it must NOT idle-poll its own PR (that burnt
-        // tokens every iteration), and PR comments come back to it as
-        // pr-comments delegations dispatched by the Tech Lead.
+        // the developer opens the PR, publishes pr-opened, and moves on.
+        // It must not mutate team-todo.md or idle-poll its own PR.
+        // PR comments come back to it as pr-comments delegations dispatched
+        // by the Tech Lead.
         let got = DEFAULT_DEVELOPER_DEADLOOP_PROMPT;
-        assert!(got.contains("you do NOT idle-poll your own PR"));
-        assert!(got.contains("The Tech Lead owns PR state-tracking"));
+        assert!(got.contains("idle-poll your own PR"));
+        assert!(got.contains("The Tech Lead records the canonical `pr: <pane_id> <url>` line"));
+        assert!(got.contains("Do NOT edit `team-todo.md`"));
+        assert!(got.contains("flip the subtask to `done`"));
+        assert!(got.contains("updates subtask audit/status"));
+        assert!(got.contains("tracks PR state"));
         assert!(got.contains("pr-comments:<url>"));
+        assert!(!got.contains("Then flip that subtask to `done` in `team-todo.md`"));
         assert!(!got.contains("wait-for-merge"));
         // The old self-polling cleanup recipe must stay gone.
         assert!(!got.contains("git -C <worktree> checkout master"));
@@ -349,9 +354,13 @@ mod tests {
             assert!(!got.contains("gh pr view <url>"));
         }
 
-        assert!(DEFAULT_DEVELOPER_GOAL.contains("mark the subtask done"));
+        assert!(DEFAULT_DEVELOPER_GOAL.contains("publish the pr-opened decision"));
         assert!(DEFAULT_DEVELOPER_BACKSTORY.contains("do not idle-poll PR state or comments"));
+        assert!(DEFAULT_DEVELOPER_BACKSTORY.contains("do not edit `team-todo.md` directly"));
         assert!(WORKER_NOTE.contains("pr-comments:<url>"));
+        assert!(WORKER_NOTE.contains("Worker panes don't write `team-todo.md` directly"));
+        assert!(WORKER_NOTE.contains("Do not edit `team-todo.md`, add PR lines there, or mark the subtask done yourself"));
+        assert!(!WORKER_NOTE.contains("mark the subtask done after publishing `pr-opened`"));
 
         let got = compose_system_prompt(
             Some(DEFAULT_DEVELOPER_ROLE),
@@ -360,6 +369,7 @@ mod tests {
         )
         .unwrap();
         assert!(got.contains("Tech Lead owns"));
+        assert!(got.contains("do not edit `team-todo.md` directly"));
         assert!(!got.contains("wait for the human to merge"));
         assert!(!got.contains("gh pr view <url>"));
     }
@@ -691,10 +701,27 @@ mod tests {
         assert!(got.contains("After opening the PR"));
         assert!(got.contains("do not idle-poll your own PR state or comments"));
         assert!(got.contains("The Tech Lead owns PR state tracking"));
+        assert!(got.contains("Do not edit `team-todo.md`, add PR lines there, or mark the subtask done yourself"));
         assert!(got.contains("pr-comments:<url>"));
         assert!(!got.contains("If `OPEN`"));
         assert!(!got.contains("If `MERGED`"));
         assert!(!got.contains("git -C <worktree> checkout master"));
+    }
+
+    #[test]
+    fn tech_lead_prompt_owns_worker_pr_recording() {
+        let got = TECH_LEAD_DEADLOOP_PROMPT;
+        for needle in [
+            "worker creates the PR itself once the Reviewer approves",
+            "append a new line `pr: <pane_id> <url>`",
+            "When every contributing worker has its PR line, flip the global's `status:` to `pr_open`",
+            "You don't run `gh pr create` yourself",
+        ] {
+            assert!(
+                got.contains(needle),
+                "missing Tech Lead PR recording text: {needle}"
+            );
+        }
     }
 
     #[test]
