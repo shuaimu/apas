@@ -81,6 +81,8 @@ pub struct GlobalTodo {
     pub title: String,
     pub status: GlobalStatus,
     pub origin: Origin,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     /// One PR per contributing worker pane. Per-worker because a Global
     /// TODO can split across multiple panes — each pane has its own
     /// branch in its own worktree, and we don't try to merge them into
@@ -518,6 +520,11 @@ fn build_global(
     };
     let status = GlobalStatus::from_str(get("status").as_deref().unwrap_or("proposed"))?;
     let origin = Origin::from_str(get("origin").as_deref().unwrap_or("tech-lead"))?;
+    let notes: Vec<String> = fields
+        .iter()
+        .filter(|(k, _)| k == "note")
+        .map(|(_, v)| v.clone())
+        .collect();
 
     // Each `pr:` line is `<pane_id> <url>` (per-worker PR). For backward
     // compat with the older single-PR schema, lines whose value is
@@ -558,6 +565,7 @@ fn build_global(
         title,
         status,
         origin,
+        notes,
         prs,
         body: body.to_string(),
     })
@@ -643,6 +651,9 @@ pub fn serialize(todo: &TeamTodo) -> String {
                     }
                 }
             }
+        }
+        for note in &g.notes {
+            let _ = writeln!(out, "note: {}", note);
         }
         if !g.body.is_empty() {
             let _ = writeln!(out);
@@ -917,6 +928,7 @@ pub fn add_user_todo(todo: &mut TeamTodo, title: &str, body: String) -> Option<S
         title: trimmed.to_string(),
         status: GlobalStatus::Approved,
         origin: Origin::User,
+        notes: Vec::new(),
         prs: Vec::new(),
         body,
     });
@@ -1076,6 +1088,7 @@ The test fixtures bake session cookies in; replace with a JWT minter.\n\
             title: "Only one worker".into(),
             status: GlobalStatus::InProgress,
             origin: Origin::User,
+            notes: Vec::new(),
             prs: vec![],
             body: String::new(),
         });
@@ -1084,6 +1097,7 @@ The test fixtures bake session cookies in; replace with a JWT minter.\n\
             title: "Two workers".into(),
             status: GlobalStatus::InProgress,
             origin: Origin::User,
+            notes: Vec::new(),
             prs: vec![],
             body: String::new(),
         });
@@ -1127,6 +1141,7 @@ The test fixtures bake session cookies in; replace with a JWT minter.\n\
             title: "done before removal".into(),
             status: GlobalStatus::PrOpen,
             origin: Origin::User,
+            notes: Vec::new(),
             prs: vec![],
             body: String::new(),
         });
@@ -1311,6 +1326,90 @@ landed.\n";
     }
 
     #[test]
+    fn parses_and_round_trips_single_global_note() {
+        let s = "# Team TODO\n\n## Global TODOs\n\n\
+### [TODO-001] Audit note\n\
+status: approved\n\
+origin: tech-lead\n\
+pr: (not yet)\n\
+note: auto-approved by tech-lead at 2026-06-16T10:03:48-04:00\n\
+\n\
+audit body.\n";
+        let t = parse(s).unwrap();
+        let g = &t.globals[0];
+        assert_eq!(
+            g.notes,
+            vec!["auto-approved by tech-lead at 2026-06-16T10:03:48-04:00".to_string()]
+        );
+
+        let rendered = serialize(&t);
+        assert!(rendered.contains(
+            "note: auto-approved by tech-lead at 2026-06-16T10:03:48-04:00"
+        ));
+        let reparsed = parse(&rendered).unwrap();
+        assert_eq!(reparsed, t);
+    }
+
+    #[test]
+    fn parses_and_round_trips_multiple_global_notes() {
+        let s = "# Team TODO\n\n## Global TODOs\n\n\
+### [TODO-001] Audit notes\n\
+status: proposed\n\
+origin: tech-lead\n\
+note: first survey note\n\
+note: second survey note\n\
+\n\
+body.\n";
+        let t = parse(s).unwrap();
+        let g = &t.globals[0];
+        assert_eq!(
+            g.notes,
+            vec![
+                "first survey note".to_string(),
+                "second survey note".to_string()
+            ]
+        );
+
+        let rendered = serialize(&t);
+        assert!(rendered.contains("note: first survey note\nnote: second survey note"));
+        let reparsed = parse(&rendered).unwrap();
+        assert_eq!(reparsed, t);
+    }
+
+    #[test]
+    fn preserves_notes_with_merged_annotated_pr_lines() {
+        let s = "# Team TODO\n\n## Global TODOs\n\n\
+### [TODO-001] Landed\n\
+status: done\n\
+origin: tech-lead\n\
+pr: 568 https://github.com/shuaimu/apas/pull/12 (MERGED 2026-06-16T03:59:12Z 7d78b3e...)\n\
+note: auto-approved by tech-lead at 2026-06-16T10:03:48-04:00\n\
+\n\
+landed body.\n";
+        let t = parse(s).unwrap();
+        let g = &t.globals[0];
+        assert_eq!(
+            g.notes,
+            vec!["auto-approved by tech-lead at 2026-06-16T10:03:48-04:00".to_string()]
+        );
+        assert_eq!(g.prs[0].pane_id, 568);
+        assert_eq!(g.prs[0].url, "https://github.com/shuaimu/apas/pull/12");
+        assert_eq!(
+            g.prs[0].annotation.as_deref(),
+            Some("(MERGED 2026-06-16T03:59:12Z 7d78b3e...)")
+        );
+
+        let rendered = serialize(&t);
+        assert!(rendered.contains(
+            "pr: 568 https://github.com/shuaimu/apas/pull/12 \
+(MERGED 2026-06-16T03:59:12Z 7d78b3e...)\n\
+note: auto-approved by tech-lead at 2026-06-16T10:03:48-04:00"
+        ));
+        let reparsed = parse(&rendered).unwrap();
+        assert_eq!(reparsed, t);
+    }
+
+    #[test]
     fn parses_legacy_single_pr_line_with_pane_id_zero() {
         let s = "# Team TODO\n\n## Global TODOs\n\n\
 ### [TODO-001] Legacy one\n\
@@ -1335,6 +1434,7 @@ old format.\n";
             title: "x".into(),
             status: GlobalStatus::Proposed,
             origin: Origin::User,
+            notes: Vec::new(),
             prs: Vec::new(),
             body: String::new(),
         });
@@ -1363,6 +1463,7 @@ old format.\n";
             title: "fresh".into(),
             status: GlobalStatus::Approved,
             origin: Origin::User,
+            notes: Vec::new(),
             prs: Vec::new(),
             body: String::new(),
         });
@@ -1399,6 +1500,7 @@ old format.\n";
             title: "first".into(),
             status: GlobalStatus::Proposed,
             origin: Origin::TechLead,
+            notes: Vec::new(),
             prs: Vec::new(),
             body: "body".into(),
         });
