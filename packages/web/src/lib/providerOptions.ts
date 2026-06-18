@@ -3,6 +3,7 @@ export const GLM_DEFAULT_MODEL = "glm-5.1";
 // Keep in sync with crates/client-cli/src/mode/dual_pane.rs; the apas
 // cargo test `deepseek_default_model_matches_web_provider_options` guards drift.
 export const DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-pro";
+export const CLAUDE_FABLE_MODEL = "claude-fable-5";
 
 export interface ProviderModelOption {
   value: string;
@@ -28,6 +29,12 @@ export const PROVIDER_MODEL_GROUPS: ProviderModelGroup[] = [
     toneClass: "text-blue-500",
     options: [
       { value: "claude/official", label: "Official", provider: "claude" },
+      {
+        value: "claude/fable",
+        label: "Fable",
+        provider: "claude",
+        model: CLAUDE_FABLE_MODEL,
+      },
       {
         value: "claude/minimax",
         label: "MiniMax 2.7",
@@ -110,11 +117,18 @@ export function isDeepseekModel(model?: string | null): boolean {
   return normalized.includes("deepseek");
 }
 
+export function isFableModel(model?: string | null): boolean {
+  if (typeof model !== "string") return false;
+  const normalized = model.trim().toLowerCase();
+  return normalized.includes("fable");
+}
+
 export function providerModelValue(
   provider?: string | null,
   model?: string | null,
 ): string {
   if (provider === "claude") {
+    if (isFableModel(model)) return "claude/fable";
     if (isMiniMaxModel(model)) return "claude/minimax";
     if (isGlmModel(model)) return "claude/glm";
     if (isDeepseekModel(model)) return "claude/deepseek";
@@ -126,6 +140,7 @@ export function providerModelValue(
   if (provider === "minimax") return "claude/minimax";
   if (provider === "glm") return "claude/glm";
   if (provider === "deepseek") return "claude/deepseek";
+  if (provider === "fable") return "claude/fable";
   return DEFAULT_PROVIDER_MODEL_OPTION.value;
 }
 

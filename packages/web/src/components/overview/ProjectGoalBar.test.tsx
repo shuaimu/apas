@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProjectGoalBar } from "./ProjectGoalBar";
+import { CLAUDE_FABLE_MODEL } from "@/lib/providerOptions";
 import { useStore, type PaneConfig } from "@/lib/store";
 
 const DEFAULT_SESSION_ID = "test-session";
@@ -109,6 +110,37 @@ describe("ProjectGoalBar team role slots", () => {
         role: "developer",
         goal: expect.stringContaining("Implement the leaf task"),
         backstory: expect.stringContaining("You are a hands-on implementer"),
+        planReviewMode: "never",
+      }),
+      true,
+    );
+  });
+
+  it("launches a missing developer with the shared Claude Fable option", () => {
+    const addPane = vi.fn(() => ({ success: true }));
+    seedProjectGoalBar({ addPane });
+    render(<ProjectGoalBar />);
+
+    fireEvent.change(screen.getByLabelText("Developer provider/model"), {
+      target: { value: "claude/fable" },
+    });
+
+    const developerSlot = roleSlot("Developer");
+    const launchButton = within(developerSlot).getByRole("button", {
+      name: /launch/i,
+    });
+    fireEvent.click(launchButton);
+
+    expect(addPane).toHaveBeenCalledWith(
+      "claude",
+      "deadloop",
+      "Developer",
+      undefined,
+      CLAUDE_FABLE_MODEL,
+      true,
+      expect.objectContaining({
+        role: "developer",
+        goal: expect.stringContaining("Implement the leaf task"),
         planReviewMode: "never",
       }),
       true,
