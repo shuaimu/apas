@@ -65,8 +65,8 @@ export function PaneGrid({
     if (kind === "managed") {
       return (
         <div className="rounded border border-dashed border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30 p-4 text-sm italic text-gray-500 dark:text-gray-400">
-          No team members yet. Use <strong>+ Add Worker</strong> above to add one,
-          or promote an existing side chat below.
+          No team members yet. Use the Start team card above to launch the default
+          roles, or promote an existing side chat below.
         </div>
       );
     }
