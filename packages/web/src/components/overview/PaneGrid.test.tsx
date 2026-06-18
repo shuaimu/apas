@@ -68,6 +68,26 @@ function optionLabels(select: HTMLSelectElement): string[] {
   return Array.from(select.options).map((option) => option.textContent ?? "");
 }
 
+describe("PaneGrid empty states", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    act(() => {
+      useStore.setState(initialStore, true);
+    });
+  });
+
+  it("points the empty managed-team copy at Start team and side-chat promotion", () => {
+    seedPaneGrid([]);
+
+    renderPaneGrid("managed");
+
+    const emptyState = screen.getByText(/No team members yet/);
+    expect(emptyState.textContent).toContain("Start team");
+    expect(emptyState.textContent).toContain("promote an existing side chat");
+    expect(emptyState.textContent).not.toContain("+ Add Worker");
+  });
+});
+
 describe("PaneGrid removal controls", () => {
   afterEach(() => {
     vi.restoreAllMocks();
