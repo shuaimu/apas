@@ -642,18 +642,28 @@ function CollapsedFolder({
             <span className={titleClass}>{g.title}</span>
             {variant === "done" && g.prs?.length > 0 && (
               <span className="ml-1 flex shrink-0 items-baseline gap-1">
-                {g.prs.map((pr, i) => (
-                  <a
-                    key={i}
-                    href={pr.url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-[10px] text-blue-600 hover:underline dark:text-blue-400"
-                    title={pr.url}
-                  >
-                    PR{pr.pane_id ? ` (pane ${pr.pane_id})` : ""} ↗
-                  </a>
-                ))}
+                {g.prs.map((pr, i) => {
+                  const annotation = formatPrAnnotation(pr.annotation);
+                  return (
+                    <span key={i} className="inline-flex items-baseline gap-1">
+                      <a
+                        href={pr.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-[10px] text-blue-600 hover:underline dark:text-blue-400"
+                        title={pr.url}
+                      >
+                        PR{pr.pane_id ? ` (pane ${pr.pane_id})` : ""} ↗
+                      </a>
+                      {annotation && (
+                        <PrAnnotationCue
+                          label={annotation.label}
+                          title={annotation.title}
+                        />
+                      )}
+                    </span>
+                  );
+                })}
               </span>
             )}
             <span className="ml-auto shrink-0 text-[10px] text-gray-500 dark:text-gray-400">
@@ -691,13 +701,17 @@ function GlobalRow({
   /// Drop entries whose URL doesn't parse as a real GitHub PR.
   const uniquePrs = useMemo(() => {
     const seen = new Set<string>();
-    const out: { pane_id: number; parsed: ParsedPrLine }[] = [];
+    const out: {
+      pane_id: number;
+      parsed: ParsedPrLine;
+      annotation?: string;
+    }[] = [];
     for (const pr of g.prs ?? []) {
       if (seen.has(pr.url)) continue;
       const parsed = parsePrLine(`pr: ${pr.pane_id} ${pr.url}`);
       if (!parsed) continue;
       seen.add(pr.url);
-      out.push({ pane_id: pr.pane_id, parsed });
+      out.push({ pane_id: pr.pane_id, parsed, annotation: pr.annotation });
     }
     return out;
   }, [g.prs]);
@@ -710,11 +724,12 @@ function GlobalRow({
             <code className="text-[10px] text-gray-500 dark:text-gray-400">{g.id}</code>
             <StatusBadge status={g.status} />
             <OriginBadge origin={g.origin} />
-            {uniquePrs.map(({ pane_id, parsed }) => (
+            {uniquePrs.map(({ pane_id, parsed, annotation }) => (
               <PrLink
                 key={parsed.url}
                 paneId={pane_id}
                 parsed={parsed}
+                annotation={annotation}
                 globalStatus={g.status}
               />
             ))}
@@ -809,16 +824,23 @@ interface PullReviewJson {
 function PrLink({
   paneId,
   parsed,
+  annotation,
   globalStatus,
 }: {
   paneId: number;
   parsed: ParsedPrLine;
+  annotation?: string;
   globalStatus: string;
 }) {
   const skipFetch = globalStatus === "done";
   const [state, setState] = useState<PrFetchState>(
     skipFetch ? { kind: "done" } : { kind: "loading" },
   );
+  const formattedAnnotation = formatPrAnnotation(annotation);
+  const visibleAnnotation =
+    formattedAnnotation && (globalStatus === "done" || state.kind === "merged")
+      ? formattedAnnotation
+      : null;
 
   useEffect(() => {
     if (skipFetch) return;
@@ -871,6 +893,42 @@ function PrLink({
       </a>
       <PrStateBadge state={state} />
       <PrReadinessBadge readiness={state.kind === "open" ? state.readiness : undefined} />
+      {visibleAnnotation && (
+        <PrAnnotationCue
+          label={visibleAnnotation.label}
+          title={visibleAnnotation.title}
+        />
+      )}
+    </span>
+  );
+}
+
+function formatPrAnnotation(
+  annotation: string | undefined,
+): { label: string; title: string } | null {
+  const trimmed = annotation?.trim();
+  if (!trimmed) return null;
+  const withoutParens = trimmed.replace(/^\((.*)\)$/, "$1").trim();
+  const merged = withoutParens.match(
+    /^MERGED\s+(\S+)(?:\s+([0-9a-fA-F]{7,40})(?:\.\.\.)?)?$/i,
+  );
+  if (!merged) return { label: withoutParens, title: trimmed };
+  const timestamp = merged[1];
+  const sha = merged[2]?.slice(0, 7);
+  return {
+    label: sha ? `merged ${timestamp} ${sha}` : `merged ${timestamp}`,
+    title: trimmed,
+  };
+}
+
+function PrAnnotationCue({ label, title }: { label: string; title: string }) {
+  return (
+    <span
+      aria-label={`PR annotation: ${label}`}
+      className="rounded bg-emerald-50 px-1 py-0.5 text-[10px] text-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-300"
+      title={title}
+    >
+      {label}
     </span>
   );
 }
