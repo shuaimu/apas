@@ -1,7 +1,7 @@
 //! Phase 2.2a: project-scoped team scratchpad.
 //!
 //! The scratchpad is an append-only JSONL file at
-//! `<project>/.apas/team.jsonl`. Each line is one [`TeamRecord`]. Panes
+//! `<project>/.apas-team.jsonl`. Each line is one [`TeamRecord`]. Panes
 //! publish artifacts they want other panes (or the human) to see —
 //! diffs, reviews, decisions, status pings — and the file is the
 //! single source of truth that survives restarts.
@@ -23,7 +23,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 /// Path of the team scratchpad relative to the project root.
-pub const SCRATCHPAD_REL_PATH: &str = ".apas/team.jsonl";
+pub const SCRATCHPAD_REL_PATH: &str = ".apas-team.jsonl";
 
 /// One published artifact in the team scratchpad. Forward-compat fields
 /// use `#[serde(default)]` so older readers don't choke on extras.
@@ -95,18 +95,11 @@ pub fn delegate_target_pane(record: &TeamRecord) -> Option<u32> {
     None
 }
 
-/// Append a single record to the project's scratchpad. Creates the
-/// `.apas/` parent dir if missing (the `.apas` file already lives in
-/// the project root, but the *directory* of that name may not exist —
-/// we use a sibling dir style: `.apas-worktrees`, `.apas` file, and
-/// now `.apas/team.jsonl`).
-///
-/// **File layout caveat**: the project's `.apas` is itself a *file*,
-/// not a directory — we use a different filename (`.apas-team.jsonl`)
-/// to avoid the file-vs-dir conflict. Helper documented so the
-/// convention is stable.
+/// Append a single record to the project's scratchpad. The project's
+/// `.apas` is metadata stored as a file, so the scratchpad lives beside
+/// it as `.apas-team.jsonl`.
 pub fn append(project_dir: &Path, record: &TeamRecord) -> Result<()> {
-    let path = scratchpad_path_resolved(project_dir);
+    let path = scratchpad_path(project_dir);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -125,7 +118,7 @@ pub fn append(project_dir: &Path, record: &TeamRecord) -> Result<()> {
 /// Read all records from the scratchpad. Skips malformed lines with a
 /// trace warning so a single bad write doesn't poison the entire log.
 pub fn read_all(project_dir: &Path) -> Result<Vec<TeamRecord>> {
-    let path = scratchpad_path_resolved(project_dir);
+    let path = scratchpad_path(project_dir);
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -177,19 +170,6 @@ pub fn read_filtered_by_tags(project_dir: &Path, wanted: &[&str]) -> Result<Vec<
         .collect())
 }
 
-/// Inner path resolution. `.apas` is a *file* (project metadata) so we
-/// can't put `team.jsonl` underneath it as a directory. Use the
-/// sibling `.apas-team.jsonl` file instead. Surface API still names
-/// the "scratchpad" so the term is stable; the on-disk file is just
-/// flat.
-fn scratchpad_path_resolved(project_dir: &Path) -> PathBuf {
-    // The doc-comment in the module talks about ".apas/team.jsonl"
-    // (the *conceptual* path), but on disk we use the flat sibling
-    // name because `.apas` is a file. If a future leaf migrates `.apas`
-    // to a directory, this is the one place that needs to change.
-    project_dir.join(".apas-team.jsonl")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,6 +182,7 @@ mod tests {
         let r2 = TeamRecord::now(Some(3), "review", "second body").with_tag("approves:42");
         append(tmp.path(), &r1).unwrap();
         append(tmp.path(), &r2).unwrap();
+        assert!(scratchpad_path(tmp.path()).exists());
         let got = read_all(tmp.path()).unwrap();
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].kind, "diff");
@@ -209,6 +190,38 @@ mod tests {
         assert_eq!(got[0].tags, vec!["pr-review"]);
         assert_eq!(got[1].pane_id, Some(3));
         assert_eq!(got[1].tags, vec!["approves:42"]);
+    }
+
+    #[test]
+    fn scratchpad_path_points_to_sibling_file() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(
+            scratchpad_path(tmp.path()),
+            tmp.path().join(".apas-team.jsonl")
+        );
+        assert_eq!(
+            scratchpad_path(tmp.path()),
+            tmp.path().join(SCRATCHPAD_REL_PATH)
+        );
+    }
+
+    #[test]
+    fn append_and_read_use_public_sibling_path() {
+        let tmp = TempDir::new().unwrap();
+        let public_path = scratchpad_path(tmp.path());
+        let legacy_path = tmp.path().join(".apas").join("team.jsonl");
+
+        append(
+            tmp.path(),
+            &TeamRecord::now(Some(8), "status", "using sibling scratchpad"),
+        )
+        .unwrap();
+
+        assert!(public_path.exists());
+        assert!(!legacy_path.exists());
+        let got = read_all(tmp.path()).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].body, "using sibling scratchpad");
     }
 
     #[test]
@@ -260,7 +273,7 @@ mod tests {
     #[test]
     fn malformed_lines_are_skipped_not_fatal() {
         let tmp = TempDir::new().unwrap();
-        let path = scratchpad_path_resolved(tmp.path());
+        let path = scratchpad_path(tmp.path());
         std::fs::write(
             &path,
             r#"{"ts":"2026-01-01T00:00:00Z","kind":"diff","body":"ok"}
