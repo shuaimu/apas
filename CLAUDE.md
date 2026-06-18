@@ -153,14 +153,48 @@ claude_path = "claude"
 ```
 
 ### Project Identification
-Each project directory gets a `.apas` file with project metadata:
+Each project directory gets a `.apas` file with project metadata and restored
+pane state:
 ```json
 {
   "id": "uuid",
   "name": "project-name",
-  "created_at": "2024-01-01T00:00:00Z"
+  "created_at": "2024-01-01T00:00:00Z",
+  "auto_approve_todos": false,
+  "auto_merge_prs": false,
+  "panes": [
+    {
+      "pane_id": 151,
+      "role": "team manager",
+      "mode": "interactive",
+      "managed": true
+    },
+    {
+      "pane_id": 178,
+      "role": "tech lead",
+      "mode": "deadloop",
+      "managed": true
+    },
+    {
+      "pane_id": 568,
+      "role": "developer",
+      "mode": "deadloop",
+      "managed": true,
+      "worktree_path": null
+    },
+    {
+      "pane_id": 440,
+      "role": null,
+      "mode": "interactive",
+      "managed": false
+    }
+  ]
 }
 ```
+
+`auto_approve_todos` and `auto_merge_prs` are project-level autonomy flags read
+by the Tech Lead loop. Managed pane entries are restored as team roles; unmanaged
+interactive panes can coexist with the team.
 
 ## Message Types
 
