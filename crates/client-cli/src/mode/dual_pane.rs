@@ -1863,13 +1863,7 @@ async fn run_inner(
         let project_for_pad = std::path::PathBuf::from(working_dir_str.clone());
         let input_channels_for_pad = input_channels.clone();
         thread::spawn(move || {
-            let path = crate::scratchpad::scratchpad_path(&project_for_pad);
-            // Replace the path resolver with the actual on-disk file.
-            // scratchpad_path() returns the *conceptual* path; the
-            // resolver inside the module maps it to the sibling. Read
-            // helpers handle the mapping, so just use read_all() for
-            // diffing.
-            let _ = path;
+            let scratchpad_path = crate::scratchpad::scratchpad_path(&project_for_pad);
             let mut last_size: u64 = 0;
             let mut seen_count: usize = 0;
             // Send existing history once on startup so attached web
@@ -1891,8 +1885,9 @@ async fn run_inner(
                 // Cheap change check: if file size hasn't grown since
                 // last tick, skip the re-read entirely. read_all()
                 // does its own malformed-line tolerance.
-                let actual_path = project_for_pad.join(".apas-team.jsonl");
-                let size = std::fs::metadata(&actual_path).map(|m| m.len()).unwrap_or(0);
+                let size = std::fs::metadata(&scratchpad_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
                 if size == last_size {
                     continue;
                 }
