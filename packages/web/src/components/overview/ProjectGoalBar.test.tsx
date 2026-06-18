@@ -207,6 +207,26 @@ describe("ProjectGoalBar team role slots", () => {
     expect(prompt).toEqual(expect.stringContaining("user-approved backlog state is preserved"));
     expect(prompt).toEqual(expect.stringContaining("configured capacity"));
     const promptText = String(prompt);
+    expect(promptText).toContain('kind: "diff"');
+    expect(promptText).toContain("record the branch/commit details");
+    expect(promptText).toContain("team-todo.md");
+    expect(promptText).toContain("status: reviewing");
+    expect(promptText).toContain("reviewing / approved / done");
+    expect(promptText).toContain("under_review");
+    expect(promptText).toContain('tags ["delegate-to:<reviewer_pane_id>", "task:TODO-NNN"]');
+    expect(promptText).toContain("review-worker:<pane_id>");
+    expect(promptText).toContain("do not request Reviewer review for that single diff yet");
+    const diffRecordIndex = promptText.indexOf('When a worker publishes kind: "diff"');
+    const allContributorsIndex = promptText.indexOf(
+      "only when every contributor is reviewing / approved / done",
+    );
+    const reviewerDelegationIndex = promptText.indexOf(
+      'tags ["delegate-to:<reviewer_pane_id>", "task:TODO-NNN"]',
+      diffRecordIndex,
+    );
+    expect(diffRecordIndex).toBeGreaterThanOrEqual(0);
+    expect(allContributorsIndex).toBeGreaterThan(diffRecordIndex);
+    expect(reviewerDelegationIndex).toBeGreaterThan(allContributorsIndex);
     expect(promptText).toContain("Orphan PR reconciliation");
     expect(promptText).toContain("legacy status: done / bare pr: https://github.com/.../pull/N shape");
     expect(promptText).toContain("contributing pane subtask contains clear evidence");
