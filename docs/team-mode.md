@@ -128,6 +128,11 @@ The Tech Lead records worker `pr-opened` decisions back into `team-todo.md`
 as `pr: <pane_id> <url>` lines and tracks PR state. Developers do not merge
 their own PRs and do not poll open PRs for comments; the Tech Lead dispatches
 new PR comments back to the PR owner with a `pr-comments:<url>` tag.
+If a PR becomes `CONFLICTING`, the Tech Lead keeps the Global TODO
+`pr_open` and routes a `pr-comments:<url>` repair delegation back to the
+owning Developer instead of closing the PR automatically. The Developer
+rebases or merges the current default branch, resolves the conflict, reruns
+verification, and pushes the same PR branch.
 
 ## Reviewer pattern
 
