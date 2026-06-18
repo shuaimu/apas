@@ -456,6 +456,28 @@ mod tests {
     }
 
     #[test]
+    fn tech_lead_prompt_dispatches_pr_comments_with_per_pr_cursor() {
+        let got = TECH_LEAD_DEADLOOP_PROMPT;
+        for needle in [
+            ".apas-tech-lead-pr-comments.json",
+            "gh pr view <url> --json comments,reviews",
+            "createdAt > cursor[url]",
+            "post ONE delegation per PR",
+            "delegate-to:<pr_owner_pane>",
+            "task:<orig-TODO>-pr-comments",
+            "pr-comments:<url>",
+            "write the latest comment `createdAt` you saw back into the cursor",
+            "cursor only advances on success",
+            "Skip PRs whose Globals are already `done` / `rejected`",
+        ] {
+            assert!(
+                got.contains(needle),
+                "missing Tech Lead PR-comment dispatcher text: {needle}"
+            );
+        }
+    }
+
+    #[test]
     fn tech_lead_prompt_handles_diff_records_as_review_handoff() {
         let got = TECH_LEAD_DEADLOOP_PROMPT;
         for needle in [
