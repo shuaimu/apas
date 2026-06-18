@@ -33,8 +33,10 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const TEAM_TODO_FILENAME: &str = "team-todo.md";
+static TEAM_TODO_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn team_todo_path(project_dir: &Path) -> PathBuf {
     project_dir.join(TEAM_TODO_FILENAME)
@@ -61,12 +63,29 @@ pub fn save(project_dir: &Path, todo: &TeamTodo) -> Result<()> {
         std::fs::create_dir_all(parent).ok();
     }
     let body = serialize(todo);
-    let tmp = path.with_extension("md.tmp");
+    let tmp = team_todo_tmp_path(&path);
     std::fs::write(&tmp, body)
         .with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path)
-        .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
+    if let Err(err) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err)
+            .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()));
+    }
     Ok(())
+}
+
+fn team_todo_tmp_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(TEAM_TODO_FILENAME);
+    let counter = TEAM_TODO_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(
+        "{}.{}.{}.tmp",
+        file_name,
+        std::process::id(),
+        counter
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -940,6 +959,39 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn team_todo_tmp_entries(dir: &Path) -> Vec<String> {
+        let mut entries: Vec<String> = std::fs::read_dir(dir)
+            .expect("read temp project dir")
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().into_string().ok()?;
+                (name.starts_with("team-todo.md.") && name.ends_with(".tmp"))
+                    .then_some(name)
+            })
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    #[test]
+    fn team_todo_tmp_path_is_unique_and_not_legacy_shared_name() {
+        let tmp = TempDir::new().expect("temp project dir");
+        let path = tmp.path().join(TEAM_TODO_FILENAME);
+        let first = team_todo_tmp_path(&path);
+        let second = team_todo_tmp_path(&path);
+
+        assert_ne!(first, second);
+        assert_ne!(first, path.with_extension("md.tmp"));
+        assert_eq!(first.parent(), Some(tmp.path()));
+
+        let tmp_name = first
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("utf-8 temp filename");
+        assert!(tmp_name.starts_with("team-todo.md."));
+        assert!(tmp_name.contains(&format!(".{}.", std::process::id())));
+        assert!(tmp_name.ends_with(".tmp"));
+    }
+
     fn sample_doc() -> &'static str {
         // Includes both kinds of section, the optional role hint syntax,
         // multi-line bodies, and the "(not yet)" PR sentinel.
@@ -1543,8 +1595,7 @@ old format.\n";
 
     #[test]
     fn save_load_round_trip_through_filesystem() {
-        let tmp = std::env::temp_dir().join(format!("apas-team-todo-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = TempDir::new().expect("temp project dir");
         let mut t = TeamTodo::default();
         t.push_global(GlobalTodo {
             id: "TODO-001".into(),
@@ -1555,19 +1606,84 @@ old format.\n";
             prs: Vec::new(),
             body: "body".into(),
         });
-        save(&tmp, &t).unwrap();
-        let reloaded = load(&tmp).unwrap();
+        save(tmp.path(), &t).unwrap();
+        let reloaded = load(tmp.path()).unwrap();
         assert_eq!(reloaded, t);
-        std::fs::remove_dir_all(&tmp).ok();
+        assert!(!tmp.path().join("team-todo.md.tmp").exists());
+    }
+
+    #[test]
+    fn repeated_saves_write_readable_markdown_without_stale_temp_files() {
+        let tmp = TempDir::new().expect("temp project dir");
+        let legacy_tmp = tmp.path().join("team-todo.md.tmp");
+        let mut t = TeamTodo::default();
+        t.push_global(GlobalTodo {
+            id: "TODO-001".into(),
+            title: "first".into(),
+            status: GlobalStatus::Proposed,
+            origin: Origin::TechLead,
+            notes: Vec::new(),
+            prs: Vec::new(),
+            body: String::new(),
+        });
+
+        for idx in 0..3 {
+            t.globals[0].body = format!("body {idx}");
+            save(tmp.path(), &t).unwrap();
+
+            let reloaded = load(tmp.path()).unwrap();
+            assert_eq!(reloaded, t);
+            assert!(
+                !legacy_tmp.exists(),
+                "shared team-todo.md.tmp should not remain"
+            );
+            let stale_tmp_entries = team_todo_tmp_entries(tmp.path());
+            assert!(
+                stale_tmp_entries.is_empty(),
+                "stale team-todo temp files remained: {stale_tmp_entries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn save_after_approval_and_add_todo_mutations_publishes_readable_markdown() {
+        let tmp = TempDir::new().expect("temp project dir");
+        let mut t = TeamTodo::default();
+        t.push_global(GlobalTodo {
+            id: "TODO-001".into(),
+            title: "needs approval".into(),
+            status: GlobalStatus::Proposed,
+            origin: Origin::TechLead,
+            notes: Vec::new(),
+            prs: Vec::new(),
+            body: "proposal body".into(),
+        });
+
+        let previous = apply_todo_approval(&mut t, "TODO-001", "approve").unwrap();
+        assert_eq!(previous, Some(GlobalStatus::Proposed));
+        let added_id =
+            add_user_todo(&mut t, "user request", "user body".to_string()).unwrap();
+        assert_eq!(added_id, "TODO-002");
+
+        save(tmp.path(), &t).unwrap();
+        let reloaded = load(tmp.path()).unwrap();
+        assert_eq!(reloaded, t);
+        assert_eq!(
+            reloaded.find_global("TODO-001").map(|item| item.status),
+            Some(GlobalStatus::Approved)
+        );
+        assert_eq!(
+            reloaded.find_global("TODO-002").map(|item| item.origin),
+            Some(Origin::User)
+        );
+        assert!(!tmp.path().join("team-todo.md.tmp").exists());
     }
 
     #[test]
     fn load_returns_empty_when_file_missing() {
-        let tmp = std::env::temp_dir().join(format!("apas-team-todo-missing-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let t = load(&tmp).unwrap();
+        let tmp = TempDir::new().expect("temp project dir");
+        let t = load(tmp.path()).unwrap();
         assert_eq!(t, TeamTodo::default());
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
