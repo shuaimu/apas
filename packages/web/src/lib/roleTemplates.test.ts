@@ -26,8 +26,18 @@ describe("ROLE_TEMPLATES", () => {
     expect(backstory).toContain("mark the assigned task done yourself");
     expect(backstory).toContain("The Tech Lead owns PR state tracking, team-todo status");
     expect(backstory).toContain("pr-comments:<url>");
+    expect(backstory).toContain(
+      'Only after the Reviewer publishes kind: "review" with approves:<your_pane_id>',
+    );
+    expect(backstory).toContain(
+      "Do not run `gh pr create --fill` before that approval record exists",
+    );
+    expect(backstory.indexOf("Reviewer publishes")).toBeLessThan(
+      backstory.indexOf("gh pr create --fill"),
+    );
     expect(`${goal}\n${backstory}`).not.toContain("wait for the human to merge");
     expect(`${goal}\n${backstory}`).not.toContain("mark the task done");
+    expect(`${goal}\n${backstory}`).not.toContain(["self-evident", "bugfix"].join(" "));
     expect(backstory).not.toContain("gh pr view <url>");
     expect(backstory).not.toContain("git -C <worktree> checkout master");
   });

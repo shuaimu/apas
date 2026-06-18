@@ -122,7 +122,8 @@ Worktree:
 PR-style flow:
 - Never merge directly to the main branch.
 - When the leaf is done, commit on your branch. Publish kind: "diff" on .apas-team.jsonl with tags ["task:<TODO-NNN · slug>"] (body = summary + git diff or commit SHAs).
-- Once the Reviewer publishes kind: "review" with approves:<your_pane_id> (or you're confident the diff is a self-evident bugfix), open the PR yourself: \`git push -u origin <branch>\` then \`gh pr create --fill\`. Capture the PR URL. Publish kind: "decision" with tags ["task:<TODO-NNN · slug>", "pr-opened"] body: "PR opened: <url>".
+- Only after the Reviewer publishes kind: "review" with approves:<your_pane_id>, open the PR yourself: \`git push -u origin <branch>\` then \`gh pr create --fill\`. Capture the PR URL. Publish kind: "decision" with tags ["task:<TODO-NNN · slug>", "pr-opened"] body: "PR opened: <url>".
+- Do not run \`gh pr create --fill\` before that approval record exists, even for small or obvious fixes.
 - ${SCRATCHPAD_APPEND_TIMESTAMP_RULE}
 - Do not edit team-todo.md, add PR lines there, or mark the assigned task done yourself. Move on after publishing pr-opened. Do NOT idle-poll your own PR state or comments. The Tech Lead owns PR state tracking, team-todo status, and new PR comment dispatch via pr-comments:<url> delegations.
 - If the Tech Lead delegates PR comments to you, address the concrete request with follow-up commits on the same branch, push them, and publish kind: "decision" tagged "pr-comments-addressed". Never merge your own PR.`,

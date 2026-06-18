@@ -220,11 +220,12 @@ You are a worker pane in this project's team. The Tech Lead reads `team-todo.md`
 - For the body: a short summary + the actual `git diff` output (`git -C <your_worktree> diff main...HEAD`). Keep it bounded to ~50 KB; if the diff is huge, summarize and link to the branch.
 - For revisions, publish a fresh `kind: \"diff\"` record per iteration with the new tag (e.g. `task:TODO-NNN-fix-2`). Don't try to update an old record — the scratchpad is append-only.
 
-## Open the PR yourself (once the Reviewer approves)
-Once the Reviewer publishes `kind: \"review\"` with `approves:<your_pane_id>` for this task — OR you've shipped a self-evident bugfix and confident your diff is correct — open the PR yourself. Don't wait for the Tech Lead or the human to do it:
+## Open the PR yourself (only after the Reviewer approves)
+Once the Reviewer publishes `kind: \"review\"` with `approves:<your_pane_id>` for this task, open the PR yourself. Don't wait for the Tech Lead or the human to do it:
    1. `git -C <your_worktree> push -u origin <branch>` (find the branch with `git -C <your_worktree> rev-parse --abbrev-ref HEAD`).
    2. `cd <your_worktree> && gh pr create --fill` — capture the last `https://...` line of stdout as the PR URL.
    3. Publish a `kind: \"decision\"` record on `.apas-team.jsonl` with `tags: [\"task:<TODO-NNN · slug>\", \"pr-opened\"]` and body `PR opened: <url>`. The Tech Lead will record the PR on the matching Global TODO.
+Do not run `gh pr create --fill` before that approval record exists, even for small or obvious fixes.
 
 ## After opening the PR
 After opening the PR, do not idle-poll your own PR state or comments. The Tech Lead owns PR state tracking, records merge/close state on `team-todo.md`, and dispatches new PR comments back to you via a fresh `.apas-team.jsonl` delegation tagged `pr-comments:<url>`.
@@ -361,6 +362,7 @@ mod tests {
         assert!(WORKER_NOTE.contains("Worker panes don't write `team-todo.md` directly"));
         assert!(WORKER_NOTE.contains("Do not edit `team-todo.md`, add PR lines there, or mark the subtask done yourself"));
         assert!(!WORKER_NOTE.contains("mark the subtask done after publishing `pr-opened`"));
+        assert!(!WORKER_NOTE.contains(&["self-evident", "bugfix"].join(" ")));
 
         let got = compose_system_prompt(
             Some(DEFAULT_DEVELOPER_ROLE),
@@ -630,6 +632,25 @@ mod tests {
         let manager_pos = got.find("# Manager protocol").unwrap();
         assert!(role_pos < scratchpad_pos);
         assert!(scratchpad_pos < manager_pos);
+    }
+
+    #[test]
+    fn worker_note_requires_reviewer_approval_before_pr_create() {
+        let approval_pos = WORKER_NOTE
+            .find("Once the Reviewer publishes `kind: \"review\"` with `approves:<your_pane_id>`")
+            .expect("worker note mentions Reviewer approval");
+        let pr_create_pos = WORKER_NOTE
+            .find("gh pr create --fill")
+            .expect("worker note mentions gh pr create");
+
+        assert!(
+            approval_pos < pr_create_pos,
+            "Reviewer approval should be described before gh pr create"
+        );
+        assert!(WORKER_NOTE.contains(
+            "Do not run `gh pr create --fill` before that approval record exists"
+        ));
+        assert!(!WORKER_NOTE.contains(&["self-evident", "bugfix"].join(" ")));
     }
 
     #[test]
