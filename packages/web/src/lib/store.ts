@@ -275,6 +275,12 @@ export const PANE_ID_DEADLOOP = 1;
 export const PANE_ID_INTERACTIVE = 2;
 const usageProviderHints = new Map<string, Provider>();
 
+export function storeDebugLog(...args: Parameters<typeof console.log>) {
+  if (process.env.NODE_ENV !== "production") {
+    console.log(...args);
+  }
+}
+
 function normalizeProvider(raw: unknown): Provider | null {
   if (typeof raw === "string") {
     const normalized = raw.trim().toLowerCase();
@@ -842,7 +848,7 @@ export const useStore = create<AppState>((set, get) => ({
   connect: () => {
     const token = typeof window !== 'undefined' ? localStorage.getItem("apas_token") : null;
     if (!token) {
-      console.log("No token found, cannot connect");
+      storeDebugLog("No token found, cannot connect");
       return;
     }
 
@@ -900,7 +906,7 @@ export const useStore = create<AppState>((set, get) => ({
     }, heartbeatMs);
 
     ws.onopen = () => {
-      console.log("WebSocket connected, sending authentication...");
+      storeDebugLog("WebSocket connected, sending authentication...");
       // Reset reconnect attempts on successful connection
       set({ reconnectAttempts: 0 });
       lastIncomingAt = Date.now();
@@ -919,7 +925,7 @@ export const useStore = create<AppState>((set, get) => ({
     };
 
     ws.onclose = (event) => {
-      console.log("WebSocket disconnected", event.code, event.reason);
+      storeDebugLog("WebSocket disconnected", event.code, event.reason);
       clearInterval(heartbeatHandle);
       set({ connected: false, ws: null, cliClients: [], isAttached: false });
 
@@ -929,15 +935,15 @@ export const useStore = create<AppState>((set, get) => ({
         const maxAttempts = 10;
         if (reconnectAttempts < maxAttempts) {
           const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
-          console.log(`Scheduling reconnect attempt ${reconnectAttempts + 1} in ${delay}ms`);
+          storeDebugLog(`Scheduling reconnect attempt ${reconnectAttempts + 1} in ${delay}ms`);
           const timeout = setTimeout(() => {
-            console.log(`Reconnect attempt ${reconnectAttempts + 1}`);
+            storeDebugLog(`Reconnect attempt ${reconnectAttempts + 1}`);
             set({ reconnectAttempts: reconnectAttempts + 1 });
             get().connect();
           }, delay);
           set({ reconnectTimeout: timeout });
         } else {
-          console.log("Max reconnect attempts reached");
+          storeDebugLog("Max reconnect attempts reached");
         }
       }
     };
@@ -951,9 +957,9 @@ export const useStore = create<AppState>((set, get) => ({
       const handler = () => {
         if (document.visibilityState === 'visible') {
           const { ws, connected, sessionId, isAttached } = get();
-          console.log("App became visible, checking connection...", { connected, isAttached, sessionId });
+          storeDebugLog("App became visible, checking connection...", { connected, isAttached, sessionId });
           if (!connected || !ws || ws.readyState !== WebSocket.OPEN) {
-            console.log("Connection lost while in background, reconnecting...");
+            storeDebugLog("Connection lost while in background, reconnecting...");
             set({ reconnectAttempts: 0 });
             get().connect();
           } else {
@@ -964,7 +970,7 @@ export const useStore = create<AppState>((set, get) => ({
             // unhiding. Refresh ancillary state AND fire a tail catchup
             // for the current session so any messages we missed while
             // backgrounded land before the user starts reading.
-            console.log("Connection appears healthy, refreshing data...");
+            storeDebugLog("Connection appears healthy, refreshing data...");
             get().refreshCliClients();
             get().listSessions();
             if (sessionId) {
@@ -974,7 +980,7 @@ export const useStore = create<AppState>((set, get) => ({
             // attachment got dropped for some reason), reattach without
             // forceReload — cache-first so the user keeps their messages.
             if (sessionId && !isAttached) {
-              console.log("Session was detached server-side; soft re-attach...");
+              storeDebugLog("Session was detached server-side; soft re-attach...");
               get().attachSession(sessionId, false);
             }
           }
@@ -1735,7 +1741,7 @@ export const useStore = create<AppState>((set, get) => ({
       const { ws, connected, sessionId, isAttached, cliClients } = get();
 
       if (ws && ws.readyState !== WebSocket.OPEN) {
-        console.log("WebSocket not in OPEN state, triggering reconnect...");
+        storeDebugLog("WebSocket not in OPEN state, triggering reconnect...");
         set({ connected: false, ws: null, isAttached: false, reconnectAttempts: 0 });
         get().connect();
         return;
@@ -2719,7 +2725,7 @@ function handleServerMessage(
       if (data.user_email) {
         localStorage.setItem("apas_user_email", data.user_email as string);
       }
-      console.log("Authenticated as user:", data.user_id);
+      storeDebugLog("Authenticated as user:", data.user_id);
       get().refreshCliClients();
       get().listMachines();
       get().listSessions();
@@ -2752,7 +2758,7 @@ function handleServerMessage(
           if (wsNow && wsNow.readyState === WebSocket.OPEN) {
             wsNow.send(JSON.stringify({ type: "attach_session", session_id: sessionToRestore }));
           }
-          console.log("Restoring session:", sessionToRestore);
+          storeDebugLog("Restoring session:", sessionToRestore);
           setTimeout(() => {
             // forceReload=false: keep the cached paneMessages visible across
             // the reconnect (e.g. phone unlock killed the WS). Without this,
@@ -2976,9 +2982,9 @@ function handleServerMessage(
       // away from.
       if (!existing || existing === newSessionId) {
         set({ sessionId: newSessionId });
-        console.log("Session started:", newSessionId);
+        storeDebugLog("Session started:", newSessionId);
       } else {
-        console.log(
+        storeDebugLog(
           "Ignoring stale session_started for",
           newSessionId,
           "(currently on",
@@ -2990,12 +2996,12 @@ function handleServerMessage(
     }
 
     case "session_status":
-      console.log("Session status:", data.status);
+      storeDebugLog("Session status:", data.status);
       break;
 
     case "session_attached": {
       const hasActiveCli = data.has_active_cli as boolean;
-      console.log("Session attached, has active CLI:", hasActiveCli);
+      storeDebugLog("Session attached, has active CLI:", hasActiveCli);
       set({ isAttached: hasActiveCli });
       break;
     }
@@ -3959,7 +3965,7 @@ function handleServerMessage(
 
     case "deadloop_status": {
       const isPaused = data.is_paused as boolean;
-      console.log("Deadloop status update:", isPaused ? "paused" : "running");
+      storeDebugLog("Deadloop status update:", isPaused ? "paused" : "running");
       set((state) => ({
         isDeadloopPaused: isPaused,
         pausedPanes: isPaused
@@ -3972,7 +3978,7 @@ function handleServerMessage(
     case "pane_paused": {
       const paneId = data.pane_id as number;
       const isPaused = data.is_paused as boolean;
-      console.log(`Pane ${paneId} ${isPaused ? "paused" : "resumed"}`);
+      storeDebugLog(`Pane ${paneId} ${isPaused ? "paused" : "resumed"}`);
       set((state) => ({
         pausedPanes: isPaused
           ? [...state.pausedPanes.filter(p => p !== paneId), paneId]
@@ -4012,7 +4018,7 @@ function handleServerMessage(
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
 
-      console.log(`Downloaded session ${sessionId} with ${messages.length} messages`);
+      storeDebugLog(`Downloaded session ${sessionId} with ${messages.length} messages`);
       break;
     }
 
@@ -4062,13 +4068,13 @@ function handleServerMessage(
           newMap.set(cliClientId, { ...existing, [provider]: parsedLimits });
           return { usageLimits: newMap };
         });
-        console.log("Usage limits updated for CLI:", cliClientId, provider, parsedLimits);
+        storeDebugLog("Usage limits updated for CLI:", cliClientId, provider, parsedLimits);
       }
       break;
     }
 
     default:
-      console.log("Unknown message type:", data.type);
+      storeDebugLog("Unknown message type:", data.type);
   }
 }
 

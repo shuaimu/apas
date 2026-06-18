@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { useStore, type Message, type CliClient, type TeamRecord } from './store';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { storeDebugLog, useStore, type Message, type CliClient, type TeamRecord } from './store';
 
 describe('useStore', () => {
   beforeEach(() => {
@@ -18,6 +18,32 @@ describe('useStore', () => {
       projectFlags: {},
       teamRecords: [],
       teamRecordsBySession: new Map(),
+    });
+  });
+
+  describe('storeDebugLog', () => {
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it('emits diagnostics outside production', () => {
+      vi.stubEnv('NODE_ENV', 'development');
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      storeDebugLog('store diagnostic', { connected: true });
+
+      expect(consoleSpy).toHaveBeenCalledWith('store diagnostic', { connected: true });
+      consoleSpy.mockRestore();
+    });
+
+    it('suppresses diagnostics in production', () => {
+      vi.stubEnv('NODE_ENV', 'production');
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      storeDebugLog('store diagnostic');
+
+      expect(consoleSpy).not.toHaveBeenCalled();
+      consoleSpy.mockRestore();
     });
   });
 
