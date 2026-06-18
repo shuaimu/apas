@@ -2,11 +2,13 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use shared::PaneConfig;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 
 const APAS_FILE: &str = ".apas";
 const USER_PROJECTS_FILE: &str = "projects.json";
 const LEGACY_USER_REGISTRY_DIR: &str = ".apas";
+static APAS_METADATA_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisteredProject {
@@ -487,7 +489,7 @@ pub fn get_or_create_project(dir: &Path) -> Result<ProjectMetadata> {
 pub fn save_project(dir: &Path, metadata: &ProjectMetadata) -> Result<()> {
     let apas_path = dir.join(APAS_FILE);
     let content = serde_json::to_string_pretty(metadata)?;
-    let tmp_path = apas_path.with_extension("apas.tmp");
+    let tmp_path = project_metadata_tmp_path(&apas_path);
     std::fs::write(&tmp_path, &content)?;
     std::fs::rename(&tmp_path, &apas_path)?;
     if let Err(err) = register_project(dir, metadata) {
@@ -495,6 +497,20 @@ pub fn save_project(dir: &Path, metadata: &ProjectMetadata) -> Result<()> {
     }
     tracing::debug!("Saved project metadata to {:?}", apas_path);
     Ok(())
+}
+
+fn project_metadata_tmp_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(APAS_FILE);
+    let counter = APAS_METADATA_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(
+        "{}.{}.{}.tmp",
+        file_name,
+        std::process::id(),
+        counter
+    ))
 }
 
 /// Get the .apas file path for a directory
@@ -510,9 +526,10 @@ pub fn is_project(dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn unique_temp_dir(label: &str) -> PathBuf {
         let stamp = SystemTime::now()
@@ -527,52 +544,33 @@ mod tests {
         ))
     }
 
-    fn registry_env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    struct EnvGuard {
-        saved: Vec<(&'static str, Option<OsString>)>,
-    }
-
-    impl EnvGuard {
-        fn set(vars: &[(&'static str, PathBuf)]) -> Self {
-            let saved = vars
-                .iter()
-                .map(|(name, _)| (*name, std::env::var_os(name)))
-                .collect();
-            for (name, value) in vars {
-                std::env::set_var(name, value);
-            }
-            Self { saved }
+    fn restore_env_var(key: &str, value: Option<std::ffi::OsString>) {
+        if let Some(value) = value {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
         }
     }
 
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (name, value) in self.saved.iter().rev() {
-                if let Some(value) = value {
-                    std::env::set_var(name, value);
-                } else {
-                    std::env::remove_var(name);
-                }
-            }
+    fn with_isolated_config<T>(test: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let xdg_config_home = tempfile::tempdir().expect("temp xdg config home");
+        let home = tempfile::tempdir().expect("temp home");
+        let old_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
+        let old_home = std::env::var_os("HOME");
+
+        std::env::set_var("XDG_CONFIG_HOME", xdg_config_home.path());
+        std::env::set_var("HOME", home.path());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test));
+
+        restore_env_var("XDG_CONFIG_HOME", old_xdg_config_home);
+        restore_env_var("HOME", old_home);
+
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
         }
-    }
-
-    fn with_isolated_config_env<T>(label: &str, f: impl FnOnce(&Path) -> T) -> T {
-        let _lock = registry_env_lock().lock().expect("registry env lock");
-        let root = unique_temp_dir(label);
-        let config_home = root.join("xdg-config");
-        let home = root.join("home");
-        std::fs::create_dir_all(&config_home).expect("create isolated config home");
-        std::fs::create_dir_all(&home).expect("create isolated home");
-
-        let _guard = EnvGuard::set(&[("XDG_CONFIG_HOME", config_home), ("HOME", home)]);
-        let result = f(&root);
-        let _ = std::fs::remove_dir_all(&root);
-        result
     }
 
     fn metadata_with_id(id: Uuid, name: &str) -> ProjectMetadata {
@@ -638,11 +636,11 @@ mod tests {
 
     #[test]
     fn register_project_deduplicates_by_id_and_path_and_sorts_output() {
-        with_isolated_config_env("register-dedupe", |root| {
-            let projects_root = root.join("projects");
-            let a_dir = projects_root.join("a-project");
-            let m_dir = projects_root.join("m-project");
-            let z_dir = projects_root.join("z-project");
+        with_isolated_config(|| {
+            let projects_root = tempfile::tempdir().expect("temp projects root");
+            let a_dir = projects_root.path().join("a-project");
+            let m_dir = projects_root.path().join("m-project");
+            let z_dir = projects_root.path().join("z-project");
             for dir in [&a_dir, &m_dir, &z_dir] {
                 std::fs::create_dir_all(dir).expect("create project dir");
             }
@@ -703,6 +701,61 @@ mod tests {
                 .projects
                 .iter()
                 .any(|project| project.path == z_path));
+        });
+    }
+
+    #[test]
+    fn project_metadata_tmp_path_is_unique_and_pid_scoped() {
+        let dir = tempfile::tempdir().expect("temp project dir");
+        let apas_path = dir.path().join(APAS_FILE);
+
+        let first = project_metadata_tmp_path(&apas_path);
+        let second = project_metadata_tmp_path(&apas_path);
+
+        assert_eq!(first.parent(), Some(dir.path()));
+        assert_ne!(first, apas_path.with_extension("apas.tmp"));
+        assert_ne!(first, second);
+
+        let tmp_name = first
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("utf-8 temp filename");
+        assert!(tmp_name.starts_with(".apas."));
+        assert!(tmp_name.contains(&format!(".{}.", std::process::id())));
+        assert!(tmp_name.ends_with(".tmp"));
+    }
+
+    #[test]
+    fn save_project_writes_valid_metadata_without_stale_shared_tmp() {
+        with_isolated_config(|| {
+            let dir = tempfile::tempdir().expect("temp project dir");
+            let mut metadata = ProjectMetadata::with_name("demo".to_string());
+            metadata.prompt = Some("first save".to_string());
+
+            save_project(dir.path(), &metadata).expect("first save");
+            metadata.prompt = Some("second save".to_string());
+            save_project(dir.path(), &metadata).expect("second save");
+
+            let apas_path = dir.path().join(APAS_FILE);
+            let content = std::fs::read_to_string(&apas_path).expect("read .apas");
+            let saved: ProjectMetadata =
+                serde_json::from_str(&content).expect("valid .apas metadata JSON");
+
+            assert_eq!(saved.id, metadata.id);
+            assert_eq!(saved.name, metadata.name);
+            assert_eq!(saved.prompt, Some("second save".to_string()));
+            assert!(!dir.path().join(".apas.tmp").exists());
+
+            let stale_tmp_entries: Vec<_> = std::fs::read_dir(dir.path())
+                .expect("read project dir")
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().to_string())
+                .filter(|name| name.starts_with(".apas.") && name.ends_with(".tmp"))
+                .collect();
+            assert!(
+                stale_tmp_entries.is_empty(),
+                "stale metadata temp files remained: {stale_tmp_entries:?}"
+            );
         });
     }
 
