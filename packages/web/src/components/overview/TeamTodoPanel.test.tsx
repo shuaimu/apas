@@ -234,6 +234,46 @@ describe("PrStateBadge fetch-driven color", () => {
     expect(badge.textContent).toBe("MERGED");
   });
 
+  it("renders annotated merged metadata without changing the PR link href", async () => {
+    const annotation = "(MERGED 2026-06-17T05:33:24Z a696d8e...)";
+    seedTeamTodo({
+      globals: [
+        {
+          id: "TODO-001",
+          title: "test",
+          status: "pr_open",
+          origin: "tech-lead",
+          prs: [{ pane_id: 568, url: PR_URL, annotation }],
+          body: "",
+        },
+      ],
+      workers: [],
+      tech_lead_cursor: null,
+      reviewer_cursor: null,
+    });
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ state: "closed", merged: true }),
+    }) as unknown as typeof fetch;
+
+    render(<TeamTodoPanel />);
+
+    const badge = await screen.findByTestId("pr-state-badge");
+    await waitFor(() =>
+      expect(badge.getAttribute("data-pr-state")).toBe("merged"),
+    );
+    const link = screen.getByRole("link", {
+      name: /PR #1 \(pane 568\)/,
+    }) as HTMLAnchorElement;
+    expect(link.getAttribute("href")).toBe(PR_URL);
+    expect(
+      screen.getByLabelText(
+        "PR annotation: merged 2026-06-17T05:33:24Z a696d8e",
+      ),
+    ).toBeTruthy();
+  });
+
   it("renders OPEN (amber) when GitHub reports open", async () => {
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
@@ -447,6 +487,44 @@ describe("PrStateBadge fetch-driven color", () => {
       name: /PR \(pane 218\)/,
     }) as HTMLAnchorElement;
     expect(link.getAttribute("href")).toBe(PR_URL);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("renders done Global PR annotations accessibly without fetching", () => {
+    const annotation = "(MERGED 2026-06-17T05:33:24Z a696d8e...)";
+    seedTeamTodo({
+      globals: [
+        {
+          id: "TODO-001",
+          title: "test",
+          status: "done",
+          origin: "tech-lead",
+          prs: [{ pane_id: 568, url: PR_URL, annotation }],
+          body: "",
+        },
+      ],
+      workers: [],
+      tech_lead_cursor: null,
+      reviewer_cursor: null,
+    });
+    const fetchSpy = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({}),
+    });
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+
+    render(<TeamTodoPanel />);
+
+    const link = screen.getByRole("link", {
+      name: /PR \(pane 568\)/,
+    }) as HTMLAnchorElement;
+    expect(link.getAttribute("href")).toBe(PR_URL);
+    expect(
+      screen.getByLabelText(
+        "PR annotation: merged 2026-06-17T05:33:24Z a696d8e",
+      ),
+    ).toBeTruthy();
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
