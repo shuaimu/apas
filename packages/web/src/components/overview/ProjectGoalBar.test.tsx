@@ -233,6 +233,15 @@ describe("ProjectGoalBar team role slots", () => {
     expect(promptText).toContain("repository-level blocker");
     expect(promptText).toContain("escalate once with the affected PR URL list");
     expect(promptText).toContain("leave later eligible PRs in that same repo open");
+    expect(promptText).toContain(".apas-tech-lead-pr-comments.json");
+    expect(promptText).toContain("gh pr view <url> --json comments,reviews");
+    expect(promptText).toContain("createdAt > cursor[url]");
+    expect(promptText).toContain("pr-comments:<url>");
+    expect(promptText).toContain("Advance cursor[url] only after successful fetches");
+    expect(promptText).toContain("skip settled done / rejected Globals");
+    expect(promptText).toContain("worker-owned kind: \"decision\"");
+    expect(promptText).toContain("tags including \"pr-opened\"");
+    expect(promptText).toContain("record pr: <pane_id> <url> lines");
     expect(promptText).not.toContain("may NEVER write 'approved' yourself");
     expect(addPane).toHaveBeenCalledWith(
       "claude",
