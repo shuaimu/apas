@@ -246,6 +246,153 @@ describe("PrStateBadge fetch-driven color", () => {
       expect(badge.getAttribute("data-pr-state")).toBe("open"),
     );
     expect(badge.textContent).toBe("OPEN");
+    expect(screen.queryByTestId("pr-readiness-badge")).toBeNull();
+  });
+
+  it("renders ready readiness when review, checks, and mergeability are clear", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          state: "open",
+          merged: false,
+          mergeable: true,
+          mergeable_state: "clean",
+          statuses_url: "https://api.github.com/repos/shuaimu/apas/statuses/abc",
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => [{ context: "ci", state: "success" }],
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => [
+          { state: "COMMENTED", submitted_at: "2026-06-18T09:00:00Z" },
+          { state: "APPROVED", submitted_at: "2026-06-18T09:01:00Z" },
+        ],
+      });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    render(<TeamTodoPanel />);
+
+    const readiness = await screen.findByTestId("pr-readiness-badge");
+    await waitFor(() =>
+      expect(readiness.getAttribute("data-pr-readiness")).toBe("ready"),
+    );
+    expect(readiness.textContent).toBe("ready");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("renders changes-requested readiness from PR reviews data", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          state: "open",
+          merged: false,
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => [
+          { state: "APPROVED", submitted_at: "2026-06-18T09:00:00Z" },
+          {
+            state: "CHANGES_REQUESTED",
+            submitted_at: "2026-06-18T09:01:00Z",
+          },
+        ],
+      });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    render(<TeamTodoPanel />);
+
+    const readiness = await screen.findByTestId("pr-readiness-badge");
+    await waitFor(() =>
+      expect(readiness.getAttribute("data-pr-readiness")).toBe("changes_requested"),
+    );
+    expect(readiness.textContent).toBe("changes requested");
+  });
+
+  it("renders pending-checks readiness from commit status data", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          state: "open",
+          merged: false,
+          mergeable: true,
+          mergeable_state: "clean",
+          statuses_url: "https://api.github.com/repos/shuaimu/apas/statuses/abc",
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => [{ context: "ci", state: "pending" }],
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => [
+          { state: "APPROVED", submitted_at: "2026-06-18T09:00:00Z" },
+        ],
+      });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    render(<TeamTodoPanel />);
+
+    const readiness = await screen.findByTestId("pr-readiness-badge");
+    await waitFor(() =>
+      expect(readiness.getAttribute("data-pr-readiness")).toBe("checks_pending"),
+    );
+    expect(readiness.textContent).toBe("checks pending");
+  });
+
+  it("renders failing-checks readiness from commit status data", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          state: "open",
+          merged: false,
+          mergeable: true,
+          mergeable_state: "clean",
+          statuses_url: "https://api.github.com/repos/shuaimu/apas/statuses/abc",
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => [{ context: "ci", state: "failure" }],
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => [
+          { state: "APPROVED", submitted_at: "2026-06-18T09:00:00Z" },
+        ],
+      });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    render(<TeamTodoPanel />);
+
+    const readiness = await screen.findByTestId("pr-readiness-badge");
+    await waitFor(() =>
+      expect(readiness.getAttribute("data-pr-readiness")).toBe("checks_failing"),
+    );
+    expect(readiness.textContent).toBe("checks failing");
   });
 
   it("renders CLOSED (gray) when GitHub reports closed without merge", async () => {
