@@ -24,11 +24,7 @@ static LAUNCH_BINARY_PATH: OnceLock<PathBuf> = OnceLock::new();
 /// chain still applies.
 pub fn capture_launch_binary_path() {
     if let Ok(path) = env::current_exe() {
-        if !is_proc_self_exe(&path)
-            && !is_deleted_path(&path)
-            && !is_nfs_silly_rename(&path)
-            && path.exists()
-        {
+        if is_safe_restart_exe(&path) {
             let _ = LAUNCH_BINARY_PATH.set(path);
         }
     }
@@ -81,15 +77,15 @@ fn is_nfs_silly_rename(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn is_safe_restart_exe(path: &Path) -> bool {
+    !is_proc_self_exe(path) && !is_deleted_path(path) && !is_nfs_silly_rename(path) && path.exists()
+}
+
 /// Return a usable on-disk executable for the current process.
 /// This intentionally excludes /proc/self/exe and deleted inode paths.
 fn get_current_on_disk_exe() -> Option<PathBuf> {
     let path = get_current_exe()?;
-    if is_proc_self_exe(&path)
-        || is_deleted_path(&path)
-        || is_nfs_silly_rename(&path)
-        || !path.exists()
-    {
+    if !is_safe_restart_exe(&path) {
         return None;
     }
     Some(path)
@@ -105,13 +101,7 @@ fn path_installed_exe() -> Option<PathBuf> {
     let path_var = env::var_os("PATH")?;
     for dir in env::split_paths(&path_var) {
         let candidate = dir.join("apas");
-        if !candidate.exists() {
-            continue;
-        }
-        if is_proc_self_exe(&candidate)
-            || is_deleted_path(&candidate)
-            || is_nfs_silly_rename(&candidate)
-        {
+        if !is_safe_restart_exe(&candidate) {
             continue;
         }
         return Some(candidate);
@@ -122,10 +112,7 @@ fn path_installed_exe() -> Option<PathBuf> {
 fn argv0_exe() -> Option<PathBuf> {
     let argv0 = env::args().next()?;
     let path = PathBuf::from(argv0);
-    if !path.is_absolute() || !path.exists() {
-        return None;
-    }
-    if is_proc_self_exe(&path) || is_deleted_path(&path) || is_nfs_silly_rename(&path) {
+    if !path.is_absolute() || !is_safe_restart_exe(&path) {
         return None;
     }
     Some(path)
@@ -143,6 +130,26 @@ fn resolve_install_target_exe() -> Option<PathBuf> {
         .or_else(default_install_path)
 }
 
+fn resolve_preferred_apas_executable_from_candidates<'a, I>(
+    launch_path: Option<&'a Path>,
+    candidates: I,
+) -> PathBuf
+where
+    I: IntoIterator<Item = &'a Path>,
+{
+    if let Some(path) = launch_path {
+        if is_safe_restart_exe(path) {
+            return path.to_path_buf();
+        }
+    }
+
+    candidates
+        .into_iter()
+        .find(|path| is_safe_restart_exe(path))
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("apas"))
+}
+
 /// Resolve the executable path we should restart/spawn.
 /// Priority is always real on-disk binaries, never /proc/self/exe.
 ///
@@ -152,16 +159,16 @@ fn resolve_install_target_exe() -> Option<PathBuf> {
 /// of the old inode. Capturing the path at launch and reusing it is
 /// the simplest way to make reboot deterministic.
 pub fn resolve_preferred_apas_executable() -> PathBuf {
-    if let Some(p) = LAUNCH_BINARY_PATH.get() {
-        if p.exists() {
-            return p.clone();
-        }
-    }
-    get_current_on_disk_exe()
-        .or_else(home_installed_exe)
-        .or_else(path_installed_exe)
-        .or_else(argv0_exe)
-        .unwrap_or_else(|| PathBuf::from("apas"))
+    let candidates = [
+        get_current_on_disk_exe(),
+        home_installed_exe(),
+        path_installed_exe(),
+        argv0_exe(),
+    ];
+    resolve_preferred_apas_executable_from_candidates(
+        LAUNCH_BINARY_PATH.get().map(PathBuf::as_path),
+        candidates.iter().filter_map(|path| path.as_deref()),
+    )
 }
 
 /// Ensure the source repo exists (clone if not, fetch if exists)
@@ -532,6 +539,11 @@ pub fn restart_cli() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    fn touch(path: &Path) {
+        fs::write(path, b"apas").unwrap();
+    }
 
     #[test]
     fn is_nfs_silly_rename_matches_nfs_prefix() {
@@ -543,11 +555,93 @@ mod tests {
 
     #[test]
     fn is_nfs_silly_rename_rejects_normal_paths() {
-        assert!(!is_nfs_silly_rename(Path::new("/home/users/shuai/.local/bin/apas")));
+        assert!(!is_nfs_silly_rename(Path::new(
+            "/home/users/shuai/.local/bin/apas"
+        )));
         assert!(!is_nfs_silly_rename(Path::new("apas")));
         assert!(!is_nfs_silly_rename(Path::new("/usr/bin/apas")));
         // Hidden dotfiles that aren't NFS ghosts should not match.
         assert!(!is_nfs_silly_rename(Path::new("/home/user/.bashrc")));
         assert!(!is_nfs_silly_rename(Path::new("/home/user/.config/apas")));
+    }
+
+    #[test]
+    fn resolve_preferred_apas_executable_prefers_safe_launch_path() {
+        let dir = tempdir().unwrap();
+        let launch = dir.path().join("launch-apas");
+        let installed = dir.path().join("installed-apas");
+        touch(&launch);
+        touch(&installed);
+
+        let resolved =
+            resolve_preferred_apas_executable_from_candidates(Some(&launch), [installed.as_path()]);
+
+        assert_eq!(resolved, launch);
+    }
+
+    #[test]
+    fn resolve_preferred_apas_executable_rejects_unsafe_launch_paths() {
+        let dir = tempdir().unwrap();
+        let installed = dir.path().join("installed-apas");
+        let deleted = dir.path().join("apas (deleted)");
+        let nfs = dir.path().join(".nfs0000000001e8ab86000001f5");
+        touch(&installed);
+        touch(&deleted);
+        touch(&nfs);
+
+        for launch in [
+            Path::new("/proc/self/exe"),
+            deleted.as_path(),
+            nfs.as_path(),
+        ] {
+            let resolved = resolve_preferred_apas_executable_from_candidates(
+                Some(launch),
+                [installed.as_path()],
+            );
+            assert_eq!(resolved, installed);
+        }
+    }
+
+    #[test]
+    fn resolve_preferred_apas_executable_skips_unsafe_candidates() {
+        let dir = tempdir().unwrap();
+        let installed = dir.path().join("installed-apas");
+        let deleted = dir.path().join("apas (deleted)");
+        let nfs = dir.path().join(".nfs0000000001e8ab86000001f5");
+        touch(&installed);
+        touch(&deleted);
+        touch(&nfs);
+
+        let resolved = resolve_preferred_apas_executable_from_candidates(
+            None,
+            [
+                Path::new("/proc/self/exe"),
+                deleted.as_path(),
+                nfs.as_path(),
+                installed.as_path(),
+            ],
+        );
+
+        assert_eq!(resolved, installed);
+    }
+
+    #[test]
+    fn resolve_preferred_apas_executable_falls_back_to_plain_apas_without_safe_candidates() {
+        let dir = tempdir().unwrap();
+        let deleted = dir.path().join("apas (deleted)");
+        let nfs = dir.path().join(".nfs0000000001e8ab86000001f5");
+        touch(&deleted);
+        touch(&nfs);
+
+        let resolved = resolve_preferred_apas_executable_from_candidates(
+            None,
+            [
+                Path::new("/proc/self/exe"),
+                deleted.as_path(),
+                nfs.as_path(),
+            ],
+        );
+
+        assert_eq!(resolved, PathBuf::from("apas"));
     }
 }
