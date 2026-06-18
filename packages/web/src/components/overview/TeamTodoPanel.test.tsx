@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { parsePrLine } from "./TeamTodoPanel";
 import { TeamTodoPanel } from "./TeamTodoPanel";
 import { paneKey, useStore, type PaneConfig, type TeamTodoState } from "@/lib/store";
@@ -564,6 +564,125 @@ describe("active TODO status groups", () => {
     expect(proposedWithin.getByText("needs approval")).toBeTruthy();
     expect(proposedWithin.getByTitle(/Approve/)).toBeTruthy();
     expect(proposedWithin.getByTitle("Reject")).toBeTruthy();
+  });
+});
+
+describe("team TODO search filter", () => {
+  const originalFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ state: "open", merged: false }),
+    }) as unknown as typeof fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    act(() => {
+      useStore.setState({
+        sessionId: null,
+        teamTodoState: null,
+        teamTodoStates: new Map(),
+      });
+    });
+  });
+
+  it("filters globals by TODO id, title, status, and PR number", () => {
+    seedTeamTodo({
+      globals: [
+        mkTodo(
+          "TODO-151",
+          "Team TODO search filter",
+          "in_progress",
+          "Find backlog entries quickly",
+        ),
+        mkTodo(
+          "TODO-152",
+          "Legacy project registry migration",
+          "proposed",
+        ),
+        {
+          id: "TODO-153",
+          title: "Open review branch",
+          status: "pr_open",
+          origin: "tech-lead",
+          prs: [
+            {
+              pane_id: 568,
+              url: "https://github.com/shuaimu/apas/pull/137",
+            },
+          ],
+          body: "",
+        },
+      ],
+      workers: [],
+      tech_lead_cursor: null,
+      reviewer_cursor: null,
+    });
+
+    render(<TeamTodoPanel />);
+
+    const input = screen.getByLabelText("Search Team TODOs");
+
+    fireEvent.change(input, { target: { value: "TODO-151" } });
+    expect(screen.getByText("Team TODO search filter")).toBeTruthy();
+    expect(screen.queryByText("Legacy project registry migration")).toBeNull();
+    expect(screen.queryByText("Open review branch")).toBeNull();
+    expect(screen.getByText("In progress (1)")).toBeTruthy();
+
+    fireEvent.change(input, { target: { value: "legacy project" } });
+    expect(screen.queryByText("Team TODO search filter")).toBeNull();
+    expect(screen.getByText("Legacy project registry migration")).toBeTruthy();
+    expect(screen.getByText("Proposed (1)")).toBeTruthy();
+
+    fireEvent.change(input, { target: { value: "pr open" } });
+    expect(screen.queryByText("Team TODO search filter")).toBeNull();
+    expect(screen.queryByText("Legacy project registry migration")).toBeNull();
+    expect(screen.getByText("Open review branch")).toBeTruthy();
+    expect(screen.getByText("PR open (1)")).toBeTruthy();
+
+    fireEvent.change(input, { target: { value: "137" } });
+    expect(screen.getByText("Open review branch")).toBeTruthy();
+    expect(screen.getByRole("link", { name: /PR #137/ })).toBeTruthy();
+  });
+
+  it("clears the query without changing proposed approval controls", () => {
+    seedTeamTodo({
+      globals: [
+        mkTodo("TODO-160", "Active implementation", "in_progress"),
+        mkTodo("TODO-161", "Needs approval", "proposed"),
+      ],
+      workers: [],
+      tech_lead_cursor: null,
+      reviewer_cursor: null,
+    });
+
+    render(<TeamTodoPanel />);
+
+    const input = screen.getByLabelText("Search Team TODOs");
+    fireEvent.change(input, { target: { value: "needs approval" } });
+    expect(screen.queryByText("Active implementation")).toBeNull();
+
+    const proposedGroup = screen.getByText("Proposed (1)").closest("section");
+    expect(proposedGroup).toBeTruthy();
+    expect(within(proposedGroup as HTMLElement).getByTitle(/Approve/)).toBeTruthy();
+    expect(within(proposedGroup as HTMLElement).getByTitle("Reject")).toBeTruthy();
+
+    fireEvent.click(screen.getByLabelText("Clear Team TODO search"));
+
+    expect(screen.getByText("Active implementation")).toBeTruthy();
+    const restoredProposedGroup = screen
+      .getByText("Proposed (1)")
+      .closest("section");
+    expect(restoredProposedGroup).toBeTruthy();
+    expect(
+      within(restoredProposedGroup as HTMLElement).getByTitle(/Approve/),
+    ).toBeTruthy();
+    expect(
+      within(restoredProposedGroup as HTMLElement).getByTitle("Reject"),
+    ).toBeTruthy();
   });
 });
 

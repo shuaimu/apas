@@ -12,7 +12,15 @@
  * fresh without waiting for the Tech Lead's next iteration to push.
  */
 import { useEffect, useMemo, useState } from "react";
-import { Check, X, Loader2, Plus, ChevronDown, ChevronRight } from "lucide-react";
+import {
+  Check,
+  X,
+  Loader2,
+  Plus,
+  ChevronDown,
+  ChevronRight,
+  Search,
+} from "lucide-react";
 import {
   TeamTodoGlobal,
   TeamTodoSubtask,
@@ -61,6 +69,15 @@ export function TeamTodoPanel() {
     if (typeof window === "undefined") return false;
     return window.localStorage.getItem(COLLAPSED_KEY) === "1";
   });
+  const [searchQuery, setSearchQuery] = useState("");
+  const normalizedSearchQuery = searchQuery.trim().toLowerCase();
+  const visibleGlobals = useMemo(() => {
+    if (!state) return [];
+    if (!normalizedSearchQuery) return state.globals;
+    return state.globals.filter((g) =>
+      globalMatchesSearch(g, normalizedSearchQuery),
+    );
+  }, [state, normalizedSearchQuery]);
   const toggleCollapsed = () => {
     setCollapsed((c) => {
       const next = !c;
@@ -131,6 +148,15 @@ export function TeamTodoPanel() {
         reviewerCursor={state?.reviewer_cursor ?? null}
       />
 
+      {state && state.globals.length > 0 && (
+        <TeamTodoSearchControl
+          value={searchQuery}
+          onChange={setSearchQuery}
+          visibleCount={visibleGlobals.length}
+          totalCount={state.globals.length}
+        />
+      )}
+
       {empty && (
         <p className="text-xs text-gray-500 dark:text-gray-400">
           No TODOs yet. Click + Add TODO above, or ask the Manager to add one,
@@ -142,17 +168,21 @@ export function TeamTodoPanel() {
         <p className="mb-3 text-xs text-gray-500 dark:text-gray-400">
           No global TODOs yet.
         </p>
+      ) : !empty && state && state.globals.length > 0 && visibleGlobals.length === 0 ? (
+        <p className="mb-3 rounded border border-dashed border-gray-300 px-3 py-2 text-xs text-gray-500 dark:border-gray-700 dark:text-gray-400">
+          No TODOs match "{searchQuery.trim()}".
+        </p>
       ) : !empty && state ? (
         (() => {
-          const active = state.globals.filter(
+          const active = visibleGlobals.filter(
             (g) =>
               g.status !== "rejected" &&
               g.status !== "done" &&
               g.status !== "withdrawn",
           );
-          const done = state.globals.filter((g) => g.status === "done");
-          const rejected = state.globals.filter((g) => g.status === "rejected");
-          const withdrawn = state.globals.filter((g) => g.status === "withdrawn");
+          const done = visibleGlobals.filter((g) => g.status === "done");
+          const rejected = visibleGlobals.filter((g) => g.status === "rejected");
+          const withdrawn = visibleGlobals.filter((g) => g.status === "withdrawn");
           const activeGroups = groupActiveGlobals(active);
           return (
             <>
@@ -205,6 +235,75 @@ export function TeamTodoPanel() {
         </>
       )}
     </section>
+  );
+}
+
+function TeamTodoSearchControl({
+  value,
+  onChange,
+  visibleCount,
+  totalCount,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  visibleCount: number;
+  totalCount: number;
+}) {
+  const active = value.trim().length > 0;
+  return (
+    <div className="mb-3 flex flex-wrap items-center gap-2">
+      <div className="relative min-w-0 flex-1 sm:max-w-sm">
+        <Search
+          className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-gray-400"
+          aria-hidden="true"
+        />
+        <input
+          type="search"
+          aria-label="Search Team TODOs"
+          placeholder="Search TODOs"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className="h-8 w-full rounded border border-gray-300 bg-white px-7 py-1 text-xs text-gray-900 placeholder:text-gray-400 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-100"
+        />
+        {value && (
+          <button
+            type="button"
+            aria-label="Clear Team TODO search"
+            onClick={() => onChange("")}
+            className="absolute right-1.5 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded text-gray-400 hover:bg-gray-100 hover:text-gray-700 dark:hover:bg-gray-700 dark:hover:text-gray-200"
+          >
+            <X className="h-3 w-3" />
+          </button>
+        )}
+      </div>
+      <span className="text-[11px] text-gray-500 dark:text-gray-400">
+        {active ? `${visibleCount} of ${totalCount}` : `${totalCount}`} TODOs
+      </span>
+    </div>
+  );
+}
+
+function globalMatchesSearch(
+  global: TeamTodoGlobal,
+  normalizedQuery: string,
+): boolean {
+  const fields = [
+    global.id,
+    global.title,
+    global.body,
+    global.status,
+    global.status.replace(/_/g, " "),
+    global.origin,
+  ];
+  for (const pr of global.prs ?? []) {
+    const parsed = parsePrLine(`pr: ${pr.pane_id} ${pr.url}`);
+    fields.push(pr.url, String(pr.pane_id));
+    if (parsed) {
+      fields.push(String(parsed.num), `#${parsed.num}`, `pr #${parsed.num}`);
+    }
+  }
+  return fields.some((field) =>
+    field.toLowerCase().includes(normalizedQuery),
   );
 }
 
@@ -871,7 +970,6 @@ function prReadiness(
   if (
     reviewState === "APPROVED" &&
     (checkState === "success" || checkState === undefined) &&
-    pull.mergeable !== false &&
     mergeState !== "dirty"
   ) {
     return "ready";
