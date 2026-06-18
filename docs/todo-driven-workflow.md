@@ -231,9 +231,16 @@ Each iteration the Tech Lead:
    - For `proposed` items: do nothing (waiting for user). Escalate to
      Manager if the queue is too cold (so user knows there's something to
      review).
-   - For `approved` items with no subtasks: **expand** — break into 1-N
-     worker subtasks, write them into the appropriate worker sections,
-     mark global as `in_progress`.
+   - For `approved` items with no subtasks: apply backlog backpressure
+     before expanding. Count managed Developer panes and their `pending`,
+     `in_progress`, and `revising` subtasks. Available capacity is the
+     number of managed Developers with none of those active subtasks, and
+     the queue limit allows one additional `pending` subtask per managed
+     Developer across the whole queue. Expand only while new subtasks fit
+     within available capacity plus remaining queue slots; write those
+     subtasks into the appropriate worker sections and mark that Global as
+     `in_progress`. Leave the remaining approved Globals as `approved`
+     with no subtasks until worker capacity opens.
    - For `in_progress` items: dispatch pending subtasks. When the
      relevant worker diffs are ready, flip to `under_review` and post a
      `delegate-to:<reviewer_pane_id>` record asking the project's

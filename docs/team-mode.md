@@ -108,6 +108,8 @@ work to one worker.
    `.apas-team.jsonl`. It proposes bounded Global TODOs as
    `status: proposed, origin: tech-lead`, waits for the user to approve or
    reject them in Overview, then dispatches approved subtasks with
+   backlog backpressure: approved Globals may intentionally remain
+   `approved` until managed Developer capacity opens. Dispatches use
    `kind: "delegation"` and tags such as
    `delegate-to:<developer_pane>`, `task:TODO-014`, and
    `task:TODO-014-team-mode-v3-guide`.
