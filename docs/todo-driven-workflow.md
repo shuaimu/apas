@@ -175,13 +175,16 @@ many records between iterations, so a fixed-window `tail -n 30` will
 miss things. Both agents instead maintain a per-pane cursor file:
 
 - `.apas-tech-lead-cursor` — single-line file holding the `ts` of the
-  last scratchpad record the Tech Lead acted on.
+  last scratchpad record the Tech Lead processed/scanned.
 - `.apas-reviewer-cursor` — same idea for the Reviewer.
 
 Each iteration the agent reads the cursor, queries records strictly
 newer (`jq -c 'select(.ts > "<cursor>")' .apas-team.jsonl`), acts,
-then writes back the newest `ts` it processed. First run (cursor file
-missing) falls back to `tail -n 50` as catch-up.
+then writes back the newest `ts` it processed/scanned after handling any
+directed work. Self-authored records and delegations to other panes can
+be ignored, but they still count as successfully scanned and should
+advance the scratchpad cursor so they are not re-read every loop. First
+run (cursor file missing) falls back to `tail -n 50` as catch-up.
 
 Because those cursors compare the record's `ts`, every writer must stamp
 scratchpad records at append time. Generate the timestamp immediately
