@@ -221,6 +221,11 @@ describe("ProjectGoalBar team role slots", () => {
     expect(promptText).toContain("reviewDecision is not CHANGES_REQUESTED");
     expect(promptText).toContain('mergeable == "MERGEABLE"');
     expect(promptText).toContain("CI is green with no pending checks");
+    expect(promptText).toContain("enablePullRequestAutoMerge");
+    expect(promptText).toContain("Auto merge is not allowed for this repository");
+    expect(promptText).toContain("repository-level blocker");
+    expect(promptText).toContain("escalate once with the affected PR URL list");
+    expect(promptText).toContain("leave later eligible PRs in that same repo open");
     expect(promptText).not.toContain("may NEVER write 'approved' yourself");
     expect(addPane).toHaveBeenCalledWith(
       "claude",
