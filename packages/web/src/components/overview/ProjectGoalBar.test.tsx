@@ -174,6 +174,22 @@ describe("ProjectGoalBar team role slots", () => {
     expect(prompt).toEqual(expect.stringContaining("explicit queue limit"));
     expect(prompt).toEqual(expect.stringContaining("user-approved backlog state is preserved"));
     expect(prompt).toEqual(expect.stringContaining("configured capacity"));
+    const promptText = String(prompt);
+    expect(promptText).toContain(
+      "jq '.auto_approve_todos // false, .auto_merge_prs // false' .apas",
+    );
+    expect(promptText).toContain("auto_approve_todos");
+    expect(promptText).toContain("auto_merge_prs");
+    expect(promptText).toContain("proposed -> approved");
+    expect(promptText).toContain("auto_approve_todos is true");
+    expect(promptText).toContain("concrete, bounded, aligned with project_goal.md");
+    expect(promptText).toContain("not a duplicate");
+    expect(promptText).toContain("gh pr merge <url> --squash --auto");
+    expect(promptText).toContain("local Reviewer approval record");
+    expect(promptText).toContain("reviewDecision is not CHANGES_REQUESTED");
+    expect(promptText).toContain('mergeable == "MERGEABLE"');
+    expect(promptText).toContain("CI is green with no pending checks");
+    expect(promptText).not.toContain("may NEVER write 'approved' yourself");
     expect(addPane).toHaveBeenCalledWith(
       "claude",
       "deadloop",

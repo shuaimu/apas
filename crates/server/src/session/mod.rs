@@ -751,6 +751,13 @@ impl SessionManager {
         self.web_users.insert(connection_id, user_id);
     }
 
+    /// The authenticated user behind a web connection, if any. Lets control
+    /// handlers re-check session access (and auto-attach) without threading
+    /// `user_id` through every call site.
+    pub fn get_web_user(&self, connection_id: &Uuid) -> Option<Uuid> {
+        self.web_users.get(connection_id).map(|e| *e.value())
+    }
+
     pub fn unregister_web(&self, connection_id: &Uuid) {
         self.web_senders.remove(connection_id);
         self.web_users.remove(connection_id);

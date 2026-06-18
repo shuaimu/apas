@@ -690,7 +690,7 @@ fn set_config_value(config: &mut config::Config, key: &str, value: String) -> Re
 
 #[cfg(test)]
 mod tests {
-    use super::{get_config_value, set_config_value};
+    use super::{get_config_value, set_config_value, should_restart_for_version};
     use crate::config;
 
     #[test]
@@ -727,6 +727,32 @@ mod tests {
             get_config_value(&config, "deepseek_api_base_url").unwrap(),
             "https://api.deepseek.com/anthropic"
         );
+    }
+
+    #[test]
+    fn should_restart_for_version_restarts_when_daemon_version_is_missing() {
+        assert!(should_restart_for_version(None, "26.06.42"));
+    }
+
+    #[test]
+    fn should_restart_for_version_restarts_when_daemon_is_older() {
+        assert!(should_restart_for_version(Some("26.06.41"), "26.06.42"));
+        assert!(should_restart_for_version(Some("26.05.999"), "26.06.1"));
+    }
+
+    #[test]
+    fn should_restart_for_version_keeps_equal_or_newer_daemon() {
+        assert!(!should_restart_for_version(Some("26.06.42"), "26.06.42"));
+        assert!(!should_restart_for_version(Some("26.06.43"), "26.06.42"));
+        assert!(!should_restart_for_version(Some("26.07.1"), "26.06.999"));
+    }
+
+    #[test]
+    fn should_restart_for_version_is_conservative_for_unparsable_versions() {
+        assert!(!should_restart_for_version(Some("dev"), "26.06.42"));
+        assert!(!should_restart_for_version(Some("26.06.42"), "dev"));
+        assert!(!should_restart_for_version(Some("26.06"), "26.06.42"));
+        assert!(!should_restart_for_version(Some("26.06.42"), "26.06"));
     }
 }
 

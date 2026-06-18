@@ -21,10 +21,11 @@
 //! the final safety net for external state (e.g., PR-status polling)
 //! that has no local file proxy.
 //!
-//! The cursor is the pane's last-iteration-end timestamp, so a pane's
-//! own writes don't re-trigger its next iteration — but OTHER panes
-//! that haven't iterated past that change DO wake. Tech Lead writing
-//! to `team-todo.md` cleanly fans out to Reviewer + Developer.
+//! The cursor is the pane's wait-entry timestamp, so a pane's own
+//! writes from the iteration that just finished don't re-trigger its
+//! next iteration — but OTHER panes that haven't iterated past that
+//! change DO wake. Tech Lead writing to `team-todo.md` cleanly fans
+//! out to Reviewer + Developer.
 
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
@@ -296,6 +297,71 @@ fn poll_loop(state: Arc<(Mutex<WatcherState>, Condvar)>, project_dir: PathBuf) {
             let chunk = std::cmp::min(remaining, Duration::from_millis(500));
             std::thread::sleep(chunk);
             remaining = remaining.saturating_sub(chunk);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProjectFileWatcher, WakeReason, WatcherState};
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    fn test_watcher() -> ProjectFileWatcher {
+        ProjectFileWatcher {
+            state: Arc::new((Mutex::new(WatcherState::default()), Condvar::new())),
+            _watcher: None,
+            _poll_thread: None,
+        }
+    }
+
+    fn record_change(watcher: &ProjectFileWatcher, at: Instant) {
+        let (lock, cvar) = &*watcher.state;
+        let mut guard = lock.lock().unwrap();
+        guard.last_change = Some(at);
+        guard.last_change_path = Some(PathBuf::from("team-todo.md"));
+        cvar.notify_all();
+    }
+
+    #[test]
+    fn deadloop_wait_cursor_ignores_pre_cursor_change_but_reports_post_cursor_change() {
+        let watcher = test_watcher();
+        let shutdown = AtomicBool::new(false);
+        let pause = AtomicBool::new(false);
+        let stop = AtomicBool::new(false);
+        let wait_entry_cursor = Instant::now();
+        let self_write_before_wait = wait_entry_cursor
+            .checked_sub(Duration::from_millis(1))
+            .unwrap_or(wait_entry_cursor);
+
+        record_change(&watcher, self_write_before_wait);
+        assert!(matches!(
+            watcher.wait_until(
+                Some(wait_entry_cursor),
+                Duration::from_millis(1),
+                &shutdown,
+                &pause,
+                &stop,
+            ),
+            WakeReason::Timeout
+        ));
+
+        let sibling_write_after_wait = wait_entry_cursor + Duration::from_millis(1);
+        record_change(&watcher, sibling_write_after_wait);
+        match watcher.wait_until(
+            Some(wait_entry_cursor),
+            Duration::from_millis(1),
+            &shutdown,
+            &pause,
+            &stop,
+        ) {
+            WakeReason::FileChanged { at, path } => {
+                assert_eq!(at, sibling_write_after_wait);
+                assert_eq!(path, Some(PathBuf::from("team-todo.md")));
+            }
+            other => panic!("expected post-cursor change to wake, got {other:?}"),
         }
     }
 }

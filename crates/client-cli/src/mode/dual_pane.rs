@@ -102,6 +102,24 @@ fn truncate_str_at_char_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+fn update_project_flags(
+    project_dir: &Path,
+    session_id: Uuid,
+    auto_approve_todos: bool,
+    auto_merge_prs: bool,
+) -> Result<CliToServer> {
+    let mut meta = get_or_create_project(project_dir)?;
+    meta.auto_approve_todos = auto_approve_todos;
+    meta.auto_merge_prs = auto_merge_prs;
+    save_project(project_dir, &meta)?;
+
+    Ok(CliToServer::ProjectFlagsChanged {
+        session_id,
+        auto_approve_todos,
+        auto_merge_prs,
+    })
+}
+
 /// Spawn whichever team panes (Manager, Tech Lead, Reviewer, Developer)
 /// are missing for this project. Idempotent: each role is gated on
 /// whether a managed pane with that role already exists in
@@ -833,6 +851,8 @@ type PaneMetas = Arc<Mutex<HashMap<u32, PaneMeta>>>;
 
 const ASK_USER_QUESTION_AUTO_CANCEL_STATUS: &str =
     "[Pending question auto-cancelled: new message replaces it]";
+const MANAGED_PANE_CREATE_PR_ERROR: &str =
+    "Managed team panes open PRs through the Reviewer-approved Team TODO flow; manual PR creation is disabled for this pane.";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CancelledAskUserQuestion {
@@ -908,6 +928,18 @@ fn auto_cancel_pending_questions_for_new_input(
         });
     }
     cancelled
+}
+
+fn manual_create_pr_worktree_path(
+    pane_metas: &PaneMetas,
+    target_pane: u32,
+) -> Result<Option<String>, String> {
+    let metas = pane_metas.lock().unwrap();
+    match metas.get(&target_pane) {
+        Some(meta) if meta.managed => Err(MANAGED_PANE_CREATE_PR_ERROR.to_string()),
+        Some(meta) => Ok(meta.worktree_path.clone()),
+        None => Ok(None),
+    }
 }
 
 fn route_web_input_to_pane(
@@ -1863,13 +1895,7 @@ async fn run_inner(
         let project_for_pad = std::path::PathBuf::from(working_dir_str.clone());
         let input_channels_for_pad = input_channels.clone();
         thread::spawn(move || {
-            let path = crate::scratchpad::scratchpad_path(&project_for_pad);
-            // Replace the path resolver with the actual on-disk file.
-            // scratchpad_path() returns the *conceptual* path; the
-            // resolver inside the module maps it to the sibling. Read
-            // helpers handle the mapping, so just use read_all() for
-            // diffing.
-            let _ = path;
+            let scratchpad_path = crate::scratchpad::scratchpad_path(&project_for_pad);
             let mut last_size: u64 = 0;
             let mut seen_count: usize = 0;
             // Send existing history once on startup so attached web
@@ -1891,8 +1917,9 @@ async fn run_inner(
                 // Cheap change check: if file size hasn't grown since
                 // last tick, skip the re-read entirely. read_all()
                 // does its own malformed-line tolerance.
-                let actual_path = project_for_pad.join(".apas-team.jsonl");
-                let size = std::fs::metadata(&actual_path).map(|m| m.len()).unwrap_or(0);
+                let size = std::fs::metadata(&scratchpad_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
                 if size == last_size {
                     continue;
                 }
@@ -3726,6 +3753,34 @@ fn build_deadloop_agent_args(
     )
 }
 
+fn is_codex_stale_session_error(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    lower.contains("no rollout found") || lower.contains("thread/resume failed")
+}
+
+fn should_recover_deadloop_stale_session(
+    stale_session_detected: bool,
+    first_message: bool,
+    using_resume: bool,
+    exit_was_error: bool,
+    had_error: bool,
+) -> bool {
+    stale_session_detected || (first_message && using_resume && exit_was_error && !had_error)
+}
+
+fn reset_deadloop_codex_stale_session(
+    first_message: &mut bool,
+    try_resume_first: &mut bool,
+    claude_session_id: &mut Uuid,
+    fresh_session_id: Uuid,
+) -> Uuid {
+    let old = *claude_session_id;
+    *claude_session_id = fresh_session_id;
+    *try_resume_first = false;
+    *first_message = true;
+    old
+}
+
 /// Intercept claude's `control_request` envelopes on stdout. Returns
 /// `Some(true)` if the line was a control_request (caller should `continue`),
 /// `Some(false)` if it's a control_request we explicitly leave for downstream
@@ -3977,20 +4032,24 @@ mod tests {
         active_usage_providers, auto_cancel_pending_questions_for_new_input, build_agent_args,
         build_agent_switch_respawn_event, build_deadloop_agent_args, build_pane_reboot_events,
         build_pane_env_overrides_from_keys, build_pane_list, boot_restore_try_resume_first,
-        pane_label_or_default, promote_pane_to_managed, resolve_pane_binary_path,
+        deadloop_wait_plan, is_codex_stale_session_error, manual_create_pr_worktree_path,
+        pane_label_or_default, promote_pane_to_managed, reset_deadloop_codex_stale_session,
+        resolve_pane_binary_path,
         route_web_input_to_pane, restored_pane_mode_and_pause, run_deadloop_session_inner,
-        save_pane_configs, start_bot_preserved_fields, truncate_str_at_char_boundary,
+        save_pane_configs, should_recover_deadloop_stale_session, start_bot_preserved_fields,
+        truncate_str_at_char_boundary, update_project_flags,
         ASK_USER_QUESTION_AUTO_CANCEL_STATUS, InputChannels, PaneInputRouteResult, PaneMeta,
         PaneMetas, PanePauses, PaneStopRequests, PendingAskQuestion, DEEPSEEK_DEFAULT_MODEL,
+        MANAGED_PANE_CREATE_PR_ERROR,
     };
-    use crate::project::get_or_create_project;
+    use crate::project::{get_or_create_project, save_project};
     use crate::tui::{PaneOutput, TuiEvent};
     use shared::{CliToServer, Provider};
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio::sync::mpsc as tokio_mpsc;
     use uuid::Uuid;
 
@@ -3998,6 +4057,25 @@ mod tests {
         "Work on tasks defined in TODO.md.\n1. Analyze\n2. Implement\n3. Test";
     const WEB_PROVIDER_OPTIONS_TS: &str =
         include_str!("../../../../packages/web/src/lib/providerOptions.ts");
+
+    #[test]
+    fn deadloop_wait_cursor_is_sampled_at_wait_entry() {
+        let last_started_at = Instant::now();
+        let self_write_at = last_started_at + Duration::from_millis(20);
+        let wait_entry_at = last_started_at + Duration::from_millis(50);
+        let min_interval = Duration::from_secs(10);
+
+        let plan = deadloop_wait_plan(last_started_at, min_interval, wait_entry_at)
+            .expect("min interval still has time remaining");
+
+        assert_eq!(plan.cursor, wait_entry_at);
+        assert!(plan.cursor > self_write_at);
+        assert_ne!(plan.cursor, last_started_at);
+        assert_eq!(
+            plan.remaining,
+            min_interval - Duration::from_millis(50)
+        );
+    }
 
     fn extract_ts_string_const<'a>(source: &'a str, name: &str) -> Option<&'a str> {
         let prefix = format!("export const {name} = ");
@@ -4105,6 +4183,51 @@ mod tests {
     }
 
     #[test]
+    fn manual_create_pr_rejects_managed_pane() {
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+        pane_metas.lock().unwrap().insert(
+            42,
+            test_pane_meta(
+                Provider::Claude,
+                true,
+                None,
+                Arc::new(Mutex::new(None)),
+            ),
+        );
+
+        let err = manual_create_pr_worktree_path(&pane_metas, 42).unwrap_err();
+
+        assert_eq!(err, MANAGED_PANE_CREATE_PR_ERROR);
+    }
+
+    #[test]
+    fn manual_create_pr_preserves_unmanaged_worktree_path() {
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+        pane_metas.lock().unwrap().insert(
+            42,
+            test_pane_meta(
+                Provider::Claude,
+                false,
+                None,
+                Arc::new(Mutex::new(None)),
+            ),
+        );
+
+        let worktree_path = manual_create_pr_worktree_path(&pane_metas, 42).unwrap();
+
+        assert_eq!(worktree_path.as_deref(), Some("/tmp/apas-side-dev"));
+    }
+
+    #[test]
+    fn manual_create_pr_preserves_missing_pane_fallback() {
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+
+        let worktree_path = manual_create_pr_worktree_path(&pane_metas, 404).unwrap();
+
+        assert_eq!(worktree_path, None);
+    }
+
+    #[test]
     fn build_agent_args_claude_resume_keeps_full_prompt() {
         let session_id = Uuid::new_v4();
         let (args, using_resume) = build_agent_args(
@@ -4139,6 +4262,99 @@ mod tests {
         assert_eq!(args.get(0).map(String::as_str), Some("exec"));
         assert_eq!(args.get(1).map(String::as_str), Some("resume"));
         assert_eq!(args.last().map(String::as_str), Some(FULL_PROMPT));
+    }
+
+    #[test]
+    fn codex_stale_session_recovery_resets_first_resumed_message_for_fresh_retry() {
+        let old_session_id =
+            Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let fresh_session_id =
+            Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
+        let mut session_id = old_session_id;
+        let mut first_message = true;
+        let mut try_resume_first = true;
+
+        assert!(should_recover_deadloop_stale_session(
+            false,
+            first_message,
+            true,
+            true,
+            false,
+        ));
+
+        let old = reset_deadloop_codex_stale_session(
+            &mut first_message,
+            &mut try_resume_first,
+            &mut session_id,
+            fresh_session_id,
+        );
+
+        assert_eq!(old, old_session_id);
+        assert_eq!(session_id, fresh_session_id);
+        assert!(first_message);
+        assert!(!try_resume_first);
+
+        let (args, using_resume) = build_deadloop_agent_args(
+            &Provider::Codex,
+            &session_id,
+            FULL_PROMPT,
+            None,
+            None,
+            first_message,
+            try_resume_first,
+        );
+
+        assert!(!using_resume);
+        assert_eq!(args.get(0).map(String::as_str), Some("exec"));
+        assert!(!args.iter().any(|arg| arg == "resume"));
+        assert_eq!(args.last().map(String::as_str), Some(FULL_PROMPT));
+        assert!(!args.iter().any(|arg| arg == &old_session_id.to_string()));
+        assert!(!args.iter().any(|arg| arg == &fresh_session_id.to_string()));
+    }
+
+    #[test]
+    fn codex_stale_session_recovery_ignores_mid_loop_ordinary_failure() {
+        let session_id = Uuid::parse_str("00000000-0000-4000-8000-000000000003")
+            .unwrap();
+        let first_message = false;
+        let try_resume_first = true;
+
+        assert!(!should_recover_deadloop_stale_session(
+            false,
+            first_message,
+            true,
+            true,
+            true,
+        ));
+
+        let (args, using_resume) = build_deadloop_agent_args(
+            &Provider::Codex,
+            &session_id,
+            FULL_PROMPT,
+            None,
+            None,
+            first_message,
+            try_resume_first,
+        );
+
+        assert!(using_resume);
+        assert_eq!(args.get(0).map(String::as_str), Some("exec"));
+        assert_eq!(args.get(1).map(String::as_str), Some("resume"));
+        assert!(args.iter().any(|arg| arg == &session_id.to_string()));
+        assert_eq!(args.last().map(String::as_str), Some(FULL_PROMPT));
+    }
+
+    #[test]
+    fn codex_stale_session_error_detects_resume_failures() {
+        assert!(is_codex_stale_session_error(
+            "ERROR no rollout found for thread id abc123"
+        ));
+        assert!(is_codex_stale_session_error(
+            "thread/resume failed: remote thread disappeared"
+        ));
+        assert!(!is_codex_stale_session_error(
+            "model returned a normal tool execution error"
+        ));
     }
 
     #[test]
@@ -4433,6 +4649,73 @@ mod tests {
         let metadata = get_or_create_project(dir.path()).expect("metadata should reload");
         assert!(!metadata.is_paused);
         assert!(metadata.panes.iter().all(|pane| !pane.is_paused));
+    }
+
+    #[test]
+    fn update_project_flags_persists_flags_and_preserves_panes() {
+        let dir = tempfile::tempdir().expect("temp project dir");
+        let mut metadata = get_or_create_project(dir.path()).expect("metadata should initialize");
+        metadata.auto_approve_todos = false;
+        metadata.auto_merge_prs = false;
+        metadata.panes = vec![shared::PaneConfig {
+            pane_id: 42,
+            provider: Provider::Codex,
+            mode: shared::PaneMode::Deadloop,
+            session_id: Uuid::new_v4(),
+            is_paused: true,
+            stop_requested: false,
+            prompt: Some("Keep implementing".to_string()),
+            min_iteration_interval_minutes: Some(7),
+            label: Some("Developer".to_string()),
+            model: Some("gpt-5-codex".to_string()),
+            effort: Some("high".to_string()),
+            worktree_path: Some("/tmp/apas-worker".to_string()),
+            role: Some("developer".to_string()),
+            goal: Some("Ship the delegated task".to_string()),
+            backstory: Some("A managed worker".to_string()),
+            plan_review_mode: shared::PlanReviewMode::RiskyOnly,
+            manual_mode: true,
+            managed: true,
+        }];
+        let original_pane = metadata.panes[0].clone();
+        save_project(dir.path(), &metadata).expect("seed metadata");
+
+        let session_id = Uuid::new_v4();
+        let echo = update_project_flags(dir.path(), session_id, true, false)
+            .expect("flags should persist");
+
+        match echo {
+            CliToServer::ProjectFlagsChanged {
+                session_id: echoed_session_id,
+                auto_approve_todos,
+                auto_merge_prs,
+            } => {
+                assert_eq!(echoed_session_id, session_id);
+                assert!(auto_approve_todos);
+                assert!(!auto_merge_prs);
+            }
+            other => panic!("unexpected echo message: {other:?}"),
+        }
+
+        let reloaded = get_or_create_project(dir.path()).expect("metadata should reload");
+        assert!(reloaded.auto_approve_todos);
+        assert!(!reloaded.auto_merge_prs);
+        assert_eq!(reloaded.panes.len(), 1);
+        let pane = &reloaded.panes[0];
+        assert_eq!(pane.pane_id, original_pane.pane_id);
+        assert_eq!(pane.provider, original_pane.provider);
+        assert_eq!(pane.session_id, original_pane.session_id);
+        assert_eq!(pane.is_paused, original_pane.is_paused);
+        assert_eq!(pane.label, original_pane.label);
+        assert_eq!(pane.model, original_pane.model);
+        assert_eq!(pane.effort, original_pane.effort);
+        assert_eq!(pane.worktree_path, original_pane.worktree_path);
+        assert_eq!(pane.role, original_pane.role);
+        assert_eq!(pane.goal, original_pane.goal);
+        assert_eq!(pane.backstory, original_pane.backstory);
+        assert_eq!(pane.plan_review_mode, original_pane.plan_review_mode);
+        assert_eq!(pane.manual_mode, original_pane.manual_mode);
+        assert_eq!(pane.managed, original_pane.managed);
     }
 
     #[test]
@@ -5494,6 +5777,33 @@ fn run_deadloop_session(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeadloopWaitPlan {
+    remaining: Duration,
+    cursor: Instant,
+}
+
+fn deadloop_wait_plan(
+    last_iteration_started_at: Instant,
+    min_iteration_interval: Duration,
+    wait_entry_at: Instant,
+) -> Option<DeadloopWaitPlan> {
+    let elapsed_since_last_start = wait_entry_at
+        .checked_duration_since(last_iteration_started_at)
+        .unwrap_or(Duration::ZERO);
+    let remaining = min_iteration_interval
+        .checked_sub(elapsed_since_last_start)
+        .unwrap_or(Duration::ZERO);
+    if remaining.is_zero() {
+        None
+    } else {
+        Some(DeadloopWaitPlan {
+            remaining,
+            cursor: wait_entry_at,
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_deadloop_session_inner(
     binary_path: &str,
@@ -5644,14 +5954,13 @@ fn run_deadloop_session_inner(
             // timer fires — whichever first. Replaces the pure-sleep
             // loop that paid tokens on every cycle even when nothing
             // had moved.
-            let remaining = min_iteration_interval
-                .checked_sub(last_started_at.elapsed())
-                .unwrap_or(Duration::ZERO);
-            if !remaining.is_zero() {
+            if let Some(wait_plan) =
+                deadloop_wait_plan(last_started_at, min_iteration_interval, Instant::now())
+            {
                 let _ = output_tx.send(PaneOutput {
                     text: format!(
                         "[Waiting for file change or {}s timeout (min interval: {}m)]",
-                        remaining.as_secs(),
+                        wait_plan.remaining.as_secs(),
                         min_iteration_interval_minutes
                     ),
                     pane_id,
@@ -5664,10 +5973,9 @@ fn run_deadloop_session_inner(
                 // the loop the instant it goes to sleep. That bug
                 // collapses the 15-minute min interval to ~0s and was
                 // the symptom of "the Tech Lead loops constantly".
-                let wait_cursor = Instant::now();
                 let reason = file_watcher.wait_until(
-                    Some(wait_cursor),
-                    remaining,
+                    Some(wait_plan.cursor),
+                    wait_plan.remaining,
                     &shutdown,
                     &pause,
                     &stop_requested,
@@ -5894,10 +6202,7 @@ fn run_deadloop_session_inner(
                                     // Covers both the older "no rollout
                                     // found" phrasing and the JSON-RPC
                                     // "thread/resume failed" prefix.
-                                    let lower = line.to_lowercase();
-                                    if lower.contains("no rollout found")
-                                        || lower.contains("thread/resume failed")
-                                    {
+                                    if is_codex_stale_session_error(&line) {
                                         stale_flag_for_stderr
                                             .store(true, Ordering::SeqCst);
                                     }
@@ -5927,6 +6232,22 @@ fn run_deadloop_session_inner(
 
                 loop {
                     if shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+
+                    // Stop/pause requested mid-turn: kill this iteration's
+                    // agent now so a long-running (non-Claude) turn halts
+                    // immediately instead of running to completion. The loop
+                    // top re-checks both flags — pause blocks, stop finalizes.
+                    // Without this, "Stop team" / pause only took effect
+                    // between iterations, so an in-flight Codex turn kept
+                    // running and the worker appeared not to stop.
+                    if pause.load(Ordering::SeqCst) || stop_requested.load(Ordering::SeqCst) {
+                        let _ = output_tx.send(PaneOutput {
+                            text: "[Stop/pause requested - ending current turn]".to_string(),
+                            pane_id,
+                        });
+                        kill_process_group(child_pid);
                         break;
                     }
 
@@ -6105,22 +6426,26 @@ fn run_deadloop_session_inner(
                     // expiry, server-side wipe), not just at startup.
                     // The stderr reader sets stale_session_detected on
                     // "no rollout found" / "thread/resume failed".
-                    let stale = stale_session_detected.swap(false, Ordering::SeqCst)
-                        || (first_message && using_resume && exit_was_error && !had_error);
+                    let stale = should_recover_deadloop_stale_session(
+                        stale_session_detected.swap(false, Ordering::SeqCst),
+                        first_message,
+                        using_resume,
+                        exit_was_error,
+                        had_error,
+                    );
                     if stale {
-                        let old = claude_session_id;
-                        claude_session_id = Uuid::new_v4();
-                        try_resume_first = false;
-                        // Also reset first_message so the next iteration
-                        // takes the "exec (no resume)" branch in
-                        // build_agent_args. Without this, when stale fires
-                        // mid-loop (first_message is already false), the
-                        // very next iteration still falls into the
-                        // "subsequent → always resume" branch and tries
-                        // exec resume on the just-minted id — which codex
-                        // also doesn't know about, so it loops forever
-                        // re-minting fresh ids and re-failing.
-                        first_message = true;
+                        // Reset first_message so the next iteration takes
+                        // the "exec (no resume)" branch in build_agent_args.
+                        // Without this, the next turn can fall into the
+                        // "subsequent -> always resume" branch and try
+                        // exec resume on the just-minted id, which Codex
+                        // also does not know about.
+                        let old = reset_deadloop_codex_stale_session(
+                            &mut first_message,
+                            &mut try_resume_first,
+                            &mut claude_session_id,
+                            Uuid::new_v4(),
+                        );
                         // Persist the fresh id straight into .apas so a
                         // CLI reboot doesn't fall back to the dead one.
                         // We don't have the full pane_metas / pane_pauses
@@ -10103,46 +10428,46 @@ async fn run_server_connection(
                                                 auto_merge_prs,
                                             } => {
                                                 let project_dir = std::path::Path::new(&working_dir).to_path_buf();
-                                                match crate::project::get_or_create_project(&project_dir) {
-                                                    Ok(mut meta) => {
-                                                        meta.auto_approve_todos = auto_approve_todos;
-                                                        meta.auto_merge_prs = auto_merge_prs;
-                                                        if let Err(err) = crate::project::save_project(&project_dir, &meta) {
-                                                            tracing::warn!("failed to persist project flags: {}", err);
-                                                        } else {
-                                                            tracing::info!(
-                                                                auto_approve_todos,
-                                                                auto_merge_prs,
-                                                                "tech-lead autonomy flags updated"
-                                                            );
-                                                        }
-                                                        // Echo back so peer web clients reconcile.
-                                                        let echo = CliToServer::ProjectFlagsChanged {
-                                                            session_id,
+                                                match update_project_flags(
+                                                    &project_dir,
+                                                    session_id,
+                                                    auto_approve_todos,
+                                                    auto_merge_prs,
+                                                ) {
+                                                    Ok(echo) => {
+                                                        tracing::info!(
                                                             auto_approve_todos,
                                                             auto_merge_prs,
-                                                        };
+                                                            "tech-lead autonomy flags updated"
+                                                        );
+                                                        // Echo back so peer web clients reconcile.
                                                         if let Ok(text) = serde_json::to_string(&echo) {
                                                             let _ = ws_sender.send(Message::Text(text.into())).await;
                                                         }
                                                     }
                                                     Err(err) => {
-                                                        tracing::warn!("failed to load .apas for flag update: {}", err);
+                                                        tracing::warn!("failed to persist project flags: {}", err);
                                                     }
                                                 }
                                             }
                                             ServerToCli::CreatePr { session_id: _, pane_id: pr_pane_id } => {
-                                                let wt: Option<String> = {
-                                                    let metas = pane_metas.lock().unwrap();
-                                                    metas.get(&pr_pane_id).and_then(|m| m.worktree_path.clone())
+                                                let result = match manual_create_pr_worktree_path(
+                                                    &pane_metas,
+                                                    pr_pane_id,
+                                                ) {
+                                                    Ok(wt) => {
+                                                        // gh pr create + git push are blocking on a network call;
+                                                        // run in spawn_blocking so the WS reader loop stays responsive.
+                                                        tokio::task::spawn_blocking(move || {
+                                                            crate::worktree::create_pr_for_pane(wt.as_deref())
+                                                        })
+                                                        .await
+                                                        .unwrap_or_else(|e| {
+                                                            Err(anyhow::anyhow!("task join: {}", e))
+                                                        })
+                                                    }
+                                                    Err(err) => Err(anyhow::anyhow!("{}", err)),
                                                 };
-                                                // gh pr create + git push are blocking on a network call;
-                                                // run in spawn_blocking so the WS reader loop stays responsive.
-                                                let result = tokio::task::spawn_blocking(move || {
-                                                    crate::worktree::create_pr_for_pane(wt.as_deref())
-                                                })
-                                                .await
-                                                .unwrap_or_else(|e| Err(anyhow::anyhow!("task join: {}", e)));
                                                 let pr_msg = match result {
                                                     Ok(url) => CliToServer::PrCreated {
                                                         session_id,
