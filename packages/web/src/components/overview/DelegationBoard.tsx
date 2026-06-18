@@ -3,9 +3,8 @@
 /**
  * Phase 5.1d — pairs delegate-to / reply-to records from the team
  * scratchpad so the human can see which dispatched tasks are still
- * awaiting a worker reply. Loose correlation by `task-id:<uuid>` tag
- * — no UUID means "untracked" and we just show the delegate row by
- * itself.
+ * awaiting a worker reply. Current records correlate by `task:<TODO-NNN>`
+ * tags, with legacy `task-id:<uuid>` tags retained as a fallback.
  *
  * Source data: store.teamRecords (already populated by the CLI
  * watcher; no new wire types).
@@ -17,8 +16,8 @@ interface DelegationRow {
   delegate: TeamRecord;
   /** Pane the work was delegated TO (parsed from delegate-to:N tag). */
   toPane?: number;
-  /** Task id parsed from task-id:<uuid> tag, used for reply correlation. */
-  taskId?: string;
+  /** Current task tag value or legacy task-id fallback used for correlation. */
+  taskKey?: string;
   /** Matching reply record if one has arrived. */
   reply?: TeamRecord;
 }
@@ -33,7 +32,9 @@ export function DelegationBoard() {
   if (rows.length === 0) {
     return (
       <div className="rounded border border-dashed border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30 p-4 text-sm italic text-gray-500 dark:text-gray-400">
-        No delegations seen yet. A manager pane appends a record with <code>tags: [&quot;delegate-to:&lt;pane_id&gt;&quot;, &quot;task-id:&lt;uuid&gt;&quot;]</code> to dispatch work.
+        No delegations seen yet. A coordinator pane appends records with{" "}
+        <code>delegate-to:&lt;pane_id&gt;</code> and{" "}
+        <code>task:&lt;TODO-NNN&gt;</code> tags to dispatch work.
       </div>
     );
   }
@@ -65,15 +66,15 @@ export function DelegationBoard() {
 }
 
 function DelegationRowView({ row }: { row: DelegationRow }) {
-  const { delegate, toPane, taskId, reply } = row;
+  const { delegate, toPane, taskKey, reply } = row;
   const status = reply
     ? "replied"
-    : taskId
+    : taskKey
       ? "awaiting reply"
       : "untracked";
   const statusColor = reply
     ? "bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300"
-    : taskId
+    : taskKey
       ? "bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300"
       : "bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400";
   const replyDelta = reply ? deltaTs(delegate.ts, reply.ts) : null;
@@ -84,8 +85,11 @@ function DelegationRowView({ row }: { row: DelegationRow }) {
         {" → "}
         {toPane !== undefined ? `pane ${toPane}` : "?"}
       </td>
-      <td className="px-2 py-1.5 font-mono whitespace-nowrap text-gray-600 dark:text-gray-400">
-        {taskId ? shortId(taskId) : "—"}
+      <td
+        className="px-2 py-1.5 font-mono whitespace-nowrap text-gray-600 dark:text-gray-400"
+        title={taskKey}
+      >
+        {taskKey ? taskLabel(taskKey) : "—"}
       </td>
       <td className="px-2 py-1.5 text-gray-700 dark:text-gray-300 max-w-[40ch] truncate" title={delegate.body}>
         {delegate.body}
@@ -105,32 +109,69 @@ function DelegationRowView({ row }: { row: DelegationRow }) {
 function buildRows(records: TeamRecord[]): DelegationRow[] {
   // First pass: collect delegates. Second pass: attach replies.
   const delegates: DelegationRow[] = [];
-  // task_id → row index for fast reply attachment.
+  // task key or alias → row index for fast reply attachment.
   const byTask = new Map<string, number>();
   for (const r of records) {
     const toTag = r.tags.find((t) => t.startsWith("delegate-to:"));
     if (toTag) {
       const toPaneStr = toTag.slice("delegate-to:".length);
       const toPane = /^\d+$/.test(toPaneStr) ? parseInt(toPaneStr, 10) : undefined;
-      const taskTag = r.tags.find((t) => t.startsWith("task-id:"));
-      const taskId = taskTag ? taskTag.slice("task-id:".length) : undefined;
+      const taskKeys = taskTags(r);
+      const taskKey = taskKeys[0] ?? legacyTaskId(r);
       const idx = delegates.length;
-      delegates.push({ delegate: r, toPane, taskId });
-      if (taskId) byTask.set(taskId, idx);
+      delegates.push({ delegate: r, toPane, taskKey });
+      for (const key of taskKeys.length > 0 ? taskKeys : taskKey ? [taskKey] : []) {
+        for (const alias of taskAliases(key)) {
+          byTask.set(alias, idx);
+        }
+      }
     }
   }
   for (const r of records) {
-    const replyTag = r.tags.find((t) => t.startsWith("reply-to:"));
-    if (replyTag) {
-      const taskId = replyTag.slice("reply-to:".length);
-      const idx = byTask.get(taskId);
+    if (r.tags.some((t) => t.startsWith("delegate-to:"))) continue;
+    const replyKeys = replyTaskKeys(r);
+    for (const key of replyKeys) {
+      const idx = byTask.get(key);
       if (idx !== undefined && !delegates[idx].reply) {
         delegates[idx].reply = r;
+        break;
       }
     }
   }
   // Newest first.
   return delegates.reverse();
+}
+
+function taskTags(record: TeamRecord): string[] {
+  return record.tags
+    .filter((t) => t.startsWith("task:"))
+    .map((t) => t.slice("task:".length))
+    .filter(Boolean);
+}
+
+function legacyTaskId(record: TeamRecord): string | undefined {
+  const taskTag = record.tags.find((t) => t.startsWith("task-id:"));
+  return taskTag ? taskTag.slice("task-id:".length) : undefined;
+}
+
+function replyTaskKeys(record: TeamRecord): string[] {
+  const keys = taskTags(record).flatMap(taskAliases);
+  if (keys.length > 0) return keys;
+  return record.tags
+    .filter((t) => t.startsWith("reply-to:"))
+    .map((t) => t.slice("reply-to:".length))
+    .flatMap(taskAliases);
+}
+
+function taskAliases(taskKey: string): string[] {
+  const aliases = new Set<string>([taskKey]);
+  const todo = taskKey.match(/^TODO-\d+/i)?.[0];
+  if (todo) aliases.add(todo);
+  return [...aliases];
+}
+
+function taskLabel(taskKey: string): string {
+  return taskKey.match(/^TODO-\d+/i)?.[0] ?? shortId(taskKey);
 }
 
 function shortId(s: string): string {
