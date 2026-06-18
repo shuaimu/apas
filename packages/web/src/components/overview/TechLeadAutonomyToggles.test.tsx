@@ -55,6 +55,20 @@ describe("TechLeadAutonomyToggles", () => {
     expect(autoMergeCheckbox().checked).toBe(false);
   });
 
+  it("explains the auto-merge repository requirement and safety gates", () => {
+    act(() => {
+      useStore.setState({ sessionId: "session-a", projectFlags: {} });
+    });
+
+    render(<TechLeadAutonomyToggles />);
+
+    const note = screen.getByText(/Requires GitHub auto-merge enabled/);
+    expect(note.textContent).toContain("target repository");
+    expect(note.textContent).toContain("Reviewer approval");
+    expect(note.textContent).toContain("mergeability");
+    expect(note.textContent).toContain("green/no-pending CI");
+  });
+
   it("sends both current booleans when either checkbox changes", () => {
     const updateProjectFlags = vi.fn();
     act(() => {

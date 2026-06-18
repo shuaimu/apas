@@ -77,6 +77,10 @@ export function TechLeadAutonomyToggles() {
               rejection comment, or comment "needs more work" on PRs in{" "}
               <code className="text-[11px]">pr_open</code> Globals.
             </span>
+            <span className="block text-xs text-gray-500 dark:text-gray-400">
+              Requires GitHub auto-merge enabled on the target repository,
+              Reviewer approval, mergeability, and green/no-pending CI.
+            </span>
           </span>
         </label>
       </div>
