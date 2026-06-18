@@ -721,6 +721,47 @@ mod tests {
     }
 
     #[test]
+    fn manager_role_pins_direct_user_todo_intake_contract() {
+        let got = compose_system_prompt(Some("team manager"), None, None).unwrap();
+        for needle in [
+            "team-todo.md",
+            "Add a Global TODO under `## Global TODOs`",
+            "status: approved, origin: user",
+            "auto-incremented id (`TODO-NNN` past the existing max)",
+            "Don't relay through the Tech Lead via scratchpad",
+        ] {
+            assert!(
+                got.contains(needle),
+                "missing Manager direct-user TODO intake text: {needle}"
+            );
+        }
+
+        for (role, got) in [
+            (
+                "tech lead",
+                compose_system_prompt(Some("tech lead"), None, None).unwrap(),
+            ),
+            (
+                "reviewer",
+                compose_system_prompt(Some("reviewer"), None, None).unwrap(),
+            ),
+        ] {
+            assert!(
+                !got.contains("# Manager protocol"),
+                "{role} prompt should not receive Manager protocol"
+            );
+            assert!(
+                !got.contains("status: approved, origin: user"),
+                "{role} prompt should not receive Manager direct-user TODO intake text"
+            );
+            assert!(
+                !got.contains("Don't relay through the Tech Lead via scratchpad"),
+                "{role} prompt should not receive Manager direct-user TODO intake text"
+            );
+        }
+    }
+
+    #[test]
     fn tech_lead_role_gets_orchestrator_protocol_addendum() {
         let got = compose_system_prompt(Some("tech lead"), None, None).unwrap();
         assert!(got.contains("# Tech Lead protocol"));
