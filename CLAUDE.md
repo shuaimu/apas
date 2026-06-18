@@ -167,15 +167,24 @@ Each project directory gets a `.apas` file with project metadata:
 Key message types in `crates/shared/src/messages.rs`:
 
 - **CliToServer**: Register, SessionStart, StreamMessage, UserInput,
-  Heartbeat, ProjectGoalChanged, TeamTodoChanged, SuggestedWorkersChanged,
-  machine config/status updates.
+  Heartbeat, ProjectGoalChanged, ProjectFlagsChanged, TeamTodoChanged,
+  SuggestedWorkersChanged, machine config/status updates.
 - **ServerToCli**: Registered, SessionAssigned, Input, Signal,
-  UpdateProjectGoal, TodoApproval, AddTodo, pane/worktree/suggestion actions.
+  UpdateProjectGoal, UpdateProjectFlags, TodoApproval, AddTodo,
+  pane/worktree/suggestion actions.
 - **WebToServer**: Authenticate, ListCliClients, AttachSession, Input,
-  UpdateProjectGoal, TodoApproval, AddTodo, machine/provider config actions.
+  UpdateProjectGoal, UpdateProjectFlags, TodoApproval, AddTodo,
+  machine/provider config actions.
 - **ServerToWeb**: Authenticated, CliClients, SessionMessages, StreamMessage,
-  UserInput, ProjectGoalChanged, TeamTodoChanged, SuggestedWorkersChanged,
-  Machines, PaneDiff.
+  UserInput, ProjectGoalChanged, ProjectFlagsChanged, TeamTodoChanged,
+  SuggestedWorkersChanged, Machines, PaneDiff.
+
+`WebToServer::UpdateProjectFlags` carries the Tech Lead autonomy flags
+(`auto_approve_todos` and `auto_merge_prs`) from the web to the server. The
+server forwards `ServerToCli::UpdateProjectFlags` to the CLI for `.apas`
+persistence; the CLI then emits `CliToServer::ProjectFlagsChanged`, and the
+server broadcasts `ServerToWeb::ProjectFlagsChanged`. Behavioral safeguards for
+those flags are documented in the role prompts and README.
 
 ## Data Storage
 
