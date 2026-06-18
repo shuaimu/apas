@@ -579,6 +579,32 @@ mod tests {
         metadata
     }
 
+    fn sample_registered_project(name: &str) -> RegisteredProject {
+        RegisteredProject {
+            project_id: Uuid::new_v4().to_string(),
+            name: Some(name.to_string()),
+            path: format!("/tmp/apas-{name}"),
+        }
+    }
+
+    fn preferred_registry_path() -> PathBuf {
+        crate::config::Config::config_dir()
+            .expect("config dir")
+            .join(USER_PROJECTS_FILE)
+    }
+
+    fn write_legacy_registry(content: &str) -> PathBuf {
+        let legacy_path = legacy_project_registry_path().expect("legacy registry path");
+        std::fs::create_dir_all(
+            legacy_path
+                .parent()
+                .expect("legacy registry should have parent"),
+        )
+        .expect("create legacy registry dir");
+        std::fs::write(&legacy_path, content).expect("write legacy registry");
+        legacy_path
+    }
+
     #[test]
     fn project_registry_tmp_path_includes_process_id() {
         let path = unique_temp_dir("tmp-path").join(USER_PROJECTS_FILE);
@@ -632,6 +658,104 @@ mod tests {
         assert_eq!(written.projects[0].path, expected_project.path);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_existing_project_registry_falls_back_to_legacy_wrapped_json() {
+        with_isolated_config(|| {
+            let preferred_path = preferred_registry_path();
+            let expected_project = sample_registered_project("legacy-wrapped");
+            let content = serde_json::to_string(&ProjectRegistry {
+                projects: vec![expected_project.clone()],
+            })
+            .expect("wrapped registry json");
+            write_legacy_registry(&content);
+
+            let registry =
+                read_existing_project_registry(&preferred_path).expect("read legacy registry");
+
+            assert!(!preferred_path.exists());
+            assert_eq!(registry.projects.len(), 1);
+            assert_eq!(registry.projects[0].project_id, expected_project.project_id);
+            assert_eq!(registry.projects[0].name, expected_project.name);
+            assert_eq!(registry.projects[0].path, expected_project.path);
+        });
+    }
+
+    #[test]
+    fn read_existing_project_registry_falls_back_to_legacy_plain_array_json() {
+        with_isolated_config(|| {
+            let preferred_path = preferred_registry_path();
+            let expected_project = sample_registered_project("legacy-array");
+            let content = serde_json::to_string(&vec![expected_project.clone()])
+                .expect("array registry json");
+            write_legacy_registry(&content);
+
+            let registry =
+                read_existing_project_registry(&preferred_path).expect("read legacy registry");
+
+            assert!(!preferred_path.exists());
+            assert_eq!(registry.projects.len(), 1);
+            assert_eq!(registry.projects[0].project_id, expected_project.project_id);
+            assert_eq!(registry.projects[0].name, expected_project.name);
+            assert_eq!(registry.projects[0].path, expected_project.path);
+        });
+    }
+
+    #[test]
+    fn maybe_migrate_legacy_project_registry_moves_content_to_preferred_path() {
+        with_isolated_config(|| {
+            let preferred_path = preferred_registry_path();
+            let expected_project = sample_registered_project("migrated");
+            let content = serde_json::to_string(&ProjectRegistry {
+                projects: vec![expected_project.clone()],
+            })
+            .expect("wrapped registry json");
+            let legacy_path = write_legacy_registry(&content);
+
+            maybe_migrate_legacy_project_registry(&preferred_path);
+
+            assert!(preferred_path.exists());
+            assert!(!legacy_path.exists());
+            let registry = read_project_registry(&preferred_path).expect("read migrated registry");
+            assert_eq!(registry.projects.len(), 1);
+            assert_eq!(registry.projects[0].project_id, expected_project.project_id);
+            assert_eq!(registry.projects[0].name, expected_project.name);
+            assert_eq!(registry.projects[0].path, expected_project.path);
+        });
+    }
+
+    #[test]
+    fn maybe_migrate_legacy_project_registry_does_not_overwrite_preferred_registry() {
+        with_isolated_config(|| {
+            let preferred_path = preferred_registry_path();
+            let preferred_project = sample_registered_project("preferred");
+            let legacy_project = sample_registered_project("legacy");
+            write_project_registry(
+                &preferred_path,
+                &ProjectRegistry {
+                    projects: vec![preferred_project.clone()],
+                },
+            )
+            .expect("write preferred registry");
+            let legacy_content = serde_json::to_string(&ProjectRegistry {
+                projects: vec![legacy_project],
+            })
+            .expect("legacy registry json");
+            let legacy_path = write_legacy_registry(&legacy_content);
+
+            maybe_migrate_legacy_project_registry(&preferred_path);
+
+            assert!(legacy_path.exists());
+            let registry = read_project_registry(&preferred_path).expect("read preferred registry");
+            assert_eq!(registry.projects.len(), 1);
+            assert_eq!(
+                registry.projects[0].project_id,
+                preferred_project.project_id
+            );
+            assert_eq!(registry.projects[0].name, preferred_project.name);
+            assert_eq!(registry.projects[0].path, preferred_project.path);
+        });
     }
 
     #[test]
