@@ -598,6 +598,10 @@ fn reboot_pane_cli_message(session_id: Uuid, pane_id: u32) -> ServerToCli {
     }
 }
 
+fn reboot_cli_message(session_id: Uuid) -> ServerToCli {
+    ServerToCli::RebootCli { session_id }
+}
+
 async fn handle_web_input(
     state: &AppState,
     connection_id: &Uuid,
@@ -713,7 +717,7 @@ async fn handle_web_input(
 }
 
 #[cfg(test)]
-mod reboot_pane_route_tests {
+mod reboot_route_tests {
     use super::*;
     use crate::config::Config;
     use crate::db::Database;
@@ -768,6 +772,50 @@ mod reboot_pane_route_tests {
                 assert_eq!(pane_id, 42);
             }
             other => panic!("expected RebootPane message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reboot_cli_falls_back_to_active_session_and_routes_full_cli_reboot_to_cli() {
+        let state = test_state().await;
+        let user_id = Uuid::new_v4();
+        let web_connection_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let cli_id = Uuid::new_v4();
+
+        let (web_tx, _web_rx) = mpsc::channel(4);
+        state.sessions.register_web(web_connection_id, web_tx);
+        state
+            .sessions
+            .create_session(session_id, user_id, web_connection_id);
+
+        let (cli_tx, mut cli_rx) = mpsc::channel(4);
+        state.sessions.register_cli(cli_id, user_id, cli_tx, None);
+        assert!(state.sessions.assign_cli_to_session(&session_id, cli_id));
+
+        let sid = resolve_target_session(&state, &web_connection_id, None, Some(session_id))
+            .await
+            .expect("active session fallback");
+        assert_eq!(sid, session_id);
+
+        assert!(
+            state
+                .sessions
+                .route_to_cli(&sid, reboot_cli_message(sid))
+                .await
+        );
+
+        let msg = cli_rx.try_recv().expect("forwarded CLI message");
+        match msg {
+            ServerToCli::RebootCli {
+                session_id: forwarded_session_id,
+            } => {
+                assert_eq!(forwarded_session_id, session_id);
+            }
+            ServerToCli::RebootPane { .. } => {
+                panic!("expected RebootCli message, got RebootPane")
+            }
+            other => panic!("expected RebootCli message, got {other:?}"),
         }
     }
 }
@@ -1332,7 +1380,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         tracing::info!("Rebooting CLI for session {}", sid);
                         state
                             .sessions
-                            .route_to_cli(&sid, ServerToCli::RebootCli { session_id: sid })
+                            .route_to_cli(&sid, reboot_cli_message(sid))
                             .await;
                     }
                 }

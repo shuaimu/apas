@@ -189,6 +189,28 @@ describe("TabBar coordinator close controls", () => {
     expect(onRebootCli).toHaveBeenCalledOnce();
     confirmSpy.mockRestore();
   });
+
+  it("does not render Reboot CLI without both the full-process action and visibility flag", () => {
+    const onRebootCli = vi.fn();
+
+    renderTabBar({ onRebootCli, showRebootButton: false });
+    expect(screen.queryByText("Reboot CLI")).toBeNull();
+
+    renderTabBar({ showRebootButton: true });
+    expect(screen.queryByText("Reboot CLI")).toBeNull();
+  });
+
+  it("does not reboot the CLI when confirmation is declined", () => {
+    const onRebootCli = vi.fn();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    renderTabBar({ onRebootCli, showRebootButton: true });
+
+    fireEvent.click(screen.getByText("Reboot CLI"));
+
+    expect(confirmSpy).toHaveBeenCalledWith("Are you sure you want to reboot the CLI?");
+    expect(onRebootCli).not.toHaveBeenCalled();
+    confirmSpy.mockRestore();
+  });
 });
 
 describe("TabBar rename and reorder controls", () => {
