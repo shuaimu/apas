@@ -211,13 +211,17 @@ describe('useStore', () => {
   describe('team todo approval and add', () => {
     const initialStore = useStore.getInitialState();
 
-    function makeOpenWs() {
+    function makeWs(readyState: number = WebSocket.OPEN) {
       const send = vi.fn();
       return {
-        readyState: WebSocket.OPEN,
+        readyState,
         send,
         close: vi.fn(),
       } as unknown as WebSocket & { send: typeof send };
+    }
+
+    function makeOpenWs() {
+      return makeWs();
     }
 
     beforeEach(() => {
@@ -226,6 +230,7 @@ describe('useStore', () => {
         approveTodo: initialStore.approveTodo,
         rejectTodo: initialStore.rejectTodo,
         addTodo: initialStore.addTodo,
+        startTeam: initialStore.startTeam,
         showToast: initialStore.showToast,
       });
     });
@@ -281,6 +286,45 @@ describe('useStore', () => {
         title: 'Ship the workflow',
         body: 'acceptance\ncriteria',
       }));
+    });
+
+    it('startTeam sends exact role specs and omits null models', () => {
+      const ws = makeOpenWs();
+      useStore.setState({ ws });
+
+      useStore.getState().startTeam({
+        manager: { provider: 'claude', model: 'claude-sonnet-4' },
+        techLead: { provider: 'codex', model: null },
+        reviewer: { provider: 'minimax', model: 'MiniMax-M2.7' },
+        developer: { provider: 'glm', model: 'glm-5.1' },
+      });
+
+      expect(ws.send).toHaveBeenCalledOnce();
+      const payload = JSON.parse(ws.send.mock.calls[0][0] as string);
+      expect(payload).toEqual({
+        type: 'start_team',
+        manager: { provider: 'claude', model: 'claude-sonnet-4' },
+        tech_lead: { provider: 'codex' },
+        reviewer: { provider: 'minimax', model: 'MiniMax-M2.7' },
+        developer: { provider: 'glm', model: 'glm-5.1' },
+      });
+      expect(payload.tech_lead).not.toHaveProperty('model');
+    });
+
+    it('startTeam shows an error toast and does not send when disconnected', () => {
+      const ws = makeWs(WebSocket.CLOSED);
+      const showToast = vi.fn();
+      useStore.setState({ ws, showToast });
+
+      useStore.getState().startTeam({
+        manager: { provider: 'claude', model: null },
+        techLead: { provider: 'claude', model: null },
+        reviewer: { provider: 'claude', model: null },
+        developer: { provider: 'claude', model: null },
+      });
+
+      expect(ws.send).not.toHaveBeenCalled();
+      expect(showToast).toHaveBeenCalledWith(expect.stringContaining('cannot start team'), 'error');
     });
   });
 
