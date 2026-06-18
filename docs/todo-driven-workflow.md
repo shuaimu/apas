@@ -1,7 +1,9 @@
 # Tech-Lead-Driven Workflow (TODO doc + approval gate + PR review)
 
-Status: **draft** — written to capture the workflow the user described in
-chat so we can iterate on the design before / during implementation.
+Status: **implemented and evolving** — this is the operating protocol
+for APAS team-mode TODO orchestration. The core workflow is in use; new
+TODO-backed refinements should update this document when they change the
+state machine or role responsibilities.
 
 Complements `docs/team-mode.md` (which describes the lower-level
 scratchpad / delegation primitives). This doc is the higher-level
@@ -9,25 +11,21 @@ scratchpad / delegation primitives). This doc is the higher-level
 
 ## Motivation
 
-Today's flow:
-- Manager and Tech Lead pick up user requests ad-hoc.
-- Tech Lead delegates via `.apas-team.jsonl` records.
-- Workers commit directly to their worktrees; the user has no single
-  "queue of things the team intends to do" to look at.
-- The default team needs a long-lived Reviewer slot so code review is a
-  standard handoff rather than an ad-hoc worker setup step.
-- Nothing forces a PR boundary — the team's work can land on main with
-  no explicit user gate.
+APAS team mode coordinates autonomous panes through three durable files:
 
-What we want instead:
-- One **TODO document** the team maintains as the single source of
-  truth for "what we're doing."
-- A **user-approval gate** before the team spends tokens on
-  Tech-Lead-originated work.
-- A **per-worker section** so each worker has a clear queue.
-- A **mandatory code-review loop** before anything turns into a PR.
-- Each global TODO item maps to one or more **worker PRs the user can
-  review**.
+- `project_goal.md` captures the current product direction in the
+  Manager's lane.
+- `team-todo.md` is the structured queue the Tech Lead owns: proposed
+  work, approved Globals, per-worker subtasks, review state, and PR
+  links all live here.
+- `.apas-team.jsonl` remains the append-only bus for delegations, diffs,
+  reviews, decisions, and escalations.
+
+That split gives the user a visible approval surface before
+Tech-Lead-originated work consumes tokens, gives each worker a concrete
+subtask queue, requires Reviewer approval before PR handoff, and maps
+each Global TODO to one or more worker-opened PRs the user can review in
+GitHub.
 
 ## Roles
 
@@ -357,31 +355,34 @@ writes the URL into the matching Global TODO's `pr:` field. A
 multi-worker Global TODO reaches `pr_open` only after every contributing
 worker has a recorded PR.
 
-## Implementation phases
+## Implementation history
 
-Each phase is independently shippable.
+The workflow shipped incrementally. These notes are architecture
+breadcrumbs, not an active implementation plan:
 
-### Phase 1 — TODO doc + Tech Lead expand/dispatch loop
+### TODO doc + Tech Lead expand/dispatch loop
 
-- Define the Markdown schema (`team-todo.md`).
-- Parser + serializer in `crates/client-cli/src/team_todo.rs` (Rust;
-  shared types for parsing/writing entries).
-- Tech Lead system prompt: read the doc each iteration, expand the
-  oldest `approved` item, dispatch first `pending` subtask per worker.
-- Tests: parser round-trips, expand-and-dispatch sequence with stub
-  panes.
+- `team-todo.md` defines the Markdown schema and remains the source of
+  truth for Global TODOs and worker subtasks.
+- Parser, serializer, atomic save, and state-machine helpers live in
+  `crates/client-cli/src/team_todo.rs`.
+- The Tech Lead prompt reads the doc each iteration, expands approved
+  Globals subject to backlog backpressure, and dispatches pending
+  subtasks to available workers.
+- Regression coverage protects parser round-trips and representative
+  expand/dispatch behavior.
 
-### Phase 2 — Approval gate
+### Approval gate
 
-- Tech Lead's propose path: append a `proposed/tech-lead` entry to
-  `team-todo.md`.
-- Manager's system prompt: surface unactioned proposals; parse user
-  decisions; edit the doc.
-- Optional web UI: render proposals in Overview; Approve/Reject
-  buttons that re-use the same edit path via a new
-  `WebToServer::TodoApproval` message.
+- Tech-Lead-originated work enters as `status: proposed, origin:
+  tech-lead`.
+- The Manager surfaces unactioned proposals and can translate direct
+  user requests into `status: approved, origin: user` Globals.
+- The Web Overview renders proposal controls; Approve/Reject sends
+  `WebToServer::TodoApproval`, which the CLI applies through the same
+  `team_todo` state-machine path.
 
-### Phase 3 — Code review loop
+### Code review loop
 
 - Reviewer is the default managed team slot with `role: "reviewer"`.
   Tech Lead delegates to it on `.apas-team.jsonl` when a Global TODO
@@ -395,25 +396,27 @@ Each phase is independently shippable.
   the delegation record. The reviewer iterates with workers until
   approved; Tech Lead watches for final `approves:<worker>` records and
   then for worker `pr-opened` decisions.
+- Reviewer posts `approves:<worker>` / `rejects:<worker>` verdicts.
+  Rejects go directly back to the worker as normal delegations; approvals
+  let workers open their PRs.
 
-### Phase 4 — PR handoff
+### PR handoff
 
 - Workers run `git push -u origin <branch>` and `gh pr create --fill`
   after Reviewer approval, then publish `kind: "decision"` with
   `pr-opened`.
 - Tech Lead records each worker URL as `pr: <pane_id> <url>` and flips
   the Global TODO to `pr_open` once all contributing workers have PRs.
-- The Tech Lead loop refreshes recorded PR state and flips `pr_open` →
-  `done` only after every PR is merged.
+- Tech Lead owns PR state refresh and PR-comment dispatch; workers do
+  not idle-poll their own PRs.
 
-### Phase 5 — Migration / Polish
+### Migration / UI polish
 
-- One-time migration: on Tech Lead boot, if `team-todo.md` is missing
-  but `.apas-team.jsonl` shows recent delegations, seed an empty doc
-  with a "## pane:X — <role>" stub for each known worker.
-- Web Overview: a TODO panel that renders the doc as a checklist with
-  status badges and approval controls. Agents still mutate the doc
-  directly for orchestration state.
+- On boot, the team stack can seed missing worker sections from the
+  current pane roster so `team-todo.md` stays navigable.
+- The Web Overview renders the TODO document as a checklist with status
+  badges, proposal controls, PR links, and subtask lifecycle state.
+  Agents still mutate the document directly for orchestration state.
 
 ## Non-goals
 
