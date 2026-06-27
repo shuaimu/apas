@@ -282,6 +282,11 @@ describe("ProjectGoalBar team role slots", () => {
     expect(promptText).toContain("worker-owned kind: \"decision\"");
     expect(promptText).toContain("tags including \"pr-opened\"");
     expect(promptText).toContain("record pr: <pane_id> <url> lines");
+    expect(promptText).toContain("Scan .apas for current managed worker/developer readiness");
+    expect(promptText).toContain("managed developer panes");
+    expect(promptText).toContain("use that readiness");
+    expect(promptText).toContain("new proposed work can be staffed");
+    expect(promptText).toContain("current managed developer capacity");
     expect(promptText).not.toContain("may NEVER write 'approved' yourself");
     expect(addPane).toHaveBeenCalledWith(
       "claude",
