@@ -207,6 +207,12 @@ describe("ProjectGoalBar team role slots", () => {
     expect(prompt).toEqual(expect.stringContaining("user-approved backlog state is preserved"));
     expect(prompt).toEqual(expect.stringContaining("configured capacity"));
     const promptText = String(prompt);
+    expect(promptText).toContain("Owner hints");
+    expect(promptText).toContain("Owner: pane X");
+    expect(promptText).toContain("present in .apas as a managed developer pane");
+    expect(promptText).toContain("missing, unmanaged, or no longer a developer");
+    expect(promptText).toContain("treat the Owner: pane X hint as stale");
+    expect(promptText).toContain("assign the work to a current managed developer pane");
     expect(promptText).toContain('kind: "diff"');
     expect(promptText).toContain("record the branch/commit details");
     expect(promptText).toContain("team-todo.md");
