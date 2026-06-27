@@ -207,6 +207,12 @@ describe("ProjectGoalBar team role slots", () => {
     expect(prompt).toEqual(expect.stringContaining("user-approved backlog state is preserved"));
     expect(prompt).toEqual(expect.stringContaining("configured capacity"));
     const promptText = String(prompt);
+    expect(promptText).toContain("count all status: proposed Globals across origins");
+    expect(promptText).toContain("Cap at 10 outstanding proposed Globals");
+    expect(promptText).toContain("count is already 10 or more");
+    expect(promptText).toContain("skip the entire proposal step");
+    expect(promptText).toContain("user can triage the existing queue");
+    expect(promptText).toContain("Otherwise cap at 3/iter");
     expect(promptText).toContain('kind: "diff"');
     expect(promptText).toContain("record the branch/commit details");
     expect(promptText).toContain("team-todo.md");
