@@ -213,6 +213,13 @@ describe("ProjectGoalBar team role slots", () => {
     expect(promptText).toContain("status: reviewing");
     expect(promptText).toContain("reviewing / approved / done");
     expect(promptText).toContain("under_review");
+    expect(promptText).toContain(".apas-tech-lead-cursor");
+    expect(promptText).toContain("After each successful scratchpad scan");
+    expect(promptText).toContain("newest scratchpad record");
+    expect(promptText).toContain("successfully scanned/processed");
+    expect(promptText).toContain("ignored records");
+    expect(promptText).toContain("records that require no action");
+    expect(promptText).toContain("no-op records are not reread forever");
     expect(promptText).toContain('tags ["delegate-to:<reviewer_pane_id>", "task:TODO-NNN"]');
     expect(promptText).toContain("review-worker:<pane_id>");
     expect(promptText).toContain("do not request Reviewer review for that single diff yet");
