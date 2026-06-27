@@ -244,6 +244,11 @@ describe("ProjectGoalBar team role slots", () => {
     expect(promptText).toContain("concrete, bounded, aligned with project_goal.md");
     expect(promptText).toContain("not a duplicate");
     expect(promptText).toContain("gh pr merge <url> --squash --auto");
+    expect(promptText).toContain("If every pr: URL reports MERGED");
+    expect(promptText).toContain("Global status: done");
+    expect(promptText).toContain("If any pr: URL reports CLOSED");
+    expect(promptText).toContain("Global status: rejected");
+    expect(promptText).toContain("escalate to the Manager with the closed PR URL(s)");
     expect(promptText).toContain("local Reviewer approval record");
     expect(promptText).toContain("reviewDecision is not CHANGES_REQUESTED");
     expect(promptText).toContain('mergeable == "MERGEABLE"');
