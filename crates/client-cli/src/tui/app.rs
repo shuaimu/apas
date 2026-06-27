@@ -1,13 +1,21 @@
-//! Tab-based TUI application
+//! Minimal status TUI.
 //!
-//! Supports N tabs, each with its own output buffer, scroll state, and input.
-//! Only the active tab is rendered. Tab bar at top, status bar at bottom.
+//! Replaces the previous tabbed chat / input UI with a single-screen status
+//! report. The web app is the canonical surface for chat and pane control;
+//! the CLI runs in the background and only surfaces what a user might miss
+//! from the web — version, per-pane error counts, the last error line.
+//!
+//! The public types (`PaneOutput`, `TuiEvent`, `TuiCommand`, `App`) are
+//! preserved so the rest of the crate continues to compile unchanged. The
+//! interactive plumbing the old App had (keyboard handling, scrollback,
+//! tab navigation, input forwarding) is gone.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
@@ -16,48 +24,31 @@ use crossterm::{
 };
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph, Row, Table, Wrap},
 };
 use shared::PaneMode;
 
-/// Output message routed by pane_id
+const CURRENT_VERSION: &str = env!("APAS_VERSION");
+
+/// Output message routed by pane_id.
+///
+/// Other modules still emit `PaneOutput`s for status lines and stderr
+/// captures; the status app counts errors and keeps the most recent text
+/// per pane, but throws away the full scrollback (the web has the real
+/// chat).
 #[derive(Debug, Clone)]
 pub struct PaneOutput {
     pub text: String,
     pub pane_id: u32,
 }
 
-/// Per-tab state
-struct TabState {
-    pane_id: u32,
-    label: String,
-    mode: PaneMode,
-    output: Vec<String>,
-    input: String,
-    scroll: u16,
-    auto_scroll: bool,
-}
-
-impl TabState {
-    fn new(pane_id: u32, label: String, mode: PaneMode) -> Self {
-        let init_msg = format!("[{} initialized]", label);
-        Self {
-            pane_id,
-            label,
-            mode,
-            output: vec![init_msg],
-            input: String::new(),
-            scroll: 0,
-            auto_scroll: true,
-        }
-    }
-}
-
-/// Callback for tab management events from the TUI
+/// Callback for tab management events from the TUI (kept for ABI
+/// compatibility with the rest of the crate — the new status app emits
+/// none of these, but `AddTabWithConfig` is still the canonical pane
+/// creation event used by web/server spawn paths).
 #[derive(Debug, Clone)]
 pub enum TuiEvent {
     AddTab,
-    /// Add a tab with a specific pane_id, label, mode, provider, prompt, and model (from web/server)
     AddTabWithConfig {
         pane_id: u32,
         label: String,
@@ -68,68 +59,37 @@ pub enum TuiEvent {
         min_iteration_interval_minutes: Option<u64>,
         model: Option<String>,
         effort: Option<String>,
-        /// Absolute path of an isolated git worktree (Phase 1.1e). When
-        /// Some, the new pane spawns its agent in this dir and its
-        /// session jsonl is keyed by it. None = legacy shared cwd.
         worktree_path: Option<String>,
-        /// A user-submitted input that arrived just BEFORE the pane's
-        /// input channel existed (e.g. because the CLI was restarted
-        /// and the pane is being recreated to handle it). When Some,
-        /// the interactive-pane handler replays it on the newly-
-        /// registered input_tx so the user doesn't have to retype.
-        /// Deadloop panes log + drop it (no good place to inject mid-
-        /// loop without disrupting the /loop kickoff).
         initial_input: Option<String>,
-        /// Initial role/goal/backstory baked into the agent's first
-        /// system prompt — populated when the pane was created via
-        /// the Overview "Add Worker" modal with a template selected.
-        /// None on legacy paths.
         role: Option<String>,
         goal: Option<String>,
         backstory: Option<String>,
         plan_review_mode: shared::PlanReviewMode,
-        /// v3.5 — managed vs unmanaged. true = part of the team
-        /// (auto-spawned orchestrators + Overview AddWorker); false =
-        /// side chat from TabBar +. See PaneConfig::managed.
         managed: bool,
-        // Whether the worker should attempt a `--resume`/`exec resume`
-        // on its very first agent invocation. Default `true` for the
-        // existing spawn paths (recreate after crash, AddPane, etc.)
-        // where the session_id refers to a real prior session. Set
-        // `false` when respawning under a fresh-just-minted session
-        // id (e.g. provider switch via UpdatePaneModel) — codex's
-        // `exec resume` errors out hard ("no rollout found") if the
-        // id doesn't exist on its server.
         try_resume_first: bool,
     },
     CloseTab {
         pane_id: u32,
-        /// What to do with the pane's isolated worktree (and its branch) on
-        /// close. None means leave both alone — legacy behaviour and the
-        /// default for TUI-initiated close (which doesn't currently prompt).
         cleanup_action: Option<shared::PaneCleanupAction>,
     },
-    /// Start bot (deadloop) on an existing interactive pane
     StartBot {
         pane_id: u32,
         prompt: Option<String>,
         min_iteration_interval_minutes: Option<u64>,
         effort: Option<String>,
     },
-    /// Stop bot on a deadloop pane (revert to interactive)
     StopBot {
         pane_id: u32,
     },
-    /// Finalize a graceful stop — deadloop finished its current iteration.
-    /// Carries the stop_flag Arc so the handler can verify it belongs to the
-    /// current deadloop (prevents stale finalize from killing a newer deadloop).
     FinalizeStopBot {
         pane_id: u32,
         stop_flag: Arc<AtomicBool>,
     },
 }
 
-/// Commands sent back to the TUI from event handlers
+/// Commands sent into the TUI from event handlers — used by dual_pane to
+/// reflect pane lifecycle (add / remove / mode change) into the status
+/// display.
 #[derive(Debug)]
 pub enum TuiCommand {
     AddTab {
@@ -146,28 +106,72 @@ pub enum TuiCommand {
     },
 }
 
-/// Main TUI application state
+/// Per-pane summary tracked by the status app. We deliberately do NOT
+/// keep the scrollback — only the count of error lines and the most
+/// recent text, so memory stays bounded regardless of how chatty the
+/// agents are.
+struct PaneSummary {
+    label: String,
+    mode: PaneMode,
+    error_count: u32,
+    last_text: String,
+    last_activity: Instant,
+}
+
+impl PaneSummary {
+    fn new(label: String, mode: PaneMode) -> Self {
+        Self {
+            label,
+            mode,
+            error_count: 0,
+            last_text: String::new(),
+            last_activity: Instant::now(),
+        }
+    }
+}
+
+/// Classify a PaneOutput line as "looks like an error" so we can count
+/// it. Conservative — bare `error` mentions in normal agent text would
+/// otherwise inflate the count. The patterns below match how the rest
+/// of the crate actually surfaces errors in PaneOutput:
+///   - `format!("[Error spawning … ]", …)` from format_spawn_error
+///   - `[Failed to send input to agent: …]` / `[Failed to spawn agent: …]`
+///   - `[stderr] Error:` from the codex/claude stderr reader
+fn looks_like_error(text: &str) -> bool {
+    let t = text.trim_start();
+    t.starts_with("[Error")
+        || t.starts_with("[Failed")
+        || t.starts_with("[stderr] Error")
+        || t.starts_with("[stderr] error")
+}
+
+/// Status TUI. Public methods preserved from the old App so the call
+/// site in dual_pane.rs continues to compile without changes:
+///   `App::new(input_tx, output_rx, event_tx, command_rx, initial_tabs)`
+///   `.with_shutdown(shutdown)`
+///   `.run()`
 pub struct App {
-    /// All tabs, keyed by pane_id
-    tabs: Vec<TabState>,
-    /// Index of active tab in `tabs` vec
-    active_tab: usize,
-    /// Channel to send user input (with pane_id)
-    input_tx: Sender<(u32, String)>,
-    /// Channel to receive output
+    panes: BTreeMap<u32, PaneSummary>,
     output_rx: Receiver<PaneOutput>,
-    /// Channel to send tab management events
-    event_tx: Sender<TuiEvent>,
-    /// Channel to receive commands (add/remove tabs from event handler)
     command_rx: Receiver<TuiCommand>,
-    /// Whether to quit
-    should_quit: bool,
-    /// Shared shutdown flag (from main)
+    /// Last error line seen across any pane, with the pane id it came
+    /// from. Surfaced in the footer so the user can spot a recent
+    /// failure at a glance.
+    last_error: Option<(u32, String, Instant)>,
     shutdown: Option<Arc<AtomicBool>>,
+    /// Wall-clock at which the app started — used to render uptime.
+    started_at: Instant,
+    /// Cumulative output-line counter, just for the header so the
+    /// user can confirm activity is flowing.
+    output_lines_total: u64,
 }
 
 impl App {
-    /// Create a new App with channels for I/O
+    /// Create a new status App. The `input_tx` and `event_tx` arguments
+    /// are kept for signature compatibility with the old tabbed TUI but
+    /// are no longer used — `input_tx` would carry user-typed text from
+    /// the TUI (no chat input here), and the status app never produces
+    /// `TuiEvent`s itself. Both are dropped immediately.
     pub fn new(
         input_tx: Sender<(u32, String)>,
         output_rx: Receiver<PaneOutput>,
@@ -175,60 +179,31 @@ impl App {
         command_rx: Receiver<TuiCommand>,
         initial_tabs: Vec<(u32, String, PaneMode)>,
     ) -> Self {
-        let tabs: Vec<TabState> = initial_tabs
-            .into_iter()
-            .map(|(id, label, mode)| TabState::new(id, label, mode))
-            .collect();
-
+        drop(input_tx);
+        drop(event_tx);
+        let mut panes = BTreeMap::new();
+        for (id, label, mode) in initial_tabs {
+            panes.insert(id, PaneSummary::new(label, mode));
+        }
         Self {
-            tabs,
-            active_tab: 0,
-            input_tx,
+            panes,
             output_rx,
-            event_tx,
             command_rx,
-            should_quit: false,
+            last_error: None,
             shutdown: None,
+            started_at: Instant::now(),
+            output_lines_total: 0,
         }
     }
 
-    /// Set the shared shutdown flag
     pub fn with_shutdown(mut self, shutdown: Arc<AtomicBool>) -> Self {
         self.shutdown = Some(shutdown);
         self
     }
 
-    /// Add a new tab dynamically (called from outside the TUI loop)
-    pub fn add_tab(&mut self, pane_id: u32, label: String, mode: PaneMode) {
-        // Don't add duplicate
-        if self.tabs.iter().any(|t| t.pane_id == pane_id) {
-            return;
-        }
-        self.tabs.push(TabState::new(pane_id, label, mode));
-    }
-
-    /// Remove a tab dynamically
-    pub fn remove_tab(&mut self, pane_id: u32) {
-        if let Some(idx) = self.tabs.iter().position(|t| t.pane_id == pane_id) {
-            self.tabs.remove(idx);
-            // Adjust active_tab if needed
-            if self.tabs.is_empty() {
-                self.active_tab = 0;
-            } else if self.active_tab >= self.tabs.len() {
-                self.active_tab = self.tabs.len() - 1;
-            }
-        }
-    }
-
-    /// Check if shutdown has been requested
-    fn is_shutdown(&self) -> bool {
-        self.shutdown
-            .as_ref()
-            .map(|s| s.load(Ordering::SeqCst))
-            .unwrap_or(false)
-    }
-
-    /// Run the TUI main loop
+    /// Drive the status loop until shutdown is requested or the user
+    /// presses Ctrl+C / q. Render tick is ~250 ms which is plenty for
+    /// a status display and keeps CPU near zero.
     pub fn run(&mut self) -> io::Result<()> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -236,25 +211,56 @@ impl App {
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
-        while !self.should_quit && !self.is_shutdown() {
-            self.process_commands();
-            self.process_output();
-            terminal.draw(|f| self.draw(f))?;
+        let mut last_render = Instant::now() - Duration::from_secs(1);
+        let render_interval = Duration::from_millis(250);
+        let input_poll = Duration::from_millis(50);
 
-            if event::poll(Duration::from_millis(50))? {
+        loop {
+            if self.is_shutting_down() {
+                break;
+            }
+
+            // Drain channels without blocking so the render stays fresh.
+            self.drain_commands();
+            self.drain_outputs();
+
+            // Keyboard: Ctrl+C / q / Esc quits and flips the shared
+            // shutdown flag so the server thread tears down cleanly.
+            if event::poll(input_poll)? {
                 if let Event::Key(key) = event::read()? {
-                    self.handle_key(key.code, key.modifiers);
+                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    let quit = matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+                        || (ctrl && matches!(key.code, KeyCode::Char('c')));
+                    if quit {
+                        if let Some(flag) = &self.shutdown {
+                            flag.store(true, Ordering::SeqCst);
+                        }
+                        break;
+                    }
                 }
+            }
+
+            if last_render.elapsed() >= render_interval {
+                terminal.draw(|f| self.render(f))?;
+                last_render = Instant::now();
             }
         }
 
+        // Restore terminal state.
         disable_raw_mode()?;
         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        terminal.show_cursor()?;
         Ok(())
     }
 
-    /// Process pending commands (add/remove tabs from event handler)
-    fn process_commands(&mut self) {
+    fn is_shutting_down(&self) -> bool {
+        self.shutdown
+            .as_ref()
+            .map(|f| f.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+
+    fn drain_commands(&mut self) {
         while let Ok(cmd) = self.command_rx.try_recv() {
             match cmd {
                 TuiCommand::AddTab {
@@ -262,342 +268,225 @@ impl App {
                     label,
                     mode,
                 } => {
-                    self.add_tab(pane_id, label, mode);
-                    // Switch to newly created tab
-                    self.active_tab = self.tabs.len() - 1;
+                    let entry = self
+                        .panes
+                        .entry(pane_id)
+                        .or_insert_with(|| PaneSummary::new(label.clone(), mode));
+                    entry.label = label;
                 }
                 TuiCommand::RemoveTab { pane_id } => {
-                    self.remove_tab(pane_id);
+                    self.panes.remove(&pane_id);
                 }
                 TuiCommand::SetMode { pane_id, mode } => {
-                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.pane_id == pane_id) {
-                        tab.mode = mode;
+                    if let Some(p) = self.panes.get_mut(&pane_id) {
+                        p.mode = mode;
                     }
                 }
             }
         }
     }
 
-    /// Process pending output from channel
-    fn process_output(&mut self) {
-        while let Ok(output) = self.output_rx.try_recv() {
-            // Find the tab for this pane_id
-            if let Some(tab) = self.tabs.iter_mut().find(|t| t.pane_id == output.pane_id) {
-                tab.output.push(output.text);
-                if tab.auto_scroll {
-                    tab.scroll = u16::MAX;
-                }
-            }
-            // If no tab found, output is silently dropped (pane may have been closed)
-        }
-    }
-
-    /// Handle keyboard input
-    fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
-        // Global shortcuts (Ctrl+*)
-        if modifiers.contains(KeyModifiers::CONTROL) {
-            match code {
-                KeyCode::Char('c') => {
-                    // Ctrl+C in raw mode never reaches the OS SIGINT
-                    // handler — crossterm captures it as a key event.
-                    // Set BOTH our local quit flag (to exit this draw
-                    // loop) AND the shared shutdown Arc that the
-                    // server task, deadloop workers, file watcher, and
-                    // child-killer rely on; otherwise the TUI exits
-                    // but everything else keeps running and the
-                    // process appears wedged to the user.
-                    self.should_quit = true;
-                    if let Some(shutdown) = &self.shutdown {
-                        shutdown.store(true, Ordering::SeqCst);
-                    }
-                }
-                KeyCode::Char('t') => {
-                    // Create new tab
-                    let _ = self.event_tx.send(TuiEvent::AddTab);
-                }
-                KeyCode::Char('w') => {
-                    // Close current tab (only if more than 1 tab)
-                    if self.tabs.len() > 1 {
-                        if let Some(tab) = self.tabs.get(self.active_tab) {
-                            let pane_id = tab.pane_id;
-                            let _ = self.event_tx.send(TuiEvent::CloseTab {
-                                pane_id,
-                                cleanup_action: None,
-                            });
-                        }
-                    }
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        // Tab switching with Alt+number or Tab/Shift+Tab
-        if modifiers.contains(KeyModifiers::ALT) {
-            if let KeyCode::Char(c) = code {
-                if let Some(digit) = c.to_digit(10) {
-                    let idx = if digit == 0 { 9 } else { (digit - 1) as usize };
-                    if idx < self.tabs.len() {
-                        self.active_tab = idx;
-                    }
-                    return;
-                }
-            }
-        }
-
-        // Tab/Shift+Tab to cycle tabs
-        match code {
-            KeyCode::BackTab => {
-                // Shift+Tab: previous tab
-                if !self.tabs.is_empty() {
-                    if self.active_tab == 0 {
-                        self.active_tab = self.tabs.len() - 1;
-                    } else {
-                        self.active_tab -= 1;
-                    }
-                }
-                return;
-            }
-            _ => {}
-        }
-
-        // Active tab input
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-            match code {
-                KeyCode::Tab => {
-                    // Next tab
-                    if !self.tabs.is_empty() {
-                        self.active_tab = (self.active_tab + 1) % self.tabs.len();
-                    }
-                }
-                KeyCode::Enter => {
-                    // Deadloop tabs don't accept user input
-                    if tab.mode == PaneMode::Deadloop {
-                        return;
-                    }
-                    if !tab.input.is_empty() {
-                        let input = std::mem::take(&mut tab.input);
-                        let _ = self.input_tx.send((tab.pane_id, input));
-                    }
-                }
-                KeyCode::Char(c) => {
-                    if tab.mode == PaneMode::Deadloop {
-                        return;
-                    }
-                    tab.input.push(c);
-                }
-                KeyCode::Backspace => {
-                    if tab.mode == PaneMode::Deadloop {
-                        return;
-                    }
-                    tab.input.pop();
-                }
-                KeyCode::Up => {
-                    tab.auto_scroll = false;
-                    tab.scroll = tab.scroll.saturating_sub(1);
-                }
-                KeyCode::Down => {
-                    tab.scroll = tab.scroll.saturating_add(1);
-                }
-                KeyCode::PageUp => {
-                    tab.auto_scroll = false;
-                    tab.scroll = tab.scroll.saturating_sub(20);
-                }
-                KeyCode::PageDown => {
-                    tab.scroll = tab.scroll.saturating_add(20);
-                }
-                KeyCode::End => {
-                    tab.auto_scroll = true;
-                    tab.scroll = u16::MAX;
-                }
-                KeyCode::Esc => {
-                    tab.input.clear();
-                }
-                _ => {}
+    fn drain_outputs(&mut self) {
+        while let Ok(out) = self.output_rx.try_recv() {
+            self.output_lines_total = self.output_lines_total.saturating_add(1);
+            let entry = self
+                .panes
+                .entry(out.pane_id)
+                .or_insert_with(|| PaneSummary::new(format!("pane {}", out.pane_id), PaneMode::Interactive));
+            entry.last_activity = Instant::now();
+            entry.last_text = out.text.clone();
+            if looks_like_error(&out.text) {
+                entry.error_count = entry.error_count.saturating_add(1);
+                self.last_error = Some((out.pane_id, out.text, Instant::now()));
             }
         }
     }
 
-    /// Draw the UI
-    fn draw(&mut self, frame: &mut Frame) {
-        let area = frame.area();
-
-        // Layout: tab bar (1 line) + content + status bar (1 line)
-        let layout = Layout::default()
+    fn render(&self, f: &mut Frame) {
+        let area = f.area();
+        let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // Tab bar
-                Constraint::Min(0),    // Content
-                Constraint::Length(1), // Status bar
+                Constraint::Length(3), // header
+                Constraint::Min(1),    // pane table
+                Constraint::Length(4), // footer
             ])
             .split(area);
 
-        self.draw_tab_bar(frame, layout[0]);
-        self.draw_active_tab(frame, layout[1]);
-        self.draw_status_bar(frame, layout[2]);
-    }
+        // ---- Header
+        let pane_count = self.panes.len();
+        let errs: u32 = self.panes.values().map(|p| p.error_count).sum();
+        let uptime = humanize_duration(self.started_at.elapsed());
+        let header_lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    format!("apas v{}", CURRENT_VERSION),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("   "),
+                Span::styled(
+                    format!("uptime {}", uptime),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+            Line::from(vec![
+                Span::raw(format!("panes: {}   ", pane_count)),
+                Span::styled(
+                    format!("errors: {}   ", errs),
+                    if errs > 0 {
+                        Style::default().fg(Color::Red)
+                    } else {
+                        Style::default().fg(Color::Green)
+                    },
+                ),
+                Span::styled(
+                    format!("output lines: {}", self.output_lines_total),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+        ];
+        let header = Paragraph::new(header_lines)
+            .block(Block::default().borders(Borders::BOTTOM));
+        f.render_widget(header, chunks[0]);
 
-    /// Draw the tab bar
-    fn draw_tab_bar(&self, frame: &mut Frame, area: Rect) {
-        let mut spans = Vec::new();
-
-        for (i, tab) in self.tabs.iter().enumerate() {
-            let is_active = i == self.active_tab;
-            let is_bot = tab.mode == PaneMode::Deadloop;
-
-            // Tab number prefix
-            let num = format!(" {}:", i + 1);
-            let label = if is_bot {
-                format!("{} (Bot) ", tab.label)
-            } else {
-                format!("{} ", tab.label)
-            };
-
-            if is_active {
-                spans.push(Span::styled(
-                    num,
-                    Style::default().fg(Color::Black).bg(Color::White).bold(),
-                ));
-                spans.push(Span::styled(
-                    label,
-                    Style::default().fg(Color::Black).bg(Color::White).bold(),
-                ));
-            } else {
-                spans.push(Span::styled(num, Style::default().fg(Color::Gray)));
-                spans.push(Span::styled(label, Style::default().fg(Color::Gray)));
-            }
-
-            // Separator
-            spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
-        }
-
-        // Add "+" hint
-        spans.push(Span::styled(" + ", Style::default().fg(Color::DarkGray)));
-
-        let line = Line::from(spans);
-        let paragraph = Paragraph::new(line).style(Style::default().bg(Color::DarkGray));
-        frame.render_widget(paragraph, area);
-    }
-
-    /// Draw the active tab's content
-    fn draw_active_tab(&mut self, frame: &mut Frame, area: Rect) {
-        if self.tabs.is_empty() {
-            let paragraph = Paragraph::new("No tabs open. Press Ctrl+T to create one.")
-                .style(Style::default().fg(Color::Gray));
-            frame.render_widget(paragraph, area);
-            return;
-        }
-
-        let tab = &mut self.tabs[self.active_tab];
-
-        let border_style = Style::default().fg(Color::Cyan);
-        let block = Block::default()
-            .title(format!(" {} ", tab.label))
-            .borders(Borders::ALL)
-            .border_style(border_style);
-
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-
-        // Split inner area: output + input box
-        let content_layout = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(3)])
-            .split(inner);
-
-        // --- Output area ---
-        let viewport_width = content_layout[0].width as usize;
-        let content_lines: u16 = tab
-            .output
+        // ---- Pane table
+        let header_row = Row::new(vec!["id", "label", "mode", "errs", "last activity"])
+            .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
+        let rows: Vec<Row> = self
+            .panes
             .iter()
-            .map(|line| {
-                if line.is_empty() || viewport_width == 0 {
-                    1
+            .map(|(id, p)| {
+                let mode = match p.mode {
+                    PaneMode::Interactive => "interactive",
+                    PaneMode::Deadloop => "deadloop",
+                };
+                let last = humanize_age(p.last_activity.elapsed());
+                let err_style = if p.error_count > 0 {
+                    Style::default().fg(Color::Red)
                 } else {
-                    ((line.chars().count() + viewport_width - 1) / viewport_width).max(1) as u16
-                }
+                    Style::default().fg(Color::Green)
+                };
+                Row::new(vec![
+                    ratatui::widgets::Cell::from(id.to_string()),
+                    ratatui::widgets::Cell::from(p.label.clone()),
+                    ratatui::widgets::Cell::from(mode),
+                    ratatui::widgets::Cell::from(format!("{}", p.error_count)).style(err_style),
+                    ratatui::widgets::Cell::from(last),
+                ])
             })
-            .sum();
+            .collect();
+        let widths = [
+            Constraint::Length(6),
+            Constraint::Min(16),
+            Constraint::Length(12),
+            Constraint::Length(6),
+            Constraint::Length(14),
+        ];
+        let table = Table::new(rows, widths)
+            .header(header_row)
+            .block(Block::default().borders(Borders::NONE));
+        f.render_widget(table, chunks[1]);
 
-        let viewport_height = content_layout[0].height;
-        let max_scroll = content_lines.saturating_sub(viewport_height);
-
-        let scroll = if tab.auto_scroll {
-            tab.scroll = max_scroll;
-            max_scroll
+        // ---- Footer: last error + hint
+        let footer_lines = if let Some((pid, text, at)) = &self.last_error {
+            vec![
+                Line::from(vec![
+                    Span::styled("last error: ", Style::default().fg(Color::Red)),
+                    Span::raw(format!("pane {} · {} · ", pid, humanize_age(at.elapsed()))),
+                    Span::raw(truncate(text, 200)),
+                ]),
+                Line::from(Span::styled(
+                    "Ctrl+C / q  quit · web UI is the canonical surface",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
         } else {
-            tab.scroll = tab.scroll.min(max_scroll);
-            tab.scroll
+            vec![
+                Line::from(Span::styled(
+                    "no errors recorded",
+                    Style::default().fg(Color::Green),
+                )),
+                Line::from(Span::styled(
+                    "Ctrl+C / q  quit · web UI is the canonical surface",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
         };
-
-        let output_text = tab.output.join("\n");
-        let paragraph = Paragraph::new(output_text)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0));
-        frame.render_widget(paragraph, content_layout[0]);
-
-        // --- Input area ---
-        let is_deadloop = tab.mode == PaneMode::Deadloop;
-        let input_block = Block::default()
-            .title(if is_deadloop { " Bot Mode " } else { " Input " })
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(if is_deadloop {
-                Color::DarkGray
-            } else {
-                Color::Green
-            }));
-
-        let input_inner = input_block.inner(content_layout[1]);
-        frame.render_widget(input_block, content_layout[1]);
-
-        let input_text = if is_deadloop {
-            "Bot running autonomously...".to_string()
-        } else {
-            format!("{}_", tab.input)
-        };
-        let input_paragraph = Paragraph::new(input_text).style(if is_deadloop {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default()
-        });
-        frame.render_widget(input_paragraph, input_inner);
-    }
-
-    /// Draw the status bar
-    fn draw_status_bar(&self, frame: &mut Frame, area: Rect) {
-        let tab_info = if let Some(tab) = self.tabs.get(self.active_tab) {
-            format!("{} ({})", tab.label, tab.pane_id)
-        } else {
-            "No tabs".to_string()
-        };
-
-        let status = format!(
-            " Tab: {} | Tab/Shift+Tab: Switch | Alt+N: Go to tab | Ctrl+T: New | Ctrl+W: Close | Ctrl+C: Quit ",
-            tab_info
-        );
-
-        let paragraph =
-            Paragraph::new(status).style(Style::default().bg(Color::DarkGray).fg(Color::White));
-        frame.render_widget(paragraph, area);
+        let footer = Paragraph::new(footer_lines)
+            .wrap(Wrap { trim: true })
+            .block(Block::default().borders(Borders::TOP));
+        f.render_widget(footer, chunks[2]);
     }
 }
 
-/// Create channels for TUI communication
-pub fn create_channels() -> (
-    Sender<(u32, String)>,   // input_tx: (pane_id, text)
-    Receiver<(u32, String)>, // input_rx
-    Sender<PaneOutput>,      // output_tx
-    Receiver<PaneOutput>,    // output_rx
-    Sender<TuiEvent>,        // event_tx
-    Receiver<TuiEvent>,      // event_rx
-    Sender<TuiCommand>,      // command_tx
-    Receiver<TuiCommand>,    // command_rx
-) {
-    let (input_tx, input_rx) = mpsc::channel();
-    let (output_tx, output_rx) = mpsc::channel();
-    let (event_tx, event_rx) = mpsc::channel();
-    let (command_tx, command_rx) = mpsc::channel();
-    (
-        input_tx, input_rx, output_tx, output_rx, event_tx, event_rx, command_tx, command_rx,
-    )
+fn humanize_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else if secs < 86400 {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!("{}d{}h", secs / 86400, (secs % 86400) / 3600)
+    }
+}
+
+fn humanize_age(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 1 {
+        "now".to_string()
+    } else if secs < 60 {
+        format!("{}s ago", secs)
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
+}
+
+fn truncate(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn looks_like_error_matches_known_patterns() {
+        assert!(looks_like_error("[Error spawning claude]"));
+        assert!(looks_like_error("[Failed to spawn agent: foo]"));
+        assert!(looks_like_error("[stderr] Error: thread/resume failed"));
+        assert!(!looks_like_error("> hi"));
+        assert!(!looks_like_error("[Thinking...]"));
+        assert!(!looks_like_error("normal output mentioning error in passing"));
+    }
+
+    #[test]
+    fn humanize_age_buckets() {
+        assert_eq!(humanize_age(Duration::from_millis(500)), "now");
+        assert_eq!(humanize_age(Duration::from_secs(45)), "45s ago");
+        assert_eq!(humanize_age(Duration::from_secs(120)), "2m ago");
+        assert_eq!(humanize_age(Duration::from_secs(7200)), "2h ago");
+    }
+
+    #[test]
+    fn truncate_respects_char_boundary() {
+        // 3-byte ellipsis at byte index 1..4; truncate at 3 would land
+        // mid-codepoint without the boundary walk.
+        let s = "x…y";
+        let t = truncate(s, 3);
+        assert!(s.starts_with(t));
+        assert!(t.len() <= 3);
+    }
 }
