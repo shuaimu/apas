@@ -211,6 +211,11 @@ describe("ProjectGoalBar team role slots", () => {
     expect(promptText).toContain("record the branch/commit details");
     expect(promptText).toContain("team-todo.md");
     expect(promptText).toContain("status: reviewing");
+    expect(promptText).toContain(".apas-tech-lead-cursor");
+    expect(promptText).toContain("empty or missing");
+    expect(promptText).toContain("tail -n 50 .apas-team.jsonl");
+    expect(promptText).toContain("newest processed timestamp");
+    expect(promptText).toContain("write the newest processed timestamp back");
     expect(promptText).toContain("reviewing / approved / done");
     expect(promptText).toContain("under_review");
     expect(promptText).toContain('tags ["delegate-to:<reviewer_pane_id>", "task:TODO-NNN"]');
