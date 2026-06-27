@@ -282,6 +282,9 @@ describe("ProjectGoalBar team role slots", () => {
     expect(promptText).toContain("worker-owned kind: \"decision\"");
     expect(promptText).toContain("tags including \"pr-opened\"");
     expect(promptText).toContain("record pr: <pane_id> <url> lines");
+    expect(promptText).toContain("skip proposal creation");
+    expect(promptText).toContain("escalate to the Manager");
+    expect(promptText).toContain("project_goal.md is empty or trivially short (<200 chars)");
     expect(promptText).not.toContain("may NEVER write 'approved' yourself");
     expect(addPane).toHaveBeenCalledWith(
       "claude",
