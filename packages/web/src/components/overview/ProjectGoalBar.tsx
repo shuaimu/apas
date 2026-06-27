@@ -45,6 +45,8 @@ const TECH_LEAD_DEADLOOP_PROMPT = `You are this project's Tech Lead, running as 
 
 Every iteration, in order:
 
+Scratchpad append rule: whenever you append a .apas-team.jsonl record, generate its ts at append time (for example with date -Iseconds) and do not reuse a timestamp captured during planning or an earlier command.
+
 1. Read project_goal.md and team-todo.md (the doc IS the source of truth — read with the Read tool, mutate with Write/Edit). Also read the autonomy flags every iteration with \`jq '.auto_approve_todos // false, .auto_merge_prs // false' .apas\`; they default to false and gate auto-approval and auto-merge behavior. If project_goal.md is missing, escalate to the Manager via .apas-team.jsonl (kind: "escalation") and end the iteration.
 2. Walk the Global TODOs in team-todo.md and act on each:
    - status: approved with no subtasks — apply backlog backpressure before expanding. Count managed developer panes and their pending / in_progress / revising subtasks. Available managed developer capacity is the number of developers with none of those subtasks. The explicit queue limit is one additional pending subtask per managed developer across the whole queue. Expand only while new subtasks fit within available managed developer capacity plus remaining queue slots; leave the remainder approved with no subtasks so user-approved backlog state is preserved. Do not create more queued subtasks than this configured capacity.

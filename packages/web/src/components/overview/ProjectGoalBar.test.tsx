@@ -211,6 +211,11 @@ describe("ProjectGoalBar team role slots", () => {
     expect(promptText).toContain("record the branch/commit details");
     expect(promptText).toContain("team-todo.md");
     expect(promptText).toContain("status: reviewing");
+    expect(promptText).toContain("Scratchpad append rule");
+    expect(promptText).toContain(".apas-team.jsonl record");
+    expect(promptText).toContain("generate its ts at append time");
+    expect(promptText).toContain("date -Iseconds");
+    expect(promptText).toContain("do not reuse a timestamp captured during planning");
     expect(promptText).toContain("reviewing / approved / done");
     expect(promptText).toContain("under_review");
     expect(promptText).toContain('tags ["delegate-to:<reviewer_pane_id>", "task:TODO-NNN"]');
