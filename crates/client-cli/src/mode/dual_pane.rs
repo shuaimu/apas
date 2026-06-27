@@ -3534,6 +3534,48 @@ fn promote_pane_to_managed(pane_metas: &PaneMetas, promote_id: u32) -> bool {
                     *guard = Some("max".to_string());
                 }
             }
+            // Role inference: a pane labelled "Reviewer" / "Tech Lead" /
+            // "Developer" / "Manager" was almost certainly meant to be
+            // that team role, but earlier spawn paths (older Start-team
+            // before specs, "+"→rename, AddPane from web) didn't set the
+            // role/goal/backstory triple. Without those, the Tech Lead's
+            // delegation step (`role` contains "developer" etc.) can't
+            // see the pane as a delegation target. On promote, fill in
+            // the matching team defaults — but only when role is empty,
+            // so a user's custom role label is never clobbered.
+            if m.role.as_deref().map(|s| s.trim()).unwrap_or("").is_empty() {
+                let lower = m.label.to_ascii_lowercase();
+                let (role, goal, backstory) = if lower.contains("tech lead") {
+                    (
+                        crate::role::DEFAULT_TECH_LEAD_ROLE,
+                        crate::role::DEFAULT_TECH_LEAD_GOAL,
+                        crate::role::DEFAULT_TECH_LEAD_BACKSTORY,
+                    )
+                } else if lower.contains("manager") {
+                    (
+                        crate::role::DEFAULT_MANAGER_ROLE,
+                        crate::role::DEFAULT_MANAGER_GOAL,
+                        crate::role::DEFAULT_MANAGER_BACKSTORY,
+                    )
+                } else if lower.contains("reviewer") {
+                    (
+                        crate::role::DEFAULT_REVIEWER_ROLE,
+                        crate::role::DEFAULT_REVIEWER_GOAL,
+                        crate::role::DEFAULT_REVIEWER_BACKSTORY,
+                    )
+                } else if lower.contains("developer") {
+                    (
+                        crate::role::DEFAULT_DEVELOPER_ROLE,
+                        crate::role::DEFAULT_DEVELOPER_GOAL,
+                        crate::role::DEFAULT_DEVELOPER_BACKSTORY,
+                    )
+                } else {
+                    return true;
+                };
+                m.role = Some(role.to_string());
+                m.goal = Some(goal.to_string());
+                m.backstory = Some(backstory.to_string());
+            }
             true
         }
         _ => false,
