@@ -405,9 +405,12 @@ fn normalize_effort_level(raw: Option<&str>) -> Option<String> {
         return None;
     }
     let normalized = trimmed.to_ascii_lowercase();
-    // Valid levels (from `claude --help`): low, medium, high, xhigh, max.
-    // Pass the user's selection through verbatim so xhigh and max stay
-    // distinct — previously we coerced xhigh → max.
+    // Valid claude levels (from `claude --help`): low, medium, high, xhigh,
+    // max. Pass the user's selection through verbatim so xhigh and max stay
+    // distinct — previously we coerced xhigh → max. `ultracode` is an
+    // apas-only level (not a real claude effort) — it survives the
+    // normalizer as a distinct string and is translated to the wire flag
+    // `xhigh` plus an `ultracode ` prompt prefix at envelope-build time.
     match normalized.as_str() {
         "default" | "auto" | "none" | "off" => None,
         "low" => Some("low".to_string()),
@@ -415,8 +418,41 @@ fn normalize_effort_level(raw: Option<&str>) -> Option<String> {
         "high" => Some("high".to_string()),
         "xhigh" | "x-high" => Some("xhigh".to_string()),
         "max" => Some("max".to_string()),
+        "ultracode" => Some("ultracode".to_string()),
         _ => None,
     }
+}
+
+/// Map a normalized effort string to the value passed via `claude --effort`.
+/// `ultracode` is apas-only and not accepted by claude's CLI, so it spawns
+/// as `xhigh` (and the workflow trigger is provided via a prompt prefix).
+/// All other normalized levels pass through unchanged.
+fn effort_to_claude_flag(normalized: &str) -> &str {
+    match normalized {
+        "ultracode" => "xhigh",
+        other => other,
+    }
+}
+
+/// Build the JSONL user-input envelope line written to claude's stdin.
+/// Wire format from happy-cli/src/claude/sdk/utils.ts:190 — plain string
+/// `content`, not a content-block array. When the live effort is
+/// `ultracode`, prefix the content with `ultracode ` so claude picks up
+/// the apas-only workflow trigger; otherwise the prompt is passed through
+/// unchanged.
+fn build_user_envelope_line(prompt: &str, live_effort: Option<&str>) -> String {
+    let content_owned;
+    let content: &str = if live_effort == Some("ultracode") {
+        content_owned = format!("ultracode {}", prompt);
+        &content_owned
+    } else {
+        prompt
+    };
+    let envelope = serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": content },
+    });
+    format!("{}\n", envelope)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1164,12 +1200,14 @@ async fn run_inner(
     // suggested workers) to always think at the highest level when
     // running official Claude. Re-asserting on every boot also recovers
     // any pane that was downgraded by hand or by an older binary.
+    // `ultracode` is an accepted alternative baseline (xhigh + workflow
+    // prefix) — don't clobber an explicit user choice back to max.
     // Non-Claude providers don't have an --effort knob so we leave them
     // alone.
     for pane in metadata.panes.iter_mut() {
         if pane.managed
             && matches!(pane.provider, shared::Provider::Claude)
-            && pane.effort.as_deref() != Some("max")
+            && !matches!(pane.effort.as_deref(), Some("max") | Some("ultracode"))
         {
             tracing::info!(
                 pane_id = pane.pane_id,
@@ -3526,8 +3564,10 @@ fn promote_pane_to_managed(pane_metas: &PaneMetas, promote_id: u32) -> bool {
             // Bring promoted Claude panes up to the team's baseline (max
             // effort). effort_arc is read by the streaming worker before
             // each turn, so the next Claude restart picks it up.
+            // `ultracode` counts as an accepted baseline — don't clobber
+            // a user's explicit choice when promoting a side chat.
             if matches!(m.provider, shared::Provider::Claude)
-                && m.effort.as_deref() != Some("max")
+                && !matches!(m.effort.as_deref(), Some("max") | Some("ultracode"))
             {
                 m.effort = Some("max".to_string());
                 if let Ok(mut guard) = m.effort_arc.lock() {
@@ -3701,12 +3741,14 @@ fn build_agent_args(
                 && !is_deepseek_model(model)
             {
                 if let Some(normalized_effort) = normalize_effort_level(effort) {
+                    let claude_flag = effort_to_claude_flag(&normalized_effort).to_string();
                     tracing::info!(
                         target: "apas::effort",
-                        effort = %normalized_effort,
+                        level = %normalized_effort,
+                        claude_flag = %claude_flag,
                         "Launching claude with --effort",
                     );
-                    base.extend_from_slice(&["--effort".to_string(), normalized_effort]);
+                    base.extend_from_slice(&["--effort".to_string(), claude_flag]);
                 }
             }
             if first_message && try_resume {
@@ -4126,12 +4168,12 @@ mod tests {
         active_usage_providers, auto_cancel_pending_questions_for_new_input, build_agent_args,
         build_agent_switch_respawn_event, build_deadloop_agent_args, build_pane_reboot_events,
         build_pane_env_overrides_from_keys, build_pane_list, boot_restore_try_resume_first,
-        deadloop_wait_plan, evaluate_deadloop_watchdog, is_codex_stale_session_error,
-        manual_create_pr_worktree_path, pane_label_or_default, promote_pane_to_managed,
-        reset_deadloop_codex_stale_session, resolve_pane_binary_path, route_web_input_to_pane,
-        refresh_stale_managed_builtin_prompts, restored_pane_mode_and_pause,
-        run_deadloop_session_inner, save_pane_configs, should_recover_deadloop_stale_session,
-        start_bot_preserved_fields,
+        build_user_envelope_line, deadloop_wait_plan, evaluate_deadloop_watchdog,
+        is_codex_stale_session_error, manual_create_pr_worktree_path, normalize_effort_level,
+        pane_label_or_default, promote_pane_to_managed, reset_deadloop_codex_stale_session,
+        resolve_pane_binary_path, route_web_input_to_pane, refresh_stale_managed_builtin_prompts,
+        restored_pane_mode_and_pause, run_deadloop_session_inner, save_pane_configs,
+        should_recover_deadloop_stale_session, start_bot_preserved_fields,
         truncate_str_at_char_boundary, update_project_flags, DeadloopWatchdogDecision,
         DeadloopWatchdogState, ASK_USER_QUESTION_AUTO_CANCEL_STATUS, InputChannels,
         PaneInputRouteResult, PaneMeta, PaneMetas, PanePauses, PaneStopRequests,
@@ -5566,6 +5608,63 @@ Use a project-specific custom dispatch loop.";
         // them.
         assert!(args.windows(2).any(|w| w == ["--effort", "xhigh"]));
         assert!(!args.windows(2).any(|w| w == ["--effort", "max"]));
+    }
+
+    #[test]
+    fn build_agent_args_claude_effort_ultracode_emits_xhigh_flag() {
+        // `ultracode` is apas-only and claude's CLI rejects the literal —
+        // it must be translated to `--effort xhigh` on the wire.
+        let session_id = Uuid::new_v4();
+        let (args, _) = build_agent_args(
+            &Provider::Claude,
+            &session_id,
+            FULL_PROMPT,
+            None,
+            Some("ultracode"),
+            true,
+            false,
+        );
+
+        assert!(args.windows(2).any(|w| w == ["--effort", "xhigh"]));
+        assert!(!args.iter().any(|arg| arg == "ultracode"));
+    }
+
+    #[test]
+    fn build_user_envelope_line_prefixes_prompt_when_ultracode() {
+        // Envelope-prefix path: the only behavioural difference between
+        // `ultracode` and `xhigh` is the `ultracode ` keyword prepended to
+        // the prompt content on every user-input envelope. Parse the
+        // result rather than string-match to stay agnostic to JSON key
+        // ordering (serde_json sorts insertion order, but be robust).
+        let line = build_user_envelope_line("do the thing", Some("ultracode"));
+        assert!(line.ends_with('\n'));
+        let v: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(v["type"], "user");
+        assert_eq!(v["message"]["role"], "user");
+        assert_eq!(v["message"]["content"], "ultracode do the thing");
+
+        // Non-ultracode efforts (and absent effort) must not be prefixed.
+        for eff in [Some("xhigh"), Some("max"), Some("high"), None] {
+            let l = build_user_envelope_line("do the thing", eff);
+            let parsed: serde_json::Value = serde_json::from_str(l.trim_end()).unwrap();
+            assert_eq!(parsed["message"]["content"], "do the thing");
+            assert!(!l.contains("ultracode"));
+        }
+    }
+
+    #[test]
+    fn normalize_effort_level_passes_ultracode_through() {
+        // Used by AddTabWithConfig: a caller-supplied `Some("ultracode")`
+        // on a managed Claude pane must survive normalization so it lands
+        // in both meta.effort and effort_arc.
+        assert_eq!(
+            normalize_effort_level(Some("ultracode")),
+            Some("ultracode".to_string())
+        );
+        assert_eq!(
+            normalize_effort_level(Some("UltraCode")),
+            Some("ultracode".to_string())
+        );
     }
 
     #[test]
@@ -7860,14 +7959,16 @@ fn run_pane_session_streaming(
                 .and_then(|g| g.clone())
                 .or_else(|| effort.clone());
             if let Some(eff) = normalize_effort_level(current_effort.as_deref()) {
+                let claude_flag = effort_to_claude_flag(&eff).to_string();
                 tracing::info!(
                     target: "apas::effort",
                     pane_id,
-                    effort = %eff,
+                    level = %eff,
+                    claude_flag = %claude_flag,
                     "Launching streaming claude with --effort",
                 );
                 args.push("--effort".into());
-                args.push(eff);
+                args.push(claude_flag);
             }
         }
 
@@ -8437,13 +8538,15 @@ fn run_pane_session_streaming(
                             pane_id: Some(pane_id),
                         });
                     }
-                    // Wire format from happy-cli/src/claude/sdk/utils.ts:190.
-                    // Plain string content, not a content-block array.
-                    let envelope = serde_json::json!({
-                        "type": "user",
-                        "message": { "role": "user", "content": prompt },
-                    });
-                    let line = format!("{}\n", envelope);
+                    // Snapshot the live effort so an `ultracode`-configured
+                    // pane prepends the workflow keyword to each prompt.
+                    // This is the only behavioural difference between
+                    // `ultracode` and `xhigh` — the wire flag is the same.
+                    let live_effort = effort_arc
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.clone());
+                    let line = build_user_envelope_line(&prompt, live_effort.as_deref());
                     if let Err(e) = stdin.write_all(line.as_bytes()) {
                         let _ = output_tx.send(PaneOutput {
                             text: format!("[Failed to send input to agent: {}]", e),
@@ -10240,18 +10343,25 @@ async fn run_server_connection(
                                                 if is_claude {
                                                     let chat_text = match (control_tx, normalized.clone()) {
                                                         (Some(tx), Some(level)) => {
+                                                            // claude's runtime rejects the apas-only
+                                                            // `ultracode` literal — send `xhigh` on
+                                                            // the wire while keeping the chat-text
+                                                            // and persisted meta.effort as the
+                                                            // user-facing level.
+                                                            let wire_level = effort_to_claude_flag(&level).to_string();
                                                             let req = serde_json::json!({
                                                                 "type": "control_request",
                                                                 "request_id": format!("apas-effort-{}", uuid::Uuid::new_v4()),
                                                                 "request": {
                                                                     "subtype": "apply_flag_settings",
-                                                                    "settings": { "effortLevel": level },
+                                                                    "settings": { "effortLevel": wire_level },
                                                                 },
                                                             });
                                                             if tx.send(req.to_string()).is_ok() {
                                                                 tracing::info!(
                                                                     pane_id = target_pane,
-                                                                    effort = %level,
+                                                                    level = %level,
+                                                                    wire_level = %wire_level,
                                                                     "Sent apply_flag_settings(effortLevel) live to claude",
                                                                 );
                                                                 Some(format!("[Effort set to {} — applies to the next prompt]", level))

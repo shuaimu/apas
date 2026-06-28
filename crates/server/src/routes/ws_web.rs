@@ -260,6 +260,9 @@ fn normalize_start_bot_effort(raw: &str) -> Option<String> {
         return None;
     }
     let normalized = trimmed.to_ascii_lowercase();
+    // Keep in lock-step with the CLI's `normalize_effort_level` —
+    // `ultracode` is an apas-only level (xhigh wire flag + workflow
+    // prompt prefix) that must round-trip through the server unchanged.
     match normalized.as_str() {
         "default" | "auto" | "none" | "off" => None,
         "low" => Some("low".to_string()),
@@ -267,6 +270,7 @@ fn normalize_start_bot_effort(raw: &str) -> Option<String> {
         "high" => Some("high".to_string()),
         "xhigh" | "x-high" => Some("xhigh".to_string()),
         "max" => Some("max".to_string()),
+        "ultracode" => Some("ultracode".to_string()),
         _ => None,
     }
 }

@@ -248,8 +248,13 @@ function isDeepseekModel(model?: string): boolean {
 }
 
 // Listed lowest → highest. xhigh sits between high and max (Opus-only
-// extra-deep tier); max is the highest level.
+// extra-deep tier); max is the highest level. `ultracode` is a special
+// top-of-list entry — it is NOT a strict effort tier but an apas-only
+// workflow (xhigh wire flag + auto multi-agent prompt prefix), so it
+// renders at the top of the dropdown above max despite breaking the
+// ordering invariant.
 const CLAUDE_EFFORT_OPTIONS = [
+  { value: "ultracode", label: "UltraCode" },
   { value: "default", label: "Default" },
   { value: "low", label: "Low" },
   { value: "medium", label: "Medium" },
@@ -319,7 +324,8 @@ function normalizeClaudeEffortOption(raw?: string | null): ClaudeEffortOption {
     normalized === "medium" ||
     normalized === "high" ||
     normalized === "max" ||
-    normalized === "xhigh"
+    normalized === "xhigh" ||
+    normalized === "ultracode"
   ) {
     return normalized;
   }
@@ -1056,7 +1062,13 @@ export function TabbedView() {
                   title="Claude thinking effort — persisted per tab"
                 >
                   {CLAUDE_EFFORT_OPTIONS.map((option) => (
-                    <option key={option.value} value={option.value}>
+                    <option
+                      key={option.value}
+                      value={option.value}
+                      {...(option.value === "ultracode"
+                        ? { title: "xhigh + auto multi-agent workflows" }
+                        : {})}
+                    >
                       {option.label}
                     </option>
                   ))}

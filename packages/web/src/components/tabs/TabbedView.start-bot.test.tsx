@@ -164,6 +164,29 @@ describe("TabbedView Start Bot prompt modal", () => {
     expect(startBot).toHaveBeenCalledWith(PANE_ID, "Keep going", 0, "default");
   });
 
+  it("forwards the ultracode effort selection through updatePaneEffort", async () => {
+    // Locks in that the new apas-only `ultracode` option survives the
+    // dropdown -> normalizeClaudeEffortOption -> updatePaneEffort wire
+    // path and reaches the server unchanged. The CLI translates it to
+    // `--effort xhigh` plus a prompt prefix; the wire value is the
+    // user-facing string.
+    const updatePaneEffort = vi.fn();
+    seedTabbedView({
+      paneConfig: pane({ prompt: "Saved worker loop", effort: "high" }),
+    });
+    act(() => {
+      useStore.setState({ updatePaneEffort });
+    });
+
+    render(<TabbedView />);
+    const effortSelect = await screen.findByTitle(
+      "Claude thinking effort — persisted per tab",
+    );
+    fireEvent.change(effortSelect, { target: { value: "ultracode" } });
+
+    expect(updatePaneEffort).toHaveBeenCalledWith(PANE_ID, "ultracode");
+  });
+
   it("closes from Cancel or backdrop without starting the bot", async () => {
     const { startBot } = seedTabbedView({ paneConfig: pane({ prompt: "Saved worker loop" }) });
 

@@ -1552,7 +1552,9 @@ pub struct PaneConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>, // Optional model/backend override (e.g., "o3", "MiniMax-M2.7")
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>, // Optional Claude thinking effort override (e.g., "high", "max")
+    pub effort: Option<String>, // Optional Claude thinking effort override (e.g., "high", "max", "ultracode").
+    // `ultracode` is apas-only: it spawns claude with `--effort xhigh` and prepends
+    // an `ultracode ` prefix to each user prompt envelope as a workflow trigger.
     /// Absolute path to an isolated git worktree this pane should run in.
     /// When `None`, the pane runs in the project's main working_dir as before
     /// (legacy behaviour, all panes share one tree → potential conflicts).
