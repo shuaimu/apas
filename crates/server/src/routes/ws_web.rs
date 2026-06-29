@@ -896,6 +896,21 @@ async fn handle_web_input(
                 },
             )
             .await;
+
+        // Count this as a prompt for the pane. The CLI deliberately skips
+        // CliToServer::UserInput for web-originated input (it's already echoed
+        // above), so this is the only place web prompts get recorded -- without
+        // it, web chat would inflate responses/tokens but leave prompts at 0.
+        crate::routes::ws_cli::record_and_broadcast_usage(
+            state,
+            sid,
+            effective_pane_id,
+            crate::db::UsageDelta {
+                prompt_count: 1,
+                ..Default::default()
+            },
+        )
+        .await;
     } else {
         tracing::warn!("Failed to route input to CLI for session {}", sid);
         state
@@ -2715,6 +2730,26 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 },
                             )
                             .await;
+
+                        // Replay current usage stats so the Overview panel is
+                        // populated immediately on attach / hard refresh.
+                        match state.db.get_project_usage_stats(&sid.to_string()).await {
+                            Ok(stats) => {
+                                state
+                                    .sessions
+                                    .send_to_web(
+                                        &connection_id,
+                                        ServerToWeb::ProjectUsageStats {
+                                            session_id: sid,
+                                            stats,
+                                        },
+                                    )
+                                    .await;
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to load usage stats on attach: {}", e)
+                            }
+                        }
 
                         // Send current pause state for this session
                         // First check in-memory state, then fall back to database (for server restart recovery)

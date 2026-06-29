@@ -246,6 +246,34 @@ export interface TeamTodoSubtask {
 
 export type PaneType = "deadloop" | "interactive";
 
+/** Aggregated usage counters for one time window. snake_case to match the
+ *  server's ServerToWeb::ProjectUsageStats payload verbatim. */
+export interface UsageCounters {
+  prompts: number;
+  responses: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  cost_usd: number;
+}
+
+export interface PaneUsageStats {
+  pane_id: number;
+  lifetime: UsageCounters;
+  last_7d: UsageCounters;
+  today: UsageCounters;
+  last_active?: string;
+}
+
+export interface ProjectUsageStats {
+  panes: PaneUsageStats[];
+  lifetime: UsageCounters;
+  last_7d: UsageCounters;
+  today: UsageCounters;
+  last_active?: string;
+}
+
 export interface PaneConfig {
   pane_id: number;
   provider: Provider;
@@ -645,6 +673,9 @@ interface AppState {
    *  from the CLI's mtime poller. Used by ProjectGoalBar to hydrate the
    *  textbox when the user isn't editing. */
   projectGoals: Record<string, string>;
+  /** Per-session usage stats (prompts/tokens/cost) for the Overview panel,
+   *  keyed by session_id. Pushed live and replayed on attach. */
+  usageStats: Record<string, ProjectUsageStats>;
   /** Tech-Lead autonomy flags per session, mirrored from the CLI's
    *  `.apas` poller. Toggled from the Overview. */
   projectFlags: Record<string, { autoApproveTodos: boolean; autoMergePrs: boolean }>;
@@ -769,6 +800,7 @@ export const useStore = create<AppState>((set, get) => ({
   pausedPanes: [],
   paneDiffs: {},
   projectGoals: {},
+  usageStats: {},
   projectFlags: {},
   teamRecordsBySession: new Map(),
   teamRecords: [],
@@ -3073,6 +3105,17 @@ function handleServerMessage(
       if (sessionId && typeof content === "string") {
         set((state) => ({
           projectGoals: { ...state.projectGoals, [sessionId]: content },
+        }));
+      }
+      break;
+    }
+
+    case "project_usage_stats": {
+      const sessionId = data.session_id as string | undefined;
+      const stats = data.stats as ProjectUsageStats | undefined;
+      if (sessionId && stats) {
+        set((state) => ({
+          usageStats: { ...state.usageStats, [sessionId]: stats },
         }));
       }
       break;

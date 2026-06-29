@@ -1271,6 +1271,14 @@ pub enum ServerToWeb {
         content: String,
     },
 
+    /// Per-project and per-pane usage stats (prompt/token/cost counts) for
+    /// the Overview. Pushed after each turn is recorded and replayed on
+    /// attach; the server aggregates from the day-bucketed stats table.
+    ProjectUsageStats {
+        session_id: Uuid,
+        stats: ProjectUsageStats,
+    },
+
     /// Forwarded from `CliToServer::ProjectFlagsChanged`. Web mirrors
     /// the latest Tech-Lead autonomy flags per session for the Overview
     /// toggles.
@@ -1405,6 +1413,61 @@ pub struct SessionInfo {
     /// True if this session has an active CLI client connected
     #[serde(default)]
     pub is_active: bool,
+}
+
+/// Aggregated usage counters for a pane or project over one time window.
+/// All token counts come from the per-turn Claude/Codex stream `result`
+/// usage; `prompts` counts user/loop inputs and `responses` counts completed
+/// turns. Fields are snake_case so the wire keys match the web store verbatim.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UsageCounters {
+    #[serde(default)]
+    pub prompts: u64,
+    #[serde(default)]
+    pub responses: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
+    /// Real cost in USD (only Claude transport reports it; 0 otherwise).
+    #[serde(default)]
+    pub cost_usd: f64,
+}
+
+/// Per-pane usage broken down by time window (cumulative lifetime plus the
+/// rolling 7-day and today windows derived from day-bucketed rows).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PaneUsageStats {
+    pub pane_id: u32,
+    #[serde(default)]
+    pub lifetime: UsageCounters,
+    #[serde(default)]
+    pub last_7d: UsageCounters,
+    #[serde(default)]
+    pub today: UsageCounters,
+    /// Most recent activity timestamp (ISO 8601), max over the pane's buckets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_active: Option<String>,
+}
+
+/// Project-level usage: the per-pane breakdown plus the project totals
+/// (sum over all panes of every session that shares this project_id).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectUsageStats {
+    #[serde(default)]
+    pub panes: Vec<PaneUsageStats>,
+    #[serde(default)]
+    pub lifetime: UsageCounters,
+    #[serde(default)]
+    pub last_7d: UsageCounters,
+    #[serde(default)]
+    pub today: UsageCounters,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_active: Option<String>,
 }
 
 /// Information about a persisted message
@@ -2039,10 +2102,10 @@ pub fn convert_codex_to_claude(
             }
         }
         CodexStreamMessage::TurnCompleted { usage } => {
-            let (input_tokens, output_tokens) = usage
+            let (input_tokens, output_tokens, cached_input_tokens) = usage
                 .as_ref()
-                .map(|u| (u.input_tokens, u.output_tokens))
-                .unwrap_or((0, 0));
+                .map(|u| (u.input_tokens, u.output_tokens, u.cached_input_tokens))
+                .unwrap_or((0, 0, 0));
             Some(ClaudeStreamMessage::Result {
                 subtype: "success".to_string(),
                 result: format!(
@@ -2053,7 +2116,21 @@ pub fn convert_codex_to_claude(
                 duration_ms: 0,
                 session_id: session_id_str.to_string(),
                 is_error: false,
-                extra: serde_json::Value::Null,
+                // Preserve token usage in the same shape the server reads for
+                // Claude panes so Codex panes also accumulate token stats.
+                // Codex's `input_tokens` is the FULL prompt size and
+                // `cached_input_tokens` is a SUBSET of it, whereas Anthropic
+                // reports `input_tokens` disjoint from cache reads. Subtract the
+                // cached portion so input + cache_read don't double-count (the
+                // web sums all token fields for the "Total" column). Codex
+                // reports no cache-creation tokens and no cost.
+                extra: serde_json::json!({
+                    "usage": {
+                        "input_tokens": input_tokens.saturating_sub(cached_input_tokens),
+                        "output_tokens": output_tokens,
+                        "cache_read_input_tokens": cached_input_tokens,
+                    }
+                }),
             })
         }
         CodexStreamMessage::Error { message } => Some(ClaudeStreamMessage::Result {
@@ -2257,6 +2334,82 @@ mod tests {
         match parsed {
             CliToServer::SessionStart { git_remote, .. } => assert_eq!(git_remote, None),
             _ => panic!("Expected SessionStart variant"),
+        }
+    }
+
+    #[test]
+    fn test_project_usage_stats_serialization() {
+        let stats = ProjectUsageStats {
+            panes: vec![PaneUsageStats {
+                pane_id: 178,
+                lifetime: UsageCounters {
+                    prompts: 3,
+                    responses: 2,
+                    input_tokens: 100,
+                    output_tokens: 40,
+                    cache_read_tokens: 10,
+                    cache_creation_tokens: 5,
+                    cost_usd: 0.25,
+                },
+                today: UsageCounters {
+                    prompts: 1,
+                    ..Default::default()
+                },
+                last_active: Some("2026-06-29T00:00:00Z".to_string()),
+                ..Default::default()
+            }],
+            lifetime: UsageCounters {
+                input_tokens: 100,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let msg = ServerToWeb::ProjectUsageStats {
+            session_id: Uuid::new_v4(),
+            stats,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"project_usage_stats\""));
+        // snake_case wire keys must match what the web store reads.
+        assert!(json.contains("\"input_tokens\":100"));
+        assert!(json.contains("\"cache_read_tokens\":10"));
+        assert!(json.contains("\"cost_usd\":0.25"));
+        assert!(json.contains("\"last_7d\""));
+
+        let round: ServerToWeb = serde_json::from_str(&json).unwrap();
+        match round {
+            ServerToWeb::ProjectUsageStats { stats, .. } => {
+                assert_eq!(stats.panes.len(), 1);
+                assert_eq!(stats.panes[0].pane_id, 178);
+                assert_eq!(stats.panes[0].lifetime.input_tokens, 100);
+            }
+            _ => panic!("expected ProjectUsageStats"),
+        }
+    }
+
+    #[test]
+    fn test_codex_turn_completed_preserves_token_usage() {
+        let msg = CodexStreamMessage::TurnCompleted {
+            usage: Some(CodexUsage {
+                input_tokens: 1234,
+                cached_input_tokens: 56,
+                output_tokens: 78,
+            }),
+        };
+        let converted = convert_codex_to_claude(&msg, "sess").expect("maps to Result");
+        match converted {
+            ClaudeStreamMessage::Result { extra, .. } => {
+                let usage = extra.get("usage").expect("usage present in extra");
+                // input_tokens is reported disjoint from the cached subset
+                // (1234 full - 56 cached) to match Anthropic's token model.
+                assert_eq!(usage.get("input_tokens").and_then(|v| v.as_u64()), Some(1178));
+                assert_eq!(usage.get("output_tokens").and_then(|v| v.as_u64()), Some(78));
+                assert_eq!(
+                    usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()),
+                    Some(56)
+                );
+            }
+            _ => panic!("expected Result"),
         }
     }
 
