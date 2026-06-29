@@ -402,6 +402,7 @@ mod session_download_tests {
             updated_at: None,
             is_paused: false,
             project_id: Some(project_id.to_string()),
+            git_remote: None,
         }
     }
 
@@ -572,6 +573,7 @@ mod machine_access_tests {
             updated_at: None,
             is_paused: false,
             project_id: None,
+            git_remote: None,
         }
     }
 
@@ -2918,6 +2920,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     .and_then(|id| Uuid::parse_str(&id).ok()),
                                 working_dir: s.working_dir,
                                 hostname: s.hostname,
+                                git_remote: s.git_remote,
                                 status: s.status,
                                 created_at: s.created_at,
                                 is_shared: false,
@@ -2943,6 +2946,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             cli_client_id: s.cli_client_id.and_then(|id| Uuid::parse_str(&id).ok()),
                             working_dir: s.working_dir,
                             hostname: s.hostname,
+                            git_remote: s.git_remote,
                             status: s.status,
                             created_at: s.created_at,
                             is_shared: true,

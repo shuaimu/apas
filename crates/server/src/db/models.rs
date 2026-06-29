@@ -35,6 +35,11 @@ pub struct Session {
     /// one-session-per-project.
     #[sqlx(default)]
     pub project_id: Option<String>,
+    /// Canonical `host/owner/repo` of the project's git `origin` remote, sent by
+    /// the CLI in SessionStart. The web sidebar groups sessions by this. `None`
+    /// for rows that pre-date the column or projects with no remote.
+    #[sqlx(default)]
+    pub git_remote: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]

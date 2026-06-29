@@ -88,6 +88,12 @@ pub enum CliToServer {
         project_id: Option<Uuid>,
         working_dir: Option<String>,
         hostname: Option<String>,
+        /// Canonical `host/owner/repo` derived from the project's `origin` git
+        /// remote, used by the web sidebar to group projects that belong to the
+        /// same repo. `None` when there is no remote (or no git). Older CLIs
+        /// omit it, so it stays optional and back-compatible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        git_remote: Option<String>,
         #[serde(default)]
         pane_type: Option<PaneType>,
         /// Pane configurations for this session
@@ -1380,6 +1386,11 @@ pub struct SessionInfo {
     pub cli_client_id: Option<Uuid>,
     pub working_dir: Option<String>,
     pub hostname: Option<String>,
+    /// Canonical `host/owner/repo` of the project's git `origin` remote. The
+    /// web sidebar groups projects with the same value under one repo header.
+    /// `None`/absent means "no remote" (its own sidebar group).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_remote: Option<String>,
     pub status: String,
     pub created_at: Option<String>,
     /// True if this session is shared with the user (not owned)
@@ -2197,23 +2208,54 @@ mod tests {
             project_id: None,
             working_dir: Some("/home/user/project".to_string()),
             hostname: None,
+            git_remote: Some("github.com/shuaimu/apas".to_string()),
             pane_type: None,
             panes: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"session_start\""));
         assert!(json.contains(&session_id.to_string()));
+        assert!(json.contains("\"git_remote\":\"github.com/shuaimu/apas\""));
 
         let deserialized: CliToServer = serde_json::from_str(&json).unwrap();
         match deserialized {
             CliToServer::SessionStart {
                 session_id: sid,
                 working_dir,
+                git_remote,
                 ..
             } => {
                 assert_eq!(sid, session_id);
                 assert_eq!(working_dir, Some("/home/user/project".to_string()));
+                assert_eq!(git_remote, Some("github.com/shuaimu/apas".to_string()));
             }
+            _ => panic!("Expected SessionStart variant"),
+        }
+    }
+
+    #[test]
+    fn test_session_start_git_remote_backcompat_and_skip() {
+        // None must be omitted from the wire (skip_serializing_if).
+        let session_id = Uuid::new_v4();
+        let msg = CliToServer::SessionStart {
+            session_id,
+            project_id: None,
+            working_dir: None,
+            hostname: None,
+            git_remote: None,
+            pane_type: None,
+            panes: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("git_remote"));
+
+        // Legacy CLIs omit git_remote entirely — must still parse to None.
+        let legacy = format!(
+            r#"{{"type":"session_start","session_id":"{session_id}","working_dir":"/p","hostname":null}}"#
+        );
+        let parsed: CliToServer = serde_json::from_str(&legacy).unwrap();
+        match parsed {
+            CliToServer::SessionStart { git_remote, .. } => assert_eq!(git_remote, None),
             _ => panic!("Expected SessionStart variant"),
         }
     }

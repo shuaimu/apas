@@ -387,6 +387,69 @@ fn run_git_cd(cwd: &str, args: &[&str]) -> Result<String> {
     run_git_path(Path::new(cwd), args)
 }
 
+/// Canonical `host/owner/repo` grouping key for a project's `origin` remote,
+/// used by the web sidebar to group projects that belong to the same repo.
+///
+/// Returns `None` when `working_dir` is not a git repo, has no `origin`
+/// remote, or `git` is unavailable — all of which map to the sidebar's
+/// "(no remote)" group rather than an error.
+pub fn normalized_git_remote(working_dir: &Path) -> Option<String> {
+    let raw = run_git_path(working_dir, &["remote", "get-url", "origin"]).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(normalize_remote_url(trimmed))
+}
+
+/// Pure canonicalization of a git remote URL into a lowercase `host/owner/repo`
+/// key. The three common shapes for the same repo collapse to one string:
+///   `git@github.com:Owner/Repo.git`     -> `github.com/owner/repo`
+///   `https://github.com/owner/repo.git` -> `github.com/owner/repo`
+///   `ssh://git@github.com/owner/repo`   -> `github.com/owner/repo`
+fn normalize_remote_url(raw: &str) -> String {
+    // Trim trailing slashes, strip a single `.git`, then trim slashes again so
+    // `repo`, `repo/`, `repo.git`, and `repo.git/` all collapse to one key.
+    let s = raw.trim().trim_end_matches('/');
+    let s = s.strip_suffix(".git").unwrap_or(s).trim_end_matches('/');
+
+    let (host, path) = if let Some(idx) = s.find("://") {
+        // scheme://[user@]authority[:port]/owner/repo...
+        let rest = &s[idx + 3..];
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+        // An IPv6 literal authority is `[addr]:port`; the address itself
+        // contains colons, so pull it out of the brackets before the port split.
+        let host = if let Some(rest) = authority.strip_prefix('[') {
+            rest.split_once(']').map_or(authority, |(addr, _)| addr)
+        } else {
+            authority.split_once(':').map_or(authority, |(h, _)| h)
+        };
+        (host.to_string(), path.to_string())
+    } else if let Some((before, after)) = s.split_once(':') {
+        // scp-like `[user@]host:owner/repo` — only when the host part has no `/`.
+        if before.contains('/') {
+            (String::new(), s.to_string())
+        } else {
+            let host = before.rsplit_once('@').map_or(before, |(_, h)| h);
+            (host.to_string(), after.to_string())
+        }
+    } else {
+        // Bare `owner/repo`, a local path, or anything unparseable.
+        (String::new(), s.to_string())
+    };
+
+    let mut combined = if host.is_empty() {
+        path
+    } else {
+        format!("{host}/{path}")
+    };
+    while combined.contains("//") {
+        combined = combined.replace("//", "/");
+    }
+    combined.trim_matches('/').to_lowercase()
+}
+
 /// Resolve the current branch in a worktree. Returns None for detached HEAD.
 fn current_branch_in(worktree: &str) -> Option<String> {
     let out = run_git_cd(worktree, &["branch", "--show-current"]).ok()?;
@@ -481,6 +544,98 @@ pub fn cleanup_on_close(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn normalize_remote_url_canonicalizes_common_forms() {
+        // All three shapes for the same repo collapse to one key.
+        assert_eq!(
+            normalize_remote_url("git@github.com:Owner/Repo.git"),
+            "github.com/owner/repo"
+        );
+        assert_eq!(
+            normalize_remote_url("https://github.com/owner/repo.git"),
+            "github.com/owner/repo"
+        );
+        assert_eq!(
+            normalize_remote_url("ssh://git@github.com/owner/repo"),
+            "github.com/owner/repo"
+        );
+        // Trailing slash, case-folding, and ports.
+        assert_eq!(
+            normalize_remote_url("https://github.com/Owner/Repo/"),
+            "github.com/owner/repo"
+        );
+        assert_eq!(
+            normalize_remote_url("ssh://git@github.com:22/owner/repo.git"),
+            "github.com/owner/repo"
+        );
+        // Multi-segment paths (self-hosted GitLab groups) keep their slashes.
+        assert_eq!(
+            normalize_remote_url("git@gitlab.example.com:team/sub/proj.git"),
+            "gitlab.example.com/team/sub/proj"
+        );
+        // A trailing slash AFTER `.git` must still strip the `.git` so the repo
+        // collapses with its slash-less form.
+        assert_eq!(
+            normalize_remote_url("https://github.com/owner/repo.git/"),
+            "github.com/owner/repo"
+        );
+        assert_eq!(
+            normalize_remote_url("git@github.com:owner/repo.git/"),
+            "github.com/owner/repo"
+        );
+        // IPv6-literal hosts: the bracketed address is the host, not `[`, and
+        // distinct addresses stay in distinct groups.
+        assert_eq!(
+            normalize_remote_url("ssh://git@[::1]:22/owner/repo.git"),
+            "::1/owner/repo"
+        );
+        assert_ne!(
+            normalize_remote_url("ssh://git@[::1]:22/owner/repo"),
+            normalize_remote_url("ssh://git@[::2]:22/owner/repo")
+        );
+    }
+
+    #[test]
+    fn normalized_git_remote_is_none_without_origin() {
+        // A fresh git repo with no `origin` remote -> None (the "(no remote)" group).
+        let tmp = TempDir::new().expect("tmpdir");
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(args)
+                .status()
+                .expect("git");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        assert_eq!(normalized_git_remote(tmp.path()), None);
+    }
+
+    #[test]
+    fn normalized_git_remote_reads_origin() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(args)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {} failed", args.join(" "));
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&[
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:Shuaimu/APAS.git",
+        ]);
+        assert_eq!(
+            normalized_git_remote(tmp.path()).as_deref(),
+            Some("github.com/shuaimu/apas")
+        );
+    }
 
     /// Set up `<tmp>/proj` as a git repo with one commit on `main`, then run
     /// `apas worktree add 2 -b apas-pane-2` style git plumbing to materialize

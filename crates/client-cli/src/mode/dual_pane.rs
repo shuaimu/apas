@@ -9488,6 +9488,10 @@ async fn run_server_connection(
     let max_reconnect_delay = std::time::Duration::from_secs(60);
     let mut connection_count = 0u32;
 
+    // Resolve the project's git remote once: it can't change between
+    // reconnects, so we avoid re-shelling out to git on every loop iteration.
+    let git_remote = crate::worktree::normalized_git_remote(std::path::Path::new(working_dir));
+
     while !shutdown.load(Ordering::SeqCst) {
         let ws_url = format!("{}/ws/cli", server_url);
 
@@ -9622,6 +9626,7 @@ async fn run_server_connection(
                     project_id: Some(session_id),
                     working_dir: Some(working_dir.to_string()),
                     hostname,
+                    git_remote: git_remote.clone(),
                     pane_type: None,
                     panes: Some(pane_list.clone()),
                 };

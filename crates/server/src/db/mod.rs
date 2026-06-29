@@ -104,6 +104,12 @@ impl Database {
         let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN project_id TEXT")
             .execute(&self.pool)
             .await;
+        // Canonical `host/owner/repo` of the project's git remote, used by the
+        // web sidebar to group same-repo projects. No backfill: unlike
+        // project_id, a NULL git_remote is the intended "(no remote)" value.
+        let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN git_remote TEXT")
+            .execute(&self.pool)
+            .await;
         // Backfill project_id for rows that pre-date the column. Until now,
         // each .apas held a single id used as both project and session id, so
         // the safest backfill is project_id = id — old rows keep their
@@ -284,14 +290,15 @@ impl Database {
             .unwrap_or_else(|| session.id.clone());
         sqlx::query(
             r#"
-            INSERT INTO sessions (id, user_id, cli_client_id, working_dir, hostname, status, project_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO sessions (id, user_id, cli_client_id, working_dir, hostname, status, project_id, git_remote)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 cli_client_id = excluded.cli_client_id,
                 working_dir = excluded.working_dir,
                 hostname = excluded.hostname,
                 status = excluded.status,
                 project_id = excluded.project_id,
+                git_remote = excluded.git_remote,
                 updated_at = CURRENT_TIMESTAMP,
                 user_id = CASE
                     WHEN (SELECT email FROM users WHERE id = sessions.user_id) LIKE 'dev-%@local'
@@ -307,6 +314,7 @@ impl Database {
         .bind(&session.hostname)
         .bind(&session.status)
         .bind(&project_id)
+        .bind(&session.git_remote)
         .execute(&self.pool)
         .await?;
 
@@ -379,7 +387,7 @@ impl Database {
 
     pub async fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let session = sqlx::query_as::<_, Session>(
-            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at, COALESCE(is_paused, 0) as is_paused, COALESCE(project_id, id) as project_id FROM sessions WHERE id = ?",
+            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at, COALESCE(is_paused, 0) as is_paused, COALESCE(project_id, id) as project_id, git_remote FROM sessions WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -418,7 +426,7 @@ impl Database {
 
     pub async fn get_all_sessions(&self) -> Result<Vec<Session>> {
         let sessions = sqlx::query_as::<_, Session>(
-            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at, COALESCE(is_paused, 0) as is_paused, COALESCE(project_id, id) as project_id FROM sessions ORDER BY created_at DESC LIMIT 50",
+            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at, COALESCE(is_paused, 0) as is_paused, COALESCE(project_id, id) as project_id, git_remote FROM sessions ORDER BY created_at DESC LIMIT 50",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -427,7 +435,7 @@ impl Database {
 
     pub async fn get_sessions_for_user(&self, user_id: &str) -> Result<Vec<Session>> {
         let sessions = sqlx::query_as::<_, Session>(
-            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at, COALESCE(is_paused, 0) as is_paused, COALESCE(project_id, id) as project_id FROM sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
+            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at, COALESCE(is_paused, 0) as is_paused, COALESCE(project_id, id) as project_id, git_remote FROM sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
         )
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -541,7 +549,7 @@ impl Database {
         // Returns sessions shared with this user along with the owner's email and share role
         let rows = sqlx::query(
             r#"
-            SELECT s.id, s.user_id, s.cli_client_id, s.working_dir, s.hostname, s.status, s.created_at, s.updated_at, COALESCE(s.is_paused, 0) as is_paused, COALESCE(s.project_id, s.id) as project_id, u.email, COALESCE(ss.role, 'user') AS role
+            SELECT s.id, s.user_id, s.cli_client_id, s.working_dir, s.hostname, s.status, s.created_at, s.updated_at, COALESCE(s.is_paused, 0) as is_paused, COALESCE(s.project_id, s.id) as project_id, s.git_remote, u.email, COALESCE(ss.role, 'user') AS role
             FROM sessions s
             INNER JOIN session_shares ss ON s.id = ss.session_id
             INNER JOIN users u ON s.user_id = u.id
@@ -568,6 +576,7 @@ impl Database {
                 updated_at: row.get("updated_at"),
                 is_paused: row.get::<i32, _>("is_paused") != 0,
                 project_id: row.get("project_id"),
+                git_remote: row.get("git_remote"),
             };
             let email: String = row.get("email");
             let role: String = row.get("role");

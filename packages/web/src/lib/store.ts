@@ -44,6 +44,10 @@ export interface SessionInfo {
   cliClientId?: string;
   workingDir?: string;
   hostname?: string;
+  /** Canonical `host/owner/repo` of the project's git `origin` remote. The
+   * sidebar groups projects that share this value under one repo header.
+   * Undefined means "no remote" (its own sidebar group). */
+  gitRemote?: string;
   status: string;
   createdAt?: string;
   isShared?: boolean;
@@ -3225,6 +3229,7 @@ function handleServerMessage(
         cliClientId: s.cli_client_id as string | undefined,
         workingDir: s.working_dir as string | undefined,
         hostname: s.hostname as string | undefined,
+        gitRemote: s.git_remote as string | undefined,
         status: s.status as string,
         createdAt: s.created_at as string | undefined,
         isShared: s.is_shared as boolean | undefined,

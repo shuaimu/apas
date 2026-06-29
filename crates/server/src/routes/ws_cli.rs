@@ -266,6 +266,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 project_id,
                                 working_dir,
                                 hostname,
+                                git_remote,
                                 pane_type: _,
                                 panes,
                             }) => {
@@ -395,6 +396,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     updated_at: None,
                                     is_paused: false,
                                     project_id: Some(project_id.to_string()),
+                                    git_remote,
                                 };
                                 if let Err(e) = state.db.create_session(&session).await {
                                     tracing::error!("Failed to persist session to database: {}", e);
