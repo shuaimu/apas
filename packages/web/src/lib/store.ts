@@ -48,6 +48,9 @@ export interface SessionInfo {
    * sidebar groups projects that share this value under one repo header.
    * Undefined means "no remote" (its own sidebar group). */
   gitRemote?: string;
+  /** Raw cloneable `origin` URL, used to prefill the clone URL when creating
+   * a new instance under this repo. */
+  gitRemoteUrl?: string;
   status: string;
   createdAt?: string;
   isShared?: boolean;
@@ -591,6 +594,14 @@ interface AppState {
   listMachines: () => void;
   startMachineProjectCli: (machineId: string, projectId: string) => void;
   stopMachineProjectCli: (machineId: string, projectId: string) => void;
+  createProjectInstance: (
+    machineId: string,
+    gitRemote: string,
+    instanceName: string,
+    branch: string,
+    cloneUrl?: string,
+    basePath?: string,
+  ) => boolean;
   setMachineMiniMaxConfig: (
     machineId: string,
     apiKey?: string,
@@ -1287,6 +1298,36 @@ export const useStore = create<AppState>((set, get) => ({
       machine_id: machineId,
       project_id: projectId,
     }));
+  },
+
+  createProjectInstance: (
+    machineId: string,
+    gitRemote: string,
+    instanceName: string,
+    branch: string,
+    cloneUrl?: string,
+    basePath?: string,
+  ): boolean => {
+    const { ws, showToast } = get();
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      showToast("Not connected — try again in a moment", "error");
+      return false;
+    }
+    const requestId =
+      typeof crypto !== "undefined" && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `req-${Date.now()}`;
+    ws.send(JSON.stringify({
+      type: "create_project_instance",
+      machine_id: machineId,
+      git_remote: gitRemote,
+      instance_name: instanceName,
+      branch,
+      clone_url: cloneUrl || undefined,
+      base_path: basePath || undefined,
+      request_id: requestId,
+    }));
+    return true;
   },
 
   setMachineMiniMaxConfig: (
@@ -3179,6 +3220,19 @@ function handleServerMessage(
       break;
     }
 
+    case "project_instance_created": {
+      const error = data.error as string | undefined;
+      const { showToast } = get();
+      if (error) {
+        showToast(`New instance failed: ${error}`, "error");
+      } else {
+        showToast("New instance created and starting…", "success");
+        // Refresh the machine list so the new running project appears.
+        get().listMachines();
+      }
+      break;
+    }
+
     case "pane_status": {
       // The web is multi-attached to several sessions (background tabs stay
       // live). Statuses from non-foreground sessions would otherwise
@@ -3273,6 +3327,7 @@ function handleServerMessage(
         workingDir: s.working_dir as string | undefined,
         hostname: s.hostname as string | undefined,
         gitRemote: s.git_remote as string | undefined,
+        gitRemoteUrl: s.git_remote_url as string | undefined,
         status: s.status as string,
         createdAt: s.created_at as string | undefined,
         isShared: s.is_shared as boolean | undefined,

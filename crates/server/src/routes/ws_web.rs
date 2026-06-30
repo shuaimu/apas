@@ -403,6 +403,7 @@ mod session_download_tests {
             is_paused: false,
             project_id: Some(project_id.to_string()),
             git_remote: None,
+            git_remote_url: None,
         }
     }
 
@@ -574,6 +575,7 @@ mod machine_access_tests {
             is_paused: false,
             project_id: None,
             git_remote: None,
+            git_remote_url: None,
         }
     }
 
@@ -1714,6 +1716,79 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     if !state
                         .sessions
                         .send_to_daemon(&machine_id, ServerToDaemon::StopProjectCli { project_id })
+                        .await
+                    {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Daemon is offline".to_string(),
+                                },
+                            )
+                            .await;
+                    }
+                }
+                Ok(WebToServer::CreateProjectInstance {
+                    machine_id,
+                    git_remote,
+                    instance_name,
+                    branch,
+                    clone_url,
+                    base_path,
+                    request_id,
+                }) => {
+                    let Some(uid) = user_id else {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Not authenticated".to_string(),
+                                },
+                            )
+                            .await;
+                        continue;
+                    };
+
+                    // A brand-new instance has no project_id yet, so authorize by
+                    // machine OWNERSHIP only (the daemon must belong to this user).
+                    let owns_machine = state
+                        .sessions
+                        .get_machines_for_user(&uid)
+                        .into_iter()
+                        .any(|m| m.machine.machine_id == machine_id);
+                    if !owns_machine {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Machine not found".to_string(),
+                                },
+                            )
+                            .await;
+                        continue;
+                    }
+
+                    tracing::info!(
+                        "CreateProjectInstance: user={} machine={} repo={} name={}",
+                        uid, machine_id, git_remote, instance_name
+                    );
+
+                    if !state
+                        .sessions
+                        .send_to_daemon(
+                            &machine_id,
+                            ServerToDaemon::CreateProjectInstance {
+                                git_remote,
+                                instance_name,
+                                branch,
+                                clone_url,
+                                base_path,
+                                request_id,
+                            },
+                        )
                         .await
                     {
                         state
@@ -2956,6 +3031,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 working_dir: s.working_dir,
                                 hostname: s.hostname,
                                 git_remote: s.git_remote,
+                                git_remote_url: s.git_remote_url,
                                 status: s.status,
                                 created_at: s.created_at,
                                 is_shared: false,
@@ -2982,6 +3058,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             working_dir: s.working_dir,
                             hostname: s.hostname,
                             git_remote: s.git_remote,
+                            git_remote_url: s.git_remote_url,
                             status: s.status,
                             created_at: s.created_at,
                             is_shared: true,

@@ -94,6 +94,11 @@ pub enum CliToServer {
         /// omit it, so it stays optional and back-compatible.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         git_remote: Option<String>,
+        /// Raw `origin` remote URL (scheme/user/auth preserved), used as the
+        /// clone URL when creating a new instance of this repo on any machine.
+        /// `git_remote` is the lossy grouping key; this is the lossless URL.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        git_remote_url: Option<String>,
         #[serde(default)]
         pane_type: Option<PaneType>,
         /// Pane configurations for this session
@@ -584,6 +589,20 @@ pub enum DaemonToServer {
 
     /// Update machine metadata (for config changes without reconnect)
     MachineInfoUpdate { machine: MachineInfo },
+
+    /// Result of a `CreateProjectInstance` request. Carries the new project_id
+    /// + path on success, or an `error` on failure (clone/auth/dir collision) —
+    /// failures for a never-registered project can't be expressed via Heartbeat.
+    ProjectInstanceCreated {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 /// Messages sent from server to machine daemon
@@ -601,6 +620,22 @@ pub enum ServerToDaemon {
 
     /// Stop APAS CLI for a project on this machine
     StopProjectCli { project_id: String },
+
+    /// Clone a repo into a new instance directory, branch it, register a
+    /// `.apas`, and start it. The daemon mints the project_id (so, unlike
+    /// StartProjectCli, this carries no project_id) and resolves the dest path
+    /// + clone URL machine-side.
+    CreateProjectInstance {
+        git_remote: String,
+        instance_name: String,
+        branch: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clone_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+    },
 
     /// Request a fresh project scan/update push
     RefreshProjects,
@@ -887,6 +922,24 @@ pub enum WebToServer {
     StopMachineProjectCli {
         machine_id: Uuid,
         project_id: String,
+    },
+
+    /// Create a brand-new project instance under a repo on a chosen machine:
+    /// the daemon clones `clone_url` into `~/apas_projects/<instance_name>`
+    /// (auto-suffixed on collision), checks out a fresh `branch`, registers a
+    /// `.apas`, and starts it. `git_remote` is the canonical key (for the
+    /// daemon's sibling-URL fallback + naming); `clone_url` is the real URL.
+    CreateProjectInstance {
+        machine_id: Uuid,
+        git_remote: String,
+        instance_name: String,
+        branch: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clone_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
 
     /// Update machine-level MiniMax backend API configuration
@@ -1279,6 +1332,19 @@ pub enum ServerToWeb {
         stats: ProjectUsageStats,
     },
 
+    /// Result of a web-initiated `CreateProjectInstance`, relayed from the
+    /// daemon's ack to the requesting user's web clients as a toast. Distinct
+    /// from the generic `Error` variant (which renders in the chat log).
+    ProjectInstanceCreated {
+        machine_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
     /// Forwarded from `CliToServer::ProjectFlagsChanged`. Web mirrors
     /// the latest Tech-Lead autonomy flags per session for the Overview
     /// toggles.
@@ -1399,6 +1465,10 @@ pub struct SessionInfo {
     /// `None`/absent means "no remote" (its own sidebar group).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_remote: Option<String>,
+    /// Raw `origin` URL for this project's repo (the cloneable URL). Surfaced
+    /// so the web can prefill the clone URL when creating a new instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_remote_url: Option<String>,
     pub status: String,
     pub created_at: Option<String>,
     /// True if this session is shared with the user (not owned)
@@ -2286,11 +2356,13 @@ mod tests {
             working_dir: Some("/home/user/project".to_string()),
             hostname: None,
             git_remote: Some("github.com/shuaimu/apas".to_string()),
+            git_remote_url: Some("git@github.com:shuaimu/apas.git".to_string()),
             pane_type: None,
             panes: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"session_start\""));
+        assert!(json.contains("\"git_remote_url\":\"git@github.com:shuaimu/apas.git\""));
         assert!(json.contains(&session_id.to_string()));
         assert!(json.contains("\"git_remote\":\"github.com/shuaimu/apas\""));
 
@@ -2320,6 +2392,7 @@ mod tests {
             working_dir: None,
             hostname: None,
             git_remote: None,
+            git_remote_url: None,
             pane_type: None,
             panes: None,
         };

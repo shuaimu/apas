@@ -40,6 +40,10 @@ pub struct Session {
     /// for rows that pre-date the column or projects with no remote.
     #[sqlx(default)]
     pub git_remote: Option<String>,
+    /// Raw `origin` URL (cloneable) for this project's repo, sent by the CLI.
+    /// Surfaced to the web to prefill the clone URL when creating an instance.
+    #[sqlx(default)]
+    pub git_remote_url: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]

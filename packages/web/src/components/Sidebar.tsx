@@ -1,7 +1,8 @@
 "use client";
 
 import { useStore } from "@/lib/store";
-import { FolderOpen, RefreshCw, Share2, Users, X, Crown, Trash2, ChevronLeft, ChevronDown, ChevronRight, BarChart3, Server } from "lucide-react";
+import { FolderOpen, RefreshCw, Share2, Users, X, Crown, Trash2, ChevronLeft, ChevronDown, ChevronRight, BarChart3, Server, Plus } from "lucide-react";
+import { CreateInstanceModal } from "./CreateInstanceModal";
 import Link from "next/link";
 import { useMemo, useState, useEffect } from "react";
 import { createPortal } from "react-dom";
@@ -140,6 +141,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
       workingDir: string;
       hostname?: string;
       gitRemote?: string;
+      gitRemoteUrl?: string;
       isActive: boolean;
       createdAt?: string;
       isShared?: boolean;
@@ -171,6 +173,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
           workingDir,
           hostname: session.hostname,
           gitRemote: session.gitRemote,
+          gitRemoteUrl: session.gitRemoteUrl,
           isActive: session.isActive || false,
           createdAt: session.createdAt,
           isShared: session.isShared,
@@ -225,7 +228,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
   const repoGroups = useMemo(() => {
     const byKey = new Map<
       string,
-      { key: string; label: string; isNoRemote: boolean; projects: typeof projects }
+      { key: string; label: string; isNoRemote: boolean; cloneUrl?: string; projects: typeof projects }
     >();
     for (const project of projects) {
       const key = project.gitRemote ?? NO_REMOTE_KEY;
@@ -238,6 +241,10 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
           projects: [],
         };
         byKey.set(key, group);
+      }
+      // Remember a representative clone URL from any project in the group.
+      if (!group.cloneUrl && project.gitRemoteUrl) {
+        group.cloneUrl = project.gitRemoteUrl;
       }
       group.projects.push(project);
     }
@@ -278,6 +285,11 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
       return next;
     });
   };
+
+  // Repo whose "New instance" modal is open (null = closed).
+  const [newInstanceRepo, setNewInstanceRepo] = useState<
+    { gitRemote: string; cloneUrl?: string } | null
+  >(null);
 
   const handleRefresh = () => {
     if (isRefreshing) return;
@@ -544,21 +556,34 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
               const collapsed = collapsedGroups.has(group.key);
               return (
                 <div key={group.key}>
-                  <button
-                    onClick={() => toggleGroup(group.key)}
-                    className="w-full flex items-center gap-1 px-1 py-1 text-xs font-semibold text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 select-none"
-                    title={group.isNoRemote ? "Projects with no git remote" : group.key}
-                  >
-                    {collapsed ? (
-                      <ChevronRight className="w-3.5 h-3.5 flex-shrink-0" />
-                    ) : (
-                      <ChevronDown className="w-3.5 h-3.5 flex-shrink-0" />
+                  <div className="flex items-center gap-1 px-1 py-1">
+                    <button
+                      onClick={() => toggleGroup(group.key)}
+                      className="flex flex-1 min-w-0 items-center gap-1 text-xs font-semibold text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 select-none"
+                      title={group.isNoRemote ? "Projects with no git remote" : group.key}
+                    >
+                      {collapsed ? (
+                        <ChevronRight className="w-3.5 h-3.5 flex-shrink-0" />
+                      ) : (
+                        <ChevronDown className="w-3.5 h-3.5 flex-shrink-0" />
+                      )}
+                      <span className="truncate flex-1 text-left">{group.label}</span>
+                      <span className="font-normal text-gray-400 dark:text-gray-500">
+                        {group.projects.length}
+                      </span>
+                    </button>
+                    {!group.isNoRemote && (
+                      <button
+                        onClick={() =>
+                          setNewInstanceRepo({ gitRemote: group.key, cloneUrl: group.cloneUrl })
+                        }
+                        className="flex-shrink-0 rounded p-0.5 text-gray-400 hover:bg-gray-200 hover:text-emerald-600 dark:hover:bg-gray-700"
+                        title={`Create a new instance under ${group.label}`}
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                      </button>
                     )}
-                    <span className="truncate flex-1 text-left">{group.label}</span>
-                    <span className="font-normal text-gray-400 dark:text-gray-500">
-                      {group.projects.length}
-                    </span>
-                  </button>
+                  </div>
                   {!collapsed && (
                     <div className="mt-1 ml-2 pl-1.5 border-l border-gray-200 dark:border-gray-800 space-y-1">
                       {group.projects.map((project) => (
@@ -852,6 +877,16 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
           </div>
         </div>,
         document.body
+      )}
+
+      {newInstanceRepo && (
+        <CreateInstanceModal
+          key={newInstanceRepo.gitRemote}
+          open
+          onClose={() => setNewInstanceRepo(null)}
+          gitRemote={newInstanceRepo.gitRemote}
+          cloneUrl={newInstanceRepo.cloneUrl}
+        />
       )}
     </div>
   );

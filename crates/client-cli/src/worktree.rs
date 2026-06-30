@@ -450,6 +450,135 @@ fn normalize_remote_url(raw: &str) -> String {
     combined.trim_matches('/').to_lowercase()
 }
 
+/// The raw `origin` URL (scheme/user/auth preserved) for `working_dir`, or None
+/// when there's no origin / no git. Unlike `normalized_git_remote` (a lossy
+/// grouping key) this keeps the exact URL so the repo can be cloned elsewhere.
+pub fn raw_git_remote(working_dir: &Path) -> Option<String> {
+    let raw = run_git_path(working_dir, &["remote", "get-url", "origin"]).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Clone `url` into `dest` (which must not already exist). Runs
+/// non-interactively (`GIT_TERMINAL_PROMPT=0`) so a missing credential fails
+/// fast with an error instead of hanging on a terminal prompt.
+pub fn clone_repo(url: &str, dest: &Path) -> Result<()> {
+    let out = Command::new("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg("clone")
+        .arg(url)
+        .arg(dest)
+        .output()
+        .with_context(|| format!("running `git clone` into {}", dest.display()))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "git clone failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Create and switch to a fresh branch in the freshly-cloned repo at `dest`,
+/// auto-suffixing (`-2`, `-3`…) when the desired name already exists (e.g. the
+/// user picked the repo's default branch). Returns the branch actually created.
+pub fn checkout_unique_branch(dest: &Path, desired: &str) -> Result<String> {
+    if run_git_path(dest, &["checkout", "-b", desired]).is_ok() {
+        return Ok(desired.to_string());
+    }
+    // Bounded retry: a sane collision needs only a few suffixes, and an
+    // intrinsically-invalid ref would otherwise spawn git hundreds of times.
+    for n in 2..30 {
+        let candidate = format!("{desired}-{n}");
+        if run_git_path(dest, &["checkout", "-b", &candidate]).is_ok() {
+            return Ok(candidate);
+        }
+    }
+    Err(anyhow!("could not create a unique branch from '{desired}'"))
+}
+
+/// Return `desired` if free, else the first `<name>-N` (N≥2) that doesn't
+/// exist — the directory auto-suffix used when an instance name collides.
+pub fn unique_dir(desired: &Path) -> PathBuf {
+    if !desired.exists() {
+        return desired.to_path_buf();
+    }
+    let parent = desired.parent().unwrap_or_else(|| Path::new("."));
+    let stem = desired
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("instance");
+    for n in 2..10_000 {
+        let candidate = parent.join(format!("{stem}-{n}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    desired.to_path_buf()
+}
+
+/// Sanitize a user-supplied instance name into a safe single path component:
+/// alphanumerics plus `-_.`, with any other char folded to `-`, and leading/
+/// trailing `-`/`.` stripped so `..`/`.` can't escape the projects root.
+pub fn sanitize_instance_name(name: &str) -> String {
+    let cleaned: String = name
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches(|c| c == '-' || c == '.').to_string();
+    if cleaned.is_empty() {
+        "instance".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Sanitize a user-supplied branch name into a valid-ish git ref: allow
+/// `-_/.` plus alphanumerics, collapse `..`, and strip leading/trailing
+/// `-`/`/`/`.` (which git refs disallow).
+pub fn sanitize_branch_name(name: &str) -> String {
+    let cleaned: String = name
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let mut cleaned = cleaned.replace("..", "-");
+    // Collapse `//` (an empty ref component) and `/.` (a component can't start
+    // with `.`); git rejects both, and `checkout -b` would then fail for every
+    // suffix candidate.
+    while cleaned.contains("//") {
+        cleaned = cleaned.replace("//", "/");
+    }
+    while cleaned.contains("/.") {
+        cleaned = cleaned.replace("/.", "/");
+    }
+    let cleaned = cleaned
+        .trim_matches(|c| c == '-' || c == '/' || c == '.')
+        .to_string();
+    if cleaned.is_empty() {
+        "apas-instance".to_string()
+    } else {
+        cleaned
+    }
+}
+
 /// Resolve the current branch in a worktree. Returns None for detached HEAD.
 fn current_branch_in(worktree: &str) -> Option<String> {
     let out = run_git_cd(worktree, &["branch", "--show-current"]).ok()?;
@@ -594,6 +723,37 @@ mod tests {
             normalize_remote_url("ssh://git@[::1]:22/owner/repo"),
             normalize_remote_url("ssh://git@[::2]:22/owner/repo")
         );
+    }
+
+    #[test]
+    fn sanitize_instance_name_strips_traversal_and_separators() {
+        assert_eq!(sanitize_instance_name("my repo!"), "my-repo");
+        assert_eq!(sanitize_instance_name("../etc"), "etc");
+        assert_eq!(sanitize_instance_name(".."), "instance");
+        assert_eq!(sanitize_instance_name("  ok-1.2  "), "ok-1.2");
+        assert_eq!(sanitize_instance_name(""), "instance");
+    }
+
+    #[test]
+    fn sanitize_branch_name_makes_valid_ref() {
+        assert_eq!(sanitize_branch_name("feature/foo bar"), "feature/foo-bar");
+        assert_eq!(sanitize_branch_name("/leading/"), "leading");
+        assert_eq!(sanitize_branch_name("a..b"), "a-b");
+        assert_eq!(sanitize_branch_name(""), "apas-instance");
+        // `//` and `/.` collapse to valid single separators (git rejects them).
+        assert_eq!(sanitize_branch_name("feature//foo"), "feature/foo");
+        assert_eq!(sanitize_branch_name("feature/.hidden"), "feature/hidden");
+    }
+
+    #[test]
+    fn unique_dir_suffixes_on_collision() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let want = tmp.path().join("proj");
+        // Free name returns unchanged.
+        assert_eq!(unique_dir(&want), want);
+        // Occupied name auto-suffixes.
+        std::fs::create_dir(&want).unwrap();
+        assert_eq!(unique_dir(&want), tmp.path().join("proj-2"));
     }
 
     #[test]
