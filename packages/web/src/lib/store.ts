@@ -542,6 +542,14 @@ interface AppState {
   /// Removed when the matching `user_input` arrives.
   pendingSends: PendingSend[];
 
+  /// Persisted queue of AskUserQuestion answers waiting for claude to
+  /// actually process them. Replayed on every WS authenticate so a
+  /// dropped submission (silently-stale WS, server rejected forward,
+  /// CLI wasn't attached) eventually lands. Removed when the answered
+  /// tool_result arrives with the {answers} payload in its
+  /// tool_use_result.
+  pendingAnswers: PendingAnswer[];
+
   /** Per-session snapshot of suggested-workers.md. Pushed by the CLI on
    *  FetchSuggestedWorkers, after Dismiss mutations, and via the CLI's
    *  mtime-gated poller. Keyed by session_id so switching projects shows
@@ -816,7 +824,7 @@ export const useStore = create<AppState>((set, get) => ({
   teamRecordsBySession: new Map(),
   teamRecords: [],
   planReviewPending: [],
-  answeredQuestions: new Map(),
+  answeredQuestions: loadAnsweredQuestions(),
   toasts: [],
   sessionCache: new Map(),
   unreadSessions: new Set(),
@@ -825,6 +833,7 @@ export const useStore = create<AppState>((set, get) => ({
   paneLoadingInitial: new Set(),
   reconnectWatermarks: new Map(),
   pendingSends: loadPendingSends(),
+  pendingAnswers: loadPendingAnswers(),
   teamTodoStates: new Map(),
   suggestedWorkersBySession: new Map(),
   loadingMorePane: null,
@@ -1545,23 +1554,48 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   answerQuestion: (toolUseId: string, answers: Record<string, string>) => {
-    const { ws, showToast } = get();
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
-        type: "answer_question",
-        tool_use_id: toolUseId,
-        answers,
-      }));
+    const { ws, sessionId, showToast } = get();
+    const canSend = ws && ws.readyState === WebSocket.OPEN;
+    if (canSend) {
+      ws.send(
+        JSON.stringify({
+          type: "answer_question",
+          tool_use_id: toolUseId,
+          answers,
+        }),
+      );
       showToast("Answer sent to Claude", "success");
     } else {
-      showToast("Not connected — answer not sent", "error");
+      showToast("Not connected — answer queued for retry", "info");
     }
-    // Mark the question locally as answered so the card flips to the
-    // submitted state immediately, even before the tool_result arrives.
+    // Enqueue into the pending-answer queue AND persist immediately.
+    // Reasons this needs to live in localStorage, not just in-memory:
+    // (1) A page refresh right after submit was previously losing the
+    //     submitted state — the card would ask again.
+    // (2) A ws.send() on a "silently stale" socket (readyState OPEN but
+    //     TCP dead) drops the frame. The pending-answer queue is
+    //     flushed on every reconnect so the answer eventually lands.
+    // Confirmed root cause on mako Claude-6: server messages.jsonl AND
+    // claude's on-disk session jsonl both show a 16-min gap between
+    // the AskUserQuestion tool_use and its cancel tool_result — the
+    // answer never reached claude's stdin.
     set((state) => {
-      const next = new Map(state.answeredQuestions);
-      next.set(toolUseId, answers);
-      return { answeredQuestions: next };
+      const alreadyAnswered = new Map(state.answeredQuestions);
+      alreadyAnswered.set(toolUseId, answers);
+      saveAnsweredQuestions(alreadyAnswered);
+      const filtered = state.pendingAnswers.filter((p) => p.toolUseId !== toolUseId);
+      const next: PendingAnswer[] = [
+        ...filtered,
+        {
+          toolUseId,
+          answers,
+          sessionId: sessionId ?? "",
+          createdAt: Date.now(),
+          attempts: canSend ? 1 : 0,
+        },
+      ];
+      savePendingAnswers(next);
+      return { answeredQuestions: alreadyAnswered, pendingAnswers: next };
     });
   },
 
@@ -2635,6 +2669,78 @@ function addMessageWithPaneRouting(
 /// this tab — without it, the live watermark would skip past the
 /// disconnect-window messages still sitting on disk.
 const PENDING_SENDS_KEY = "apas_pending_sends";
+const PENDING_ANSWERS_KEY = "apas_pending_answers";
+const ANSWERED_QUESTIONS_KEY = "apas_answered_questions";
+
+/// One unacked AskUserQuestion answer waiting for confirmation that
+/// claude actually processed it (the answered tool_result arrives).
+/// Persisted so a page refresh doesn't drop the submission on the
+/// floor — mako Claude-6 reproduced this exact symptom (user answered,
+/// answer never reached claude, refresh → card asks again).
+export interface PendingAnswer {
+  toolUseId: string;
+  answers: Record<string, string>;
+  sessionId: string;
+  createdAt: number;
+  attempts: number;
+}
+
+function loadPendingAnswers(): PendingAnswer[] {
+  if (typeof localStorage === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(PENDING_ANSWERS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as PendingAnswer[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function savePendingAnswers(items: PendingAnswer[]) {
+  if (typeof localStorage === "undefined") return;
+  try {
+    if (items.length === 0) {
+      localStorage.removeItem(PENDING_ANSWERS_KEY);
+    } else {
+      localStorage.setItem(PENDING_ANSWERS_KEY, JSON.stringify(items));
+    }
+  } catch {
+    // best-effort
+  }
+}
+
+/// Persisted mirror of `answeredQuestions`. Restores the
+/// AskUserQuestionCard's "submitted" state after a refresh so the
+/// user isn't asked to re-answer a question they've already answered.
+/// Keyed by tool_use_id → answers.
+function loadAnsweredQuestions(): Map<string, Record<string, string>> {
+  if (typeof localStorage === "undefined") return new Map();
+  try {
+    const raw = localStorage.getItem(ANSWERED_QUESTIONS_KEY);
+    if (!raw) return new Map();
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return new Map();
+    return new Map(Object.entries(parsed as Record<string, Record<string, string>>));
+  } catch {
+    return new Map();
+  }
+}
+
+function saveAnsweredQuestions(m: Map<string, Record<string, string>>) {
+  if (typeof localStorage === "undefined") return;
+  try {
+    if (m.size === 0) {
+      localStorage.removeItem(ANSWERED_QUESTIONS_KEY);
+    } else {
+      const obj: Record<string, Record<string, string>> = {};
+      for (const [k, v] of m) obj[k] = v;
+      localStorage.setItem(ANSWERED_QUESTIONS_KEY, JSON.stringify(obj));
+    }
+  } catch {
+    // best-effort
+  }
+}
 
 function loadPendingSends(): PendingSend[] {
   if (typeof localStorage === "undefined") return [];
@@ -2699,6 +2805,46 @@ function flushPendingSends(
   }
   savePendingSends(next);
   set({ pendingSends: next });
+}
+
+/// Retransmit any unacked AskUserQuestion answers for the current
+/// session. Mirrors flushPendingSends. Called after authenticate so a
+/// dropped answer eventually lands. Duplicate-arrival risk: if the
+/// CLI got the original answer, it removed the pending_questions entry
+/// and the retry logs a warn ("no matching pending AskUserQuestion")
+/// and is dropped harmlessly.
+function flushPendingAnswers(
+  set: (partial: Partial<AppState> | ((state: AppState) => Partial<AppState>)) => void,
+  get: () => AppState,
+) {
+  const state = get();
+  const ws = state.ws;
+  const currentSid = state.sessionId;
+  if (!ws || ws.readyState !== WebSocket.OPEN || !currentSid) return;
+  const toFlush = state.pendingAnswers.filter((p) => p.sessionId === currentSid);
+  if (toFlush.length === 0) return;
+  const now = Date.now();
+  // Drop answers older than 1 hour; user has moved on. AskUserQuestion
+  // is a decision surface, not a stream of typed text, so we can be
+  // more generous than pendingSends' 10-min TTL — a laptop-closed
+  // scenario shouldn't discard a legitimate submission.
+  const next: PendingAnswer[] = state.pendingAnswers
+    .filter((p) => p.sessionId !== currentSid || now - p.createdAt <= 60 * 60_000)
+    .map((p) =>
+      p.sessionId === currentSid ? { ...p, attempts: p.attempts + 1 } : p,
+    );
+  for (const entry of toFlush) {
+    if (now - entry.createdAt > 60 * 60_000) continue;
+    ws.send(
+      JSON.stringify({
+        type: "answer_question",
+        tool_use_id: entry.toolUseId,
+        answers: entry.answers,
+      }),
+    );
+  }
+  savePendingAnswers(next);
+  set({ pendingAnswers: next });
 }
 
 /// Update the per-pane watermark for `(sessionId, paneId)` and
@@ -2853,6 +2999,8 @@ function handleServerMessage(
             // WS window. Duplicate-arrival is fine: the user_input ack
             // dedupes against the optimistic placeholder via content+recency.
             flushPendingSends(set, get);
+            // Same idea for unacked AskUserQuestion answers.
+            flushPendingAnswers(set, get);
           }, 500);
         }
         // Subscribe to every other session we have a cached snapshot for
@@ -3476,12 +3624,21 @@ function handleServerMessage(
                 .answers as Record<string, string> | undefined;
               if (answers && typeof answers === "object") {
                 set((state) => {
-                  if (state.answeredQuestions.has(toolUseId)) {
-                    return {};
+                  const patch: Partial<AppState> = {};
+                  if (!state.answeredQuestions.has(toolUseId)) {
+                    const nextMap = new Map(state.answeredQuestions);
+                    nextMap.set(toolUseId, answers);
+                    saveAnsweredQuestions(nextMap);
+                    patch.answeredQuestions = nextMap;
                   }
-                  const next = new Map(state.answeredQuestions);
-                  next.set(toolUseId, answers);
-                  return { answeredQuestions: next };
+                  // Claude confirmed the answer — clear any pending
+                  // retry entry so we don't re-send.
+                  const trimmed = state.pendingAnswers.filter((p) => p.toolUseId !== toolUseId);
+                  if (trimmed.length !== state.pendingAnswers.length) {
+                    savePendingAnswers(trimmed);
+                    patch.pendingAnswers = trimmed;
+                  }
+                  return patch;
                 });
               }
             }
@@ -3984,13 +4141,24 @@ function handleServerMessage(
               if (block.type === "tool_result") {
                 const toolUseId = block.tool_use_id as string | undefined;
                 if (toolUseId && toolNameMap.get(toolUseId) === "AskUserQuestion") {
+                  const capturedId = toolUseId;
                   set((state) => {
-                    if (state.answeredQuestions.has(toolUseId)) {
-                      return {};
+                    const patch: Partial<AppState> = {};
+                    if (!state.answeredQuestions.has(capturedId)) {
+                      const nextMap = new Map(state.answeredQuestions);
+                      nextMap.set(capturedId, answers);
+                      saveAnsweredQuestions(nextMap);
+                      patch.answeredQuestions = nextMap;
                     }
-                    const next = new Map(state.answeredQuestions);
-                    next.set(toolUseId, answers);
-                    return { answeredQuestions: next };
+                    // Confirm receipt — drop any pending retry entry.
+                    const trimmed = state.pendingAnswers.filter(
+                      (p) => p.toolUseId !== capturedId,
+                    );
+                    if (trimmed.length !== state.pendingAnswers.length) {
+                      savePendingAnswers(trimmed);
+                      patch.pendingAnswers = trimmed;
+                    }
+                    return patch;
                   });
                 }
               }
