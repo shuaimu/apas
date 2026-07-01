@@ -3410,6 +3410,26 @@ function handleServerMessage(
         set({ isDualPane: true });
       }
 
+      // Pre-pass: populate toolNameMap from every tool_use in this
+      // batch BEFORE mapping to Message objects. Without this, a
+      // paginated / load-more fetch that delivers a tool_result whose
+      // matching tool_use lives in an earlier (already-loaded or
+      // not-yet-loaded) page falls back to
+      // `tool: toolUseId` at line "tool: toolNameMap.get(toolUseId) ||
+      // toolUseId" — which breaks the AssistantMessage router's
+      // by-name filter for AskUserQuestion and leaks the raw
+      // "User cancelled the question by sending a new prompt." body
+      // into the chat as a red ToolCard.
+      for (const m of messages) {
+        if ((m.message_type as string) !== "tool_use") continue;
+        try {
+          const t = JSON.parse(m.content as string) as { id?: string; name?: string };
+          if (t.id && t.name) toolNameMap.set(t.id, t.name);
+        } catch {
+          // Malformed tool_use content — skip; the per-message map
+          // pass below will catch it (or fall back to text).
+        }
+      }
       const parsedMessages: Message[] = messages.map((m) => {
         const messageType = m.message_type as string || "text";
         const content = m.content as string;

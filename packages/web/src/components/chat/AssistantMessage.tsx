@@ -206,6 +206,21 @@ function renderContent(message: Message, outputType: Message["outputType"]) {
       if (outputType.tool === "AskUserQuestion") {
         return null;
       }
+      // Defensive fallback: apas emits this exact string as the
+      // tool_result body when a pending AskUserQuestion gets auto-
+      // cancelled by the user sending a new prompt. If toolNameMap
+      // missed for this tool_use_id (e.g. the tool_use lived in a
+      // page that hadn't loaded yet), outputType.tool falls back to
+      // the raw `toolu_...` id and the by-name filter above misses.
+      // Match by content as a second line of defense so the raw
+      // "error" text never leaks into the chat as a red ToolCard.
+      if (
+        typeof message.content === "string" &&
+        message.content ===
+          "User cancelled the question by sending a new prompt."
+      ) {
+        return null;
+      }
       return (
         <ToolCard
           tool={outputType.tool}
