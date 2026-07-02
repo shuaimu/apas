@@ -550,6 +550,12 @@ interface AppState {
   /// tool_use_result.
   pendingAnswers: PendingAnswer[];
 
+  /// Persisted queue of pane-label renames waiting for the CLI to ack
+  /// (next PaneList arrives with the matching label). Prevents "reboot
+  /// lost my rename" when the update_pane_label WS frame is dropped
+  /// silently.
+  pendingLabels: PendingLabel[];
+
   /** Per-session snapshot of suggested-workers.md. Pushed by the CLI on
    *  FetchSuggestedWorkers, after Dismiss mutations, and via the CLI's
    *  mtime-gated poller. Keyed by session_id so switching projects shows
@@ -834,6 +840,7 @@ export const useStore = create<AppState>((set, get) => ({
   reconnectWatermarks: new Map(),
   pendingSends: loadPendingSends(),
   pendingAnswers: loadPendingAnswers(),
+  pendingLabels: loadPendingLabels(),
   teamTodoStates: new Map(),
   suggestedWorkersBySession: new Map(),
   loadingMorePane: null,
@@ -2235,9 +2242,38 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   updatePaneLabel: (paneId: number, label: string) => {
+    const trimmed = label.trim();
+    if (!trimmed) return;
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "update_pane_label", pane_id: paneId, label }));
+      ws.send(JSON.stringify({ type: "update_pane_label", pane_id: paneId, label: trimmed }));
+    }
+    // Optimistic local update — the label sticks in the UI immediately
+    // regardless of whether the WS frame lands. mako Claude-6 reported
+    // "reboot lost my rename" — either the WS frame was dropped in
+    // transit (same class of bug as the AskUserQuestion answer loss)
+    // or the CLI acked but a later PaneList refresh clobbered the
+    // display. Optimistic + a persistent retry queue means neither
+    // path can make the user's rename disappear.
+    set((state) => ({
+      paneConfigs: state.paneConfigs.map((p) =>
+        p.pane_id === paneId ? { ...p, label: trimmed } : p,
+      ),
+    }));
+    // Enqueue for retry-on-reconnect. Mirror pendingSends / pendingAnswers.
+    const sessionId = get().sessionId;
+    if (sessionId) {
+      set((state) => {
+        const filtered = state.pendingLabels.filter(
+          (p) => !(p.paneId === paneId && p.sessionId === sessionId),
+        );
+        const next = [
+          ...filtered,
+          { paneId, label: trimmed, sessionId, createdAt: Date.now(), attempts: 1 },
+        ];
+        savePendingLabels(next);
+        return { pendingLabels: next };
+      });
     }
   },
 
@@ -2671,6 +2707,43 @@ function addMessageWithPaneRouting(
 const PENDING_SENDS_KEY = "apas_pending_sends";
 const PENDING_ANSWERS_KEY = "apas_pending_answers";
 const ANSWERED_QUESTIONS_KEY = "apas_answered_questions";
+const PENDING_LABELS_KEY = "apas_pending_labels";
+
+/// One unacked pane-label rename waiting for confirmation that the CLI
+/// received it (the next PaneList shows the new label). Persisted so a
+/// dropped WS frame doesn't silently revert the user's rename.
+export interface PendingLabel {
+  paneId: number;
+  label: string;
+  sessionId: string;
+  createdAt: number;
+  attempts: number;
+}
+
+function loadPendingLabels(): PendingLabel[] {
+  if (typeof localStorage === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(PENDING_LABELS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as PendingLabel[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function savePendingLabels(items: PendingLabel[]) {
+  if (typeof localStorage === "undefined") return;
+  try {
+    if (items.length === 0) {
+      localStorage.removeItem(PENDING_LABELS_KEY);
+    } else {
+      localStorage.setItem(PENDING_LABELS_KEY, JSON.stringify(items));
+    }
+  } catch {
+    // best-effort
+  }
+}
 
 /// One unacked AskUserQuestion answer waiting for confirmation that
 /// claude actually processed it (the answered tool_result arrives).
@@ -2847,6 +2920,39 @@ function flushPendingAnswers(
   set({ pendingAnswers: next });
 }
 
+/// Retransmit any unacked pane-label renames for the current session.
+/// Confirmed cleared when the incoming PaneList carries the matching
+/// label for the pane_id.
+function flushPendingLabels(
+  set: (partial: Partial<AppState> | ((state: AppState) => Partial<AppState>)) => void,
+  get: () => AppState,
+) {
+  const state = get();
+  const ws = state.ws;
+  const currentSid = state.sessionId;
+  if (!ws || ws.readyState !== WebSocket.OPEN || !currentSid) return;
+  const toFlush = state.pendingLabels.filter((p) => p.sessionId === currentSid);
+  if (toFlush.length === 0) return;
+  const now = Date.now();
+  const next: PendingLabel[] = state.pendingLabels
+    .filter((p) => p.sessionId !== currentSid || now - p.createdAt <= 60 * 60_000)
+    .map((p) =>
+      p.sessionId === currentSid ? { ...p, attempts: p.attempts + 1 } : p,
+    );
+  for (const entry of toFlush) {
+    if (now - entry.createdAt > 60 * 60_000) continue;
+    ws.send(
+      JSON.stringify({
+        type: "update_pane_label",
+        pane_id: entry.paneId,
+        label: entry.label,
+      }),
+    );
+  }
+  savePendingLabels(next);
+  set({ pendingLabels: next });
+}
+
 /// Update the per-pane watermark for `(sessionId, paneId)` and
 /// recompute the session-level watermark as the MIN across all known
 /// panes. Caller passes `paneId = null` for messages that aren't
@@ -3001,6 +3107,8 @@ function handleServerMessage(
             flushPendingSends(set, get);
             // Same idea for unacked AskUserQuestion answers.
             flushPendingAnswers(set, get);
+            // Same idea for unacked pane-label renames.
+            flushPendingLabels(set, get);
           }, 500);
         }
         // Subscribe to every other session we have a cached snapshot for
@@ -3428,12 +3536,35 @@ function handleServerMessage(
       }, {});
       // Sync is_paused from pane configs to pausedPanes state
       const pausedPaneIds = panes.filter((p) => p.is_paused).map((p) => p.pane_id);
-      set({
-        paneConfigs: panes,
-        paneModes,
-        pausedPanes: pausedPaneIds,
-        // Legacy compat
-        isDeadloopPaused: pausedPaneIds.includes(PANE_ID_DEADLOOP),
+      set((state) => {
+        // Acknowledge pending label renames when the CLI's list now
+        // reflects the requested label. Only clear on positive match
+        // — if the CLI still has the old label, keep the entry and
+        // let flushPendingLabels retry it on the next reconnect.
+        const stillPending = state.pendingLabels.filter((p) => {
+          const match = panes.find((pane) => pane.pane_id === p.paneId);
+          return !match || match.label !== p.label;
+        });
+        const labelsChanged = stillPending.length !== state.pendingLabels.length;
+        // If the CLI's list would clobber a still-pending optimistic
+        // rename, keep the optimistic label on paneConfigs and let
+        // flushPendingLabels drive it home. Otherwise trust the CLI.
+        const pendingByPane = new Map(stillPending.map((p) => [p.paneId, p.label] as const));
+        const merged = panes.map((pane) => {
+          const kept = pendingByPane.get(pane.pane_id);
+          return kept ? { ...pane, label: kept } : pane;
+        });
+        const patch: Partial<AppState> = {
+          paneConfigs: merged,
+          paneModes,
+          pausedPanes: pausedPaneIds,
+          isDeadloopPaused: pausedPaneIds.includes(PANE_ID_DEADLOOP),
+        };
+        if (labelsChanged) {
+          savePendingLabels(stillPending);
+          patch.pendingLabels = stillPending;
+        }
+        return patch;
       });
       break;
     }
