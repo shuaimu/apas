@@ -63,6 +63,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     Ok(DaemonToServer::MachineInfoUpdate { .. }) => {
                         tracing::warn!("Daemon sent machine info update before register");
                     }
+                    Ok(DaemonToServer::ProjectInstanceCreated { .. }) => {
+                        tracing::warn!("Daemon sent project-instance result before register");
+                    }
                     Err(err) => {
                         tracing::warn!("Failed to parse daemon registration message: {}", err);
                     }
@@ -220,6 +223,14 @@ fn apply_registered_daemon_message(
         }
         DaemonToServer::MachineInfoUpdate { machine } => {
             sessions.update_daemon_machine_info(machine_id, machine);
+        }
+        DaemonToServer::ProjectInstanceCreated {
+            request_id,
+            project_id,
+            error,
+            ..
+        } => {
+            sessions.relay_project_instance_created(machine_id, request_id, project_id, error);
         }
     }
 }
