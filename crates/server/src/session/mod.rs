@@ -566,6 +566,36 @@ impl SessionManager {
         }
     }
 
+    /// Relay a daemon's create-instance result to the owning user's web clients
+    /// as a `ServerToWeb::ProjectInstanceCreated` toast (a create can succeed or
+    /// fail before any project_id exists, so the generic Machines refresh can't
+    /// convey it). Best-effort via try_send; dropped messages are acceptable.
+    pub fn relay_project_instance_created(
+        &self,
+        machine_id: &Uuid,
+        request_id: Option<String>,
+        project_id: Option<String>,
+        error: Option<String>,
+    ) {
+        let Some(owner) = self.daemon_users.get(machine_id).map(|e| *e) else {
+            return;
+        };
+        let msg = ServerToWeb::ProjectInstanceCreated {
+            machine_id: *machine_id,
+            request_id,
+            project_id,
+            error,
+        };
+        for web_entry in self.web_users.iter() {
+            if *web_entry.value() != owner {
+                continue;
+            }
+            if let Some(sender) = self.web_senders.get(web_entry.key()) {
+                let _ = sender.try_send(msg.clone());
+            }
+        }
+    }
+
     pub fn get_machines_for_user(&self, user_id: &Uuid) -> Vec<MachineWithProjects> {
         // Collect working dirs of active CLI sessions grouped by hostname
         let mut active_dirs_by_host: HashMap<String, HashSet<String>> = HashMap::new();

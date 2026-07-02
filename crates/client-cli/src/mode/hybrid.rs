@@ -528,12 +528,17 @@ async fn connect_to_server(
 
     // Send SessionStart to register our local session with the server
     let hostname = hostname::get().ok().and_then(|h| h.into_string().ok());
+    let git_remote =
+        crate::worktree::normalized_git_remote(std::path::Path::new(working_dir));
+    let git_remote_url = crate::worktree::raw_git_remote(std::path::Path::new(working_dir));
     let session_start_msg = CliToServer::SessionStart {
         session_id,
         // session_id is the .apas project id in this mode (1:1).
         project_id: Some(session_id),
         working_dir: Some(working_dir.to_string()),
         hostname,
+        git_remote,
+        git_remote_url,
         pane_type: None,
         panes: None,
     };

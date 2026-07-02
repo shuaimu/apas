@@ -347,11 +347,15 @@ async fn run_connection(
     // then start a session handler per pane ready to receive input.
     if let Ok(project) = crate::project::get_or_create_project(working_dir) {
         let hostname = hostname::get().ok().and_then(|v| v.into_string().ok());
+        let git_remote = crate::worktree::normalized_git_remote(working_dir);
+        let git_remote_url = crate::worktree::raw_git_remote(working_dir);
         let session_start = CliToServer::SessionStart {
             session_id: project.id,
             project_id: Some(project.id),
             working_dir: Some(working_dir.to_string_lossy().to_string()),
             hostname,
+            git_remote,
+            git_remote_url,
             pane_type: None,
             panes: Some(project.panes.clone()),
         };

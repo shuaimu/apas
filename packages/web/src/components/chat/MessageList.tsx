@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useRef, useCallback, memo } from "react";
+import { useEffect, useMemo, useRef, useCallback, memo } from "react";
 import { useStore, Message } from "@/lib/store";
 import { UserMessage } from "./UserMessage";
 import { AssistantMessage } from "./AssistantMessage";
+import { ToolGroupCard, groupMessagesForRender } from "./ToolGroupCard";
 
 // Store scroll positions per session
 interface ScrollState {
@@ -130,6 +131,12 @@ export function MessageList() {
     }
   }, [messages.length]);
 
+  // Fold consecutive tool_use / tool_result messages into ToolGroupCards
+  // so long tool-chain runs don't drown the readable text turns. Only
+  // kicks in when there are at least TOOL_GROUP_MIN_ITEMS consecutive
+  // tool-like messages — short bursts render inline as before.
+  const renderItems = useMemo(() => groupMessagesForRender(messages), [messages]);
+
   if (messages.length === 0) {
     return (
       <div className="flex-1 flex items-center justify-center text-gray-400">
@@ -159,9 +166,13 @@ export function MessageList() {
           Scroll up to load more
         </div>
       )}
-      {messages.map((message) => (
-        <MessageComponent key={message.id} message={message} />
-      ))}
+      {renderItems.map((item) =>
+        item.kind === "tool-group" ? (
+          <ToolGroupCard key={item.id} items={item.items} />
+        ) : (
+          <MessageComponent key={item.message.id} message={item.message} />
+        ),
+      )}
       <div ref={messagesEndRef} />
     </div>
   );

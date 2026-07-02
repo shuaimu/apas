@@ -95,6 +95,9 @@ function projectRow(workingDir: string): HTMLElement {
 describe("Sidebar project list", () => {
   afterEach(() => {
     vi.clearAllMocks();
+    // Collapse state persists to localStorage; clear it so a group collapsed in
+    // one test doesn't start collapsed in the next.
+    window.localStorage.clear();
     act(() => {
       useStore.setState(initialStore, true);
     });
@@ -197,5 +200,87 @@ describe("Sidebar project list", () => {
 
     expect(attachSession).toHaveBeenCalledWith("session-click-target");
     expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("renders a repo header per group, including the no-remote bucket", () => {
+    seedSidebarState({
+      sessions: [
+        makeSession({
+          id: "s-apas",
+          projectId: "p-apas",
+          workingDir: "/repo/apas",
+          gitRemote: "github.com/shuaimu/apas",
+          createdAt: "2026-06-17T10:00:00Z",
+        }),
+        makeSession({
+          id: "s-loose",
+          projectId: "p-loose",
+          workingDir: "/repo/loose",
+          createdAt: "2026-06-16T10:00:00Z",
+        }),
+      ],
+    });
+
+    render(<Sidebar />);
+
+    // GitHub remote is shown as owner/repo; remote-less projects group under
+    // the literal "(no remote)" header.
+    expect(screen.getByText("shuaimu/apas")).toBeTruthy();
+    expect(screen.getByText("(no remote)")).toBeTruthy();
+    expect(projectRow("/repo/apas").textContent).toContain("/repo/apas");
+    expect(projectRow("/repo/loose").textContent).toContain("/repo/loose");
+  });
+
+  it("groups two projects that share the same git remote under one header", () => {
+    seedSidebarState({
+      sessions: [
+        makeSession({
+          id: "s-a",
+          projectId: "p-a",
+          workingDir: "/home/a/apas",
+          gitRemote: "github.com/shuaimu/apas",
+          createdAt: "2026-06-17T10:00:00Z",
+        }),
+        makeSession({
+          id: "s-b",
+          projectId: "p-b",
+          workingDir: "/home/b/apas-fork",
+          gitRemote: "github.com/shuaimu/apas",
+          createdAt: "2026-06-16T10:00:00Z",
+        }),
+      ],
+    });
+
+    render(<Sidebar />);
+
+    // A single shared header covers both project rows.
+    expect(screen.getAllByText("shuaimu/apas")).toHaveLength(1);
+    expect(screen.getByText("/home/a/apas")).toBeTruthy();
+    expect(screen.getByText("/home/b/apas-fork")).toBeTruthy();
+  });
+
+  it("toggling a repo header hides and reshows its project rows", () => {
+    seedSidebarState({
+      sessions: [
+        makeSession({
+          id: "s-apas",
+          projectId: "p-apas",
+          workingDir: "/repo/apas",
+          gitRemote: "github.com/shuaimu/apas",
+          createdAt: "2026-06-17T10:00:00Z",
+        }),
+      ],
+    });
+
+    render(<Sidebar />);
+
+    const header = screen.getByText("shuaimu/apas");
+    expect(screen.getByText("/repo/apas")).toBeTruthy();
+
+    fireEvent.click(header);
+    expect(screen.queryByText("/repo/apas")).toBeNull();
+
+    fireEvent.click(header);
+    expect(screen.getByText("/repo/apas")).toBeTruthy();
   });
 });
