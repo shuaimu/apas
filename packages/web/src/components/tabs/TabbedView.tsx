@@ -7,6 +7,7 @@ import { extractTimeline, TimelineEntry } from "@/lib/timeline";
 import { OverviewView } from "../overview/OverviewView";
 import { UserMessage } from "../chat/UserMessage";
 import { AssistantMessage } from "../chat/AssistantMessage";
+import { ToolGroupCard, groupMessagesForRender } from "../chat/ToolGroupCard";
 import { TabBar } from "./TabBar";
 import { WorkerTaskBar } from "./WorkerTaskBar";
 import { UsageLimitsDisplay } from "../UsageLimits";
@@ -2458,6 +2459,16 @@ export function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, 
   const hiddenCount = expanded ? 0 : Math.max(0, messages.length - revealCount);
   hiddenCountRef.current = hiddenCount;
   const visibleMessages = hiddenCount > 0 ? messages.slice(hiddenCount) : messages;
+  // Second-level fold: collapse consecutive tool_use / tool_result
+  // runs of at least TOOL_GROUP_MIN_ITEMS messages into a single
+  // expandable ToolGroupCard so long tool-chain turns don't drown
+  // the readable text. Individual ToolCards inside remain foldable
+  // (the existing per-card behavior). AskUserQuestion tool_use /
+  // result stays inline — the user has to see and click it.
+  const renderItems = useMemo(
+    () => groupMessagesForRender(visibleMessages),
+    [visibleMessages],
+  );
 
   return (
     <div
@@ -2479,9 +2490,13 @@ export function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, 
           </button>
         </div>
       )}
-      {visibleMessages.map((message) => (
-        <MessageComponent key={message.id} message={message} />
-      ))}
+      {renderItems.map((item) =>
+        item.kind === "tool-group" ? (
+          <ToolGroupCard key={item.id} items={item.items} />
+        ) : (
+          <MessageComponent key={item.message.id} message={item.message} />
+        ),
+      )}
       <div ref={messagesEndRef} />
     </div>
   );
