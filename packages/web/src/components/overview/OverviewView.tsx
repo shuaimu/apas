@@ -8,6 +8,7 @@ import { PaneGrid } from "./PaneGrid";
 import { ScratchpadTicker } from "./ScratchpadTicker";
 import { DelegationBoard } from "./DelegationBoard";
 import { ResourceUseRollup } from "./ResourceUseRollup";
+import { UsageStatsRollup } from "./UsageStatsRollup";
 import { AddWorkerModal } from "./AddWorkerModal";
 import { ProjectGoalBar } from "./ProjectGoalBar";
 import { TeamSetupCard } from "./TeamSetupCard";
@@ -196,6 +197,10 @@ export function OverviewView({
 
         <OverviewSection title="Delegation board">
           <DelegationBoard />
+        </OverviewSection>
+
+        <OverviewSection title="Usage stats">
+          <UsageStatsRollup />
         </OverviewSection>
 
         <OverviewSection title="Resource use">

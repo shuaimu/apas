@@ -331,7 +331,12 @@ sleep 1
 # what will get cleaned up.
 rsync -av --delete --exclude 'node_modules' --exclude '.next' --exclude '.apas-version' packages/web/ root@apas.mpaxos.com:/opt/apas/web/
 
-# Restart apas-web (compute version locally since server lacks git history)
+# Restart apas-web (compute version locally since server lacks git history).
+# `npm run build` runs `prebuild` first (`eslint .`, packages/web/eslint.config.mjs),
+# which fails the build on React Rules-of-Hooks violations (e.g. a hook after an
+# early return -> React error #310 -> whole-app crash). So a lint failure here
+# aborts the deploy before restart — fix the reported hook error, don't bypass it.
+# Requires devDependencies installed (the plain `npm install` above does this).
 month_start="$(date +%Y-%m-01) 00:00:00"
 web_version="$(date +%y.%m).$(git rev-list --count --since="$month_start" HEAD)"
 ssh root@apas.mpaxos.com "cd /opt/apas/web && npm install && NEXT_PUBLIC_WEB_UI_VERSION=${web_version} npm run build && systemctl restart apas-web"

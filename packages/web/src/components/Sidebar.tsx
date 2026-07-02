@@ -1,7 +1,8 @@
 "use client";
 
 import { useStore } from "@/lib/store";
-import { FolderOpen, RefreshCw, Share2, Users, X, Crown, Trash2, ChevronLeft, BarChart3, Server } from "lucide-react";
+import { FolderOpen, RefreshCw, Share2, Users, X, Crown, Trash2, ChevronLeft, ChevronDown, ChevronRight, BarChart3, Server, Plus } from "lucide-react";
+import { CreateInstanceModal } from "./CreateInstanceModal";
 import Link from "next/link";
 import { useMemo, useState, useEffect } from "react";
 import { createPortal } from "react-dom";
@@ -49,6 +50,19 @@ interface SidebarProps {
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://apas.mpaxos.com:8080";
 type ProjectRole = "owner" | "admin" | "user";
+
+// Group key + localStorage key for collapsed repo groups in the sidebar.
+const NO_REMOTE_KEY = "__no_remote__";
+const COLLAPSED_GROUPS_STORAGE_KEY = "apas_collapsed_repo_groups";
+
+// Turn a canonical `host/owner/repo` remote into a compact header label.
+// GitHub repos drop the host (`github.com/shuaimu/apas` -> `shuaimu/apas`);
+// other hosts keep it so self-hosted/GitLab repos stay distinguishable.
+function repoDisplayLabel(remote: string): string {
+  return remote.startsWith("github.com/")
+    ? remote.slice("github.com/".length)
+    : remote;
+}
 
 function parseProjectRole(raw: unknown): ProjectRole {
   if (typeof raw !== "string") return "user";
@@ -126,6 +140,8 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
       name: string;
       workingDir: string;
       hostname?: string;
+      gitRemote?: string;
+      gitRemoteUrl?: string;
       isActive: boolean;
       createdAt?: string;
       isShared?: boolean;
@@ -156,6 +172,8 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
           name,
           workingDir,
           hostname: session.hostname,
+          gitRemote: session.gitRemote,
+          gitRemoteUrl: session.gitRemoteUrl,
           isActive: session.isActive || false,
           createdAt: session.createdAt,
           isShared: session.isShared,
@@ -202,6 +220,76 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
       return 0;
     });
   }, [cliClients, sessions, machines]);
+
+  // Group the deduped projects by the repo they belong to. Always emit a header
+  // per group (including the "(no remote)" bucket). Named-repo groups keep the
+  // activity/recency order inherited from `projects` (Array#sort is stable, so
+  // returning 0 preserves first-seen order); the no-remote bucket sinks last.
+  const repoGroups = useMemo(() => {
+    const byKey = new Map<
+      string,
+      { key: string; label: string; isNoRemote: boolean; cloneUrl?: string; projects: typeof projects }
+    >();
+    for (const project of projects) {
+      const key = project.gitRemote ?? NO_REMOTE_KEY;
+      let group = byKey.get(key);
+      if (!group) {
+        group = {
+          key,
+          label: project.gitRemote ? repoDisplayLabel(project.gitRemote) : "(no remote)",
+          isNoRemote: !project.gitRemote,
+          projects: [],
+        };
+        byKey.set(key, group);
+      }
+      // Remember a representative clone URL from any project in the group.
+      if (!group.cloneUrl && project.gitRemoteUrl) {
+        group.cloneUrl = project.gitRemoteUrl;
+      }
+      group.projects.push(project);
+    }
+    return Array.from(byKey.values()).sort((a, b) => {
+      if (a.isNoRemote !== b.isNoRemote) return a.isNoRemote ? 1 : -1;
+      return 0;
+    });
+  }, [projects]);
+
+  // Collapsed repo groups, persisted to localStorage so the choice survives
+  // reloads and the `repoGroups` recompute. Groups default to expanded.
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => {
+    if (typeof window === "undefined") return new Set();
+    try {
+      const raw = window.localStorage.getItem(COLLAPSED_GROUPS_STORAGE_KEY);
+      return new Set<string>(raw ? (JSON.parse(raw) as string[]) : []);
+    } catch {
+      return new Set();
+    }
+  });
+
+  const toggleGroup = (key: string) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) {
+        next.delete(key);
+      } else {
+        next.add(key);
+      }
+      try {
+        window.localStorage.setItem(
+          COLLAPSED_GROUPS_STORAGE_KEY,
+          JSON.stringify(Array.from(next)),
+        );
+      } catch {
+        // Ignore storage failures (private mode, quota).
+      }
+      return next;
+    });
+  };
+
+  // Repo whose "New instance" modal is open (null = closed).
+  const [newInstanceRepo, setNewInstanceRepo] = useState<
+    { gitRemote: string; cloneUrl?: string } | null
+  >(null);
 
   const handleRefresh = () => {
     if (isRefreshing) return;
@@ -463,8 +551,42 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
             <p className="text-xs mt-1">Run `apas` in a directory to start</p>
           </div>
         ) : (
-          <div className="space-y-1">
-            {projects.map((project) => (
+          <div className="space-y-2">
+            {repoGroups.map((group) => {
+              const collapsed = collapsedGroups.has(group.key);
+              return (
+                <div key={group.key}>
+                  <div className="flex items-center gap-1 px-1 py-1">
+                    <button
+                      onClick={() => toggleGroup(group.key)}
+                      className="flex flex-1 min-w-0 items-center gap-1 text-xs font-semibold text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 select-none"
+                      title={group.isNoRemote ? "Projects with no git remote" : group.key}
+                    >
+                      {collapsed ? (
+                        <ChevronRight className="w-3.5 h-3.5 flex-shrink-0" />
+                      ) : (
+                        <ChevronDown className="w-3.5 h-3.5 flex-shrink-0" />
+                      )}
+                      <span className="truncate flex-1 text-left">{group.label}</span>
+                      <span className="font-normal text-gray-400 dark:text-gray-500">
+                        {group.projects.length}
+                      </span>
+                    </button>
+                    {!group.isNoRemote && (
+                      <button
+                        onClick={() =>
+                          setNewInstanceRepo({ gitRemote: group.key, cloneUrl: group.cloneUrl })
+                        }
+                        className="flex-shrink-0 rounded p-0.5 text-gray-400 hover:bg-gray-200 hover:text-emerald-600 dark:hover:bg-gray-700"
+                        title={`Create a new instance under ${group.label}`}
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+                  {!collapsed && (
+                    <div className="mt-1 ml-2 pl-1.5 border-l border-gray-200 dark:border-gray-800 space-y-1">
+                      {group.projects.map((project) => (
               <div key={project.id}>
                 <div
                   onClick={() => handleProjectClick(project.id)}
@@ -523,7 +645,12 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                   )}
                 </div>
               </div>
-            ))}
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
         )}
       </div>
@@ -750,6 +877,16 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
           </div>
         </div>,
         document.body
+      )}
+
+      {newInstanceRepo && (
+        <CreateInstanceModal
+          key={newInstanceRepo.gitRemote}
+          open
+          onClose={() => setNewInstanceRepo(null)}
+          gitRemote={newInstanceRepo.gitRemote}
+          cloneUrl={newInstanceRepo.cloneUrl}
+        />
       )}
     </div>
   );

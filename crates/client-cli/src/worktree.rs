@@ -387,6 +387,198 @@ fn run_git_cd(cwd: &str, args: &[&str]) -> Result<String> {
     run_git_path(Path::new(cwd), args)
 }
 
+/// Canonical `host/owner/repo` grouping key for a project's `origin` remote,
+/// used by the web sidebar to group projects that belong to the same repo.
+///
+/// Returns `None` when `working_dir` is not a git repo, has no `origin`
+/// remote, or `git` is unavailable — all of which map to the sidebar's
+/// "(no remote)" group rather than an error.
+pub fn normalized_git_remote(working_dir: &Path) -> Option<String> {
+    let raw = run_git_path(working_dir, &["remote", "get-url", "origin"]).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(normalize_remote_url(trimmed))
+}
+
+/// Pure canonicalization of a git remote URL into a lowercase `host/owner/repo`
+/// key. The three common shapes for the same repo collapse to one string:
+///   `git@github.com:Owner/Repo.git`     -> `github.com/owner/repo`
+///   `https://github.com/owner/repo.git` -> `github.com/owner/repo`
+///   `ssh://git@github.com/owner/repo`   -> `github.com/owner/repo`
+fn normalize_remote_url(raw: &str) -> String {
+    // Trim trailing slashes, strip a single `.git`, then trim slashes again so
+    // `repo`, `repo/`, `repo.git`, and `repo.git/` all collapse to one key.
+    let s = raw.trim().trim_end_matches('/');
+    let s = s.strip_suffix(".git").unwrap_or(s).trim_end_matches('/');
+
+    let (host, path) = if let Some(idx) = s.find("://") {
+        // scheme://[user@]authority[:port]/owner/repo...
+        let rest = &s[idx + 3..];
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+        // An IPv6 literal authority is `[addr]:port`; the address itself
+        // contains colons, so pull it out of the brackets before the port split.
+        let host = if let Some(rest) = authority.strip_prefix('[') {
+            rest.split_once(']').map_or(authority, |(addr, _)| addr)
+        } else {
+            authority.split_once(':').map_or(authority, |(h, _)| h)
+        };
+        (host.to_string(), path.to_string())
+    } else if let Some((before, after)) = s.split_once(':') {
+        // scp-like `[user@]host:owner/repo` — only when the host part has no `/`.
+        if before.contains('/') {
+            (String::new(), s.to_string())
+        } else {
+            let host = before.rsplit_once('@').map_or(before, |(_, h)| h);
+            (host.to_string(), after.to_string())
+        }
+    } else {
+        // Bare `owner/repo`, a local path, or anything unparseable.
+        (String::new(), s.to_string())
+    };
+
+    let mut combined = if host.is_empty() {
+        path
+    } else {
+        format!("{host}/{path}")
+    };
+    while combined.contains("//") {
+        combined = combined.replace("//", "/");
+    }
+    combined.trim_matches('/').to_lowercase()
+}
+
+/// The raw `origin` URL (scheme/user/auth preserved) for `working_dir`, or None
+/// when there's no origin / no git. Unlike `normalized_git_remote` (a lossy
+/// grouping key) this keeps the exact URL so the repo can be cloned elsewhere.
+pub fn raw_git_remote(working_dir: &Path) -> Option<String> {
+    let raw = run_git_path(working_dir, &["remote", "get-url", "origin"]).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Clone `url` into `dest` (which must not already exist). Runs
+/// non-interactively (`GIT_TERMINAL_PROMPT=0`) so a missing credential fails
+/// fast with an error instead of hanging on a terminal prompt.
+pub fn clone_repo(url: &str, dest: &Path) -> Result<()> {
+    let out = Command::new("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg("clone")
+        .arg(url)
+        .arg(dest)
+        .output()
+        .with_context(|| format!("running `git clone` into {}", dest.display()))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "git clone failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Create and switch to a fresh branch in the freshly-cloned repo at `dest`,
+/// auto-suffixing (`-2`, `-3`…) when the desired name already exists (e.g. the
+/// user picked the repo's default branch). Returns the branch actually created.
+pub fn checkout_unique_branch(dest: &Path, desired: &str) -> Result<String> {
+    if run_git_path(dest, &["checkout", "-b", desired]).is_ok() {
+        return Ok(desired.to_string());
+    }
+    // Bounded retry: a sane collision needs only a few suffixes, and an
+    // intrinsically-invalid ref would otherwise spawn git hundreds of times.
+    for n in 2..30 {
+        let candidate = format!("{desired}-{n}");
+        if run_git_path(dest, &["checkout", "-b", &candidate]).is_ok() {
+            return Ok(candidate);
+        }
+    }
+    Err(anyhow!("could not create a unique branch from '{desired}'"))
+}
+
+/// Return `desired` if free, else the first `<name>-N` (N≥2) that doesn't
+/// exist — the directory auto-suffix used when an instance name collides.
+pub fn unique_dir(desired: &Path) -> PathBuf {
+    if !desired.exists() {
+        return desired.to_path_buf();
+    }
+    let parent = desired.parent().unwrap_or_else(|| Path::new("."));
+    let stem = desired
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("instance");
+    for n in 2..10_000 {
+        let candidate = parent.join(format!("{stem}-{n}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    desired.to_path_buf()
+}
+
+/// Sanitize a user-supplied instance name into a safe single path component:
+/// alphanumerics plus `-_.`, with any other char folded to `-`, and leading/
+/// trailing `-`/`.` stripped so `..`/`.` can't escape the projects root.
+pub fn sanitize_instance_name(name: &str) -> String {
+    let cleaned: String = name
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches(|c| c == '-' || c == '.').to_string();
+    if cleaned.is_empty() {
+        "instance".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Sanitize a user-supplied branch name into a valid-ish git ref: allow
+/// `-_/.` plus alphanumerics, collapse `..`, and strip leading/trailing
+/// `-`/`/`/`.` (which git refs disallow).
+pub fn sanitize_branch_name(name: &str) -> String {
+    let cleaned: String = name
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let mut cleaned = cleaned.replace("..", "-");
+    // Collapse `//` (an empty ref component) and `/.` (a component can't start
+    // with `.`); git rejects both, and `checkout -b` would then fail for every
+    // suffix candidate.
+    while cleaned.contains("//") {
+        cleaned = cleaned.replace("//", "/");
+    }
+    while cleaned.contains("/.") {
+        cleaned = cleaned.replace("/.", "/");
+    }
+    let cleaned = cleaned
+        .trim_matches(|c| c == '-' || c == '/' || c == '.')
+        .to_string();
+    if cleaned.is_empty() {
+        "apas-instance".to_string()
+    } else {
+        cleaned
+    }
+}
+
 /// Resolve the current branch in a worktree. Returns None for detached HEAD.
 fn current_branch_in(worktree: &str) -> Option<String> {
     let out = run_git_cd(worktree, &["branch", "--show-current"]).ok()?;
@@ -481,6 +673,129 @@ pub fn cleanup_on_close(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn normalize_remote_url_canonicalizes_common_forms() {
+        // All three shapes for the same repo collapse to one key.
+        assert_eq!(
+            normalize_remote_url("git@github.com:Owner/Repo.git"),
+            "github.com/owner/repo"
+        );
+        assert_eq!(
+            normalize_remote_url("https://github.com/owner/repo.git"),
+            "github.com/owner/repo"
+        );
+        assert_eq!(
+            normalize_remote_url("ssh://git@github.com/owner/repo"),
+            "github.com/owner/repo"
+        );
+        // Trailing slash, case-folding, and ports.
+        assert_eq!(
+            normalize_remote_url("https://github.com/Owner/Repo/"),
+            "github.com/owner/repo"
+        );
+        assert_eq!(
+            normalize_remote_url("ssh://git@github.com:22/owner/repo.git"),
+            "github.com/owner/repo"
+        );
+        // Multi-segment paths (self-hosted GitLab groups) keep their slashes.
+        assert_eq!(
+            normalize_remote_url("git@gitlab.example.com:team/sub/proj.git"),
+            "gitlab.example.com/team/sub/proj"
+        );
+        // A trailing slash AFTER `.git` must still strip the `.git` so the repo
+        // collapses with its slash-less form.
+        assert_eq!(
+            normalize_remote_url("https://github.com/owner/repo.git/"),
+            "github.com/owner/repo"
+        );
+        assert_eq!(
+            normalize_remote_url("git@github.com:owner/repo.git/"),
+            "github.com/owner/repo"
+        );
+        // IPv6-literal hosts: the bracketed address is the host, not `[`, and
+        // distinct addresses stay in distinct groups.
+        assert_eq!(
+            normalize_remote_url("ssh://git@[::1]:22/owner/repo.git"),
+            "::1/owner/repo"
+        );
+        assert_ne!(
+            normalize_remote_url("ssh://git@[::1]:22/owner/repo"),
+            normalize_remote_url("ssh://git@[::2]:22/owner/repo")
+        );
+    }
+
+    #[test]
+    fn sanitize_instance_name_strips_traversal_and_separators() {
+        assert_eq!(sanitize_instance_name("my repo!"), "my-repo");
+        assert_eq!(sanitize_instance_name("../etc"), "etc");
+        assert_eq!(sanitize_instance_name(".."), "instance");
+        assert_eq!(sanitize_instance_name("  ok-1.2  "), "ok-1.2");
+        assert_eq!(sanitize_instance_name(""), "instance");
+    }
+
+    #[test]
+    fn sanitize_branch_name_makes_valid_ref() {
+        assert_eq!(sanitize_branch_name("feature/foo bar"), "feature/foo-bar");
+        assert_eq!(sanitize_branch_name("/leading/"), "leading");
+        assert_eq!(sanitize_branch_name("a..b"), "a-b");
+        assert_eq!(sanitize_branch_name(""), "apas-instance");
+        // `//` and `/.` collapse to valid single separators (git rejects them).
+        assert_eq!(sanitize_branch_name("feature//foo"), "feature/foo");
+        assert_eq!(sanitize_branch_name("feature/.hidden"), "feature/hidden");
+    }
+
+    #[test]
+    fn unique_dir_suffixes_on_collision() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let want = tmp.path().join("proj");
+        // Free name returns unchanged.
+        assert_eq!(unique_dir(&want), want);
+        // Occupied name auto-suffixes.
+        std::fs::create_dir(&want).unwrap();
+        assert_eq!(unique_dir(&want), tmp.path().join("proj-2"));
+    }
+
+    #[test]
+    fn normalized_git_remote_is_none_without_origin() {
+        // A fresh git repo with no `origin` remote -> None (the "(no remote)" group).
+        let tmp = TempDir::new().expect("tmpdir");
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(args)
+                .status()
+                .expect("git");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        assert_eq!(normalized_git_remote(tmp.path()), None);
+    }
+
+    #[test]
+    fn normalized_git_remote_reads_origin() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(args)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {} failed", args.join(" "));
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&[
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:Shuaimu/APAS.git",
+        ]);
+        assert_eq!(
+            normalized_git_remote(tmp.path()).as_deref(),
+            Some("github.com/shuaimu/apas")
+        );
+    }
 
     /// Set up `<tmp>/proj` as a git repo with one commit on `main`, then run
     /// `apas worktree add 2 -b apas-pane-2` style git plumbing to materialize

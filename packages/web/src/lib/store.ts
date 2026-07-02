@@ -44,6 +44,13 @@ export interface SessionInfo {
   cliClientId?: string;
   workingDir?: string;
   hostname?: string;
+  /** Canonical `host/owner/repo` of the project's git `origin` remote. The
+   * sidebar groups projects that share this value under one repo header.
+   * Undefined means "no remote" (its own sidebar group). */
+  gitRemote?: string;
+  /** Raw cloneable `origin` URL, used to prefill the clone URL when creating
+   * a new instance under this repo. */
+  gitRemoteUrl?: string;
   status: string;
   createdAt?: string;
   isShared?: boolean;
@@ -241,6 +248,34 @@ export interface TeamTodoSubtask {
 }
 
 export type PaneType = "deadloop" | "interactive";
+
+/** Aggregated usage counters for one time window. snake_case to match the
+ *  server's ServerToWeb::ProjectUsageStats payload verbatim. */
+export interface UsageCounters {
+  prompts: number;
+  responses: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  cost_usd: number;
+}
+
+export interface PaneUsageStats {
+  pane_id: number;
+  lifetime: UsageCounters;
+  last_7d: UsageCounters;
+  today: UsageCounters;
+  last_active?: string;
+}
+
+export interface ProjectUsageStats {
+  panes: PaneUsageStats[];
+  lifetime: UsageCounters;
+  last_7d: UsageCounters;
+  today: UsageCounters;
+  last_active?: string;
+}
 
 export interface PaneConfig {
   pane_id: number;
@@ -507,6 +542,20 @@ interface AppState {
   /// Removed when the matching `user_input` arrives.
   pendingSends: PendingSend[];
 
+  /// Persisted queue of AskUserQuestion answers waiting for claude to
+  /// actually process them. Replayed on every WS authenticate so a
+  /// dropped submission (silently-stale WS, server rejected forward,
+  /// CLI wasn't attached) eventually lands. Removed when the answered
+  /// tool_result arrives with the {answers} payload in its
+  /// tool_use_result.
+  pendingAnswers: PendingAnswer[];
+
+  /// Persisted queue of pane-label renames waiting for the CLI to ack
+  /// (next PaneList arrives with the matching label). Prevents "reboot
+  /// lost my rename" when the update_pane_label WS frame is dropped
+  /// silently.
+  pendingLabels: PendingLabel[];
+
   /** Per-session snapshot of suggested-workers.md. Pushed by the CLI on
    *  FetchSuggestedWorkers, after Dismiss mutations, and via the CLI's
    *  mtime-gated poller. Keyed by session_id so switching projects shows
@@ -559,6 +608,14 @@ interface AppState {
   listMachines: () => void;
   startMachineProjectCli: (machineId: string, projectId: string) => void;
   stopMachineProjectCli: (machineId: string, projectId: string) => void;
+  createProjectInstance: (
+    machineId: string,
+    gitRemote: string,
+    instanceName: string,
+    branch: string,
+    cloneUrl?: string,
+    basePath?: string,
+  ) => boolean;
   setMachineMiniMaxConfig: (
     machineId: string,
     apiKey?: string,
@@ -641,6 +698,9 @@ interface AppState {
    *  from the CLI's mtime poller. Used by ProjectGoalBar to hydrate the
    *  textbox when the user isn't editing. */
   projectGoals: Record<string, string>;
+  /** Per-session usage stats (prompts/tokens/cost) for the Overview panel,
+   *  keyed by session_id. Pushed live and replayed on attach. */
+  usageStats: Record<string, ProjectUsageStats>;
   /** Tech-Lead autonomy flags per session, mirrored from the CLI's
    *  `.apas` poller. Toggled from the Overview. */
   projectFlags: Record<string, { autoApproveTodos: boolean; autoMergePrs: boolean }>;
@@ -765,11 +825,12 @@ export const useStore = create<AppState>((set, get) => ({
   pausedPanes: [],
   paneDiffs: {},
   projectGoals: {},
+  usageStats: {},
   projectFlags: {},
   teamRecordsBySession: new Map(),
   teamRecords: [],
   planReviewPending: [],
-  answeredQuestions: new Map(),
+  answeredQuestions: loadAnsweredQuestions(),
   toasts: [],
   sessionCache: new Map(),
   unreadSessions: new Set(),
@@ -778,6 +839,8 @@ export const useStore = create<AppState>((set, get) => ({
   paneLoadingInitial: new Set(),
   reconnectWatermarks: new Map(),
   pendingSends: loadPendingSends(),
+  pendingAnswers: loadPendingAnswers(),
+  pendingLabels: loadPendingLabels(),
   teamTodoStates: new Map(),
   suggestedWorkersBySession: new Map(),
   loadingMorePane: null,
@@ -1253,6 +1316,36 @@ export const useStore = create<AppState>((set, get) => ({
     }));
   },
 
+  createProjectInstance: (
+    machineId: string,
+    gitRemote: string,
+    instanceName: string,
+    branch: string,
+    cloneUrl?: string,
+    basePath?: string,
+  ): boolean => {
+    const { ws, showToast } = get();
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      showToast("Not connected — try again in a moment", "error");
+      return false;
+    }
+    const requestId =
+      typeof crypto !== "undefined" && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `req-${Date.now()}`;
+    ws.send(JSON.stringify({
+      type: "create_project_instance",
+      machine_id: machineId,
+      git_remote: gitRemote,
+      instance_name: instanceName,
+      branch,
+      clone_url: cloneUrl || undefined,
+      base_path: basePath || undefined,
+      request_id: requestId,
+    }));
+    return true;
+  },
+
   setMachineMiniMaxConfig: (
     machineId: string,
     apiKey?: string,
@@ -1468,23 +1561,48 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   answerQuestion: (toolUseId: string, answers: Record<string, string>) => {
-    const { ws, showToast } = get();
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
-        type: "answer_question",
-        tool_use_id: toolUseId,
-        answers,
-      }));
+    const { ws, sessionId, showToast } = get();
+    const canSend = ws && ws.readyState === WebSocket.OPEN;
+    if (canSend) {
+      ws.send(
+        JSON.stringify({
+          type: "answer_question",
+          tool_use_id: toolUseId,
+          answers,
+        }),
+      );
       showToast("Answer sent to Claude", "success");
     } else {
-      showToast("Not connected — answer not sent", "error");
+      showToast("Not connected — answer queued for retry", "info");
     }
-    // Mark the question locally as answered so the card flips to the
-    // submitted state immediately, even before the tool_result arrives.
+    // Enqueue into the pending-answer queue AND persist immediately.
+    // Reasons this needs to live in localStorage, not just in-memory:
+    // (1) A page refresh right after submit was previously losing the
+    //     submitted state — the card would ask again.
+    // (2) A ws.send() on a "silently stale" socket (readyState OPEN but
+    //     TCP dead) drops the frame. The pending-answer queue is
+    //     flushed on every reconnect so the answer eventually lands.
+    // Confirmed root cause on mako Claude-6: server messages.jsonl AND
+    // claude's on-disk session jsonl both show a 16-min gap between
+    // the AskUserQuestion tool_use and its cancel tool_result — the
+    // answer never reached claude's stdin.
     set((state) => {
-      const next = new Map(state.answeredQuestions);
-      next.set(toolUseId, answers);
-      return { answeredQuestions: next };
+      const alreadyAnswered = new Map(state.answeredQuestions);
+      alreadyAnswered.set(toolUseId, answers);
+      saveAnsweredQuestions(alreadyAnswered);
+      const filtered = state.pendingAnswers.filter((p) => p.toolUseId !== toolUseId);
+      const next: PendingAnswer[] = [
+        ...filtered,
+        {
+          toolUseId,
+          answers,
+          sessionId: sessionId ?? "",
+          createdAt: Date.now(),
+          attempts: canSend ? 1 : 0,
+        },
+      ];
+      savePendingAnswers(next);
+      return { answeredQuestions: alreadyAnswered, pendingAnswers: next };
     });
   },
 
@@ -2124,9 +2242,38 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   updatePaneLabel: (paneId: number, label: string) => {
+    const trimmed = label.trim();
+    if (!trimmed) return;
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "update_pane_label", pane_id: paneId, label }));
+      ws.send(JSON.stringify({ type: "update_pane_label", pane_id: paneId, label: trimmed }));
+    }
+    // Optimistic local update — the label sticks in the UI immediately
+    // regardless of whether the WS frame lands. mako Claude-6 reported
+    // "reboot lost my rename" — either the WS frame was dropped in
+    // transit (same class of bug as the AskUserQuestion answer loss)
+    // or the CLI acked but a later PaneList refresh clobbered the
+    // display. Optimistic + a persistent retry queue means neither
+    // path can make the user's rename disappear.
+    set((state) => ({
+      paneConfigs: state.paneConfigs.map((p) =>
+        p.pane_id === paneId ? { ...p, label: trimmed } : p,
+      ),
+    }));
+    // Enqueue for retry-on-reconnect. Mirror pendingSends / pendingAnswers.
+    const sessionId = get().sessionId;
+    if (sessionId) {
+      set((state) => {
+        const filtered = state.pendingLabels.filter(
+          (p) => !(p.paneId === paneId && p.sessionId === sessionId),
+        );
+        const next = [
+          ...filtered,
+          { paneId, label: trimmed, sessionId, createdAt: Date.now(), attempts: 1 },
+        ];
+        savePendingLabels(next);
+        return { pendingLabels: next };
+      });
     }
   },
 
@@ -2558,6 +2705,115 @@ function addMessageWithPaneRouting(
 /// this tab — without it, the live watermark would skip past the
 /// disconnect-window messages still sitting on disk.
 const PENDING_SENDS_KEY = "apas_pending_sends";
+const PENDING_ANSWERS_KEY = "apas_pending_answers";
+const ANSWERED_QUESTIONS_KEY = "apas_answered_questions";
+const PENDING_LABELS_KEY = "apas_pending_labels";
+
+/// One unacked pane-label rename waiting for confirmation that the CLI
+/// received it (the next PaneList shows the new label). Persisted so a
+/// dropped WS frame doesn't silently revert the user's rename.
+export interface PendingLabel {
+  paneId: number;
+  label: string;
+  sessionId: string;
+  createdAt: number;
+  attempts: number;
+}
+
+function loadPendingLabels(): PendingLabel[] {
+  if (typeof localStorage === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(PENDING_LABELS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as PendingLabel[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function savePendingLabels(items: PendingLabel[]) {
+  if (typeof localStorage === "undefined") return;
+  try {
+    if (items.length === 0) {
+      localStorage.removeItem(PENDING_LABELS_KEY);
+    } else {
+      localStorage.setItem(PENDING_LABELS_KEY, JSON.stringify(items));
+    }
+  } catch {
+    // best-effort
+  }
+}
+
+/// One unacked AskUserQuestion answer waiting for confirmation that
+/// claude actually processed it (the answered tool_result arrives).
+/// Persisted so a page refresh doesn't drop the submission on the
+/// floor — mako Claude-6 reproduced this exact symptom (user answered,
+/// answer never reached claude, refresh → card asks again).
+export interface PendingAnswer {
+  toolUseId: string;
+  answers: Record<string, string>;
+  sessionId: string;
+  createdAt: number;
+  attempts: number;
+}
+
+function loadPendingAnswers(): PendingAnswer[] {
+  if (typeof localStorage === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(PENDING_ANSWERS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as PendingAnswer[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function savePendingAnswers(items: PendingAnswer[]) {
+  if (typeof localStorage === "undefined") return;
+  try {
+    if (items.length === 0) {
+      localStorage.removeItem(PENDING_ANSWERS_KEY);
+    } else {
+      localStorage.setItem(PENDING_ANSWERS_KEY, JSON.stringify(items));
+    }
+  } catch {
+    // best-effort
+  }
+}
+
+/// Persisted mirror of `answeredQuestions`. Restores the
+/// AskUserQuestionCard's "submitted" state after a refresh so the
+/// user isn't asked to re-answer a question they've already answered.
+/// Keyed by tool_use_id → answers.
+function loadAnsweredQuestions(): Map<string, Record<string, string>> {
+  if (typeof localStorage === "undefined") return new Map();
+  try {
+    const raw = localStorage.getItem(ANSWERED_QUESTIONS_KEY);
+    if (!raw) return new Map();
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return new Map();
+    return new Map(Object.entries(parsed as Record<string, Record<string, string>>));
+  } catch {
+    return new Map();
+  }
+}
+
+function saveAnsweredQuestions(m: Map<string, Record<string, string>>) {
+  if (typeof localStorage === "undefined") return;
+  try {
+    if (m.size === 0) {
+      localStorage.removeItem(ANSWERED_QUESTIONS_KEY);
+    } else {
+      const obj: Record<string, Record<string, string>> = {};
+      for (const [k, v] of m) obj[k] = v;
+      localStorage.setItem(ANSWERED_QUESTIONS_KEY, JSON.stringify(obj));
+    }
+  } catch {
+    // best-effort
+  }
+}
 
 function loadPendingSends(): PendingSend[] {
   if (typeof localStorage === "undefined") return [];
@@ -2622,6 +2878,79 @@ function flushPendingSends(
   }
   savePendingSends(next);
   set({ pendingSends: next });
+}
+
+/// Retransmit any unacked AskUserQuestion answers for the current
+/// session. Mirrors flushPendingSends. Called after authenticate so a
+/// dropped answer eventually lands. Duplicate-arrival risk: if the
+/// CLI got the original answer, it removed the pending_questions entry
+/// and the retry logs a warn ("no matching pending AskUserQuestion")
+/// and is dropped harmlessly.
+function flushPendingAnswers(
+  set: (partial: Partial<AppState> | ((state: AppState) => Partial<AppState>)) => void,
+  get: () => AppState,
+) {
+  const state = get();
+  const ws = state.ws;
+  const currentSid = state.sessionId;
+  if (!ws || ws.readyState !== WebSocket.OPEN || !currentSid) return;
+  const toFlush = state.pendingAnswers.filter((p) => p.sessionId === currentSid);
+  if (toFlush.length === 0) return;
+  const now = Date.now();
+  // Drop answers older than 1 hour; user has moved on. AskUserQuestion
+  // is a decision surface, not a stream of typed text, so we can be
+  // more generous than pendingSends' 10-min TTL — a laptop-closed
+  // scenario shouldn't discard a legitimate submission.
+  const next: PendingAnswer[] = state.pendingAnswers
+    .filter((p) => p.sessionId !== currentSid || now - p.createdAt <= 60 * 60_000)
+    .map((p) =>
+      p.sessionId === currentSid ? { ...p, attempts: p.attempts + 1 } : p,
+    );
+  for (const entry of toFlush) {
+    if (now - entry.createdAt > 60 * 60_000) continue;
+    ws.send(
+      JSON.stringify({
+        type: "answer_question",
+        tool_use_id: entry.toolUseId,
+        answers: entry.answers,
+      }),
+    );
+  }
+  savePendingAnswers(next);
+  set({ pendingAnswers: next });
+}
+
+/// Retransmit any unacked pane-label renames for the current session.
+/// Confirmed cleared when the incoming PaneList carries the matching
+/// label for the pane_id.
+function flushPendingLabels(
+  set: (partial: Partial<AppState> | ((state: AppState) => Partial<AppState>)) => void,
+  get: () => AppState,
+) {
+  const state = get();
+  const ws = state.ws;
+  const currentSid = state.sessionId;
+  if (!ws || ws.readyState !== WebSocket.OPEN || !currentSid) return;
+  const toFlush = state.pendingLabels.filter((p) => p.sessionId === currentSid);
+  if (toFlush.length === 0) return;
+  const now = Date.now();
+  const next: PendingLabel[] = state.pendingLabels
+    .filter((p) => p.sessionId !== currentSid || now - p.createdAt <= 60 * 60_000)
+    .map((p) =>
+      p.sessionId === currentSid ? { ...p, attempts: p.attempts + 1 } : p,
+    );
+  for (const entry of toFlush) {
+    if (now - entry.createdAt > 60 * 60_000) continue;
+    ws.send(
+      JSON.stringify({
+        type: "update_pane_label",
+        pane_id: entry.paneId,
+        label: entry.label,
+      }),
+    );
+  }
+  savePendingLabels(next);
+  set({ pendingLabels: next });
 }
 
 /// Update the per-pane watermark for `(sessionId, paneId)` and
@@ -2776,6 +3105,10 @@ function handleServerMessage(
             // WS window. Duplicate-arrival is fine: the user_input ack
             // dedupes against the optimistic placeholder via content+recency.
             flushPendingSends(set, get);
+            // Same idea for unacked AskUserQuestion answers.
+            flushPendingAnswers(set, get);
+            // Same idea for unacked pane-label renames.
+            flushPendingLabels(set, get);
           }, 500);
         }
         // Subscribe to every other session we have a cached snapshot for
@@ -3074,6 +3407,17 @@ function handleServerMessage(
       break;
     }
 
+    case "project_usage_stats": {
+      const sessionId = data.session_id as string | undefined;
+      const stats = data.stats as ProjectUsageStats | undefined;
+      if (sessionId && stats) {
+        set((state) => ({
+          usageStats: { ...state.usageStats, [sessionId]: stats },
+        }));
+      }
+      break;
+    }
+
     case "project_flags_changed": {
       const sessionId = data.session_id as string | undefined;
       const autoApproveTodos = data.auto_approve_todos === true;
@@ -3132,6 +3476,19 @@ function handleServerMessage(
       break;
     }
 
+    case "project_instance_created": {
+      const error = data.error as string | undefined;
+      const { showToast } = get();
+      if (error) {
+        showToast(`New instance failed: ${error}`, "error");
+      } else {
+        showToast("New instance created and starting…", "success");
+        // Refresh the machine list so the new running project appears.
+        get().listMachines();
+      }
+      break;
+    }
+
     case "pane_status": {
       // The web is multi-attached to several sessions (background tabs stay
       // live). Statuses from non-foreground sessions would otherwise
@@ -3179,12 +3536,35 @@ function handleServerMessage(
       }, {});
       // Sync is_paused from pane configs to pausedPanes state
       const pausedPaneIds = panes.filter((p) => p.is_paused).map((p) => p.pane_id);
-      set({
-        paneConfigs: panes,
-        paneModes,
-        pausedPanes: pausedPaneIds,
-        // Legacy compat
-        isDeadloopPaused: pausedPaneIds.includes(PANE_ID_DEADLOOP),
+      set((state) => {
+        // Acknowledge pending label renames when the CLI's list now
+        // reflects the requested label. Only clear on positive match
+        // — if the CLI still has the old label, keep the entry and
+        // let flushPendingLabels retry it on the next reconnect.
+        const stillPending = state.pendingLabels.filter((p) => {
+          const match = panes.find((pane) => pane.pane_id === p.paneId);
+          return !match || match.label !== p.label;
+        });
+        const labelsChanged = stillPending.length !== state.pendingLabels.length;
+        // If the CLI's list would clobber a still-pending optimistic
+        // rename, keep the optimistic label on paneConfigs and let
+        // flushPendingLabels drive it home. Otherwise trust the CLI.
+        const pendingByPane = new Map(stillPending.map((p) => [p.paneId, p.label] as const));
+        const merged = panes.map((pane) => {
+          const kept = pendingByPane.get(pane.pane_id);
+          return kept ? { ...pane, label: kept } : pane;
+        });
+        const patch: Partial<AppState> = {
+          paneConfigs: merged,
+          paneModes,
+          pausedPanes: pausedPaneIds,
+          isDeadloopPaused: pausedPaneIds.includes(PANE_ID_DEADLOOP),
+        };
+        if (labelsChanged) {
+          savePendingLabels(stillPending);
+          patch.pendingLabels = stillPending;
+        }
+        return patch;
       });
       break;
     }
@@ -3225,6 +3605,8 @@ function handleServerMessage(
         cliClientId: s.cli_client_id as string | undefined,
         workingDir: s.working_dir as string | undefined,
         hostname: s.hostname as string | undefined,
+        gitRemote: s.git_remote as string | undefined,
+        gitRemoteUrl: s.git_remote_url as string | undefined,
         status: s.status as string,
         createdAt: s.created_at as string | undefined,
         isShared: s.is_shared as boolean | undefined,
@@ -3307,6 +3689,26 @@ function handleServerMessage(
         set({ isDualPane: true });
       }
 
+      // Pre-pass: populate toolNameMap from every tool_use in this
+      // batch BEFORE mapping to Message objects. Without this, a
+      // paginated / load-more fetch that delivers a tool_result whose
+      // matching tool_use lives in an earlier (already-loaded or
+      // not-yet-loaded) page falls back to
+      // `tool: toolUseId` at line "tool: toolNameMap.get(toolUseId) ||
+      // toolUseId" — which breaks the AssistantMessage router's
+      // by-name filter for AskUserQuestion and leaks the raw
+      // "User cancelled the question by sending a new prompt." body
+      // into the chat as a red ToolCard.
+      for (const m of messages) {
+        if ((m.message_type as string) !== "tool_use") continue;
+        try {
+          const t = JSON.parse(m.content as string) as { id?: string; name?: string };
+          if (t.id && t.name) toolNameMap.set(t.id, t.name);
+        } catch {
+          // Malformed tool_use content — skip; the per-message map
+          // pass below will catch it (or fall back to text).
+        }
+      }
       const parsedMessages: Message[] = messages.map((m) => {
         const messageType = m.message_type as string || "text";
         const content = m.content as string;
@@ -3353,12 +3755,21 @@ function handleServerMessage(
                 .answers as Record<string, string> | undefined;
               if (answers && typeof answers === "object") {
                 set((state) => {
-                  if (state.answeredQuestions.has(toolUseId)) {
-                    return {};
+                  const patch: Partial<AppState> = {};
+                  if (!state.answeredQuestions.has(toolUseId)) {
+                    const nextMap = new Map(state.answeredQuestions);
+                    nextMap.set(toolUseId, answers);
+                    saveAnsweredQuestions(nextMap);
+                    patch.answeredQuestions = nextMap;
                   }
-                  const next = new Map(state.answeredQuestions);
-                  next.set(toolUseId, answers);
-                  return { answeredQuestions: next };
+                  // Claude confirmed the answer — clear any pending
+                  // retry entry so we don't re-send.
+                  const trimmed = state.pendingAnswers.filter((p) => p.toolUseId !== toolUseId);
+                  if (trimmed.length !== state.pendingAnswers.length) {
+                    savePendingAnswers(trimmed);
+                    patch.pendingAnswers = trimmed;
+                  }
+                  return patch;
                 });
               }
             }
@@ -3861,13 +4272,24 @@ function handleServerMessage(
               if (block.type === "tool_result") {
                 const toolUseId = block.tool_use_id as string | undefined;
                 if (toolUseId && toolNameMap.get(toolUseId) === "AskUserQuestion") {
+                  const capturedId = toolUseId;
                   set((state) => {
-                    if (state.answeredQuestions.has(toolUseId)) {
-                      return {};
+                    const patch: Partial<AppState> = {};
+                    if (!state.answeredQuestions.has(capturedId)) {
+                      const nextMap = new Map(state.answeredQuestions);
+                      nextMap.set(capturedId, answers);
+                      saveAnsweredQuestions(nextMap);
+                      patch.answeredQuestions = nextMap;
                     }
-                    const next = new Map(state.answeredQuestions);
-                    next.set(toolUseId, answers);
-                    return { answeredQuestions: next };
+                    // Confirm receipt — drop any pending retry entry.
+                    const trimmed = state.pendingAnswers.filter(
+                      (p) => p.toolUseId !== capturedId,
+                    );
+                    if (trimmed.length !== state.pendingAnswers.length) {
+                      savePendingAnswers(trimmed);
+                      patch.pendingAnswers = trimmed;
+                    }
+                    return patch;
                   });
                 }
               }
