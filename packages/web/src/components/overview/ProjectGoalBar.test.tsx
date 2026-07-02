@@ -214,6 +214,19 @@ describe("ProjectGoalBar team role slots", () => {
     expect(prompt).toEqual(expect.stringContaining("user-approved backlog state is preserved"));
     expect(prompt).toEqual(expect.stringContaining("configured capacity"));
     const promptText = String(prompt);
+    expect(promptText).toContain("status: proposed");
+    expect(promptText).toContain("work is already done");
+    expect(promptText).toContain("recent commits");
+    expect(promptText).toContain("current files");
+    expect(promptText).toContain("done / pr_open / in_progress");
+    expect(promptText).toContain("flip the Global to withdrawn");
+    expect(promptText).toContain("specific commit, file, or TODO evidence");
+    expect(promptText).toContain("stale while auto_approve_todos is false");
+    expect(promptText).toContain('kind: "escalation"');
+    expect(promptText).toContain("proposed -> approved");
+    expect(promptText).toContain("concrete, bounded, aligned with project_goal.md");
+    expect(promptText).toContain("not a duplicate");
+    expect(promptText).toContain("add an audit note when auto-approving");
     expect(promptText).toContain("count all status: proposed Globals across origins");
     expect(promptText).toContain("Cap at 10 outstanding proposed Globals");
     expect(promptText).toContain("count is already 10 or more");
@@ -224,6 +237,11 @@ describe("ProjectGoalBar team role slots", () => {
     expect(promptText).toContain("record the branch/commit details");
     expect(promptText).toContain("team-todo.md");
     expect(promptText).toContain("status: reviewing");
+    expect(promptText).toContain("Scratchpad append rule");
+    expect(promptText).toContain(".apas-team.jsonl record");
+    expect(promptText).toContain("generate its ts at append time");
+    expect(promptText).toContain("date -Iseconds");
+    expect(promptText).toContain("do not reuse a timestamp captured during planning");
     expect(promptText).toContain("reviewing / approved / done");
     expect(promptText).toContain("under_review");
     expect(promptText).toContain(".apas-tech-lead-cursor");
@@ -305,6 +323,11 @@ describe("ProjectGoalBar team role slots", () => {
     expect(promptText).toContain("skip proposal creation");
     expect(promptText).toContain("escalate to the Manager");
     expect(promptText).toContain("project_goal.md is empty or trivially short (<200 chars)");
+    expect(promptText).toContain("Scan .apas for current managed worker/developer readiness");
+    expect(promptText).toContain("managed developer panes");
+    expect(promptText).toContain("use that readiness");
+    expect(promptText).toContain("new proposed work can be staffed");
+    expect(promptText).toContain("current managed developer capacity");
     expect(promptText).not.toContain("may NEVER write 'approved' yourself");
     expect(addPane).toHaveBeenCalledWith(
       "claude",
