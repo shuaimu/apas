@@ -10490,17 +10490,155 @@ async fn run_server_connection(
                                                 }
                                             }
                                             ServerToCli::UpdatePaneModel { session_id: _, pane_id: target_pane, provider, model } => {
-                                                // Snapshot current PaneMeta + kill the agent child;
-                                                // re-emit AddTabWithConfig with the new provider +
-                                                // model + fresh session id so the respawned worker
-                                                // doesn't --resume the old conversation. Chat
-                                                // history stays in paneMessages on the client; the
-                                                // new agent just starts with no prior context.
+                                                // Two paths:
+                                                //
+                                                // (fast) LIVE swap via apply_flag_settings — no
+                                                //        child kill, no fresh session, no context
+                                                //        reset. Fires when the transition stays on
+                                                //        provider Claude AND neither the old nor
+                                                //        the new model triggers a backend-swap env
+                                                //        override (deepseek/glm/minimax pin
+                                                //        ANTHROPIC_BASE_URL at spawn — can't be
+                                                //        changed on a running process). Matches
+                                                //        the effort-live pattern at ~10422.
+                                                //
+                                                // (slow) Kill + respawn with a fresh session id.
+                                                //        Fallback for provider changes or backend
+                                                //        swaps. Chat history stays visible on the
+                                                //        client but is not in the new agent's
+                                                //        prompt.
                                                 let trimmed = model
                                                     .as_deref()
                                                     .map(str::trim)
                                                     .filter(|s| !s.is_empty())
                                                     .map(str::to_string);
+
+                                                // --- Fast path attempt ------------------------
+                                                let fast_path_taken = 'fast: {
+                                                    let metas = pane_metas.lock().unwrap();
+                                                    let meta = match metas.get(&target_pane) {
+                                                        Some(m) => m,
+                                                        None => break 'fast false,
+                                                    };
+                                                    let will_stay_claude = matches!(
+                                                        provider.unwrap_or(meta.provider),
+                                                        shared::Provider::Claude,
+                                                    ) && matches!(meta.provider, shared::Provider::Claude);
+                                                    let old_backend_swap = is_deepseek_model(meta.model.as_deref())
+                                                        || is_glm_model(meta.model.as_deref())
+                                                        || is_minimax_model(meta.model.as_deref());
+                                                    let new_backend_swap = is_deepseek_model(trimmed.as_deref())
+                                                        || is_glm_model(trimmed.as_deref())
+                                                        || is_minimax_model(trimmed.as_deref());
+                                                    // Only attempt live swap when the pane stays on
+                                                    // provider=Claude, neither side is a backend
+                                                    // swap, and the user picked an explicit new
+                                                    // model (clearing to default has no clean
+                                                    // apply_flag_settings verb, so respawn instead).
+                                                    if !(will_stay_claude
+                                                        && !old_backend_swap
+                                                        && !new_backend_swap
+                                                        && trimmed.is_some())
+                                                    {
+                                                        break 'fast false;
+                                                    }
+                                                    let control_tx = meta
+                                                        .control_response_tx
+                                                        .lock()
+                                                        .ok()
+                                                        .and_then(|g| g.as_ref().cloned());
+                                                    let (Some(tx), Some(new_model)) =
+                                                        (control_tx, trimmed.clone())
+                                                    else {
+                                                        break 'fast false;
+                                                    };
+                                                    let req = serde_json::json!({
+                                                        "type": "control_request",
+                                                        "request_id": format!("apas-model-{}", uuid::Uuid::new_v4()),
+                                                        "request": {
+                                                            "subtype": "apply_flag_settings",
+                                                            "settings": { "model": new_model },
+                                                        },
+                                                    });
+                                                    if tx.send(req.to_string()).is_ok() {
+                                                        tracing::info!(
+                                                            pane_id = target_pane,
+                                                            new_model = %new_model,
+                                                            "Sent apply_flag_settings(model) live to claude — no respawn",
+                                                        );
+                                                        true
+                                                    } else {
+                                                        tracing::warn!(
+                                                            pane_id = target_pane,
+                                                            "UpdatePaneModel: control_response_tx send failed; falling back to respawn",
+                                                        );
+                                                        false
+                                                    }
+                                                };
+
+                                                if fast_path_taken {
+                                                    // Update the persisted meta.model so the
+                                                    // saved .apas matches what claude is now
+                                                    // running, and so the next respawn (e.g.
+                                                    // after a CLI reboot) reads the new value.
+                                                    // Effort_arc-style mirror not needed — model
+                                                    // isn't read out-of-band by the spawn loop
+                                                    // between apply_flag_settings and PaneList.
+                                                    {
+                                                        let mut metas = pane_metas.lock().unwrap();
+                                                        if let Some(meta) = metas.get_mut(&target_pane) {
+                                                            meta.model = trimmed.clone();
+                                                        }
+                                                    }
+                                                    save_pane_configs(
+                                                        working_dir,
+                                                        &pane_sessions,
+                                                        &pane_metas,
+                                                        &pane_pauses,
+                                                        &pane_stop_requests,
+                                                    );
+                                                    // Broadcast fresh PaneList so the web tab
+                                                    // header switches its model badge.
+                                                    let pane_list_msg = CliToServer::PaneList {
+                                                        session_id,
+                                                        panes: build_pane_list(
+                                                            &pane_metas,
+                                                            &input_channels,
+                                                            session_id,
+                                                            &pane_sessions,
+                                                            &pane_pauses,
+                                                            &pane_stop_requests,
+                                                        ),
+                                                    };
+                                                    if let Ok(text) = serde_json::to_string(&pane_list_msg) {
+                                                        let _ = ws_sender.send(Message::Text(text.into())).await;
+                                                    }
+                                                    // Chat status line so the user sees the swap
+                                                    // was live — no context reset, no interrupted
+                                                    // turn.
+                                                    let banner = format!(
+                                                        "[Model switched to {} — no respawn, chat history preserved. Takes effect on the next prompt.]",
+                                                        trimmed.as_deref().unwrap_or("default"),
+                                                    );
+                                                    let banner_msg = CliToServer::Output {
+                                                        session_id,
+                                                        data: banner,
+                                                        output_type: shared::OutputType::System,
+                                                        pane_type: None,
+                                                        pane_id: Some(target_pane),
+                                                    };
+                                                    if let Ok(text) = serde_json::to_string(&banner_msg) {
+                                                        let _ = ws_sender.send(Message::Text(text.into())).await;
+                                                    }
+                                                    continue;
+                                                }
+                                                // --- Slow path (kill + respawn) --------------
+                                                tracing::info!(
+                                                    pane_id = target_pane,
+                                                    ?provider,
+                                                    ?trimmed,
+                                                    "UpdatePaneModel: fast-path not eligible or failed; falling back to kill + respawn"
+                                                );
                                                 let snapshot = {
                                                     let mut metas = pane_metas.lock().unwrap();
                                                     let Some(meta) = metas.get_mut(&target_pane) else {
