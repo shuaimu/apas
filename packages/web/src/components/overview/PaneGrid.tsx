@@ -267,7 +267,22 @@ function PaneCard({
               if (next === currentAgentValue) return;
               const picked = AGENT_OPTS.find((o) => o.value === next);
               if (!picked) return;
+              // Live-swap eligibility mirrors the CLI's fast path in
+              // UpdatePaneModel: pane stays on Claude AND neither the
+              // old nor the new model is a backend-swap (deepseek/glm/
+              // minimax pin ANTHROPIC_BASE_URL at spawn — can't be
+              // swapped on a running process).
+              const isBackendSwap = (model?: string | null) =>
+                isDeepseekModel(model) || isGlmModel(model) || isMiniMaxModel(model);
+              const stayingOnClaude =
+                pane.provider === "claude" && picked.provider === "claude";
+              const canLiveSwap =
+                stayingOnClaude &&
+                !isBackendSwap(pane.model) &&
+                !isBackendSwap(picked.model) &&
+                picked.model != null;
               if (
+                !canLiveSwap &&
                 !confirm(
                   `Switch agent to ${picked.label}? The current turn will be interrupted and the agent respawns with a fresh context — chat history stays visible but is NOT in the new agent's prompt. Make sure the host running this pane has the required CLI installed + authenticated.`,
                 )
@@ -277,7 +292,7 @@ function PaneCard({
               updatePaneModel(pane.pane_id, picked.model, picked.provider);
             }}
             className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-1 py-0 text-[10px] font-mono text-gray-700 dark:text-gray-300 focus:outline-none"
-            title="Agent frontend / API backend — switching kills the current agent child and respawns with a fresh session id"
+            title="Agent frontend / API backend — Claude→Claude with no backend swap is a live swap (next turn takes effect); provider change or backend swap respawns with a fresh session id"
           >
             {AGENT_OPTS.map((o) => (
               <option key={o.value} value={o.value}>
@@ -292,17 +307,21 @@ function PaneCard({
                 const next = e.target.value;
                 const cur = normalizeClaudeModel(pane.model);
                 if (next === cur) return;
-                if (
-                  !confirm(
-                    `Switch model to ${next}? The current turn will be interrupted and the agent respawns with a fresh context.`,
-                  )
-                ) {
-                  return;
+                // Same rule as TabbedView: specific claude model =
+                // live swap, clearing to default = respawn.
+                if (next === "default") {
+                  if (
+                    !confirm(
+                      "Clear model back to Claude's default? The current turn will be interrupted and the agent respawns with a fresh context.",
+                    )
+                  ) {
+                    return;
+                  }
                 }
                 updatePaneModel(pane.pane_id, next === "default" ? null : next);
               }}
               className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-1 py-0 text-[10px] font-mono text-gray-700 dark:text-gray-300 focus:outline-none"
-              title="Claude model (only meaningful for Claude / Official; backend-swap agents use the backend's own model)"
+              title="Claude model — fable/sonnet/opus/haiku live-swap via apply_flag_settings (no context reset). Clearing to default respawns."
             >
               {CLAUDE_MODEL_OPTS.map((o) => (
                 <option key={o.value} value={o.value}>

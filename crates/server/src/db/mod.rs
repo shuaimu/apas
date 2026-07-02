@@ -104,6 +104,16 @@ impl Database {
         let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN project_id TEXT")
             .execute(&self.pool)
             .await;
+        // Canonical `host/owner/repo` of the project's git remote, used by the
+        // web sidebar to group same-repo projects. No backfill: unlike
+        // project_id, a NULL git_remote is the intended "(no remote)" value.
+        let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN git_remote TEXT")
+            .execute(&self.pool)
+            .await;
+        // Raw cloneable origin URL (for the create-instance feature).
+        let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN git_remote_url TEXT")
+            .execute(&self.pool)
+            .await;
         // Backfill project_id for rows that pre-date the column. Until now,
         // each .apas held a single id used as both project and session id, so
         // the safest backfill is project_id = id — old rows keep their
@@ -132,6 +142,36 @@ impl Database {
         )
         .execute(&self.pool)
         .await?;
+
+        // Per-(session, pane, day) usage counters for the Overview usage panel.
+        // Day-bucketed (UTC 'YYYY-MM-DD') so lifetime / last-7-days / today
+        // windows are all derivable by aggregating buckets. Counters are
+        // additive; no backfill needed (they start at 0).
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS pane_usage_stats (
+                session_id TEXT NOT NULL,
+                pane_id INTEGER NOT NULL,
+                day TEXT NOT NULL,
+                prompt_count INTEGER NOT NULL DEFAULT 0,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                total_cost_usd REAL NOT NULL DEFAULT 0,
+                num_responses INTEGER NOT NULL DEFAULT 0,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (session_id, pane_id, day)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        let _ = sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_pane_usage_stats_session ON pane_usage_stats(session_id)",
+        )
+        .execute(&self.pool)
+        .await;
 
         // Session sharing tables
         sqlx::query(
@@ -284,14 +324,16 @@ impl Database {
             .unwrap_or_else(|| session.id.clone());
         sqlx::query(
             r#"
-            INSERT INTO sessions (id, user_id, cli_client_id, working_dir, hostname, status, project_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO sessions (id, user_id, cli_client_id, working_dir, hostname, status, project_id, git_remote, git_remote_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 cli_client_id = excluded.cli_client_id,
                 working_dir = excluded.working_dir,
                 hostname = excluded.hostname,
                 status = excluded.status,
                 project_id = excluded.project_id,
+                git_remote = excluded.git_remote,
+                git_remote_url = excluded.git_remote_url,
                 updated_at = CURRENT_TIMESTAMP,
                 user_id = CASE
                     WHEN (SELECT email FROM users WHERE id = sessions.user_id) LIKE 'dev-%@local'
@@ -307,6 +349,8 @@ impl Database {
         .bind(&session.hostname)
         .bind(&session.status)
         .bind(&project_id)
+        .bind(&session.git_remote)
+        .bind(&session.git_remote_url)
         .execute(&self.pool)
         .await?;
 
@@ -379,7 +423,7 @@ impl Database {
 
     pub async fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let session = sqlx::query_as::<_, Session>(
-            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at, COALESCE(is_paused, 0) as is_paused, COALESCE(project_id, id) as project_id FROM sessions WHERE id = ?",
+            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at, COALESCE(is_paused, 0) as is_paused, COALESCE(project_id, id) as project_id, git_remote, git_remote_url FROM sessions WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -418,7 +462,7 @@ impl Database {
 
     pub async fn get_all_sessions(&self) -> Result<Vec<Session>> {
         let sessions = sqlx::query_as::<_, Session>(
-            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at, COALESCE(is_paused, 0) as is_paused, COALESCE(project_id, id) as project_id FROM sessions ORDER BY created_at DESC LIMIT 50",
+            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at, COALESCE(is_paused, 0) as is_paused, COALESCE(project_id, id) as project_id, git_remote, git_remote_url FROM sessions ORDER BY created_at DESC LIMIT 50",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -427,7 +471,7 @@ impl Database {
 
     pub async fn get_sessions_for_user(&self, user_id: &str) -> Result<Vec<Session>> {
         let sessions = sqlx::query_as::<_, Session>(
-            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at, COALESCE(is_paused, 0) as is_paused, COALESCE(project_id, id) as project_id FROM sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
+            "SELECT id, user_id, cli_client_id, working_dir, hostname, status, created_at, updated_at, COALESCE(is_paused, 0) as is_paused, COALESCE(project_id, id) as project_id, git_remote, git_remote_url FROM sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
         )
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -541,7 +585,7 @@ impl Database {
         // Returns sessions shared with this user along with the owner's email and share role
         let rows = sqlx::query(
             r#"
-            SELECT s.id, s.user_id, s.cli_client_id, s.working_dir, s.hostname, s.status, s.created_at, s.updated_at, COALESCE(s.is_paused, 0) as is_paused, COALESCE(s.project_id, s.id) as project_id, u.email, COALESCE(ss.role, 'user') AS role
+            SELECT s.id, s.user_id, s.cli_client_id, s.working_dir, s.hostname, s.status, s.created_at, s.updated_at, COALESCE(s.is_paused, 0) as is_paused, COALESCE(s.project_id, s.id) as project_id, s.git_remote, s.git_remote_url, u.email, COALESCE(ss.role, 'user') AS role
             FROM sessions s
             INNER JOIN session_shares ss ON s.id = ss.session_id
             INNER JOIN users u ON s.user_id = u.id
@@ -568,6 +612,8 @@ impl Database {
                 updated_at: row.get("updated_at"),
                 is_paused: row.get::<i32, _>("is_paused") != 0,
                 project_id: row.get("project_id"),
+                git_remote: row.get("git_remote"),
+                git_remote_url: row.get("git_remote_url"),
             };
             let email: String = row.get("email");
             let role: String = row.get("role");
@@ -820,5 +866,299 @@ impl Database {
                 (r.get("day"), r.get("count"))
             })
             .collect())
+    }
+
+    /// Additively record a usage delta into today's bucket for (session, pane).
+    /// `day` is a UTC `YYYY-MM-DD` string. Counters accumulate via ON CONFLICT.
+    pub async fn add_pane_usage(
+        &self,
+        session_id: &str,
+        pane_id: i64,
+        day: &str,
+        delta: &UsageDelta,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO pane_usage_stats
+                (session_id, pane_id, day, prompt_count, input_tokens, output_tokens,
+                 cache_read_tokens, cache_creation_tokens, total_cost_usd, num_responses, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(session_id, pane_id, day) DO UPDATE SET
+                prompt_count = prompt_count + excluded.prompt_count,
+                input_tokens = input_tokens + excluded.input_tokens,
+                output_tokens = output_tokens + excluded.output_tokens,
+                cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+                cache_creation_tokens = cache_creation_tokens + excluded.cache_creation_tokens,
+                total_cost_usd = total_cost_usd + excluded.total_cost_usd,
+                num_responses = num_responses + excluded.num_responses,
+                updated_at = CURRENT_TIMESTAMP
+            "#,
+        )
+        .bind(session_id)
+        .bind(pane_id)
+        .bind(day)
+        .bind(delta.prompt_count)
+        .bind(delta.input_tokens)
+        .bind(delta.output_tokens)
+        .bind(delta.cache_read_tokens)
+        .bind(delta.cache_creation_tokens)
+        .bind(delta.total_cost_usd)
+        .bind(delta.num_responses)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Aggregate usage for the whole project that `session_id` belongs to
+    /// (all sessions sharing its project_id), split per pane into the
+    /// lifetime / last-7-days / today windows used by the Overview panel.
+    pub async fn get_project_usage_stats(
+        &self,
+        session_id: &str,
+    ) -> Result<shared::ProjectUsageStats> {
+        let rows = sqlx::query_as::<_, PaneUsageDayRow>(
+            r#"
+            SELECT pus.pane_id, pus.day, pus.prompt_count, pus.input_tokens, pus.output_tokens,
+                   pus.cache_read_tokens, pus.cache_creation_tokens, pus.total_cost_usd,
+                   pus.num_responses, pus.updated_at
+            FROM pane_usage_stats pus
+            JOIN sessions s ON s.id = pus.session_id
+            WHERE COALESCE(s.project_id, s.id) =
+                  (SELECT COALESCE(project_id, id) FROM sessions WHERE id = ?)
+            "#,
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        // 7-day window is today plus the previous 6 days, inclusive.
+        let week_start = (chrono::Utc::now() - chrono::Duration::days(6))
+            .format("%Y-%m-%d")
+            .to_string();
+
+        use std::collections::BTreeMap;
+        let mut by_pane: BTreeMap<i64, shared::PaneUsageStats> = BTreeMap::new();
+        let mut project = shared::ProjectUsageStats::default();
+
+        for r in &rows {
+            let pane = by_pane
+                .entry(r.pane_id)
+                .or_insert_with(|| shared::PaneUsageStats {
+                    pane_id: r.pane_id as u32,
+                    ..Default::default()
+                });
+            accumulate(&mut pane.lifetime, r);
+            accumulate(&mut project.lifetime, r);
+            if r.day.as_str() >= week_start.as_str() {
+                accumulate(&mut pane.last_7d, r);
+                accumulate(&mut project.last_7d, r);
+            }
+            if r.day == today {
+                accumulate(&mut pane.today, r);
+                accumulate(&mut project.today, r);
+            }
+            if let Some(ua) = &r.updated_at {
+                // Normalize SQLite's "YYYY-MM-DD HH:MM:SS" to RFC3339 (UTC)
+                // BEFORE comparing/storing, so the max comparison stays
+                // consistent and clients can parse the timestamp.
+                let ua = sqlite_ts_to_rfc3339(ua);
+                if pane
+                    .last_active
+                    .as_deref()
+                    .map_or(true, |cur| cur < ua.as_str())
+                {
+                    pane.last_active = Some(ua.clone());
+                }
+                if project
+                    .last_active
+                    .as_deref()
+                    .map_or(true, |cur| cur < ua.as_str())
+                {
+                    project.last_active = Some(ua);
+                }
+            }
+        }
+
+        project.panes = by_pane.into_values().collect();
+        Ok(project)
+    }
+}
+
+/// Additive usage delta applied to a (session, pane, day) bucket.
+#[derive(Debug, Clone, Default)]
+pub struct UsageDelta {
+    pub prompt_count: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub total_cost_usd: f64,
+    pub num_responses: i64,
+}
+
+/// SQLite `CURRENT_TIMESTAMP` is `YYYY-MM-DD HH:MM:SS` (UTC, no zone marker).
+/// Render it as RFC3339 so the web can parse `last_active` unambiguously.
+fn sqlite_ts_to_rfc3339(ts: &str) -> String {
+    if ts.len() == 19 && ts.as_bytes().get(10) == Some(&b' ') {
+        format!("{}T{}Z", &ts[..10], &ts[11..])
+    } else {
+        ts.to_string()
+    }
+}
+
+/// Fold one day-bucket row into a window's running counters (negatives,
+/// which never occur in practice, are clamped to 0 before the u64 cast).
+fn accumulate(c: &mut shared::UsageCounters, r: &PaneUsageDayRow) {
+    c.prompts += r.prompt_count.max(0) as u64;
+    c.responses += r.num_responses.max(0) as u64;
+    c.input_tokens += r.input_tokens.max(0) as u64;
+    c.output_tokens += r.output_tokens.max(0) as u64;
+    c.cache_read_tokens += r.cache_read_tokens.max(0) as u64;
+    c.cache_creation_tokens += r.cache_creation_tokens.max(0) as u64;
+    c.cost_usd += r.total_cost_usd;
+}
+
+#[cfg(test)]
+mod usage_stats_tests {
+    use super::*;
+
+    async fn temp_db() -> Database {
+        let dir = std::env::temp_dir().join(format!("apas-usage-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp db dir");
+        let path = dir.join("apas.db").to_string_lossy().to_string();
+        let db = Database::new(&path).await.expect("db");
+        db.run_migrations().await.expect("migrations");
+        db
+    }
+
+    fn session(id: &str, project_id: &str) -> Session {
+        Session {
+            id: id.to_string(),
+            user_id: "u1".to_string(),
+            cli_client_id: None,
+            working_dir: None,
+            hostname: None,
+            status: "active".to_string(),
+            created_at: None,
+            updated_at: None,
+            is_paused: false,
+            project_id: Some(project_id.to_string()),
+            git_remote: None,
+            git_remote_url: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn pane_usage_aggregates_per_window_and_per_pane() {
+        let db = temp_db().await;
+        let sid = "11111111-1111-1111-1111-111111111111";
+        db.create_session(&session(sid, "project-A")).await.unwrap();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+        // Two additive turns for pane 178 today, plus a prompt.
+        db.add_pane_usage(
+            sid,
+            178,
+            &today,
+            &UsageDelta {
+                input_tokens: 100,
+                output_tokens: 50,
+                total_cost_usd: 0.02,
+                num_responses: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        db.add_pane_usage(
+            sid,
+            178,
+            &today,
+            &UsageDelta {
+                prompt_count: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // An old-day bucket for pane 178 — counts toward lifetime only.
+        db.add_pane_usage(
+            sid,
+            178,
+            "2020-01-01",
+            &UsageDelta {
+                input_tokens: 1000,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // A second pane.
+        db.add_pane_usage(
+            sid,
+            568,
+            &today,
+            &UsageDelta {
+                input_tokens: 10,
+                num_responses: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let stats = db.get_project_usage_stats(sid).await.unwrap();
+        assert_eq!(stats.panes.len(), 2);
+
+        let p178 = stats.panes.iter().find(|p| p.pane_id == 178).unwrap();
+        assert_eq!(p178.lifetime.input_tokens, 1100);
+        assert_eq!(p178.lifetime.output_tokens, 50);
+        assert_eq!(p178.lifetime.prompts, 1);
+        assert_eq!(p178.lifetime.responses, 1);
+        // The 2020 bucket is outside today/7d.
+        assert_eq!(p178.today.input_tokens, 100);
+        assert_eq!(p178.last_7d.input_tokens, 100);
+        assert!((p178.lifetime.cost_usd - 0.02).abs() < 1e-9);
+
+        // Project totals sum across both panes.
+        assert_eq!(stats.lifetime.input_tokens, 1110);
+        assert_eq!(stats.today.input_tokens, 110);
+        assert_eq!(stats.lifetime.responses, 2);
+        assert_eq!(stats.lifetime.prompts, 1);
+    }
+
+    #[tokio::test]
+    async fn usage_stats_scope_to_their_project() {
+        let db = temp_db().await;
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        db.create_session(&session("s-a", "proj-1")).await.unwrap();
+        db.create_session(&session("s-b", "proj-2")).await.unwrap();
+        db.add_pane_usage(
+            "s-a",
+            1,
+            &today,
+            &UsageDelta {
+                input_tokens: 5,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        db.add_pane_usage(
+            "s-b",
+            1,
+            &today,
+            &UsageDelta {
+                input_tokens: 99,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // s-a's project must not see s-b's usage.
+        let a = db.get_project_usage_stats("s-a").await.unwrap();
+        assert_eq!(a.lifetime.input_tokens, 5);
     }
 }

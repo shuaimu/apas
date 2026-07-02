@@ -266,6 +266,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 project_id,
                                 working_dir,
                                 hostname,
+                                git_remote,
+                                git_remote_url,
                                 pane_type: _,
                                 panes,
                             }) => {
@@ -395,6 +397,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     updated_at: None,
                                     is_paused: false,
                                     project_id: Some(project_id.to_string()),
+                                    git_remote,
+                                    git_remote_url,
                                 };
                                 if let Err(e) = state.db.create_session(&session).await {
                                     tracing::error!("Failed to persist session to database: {}", e);
@@ -505,6 +509,41 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 // Use pane_id for storage, falling back to pane_type for backward compat
                                 let effective_pane_id = pane_id.or_else(|| pane_type.map(|p| shared::PaneConfig::pane_id_from_legacy(&p)));
 
+                                // A `result` stream event ends a turn and carries the turn's
+                                // token usage (in `extra.usage`) + cost. Capture it as a usage
+                                // delta before `message` is moved into the web broadcast below.
+                                let usage_delta = if let shared::ClaudeStreamMessage::Result {
+                                    extra,
+                                    total_cost_usd,
+                                    subtype,
+                                    ..
+                                } = &message
+                                {
+                                    let success = subtype.as_str() == "success";
+                                    let usage = extra.get("usage");
+                                    let token = |key: &str| {
+                                        usage
+                                            .and_then(|u| u.get(key))
+                                            .and_then(serde_json::Value::as_u64)
+                                            .unwrap_or(0) as i64
+                                    };
+                                    Some(crate::db::UsageDelta {
+                                        prompt_count: 0,
+                                        input_tokens: token("input_tokens"),
+                                        output_tokens: token("output_tokens"),
+                                        cache_read_tokens: token("cache_read_input_tokens"),
+                                        cache_creation_tokens: token("cache_creation_input_tokens"),
+                                        // Cost is billed even for error_max_turns /
+                                        // error_during_execution turns, so record it
+                                        // regardless of subtype; only count a *completed*
+                                        // response on success.
+                                        total_cost_usd: *total_cost_usd,
+                                        num_responses: if success { 1 } else { 0 },
+                                    })
+                                } else {
+                                    None
+                                };
+
                                 // Save message(s) to file storage. Remember the max created_at
                                 // of the stored fragments so we can hand it to the web client as
                                 // a reconnect high-water mark.
@@ -528,6 +567,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     )
                                     .await;
                                 tracing::info!("StreamMessage routed to web: {}", routed);
+
+                                // Record the turn's usage and push refreshed project
+                                // stats to the Overview. `result` arrives once per turn,
+                                // so this is not chatty.
+                                if let Some(delta) = usage_delta {
+                                    record_and_broadcast_usage(&state, session_id, effective_pane_id, delta).await;
+                                }
                             }
                             Ok(CliToServer::UserInput { session_id, text, pane_type, pane_id }) => {
                                 tracing::info!("Received UserInput for session {}: {}", session_id, text);
@@ -555,6 +601,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         ServerToWeb::UserInput { session_id, text, pane_type, pane_id, created_at: Some(created_at), client_msg_id: None },
                                     )
                                     .await;
+
+                                // Count this input as a prompt for the pane and refresh
+                                // the Overview usage stats.
+                                record_and_broadcast_usage(
+                                    &state,
+                                    session_id,
+                                    effective_pane_id,
+                                    crate::db::UsageDelta { prompt_count: 1, ..Default::default() },
+                                )
+                                .await;
                             }
                             Ok(CliToServer::SessionEnd { session_id, reason }) => {
                                 // Update session status in database
@@ -920,6 +976,45 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         cli_id,
         session_ids.len()
     );
+}
+
+/// Record a usage delta for (session, pane) into today's UTC bucket and push
+/// the refreshed project-level usage stats to any attached web clients. Shared
+/// with the web-input path (`ws_web::handle_web_input`) so prompts typed in the
+/// web UI are counted too.
+pub(crate) async fn record_and_broadcast_usage(
+    state: &AppState,
+    session_id: Uuid,
+    pane_id: Option<u32>,
+    delta: crate::db::UsageDelta,
+) {
+    let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    // Unattributed turns (no pane_id, e.g. legacy hybrid mode) land in pane 0.
+    let pid = pane_id.unwrap_or(0) as i64;
+    if let Err(e) = state
+        .db
+        .add_pane_usage(&session_id.to_string(), pid, &day, &delta)
+        .await
+    {
+        tracing::error!("Failed to record pane usage: {}", e);
+        return;
+    }
+    match state
+        .db
+        .get_project_usage_stats(&session_id.to_string())
+        .await
+    {
+        Ok(stats) => {
+            state
+                .sessions
+                .route_to_web(
+                    &session_id,
+                    ServerToWeb::ProjectUsageStats { session_id, stats },
+                )
+                .await;
+        }
+        Err(e) => tracing::error!("Failed to read project usage stats: {}", e),
+    }
 }
 
 /// Convert a ClaudeStreamMessage to StoredMessages for file storage

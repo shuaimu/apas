@@ -526,6 +526,114 @@ impl DaemonState {
         }
         Ok(())
     }
+
+    /// Clone a repo into a fresh instance directory under the projects root
+    /// (default `~/apas_projects`, auto-suffixed on collision), check out a new
+    /// branch, register a `.apas`, and start the headless CLI. Returns the new
+    /// (project_id, absolute path).
+    fn create_instance(
+        &mut self,
+        git_remote: &str,
+        instance_name: &str,
+        branch: &str,
+        clone_url: Option<&str>,
+        base_path: Option<&str>,
+        server_url: &str,
+        token: &str,
+    ) -> Result<(String, String)> {
+        // Projects root: an explicit base_path (with leading ~ expanded against
+        // THIS machine's $HOME), else ~/apas_projects.
+        let root = match base_path {
+            Some(p) if !p.trim().is_empty() => expand_tilde(p.trim()),
+            _ => dirs::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("could not resolve home directory"))?
+                .join("apas_projects"),
+        };
+        let name = crate::worktree::sanitize_instance_name(instance_name);
+        let dest = crate::worktree::unique_dir(&root.join(&name));
+
+        // Make sure the projects root exists before cloning into it.
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let url = self.resolve_clone_url(git_remote, clone_url);
+
+        // Clone + branch + register. If any of these PRE-registration steps
+        // fail, remove the partial clone so retries don't accumulate orphan
+        // directories (unique_dir would otherwise auto-suffix forever).
+        let safe_branch = crate::worktree::sanitize_branch_name(branch);
+        let metadata = match (|| {
+            crate::worktree::clone_repo(&url, &dest)?;
+            let created_branch = crate::worktree::checkout_unique_branch(&dest, &safe_branch)?;
+            tracing::info!(
+                "Cloned {} into {} on branch {}",
+                url,
+                dest.display(),
+                created_branch
+            );
+            crate::project::get_or_create_project(&dest)
+        })() {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&dest);
+                return Err(err);
+            }
+        };
+
+        // The instance now exists and is registered. A start failure is NOT a
+        // create failure — surface it as a warning (the project shows on the
+        // machines page with last_error and can be started there) so the user
+        // doesn't get a "failed" toast for an instance that was created.
+        let project_id = metadata.id.to_string();
+        self.refresh_projects();
+        if let Err(err) = self.start_project(&project_id, server_url, token) {
+            tracing::warn!(
+                "Created instance {} but failed to auto-start it: {}",
+                project_id,
+                err
+            );
+        }
+
+        Ok((project_id, dest.to_string_lossy().to_string()))
+    }
+
+    /// Resolve a cloneable URL for the canonical `git_remote` (host/owner/repo):
+    /// honor an explicit `clone_url`, else reuse the exact `origin` of an
+    /// existing checkout of the same repo on this machine (preserves SSH/auth),
+    /// else reconstruct an https URL from the key.
+    fn resolve_clone_url(&self, git_remote: &str, clone_url: Option<&str>) -> String {
+        if let Some(u) = clone_url {
+            let u = u.trim();
+            if !u.is_empty() {
+                return u.to_string();
+            }
+        }
+        for project in self.projects.values() {
+            if crate::worktree::normalized_git_remote(&project.path).as_deref()
+                == Some(git_remote)
+            {
+                if let Some(raw) = crate::worktree::raw_git_remote(&project.path) {
+                    return raw;
+                }
+            }
+        }
+        format!("https://{}.git", git_remote.trim_matches('/'))
+    }
+}
+
+/// Expand a leading `~` / `~/` in `p` against this machine's $HOME.
+fn expand_tilde(p: &str) -> PathBuf {
+    if p == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    } else if let Some(rest) = p.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(p)
 }
 
 pub async fn run(
@@ -710,6 +818,59 @@ async fn run_connection(
                                 };
                                 let text = serde_json::to_string(&update)?;
                                 ws_sender.send(Message::Text(text.into())).await?;
+                            }
+                            ServerToDaemon::CreateProjectInstance {
+                                git_remote,
+                                instance_name,
+                                branch,
+                                clone_url,
+                                base_path,
+                                request_id,
+                            } => {
+                                // NOTE: clone runs inline on the message loop; a
+                                // very large clone briefly delays heartbeats.
+                                // GIT_TERMINAL_PROMPT=0 makes auth fail fast.
+                                let ack = match state.create_instance(
+                                    &git_remote,
+                                    &instance_name,
+                                    &branch,
+                                    clone_url.as_deref(),
+                                    base_path.as_deref(),
+                                    server_url,
+                                    token,
+                                ) {
+                                    Ok((project_id, path)) => {
+                                        tracing::info!(
+                                            "Created project instance {} at {}",
+                                            project_id,
+                                            path
+                                        );
+                                        DaemonToServer::ProjectInstanceCreated {
+                                            request_id,
+                                            project_id: Some(project_id),
+                                            path: Some(path),
+                                            error: None,
+                                        }
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!("create_instance failed: {}", err);
+                                        DaemonToServer::ProjectInstanceCreated {
+                                            request_id,
+                                            project_id: None,
+                                            path: None,
+                                            error: Some(err.to_string()),
+                                        }
+                                    }
+                                };
+                                ws_sender
+                                    .send(Message::Text(serde_json::to_string(&ack)?.into()))
+                                    .await?;
+                                let update = DaemonToServer::Heartbeat {
+                                    projects: state.snapshot_projects(),
+                                };
+                                ws_sender
+                                    .send(Message::Text(serde_json::to_string(&update)?.into()))
+                                    .await?;
                             }
                             ServerToDaemon::RefreshProjects => {
                                 state.refresh_projects();
