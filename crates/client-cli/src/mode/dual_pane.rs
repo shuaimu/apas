@@ -10128,20 +10128,92 @@ async fn run_server_connection(
                                                     let sessions = pane_sessions.lock().unwrap();
                                                     sessions.get(&target).copied()
                                                 };
+                                                tracing::info!(
+                                                    pane_id = target,
+                                                    label = %meta.label,
+                                                    mode = ?meta.mode,
+                                                    ?prior_session_id,
+                                                    "RebootPane: begin",
+                                                );
                                                 let (close_event, add_event) =
                                                     build_pane_reboot_events(target, &meta, prior_session_id);
 
-                                                let _ = tui_event_tx.send(close_event);
-                                                let _ = tui_event_tx.send(add_event);
+                                                if let Err(err) = tui_event_tx.send(close_event) {
+                                                    tracing::warn!(pane_id = target, %err, "RebootPane: CloseTab send failed");
+                                                }
+                                                // Clone the add_event so the defensive-retry loop
+                                                // below can re-send it if the first delivery is
+                                                // silently dropped between CloseTab and processing.
+                                                // Cheap — AddTabWithConfig is a plain data enum.
+                                                let add_event_retry = add_event.clone();
+                                                if let Err(err) = tui_event_tx.send(add_event) {
+                                                    tracing::warn!(pane_id = target, %err, "RebootPane: AddTabWithConfig send failed");
+                                                }
                                                 let _ = status_tx.send(PaneOutput {
                                                     text: "[Pane rebooted — agent restarted on the same session]".to_string(),
                                                     pane_id: target,
                                                 });
                                                 tracing::info!(
                                                     pane_id = target,
-                                                    ?prior_session_id,
-                                                    "Pane rebooted from web (resume same session)",
+                                                    "RebootPane: events dispatched, verifying respawn",
                                                 );
+
+                                                // Defensive verify-and-retry: user-reported bug on
+                                                // mako Claude-6 had the pane disappearing entirely
+                                                // after Reboot. Root cause was hard to reproduce —
+                                                // guard against it by polling pane_metas for up to
+                                                // ~2s; if the tab is still missing after the tui
+                                                // event loop should have consumed both events, log
+                                                // the failure and re-emit AddTabWithConfig so the
+                                                // user isn't stranded staring at a vanished pane.
+                                                let pane_metas_verify = pane_metas.clone();
+                                                let tui_event_tx_verify = tui_event_tx.clone();
+                                                let status_tx_verify = status_tx.clone();
+                                                tokio::task::spawn_blocking(move || {
+                                                    for attempt in 0..10 {
+                                                        std::thread::sleep(Duration::from_millis(200));
+                                                        let present = pane_metas_verify
+                                                            .lock()
+                                                            .map(|g| g.contains_key(&target))
+                                                            .unwrap_or(false);
+                                                        if present {
+                                                            if attempt > 0 {
+                                                                tracing::info!(
+                                                                    pane_id = target,
+                                                                    attempts = attempt + 1,
+                                                                    "RebootPane: pane respawned after retry",
+                                                                );
+                                                            }
+                                                            return;
+                                                        }
+                                                    }
+                                                    tracing::warn!(
+                                                        pane_id = target,
+                                                        "RebootPane: pane still missing 2s after events dispatched; re-emitting AddTabWithConfig",
+                                                    );
+                                                    if let Err(err) = tui_event_tx_verify.send(add_event_retry) {
+                                                        tracing::error!(
+                                                            pane_id = target,
+                                                            %err,
+                                                            "RebootPane: defensive re-emit failed",
+                                                        );
+                                                        let _ = status_tx_verify.send(PaneOutput {
+                                                            text: format!(
+                                                                "[Reboot: pane {} vanished and auto-recovery failed; add it back manually]",
+                                                                target,
+                                                            ),
+                                                            pane_id: target,
+                                                        });
+                                                    } else {
+                                                        let _ = status_tx_verify.send(PaneOutput {
+                                                            text: format!(
+                                                                "[Reboot: pane {} was lost between close and add; re-emitted respawn]",
+                                                                target,
+                                                            ),
+                                                            pane_id: target,
+                                                        });
+                                                    }
+                                                });
                                             }
                                             ServerToCli::RemovePane { session_id: _, pane_id: remove_id, cleanup_action } => {
                                                 // Reset team-todo for this pane: drop its `## pane:<id>`
