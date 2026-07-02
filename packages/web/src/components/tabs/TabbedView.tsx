@@ -2419,6 +2419,24 @@ export function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, 
     }
   }, [messages.length, isActive]);
 
+  // Only mount the newest `revealCount` messages until the user expands.
+  // `expanded` latches once they've paged all the way back, so older
+  // server-loaded (prepended) messages keep rendering. Computed BEFORE any
+  // early return so the useMemo below always runs — otherwise a pane that
+  // first renders empty then receives messages changes its hook count
+  // between renders (React error #310: "rendered more hooks than before").
+  const hiddenCount = expanded ? 0 : Math.max(0, messages.length - revealCount);
+  hiddenCountRef.current = hiddenCount;
+  const visibleMessages = hiddenCount > 0 ? messages.slice(hiddenCount) : messages;
+  // Second-level fold: collapse consecutive tool_use / tool_result runs of at
+  // least TOOL_GROUP_MIN_ITEMS into one expandable ToolGroupCard so long
+  // tool-chain turns don't drown the readable text. Individual ToolCards
+  // inside remain foldable; AskUserQuestion stays inline.
+  const renderItems = useMemo(
+    () => groupMessagesForRender(visibleMessages),
+    [visibleMessages],
+  );
+
   if (messages.length === 0) {
     const lowerRole = (role ?? "").toLowerCase();
     const isManager =
@@ -2452,23 +2470,6 @@ export function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, 
       </div>
     );
   }
-
-  // Only mount the newest `revealCount` messages until the user expands.
-  // `expanded` latches once they've paged all the way back, so older
-  // server-loaded (prepended) messages keep rendering.
-  const hiddenCount = expanded ? 0 : Math.max(0, messages.length - revealCount);
-  hiddenCountRef.current = hiddenCount;
-  const visibleMessages = hiddenCount > 0 ? messages.slice(hiddenCount) : messages;
-  // Second-level fold: collapse consecutive tool_use / tool_result
-  // runs of at least TOOL_GROUP_MIN_ITEMS messages into a single
-  // expandable ToolGroupCard so long tool-chain turns don't drown
-  // the readable text. Individual ToolCards inside remain foldable
-  // (the existing per-card behavior). AskUserQuestion tool_use /
-  // result stays inline — the user has to see and click it.
-  const renderItems = useMemo(
-    () => groupMessagesForRender(visibleMessages),
-    [visibleMessages],
-  );
 
   return (
     <div
