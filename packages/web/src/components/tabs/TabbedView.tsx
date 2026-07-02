@@ -7,6 +7,7 @@ import { extractTimeline, TimelineEntry } from "@/lib/timeline";
 import { OverviewView } from "../overview/OverviewView";
 import { UserMessage } from "../chat/UserMessage";
 import { AssistantMessage } from "../chat/AssistantMessage";
+import { ToolGroupCard, groupMessagesForRender } from "../chat/ToolGroupCard";
 import { TabBar } from "./TabBar";
 import { WorkerTaskBar } from "./WorkerTaskBar";
 import { UsageLimitsDisplay } from "../UsageLimits";
@@ -248,8 +249,13 @@ function isDeepseekModel(model?: string): boolean {
 }
 
 // Listed lowest → highest. xhigh sits between high and max (Opus-only
-// extra-deep tier); max is the highest level.
+// extra-deep tier); max is the highest level. `ultracode` is a special
+// top-of-list entry — it is NOT a strict effort tier but an apas-only
+// workflow (xhigh wire flag + auto multi-agent prompt prefix), so it
+// renders at the top of the dropdown above max despite breaking the
+// ordering invariant.
 const CLAUDE_EFFORT_OPTIONS = [
+  { value: "ultracode", label: "UltraCode" },
   { value: "default", label: "Default" },
   { value: "low", label: "Low" },
   { value: "medium", label: "Medium" },
@@ -319,7 +325,8 @@ function normalizeClaudeEffortOption(raw?: string | null): ClaudeEffortOption {
     normalized === "medium" ||
     normalized === "high" ||
     normalized === "max" ||
-    normalized === "xhigh"
+    normalized === "xhigh" ||
+    normalized === "ultracode"
   ) {
     return normalized;
   }
@@ -1056,7 +1063,13 @@ export function TabbedView() {
                   title="Claude thinking effort — persisted per tab"
                 >
                   {CLAUDE_EFFORT_OPTIONS.map((option) => (
-                    <option key={option.value} value={option.value}>
+                    <option
+                      key={option.value}
+                      value={option.value}
+                      {...(option.value === "ultracode"
+                        ? { title: "xhigh + auto multi-agent workflows" }
+                        : {})}
+                    >
                       {option.label}
                     </option>
                   ))}
@@ -1096,17 +1109,26 @@ export function TabbedView() {
                   onChange={(e) => {
                     const next = e.target.value as ClaudeModelOption;
                     if (next === activeModelOption) return;
-                    if (
-                      !confirm(
-                        `Switch model to ${next}? The current turn will be interrupted and the agent will respawn with a fresh context — chat history above stays visible but is NOT in the new agent's prompt.`,
-                      )
-                    ) {
-                      return;
+                    // Only the "default" (clear-model) transition
+                    // respawns — the CLI's fast-path
+                    // apply_flag_settings live-swap requires an
+                    // explicit model id, so clearing falls back to
+                    // kill + fresh session. Every specific claude
+                    // model (fable/sonnet/opus/haiku) is a live
+                    // swap: no interrupted turn, no context reset.
+                    if (next === "default") {
+                      if (
+                        !confirm(
+                          "Clear model back to Claude's default? The current turn will be interrupted and the agent will respawn with a fresh context — chat history above stays visible but is NOT in the new agent's prompt.",
+                        )
+                      ) {
+                        return;
+                      }
                     }
                     updatePaneModel(activeTabId, next === "default" ? null : next);
                   }}
                   className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-1.5 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  title="Claude model — switching kills the current claude child and respawns with a fresh session_id"
+                  title="Claude model — switching between fable/sonnet/opus/haiku live-swaps via apply_flag_settings (no context reset). Clearing to default respawns."
                 >
                   {CLAUDE_MODEL_OPTIONS.map((option) => (
                     <option key={option.value} value={option.value}>
@@ -2397,6 +2419,24 @@ export function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, 
     }
   }, [messages.length, isActive]);
 
+  // Only mount the newest `revealCount` messages until the user expands.
+  // `expanded` latches once they've paged all the way back, so older
+  // server-loaded (prepended) messages keep rendering. Computed BEFORE any
+  // early return so the useMemo below always runs — otherwise a pane that
+  // first renders empty then receives messages changes its hook count
+  // between renders (React error #310: "rendered more hooks than before").
+  const hiddenCount = expanded ? 0 : Math.max(0, messages.length - revealCount);
+  hiddenCountRef.current = hiddenCount;
+  const visibleMessages = hiddenCount > 0 ? messages.slice(hiddenCount) : messages;
+  // Second-level fold: collapse consecutive tool_use / tool_result runs of at
+  // least TOOL_GROUP_MIN_ITEMS into one expandable ToolGroupCard so long
+  // tool-chain turns don't drown the readable text. Individual ToolCards
+  // inside remain foldable; AskUserQuestion stays inline.
+  const renderItems = useMemo(
+    () => groupMessagesForRender(visibleMessages),
+    [visibleMessages],
+  );
+
   if (messages.length === 0) {
     const lowerRole = (role ?? "").toLowerCase();
     const isManager =
@@ -2431,13 +2471,6 @@ export function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, 
     );
   }
 
-  // Only mount the newest `revealCount` messages until the user expands.
-  // `expanded` latches once they've paged all the way back, so older
-  // server-loaded (prepended) messages keep rendering.
-  const hiddenCount = expanded ? 0 : Math.max(0, messages.length - revealCount);
-  hiddenCountRef.current = hiddenCount;
-  const visibleMessages = hiddenCount > 0 ? messages.slice(hiddenCount) : messages;
-
   return (
     <div
       ref={containerRef}
@@ -2458,9 +2491,13 @@ export function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, 
           </button>
         </div>
       )}
-      {visibleMessages.map((message) => (
-        <MessageComponent key={message.id} message={message} />
-      ))}
+      {renderItems.map((item) =>
+        item.kind === "tool-group" ? (
+          <ToolGroupCard key={item.id} items={item.items} />
+        ) : (
+          <MessageComponent key={item.message.id} message={item.message} />
+        ),
+      )}
       <div ref={messagesEndRef} />
     </div>
   );

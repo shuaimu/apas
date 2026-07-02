@@ -35,6 +35,15 @@ pub struct Session {
     /// one-session-per-project.
     #[sqlx(default)]
     pub project_id: Option<String>,
+    /// Canonical `host/owner/repo` of the project's git `origin` remote, sent by
+    /// the CLI in SessionStart. The web sidebar groups sessions by this. `None`
+    /// for rows that pre-date the column or projects with no remote.
+    #[sqlx(default)]
+    pub git_remote: Option<String>,
+    /// Raw `origin` URL (cloneable) for this project's repo, sent by the CLI.
+    /// Surfaced to the web to prefill the clone URL when creating an instance.
+    #[sqlx(default)]
+    pub git_remote_url: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -46,6 +55,30 @@ pub struct Message {
     pub message_type: String,
     pub metadata: Option<String>,
     pub created_at: Option<String>,
+}
+
+/// One day-bucketed usage row for a (session, pane). The Overview's
+/// lifetime/7-day/today windows are derived by aggregating these rows.
+#[derive(Debug, Clone, FromRow)]
+pub struct PaneUsageDayRow {
+    pub pane_id: i64,
+    pub day: String,
+    #[sqlx(default)]
+    pub prompt_count: i64,
+    #[sqlx(default)]
+    pub input_tokens: i64,
+    #[sqlx(default)]
+    pub output_tokens: i64,
+    #[sqlx(default)]
+    pub cache_read_tokens: i64,
+    #[sqlx(default)]
+    pub cache_creation_tokens: i64,
+    #[sqlx(default)]
+    pub total_cost_usd: f64,
+    #[sqlx(default)]
+    pub num_responses: i64,
+    #[sqlx(default)]
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]

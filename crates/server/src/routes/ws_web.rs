@@ -260,6 +260,9 @@ fn normalize_start_bot_effort(raw: &str) -> Option<String> {
         return None;
     }
     let normalized = trimmed.to_ascii_lowercase();
+    // Keep in lock-step with the CLI's `normalize_effort_level` —
+    // `ultracode` is an apas-only level (xhigh wire flag + workflow
+    // prompt prefix) that must round-trip through the server unchanged.
     match normalized.as_str() {
         "default" | "auto" | "none" | "off" => None,
         "low" => Some("low".to_string()),
@@ -267,6 +270,7 @@ fn normalize_start_bot_effort(raw: &str) -> Option<String> {
         "high" => Some("high".to_string()),
         "xhigh" | "x-high" => Some("xhigh".to_string()),
         "max" => Some("max".to_string()),
+        "ultracode" => Some("ultracode".to_string()),
         _ => None,
     }
 }
@@ -398,6 +402,8 @@ mod session_download_tests {
             updated_at: None,
             is_paused: false,
             project_id: Some(project_id.to_string()),
+            git_remote: None,
+            git_remote_url: None,
         }
     }
 
@@ -568,6 +574,8 @@ mod machine_access_tests {
             updated_at: None,
             is_paused: false,
             project_id: None,
+            git_remote: None,
+            git_remote_url: None,
         }
     }
 
@@ -890,6 +898,21 @@ async fn handle_web_input(
                 },
             )
             .await;
+
+        // Count this as a prompt for the pane. The CLI deliberately skips
+        // CliToServer::UserInput for web-originated input (it's already echoed
+        // above), so this is the only place web prompts get recorded -- without
+        // it, web chat would inflate responses/tokens but leave prompts at 0.
+        crate::routes::ws_cli::record_and_broadcast_usage(
+            state,
+            sid,
+            effective_pane_id,
+            crate::db::UsageDelta {
+                prompt_count: 1,
+                ..Default::default()
+            },
+        )
+        .await;
     } else {
         tracing::warn!("Failed to route input to CLI for session {}", sid);
         state
@@ -1693,6 +1716,79 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     if !state
                         .sessions
                         .send_to_daemon(&machine_id, ServerToDaemon::StopProjectCli { project_id })
+                        .await
+                    {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Daemon is offline".to_string(),
+                                },
+                            )
+                            .await;
+                    }
+                }
+                Ok(WebToServer::CreateProjectInstance {
+                    machine_id,
+                    git_remote,
+                    instance_name,
+                    branch,
+                    clone_url,
+                    base_path,
+                    request_id,
+                }) => {
+                    let Some(uid) = user_id else {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Not authenticated".to_string(),
+                                },
+                            )
+                            .await;
+                        continue;
+                    };
+
+                    // A brand-new instance has no project_id yet, so authorize by
+                    // machine OWNERSHIP only (the daemon must belong to this user).
+                    let owns_machine = state
+                        .sessions
+                        .get_machines_for_user(&uid)
+                        .into_iter()
+                        .any(|m| m.machine.machine_id == machine_id);
+                    if !owns_machine {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Machine not found".to_string(),
+                                },
+                            )
+                            .await;
+                        continue;
+                    }
+
+                    tracing::info!(
+                        "CreateProjectInstance: user={} machine={} repo={} name={}",
+                        uid, machine_id, git_remote, instance_name
+                    );
+
+                    if !state
+                        .sessions
+                        .send_to_daemon(
+                            &machine_id,
+                            ServerToDaemon::CreateProjectInstance {
+                                git_remote,
+                                instance_name,
+                                branch,
+                                clone_url,
+                                base_path,
+                                request_id,
+                            },
+                        )
                         .await
                     {
                         state
@@ -2710,6 +2806,26 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             )
                             .await;
 
+                        // Replay current usage stats so the Overview panel is
+                        // populated immediately on attach / hard refresh.
+                        match state.db.get_project_usage_stats(&sid.to_string()).await {
+                            Ok(stats) => {
+                                state
+                                    .sessions
+                                    .send_to_web(
+                                        &connection_id,
+                                        ServerToWeb::ProjectUsageStats {
+                                            session_id: sid,
+                                            stats,
+                                        },
+                                    )
+                                    .await;
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to load usage stats on attach: {}", e)
+                            }
+                        }
+
                         // Send current pause state for this session
                         // First check in-memory state, then fall back to database (for server restart recovery)
                         let is_paused = if state.sessions.has_session_state(&sid) {
@@ -2914,6 +3030,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     .and_then(|id| Uuid::parse_str(&id).ok()),
                                 working_dir: s.working_dir,
                                 hostname: s.hostname,
+                                git_remote: s.git_remote,
+                                git_remote_url: s.git_remote_url,
                                 status: s.status,
                                 created_at: s.created_at,
                                 is_shared: false,
@@ -2939,6 +3057,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             cli_client_id: s.cli_client_id.and_then(|id| Uuid::parse_str(&id).ok()),
                             working_dir: s.working_dir,
                             hostname: s.hostname,
+                            git_remote: s.git_remote,
+                            git_remote_url: s.git_remote_url,
                             status: s.status,
                             created_at: s.created_at,
                             is_shared: true,
