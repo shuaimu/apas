@@ -237,6 +237,9 @@ describe("ProjectGoalBar team role slots", () => {
     expect(promptText).toContain("record the branch/commit details");
     expect(promptText).toContain("team-todo.md");
     expect(promptText).toContain("status: reviewing");
+    expect(promptText).toContain(".apas-tech-lead-cursor");
+    expect(promptText).toContain("empty or missing");
+    expect(promptText).toContain("tail -n 50 .apas-team.jsonl");
     expect(promptText).toContain("Scratchpad append rule");
     expect(promptText).toContain(".apas-team.jsonl record");
     expect(promptText).toContain("generate its ts at append time");
