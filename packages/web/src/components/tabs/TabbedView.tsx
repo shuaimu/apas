@@ -1108,17 +1108,26 @@ export function TabbedView() {
                   onChange={(e) => {
                     const next = e.target.value as ClaudeModelOption;
                     if (next === activeModelOption) return;
-                    if (
-                      !confirm(
-                        `Switch model to ${next}? The current turn will be interrupted and the agent will respawn with a fresh context — chat history above stays visible but is NOT in the new agent's prompt.`,
-                      )
-                    ) {
-                      return;
+                    // Only the "default" (clear-model) transition
+                    // respawns — the CLI's fast-path
+                    // apply_flag_settings live-swap requires an
+                    // explicit model id, so clearing falls back to
+                    // kill + fresh session. Every specific claude
+                    // model (fable/sonnet/opus/haiku) is a live
+                    // swap: no interrupted turn, no context reset.
+                    if (next === "default") {
+                      if (
+                        !confirm(
+                          "Clear model back to Claude's default? The current turn will be interrupted and the agent will respawn with a fresh context — chat history above stays visible but is NOT in the new agent's prompt.",
+                        )
+                      ) {
+                        return;
+                      }
                     }
                     updatePaneModel(activeTabId, next === "default" ? null : next);
                   }}
                   className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-1.5 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  title="Claude model — switching kills the current claude child and respawns with a fresh session_id"
+                  title="Claude model — switching between fable/sonnet/opus/haiku live-swaps via apply_flag_settings (no context reset). Clearing to default respawns."
                 >
                   {CLAUDE_MODEL_OPTIONS.map((option) => (
                     <option key={option.value} value={option.value}>
