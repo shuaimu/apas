@@ -10,11 +10,11 @@ interface ToolGroupCardProps {
 }
 
 /// Minimum number of consecutive tool_use / tool_result messages needed
-/// to collapse them into a ToolGroupCard. 4 = at least two full tool
-/// calls (use + result × 2). Below the threshold we fall back to
-/// rendering each ToolCard individually so short exchanges keep their
-/// inline shape.
-export const TOOL_GROUP_MIN_ITEMS = 4;
+/// to collapse them into a ToolGroupCard. 2 = one full tool call
+/// (use + result), so even a lone "Using Edit" / "Edit succeeded" pair
+/// folds. A single unpaired tool_use stays inline — while a tool is
+/// still running the user should see what it is without expanding.
+export const TOOL_GROUP_MIN_ITEMS = 2;
 
 /// A single item in the rendered stream — either a plain Message or a
 /// synthetic group of consecutive tool-ish messages that render inside

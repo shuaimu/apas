@@ -132,9 +132,9 @@ export function MessageList() {
   }, [messages.length]);
 
   // Fold consecutive tool_use / tool_result messages into ToolGroupCards
-  // so long tool-chain runs don't drown the readable text turns. Only
-  // kicks in when there are at least TOOL_GROUP_MIN_ITEMS consecutive
-  // tool-like messages — short bursts render inline as before.
+  // so tool runs don't drown the readable text turns. Kicks in at
+  // TOOL_GROUP_MIN_ITEMS consecutive tool-like messages — even a single
+  // use+result pair; only a lone in-flight tool_use renders inline.
   const renderItems = useMemo(() => groupMessagesForRender(messages), [messages]);
 
   if (messages.length === 0) {
