@@ -2207,6 +2207,36 @@ export interface MessagePaneProps {
 export const INITIAL_RENDER_CAP = 30;
 export const RENDER_CAP_STEP = 50;
 
+// Placeholder pinned to the top of a pane while older history is paged in
+// from the server (i.e. the user scrolled to the top and the local render
+// cache is already exhausted). A labelled spinner plus a couple of muted
+// skeleton rows reads as "earlier history is loading up here" rather than a
+// bare "Loading..." string, and reserves vertical space so the prepend
+// doesn't visibly jump.
+function HistoryLoadingPlaceholder({ paneId }: { paneId: number }) {
+  return (
+    <div
+      data-testid={`history-loading-${paneId}`}
+      aria-live="polite"
+      className="pb-1"
+    >
+      <div className="flex items-center justify-center gap-2 py-1.5 text-xs font-medium text-gray-400 dark:text-gray-500">
+        <span className="w-3.5 h-3.5 rounded-full border-2 border-gray-300 border-t-transparent dark:border-gray-600 dark:border-t-transparent animate-spin" />
+        Fetching earlier history…
+      </div>
+      <div aria-hidden="true" className="space-y-3 px-1 opacity-70">
+        {[0, 1].map((row) => (
+          <div key={row} className="animate-pulse space-y-2">
+            <div className="h-2.5 w-20 rounded bg-gray-200 dark:bg-gray-700/70" />
+            <div className="h-2.5 w-full rounded bg-gray-200 dark:bg-gray-700/70" />
+            <div className="h-2.5 w-3/4 rounded bg-gray-200 dark:bg-gray-700/70" />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, isActive, role }: MessagePaneProps) {
   const sessionId = useStore((s) => s.sessionId);
   // How many newest messages to mount. Grows when the user reveals older
@@ -2478,9 +2508,7 @@ export function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, 
       onScroll={handleScroll}
       className="flex-1 overflow-y-auto overflow-x-hidden px-2 sm:px-4 py-4 space-y-3 min-h-0"
     >
-      {isLoading && (
-        <div className="text-center text-gray-400 text-sm py-2">Loading...</div>
-      )}
+      {isLoading && <HistoryLoadingPlaceholder paneId={paneId} />}
       {hiddenCount > 0 && (
         <div className="text-center py-1">
           <button
