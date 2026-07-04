@@ -159,6 +159,16 @@ export interface SessionCacheEntry {
   /// `sessionLastCreatedAt` is fresh on every page load and cannot recover
   /// this on its own).
   lastCreatedAt?: string;
+  /// Per-pane catchup watermarks (`String(paneId)` → server `created_at`)
+  /// captured at snapshot time. Persisted so a page reload can fire the
+  /// PRECISE per-pane catchup (`get_messages_per_pane_after`) instead of
+  /// the session-level MIN cutoff. That MIN is dragged far into the past
+  /// by any long-idle pane, and the server caps a single-cutoff catchup
+  /// at 500 rows across ALL panes — so an actively-updating pane's newest
+  /// messages can fall outside that window and never repaint after a
+  /// reload (previously the user had to clear IndexedDB to see them).
+  /// Per-pane watermarks fetch each pane's own tail, immune to both.
+  paneLastCreatedAt?: Record<string, string>;
   /// Latest `team-todo.md` snapshot for this session. Persisted so the
   /// Overview's TODO panel renders the right content immediately on
   /// refresh instead of going through the fetch round-trip (which can
@@ -1173,6 +1183,9 @@ export const useStore = create<AppState>((set, get) => ({
           // page load can ask the server for messages newer than this
           // instead of falsely trusting the stale cache forever.
           lastCreatedAt: state.sessionLastCreatedAt.get(currentSessionId),
+          paneLastCreatedAt: paneWatermarksToRecord(
+            state.paneLastCreatedAt.get(currentSessionId),
+          ),
           teamTodoState: state.teamTodoStates.get(currentSessionId),
           suggestedWorkers: state.suggestedWorkersBySession.get(currentSessionId),
         };
@@ -2399,6 +2412,25 @@ if (typeof window !== "undefined") {
           seededLast.set(k, v.lastCreatedAt);
         }
       }
+      // Reseed per-pane watermarks so the first post-reload catchup uses
+      // the precise per-pane form (get_messages_per_pane_after) rather
+      // than the session-level MIN cutoff — the MIN is dragged into the
+      // past by any long-idle pane, and the server's single-cutoff catchup
+      // is capped at 500 rows across all panes, so an active pane's newest
+      // messages can fall outside it and never repaint. In-memory wins on
+      // conflict (it's strictly fresher for panes seen this page load).
+      const seededPane = new Map(state.paneLastCreatedAt);
+      for (const [k, v] of diskCache) {
+        if (!v.paneLastCreatedAt) continue;
+        const mergedPane = new Map(seededPane.get(k) ?? new Map<number, string>());
+        for (const [pidStr, ts] of Object.entries(v.paneLastCreatedAt)) {
+          const pid = Number(pidStr);
+          if (!Number.isFinite(pid)) continue;
+          const prev = mergedPane.get(pid);
+          if (!prev || ts > prev) mergedPane.set(pid, ts);
+        }
+        if (mergedPane.size > 0) seededPane.set(k, mergedPane);
+      }
       // Seed per-session file snapshots (team-todo, suggested-workers)
       // so the Overview panels render immediately on refresh instead of
       // going through a fetch round-trip (which silently does nothing
@@ -2416,6 +2448,7 @@ if (typeof window !== "undefined") {
       return {
         sessionCache: merged,
         sessionLastCreatedAt: seededLast,
+        paneLastCreatedAt: seededPane,
         teamTodoStates: seededTodos,
         suggestedWorkersBySession: seededSuggested,
       };
@@ -2461,15 +2494,19 @@ if (typeof window !== "undefined") {
             interactiveMessages:
               cached.paneMessages[paneKey(PANE_ID_INTERACTIVE)] ?? [],
           });
-          // Catchup gap fix: on the same-session page-reload path
-          // `attachSession` skipped its catchup because at the time
-          // sessionCache was still empty (its guard requires the
-          // cache to have a snapshot). Now that we just restored
-          // the snapshot, fire catchup so any messages that landed
-          // server-side AFTER the snapshot's lastCreatedAt show up
-          // — without this, user has to clear IDB to see them.
-          requestCatchupIfNeeded(useStore.getState, state.sessionId);
         }
+        // Catchup gap fix: fire the current session's catchup once the
+        // per-pane watermarks are (re)seeded above — whether or not the
+        // isEmpty restore ran. Two reload orderings otherwise leave an
+        // actively-updating pane frozen at its cached tail: (1) attach saw
+        // an empty cache and skipped its own catchup, then a live
+        // stream_message beat hydration so `isEmpty` is now false and the
+        // restore+catchup above is skipped; (2) attach restored a stale
+        // cache whose tail predates messages that landed while the tab was
+        // closed. With per-pane watermarks now persisted the catchup is
+        // precise (get_messages_per_pane_after) and dedupes by id, so
+        // firing it here is safe even when nothing was missed.
+        requestCatchupIfNeeded(useStore.getState, state.sessionId);
       }
     }
     // If the WS is already authenticated, subscribe to the freshly-
@@ -2531,6 +2568,7 @@ if (typeof window !== "undefined") {
         answeredQuestions: cur.answeredQuestions,
         cachedAt: Date.now(),
         lastCreatedAt: cur.sessionLastCreatedAt.get(sid),
+        paneLastCreatedAt: paneWatermarksToRecord(cur.paneLastCreatedAt.get(sid)),
         teamTodoState: cur.teamTodoStates.get(sid),
         suggestedWorkers: cur.suggestedWorkersBySession.get(sid),
       };
@@ -2609,6 +2647,23 @@ function appendToCachedSession(
       (!existing.lastCreatedAt || serverCreatedAt > existing.lastCreatedAt)
         ? serverCreatedAt
         : existing.lastCreatedAt;
+    // Advance this pane's persisted watermark in lockstep with the
+    // appended message so a later reload catchup for this (background)
+    // session asks only for messages AFTER it. Without this, the server
+    // would re-send it, and because live messages carry client-generated
+    // ids that don't match the storage id, the by-id dedupe couldn't drop
+    // the duplicate.
+    let nextPaneLastCreatedAt = existing.paneLastCreatedAt;
+    if (paneId && serverCreatedAt) {
+      const pk = String(paneId);
+      const prev = existing.paneLastCreatedAt?.[pk];
+      if (!prev || serverCreatedAt > prev) {
+        nextPaneLastCreatedAt = {
+          ...(existing.paneLastCreatedAt ?? {}),
+          [pk]: serverCreatedAt,
+        };
+      }
+    }
     let next: SessionCacheEntry;
     if (paneId) {
       const key = paneKey(paneId);
@@ -2619,6 +2674,7 @@ function appendToCachedSession(
         isDualPane: true,
         cachedAt: Date.now(),
         lastCreatedAt: nextLastCreatedAt,
+        paneLastCreatedAt: nextPaneLastCreatedAt,
       };
     } else {
       next = {
@@ -2951,6 +3007,23 @@ function flushPendingLabels(
   }
   savePendingLabels(next);
   set({ pendingLabels: next });
+}
+
+/// Convert a session's in-memory per-pane watermark map (paneId → server
+/// `created_at`) into a plain Record for structured-clone persistence in
+/// the session snapshot. Skips the synthetic `-1` legacy single-pane key.
+/// Returns undefined when there's nothing worth persisting so the snapshot
+/// field stays absent rather than `{}`.
+export function paneWatermarksToRecord(
+  m: Map<number, string> | undefined,
+): Record<string, string> | undefined {
+  if (!m || m.size === 0) return undefined;
+  const rec: Record<string, string> = {};
+  for (const [pid, ts] of m) {
+    if (pid < 0) continue;
+    rec[String(pid)] = ts;
+  }
+  return Object.keys(rec).length > 0 ? rec : undefined;
 }
 
 /// Update the per-pane watermark for `(sessionId, paneId)` and

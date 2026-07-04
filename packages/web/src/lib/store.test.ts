@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { storeDebugLog, useStore, type Message, type CliClient, type TeamRecord } from './store';
+import { storeDebugLog, useStore, paneWatermarksToRecord, type Message, type CliClient, type TeamRecord, type SessionCacheEntry } from './store';
 
 describe('useStore', () => {
   beforeEach(() => {
@@ -881,5 +881,93 @@ describe('suggested worker accept/dismiss', () => {
       session_id: 'session-suggestions',
       suggestion_id: 'SUG-002',
     }));
+  });
+
+  describe('per-pane catchup watermarks (reload staleness fix)', () => {
+    function makeOpenWs() {
+      const send = vi.fn();
+      return {
+        readyState: WebSocket.OPEN,
+        send,
+        close: vi.fn(),
+      } as unknown as WebSocket & { send: typeof send };
+    }
+
+    function emptyCacheEntry(): SessionCacheEntry {
+      return {
+        messages: [],
+        paneMessages: {},
+        paneHasMore: {},
+        paneConfigs: [],
+        paneModes: {},
+        hasMoreMessages: false,
+        isDualPane: true,
+        answeredQuestions: new Map(),
+        cachedAt: 0,
+      };
+    }
+
+    it('paneWatermarksToRecord keys by pane id, skips the legacy -1 key, and drops empties', () => {
+      expect(
+        paneWatermarksToRecord(
+          new Map([
+            [205, 'ts-205'],
+            [841, 'ts-841'],
+            [-1, 'ts-legacy'],
+          ]),
+        ),
+      ).toEqual({ '205': 'ts-205', '841': 'ts-841' });
+
+      expect(paneWatermarksToRecord(undefined)).toBeUndefined();
+      expect(paneWatermarksToRecord(new Map())).toBeUndefined();
+      // A map that holds only the synthetic legacy key persists nothing.
+      expect(paneWatermarksToRecord(new Map([[-1, 'ts']]))).toBeUndefined();
+    });
+
+    it('attaching a cached session fires a PER-PANE watermark catchup (not the diluted single cutoff)', () => {
+      const ws = makeOpenWs();
+      const target = 'session-appdev';
+      // Simulate the post-reload state: a persisted snapshot for the
+      // target session plus its per-pane watermarks reseeded from IDB.
+      // Pane 841 is long-idle (old ts); pane 205 ("App Dev") is active.
+      useStore.setState({
+        ws,
+        isAuthenticated: true,
+        sessionId: 'session-current', // different -> isSameSession false
+        cliClients: [],
+        sessions: [],
+        sessionCache: new Map([[target, emptyCacheEntry()]]),
+        paneLastCreatedAt: new Map([
+          [
+            target,
+            new Map([
+              [205, '2026-07-04T18:40:00Z'],
+              [841, '2026-06-27T03:32:00Z'],
+            ]),
+          ],
+        ]),
+      });
+
+      useStore.getState().attachSession(target);
+
+      // The catchup must ask per-pane so pane 205's fresh tail is fetched
+      // independently of pane 841's stale watermark — never the
+      // after_created_at single cutoff (which the dead pane would drag to
+      // June 27 and the 500-row cap could then truncate before 205).
+      expect(ws.send).toHaveBeenCalledWith(
+        JSON.stringify({
+          type: 'get_session_messages',
+          session_id: target,
+          pane_watermarks: {
+            '205': '2026-07-04T18:40:00Z',
+            '841': '2026-06-27T03:32:00Z',
+          },
+        }),
+      );
+      const sentAfterCutoff = ws.send.mock.calls.some((c: unknown[]) =>
+        typeof c[0] === 'string' && c[0].includes('after_created_at'),
+      );
+      expect(sentAfterCutoff).toBe(false);
+    });
   });
 });
