@@ -385,6 +385,69 @@ pub fn check_for_update_available() -> Option<String> {
     }
 }
 
+/// Whether a changed path can affect the compiled `apas` binary. This is a
+/// deny-list: only the web frontend, docs, and CI config are considered
+/// irrelevant. Anything else (`*.rs`, `Cargo.toml`/`Cargo.lock`, build
+/// scripts, non-doc files under `crates/`, …) is treated as build-relevant
+/// so we never run a stale binary after a real code change.
+fn is_build_irrelevant_path(path: &str) -> bool {
+    let p = path.trim();
+    if p.is_empty() {
+        return false;
+    }
+    // Docs anywhere in the tree.
+    if p.ends_with(".md") {
+        return true;
+    }
+    // The Next.js frontend, docs, and CI — never linked into the binary.
+    const IRRELEVANT_PREFIXES: &[&str] = &["packages/", "docs/", ".github/"];
+    if IRRELEVANT_PREFIXES.iter().any(|prefix| p.starts_with(prefix)) {
+        return true;
+    }
+    const IRRELEVANT_EXACT: &[&str] = &[".gitignore", ".gitattributes", "LICENSE"];
+    IRRELEVANT_EXACT.iter().any(|name| p == *name)
+}
+
+/// Decide whether a set of changed files warrants rebuilding the binary.
+/// Rebuilds when the list is empty (unknown scope) or any entry is
+/// build-relevant; only skips when every changed file is web/docs/CI.
+fn changed_files_need_rebuild(files: &[String]) -> bool {
+    files.is_empty() || files.iter().any(|f| !is_build_irrelevant_path(f))
+}
+
+/// List files that differ between the built commit (`HEAD`) and the fetched
+/// remote (`origin/master`) in the source mirror. `None` on any git error so
+/// callers fall back to the safe (rebuild) path.
+fn pending_update_changed_files() -> Option<Vec<String>> {
+    let src_dir = source_dir();
+    let output = Command::new("git")
+        .args(["diff", "--name-only", "HEAD..origin/master"])
+        .current_dir(&src_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+    )
+}
+
+/// Whether the pending update actually requires a `cargo build`. Web-only /
+/// docs-only updates (the common case after a frontend deploy) skip the
+/// minutes-long rebuild and just re-exec the current binary. Defaults to
+/// rebuilding when the change set can't be determined.
+fn pending_update_needs_rebuild() -> bool {
+    match pending_update_changed_files() {
+        Some(files) => changed_files_need_rebuild(&files),
+        None => true,
+    }
+}
+
 /// Check for updates on boot and automatically install + restart if available
 /// This function will not return if an update is installed (it exec's the new binary)
 pub fn check_and_upgrade_on_boot() {
@@ -436,6 +499,13 @@ pub fn check_and_upgrade_on_boot() {
         );
     } else {
         eprintln!("[Auto-update] New commits available, updating...");
+    }
+
+    // Web/docs-only updates don't change the binary — skip the rebuild and
+    // keep booting on the current binary.
+    if !pending_update_needs_rebuild() {
+        eprintln!("[Auto-update] New commits only touch web/docs — no rebuild needed");
+        return;
     }
 
     // Build and install
@@ -492,20 +562,29 @@ pub fn restart_cli() {
     let args: Vec<String> = env::args().collect();
 
     if let Some(newer) = check_for_update_available() {
-        eprintln!(
-            "[Restart] Newer git version detected ({} > {}), updating before reboot...",
-            newer, CURRENT_VERSION
-        );
-        match pull_and_build().and_then(|binary| install_binary(&binary)) {
-            Ok(()) => {
-                eprintln!("[Restart] Update installed, rebooting into {}", newer);
+        if pending_update_needs_rebuild() {
+            eprintln!(
+                "[Restart] Newer git version detected ({} > {}), updating before reboot...",
+                newer, CURRENT_VERSION
+            );
+            match pull_and_build().and_then(|binary| install_binary(&binary)) {
+                Ok(()) => {
+                    eprintln!("[Restart] Update installed, rebooting into {}", newer);
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[Restart] Update before reboot failed ({}), continuing with installed binary",
+                        err
+                    );
+                }
             }
-            Err(err) => {
-                eprintln!(
-                    "[Restart] Update before reboot failed ({}), continuing with installed binary",
-                    err
-                );
-            }
+        } else {
+            // New commits exist ({newer}) but none touch the binary (web/docs
+            // only) — skip the multi-minute cargo build and just re-exec.
+            eprintln!(
+                "[Restart] Version {} available but only changes web/docs — skipping rebuild, restarting current binary",
+                newer
+            );
         }
     }
 
@@ -543,6 +622,45 @@ mod tests {
 
     fn touch(path: &Path) {
         fs::write(path, b"apas").unwrap();
+    }
+
+    #[test]
+    fn build_irrelevant_paths_are_web_and_docs_only() {
+        // Web frontend, docs, and CI never link into the binary.
+        assert!(is_build_irrelevant_path("packages/web/src/lib/store.ts"));
+        assert!(is_build_irrelevant_path("packages/web/package.json"));
+        assert!(is_build_irrelevant_path("README.md"));
+        assert!(is_build_irrelevant_path("CLAUDE.md"));
+        assert!(is_build_irrelevant_path("docs/architecture.md"));
+        assert!(is_build_irrelevant_path(".github/workflows/ci.yml"));
+        assert!(is_build_irrelevant_path("LICENSE"));
+
+        // Anything that can affect the compiled binary is build-relevant.
+        assert!(!is_build_irrelevant_path("crates/client-cli/src/update.rs"));
+        assert!(!is_build_irrelevant_path("crates/shared/src/messages.rs"));
+        assert!(!is_build_irrelevant_path("Cargo.toml"));
+        assert!(!is_build_irrelevant_path("Cargo.lock"));
+        assert!(!is_build_irrelevant_path("crates/server/build.rs"));
+    }
+
+    #[test]
+    fn rebuild_skipped_only_when_every_change_is_irrelevant() {
+        // The exact scenario that stalled a reboot: web + docs only.
+        assert!(!changed_files_need_rebuild(&[
+            "packages/web/src/lib/store.ts".to_string(),
+            "CLAUDE.md".to_string(),
+        ]));
+        // A single Rust change forces a rebuild.
+        assert!(changed_files_need_rebuild(&[
+            "crates/client-cli/src/update.rs".to_string()
+        ]));
+        // Mixed web + Rust still rebuilds.
+        assert!(changed_files_need_rebuild(&[
+            "packages/web/x.ts".to_string(),
+            "crates/server/src/main.rs".to_string(),
+        ]));
+        // Empty / unknown change set defaults to the safe rebuild path.
+        assert!(changed_files_need_rebuild(&[]));
     }
 
     #[test]

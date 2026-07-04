@@ -10280,6 +10280,37 @@ async fn run_server_connection(
                                                 });
                                             }
                                             ServerToCli::RebootCli { .. } => {
+                                                // Before tearing down the WS for a possibly
+                                                // minutes-long update + rebuild, flag every pane
+                                                // as "Rebooting…" so the web shows a live status
+                                                // instead of a frozen, dead-looking pane. The
+                                                // server caches pane status (a client attaching
+                                                // mid-reboot still sees it) and pushes nothing on
+                                                // disconnect, so it stays until the rebuilt CLI
+                                                // reconnects and each pane clears it with
+                                                // status:None when its next turn ends.
+                                                let reboot_panes = build_pane_list(
+                                                    &pane_metas,
+                                                    &input_channels,
+                                                    session_id,
+                                                    &pane_sessions,
+                                                    &pane_pauses,
+                                                    &pane_stop_requests,
+                                                );
+                                                for pane in &reboot_panes {
+                                                    let status_msg = serde_json::to_string(
+                                                        &CliToServer::PaneStatus {
+                                                            session_id,
+                                                            pane_type: shared::PaneType::default(),
+                                                            pane_id: Some(pane.pane_id),
+                                                            status: Some("Rebooting APAS…".to_string()),
+                                                        },
+                                                    )
+                                                    .unwrap_or_default();
+                                                    let _ = ws_sender
+                                                        .send(Message::Text(status_msg.into()))
+                                                        .await;
+                                                }
                                                 reboot_requested.store(true, Ordering::SeqCst);
                                                 shutdown.store(true, Ordering::SeqCst);
                                                 return Ok(());
