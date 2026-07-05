@@ -3100,9 +3100,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         && before_id.is_none()
                         && effective_pane_filter.is_none();
                     let fetch_result = if let Some(watermarks) = pane_watermarks.as_ref() {
+                        // Wire keys are strings (JSON object keys); storage
+                        // keys by numeric pane id. Parse back to u32, dropping
+                        // any non-numeric key defensively.
+                        let numeric: std::collections::HashMap<u32, String> = watermarks
+                            .iter()
+                            .filter_map(|(k, v)| k.parse::<u32>().ok().map(|id| (id, v.clone())))
+                            .collect();
                         state
                             .storage
-                            .get_messages_per_pane_after(&sid, watermarks)
+                            .get_messages_per_pane_after(&sid, &numeric)
                             .await
                             .map(|msgs| (msgs, false))
                     } else if let Some(after) = after_created_at.as_deref() {

@@ -775,8 +775,15 @@ pub enum WebToServer {
         // used a single per-session timestamp). Reply is flagged
         // `catchup: true`. Mutually exclusive with `after_created_at`;
         // server prefers `pane_watermarks` when both are present.
+        // Pane ids ride as JSON object KEYS, which are always strings on the
+        // wire. They must be `String` here (not `u32`): `WebToServer` is an
+        // internally-tagged enum, and serde's tagged-enum path buffers into a
+        // Content value that does NOT coerce string map keys to integers — a
+        // `HashMap<u32, _>` here fails with `invalid type: string "2",
+        // expected u32`, silently dropping every catchup. The server parses
+        // the keys back to u32 when it hands them to storage.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pane_watermarks: Option<std::collections::HashMap<u32, String>>,
+        pane_watermarks: Option<std::collections::HashMap<String, String>>,
     },
 
     /// Pause the deadloop session (legacy - use PausePane for new code)
