@@ -2957,18 +2957,18 @@ function flushPendingAnswers(
   if (!ws || ws.readyState !== WebSocket.OPEN || !currentSid) return;
   const toFlush = state.pendingAnswers.filter((p) => p.sessionId === currentSid);
   if (toFlush.length === 0) return;
-  const now = Date.now();
-  // Drop answers older than 1 hour; user has moved on. AskUserQuestion
-  // is a decision surface, not a stream of typed text, so we can be
-  // more generous than pendingSends' 10-min TTL — a laptop-closed
-  // scenario shouldn't discard a legitimate submission.
-  const next: PendingAnswer[] = state.pendingAnswers
-    .filter((p) => p.sessionId !== currentSid || now - p.createdAt <= 60 * 60_000)
-    .map((p) =>
-      p.sessionId === currentSid ? { ...p, attempts: p.attempts + 1 } : p,
-    );
+  // No TTL. An AskUserQuestion answer is unreconciled history: retransmit
+  // it on every reconnect for as long as it's still pending, no matter how
+  // old. The entry is cleared only when the server's message history shows
+  // the question resolved — its tool_result arrives (answered OR cancelled;
+  // see the tool_result handler that trims pendingAnswers). Dropping it on
+  // a timer stranded the pane forever when the answer was lost or
+  // misrouted. Idempotent: the CLI matches by tool_use_id, so a duplicate
+  // no-ops if the answer already landed.
+  const next: PendingAnswer[] = state.pendingAnswers.map((p) =>
+    p.sessionId === currentSid ? { ...p, attempts: p.attempts + 1 } : p,
+  );
   for (const entry of toFlush) {
-    if (now - entry.createdAt > 60 * 60_000) continue;
     ws.send(
       JSON.stringify({
         type: "answer_question",
@@ -3823,36 +3823,42 @@ function handleServerMessage(
               success: !resultData.is_error,
             };
             displayContent = resultData.content as string || content;
-            // Recover AskUserQuestion's answers from the persisted
-            // tool_use_result so the card shows its submitted state after
-            // a page reload.
-            if (
-              toolUseId &&
-              toolNameMap.get(toolUseId) === "AskUserQuestion" &&
-              resultData.tool_use_result &&
-              typeof resultData.tool_use_result === "object"
-            ) {
-              const answers = (resultData.tool_use_result as Record<string, unknown>)
-                .answers as Record<string, string> | undefined;
-              if (answers && typeof answers === "object") {
-                set((state) => {
-                  const patch: Partial<AppState> = {};
-                  if (!state.answeredQuestions.has(toolUseId)) {
-                    const nextMap = new Map(state.answeredQuestions);
-                    nextMap.set(toolUseId, answers);
-                    saveAnsweredQuestions(nextMap);
-                    patch.answeredQuestions = nextMap;
-                  }
-                  // Claude confirmed the answer — clear any pending
-                  // retry entry so we don't re-send.
-                  const trimmed = state.pendingAnswers.filter((p) => p.toolUseId !== toolUseId);
-                  if (trimmed.length !== state.pendingAnswers.length) {
-                    savePendingAnswers(trimmed);
-                    patch.pendingAnswers = trimmed;
-                  }
-                  return patch;
-                });
-              }
+            // A tool_result for an AskUserQuestion in the loaded history means
+            // the question RESOLVED on the server — the answer landed, or it
+            // was cancelled (e.g. the pane restarted). Either way it's no
+            // longer open, so clear any pending retry: this is the
+            // watermark-style reconciliation that lets the retransmit run
+            // with no TTL (it stops as soon as history shows the question
+            // closed). Recover the submitted answers for the card's state
+            // only when the result actually carries them (a cancel doesn't).
+            if (toolUseId && toolNameMap.get(toolUseId) === "AskUserQuestion") {
+              const resultObj =
+                resultData.tool_use_result &&
+                typeof resultData.tool_use_result === "object"
+                  ? (resultData.tool_use_result as Record<string, unknown>)
+                  : undefined;
+              const answers = resultObj?.answers as
+                | Record<string, string>
+                | undefined;
+              set((state) => {
+                const patch: Partial<AppState> = {};
+                if (
+                  answers &&
+                  typeof answers === "object" &&
+                  !state.answeredQuestions.has(toolUseId)
+                ) {
+                  const nextMap = new Map(state.answeredQuestions);
+                  nextMap.set(toolUseId, answers);
+                  saveAnsweredQuestions(nextMap);
+                  patch.answeredQuestions = nextMap;
+                }
+                const trimmed = state.pendingAnswers.filter((p) => p.toolUseId !== toolUseId);
+                if (trimmed.length !== state.pendingAnswers.length) {
+                  savePendingAnswers(trimmed);
+                  patch.pendingAnswers = trimmed;
+                }
+                return patch;
+              });
             }
           } catch {
             outputType = { type: "text" };
