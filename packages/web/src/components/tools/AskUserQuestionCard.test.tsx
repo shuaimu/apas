@@ -47,6 +47,36 @@ describe("AskUserQuestionCard", () => {
     expect(screen.getByText("Question received but no options were provided.")).toBeTruthy();
   });
 
+  it("shows a Resend button when already answered and re-sends the stored answer", () => {
+    const answers = { "Which rollout path should we take?": "Safe path" };
+    const { answerQuestion } = seedQuestionStore({
+      answeredQuestions: new Map([["tool-answered", answers]]),
+    });
+
+    render(
+      <AskUserQuestionCard
+        toolUseId="tool-answered"
+        input={{
+          questions: [
+            {
+              question: "Which rollout path should we take?",
+              header: "Release",
+              options: [
+                { label: "Safe path", description: "Lower risk" },
+                { label: "Fast path", description: "Ship immediately" },
+              ],
+            },
+          ],
+        }}
+      />,
+    );
+
+    const resend = screen.getByRole("button", { name: /Resend answer/ });
+    fireEvent.click(resend);
+
+    expect(answerQuestion).toHaveBeenCalledWith("tool-answered", answers);
+  });
+
   it("submits a single-select answer keyed by the exact question text", () => {
     const { answerQuestion } = seedQuestionStore();
 

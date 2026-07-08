@@ -338,6 +338,32 @@ export const AskUserQuestionCard = memo(function AskUserQuestionCard({
             </button>
           </div>
         )}
+        {isSubmitted && (
+          // The answer is already recorded locally, but delivery to Claude
+          // can be lost (dropped frame, or — before this was fixed —
+          // misrouted to another session). Let the user re-deliver the SAME
+          // answer without re-typing or clearing storage. Idempotent: the CLI
+          // matches by tool_use_id, so a duplicate is a no-op if it already
+          // landed, and unsticks the pane if it didn't.
+          <div className="flex items-center justify-between gap-2 pt-1">
+            <span className="text-xs text-gray-400 dark:text-gray-500">
+              If the agent didn&rsquo;t continue, resend your answer.
+            </span>
+            <button
+              type="button"
+              onClick={() => {
+                if (toolUseId && submittedAnswers) {
+                  answerQuestion(toolUseId, submittedAnswers);
+                }
+              }}
+              disabled={!toolUseId || !submittedAnswers}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-gray-600 dark:text-gray-300 border border-gray-200 dark:border-gray-700 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"
+            >
+              <Send className="w-3.5 h-3.5" />
+              Resend answer
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
