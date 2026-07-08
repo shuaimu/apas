@@ -989,6 +989,14 @@ pub enum WebToServer {
     /// relays this to the CLI which writes a control_response onto claude's
     /// stdin so the SDK's canUseTool callback completes with these answers.
     AnswerQuestion {
+        /// The session the answered AskUserQuestion belongs to. Optional for
+        /// backward compat with older web clients. When present the server
+        /// routes the answer deterministically via `resolve_target_session`
+        /// instead of falling back to the connection's last-attached session
+        /// — the multi-session fan-out drifts that, which misrouted answers
+        /// to a different project and left the asking pane stuck.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
         tool_use_id: String,
         /// Question text → selected option label(s) joined with ", " for
         /// multi-select.

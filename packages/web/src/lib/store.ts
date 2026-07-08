@@ -1580,6 +1580,11 @@ export const useStore = create<AppState>((set, get) => ({
       ws.send(
         JSON.stringify({
           type: "answer_question",
+          // Route to the session this question belongs to (the one the
+          // user is viewing). Without it the server falls back to the
+          // connection's last-attached session, which the multi-session
+          // fan-out drifts — sending the answer to the wrong project.
+          session_id: sessionId,
           tool_use_id: toolUseId,
           answers,
         }),
@@ -2967,6 +2972,9 @@ function flushPendingAnswers(
     ws.send(
       JSON.stringify({
         type: "answer_question",
+        // Carry the question's own session so a reconnect retry lands on
+        // the right pane even if the connection's active session drifted.
+        session_id: entry.sessionId,
         tool_use_id: entry.toolUseId,
         answers: entry.answers,
       }),

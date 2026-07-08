@@ -2489,13 +2489,21 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::AnswerQuestion { tool_use_id, answers }) => {
+                Ok(WebToServer::AnswerQuestion { session_id: msg_sid, tool_use_id, answers }) => {
                     // Relay the user's AskUserQuestion answers down to the CLI
                     // streaming worker. The worker matches by tool_use_id
                     // against its pending_questions map and writes the
                     // control_response onto claude's stdin so the SDK's
                     // canUseTool callback completes.
-                    if let Some(sid) = session_id {
+                    //
+                    // Route to the session the question belongs to (carried in
+                    // the message), NOT the connection's last-attached session:
+                    // the web multi-session fan-out overwrites that on every
+                    // attach, so a raw fallback misrouted answers to a
+                    // different project and left the asking pane stuck.
+                    if let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    {
                         tracing::info!(
                             tool_use_id = tool_use_id.as_str(),
                             answer_count = answers.len(),
