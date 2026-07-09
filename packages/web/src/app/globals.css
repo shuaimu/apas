@@ -36,12 +36,36 @@ body {
   height: auto !important;
 }
 
-/* Main app container - iOS compatible height */
+/* Main app container — fills the body's content box (the visual viewport
+   minus the safe-area insets the body pads with). height:100% instead of
+   100dvh keeps the frame from growing past the viewport and making the page
+   itself scrollable. */
 .app-container {
-  height: 100vh;
-  height: 100dvh; /* Override with dvh for iOS */
-  min-height: 100vh;
-  min-height: 100dvh;
+  height: 100%;
+  min-height: 0;
+}
+
+/* --- Mobile: fixed conversation frame, inner-only scroll ---
+   The body carries safe-area padding; with min-height:100dvh it grows taller
+   than the viewport and becomes scrollable, so a scroll / rubber-band at the
+   bottom drags the whole app (header, tabs, input) up and exposes a blank
+   strip. Lock the app view to the visual viewport so the page can't scroll —
+   only the inner message list moves. Scoped with :has() so auth/admin routes
+   keep normal document scrolling. */
+html:has(.app-container) {
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+body:has(.app-container) {
+  height: 100dvh;
+  min-height: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+/* Inner scroll areas keep their overscroll to themselves — no chaining to
+   the page body. */
+.app-container .overflow-y-auto {
+  overscroll-behavior: contain;
 }
 
 /* Force header to always be visible */
