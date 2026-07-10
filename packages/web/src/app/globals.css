@@ -46,24 +46,21 @@ body {
 }
 
 /* --- Mobile: fixed conversation frame, inner-only scroll ---
-   The body carries safe-area padding; with min-height:100dvh it grows taller
-   than the viewport and becomes scrollable, so a scroll / rubber-band at the
-   bottom drags the whole app (header, tabs, input) up and exposes a blank
-   strip. Lock the app view to the visual viewport so the page can't scroll —
-   only the inner message list moves. Scoped with :has() so auth/admin routes
-   keep normal document scrolling. */
-html:has(.app-container) {
-  overflow: hidden;
-  overscroll-behavior: none;
-}
+   Pin the body to the visual viewport so the frame can't scroll-drift, but
+   do NOT lock the document (no overflow:hidden / overscroll-behavior:none) —
+   locking it was what killed the browser's pull-to-refresh at the top. The
+   body has no scrollable overflow of its own (the .app-container fills it
+   exactly and clips its own content), so normal scrolling never moves the
+   frame; only the inner message list scrolls. Scoped with :has() so
+   auth/admin routes keep normal document scrolling. */
 body:has(.app-container) {
   height: 100dvh;
   min-height: 0;
-  overflow: hidden;
-  overscroll-behavior: none;
 }
-/* Inner scroll areas keep their overscroll to themselves — no chaining to
-   the page body. */
+/* The message list keeps its overscroll to itself, so scrolling to the top
+   or bottom of the conversation never nudges the fixed frame (header /
+   input). Pull-to-refresh still works from the header — it isn't a scroller,
+   so the pull passes through to the document. */
 .app-container .overflow-y-auto {
   overscroll-behavior: contain;
 }
