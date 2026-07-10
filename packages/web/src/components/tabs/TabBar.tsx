@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useRef, useEffect, useState } from "react";
+import { useCallback, useRef, useEffect, useState, type ReactNode } from "react";
 import { Bot } from "lucide-react";
 import { PaneConfig, paneKey } from "@/lib/store";
 import {
@@ -32,6 +32,11 @@ interface TabBarProps {
   showRebootButton?: boolean;
   paneStatuses: Record<string, string | null>;
   pausedPanes: number[];
+  /** Mobile-only controls merged into the tab-bar row so the top header can
+   *  be hidden on phones. Rendered at the start (leading) and end (trailing)
+   *  of the bar; callers gate their own visibility (e.g. md:hidden). */
+  leading?: ReactNode;
+  trailing?: ReactNode;
 }
 
 function isMiniMaxTab(provider: string, model?: string, label?: string): boolean {
@@ -140,6 +145,8 @@ export function TabBar({
   showRebootButton = false,
   paneStatuses,
   pausedPanes,
+  leading,
+  trailing,
 }: TabBarProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [contextMenu, setContextMenu] = useState<{ paneId: number; x: number; y: number } | null>(null);
@@ -272,6 +279,7 @@ export function TabBar({
 
   return (
     <div className="flex items-end border-b border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-800/50 flex-shrink-0 min-h-[40px]">
+      {leading}
       <div
         ref={scrollRef}
         className="flex-1 flex flex-nowrap items-end overflow-x-auto overflow-y-hidden no-scrollbar"
@@ -478,6 +486,7 @@ export function TabBar({
           </button>
         )}
       </div>
+      {trailing}
     </div>
   );
 }

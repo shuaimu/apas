@@ -382,7 +382,13 @@ function synthesizeConfigs(
   return configs;
 }
 
-export function TabbedView() {
+export function TabbedView({
+  mobileLeading,
+  mobileTrailing,
+}: {
+  mobileLeading?: React.ReactNode;
+  mobileTrailing?: React.ReactNode;
+} = {}) {
   const sessionId = useStore((s) => s.sessionId);
   const messages = useStore((s) => s.messages);
   const paneConfigs = useStore((s) => s.paneConfigs);
@@ -983,6 +989,8 @@ export function TabbedView() {
         showRebootButton={isAttached}
         paneStatuses={paneStatuses}
         pausedPanes={pausedPanes}
+        leading={mobileLeading}
+        trailing={mobileTrailing}
       />
 
       {/* Add tab error notification */}

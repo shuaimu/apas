@@ -245,7 +245,7 @@ export default function Home() {
       {/* Main content */}
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
         {/* Header */}
-        <header className="flex items-center justify-between px-2 py-1 sm:px-4 sm:py-3 border-b border-gray-200 dark:border-gray-800 flex-shrink-0">
+        <header className="hidden md:flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-gray-800 flex-shrink-0">
           <div className="flex items-center gap-2">
             {/* Mobile menu button */}
             <button
@@ -325,9 +325,57 @@ export default function Home() {
           </div>
         </header>
 
-        {/* Chat area */}
+        {/* Chat area. On phones the top header is hidden; its essential
+            controls are merged into the tab-bar row via mobileLeading /
+            mobileTrailing (leading menu, trailing actions). */}
         <main className="flex-1 overflow-hidden flex flex-col">
-          <TabbedView />
+          <TabbedView
+            mobileLeading={
+              <button
+                onClick={() => setSidebarOpen(!sidebarOpen)}
+                className="md:hidden flex items-center self-stretch px-2.5 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700/50"
+                title="Projects / menu"
+                aria-label="Toggle sidebar"
+              >
+                <Menu className="w-5 h-5" />
+              </button>
+            }
+            mobileTrailing={
+              <div className="md:hidden flex items-center self-stretch gap-0.5 pl-1 pr-1">
+                <button
+                  onClick={handleReconnect}
+                  disabled={isReconnecting}
+                  className="p-2 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700/50"
+                  title={connected ? "Connected — tap to reconnect" : "Disconnected — tap to connect"}
+                  aria-label="Connection status"
+                >
+                  {isReconnecting ? (
+                    <RefreshCw className="w-5 h-5 text-blue-500 animate-spin" />
+                  ) : connected ? (
+                    <Wifi className="w-5 h-5 text-green-500" />
+                  ) : (
+                    <WifiOff className="w-5 h-5 text-gray-400" />
+                  )}
+                </button>
+                <button
+                  onClick={() => setSettingsOpen(true)}
+                  className="p-2 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700/50 text-gray-600 dark:text-gray-300"
+                  title="Settings"
+                  aria-label="Settings"
+                >
+                  <Settings className="w-5 h-5" />
+                </button>
+                <button
+                  onClick={handleLogout}
+                  className="p-2 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700/50 text-gray-500 hover:text-red-500"
+                  title="Logout"
+                  aria-label="Logout"
+                >
+                  <LogOut className="w-5 h-5" />
+                </button>
+              </div>
+            }
+          />
         </main>
       </div>
 
