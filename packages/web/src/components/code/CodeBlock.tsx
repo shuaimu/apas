@@ -22,7 +22,7 @@ export const CodeBlock = memo(function CodeBlock({ code, language = "text" }: Co
   return (
     <div className="relative group rounded-lg overflow-hidden my-2 max-w-full">
       {/* Header */}
-      <div className="flex items-center justify-between bg-gray-800 px-2 sm:px-4 py-2 text-xs sm:text-sm">
+      <div className="flex items-center justify-between bg-gray-800 px-2 sm:px-4 py-2 text-sm">
         <span className="text-gray-400 truncate">{language}</span>
         <button
           onClick={handleCopy}
@@ -50,9 +50,9 @@ export const CodeBlock = memo(function CodeBlock({ code, language = "text" }: Co
           customStyle={{
             margin: 0,
             borderRadius: 0,
-            fontSize: "0.75rem",
+            fontSize: "0.875rem",
           }}
-          className="!text-xs sm:!text-sm"
+          className="!text-sm"
         >
           {code}
         </SyntaxHighlighter>
