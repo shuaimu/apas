@@ -80,6 +80,12 @@ header {
     min-height: 40px;
   }
 
+  /* Slimmer header on phones — the 48px desktop floor wastes vertical space
+     once the version text is hidden and only icons remain. */
+  header {
+    min-height: 0;
+  }
+
   /* Ensure main content area is visible */
   main {
     flex: 1 1 auto !important;

@@ -245,7 +245,7 @@ export default function Home() {
       {/* Main content */}
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
         {/* Header */}
-        <header className="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-gray-800 flex-shrink-0">
+        <header className="flex items-center justify-between px-2 py-1 sm:px-4 sm:py-3 border-b border-gray-200 dark:border-gray-800 flex-shrink-0">
           <div className="flex items-center gap-2">
             {/* Mobile menu button */}
             <button
@@ -293,7 +293,7 @@ export default function Home() {
               href={REPO_URL}
               target="_blank"
               rel="noopener noreferrer"
-              className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg"
+              className="hidden sm:block p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg"
               title="Open GitHub repository"
             >
               <svg
