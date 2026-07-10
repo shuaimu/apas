@@ -91,6 +91,14 @@ header {
     flex: 1 1 auto !important;
     min-height: 0;
   }
+
+  /* Larger base font on phones for readability. Scales every rem-based size
+     (message text, code, tool cards) up together — the Tailwind Typography
+     size modifiers (prose-sm / prose-base) don't generate in this v4 setup,
+     so per-class tweaks alone can't reliably resize the assistant prose. */
+  html {
+    font-size: 18px;
+  }
 }
 
 /* Toast slide-in from the right */
