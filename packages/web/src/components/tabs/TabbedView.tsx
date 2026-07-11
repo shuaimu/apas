@@ -409,6 +409,8 @@ export function TabbedView({
   const sendMessageToPane = useStore((s) => s.sendMessageToPane);
   const loadMoreMessages = useStore((s) => s.loadMoreMessages);
   const loadPaneMessagesIfNeeded = useStore((s) => s.loadPaneMessagesIfNeeded);
+  const refreshPaneWindow = useStore((s) => s.refreshPaneWindow);
+  const connected = useStore((s) => s.connected);
   const addPane = useStore((s) => s.addPane);
   const removePane = useStore((s) => s.removePane);
   const pausePane = useStore((s) => s.pausePane);
@@ -584,6 +586,26 @@ export function TabbedView({
       loadPaneMessagesIfNeeded(paneId);
     }
   }, [activeTabId, sessionId, loadPaneMessagesIfNeeded, tabIds]);
+
+  // Sliding-window heal: on the initial connect after a page load and on
+  // every reconnect, re-fetch the active pane's recent window and reconcile
+  // it as a sliding window — overwriting any hole a flaky disconnect left
+  // below the catchup watermark (catchup only extends the frontier forward
+  // and can't backfill). activeTabId is read via a ref so this fires ONLY on
+  // connect transitions, not on every tab switch.
+  const activeTabIdRef = useRef(activeTabId);
+  activeTabIdRef.current = activeTabId;
+  const prevConnectedRef = useRef(false);
+  useEffect(() => {
+    const justConnected = connected && !prevConnectedRef.current;
+    prevConnectedRef.current = connected;
+    if (!justConnected || !sessionId) return;
+    const pid = activeTabIdRef.current;
+    if (pid == null || pid <= OVERVIEW_PANE_ID) return;
+    // Let WS auth/attach and the reconnect catchup settle first.
+    const t = setTimeout(() => refreshPaneWindow(pid), 600);
+    return () => clearTimeout(t);
+  }, [connected, sessionId, refreshPaneWindow]);
 
   // Reset the lazy-mount set on session change so a fresh project starts
   // with zero mounted panes — the active-pane effect below mounts the

@@ -582,3 +582,48 @@ describe("catchup reply clears reconnectWatermarks for that session", () => {
     }, 10));
   });
 });
+
+describe("sliding-window reconcile (hole healing)", () => {
+  it("overwrites the recent window with the server's contiguous slice, filling a cache hole", async () => {
+    useStore.getState().connect();
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Cached (gappy) render: an older message, then t1 and t3 — the t2
+    // message was dropped during a flaky reconnect (a hole below the
+    // watermark), and these carry client-random ids from live streaming.
+    const t0 = new Date("2026-07-10T02:00:00Z");
+    const t1 = new Date("2026-07-10T02:38:00Z");
+    const t3 = new Date("2026-07-10T02:39:00Z");
+    useStore.setState({
+      isAuthenticated: true,
+      sessionId: SID_A,
+      isDualPane: true,
+      paneMessages: {
+        [paneKey(PANE_ID)]: [
+          { ...makeMsg("client-old", "older"), timestamp: t0 },
+          { ...makeMsg("client-a", "a"), timestamp: t1 },
+          { ...makeMsg("client-c", "c"), timestamp: t3 },
+        ],
+      },
+    });
+
+    // refreshPaneWindow reply: the contiguous newest window t1..t3
+    // (hole-free), with storage ids that DON'T match the cached client ids.
+    dispatch({
+      type: "session_messages",
+      session_id: SID_A,
+      messages: [
+        { ...makeStoredMsg("srv-a", PANE_ID, "a"), created_at: "2026-07-10T02:38:00Z" },
+        { ...makeStoredMsg("srv-b", PANE_ID, "b"), created_at: "2026-07-10T02:38:30Z" },
+        { ...makeStoredMsg("srv-c", PANE_ID, "c"), created_at: "2026-07-10T02:39:00Z" },
+      ],
+      has_more: true,
+    });
+
+    const ids = useStore.getState().paneMessages[paneKey(PANE_ID)].map((m) => m.id);
+    // Older cached message kept; recent window replaced by the server slice,
+    // so the hole (t2 / srv-b) is now present and the stale client-id
+    // duplicates of a/c are gone (no id-mismatch dupes).
+    expect(ids).toEqual(["client-old", "srv-a", "srv-b", "srv-c"]);
+  });
+});

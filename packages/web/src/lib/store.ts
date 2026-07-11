@@ -650,6 +650,10 @@ interface AppState {
    *  via `get_session_messages` with `pane_id`. No-op if the pane is
    *  already loaded or a fetch is in flight. */
   loadPaneMessagesIfNeeded: (paneId: number) => void;
+  /** Re-fetch a pane's newest contiguous slice and reconcile it as a
+   *  sliding window (overwrites the recent range, keeps older history) so a
+   *  reconnect/reload heals any hole left below the catchup watermark. */
+  refreshPaneWindow: (paneId: number, limit?: number) => void;
   prependMessages: (messages: Message[], hasMore: boolean) => void;
   sendMessageToPane: (text: string, pane: PaneType | number) => { success: boolean; error?: string };
   addMessageToPane: (message: Message, pane: PaneType | number) => void;
@@ -1681,6 +1685,27 @@ export const useStore = create<AppState>((set, get) => ({
         return { paneLoadingInitial: next };
       });
     }, 30_000);
+  },
+
+  refreshPaneWindow: (paneId: number, limit = 50) => {
+    // Re-fetch the newest contiguous slice for a pane; the session_messages
+    // handler reconciles it as a sliding window (see the isDualPane branch),
+    // keeping older cached history and OVERWRITING the recent range. Unlike
+    // loadPaneMessagesIfNeeded this fires even when the bucket is already
+    // populated — it's how a reconnect/reload heals a hole left below the
+    // watermark, which the after_created_at catchup can never backfill.
+    const { ws, sessionId } = get();
+    if (!sessionId) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (paneId < 0) return; // skip the Overview pseudo-tab sentinel
+    ws.send(
+      JSON.stringify({
+        type: "get_session_messages",
+        session_id: sessionId,
+        pane_id: paneId,
+        limit,
+      }),
+    );
   },
 
   loadMoreMessages: (pane?: PaneType | number) => {
@@ -4084,23 +4109,26 @@ function handleServerMessage(
           get().prependMessages(parsedMessages, hasMore);
         }
       } else if (isDualPane || hasPaneType) {
-        // Initial load - dual pane mode. For each pane in the server
-        // payload: if local bucket is empty, accept the server's
-        // snapshot (first-time load). Otherwise IGNORE the server
-        // payload for that pane.
+        // Initial / window-refresh load - dual pane mode. `paneMsgBuckets`
+        // holds a contiguous newest-N slice per pane straight from the
+        // server. We reconcile it as a SLIDING WINDOW so the rendered tail
+        // is always a hole-free, server-authoritative block ending at
+        // "now":
+        //   - empty local bucket  -> accept the slice (first-time load).
+        //   - non-empty bucket     -> keep cached messages strictly OLDER
+        //     than the slice's oldest, then let the slice REPLACE the
+        //     recent window. This overwrites any hole a flaky reconnect
+        //     left BELOW the watermark — which the `after_created_at`
+        //     catchup can only ever skip, since it extends the frontier
+        //     forward and never re-examines older territory.
         //
-        // Why ignore instead of merge? Stream-message-arrived messages
-        // have client-generated random IDs; session_messages-arrived
-        // ones have storage-record IDs. They're the same logical
-        // message but the id strings don't match — so dedupe-by-id
-        // can't tell them apart and naive merging produces
-        // duplicates-at-the-bottom (the original symptom of this fix).
-        // Since live stream_message events keep paneMessages
-        // authoritative anyway, treating the in-memory state as the
-        // truth source is the safe call. Server-only history that the
-        // client never saw is still reachable via loadMoreMessages
-        // (scroll-to-top), which goes through the isLoadingMore
-        // branch above.
+        // Replacing the range wholesale (rather than merging by id) is what
+        // keeps it safe: stream_message messages carry client-random ids
+        // while session_messages carry storage ids, so an id-merge would
+        // duplicate the overlap. The window swap sidesteps that entirely;
+        // the only overlap is at the boundary, cut by the strict-older
+        // filter. Older history still pages in contiguously via
+        // loadMoreMessages (scroll-to-top, the isLoadingMore branch above).
         const { paneModes: existingPaneModes, paneMessages: existingPaneMessages, paneHasMore: existingPaneHasMore, messages: existingMessages } = get();
         const newPaneMessages: Record<string, Message[]> = { ...existingPaneMessages };
         const newPaneHasMore: Record<string, boolean> = { ...existingPaneHasMore };
@@ -4110,8 +4138,19 @@ function handleServerMessage(
             // First load for this pane — accept the server snapshot.
             newPaneMessages[paneId] = msgs;
             newPaneHasMore[paneId] = hasMore;
+          } else if (msgs.length > 0) {
+            // Sliding-window reconcile: overwrite the recent range with the
+            // server's contiguous slice, keep older cached history.
+            const windowOldest = msgs.reduce(
+              (min, m) => (m.timestamp < min ? m.timestamp : min),
+              msgs[0].timestamp,
+            );
+            const kept = existing.filter((m) => m.timestamp < windowOldest);
+            newPaneMessages[paneId] = [...kept, ...msgs];
+            // There's older history to page if we kept anything below the
+            // slice, or the server flags more before it.
+            newPaneHasMore[paneId] = kept.length > 0 ? true : hasMore;
           }
-          // Else: skip. Live state wins.
         }
         // Same rule for the legacy single-pane bucket.
         const effectiveMessages = existingMessages.length === 0 ? mainMsgs : existingMessages;
