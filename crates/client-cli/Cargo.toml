@@ -43,8 +43,11 @@ ctrlc = "3.4"
 ratatui = "0.29"
 crossterm = "0.28"
 
-# HTTP client for auth
-reqwest = { version = "0.12", features = ["json"] }
+# HTTP client for auth. rustls (pure Rust) instead of the default
+# native-tls/OpenSSL so the CLI links no C TLS stack and builds cleanly for
+# the static musl target (see build.target in .cargo/config.toml). http2 +
+# charset are re-added because default-features=false drops them.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2", "charset"] }
 
 # Home directory detection
 dirs = "5.0"

@@ -275,8 +275,34 @@ fn pull_and_build() -> Result<PathBuf> {
             .status()?;
     }
 
-    // Build
+    // Build. Prefer a static musl binary on Linux so the rebuilt CLI doesn't
+    // depend on this machine's glibc version; fall back to the host libc
+    // target if the musl build fails (e.g. the musl C toolchain isn't
+    // installed) so a self-update can never leave the user without a binary.
     eprintln!("[Auto-update] Building...");
+    if let Some(target) = preferred_build_target() {
+        // Best-effort: make sure the target's std library is present.
+        let _ = Command::new("rustup")
+            .args(["target", "add", &target])
+            .current_dir(&src_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let built = Command::new("cargo")
+            .args(["build", "--release", "--target", &target, "-p", "apas"])
+            .current_dir(&src_dir)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if built {
+            return Ok(src_dir.join(format!("target/{target}/release/apas")));
+        }
+        eprintln!(
+            "[Auto-update] musl build failed (is `musl-tools` installed?); \
+             falling back to the system libc target."
+        );
+    }
+
     let status = Command::new("cargo")
         .args(["build", "--release", "-p", "apas"])
         .current_dir(&src_dir)
@@ -287,6 +313,21 @@ fn pull_and_build() -> Result<PathBuf> {
     }
 
     Ok(src_dir.join("target/release/apas"))
+}
+
+/// Preferred Cargo `--target` for the self-rebuilt CLI: a static musl target
+/// on Linux so the updated `apas` doesn't depend on the build machine's glibc
+/// version. `None` means "use the host default target" — non-Linux (macOS has
+/// no musl target), or an architecture without a musl target wired up here.
+fn preferred_build_target() -> Option<String> {
+    if cfg!(target_os = "linux") {
+        match std::env::consts::ARCH {
+            arch @ ("x86_64" | "aarch64") => Some(format!("{arch}-unknown-linux-musl")),
+            _ => None,
+        }
+    } else {
+        None
+    }
 }
 
 /// Install a new binary by replacing the current one

@@ -1,0 +1,20 @@
+# Workspace Cargo configuration.
+#
+# The client CLI (crate `apas`) ships as a static musl binary so that a
+# self-update rebuild doesn't leave it depending on the build machine's glibc
+# version. install.sh and crates/client-cli/src/update.rs build it with
+# `--target <arch>-unknown-linux-musl`; the server and host-native dev builds
+# stay on the default glibc target (musl is NOT set as a global build.target,
+# which would drag the server's bundled SQLite/ring through musl too).
+#
+# The CLI's TLS stack is rustls, whose crypto backend `ring` compiles a little
+# C for the musl target. Point that at the musl-tools wrapper compiler
+# (`musl-gcc`, Debian/Ubuntu package `musl-tools`) so the build needs no full
+# musl cross-toolchain. These CC_<target> entries are only read when compiling
+# C for the musl targets, so they are inert for the default glibc builds. They
+# are non-force: an environment whose musl compiler has a different name (e.g.
+# Alpine's native `cc`, or a `x86_64-linux-musl-gcc` cross toolchain) can
+# override CC_<target> in its own environment.
+[env]
+CC_x86_64_unknown_linux_musl = "musl-gcc"
+CC_aarch64_unknown_linux_musl = "musl-gcc"

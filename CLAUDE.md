@@ -139,6 +139,30 @@ npm install
 npm run dev
 ```
 
+### CLI build target (static musl)
+
+The shipped CLI is a **static musl** binary so a self-update rebuild never
+leaves `apas` depending on the build machine's glibc version. `install.sh` and
+the self-updater (`crates/client-cli/src/update.rs`) build it with
+`--target <arch>-unknown-linux-musl`; the server and plain `cargo build` stay
+on the host's glibc target (musl is deliberately **not** a global
+`build.target`, which would drag the server's bundled SQLite/ring through musl
+too). The CLI's TLS is rustls (not native-tls/OpenSSL) so nothing but ring's
+small C shim needs the musl toolchain.
+
+Building the CLI as it ships needs the musl target plus a musl C compiler:
+
+```bash
+rustup target add x86_64-unknown-linux-musl   # (aarch64-… on ARM)
+sudo apt-get install -y musl-tools            # provides musl-gcc + musl-dev
+
+cargo build --release --target x86_64-unknown-linux-musl -p apas
+```
+
+`.cargo/config.toml` points ring's C build at `musl-gcc` for the musl targets.
+If the musl toolchain is missing, `install.sh` and the self-updater fall back
+to a glibc build so an update can never brick the binary.
+
 ## Configuration
 
 ### CLI Config
