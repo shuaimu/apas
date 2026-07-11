@@ -2321,10 +2321,11 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   updatePaneEffort: (paneId: number, effort: string | null) => {
-    const { ws } = get();
+    const { ws, sessionId } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
         type: "update_pane_effort",
+        session_id: sessionId,
         pane_id: paneId,
         effort: effort ?? null,
       }));
@@ -2336,11 +2337,15 @@ export const useStore = create<AppState>((set, get) => ({
     model: string | null,
     provider?: string | null,
   ) => {
-    const { ws } = get();
+    const { ws, sessionId } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(
         JSON.stringify({
           type: "update_pane_model",
+          // Carry session_id so the switch targets the pane the user is
+          // viewing, not the connection's drifting last-attached session —
+          // which misrouted model changes on mobile. See interruptPane.
+          session_id: sessionId,
           pane_id: paneId,
           model: model ?? null,
           // null = keep current provider; only send when explicitly

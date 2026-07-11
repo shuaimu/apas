@@ -2523,8 +2523,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::UpdatePaneEffort { pane_id, effort }) => {
-                    if let Some(sid) = session_id {
+                Ok(WebToServer::UpdatePaneEffort { session_id: msg_sid, pane_id, effort }) => {
+                    if let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    {
                         let normalized = effort.as_deref().and_then(normalize_start_bot_effort);
                         tracing::info!(
                             "Updating pane {} effort in session {} to {:?}",
@@ -2560,8 +2562,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         }
                     }
                 }
-                Ok(WebToServer::UpdatePaneModel { pane_id, provider, model }) => {
-                    if let Some(sid) = session_id {
+                Ok(WebToServer::UpdatePaneModel { session_id: msg_sid, pane_id, provider, model }) => {
+                    if let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    {
                         let trimmed = model
                             .as_deref()
                             .map(str::trim)

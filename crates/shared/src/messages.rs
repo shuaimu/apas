@@ -868,7 +868,13 @@ pub enum WebToServer {
 
     /// Update a pane's Claude thinking-effort override. Persisted in the
     /// project .apas so switching tabs doesn't reset it to default.
+    /// `session_id` is optional (see `InterruptPane`): when present the server
+    /// validates/auto-attaches this connection to that session, so the change
+    /// isn't misrouted to the connection's drifting last-attached session
+    /// (which breaks the mobile fan-out); absent = legacy connection-session.
     UpdatePaneEffort {
+        #[serde(default)]
+        session_id: Option<Uuid>,
         pane_id: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
@@ -878,7 +884,13 @@ pub enum WebToServer {
     /// the current agent child and respawns with a fresh session id —
     /// the new agent starts with no prior chat context. See
     /// `ServerToCli::UpdatePaneModel` for the full semantics.
+    /// `session_id` is optional (see `InterruptPane`): when present the server
+    /// validates/auto-attaches this connection to that session, so the switch
+    /// isn't misrouted to the connection's drifting last-attached session
+    /// (which broke the model selector on mobile); absent = legacy behavior.
     UpdatePaneModel {
+        #[serde(default)]
+        session_id: Option<Uuid>,
         pane_id: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<Provider>,
