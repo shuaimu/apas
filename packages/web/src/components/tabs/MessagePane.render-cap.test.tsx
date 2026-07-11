@@ -156,3 +156,58 @@ describe("computeHiddenCount — tool messages don't consume the reveal budget",
     expect(computeHiddenCount(msgs, 2)).toBe(1); // ask1 + t2
   });
 });
+
+describe("MessagePane auto-fill — tool-heavy panes page in real conversation", () => {
+  const toolMsg = (id: string, kind: "tool_use" | "tool_result"): Message => ({
+    id, role: "assistant", content: id, timestamp: new Date(),
+    outputType: kind === "tool_use"
+      ? { type: "tool_use", tool: "Bash", input: {} }
+      : { type: "tool_result", tool: "Bash", success: true },
+  });
+  const allTools = (n: number): Message[] =>
+    Array.from({ length: n }, (_, i) => toolMsg(`t${i}`, i % 2 ? "tool_result" : "tool_use"));
+
+  beforeEach(() => {
+    Element.prototype.scrollIntoView = vi.fn();
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => { cb(0); return 0; });
+    act(() => { useStore.setState({ sessionId: "session-autofill" }); });
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    localStorage.clear();
+    act(() => { useStore.setState(initialStore, true); });
+  });
+
+  it("auto-loads more when the loaded window has too few non-tool messages", () => {
+    const onLoadMore = vi.fn();
+    render(
+      <MessagePane paneId={PANE_ID} messages={allTools(20)} onLoadMore={onLoadMore} hasMore={true} isActive={true} />,
+    );
+    expect(onLoadMore).toHaveBeenCalled();
+  });
+
+  it("does not auto-load once enough non-tool messages are present", () => {
+    const onLoadMore = vi.fn();
+    render(
+      <MessagePane paneId={PANE_ID} messages={makeMessages(INITIAL_RENDER_CAP + 5)} onLoadMore={onLoadMore} hasMore={true} isActive={true} />,
+    );
+    expect(onLoadMore).not.toHaveBeenCalled();
+  });
+
+  it("does not auto-load when history is exhausted (hasMore=false)", () => {
+    const onLoadMore = vi.fn();
+    render(
+      <MessagePane paneId={PANE_ID} messages={allTools(20)} onLoadMore={onLoadMore} hasMore={false} isActive={true} />,
+    );
+    expect(onLoadMore).not.toHaveBeenCalled();
+  });
+
+  it("does not auto-load a background (inactive) pane", () => {
+    const onLoadMore = vi.fn();
+    render(
+      <MessagePane paneId={PANE_ID} messages={allTools(20)} onLoadMore={onLoadMore} hasMore={true} isActive={false} />,
+    );
+    expect(onLoadMore).not.toHaveBeenCalled();
+  });
+});

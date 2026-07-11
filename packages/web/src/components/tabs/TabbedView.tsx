@@ -2237,6 +2237,16 @@ export interface MessagePaneProps {
 export const INITIAL_RENDER_CAP = 30;
 export const RENDER_CAP_STEP = 50;
 
+/// Upper bound on how many raw messages the auto-fill (in MessagePane) will
+/// page in while chasing `INITIAL_RENDER_CAP` non-tool messages. Tool-heavy
+/// panes can run ~13 folded tool messages per real message — the newest 50
+/// of one cluster pane held a single non-tool message — so without a bound a
+/// pane that is almost all tool calls would page its entire history on open.
+/// 400 keeps the initial catch-up fetch bounded (mobile payload) while still
+/// reaching ~30 real messages for even very tool-heavy panes; anything older
+/// loads on scroll-up.
+export const AUTO_FILL_MESSAGE_CAP = 400;
+
 /// How many of the oldest messages to keep unmounted. Only NON-tool
 /// messages count toward the reveal budget (`revealCap`): a turn's folded
 /// tool_use / tool_result rows shouldn't crowd the actual conversation out
@@ -2304,6 +2314,11 @@ export function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, 
   // can tell "single new message arrived" (smooth) apart from "100
   // messages just appeared at once" (snap to bottom).
   const prevMessageCountRef = useRef<number>(0);
+  // Guards the auto-fill loop below: the raw message count at the last
+  // auto-triggered load. If a load doesn't grow the window (e.g. a page of
+  // older messages that all belong to other panes, so hasMore stays true but
+  // nothing new lands for this pane), stop rather than paging forever.
+  const autoFillLastLenRef = useRef(-1);
   // `null` on first render so we can distinguish "first time we see
   // isActive" from a later transition. After the effect runs once,
   // it holds the previous value.
@@ -2497,6 +2512,33 @@ export function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, 
       messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }
   }, [messages.length, isActive]);
+
+  // Auto-fill the conversation window. Tool-heavy panes can have their newest
+  // messages be almost entirely folded tool calls — one cluster pane's newest
+  // 50 messages held a single real message — so the initial fetch lands the
+  // user on a wall of tool cards with nothing to read. Page older messages in
+  // until the loaded set holds INITIAL_RENDER_CAP non-tool messages, history
+  // runs out (hasMore), or we hit the AUTO_FILL_MESSAGE_CAP payload bound.
+  // Active pane only; sequential — each load flips isLoading, so the next
+  // fires only once the prior settles. Targets the fixed INITIAL_RENDER_CAP
+  // (not the growable revealCount) so paging further back via "Show earlier"
+  // never retriggers a fresh fill.
+  useEffect(() => {
+    if (!isActive || !onLoadMore || isLoading || !hasMore) return;
+    if (messages.length >= AUTO_FILL_MESSAGE_CAP) return;
+    let nonTool = 0;
+    for (const m of messages) {
+      if (!isToolLikeMessage(m)) {
+        nonTool += 1;
+        if (nonTool >= INITIAL_RENDER_CAP) return; // enough real messages loaded
+      }
+    }
+    // No progress since the last auto-load means paging further won't help
+    // this pane (a page landed nothing new for it) — stop instead of looping.
+    if (messages.length === autoFillLastLenRef.current) return;
+    autoFillLastLenRef.current = messages.length;
+    onLoadMore();
+  }, [isActive, messages, hasMore, isLoading, onLoadMore]);
 
   // Only mount the newest `revealCount` messages until the user expands.
   // `expanded` latches once they've paged all the way back, so older
