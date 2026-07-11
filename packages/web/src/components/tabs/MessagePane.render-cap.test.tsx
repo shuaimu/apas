@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useStore, type Message } from "@/lib/store";
-import { INITIAL_RENDER_CAP, MessagePane, RENDER_CAP_STEP } from "./TabbedView";
+import { computeHiddenCount, INITIAL_RENDER_CAP, MessagePane, RENDER_CAP_STEP } from "./TabbedView";
 
 const initialStore = useStore.getInitialState();
 const PANE_ID = 77;
@@ -116,5 +116,43 @@ describe("MessagePane render cap", () => {
     fireEvent.scroll(scroller);
 
     expect(onLoadMore).toHaveBeenCalledOnce();
+  });
+});
+
+describe("computeHiddenCount — tool messages don't consume the reveal budget", () => {
+  const textMsg = (id: string): Message => ({
+    id, role: "assistant", content: id, timestamp: new Date(), outputType: { type: "text" },
+  });
+  const toolMsg = (id: string, kind: "tool_use" | "tool_result"): Message => ({
+    id, role: "assistant", content: id, timestamp: new Date(),
+    outputType: kind === "tool_use"
+      ? { type: "tool_use", tool: "Bash", input: {} }
+      : { type: "tool_result", tool: "Bash", success: true },
+  });
+  const askMsg = (id: string): Message => ({
+    id, role: "assistant", content: id, timestamp: new Date(),
+    outputType: { type: "tool_use", tool: "AskUserQuestion", input: {} },
+  });
+
+  it("counts only non-tool messages toward the cap", () => {
+    const msgs = [
+      textMsg("t0"), toolMsg("u1", "tool_use"), toolMsg("r2", "tool_result"),
+      textMsg("t3"), toolMsg("u4", "tool_use"), toolMsg("r5", "tool_result"),
+      textMsg("t6"),
+    ];
+    // Budget of 2 text messages -> show from t3 onward (t3, its tools, t6).
+    // Old count-everything behavior would have hidden 5, leaving 1 text.
+    expect(computeHiddenCount(msgs, 2)).toBe(3);
+  });
+
+  it("shows everything when non-tool messages are fewer than the cap", () => {
+    const msgs = [textMsg("t0"), toolMsg("u1", "tool_use"), textMsg("t2")];
+    expect(computeHiddenCount(msgs, 30)).toBe(0);
+  });
+
+  it("keeps AskUserQuestion counted as a normal (budget-consuming) message", () => {
+    const msgs = [textMsg("t0"), askMsg("ask1"), textMsg("t2")];
+    expect(computeHiddenCount(msgs, 1)).toBe(2); // only t2
+    expect(computeHiddenCount(msgs, 2)).toBe(1); // ask1 + t2
   });
 });

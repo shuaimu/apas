@@ -7,7 +7,7 @@ import { extractTimeline, TimelineEntry } from "@/lib/timeline";
 import { OverviewView } from "../overview/OverviewView";
 import { UserMessage } from "../chat/UserMessage";
 import { AssistantMessage } from "../chat/AssistantMessage";
-import { ToolGroupCard, groupMessagesForRender } from "../chat/ToolGroupCard";
+import { ToolGroupCard, groupMessagesForRender, isToolLikeMessage } from "../chat/ToolGroupCard";
 import { TabBar } from "./TabBar";
 import { WorkerTaskBar } from "./WorkerTaskBar";
 import { UsageLimitsDisplay } from "../UsageLimits";
@@ -2237,6 +2237,25 @@ export interface MessagePaneProps {
 export const INITIAL_RENDER_CAP = 30;
 export const RENDER_CAP_STEP = 50;
 
+/// How many of the oldest messages to keep unmounted. Only NON-tool
+/// messages count toward the reveal budget (`revealCap`): a turn's folded
+/// tool_use / tool_result rows shouldn't crowd the actual conversation out
+/// of the window — 15 tool rows used to mean zero visible text. Interspersed
+/// tool messages are still rendered, they just don't consume the budget.
+/// Scans back from the newest until `revealCap` non-tool messages are in
+/// view and hides everything older (returns the index of the oldest shown
+/// message, i.e. the count hidden at the front).
+export function computeHiddenCount(messages: Message[], revealCap: number): number {
+  let normalSeen = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (!isToolLikeMessage(messages[i])) {
+      normalSeen++;
+      if (normalSeen >= revealCap) return i;
+    }
+  }
+  return 0;
+}
+
 // Placeholder pinned to the top of a pane while older history is paged in
 // from the server (i.e. the user scrolled to the top and the local render
 // cache is already exhausted). A labelled spinner plus a couple of muted
@@ -2485,7 +2504,7 @@ export function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, 
   // early return so the useMemo below always runs — otherwise a pane that
   // first renders empty then receives messages changes its hook count
   // between renders (React error #310: "rendered more hooks than before").
-  const hiddenCount = expanded ? 0 : Math.max(0, messages.length - revealCount);
+  const hiddenCount = expanded ? 0 : computeHiddenCount(messages, revealCount);
   hiddenCountRef.current = hiddenCount;
   const visibleMessages = hiddenCount > 0 ? messages.slice(hiddenCount) : messages;
   // Second-level fold: collapse consecutive tool_use / tool_result runs of at

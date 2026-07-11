@@ -23,7 +23,7 @@ export type RenderItem =
   | { kind: "message"; message: Message }
   | { kind: "tool-group"; id: string; items: Message[] };
 
-function isToolLikeMessage(m: Message): boolean {
+export function isToolLikeMessage(m: Message): boolean {
   const ot = m.outputType;
   if (!ot) return false;
   if (ot.type === "tool_use") {
