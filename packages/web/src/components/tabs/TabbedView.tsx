@@ -1033,8 +1033,11 @@ export function TabbedView({
         </div>
       )}
 
-      {/* Toolbar */}
-      <div className="flex items-center gap-2 px-3 py-1.5 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30 flex-shrink-0">
+      {/* Toolbar — flex-wrap so the controls (bot/effort/provider/model) wrap
+          onto a second row on narrow phones instead of overflowing past the
+          right edge, where the overflow-hidden frame would clip the rightmost
+          ones (the provider + model selectors) off-screen and unreachable. */}
+      <div className="flex flex-wrap items-center gap-2 px-3 py-1.5 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30 flex-shrink-0">
         {/* Start/Stop Bot */}
         {isAttached && activeTabId != null && activeTabId !== PANE_ID_MAIN && (
           activeIsBot ? (
