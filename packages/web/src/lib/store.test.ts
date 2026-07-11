@@ -316,7 +316,7 @@ describe('useStore', () => {
 
     it('startTeam sends exact role specs and omits null models', () => {
       const ws = makeOpenWs();
-      useStore.setState({ ws });
+      useStore.setState({ ws, sessionId: 'session-team' });
 
       useStore.getState().startTeam({
         manager: { provider: 'claude', model: 'claude-sonnet-4' },
@@ -329,6 +329,7 @@ describe('useStore', () => {
       const payload = JSON.parse(ws.send.mock.calls[0][0] as string);
       expect(payload).toEqual({
         type: 'start_team',
+        session_id: 'session-team',
         manager: { provider: 'claude', model: 'claude-sonnet-4' },
         tech_lead: { provider: 'codex' },
         reviewer: { provider: 'minimax', model: 'MiniMax-M2.7' },
@@ -386,6 +387,7 @@ describe('useStore', () => {
       expect(ws.send).toHaveBeenCalledOnce();
       expect(ws.send).toHaveBeenCalledWith(JSON.stringify({
         type: 'reboot_cli',
+        session_id: 'session-cli-reboot',
       }));
     });
 
@@ -554,6 +556,7 @@ describe('useStore', () => {
 
       expect(ws.send).toHaveBeenCalledWith(JSON.stringify({
         type: 'update_project_flags',
+        session_id: 'session-flags-a',
         auto_approve_todos: true,
         auto_merge_prs: false,
       }));

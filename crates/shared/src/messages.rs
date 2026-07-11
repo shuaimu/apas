@@ -787,10 +787,16 @@ pub enum WebToServer {
     },
 
     /// Pause the deadloop session (legacy - use PausePane for new code)
-    PauseDeadloop,
+    PauseDeadloop {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
+    },
 
     /// Resume the deadloop session (legacy - use ResumePane for new code)
-    ResumeDeadloop,
+    ResumeDeadloop {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
+    },
 
     /// Pause a specific pane. See `Input::session_id`.
     PausePane {
@@ -816,6 +822,8 @@ pub enum WebToServer {
 
     /// Add a new pane
     AddPane {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
         provider: Provider,
         mode: PaneMode,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -855,6 +863,8 @@ pub enum WebToServer {
     /// with that worktree and its branch. None = leave the on-disk worktree
     /// and branch alone (legacy behaviour — just unlink the pane from .apas).
     RemovePane {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
         pane_id: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cleanup_action: Option<PaneCleanupAction>,
@@ -862,6 +872,8 @@ pub enum WebToServer {
 
     /// Update a pane's custom label
     UpdatePaneLabel {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
         pane_id: u32,
         label: String,
     },
@@ -912,10 +924,16 @@ pub enum WebToServer {
     },
 
     /// Reorder panes (array of pane_ids in desired order)
-    ReorderPanes { pane_ids: Vec<u32> },
+    ReorderPanes {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
+        pane_ids: Vec<u32>,
+    },
 
     /// Start bot (deadloop) on a pane — converts interactive pane to deadloop
     StartBot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
         pane_id: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
@@ -926,10 +944,17 @@ pub enum WebToServer {
     },
 
     /// Stop bot on a pane — converts deadloop pane back to interactive
-    StopBot { pane_id: u32 },
+    StopBot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
+        pane_id: u32,
+    },
 
     /// Reboot the CLI process
-    RebootCli,
+    RebootCli {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
+    },
 
     /// Start APAS CLI for a daemon project
     StartMachineProjectCli {
@@ -1018,23 +1043,37 @@ pub enum WebToServer {
     /// Ask the CLI for the current `git diff` between the pane's worktree
     /// branch and the project's HEAD. Returns via `ServerToWeb::PaneDiff`.
     /// Phase 1.2a.
-    RequestPaneDiff { pane_id: u32 },
+    RequestPaneDiff {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
+        pane_id: u32,
+    },
 
     /// Web → server → CLI: push the pane's branch and run
     /// `gh pr create --fill` in its worktree. Result rides
     /// `ServerToWeb::PrCreated`.
-    CreatePr { pane_id: u32 },
+    CreatePr {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
+        pane_id: u32,
+    },
 
     /// Manager v2 — overwrite the project_goal.md file at the project
     /// root with `goal`. The deadloop manager re-reads this file on
     /// every iteration so a goal change takes effect at the next loop
     /// boundary, not mid-iteration.
-    UpdateProjectGoal { goal: String },
+    UpdateProjectGoal {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
+        goal: String,
+    },
 
     /// Set Tech-Lead autonomy flags. CLI writes both into `.apas` and
     /// then echoes `CliToServer::ProjectFlagsChanged` so peer web
     /// clients stay in sync.
     UpdateProjectFlags {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
         auto_approve_todos: bool,
         auto_merge_prs: bool,
     },
@@ -1045,6 +1084,8 @@ pub enum WebToServer {
     /// `*_spec` fields carry the provider/model the user picked in
     /// the Team setup card.
     StartTeam {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
         #[serde(default)]
         manager: TeamRoleSpec,
         #[serde(default)]
@@ -1061,6 +1102,8 @@ pub enum WebToServer {
     /// or reboot the apas CLI) since claude reads --append-system-prompt
     /// only at launch.
     UpdatePaneRole {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
         pane_id: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role: Option<String>,
@@ -1074,6 +1117,8 @@ pub enum WebToServer {
     /// resumes the agent's turn; `approve = false` rejects the tool, which
     /// claude will surface as a tool_result error.
     PlanReviewAnswer {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
         tool_use_id: String,
         approve: bool,
     },
@@ -1082,6 +1127,8 @@ pub enum WebToServer {
     /// for future control_requests — the CLI reads the field at decision
     /// time, not at spawn.
     UpdatePaneReviewMode {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
         pane_id: u32,
         mode: PlanReviewMode,
     },
@@ -1089,6 +1136,8 @@ pub enum WebToServer {
     /// v3.2: web → server → CLI: flip a worker between autonomous and
     /// manual modes. CLI updates PaneMeta + PaneConfig + persists to .apas.
     UpdatePaneManualMode {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
         pane_id: u32,
         manual_mode: bool,
     },

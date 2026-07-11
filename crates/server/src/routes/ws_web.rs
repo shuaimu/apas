@@ -1568,8 +1568,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         )
                         .await;
                 }
-                Ok(WebToServer::PauseDeadloop) => {
-                    if let Some(sid) = session_id {
+                Ok(WebToServer::PauseDeadloop { session_id: msg_sid }) => {
+                    if let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    {
                         tracing::info!("Pausing deadloop for session {}", sid);
                         state
                             .sessions
@@ -1577,8 +1579,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::ResumeDeadloop) => {
-                    if let Some(sid) = session_id {
+                Ok(WebToServer::ResumeDeadloop { session_id: msg_sid }) => {
+                    if let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    {
                         tracing::info!("Resuming deadloop for session {}", sid);
                         state
                             .sessions
@@ -1586,8 +1590,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::RebootCli) => {
-                    if let Some(sid) = session_id {
+                Ok(WebToServer::RebootCli { session_id: msg_sid }) => {
+                    if let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    {
                         tracing::info!("Rebooting CLI for session {}", sid);
                         state
                             .sessions
@@ -2071,6 +2077,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         .await;
                 }
                 Ok(WebToServer::AddPane {
+                    session_id: msg_sid,
                     provider,
                     mode,
                     label,
@@ -2083,7 +2090,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     plan_review_mode,
                     managed,
                 }) => {
-                    if let Some(sid) = session_id {
+                    if let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    {
                         // Generate a unique pane_id starting from 3 (1 and 2 are reserved for legacy deadloop/interactive)
                         let pane_id = 3 + (uuid::Uuid::new_v4().as_u128() % 1000) as u32;
                         let pane_config = shared::PaneConfig {
@@ -2125,8 +2134,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         // (CLI will send back updated pane config)
                     }
                 }
-                Ok(WebToServer::RemovePane { pane_id, cleanup_action }) => {
-                    if let Some(sid) = session_id {
+                Ok(WebToServer::RemovePane { session_id: msg_sid, pane_id, cleanup_action }) => {
+                    if let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    {
                         tracing::info!(
                             "Removing pane {} from session {} (cleanup_action={:?})",
                             pane_id, sid, cleanup_action,
@@ -2144,8 +2155,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::UpdatePaneLabel { pane_id, label }) => {
-                    if let Some(sid) = session_id {
+                Ok(WebToServer::UpdatePaneLabel { session_id: msg_sid, pane_id, label }) => {
+                    if let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    {
                         tracing::info!("Updating pane {} label in session {}", pane_id, sid);
                         let mut panes = state.sessions.get_session_panes(&sid);
                         if let Some(pane) = panes.iter_mut().find(|p| p.pane_id == pane_id) {
@@ -2198,8 +2211,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         )
                         .await;
                 }
-                Ok(WebToServer::PlanReviewAnswer { tool_use_id, approve }) => {
-                    if let Some(sid) = session_id {
+                Ok(WebToServer::PlanReviewAnswer { session_id: msg_sid, tool_use_id, approve }) => {
+                    if let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    {
                         tracing::info!(
                             "Plan review answer for session {}: {} → {}",
                             sid, tool_use_id, approve,
@@ -2217,8 +2232,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::UpdatePaneReviewMode { pane_id, mode }) => {
-                    if let Some(sid) = session_id {
+                Ok(WebToServer::UpdatePaneReviewMode { session_id: msg_sid, pane_id, mode }) => {
+                    if let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    {
                         tracing::info!(
                             "Update pane {} plan_review_mode for session {} → {:?}",
                             pane_id, sid, mode,
@@ -2236,8 +2253,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::UpdatePaneManualMode { pane_id, manual_mode }) => {
-                    if let Some(sid) = session_id {
+                Ok(WebToServer::UpdatePaneManualMode { session_id: msg_sid, pane_id, manual_mode }) => {
+                    if let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    {
                         tracing::info!(
                             "Update pane {} manual_mode for session {} → {}",
                             pane_id, sid, manual_mode,
@@ -2372,8 +2391,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         )
                         .await;
                 }
-                Ok(WebToServer::UpdatePaneRole { pane_id, role, goal, backstory }) => {
-                    if let Some(sid) = session_id {
+                Ok(WebToServer::UpdatePaneRole { session_id: msg_sid, pane_id, role, goal, backstory }) => {
+                    if let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    {
                         tracing::info!(
                             "Updating pane {} role for session {} (role={:?}, goal={:?})",
                             pane_id, sid, role, goal,
@@ -2393,8 +2414,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::RequestPaneDiff { pane_id }) => {
-                    if let Some(sid) = session_id {
+                Ok(WebToServer::RequestPaneDiff { session_id: msg_sid, pane_id }) => {
+                    if let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    {
                         tracing::info!("Requesting pane diff for pane {} in session {}", pane_id, sid);
                         state
                             .sessions
@@ -2408,8 +2431,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::CreatePr { pane_id }) => {
-                    if let Some(sid) = session_id {
+                Ok(WebToServer::CreatePr { session_id: msg_sid, pane_id }) => {
+                    if let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    {
                         tracing::info!("Create PR for pane {} in session {}", pane_id, sid);
                         state
                             .sessions
@@ -2423,8 +2448,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::UpdateProjectGoal { goal }) => {
-                    if let Some(sid) = session_id {
+                Ok(WebToServer::UpdateProjectGoal { session_id: msg_sid, goal }) => {
+                    if let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    {
                         tracing::info!(
                             "Update project_goal for session {} ({} bytes)",
                             sid,
@@ -2443,10 +2470,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                 }
                 Ok(WebToServer::UpdateProjectFlags {
+                    session_id: msg_sid,
                     auto_approve_todos,
                     auto_merge_prs,
                 }) => {
-                    if let Some(sid) = session_id {
+                    if let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    {
                         tracing::info!(
                             session_id = %sid,
                             auto_approve_todos,
@@ -2467,12 +2497,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                 }
                 Ok(WebToServer::StartTeam {
+                    session_id: msg_sid,
                     manager,
                     tech_lead,
                     reviewer,
                     developer,
                 }) => {
-                    if let Some(sid) = session_id {
+                    if let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    {
                         tracing::info!(session_id = %sid, "Start team");
                         state
                             .sessions
@@ -2608,8 +2641,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::ReorderPanes { pane_ids }) => {
-                    if let Some(sid) = session_id {
+                Ok(WebToServer::ReorderPanes { session_id: msg_sid, pane_ids }) => {
+                    if let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    {
                         tracing::info!("Reordering panes in session {}", sid);
                         let panes = state.sessions.get_session_panes(&sid);
                         let order_map: std::collections::HashMap<u32, usize> =
@@ -2640,12 +2675,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                 }
                 Ok(WebToServer::StartBot {
+                    session_id: msg_sid,
                     pane_id,
                     prompt,
                     min_iteration_interval_minutes,
                     effort,
                 }) => {
-                    if let Some(sid) = session_id {
+                    if let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    {
                         tracing::info!("Starting bot on pane {} for session {}", pane_id, sid);
                         state
                             .sessions
@@ -2688,8 +2726,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         }
                     }
                 }
-                Ok(WebToServer::StopBot { pane_id }) => {
-                    if let Some(sid) = session_id {
+                Ok(WebToServer::StopBot { session_id: msg_sid, pane_id }) => {
+                    if let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    {
                         tracing::info!("Stopping bot on pane {} for session {}", pane_id, sid);
                         let routed = state
                             .sessions

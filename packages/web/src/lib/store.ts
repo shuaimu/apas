@@ -1936,7 +1936,7 @@ export const useStore = create<AppState>((set, get) => ({
   pauseDeadloop: () => {
     const { ws, sessionId } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "pause_deadloop" }));
+      ws.send(JSON.stringify({ type: "pause_deadloop", session_id: get().sessionId }));
       // Also send new pane-specific pause
       ws.send(JSON.stringify({ type: "pause_pane", session_id: sessionId, pane_id: PANE_ID_DEADLOOP }));
     }
@@ -1945,7 +1945,7 @@ export const useStore = create<AppState>((set, get) => ({
   resumeDeadloop: () => {
     const { ws, sessionId } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "resume_deadloop" }));
+      ws.send(JSON.stringify({ type: "resume_deadloop", session_id: get().sessionId }));
       // Also send new pane-specific resume
       ws.send(JSON.stringify({ type: "resume_pane", session_id: sessionId, pane_id: PANE_ID_DEADLOOP }));
     }
@@ -1957,7 +1957,7 @@ export const useStore = create<AppState>((set, get) => ({
       ws.send(JSON.stringify({ type: "pause_pane", session_id: sessionId, pane_id: paneId }));
       // Also send legacy message for backward compat
       if (paneId === PANE_ID_DEADLOOP) {
-        ws.send(JSON.stringify({ type: "pause_deadloop" }));
+        ws.send(JSON.stringify({ type: "pause_deadloop", session_id: get().sessionId }));
       }
     }
   },
@@ -1967,7 +1967,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "resume_pane", session_id: sessionId, pane_id: paneId }));
       if (paneId === PANE_ID_DEADLOOP) {
-        ws.send(JSON.stringify({ type: "resume_deadloop" }));
+        ws.send(JSON.stringify({ type: "resume_deadloop", session_id: get().sessionId }));
       }
     }
   },
@@ -2009,6 +2009,7 @@ export const useStore = create<AppState>((set, get) => ({
     }
     ws.send(JSON.stringify({
       type: "add_pane",
+      session_id: get().sessionId,
       provider,
       mode,
       label: label || undefined,
@@ -2027,7 +2028,7 @@ export const useStore = create<AppState>((set, get) => ({
   removePane: (paneId: number, cleanupAction?: PaneCleanupAction) => {
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
-      const payload: Record<string, unknown> = { type: "remove_pane", pane_id: paneId };
+      const payload: Record<string, unknown> = { type: "remove_pane", session_id: get().sessionId, pane_id: paneId };
       if (cleanupAction) {
         payload.cleanup_action = cleanupAction;
       }
@@ -2038,14 +2039,14 @@ export const useStore = create<AppState>((set, get) => ({
   requestPaneDiff: (paneId: number) => {
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "request_pane_diff", pane_id: paneId }));
+      ws.send(JSON.stringify({ type: "request_pane_diff", session_id: get().sessionId, pane_id: paneId }));
     }
   },
 
   createPanePr: (paneId: number) => {
     const { ws, showToast } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "create_pr", pane_id: paneId }));
+      ws.send(JSON.stringify({ type: "create_pr", session_id: get().sessionId, pane_id: paneId }));
       showToast("Pushing branch + creating PR…", "info");
     } else {
       showToast("Not connected — cannot create PR", "error");
@@ -2055,7 +2056,7 @@ export const useStore = create<AppState>((set, get) => ({
   updateProjectGoal: (goal: string) => {
     const { ws, showToast } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "update_project_goal", goal }));
+      ws.send(JSON.stringify({ type: "update_project_goal", session_id: get().sessionId, goal }));
     } else {
       showToast("Not connected — cannot save goal", "error");
     }
@@ -2070,6 +2071,7 @@ export const useStore = create<AppState>((set, get) => ({
     ws.send(
       JSON.stringify({
         type: "update_project_flags",
+        session_id: get().sessionId,
         auto_approve_todos: flags.autoApproveTodos,
         auto_merge_prs: flags.autoMergePrs,
       }),
@@ -2096,6 +2098,7 @@ export const useStore = create<AppState>((set, get) => ({
     ws.send(
       JSON.stringify({
         type: "start_team",
+        session_id: get().sessionId,
         manager: toSpec(specs.manager),
         tech_lead: toSpec(specs.techLead),
         reviewer: toSpec(specs.reviewer),
@@ -2232,7 +2235,7 @@ export const useStore = create<AppState>((set, get) => ({
   updatePaneRole: (paneId: number, role?: string, goal?: string, backstory?: string) => {
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
-      const payload: Record<string, unknown> = { type: "update_pane_role", pane_id: paneId };
+      const payload: Record<string, unknown> = { type: "update_pane_role", session_id: get().sessionId, pane_id: paneId };
       if (role !== undefined) payload.role = role;
       if (goal !== undefined) payload.goal = goal;
       if (backstory !== undefined) payload.backstory = backstory;
@@ -2243,7 +2246,7 @@ export const useStore = create<AppState>((set, get) => ({
   answerPlanReview: (toolUseId: string, approve: boolean) => {
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "plan_review_answer", tool_use_id: toolUseId, approve }));
+      ws.send(JSON.stringify({ type: "plan_review_answer", session_id: get().sessionId, tool_use_id: toolUseId, approve }));
     }
     // Optimistically drop the pending item — CLI will send the control_response
     // regardless, and re-rendering it would confuse the user.
@@ -2255,7 +2258,7 @@ export const useStore = create<AppState>((set, get) => ({
   updatePaneReviewMode: (paneId: number, mode: PlanReviewMode) => {
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "update_pane_review_mode", pane_id: paneId, mode }));
+      ws.send(JSON.stringify({ type: "update_pane_review_mode", session_id: get().sessionId, pane_id: paneId, mode }));
     }
   },
 
@@ -2264,6 +2267,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
         type: "update_pane_manual_mode",
+        session_id: get().sessionId,
         pane_id: paneId,
         manual_mode: manualMode,
       }));
@@ -2289,7 +2293,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (!trimmed) return;
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "update_pane_label", pane_id: paneId, label: trimmed }));
+      ws.send(JSON.stringify({ type: "update_pane_label", session_id: get().sessionId, pane_id: paneId, label: trimmed }));
     }
     // Optimistic local update — the label sticks in the UI immediately
     // regardless of whether the WS frame lands. mako Claude-6 reported
@@ -2370,7 +2374,7 @@ export const useStore = create<AppState>((set, get) => ({
   reorderPanes: (paneIds: number[]) => {
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "reorder_panes", pane_ids: paneIds }));
+      ws.send(JSON.stringify({ type: "reorder_panes", session_id: get().sessionId, pane_ids: paneIds }));
     }
   },
 
@@ -2385,6 +2389,7 @@ export const useStore = create<AppState>((set, get) => ({
       const trimmedEffort = typeof effort === "string" ? effort.trim() : "";
       ws.send(JSON.stringify({
         type: "start_bot",
+        session_id: get().sessionId,
         pane_id: paneId,
         ...(prompt ? { prompt } : {}),
         ...(typeof minIterationIntervalMinutes === "number" && Number.isFinite(minIterationIntervalMinutes)
@@ -2398,14 +2403,14 @@ export const useStore = create<AppState>((set, get) => ({
   stopBot: (paneId: number) => {
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "stop_bot", pane_id: paneId }));
+      ws.send(JSON.stringify({ type: "stop_bot", session_id: get().sessionId, pane_id: paneId }));
     }
   },
 
   rebootCli: () => {
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "reboot_cli" }));
+      ws.send(JSON.stringify({ type: "reboot_cli", session_id: get().sessionId }));
     }
   },
 
@@ -3038,6 +3043,7 @@ function flushPendingLabels(
     ws.send(
       JSON.stringify({
         type: "update_pane_label",
+        session_id: currentSid,
         pane_id: entry.paneId,
         label: entry.label,
       }),
