@@ -434,6 +434,30 @@ fn effort_to_claude_flag(normalized: &str) -> &str {
     }
 }
 
+/// Normalize an effort selection to a valid codex `model_reasoning_effort`
+/// value. The gpt-5.6 models expose `low`/`medium`/`high`/`xhigh`/`max`/
+/// `ultra` (see `~/.codex/models_cache.json`). Codex has no `minimal` for
+/// these, so it floors to `low`; the apas-only `ultracode` maps to codex's
+/// equivalent top tier `ultra`. `default`/empty → None (let codex fall back
+/// to its config.toml default). Passed to codex as `-c
+/// model_reasoning_effort=<level>`.
+fn normalize_codex_effort(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "default" | "auto" | "none" | "off" => None,
+        "minimal" | "min" | "low" => Some("low".to_string()),
+        "medium" | "med" => Some("medium".to_string()),
+        "high" => Some("high".to_string()),
+        "xhigh" | "x-high" => Some("xhigh".to_string()),
+        "max" => Some("max".to_string()),
+        "ultra" | "ultracode" => Some("ultra".to_string()),
+        _ => None,
+    }
+}
+
 /// Build the JSONL user-input envelope line written to claude's stdin.
 /// Wire format from happy-cli/src/claude/sdk/utils.ts:190 — plain string
 /// `content`, not a content-block array. When the live effort is
@@ -3779,11 +3803,24 @@ fn build_agent_args(
         }
         Provider::Codex => {
             // Codex uses subcommands: `codex exec --json ...` or `codex exec resume --json ... <session_id> <prompt>`
-            let base_flags = vec![
+            let mut base_flags = vec![
                 "--json".to_string(),
                 "--dangerously-bypass-approvals-and-sandbox".to_string(),
                 "--skip-git-repo-check".to_string(),
             ];
+            // Per-pane model + reasoning effort. Codex re-execs each turn, so
+            // these ride every spawn/resume and take effect on the next turn
+            // (no live-swap protocol like claude's apply_flag_settings). `-m`
+            // sets the model; effort goes through codex's `-c` config override
+            // `model_reasoning_effort=<low|medium|high|xhigh|max|ultra>`.
+            if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
+                base_flags.push("--model".to_string());
+                base_flags.push(m.to_string());
+            }
+            if let Some(level) = normalize_codex_effort(effort) {
+                base_flags.push("-c".to_string());
+                base_flags.push(format!("model_reasoning_effort={level}"));
+            }
             if first_message && try_resume {
                 let mut args = vec!["exec".to_string(), "resume".to_string()];
                 args.extend(base_flags);
@@ -4169,7 +4206,8 @@ mod tests {
         build_agent_switch_respawn_event, build_deadloop_agent_args, build_pane_reboot_events,
         build_pane_env_overrides_from_keys, build_pane_list, boot_restore_try_resume_first,
         build_user_envelope_line, deadloop_wait_plan, evaluate_deadloop_watchdog,
-        is_codex_stale_session_error, manual_create_pr_worktree_path, normalize_effort_level,
+        is_codex_stale_session_error, manual_create_pr_worktree_path, normalize_codex_effort,
+        normalize_effort_level,
         pane_label_or_default, promote_pane_to_managed, reset_deadloop_codex_stale_session,
         resolve_pane_binary_path, route_web_input_to_pane, refresh_stale_managed_builtin_prompts,
         restored_pane_mode_and_pause, run_deadloop_session_inner, save_pane_configs,
@@ -4790,6 +4828,52 @@ mod tests {
         assert_eq!(args.get(0).map(String::as_str), Some("exec"));
         assert_eq!(args.get(1).map(String::as_str), Some("resume"));
         assert_eq!(args.last().map(String::as_str), Some(FULL_PROMPT));
+    }
+
+    #[test]
+    fn build_agent_args_codex_includes_model_and_reasoning_effort() {
+        let session_id = Uuid::new_v4();
+        let (args, _) = build_agent_args(
+            &Provider::Codex,
+            &session_id,
+            FULL_PROMPT,
+            Some("gpt-5.6-sol"),
+            Some("xhigh"),
+            true,
+            false,
+        );
+        assert!(args.windows(2).any(|w| w == ["--model", "gpt-5.6-sol"]));
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["-c", "model_reasoning_effort=xhigh"]));
+        // Flags ride after the `exec` subcommand, before the prompt.
+        assert_eq!(args.get(0).map(String::as_str), Some("exec"));
+        assert_eq!(args.last().map(String::as_str), Some(FULL_PROMPT));
+    }
+
+    #[test]
+    fn build_agent_args_codex_omits_model_effort_when_unset() {
+        let session_id = Uuid::new_v4();
+        let (args, _) =
+            build_agent_args(&Provider::Codex, &session_id, FULL_PROMPT, None, None, true, false);
+        assert!(!args.iter().any(|a| a == "--model"));
+        assert!(!args.iter().any(|a| a == "-c"));
+    }
+
+    #[test]
+    fn normalize_codex_effort_maps_levels() {
+        assert_eq!(normalize_codex_effort(Some("high")).as_deref(), Some("high"));
+        assert_eq!(normalize_codex_effort(Some("xhigh")).as_deref(), Some("xhigh"));
+        assert_eq!(normalize_codex_effort(Some("max")).as_deref(), Some("max"));
+        // apas-only ultracode + codex ultra both land on codex's `ultra`.
+        assert_eq!(normalize_codex_effort(Some("ultra")).as_deref(), Some("ultra"));
+        assert_eq!(normalize_codex_effort(Some("ultracode")).as_deref(), Some("ultra"));
+        // minimal floors to low (gpt-5.6 has no minimal).
+        assert_eq!(normalize_codex_effort(Some("minimal")).as_deref(), Some("low"));
+        // default / empty → None (codex uses its config.toml default).
+        assert_eq!(normalize_codex_effort(Some("default")), None);
+        assert_eq!(normalize_codex_effort(Some("  ")), None);
+        assert_eq!(normalize_codex_effort(None), None);
     }
 
     #[test]

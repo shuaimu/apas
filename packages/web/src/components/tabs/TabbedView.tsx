@@ -334,6 +334,55 @@ function normalizeClaudeEffortOption(raw?: string | null): ClaudeEffortOption {
   return "default";
 }
 
+/// Codex per-pane model choices. `value` is passed to `codex --model`. The
+/// gpt-5.6 lineup (sol/terra/luna) from ~/.codex/models_cache.json; Default =
+/// let codex use ~/.codex/config.toml.
+const CODEX_MODEL_OPTIONS = [
+  { value: "default", label: "Default" },
+  { value: "gpt-5.6-sol", label: "Sol" },
+  { value: "gpt-5.6-terra", label: "Terra" },
+  { value: "gpt-5.6-luna", label: "Luna" },
+] as const;
+type CodexModelOption = (typeof CODEX_MODEL_OPTIONS)[number]["value"];
+
+/// Codex reasoning-effort choices, passed via codex's
+/// `-c model_reasoning_effort=<level>`. sol/terra support up to `ultra`; luna
+/// tops out at `max`. Default = codex config.toml default.
+const CODEX_EFFORT_OPTIONS = [
+  { value: "default", label: "Default" },
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+  { value: "xhigh", label: "XHigh" },
+  { value: "max", label: "Max" },
+  { value: "ultra", label: "Ultra" },
+] as const;
+type CodexEffortOption = (typeof CODEX_EFFORT_OPTIONS)[number]["value"];
+
+function normalizeCodexModelOption(raw?: string | null): CodexModelOption {
+  if (typeof raw !== "string") return "default";
+  const normalized = raw.trim().toLowerCase();
+  for (const opt of CODEX_MODEL_OPTIONS) {
+    if (opt.value === normalized) return opt.value;
+  }
+  if (normalized.includes("sol")) return "gpt-5.6-sol";
+  if (normalized.includes("terra")) return "gpt-5.6-terra";
+  if (normalized.includes("luna")) return "gpt-5.6-luna";
+  return "default";
+}
+
+function normalizeCodexEffortOption(raw?: string | null): CodexEffortOption {
+  if (typeof raw !== "string") return "default";
+  const normalized = raw.trim().toLowerCase();
+  for (const opt of CODEX_EFFORT_OPTIONS) {
+    if (opt.value === normalized) return opt.value;
+  }
+  if (normalized === "x-high") return "xhigh";
+  if (normalized === "ultracode") return "ultra"; // claude→codex bridge
+  if (normalized === "minimal") return "low";
+  return "default";
+}
+
 // Synthesize PaneConfig entries from observed pane_id keys when no PaneList was received
 function synthesizeConfigs(
   paneMessages: Record<string, Message[]>,
@@ -450,7 +499,9 @@ export function TabbedView({
   const [startBotPaneId, setStartBotPaneId] = useState<number | null>(null);
   const [botPromptDraft, setBotPromptDraft] = useState("");
   const [botMinIntervalDraft, setBotMinIntervalDraft] = useState(String(DEFAULT_BOT_MIN_INTERVAL_MINUTES));
-  const [botEffortDraft, setBotEffortDraft] = useState<ClaudeEffortOption>("default");
+  // Holds a Claude or Codex effort value depending on the active pane's
+  // provider, so it's typed as the widened string rather than either union.
+  const [botEffortDraft, setBotEffortDraft] = useState<string>("default");
   const [inputDrafts, setInputDrafts] = useState<Record<string, string>>({});
   const [addTabError, setAddTabError] = useState<string | null>(null);
   // 3-option cleanup dialog shown when closing a pane that owns a worktree.
@@ -776,9 +827,23 @@ export function TabbedView({
       : activeIsDeepseek
         ? "deepseek"
         : activeProvider;
-  const activeSupportsClaudeEffort = activeUsageProvider === "claude";
-  const activeBotEffortOption = normalizeClaudeEffortOption(activeConfig?.effort);
-  const activeModelOption = normalizeClaudeModelOption(activeConfig?.model);
+  // Model + effort switchers support Claude and Codex, each with its own
+  // option list + normalizer; other backends have their own model namespaces
+  // and no reasoning-effort knob. `activeSupportsClaudeEffort` keeps its name
+  // for history but now means "this pane has a model/effort switcher".
+  const isCodexModelEffort = activeUsageProvider === "codex";
+  const activeSupportsClaudeEffort =
+    activeUsageProvider === "claude" || isCodexModelEffort;
+  const modelSwitcherOptions: readonly { value: string; label: string }[] =
+    isCodexModelEffort ? CODEX_MODEL_OPTIONS : CLAUDE_MODEL_OPTIONS;
+  const effortSwitcherOptions: readonly { value: string; label: string }[] =
+    isCodexModelEffort ? CODEX_EFFORT_OPTIONS : CLAUDE_EFFORT_OPTIONS;
+  const activeBotEffortOption: string = isCodexModelEffort
+    ? normalizeCodexEffortOption(activeConfig?.effort)
+    : normalizeClaudeEffortOption(activeConfig?.effort);
+  const activeModelOption: string = isCodexModelEffort
+    ? normalizeCodexModelOption(activeConfig?.model)
+    : normalizeClaudeModelOption(activeConfig?.model);
   const activeBotPrompt = botPromptForPane(activeConfig);
   const activeBotMinIntervalMinutes = typeof activeConfig?.min_iteration_interval_minutes === "number"
     ? activeConfig.min_iteration_interval_minutes
@@ -1084,7 +1149,9 @@ export function TabbedView({
                 <select
                   value={botEffortDraft}
                   onChange={(e) => {
-                    const next = normalizeClaudeEffortOption(e.target.value);
+                    const next = isCodexModelEffort
+                      ? normalizeCodexEffortOption(e.target.value)
+                      : normalizeClaudeEffortOption(e.target.value);
                     setBotEffortDraft(next);
                     // Persist on the server (and CLI's .apas) so the choice
                     // survives tab-switch and CLI restart.
@@ -1093,9 +1160,9 @@ export function TabbedView({
                     }
                   }}
                   className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-1.5 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  title="Claude thinking effort — persisted per tab"
+                  title="Reasoning effort — persisted per tab"
                 >
-                  {CLAUDE_EFFORT_OPTIONS.map((option) => (
+                  {effortSwitcherOptions.map((option) => (
                     <option
                       key={option.value}
                       value={option.value}
@@ -1140,16 +1207,14 @@ export function TabbedView({
                 <select
                   value={activeModelOption}
                   onChange={(e) => {
-                    const next = e.target.value as ClaudeModelOption;
+                    const next = e.target.value;
                     if (next === activeModelOption) return;
-                    // Only the "default" (clear-model) transition
-                    // respawns — the CLI's fast-path
-                    // apply_flag_settings live-swap requires an
-                    // explicit model id, so clearing falls back to
-                    // kill + fresh session. Every specific claude
-                    // model (fable/sonnet/opus/haiku) is a live
-                    // swap: no interrupted turn, no context reset.
-                    if (next === "default") {
+                    // Claude: every specific model live-swaps via
+                    // apply_flag_settings (no interrupted turn, no context
+                    // reset); only clearing to "default" respawns. Codex has
+                    // no live process to swap — it applies the model on its
+                    // next per-turn re-exec — so it skips the confirm.
+                    if (!isCodexModelEffort && next === "default") {
                       if (
                         !confirm(
                           "Clear model back to Claude's default? The current turn will be interrupted and the agent will respawn with a fresh context — chat history above stays visible but is NOT in the new agent's prompt.",
@@ -1161,9 +1226,13 @@ export function TabbedView({
                     updatePaneModel(activeTabId, next === "default" ? null : next);
                   }}
                   className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-1.5 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  title="Claude model — switching between fable/sonnet/opus/haiku live-swaps via apply_flag_settings (no context reset). Clearing to default respawns."
+                  title={
+                    isCodexModelEffort
+                      ? "Codex model — applies on the next prompt (codex re-execs each turn; no context reset)."
+                      : "Claude model — switching between fable/sonnet/opus/haiku live-swaps via apply_flag_settings (no context reset). Clearing to default respawns."
+                  }
                 >
-                  {CLAUDE_MODEL_OPTIONS.map((option) => (
+                  {modelSwitcherOptions.map((option) => (
                     <option key={option.value} value={option.value}>
                       {option.label}
                     </option>
