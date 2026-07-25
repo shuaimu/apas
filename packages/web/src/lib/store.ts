@@ -801,7 +801,7 @@ export interface PlanReviewPendingItem {
   arrivedAt: number;
 }
 
-const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://apas.mpaxos.com:8080";
+const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://apas.mpaxos.com";
 const MINIMAX_API_BASE_URL = "https://api.minimax.io/anthropic";
 const GLM_API_BASE_URL = "https://api.z.ai/api/anthropic";
 const DEEPSEEK_API_BASE_URL = "https://api.deepseek.com/anthropic";

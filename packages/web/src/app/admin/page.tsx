@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, Users, FolderOpen, Monitor, Share2, Activity } from "lucide-react";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://apas.mpaxos.com:8080";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://apas.mpaxos.com";
 const ADMIN_USER_ID = "88b6016d-a8b4-400c-bdc9-f0120504a4fc";
 
 interface SystemStats {

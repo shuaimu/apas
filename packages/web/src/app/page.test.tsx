@@ -242,7 +242,7 @@ describe("Home auth bootstrap", () => {
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
-        "http://apas.mpaxos.com:8080/auth/me",
+        "http://apas.mpaxos.com/auth/me",
         expect.objectContaining({
           headers: { Authorization: "Bearer stored-token" },
         }),

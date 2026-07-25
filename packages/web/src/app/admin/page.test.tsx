@@ -114,7 +114,7 @@ describe("AdminPage", () => {
     render(<AdminPage />);
 
     await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledWith("http://apas.mpaxos.com:8080/admin/stats", {
+      expect(fetchMock).toHaveBeenCalledWith("http://apas.mpaxos.com/admin/stats", {
         headers: {
           Authorization: "Bearer admin-token",
         },

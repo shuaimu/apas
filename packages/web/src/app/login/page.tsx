@@ -5,7 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { useStore } from "@/lib/store";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://apas.mpaxos.com:8080";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://apas.mpaxos.com";
 
 function LoginForm() {
   const router = useRouter();

@@ -167,7 +167,7 @@ describe("RegisterPage", () => {
         "registered@example.com",
       );
     });
-    expect(fetchMock).toHaveBeenCalledWith("http://apas.mpaxos.com:8080/auth/register", {
+    expect(fetchMock).toHaveBeenCalledWith("http://apas.mpaxos.com/auth/register", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email: "user@example.com", password: "secret-pass" }),
@@ -227,7 +227,7 @@ describe("RegisterPage", () => {
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
     expect(fetchMock).toHaveBeenLastCalledWith(
-      "http://apas.mpaxos.com:8080/auth/device-complete",
+      "http://apas.mpaxos.com/auth/device-complete",
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },

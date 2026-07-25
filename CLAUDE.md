@@ -300,8 +300,19 @@ The APAS server and web UI are deployed on an LXC container:
 
 - **Host**: `apas.mpaxos.com` (130.245.173.82)
 - **SSH**: `ssh root@apas.mpaxos.com`
-- **Server port**: 8080 (WebSocket: `ws://apas.mpaxos.com:8080`)
-- **Web UI port**: 80 (http://apas.mpaxos.com)
+- **Edge**: **nginx** on port **80** reverse-proxies everything (config:
+  `/etc/nginx/conf.d/apas.conf`). `/ws/ /auth/ /admin/ /share/ /health` →
+  `apas-server` (`127.0.0.1:8080`); everything else → the Next.js app
+  (`127.0.0.1:3000`). This exists so the web's WebSocket + HTTP API ride the
+  standard port 80 (`ws://apas.mpaxos.com/ws/web`) instead of the non-standard
+  `:8080`, which mobile carriers/Wi-Fi block — that broke mobile entirely.
+- **apas-server**: `127.0.0.1:8080` — still also bound publicly on `:8080` for
+  the **CLI/daemon** (`ws://apas.mpaxos.com:8080/ws/cli`); do not firewall 8080.
+- **Next.js web (apas-web)**: `127.0.0.1:3000` (moved off 80 via a systemd
+  drop-in `apas-web.service.d/port.conf` → `Environment=PORT=3000`).
+- The web's default WS/API URLs are now **port-less** (`ws://apas.mpaxos.com`,
+  `http://apas.mpaxos.com`); `NEXT_PUBLIC_WS_URL`/`NEXT_PUBLIC_API_URL` no
+  longer need to be set at build time.
 
 #### Directory Structure on Server
 ```
@@ -323,9 +334,13 @@ systemctl status apas-web
 systemctl restart apas-server
 systemctl restart apas-web
 
+# nginx edge proxy (port 80). After editing /etc/nginx/conf.d/apas.conf:
+nginx -t && systemctl reload nginx
+
 # View logs
 journalctl -u apas-server -f
 journalctl -u apas-web -f
+journalctl -u nginx -f
 ```
 
 #### Deploying Updates

@@ -154,7 +154,7 @@ describe("ResetPasswordPage", () => {
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
-        "http://apas.mpaxos.com:8080/auth/reset-password",
+        "http://apas.mpaxos.com/auth/reset-password",
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },

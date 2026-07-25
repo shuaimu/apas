@@ -15,7 +15,7 @@ const MIN_SIDEBAR_WIDTH = 180;
 const MAX_SIDEBAR_WIDTH = 400;
 const DEFAULT_SIDEBAR_WIDTH = 256;
 const REPO_URL = "https://github.com/shuaimu/apas";
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://apas.mpaxos.com:8080";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://apas.mpaxos.com";
 const WEB_UI_VERSION = process.env.NEXT_PUBLIC_WEB_UI_VERSION || "00.00.0";
 
 // Helper to get/set per-project layout preferences
@@ -431,7 +431,7 @@ export default function Home() {
                   </p>
                   <p className="text-sm">
                     <span className="text-gray-500 dark:text-gray-400">Server: </span>
-                    <span className="font-mono text-xs">{process.env.NEXT_PUBLIC_WS_URL || 'ws://apas.mpaxos.com:8080'}</span>
+                    <span className="font-mono text-xs">{process.env.NEXT_PUBLIC_WS_URL || 'ws://apas.mpaxos.com'}</span>
                   </p>
                 </div>
               </div>
