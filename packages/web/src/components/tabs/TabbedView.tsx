@@ -1050,10 +1050,23 @@ export function TabbedView({
   // No session or no tabs - empty state
   if (!sessionId || effectiveTabs.length === 0) {
     return (
-      <div className="flex-1 flex items-center justify-center text-gray-400">
-        <div className="text-center">
-          <p className="text-lg">No messages yet</p>
-          <p className="text-sm mt-1">Waiting for activity...</p>
+      <div className="flex-1 flex flex-col min-h-0">
+        {/* On mobile the tab bar (which holds the ☰ menu) isn't rendered in
+            this empty state, so surface the menu button here — otherwise a
+            user with no selected session (e.g. after clearing site data) has
+            no way to open the sidebar and pick a project. Hidden on desktop,
+            where the sidebar is always visible. */}
+        {mobileLeading && (
+          <div className="md:hidden flex items-center h-11 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30">
+            {mobileLeading}
+          </div>
+        )}
+        <div className="flex-1 flex items-center justify-center text-gray-400">
+          <div className="text-center px-6">
+            <p className="text-lg">No messages yet</p>
+            <p className="text-sm mt-1">Waiting for activity...</p>
+            <p className="text-xs mt-3 md:hidden">Tap ☰ at the top-left to pick a project.</p>
+          </div>
         </div>
       </div>
     );
