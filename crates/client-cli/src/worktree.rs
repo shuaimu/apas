@@ -814,6 +814,13 @@ mod tests {
             assert!(status.success(), "git {} failed", args.join(" "));
         };
         run(&["init", "-q", "-b", "main"]);
+        // Give the throwaway repo its own identity. `git commit` aborts with
+        // "Author identity unknown" otherwise, and a repo created here inherits
+        // nothing from the apas checkout's `.git/config` -- so relying on the
+        // developer's config makes the suite pass or fail based on whether they
+        // happen to have a global one. CI never does.
+        run(&["config", "user.name", "apas tests"]);
+        run(&["config", "user.email", "tests@apas.invalid"]);
         run(&["commit", "-q", "--allow-empty", "-m", "init"]);
         let wt = proj.join(".apas-worktrees").join("pane-2");
         std::fs::create_dir_all(wt.parent().unwrap()).unwrap();

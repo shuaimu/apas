@@ -405,6 +405,163 @@ fn kill_process_group(pgid: u32) {
 #[cfg(not(unix))]
 fn kill_process_group(_pgid: u32) {}
 
+/// How long a pane's agent gets to handle SIGTERM before the group is
+/// SIGKILLed. Matches the deadloop's existing escalation window.
+const PANE_KILL_GRACE: Duration = Duration::from_millis(500);
+
+/// Put a pane's agent in its own process group at exec.
+///
+/// Every pane spawn does this, for two reasons. The deadloop group-kills the
+/// agent the moment it emits its result event — one that lingers past result
+/// wedges the next iteration. And closing a pane (or quitting APAS)
+/// group-kills to reach the agent's *own* children: bash commands, subagents,
+/// and this pane's `apas mcp-server`, none of which are children of ours.
+///
+/// Turn semantics are unchanged for interactive panes: nothing group-kills
+/// them mid-turn, so background work a user launches still outlives the turn.
+/// It no longer outlives the pane, which is the point.
+///
+/// The flip side is that agents no longer receive the Ctrl+C delivered to
+/// APAS's own group — hence [`kill_all_pane_children`] on the shutdown paths.
+#[cfg(unix)]
+fn spawn_in_own_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn spawn_in_own_process_group(_command: &mut Command) {}
+
+/// True when `pid` leads its own process group.
+///
+/// Guards every group kill. `kill(-pid)` on a pid that is *not* a group leader
+/// signals whatever group that pid happens to sit in — for a pane spawned
+/// without `setpgid` that is APAS's own group, so the "cleanup" would take
+/// down the CLI along with every other pane. Checking leadership first makes
+/// that unrepresentable.
+#[cfg(unix)]
+fn leads_own_process_group(pid: u32) -> bool {
+    pid != 0 && unsafe { libc::getpgid(pid as i32) } == pid as i32
+}
+
+#[cfg(not(unix))]
+fn leads_own_process_group(_pid: u32) -> bool {
+    false
+}
+
+/// SIGTERM a pane's process group. Paired with [`sigkill_pane_child_group`]
+/// after a grace period; split in two so a batch teardown can signal every
+/// pane before waiting once, instead of paying the grace per pane.
+///
+/// Returns whether the group signal went out. `false` means the pane doesn't
+/// lead a group and the caller must fall back to killing the child directly.
+fn sigterm_pane_child_group(pid: u32) -> bool {
+    if !leads_own_process_group(pid) {
+        return false;
+    }
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGTERM);
+    }
+    true
+}
+
+/// SIGKILL a pane's process group, then reap the leader.
+///
+/// Only call this on a pid that [`sigterm_pane_child_group`] accepted, and only
+/// while the leader is still unreaped — reaping frees the pid, and a recycled
+/// pid would aim `-pid` at an unrelated group.
+fn sigkill_pane_child_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    // `Child` does not reap on drop, so without this every closed pane leaves
+    // a zombie for the lifetime of the CLI.
+    let _ = child.wait();
+}
+
+/// Kill a pane's agent and everything it spawned, then reap it.
+///
+/// A bare `child.kill()` only SIGKILLs the agent itself. Agents are process
+/// *parents*: claude/codex run bash commands, subagents, and this pane's own
+/// `apas mcp-server`. Those are children of the agent, not of us, so killing
+/// the agent alone reparents them to init and they keep running. When the
+/// agent leads its own process group we signal the whole group instead.
+///
+/// Blocks for `PANE_KILL_GRACE`. We wait out the full grace rather than
+/// stopping as soon as the agent exits: a grandchild that ignores SIGTERM is
+/// exactly what the escalation is for, and the agent's own exit says nothing
+/// about the rest of the subtree.
+fn kill_pane_child_group(child: &mut std::process::Child) {
+    if !sigterm_pane_child_group(child.id()) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    }
+    std::thread::sleep(PANE_KILL_GRACE);
+    sigkill_pane_child_group(child);
+}
+
+/// Tear down a closed pane's agent off the TUI event loop.
+///
+/// Takes the child out of its slot so the shutdown paths won't also try to
+/// kill it, then finishes on a detached thread — [`kill_pane_child_group`]
+/// sleeps through the SIGTERM grace, and the event loop must stay responsive
+/// while the tab disappears.
+fn shutdown_pane_child(child_process: &Arc<Mutex<Option<std::process::Child>>>) {
+    let Some(mut child) = child_process.lock().ok().and_then(|mut slot| slot.take()) else {
+        return;
+    };
+    std::thread::spawn(move || kill_pane_child_group(&mut child));
+}
+
+/// Kill every pane's agent subtree at CLI shutdown.
+///
+/// Two-phase on purpose: SIGTERM every group, sleep the grace *once*, then
+/// SIGKILL and reap. Doing it pane-by-pane would multiply the grace by the
+/// pane count and make Ctrl+C feel hung.
+fn kill_all_pane_children(pane_metas: &PaneMetas) {
+    // Snapshot the child slots and release `pane_metas` immediately — this
+    // runs from the Ctrl+C handler and from process exit, and holding the map
+    // across the grace sleep would block every pane thread trying to wind down.
+    let slots: Vec<Arc<Mutex<Option<std::process::Child>>>> = match pane_metas.lock() {
+        Ok(metas) => metas.values().map(|m| m.child_process.clone()).collect(),
+        Err(_) => return,
+    };
+
+    let mut group_led = Vec::new();
+    for slot in slots {
+        let Ok(mut guard) = slot.lock() else { continue };
+        let Some(child) = guard.as_mut() else { continue };
+        if sigterm_pane_child_group(child.id()) {
+            drop(guard);
+            group_led.push(slot);
+        } else {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    if group_led.is_empty() {
+        return;
+    }
+    std::thread::sleep(PANE_KILL_GRACE);
+    for slot in group_led {
+        if let Ok(mut guard) = slot.lock() {
+            if let Some(child) = guard.as_mut() {
+                sigkill_pane_child_group(child);
+            }
+        }
+    }
+}
+
 fn normalize_effort_level(raw: Option<&str>) -> Option<String> {
     let trimmed = raw?.trim();
     if trimmed.is_empty() {
@@ -1632,16 +1789,10 @@ async fn run_inner(
     let metas_for_handler = pane_metas.clone();
     ctrlc::set_handler(move || {
         shutdown_for_handler.store(true, Ordering::SeqCst);
-        // Kill all child processes
-        if let Ok(metas) = metas_for_handler.lock() {
-            for meta in metas.values() {
-                if let Ok(mut guard) = meta.child_process.lock() {
-                    if let Some(ref mut child) = *guard {
-                        let _ = child.kill();
-                    }
-                }
-            }
-        }
+        // Kill every pane's agent *subtree*. Ctrl+C reaches APAS's own process
+        // group, but panes run in groups of their own, so nothing reaches the
+        // agents unless we signal them here.
+        kill_all_pane_children(&metas_for_handler);
     })?;
 
     // Spawn server connection task
@@ -2233,16 +2384,9 @@ async fn run_inner(
         server_task.abort();
     }
 
-    // Kill all running child processes
-    if let Ok(metas) = pane_metas.lock() {
-        for meta in metas.values() {
-            if let Ok(mut guard) = meta.child_process.lock() {
-                if let Some(ref mut child) = *guard {
-                    let _ = child.kill();
-                }
-            }
-        }
-    }
+    // Kill every pane's agent and everything it spawned. Without the group
+    // kill, the agents' bash commands / subagents / mcp-servers outlive APAS.
+    kill_all_pane_children(&pane_metas);
 
     // Wait for threads.
     for thread in pane_threads {
@@ -2888,15 +3032,25 @@ fn handle_tui_events(
                     let mut stop_requests = pane_stop_requests.lock().unwrap();
                     stop_requests.remove(&pane_id);
                 }
+                // Kill the pty if this is a terminal pane. Closing from the web
+                // already did this in the `RemovePane` handler (the remove here
+                // then finds nothing); closing from the TUI arrives straight
+                // here, and a terminal pane has no `child_process` entry — so
+                // without this its claude/codex would keep running with nothing
+                // left reading or writing it.
+                let removed_terminal = terminal_panes
+                    .lock()
+                    .ok()
+                    .and_then(|mut m| m.remove(&pane_id));
+                if let Some(handle) = removed_terminal {
+                    tracing::info!(pane_id, "shutting down terminal pane on tab close");
+                    handle.shutdown();
+                }
                 let worktree_path: Option<String> = {
                     let metas = pane_metas.lock().unwrap();
                     let path = metas.get(&pane_id).and_then(|m| m.worktree_path.clone());
                     if let Some(meta) = metas.get(&pane_id) {
-                        if let Ok(mut guard) = meta.child_process.lock() {
-                            if let Some(ref mut child) = *guard {
-                                let _ = child.kill();
-                            }
-                        }
+                        shutdown_pane_child(&meta.child_process);
                     }
                     path
                 };
@@ -5366,6 +5520,10 @@ mod tests {
 
     #[test]
     fn save_pane_configs_persists_pause_flags_and_legacy_deadloop_pause() {
+        // `save_project` registers into `config_dir()/projects.json`; without
+        // this the write lands in whatever config dir another test's env vars
+        // currently point at.
+        let _config = crate::config::test_config::isolated_config_dir();
         let dir = tempfile::tempdir().expect("temp project dir");
         let working_dir = dir.path().to_string_lossy().to_string();
         let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
@@ -5448,6 +5606,7 @@ mod tests {
 
     #[test]
     fn update_project_flags_persists_flags_and_preserves_panes() {
+        let _config = crate::config::test_config::isolated_config_dir();
         let dir = tempfile::tempdir().expect("temp project dir");
         let mut metadata = get_or_create_project(dir.path()).expect("metadata should initialize");
         metadata.auto_approve_todos = false;
@@ -5582,6 +5741,7 @@ Use a project-specific custom dispatch loop.";
         const CUSTOM_REVIEWER_PROMPT: &str = "Reviewer custom loop";
         const CUSTOM_MANAGER_PROMPT: &str = "Manager custom prompt";
 
+        let _config = crate::config::test_config::isolated_config_dir();
         let dir = tempfile::tempdir().expect("temp project dir");
         let mut metadata = get_or_create_project(dir.path()).expect("metadata should initialize");
         metadata.panes = vec![
@@ -6636,6 +6796,115 @@ Use a project-specific custom dispatch loop.";
         );
         assert_eq!(handled, None);
     }
+
+    // --- closing a pane must not leave the agent's subtree running ---------
+    //
+    // A real agent is a process *parent*: claude/codex run bash commands,
+    // subagents, and this pane's own `apas mcp-server`. `sh -c 'sleep &'`
+    // stands in for all of them — a child of the agent, not of APAS.
+
+    #[cfg(unix)]
+    fn spawn_agent_with_grandchild() -> (std::process::Child, u32) {
+        use std::io::BufRead;
+        let mut command = std::process::Command::new("sh");
+        command
+            // `wait` is a builtin, so the shell can't `exec`-optimize itself
+            // away and stays around as the group leader.
+            .arg("-c")
+            .arg("sleep 60 & echo $!; wait")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        super::spawn_in_own_process_group(&mut command);
+        let mut child = command.spawn().expect("spawn stand-in agent");
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("agent stdout"))
+            .read_line(&mut line)
+            .expect("read grandchild pid");
+        let grandchild = line.trim().parse().expect("grandchild pid");
+        (child, grandchild)
+    }
+
+    #[cfg(unix)]
+    fn pid_is_alive(pid: u32) -> bool {
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    fn wait_until_gone(pid: u32, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if !pid_is_alive(pid) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        !pid_is_alive(pid)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn closing_a_pane_kills_the_agents_grandchildren() {
+        let (mut child, grandchild) = spawn_agent_with_grandchild();
+        assert!(pid_is_alive(grandchild), "grandchild should start alive");
+
+        super::kill_pane_child_group(&mut child);
+
+        assert!(
+            wait_until_gone(grandchild, Duration::from_secs(3)),
+            "closing a pane left the agent's child running — a real one would \
+             be a bash command, a subagent, or the pane's apas mcp-server"
+        );
+    }
+
+    /// Proves the test above measures something: the pre-fix close path — a
+    /// bare `child.kill()` — reparents the grandchild to init and it lives on.
+    #[test]
+    #[cfg(unix)]
+    fn killing_only_the_agent_orphans_its_grandchildren() {
+        let (mut child, grandchild) = spawn_agent_with_grandchild();
+
+        let _ = child.kill();
+        let _ = child.wait();
+        thread::sleep(Duration::from_millis(300));
+
+        let survived = pid_is_alive(grandchild);
+        // Reap before asserting so a failure can't leak a stray `sleep`.
+        unsafe {
+            libc::kill(grandchild as i32, libc::SIGKILL);
+        }
+        assert!(
+            survived,
+            "the regression guard is only meaningful while a bare child kill \
+             orphans the subtree"
+        );
+    }
+
+    /// The guard that makes a group kill safe. A pane spawned without
+    /// `setpgid` sits in APAS's own process group, so `kill(-pid)` there would
+    /// signal APAS and every other pane. Such a pane must fall back to killing
+    /// the child alone.
+    #[test]
+    #[cfg(unix)]
+    fn a_pane_that_leads_no_group_is_never_group_killed() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn");
+
+        assert!(!super::leads_own_process_group(child.id()));
+        assert!(
+            !super::sigterm_pane_child_group(child.id()),
+            "group signal must be refused for a non-leader"
+        );
+
+        // The fallback still kills and reaps it.
+        super::kill_pane_child_group(&mut child);
+        assert!(
+            child.try_wait().is_ok(),
+            "child must be reaped, not left a zombie"
+        );
+    }
 }
 
 /// Run the deadloop (autonomous) session on any pane
@@ -7096,22 +7365,7 @@ fn run_deadloop_session_inner(
         for (key, value) in &pane_env {
             command.env(key, value);
         }
-        // Deadloop only: put the agent in its own process group so we can
-        // group-kill it (and any background children it spawned) the moment
-        // it emits its result event. The deadloop must iterate; an agent
-        // that lingers past result wedges every subsequent iteration.
-        // Interactive panes deliberately don't do this — users may want to
-        // launch persistent background work that outlives the turn.
-        #[cfg(unix)]
-        unsafe {
-            use std::os::unix::process::CommandExt;
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        spawn_in_own_process_group(&mut command);
 
         match command.spawn() {
             Ok(mut child) => {
@@ -8296,6 +8550,7 @@ fn run_pane_session_streaming(
         for (key, value) in &pane_env {
             command.env(key, value);
         }
+        spawn_in_own_process_group(&mut command);
 
         let mut child = match command.spawn() {
             Ok(c) => c,
@@ -9455,6 +9710,7 @@ fn run_pane_session(
         for (key, value) in &pane_env {
             command.env(key, value);
         }
+        spawn_in_own_process_group(&mut command);
 
         match command.spawn() {
             Ok(mut child) => {
