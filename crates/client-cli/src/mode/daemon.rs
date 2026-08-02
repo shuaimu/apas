@@ -199,6 +199,13 @@ fn headless_pid_for(project_path: &Path) -> Option<u32> {
     headless_pids_for(project_path).into_iter().next()
 }
 
+
+/// NFS-shared config dir, where the peer registry and project claims live.
+/// Distinct from `Config::runtime_dir()`, which is host-local.
+fn config_dir_for_registry() -> std::path::PathBuf {
+    crate::config::Config::config_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
+
 /// Check if there's already a running `apas --headless` process for the given project path.
 /// Prevents the daemon from spawning duplicates when a CLI was started externally
 /// or survived a daemon restart.
@@ -419,6 +426,34 @@ impl DaemonState {
             .ok_or_else(|| anyhow::anyhow!("Unknown project id: {}", project_id))?;
 
         let session_name = tmux_session_name(project_id);
+
+        // Cross-host guard first. `is_headless_running_for` below only reads
+        // the local /proc, so on a shared-NFS cluster it cannot see a headless
+        // CLI another host already started for this same project -- and both
+        // daemons would spawn one, writing the same .apas and worktrees.
+        // The claim file is how peers tell each other who owns what.
+        match crate::daemon_registry::claim_project(
+            &config_dir_for_registry(),
+            project_id,
+            &project.path.display().to_string(),
+            self.machine_info.machine_id,
+        ) {
+            Ok(crate::daemon_registry::ClaimOutcome::HeldBy(peer)) => {
+                tracing::info!(
+                    project_id,
+                    peer = %peer.hostname,
+                    heartbeat_age_secs = peer.age_secs,
+                    "project is running on another host; skipping spawn"
+                );
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(err) => {
+                // A claim we cannot write is not worth failing the spawn over;
+                // the local /proc guard below still applies.
+                tracing::warn!(project_id, %err, "could not record project claim");
+            }
+        }
 
         // Check if an external process (e.g. manually started via systemd-run,
         // or surviving from a previous daemon) is already running for this project.
@@ -678,6 +713,23 @@ pub async fn run(
         })?;
     }
 
+    // Announce ourselves on the shared NFS registry so peer daemons can see
+    // this host is alive. Liveness travels as a heartbeat, never a pid -- a
+    // pid is only interpretable on the host that owns it.
+    let registry_dir = config_dir_for_registry();
+    if let Err(err) = crate::daemon_registry::publish_self(&registry_dir, machine_id, VERSION) {
+        tracing::warn!(%err, "could not publish daemon record to the shared registry");
+    }
+    match crate::daemon_registry::live_peers(&registry_dir) {
+        peers if peers.is_empty() => {
+            tracing::info!("no other apas daemons visible on this shared config dir")
+        }
+        peers => tracing::info!(
+            peers = ?peers.iter().map(|p| p.hostname.as_str()).collect::<Vec<_>>(),
+            "other apas daemons are live on this shared config dir"
+        ),
+    }
+
     let mut state = DaemonState::new(machine_info);
     state.refresh_projects();
 
@@ -771,10 +823,25 @@ async fn run_connection(
 
     refresh_usage_limits_cache().await;
 
+    // Shared NFS registry paths + this host's identity, for the heartbeat below.
+    let registry_dir = config_dir_for_registry();
+    let self_machine_id = state.machine_info.machine_id;
+
     loop {
         if shutdown.load(Ordering::SeqCst) {
+            // Leave cleanly so peers see us go immediately instead of waiting
+            // out the staleness window, and so our projects are free at once.
+            crate::daemon_registry::release_all_own_claims(&registry_dir);
+            crate::daemon_registry::withdraw_self(&registry_dir);
             return Ok(());
         }
+
+        // Keep our record and our project claims fresh. If these age past
+        // STALE_AFTER_SECS a peer will conclude this host died and take over
+        // projects we are actively running.
+        let _ =
+            crate::daemon_registry::publish_self(&registry_dir, self_machine_id, VERSION);
+        crate::daemon_registry::refresh_own_claims(&registry_dir);
 
         tokio::select! {
             _ = usage_refresh.tick() => {

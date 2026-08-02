@@ -12,6 +12,7 @@ use uuid::Uuid;
 mod auth;
 mod claude;
 mod config;
+mod daemon_registry;
 mod file_watcher;
 mod manager;
 mod mcp;
@@ -318,11 +319,20 @@ async fn main() -> Result<()> {
                     }
                 };
 
-                let machine_id = match config.daemon.machine_id.as_ref() {
-                    Some(raw) => Uuid::parse_str(raw).unwrap_or_else(|_| Uuid::new_v4()),
-                    None => Uuid::new_v4(),
-                };
-                config.daemon.machine_id = Some(machine_id.to_string());
+                // Derive per host rather than mint-and-persist. The old code
+                // generated a random UUID and saved it to config.toml -- which
+                // lives on the shared NFS home, so whichever host ran first
+                // donated its identity to every other host in the cluster, and
+                // the server's machine map (keyed by this id) collapsed them
+                // into one flickering entry. A derived id needs no storage,
+                // survives reboots, and is necessarily distinct per host.
+                // An explicitly configured value still wins, for overrides.
+                let machine_id = config
+                    .daemon
+                    .machine_id
+                    .as_ref()
+                    .and_then(|raw| Uuid::parse_str(raw).ok())
+                    .unwrap_or_else(daemon_registry::derive_machine_id);
 
                 let project_roots = if !roots.is_empty() {
                     tracing::warn!(

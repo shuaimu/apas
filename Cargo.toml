@@ -40,7 +40,7 @@ toml = "0.8"
 directories = "5"
 
 # Utilities
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 thiserror = "1"
 anyhow = "1"
 tracing = "0.1"

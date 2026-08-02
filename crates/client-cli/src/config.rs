@@ -100,12 +100,38 @@ impl Config {
         Ok(Self::config_dir()?.join("config.toml"))
     }
 
+    /// Host-local scratch dir for state that is only meaningful on this
+    /// machine.
+    ///
+    /// `config_dir()` is under `$HOME`, which on a shared-NFS cluster every
+    /// host sees. Pid files stored there were read by peers that then resolved
+    /// the pid through their *own* `/proc` -- so a daemon on one host would
+    /// either find an unrelated local process and refuse to start, or find
+    /// nothing and take over another host's state.
+    ///
+    /// `$XDG_RUNTIME_DIR` is tmpfs and per-host, which is exactly right for a
+    /// pid: it should not survive a reboot. Falls back to a uid-scoped dir
+    /// under the system temp dir when the variable is unset (cron, ssh
+    /// without a login session).
+    pub fn runtime_dir() -> Result<PathBuf> {
+        let base = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| {
+                let uid = unsafe { libc::getuid() };
+                std::env::temp_dir().join(format!("apas-{uid}"))
+            });
+        let dir = base.join("apas");
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
     pub fn daemon_pid_path() -> Result<PathBuf> {
-        Ok(Self::config_dir()?.join("daemon.pid"))
+        Ok(Self::runtime_dir()?.join("daemon.pid"))
     }
 
     pub fn daemon_state_path() -> Result<PathBuf> {
-        Ok(Self::config_dir()?.join("daemon.json"))
+        Ok(Self::runtime_dir()?.join("daemon.json"))
     }
 
     pub fn load() -> Result<Self> {
