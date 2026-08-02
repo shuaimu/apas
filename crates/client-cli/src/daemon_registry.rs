@@ -216,6 +216,35 @@ pub fn publish_self(config_dir: &Path, machine_id: Uuid, version: &str) -> Resul
     Ok(record)
 }
 
+/// RAII cleanup for a daemon's shared-registry presence.
+///
+/// Withdrawal must not be tied to reaching the connected event loop. A daemon
+/// that is still retrying its server connection when it gets SIGINT never gets
+/// there, so an explicit call inside that loop leaves the record behind and
+/// peers keep seeing a dead host until the staleness window expires. Dropping
+/// covers every return path, matching how `DaemonStateGuard` already handles
+/// the host-local pid file.
+///
+/// A SIGKILLed daemon still can't run this -- that case is exactly what the
+/// heartbeat staleness check is for. The two layers are complementary: this
+/// makes clean exits instant, staleness makes unclean ones eventually correct.
+pub struct RegistrationGuard {
+    config_dir: PathBuf,
+}
+
+impl RegistrationGuard {
+    pub fn new(config_dir: PathBuf) -> Self {
+        Self { config_dir }
+    }
+}
+
+impl Drop for RegistrationGuard {
+    fn drop(&mut self) {
+        release_all_own_claims(&self.config_dir);
+        withdraw_self(&self.config_dir);
+    }
+}
+
 /// Remove this host's record on clean shutdown, so peers see it leave
 /// immediately instead of waiting out the staleness window.
 pub fn withdraw_self(config_dir: &Path) {
@@ -495,6 +524,30 @@ mod tests {
 
         withdraw_self(dir.path());
         assert!(!daemons_dir(dir.path()).join(format!("{}.json", hostname())).exists());
+    }
+
+    #[test]
+    fn guard_withdraws_on_drop_even_without_a_clean_loop_exit() {
+        // Regression: withdrawal used to live inside the connected event loop,
+        // so a daemon SIGINTed while still retrying its connection never
+        // reached it and left its record behind for peers to see.
+        let dir = TempDir::new().unwrap();
+        let id = derive_machine_id();
+        publish_self(dir.path(), id, "test").unwrap();
+        claim_project(dir.path(), "p1", "/proj", id).unwrap();
+
+        let record = daemons_dir(dir.path()).join(format!("{}.json", hostname()));
+        assert!(record.exists());
+
+        {
+            let _guard = RegistrationGuard::new(dir.path().to_path_buf());
+        } // dropped here, as it would be on any early return
+
+        assert!(!record.exists(), "daemon record should be withdrawn on drop");
+        assert!(
+            !claims_dir(dir.path()).join("p1.json").exists(),
+            "our claims should be released on drop"
+        );
     }
 
     #[test]

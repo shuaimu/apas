@@ -31,7 +31,7 @@
 //! spawn time and stamped server-side. An agent cannot publish as another
 //! pane, and cannot forget to identify itself.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
@@ -486,7 +486,20 @@ impl ApasMcpServer {
     }
 
     fn load_panes(&self) -> Result<Vec<PaneSummary>> {
-        let metadata = crate::project::get_or_create_project(self.dir())?;
+        // Read `.apas` directly rather than via `get_or_create_project`: that
+        // helper *creates* the project when the file is absent and registers
+        // it in the user's `~/.config/apas/projects.json`. An MCP server only
+        // ever serves a project that already exists, and minting one as a side
+        // effect of `list_panes` polluted the real registry with an entry per
+        // test temp dir (43 dead paths before this was caught) -- which the
+        // daemon then treats as projects to spawn.
+        let apas_path = crate::project::get_apas_path(self.dir());
+        if !apas_path.exists() {
+            return Ok(Vec::new());
+        }
+        let metadata: crate::project::ProjectMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&apas_path)?)
+                .with_context(|| format!("parsing {}", apas_path.display()))?;
         Ok(metadata
             .panes
             .iter()

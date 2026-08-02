@@ -88,6 +88,17 @@ impl Default for LocalConfig {
 
 impl Config {
     pub fn config_dir() -> Result<PathBuf> {
+        // Escape hatch. Without it every code path that touches
+        // `get_or_create_project` writes into the real `~/.config/apas/` --
+        // including tests, which registered one entry per temp dir and left
+        // dozens of dead paths the daemon then tried to spawn projects for.
+        // Also useful operationally: two daemons on one host, or a throwaway
+        // config for testing, without touching the user's real state.
+        if let Some(dir) = std::env::var_os("APAS_CONFIG_DIR") {
+            let dir = PathBuf::from(dir);
+            std::fs::create_dir_all(&dir)?;
+            return Ok(dir);
+        }
         let proj_dirs = ProjectDirs::from("com", "apas", "apas")
             .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?;
 

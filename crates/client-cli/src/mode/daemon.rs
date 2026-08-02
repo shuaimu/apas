@@ -720,6 +720,9 @@ pub async fn run(
     if let Err(err) = crate::daemon_registry::publish_self(&registry_dir, machine_id, VERSION) {
         tracing::warn!(%err, "could not publish daemon record to the shared registry");
     }
+    // Withdraw on ANY exit, not just the connected loop: a daemon killed while
+    // still retrying its connection would otherwise leave a record behind.
+    let _registration = crate::daemon_registry::RegistrationGuard::new(registry_dir.clone());
     match crate::daemon_registry::live_peers(&registry_dir) {
         peers if peers.is_empty() => {
             tracing::info!("no other apas daemons visible on this shared config dir")
@@ -829,10 +832,7 @@ async fn run_connection(
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
-            // Leave cleanly so peers see us go immediately instead of waiting
-            // out the staleness window, and so our projects are free at once.
-            crate::daemon_registry::release_all_own_claims(&registry_dir);
-            crate::daemon_registry::withdraw_self(&registry_dir);
+            // RegistrationGuard (installed in `run`) withdraws on drop.
             return Ok(());
         }
 
