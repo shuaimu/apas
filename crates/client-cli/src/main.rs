@@ -14,6 +14,7 @@ mod claude;
 mod config;
 mod file_watcher;
 mod manager;
+mod mcp;
 mod mode;
 mod pane_status;
 mod plan_review;
@@ -22,6 +23,7 @@ mod role;
 mod scratchpad;
 mod suggested_workers;
 mod team_todo;
+mod terminal_pane;
 mod tui;
 mod update;
 mod usage;
@@ -123,6 +125,17 @@ enum Commands {
         /// Legacy option (ignored): daemon now reads ~/.config/apas/projects.json
         #[arg(long = "root", short = 'r')]
         roots: Vec<PathBuf>,
+    },
+    /// Serve the team-mode MCP tool surface on stdio (Phase 3.1 follow-up).
+    /// Spawned per pane by the CLI, not run by hand — `--pane-id` is what
+    /// stamps published records, so it must match the calling pane.
+    McpServer {
+        /// Project root containing .apas / team-todo.md / .apas-team.jsonl
+        #[arg(long)]
+        project_dir: PathBuf,
+        /// Pane this server publishes as
+        #[arg(long)]
+        pane_id: u32,
     },
     /// Manage per-pane isolated git worktrees (Phase 1.1 swarm plan)
     Worktree {
@@ -250,6 +263,16 @@ async fn main() -> Result<()> {
                     .unwrap_or_else(|| DEFAULT_SERVER.to_string());
                 auth::whoami(&config, &server).await?;
                 return Ok(());
+            }
+            Commands::McpServer {
+                project_dir,
+                pane_id,
+            } => {
+                // stdout is the JSON-RPC channel — anything else written there
+                // corrupts the stream. Tracing already goes to stderr (see the
+                // subscriber above), so nothing extra is needed here beyond not
+                // printing.
+                return mcp::run(project_dir, pane_id).await;
             }
             Commands::Daemon { roots } => {
                 let state_path = config::Config::daemon_state_path()?;

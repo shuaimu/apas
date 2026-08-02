@@ -62,6 +62,7 @@ apas/
 │   │   │   ├── manager.rs     # project_goal.md read/write helpers
 │   │   │   ├── worktree.rs    # Isolated worktree creation/diff/cleanup
 │   │   │   ├── claude.rs      # Claude process wrapper
+│   │   │   ├── terminal_pane.rs # Pty host for kind:"terminal" panes (portable-pty)
 │   │   │   └── mode/
 │   │   │       ├── dual_pane.rs # Default managed panes, deadloops, team files
 │   │   │       ├── hybrid.rs    # Legacy single-pane local CLI + streaming
@@ -96,11 +97,13 @@ apas/
 │       │   ├── components/
 │       │   │   ├── overview/         # Manager/goal/TODO/pane-grid control surface
 │       │   │   ├── tabs/             # Pane tabs, task bars, diff modal
+│       │   │   │   └── TerminalPane.tsx  # xterm.js view for kind:"terminal" panes
 │       │   │   ├── chat/             # Message display
 │       │   │   ├── code/             # Code blocks
 │       │   │   └── tools/            # Tool cards
 │       │   └── lib/
 │       │       ├── store.ts          # Zustand state, WebSocket message handling
+│       │       ├── terminalBus.ts    # Pty frame fan-out (deliberately NOT zustand)
 │       │       └── roleTemplates.ts  # Web-spawned managed-role prompt templates
 │       └── package.json
 │
@@ -211,6 +214,14 @@ pane state:
       "role": null,
       "mode": "interactive",
       "managed": false
+    },
+    {
+      "pane_id": 612,
+      "role": null,
+      "mode": "interactive",
+      "kind": "terminal",
+      "provider": "codex",
+      "managed": false
     }
   ]
 }
@@ -218,7 +229,9 @@ pane state:
 
 `auto_approve_todos` and `auto_merge_prs` are project-level autonomy flags read
 by the Tech Lead loop. Managed pane entries are restored as team roles; unmanaged
-interactive panes can coexist with the team.
+interactive panes can coexist with the team. `kind` defaults to `"agent"` when
+absent, so `.apas` files written before terminal panes existed keep loading
+unchanged — see "Terminal panes" under Key Concepts.
 
 ## Message Types
 
@@ -226,16 +239,23 @@ Key message types in `crates/shared/src/messages.rs`:
 
 - **CliToServer**: Register, SessionStart, StreamMessage, UserInput,
   Heartbeat, ProjectGoalChanged, ProjectFlagsChanged, TeamTodoChanged,
-  SuggestedWorkersChanged, machine config/status updates.
+  SuggestedWorkersChanged, TerminalOutput, TerminalExited, machine
+  config/status updates.
 - **ServerToCli**: Registered, SessionAssigned, Input, Signal,
   UpdateProjectGoal, UpdateProjectFlags, TodoApproval, AddTodo,
-  pane/worktree/suggestion actions.
+  TerminalInput, TerminalResize, pane/worktree/suggestion actions.
 - **WebToServer**: Authenticate, ListCliClients, AttachSession, Input,
   UpdateProjectGoal, UpdateProjectFlags, TodoApproval, AddTodo,
-  machine/provider config actions.
+  TerminalInput, TerminalResize, TerminalAttach, machine/provider config
+  actions.
 - **ServerToWeb**: Authenticated, CliClients, SessionMessages, StreamMessage,
   UserInput, ProjectGoalChanged, ProjectFlagsChanged, TeamTodoChanged,
-  SuggestedWorkersChanged, Machines, PaneDiff.
+  SuggestedWorkersChanged, Machines, PaneDiff, TerminalOutput,
+  TerminalSnapshot, TerminalExited.
+
+The `Terminal*` family is the pty byte channel for `kind: "terminal"` panes and
+is deliberately separate from `Output` / `StreamMessage` — see "Terminal panes"
+under Key Concepts for why.
 
 `WebToServer::UpdateProjectFlags` carries the Tech Lead autonomy flags
 (`auto_approve_todos` and `auto_merge_prs`) from the web to the server. The
@@ -397,3 +417,94 @@ ssh root@apas.mpaxos.com "cd /opt/apas/web && npm install && NEXT_PUBLIC_WEB_UI_
    runtime paths.
 6. **Real-time Updates**: WebSocket connections broadcast live messages,
    project-goal changes, Team TODO state, machine config, and pane diffs.
+7. **Pane kinds**: `PaneConfig.kind` picks how a pane hosts its agent, and
+   is orthogonal to `provider` (which binary) and `mode` (how autonomous).
+   See "Terminal panes" below.
+
+## Team-mode MCP server (`apas mcp-server`)
+
+Phase 3.1 shipped delegation as `.apas-team.jsonl` tag conventions driven from
+bash (see `docs/dev/3.1-delegation-via-scratchpad.md`, which left the MCP path
+open as a follow-up). That follow-up is now in: `crates/client-cli/src/mcp.rs`
+exposes the same protocol as typed MCP tools.
+
+**The scratchpad file is still the source of truth.** Every tool writes through
+`scratchpad` / `team_todo` / `manager` and lands on disk in the shape it always
+had — so the CLI's watcher still *observes* writes rather than trusting agents
+to self-report, delegations stay visible in the web Team modal, and team state
+survives a machine loss (after the 2026-08-02 NFS crash the scratchpad was the
+only durable artifact of it — the server persists none of this).
+
+Tools: `publish_record`, `delegate`, `read_records`, `read_team_todo`,
+`propose_todo`, `update_todo_status`, `read_project_goal`,
+`write_project_goal`, `list_panes`. Schemas are derived from Rust argument
+structs via `schemars`, so the advertised schema cannot drift from the code.
+
+**One server per pane.** The CLI spawns `apas mcp-server --project-dir <root>
+--pane-id <n>` as a stdio child of each pane, so `pane_id` is stamped
+server-side: an agent can neither publish as another pane nor forget to
+identify itself. Note `--project-dir` is the **project root**, never a pane's
+worktree — worktrees contain no `team-todo.md` / `.apas-team.jsonl`.
+
+Provider wiring reuses existing channels: claude (and the MiniMax/GLM/DeepSeek
+variants, which are the claude binary behind different env) via `--mcp-config`;
+codex via `-c mcp_servers.apas.*`, the same `-c` override that already carries
+`model_reasoning_effort`. opencode/cursor-agent get no flags — unverified, and a
+bad flag breaks the spawn outright.
+
+**Concurrency.** `team-todo.md` mutations are a load → mutate → save cycle, and
+every pane runs its own server process (rmcp also serves calls concurrently
+within one). Without a lock, two panes mutating at the same instant both read
+the old file and the second save silently discards the first — a lost update
+with no error either side, reproducible on the first concurrent call. All
+mutating tools therefore hold an advisory `flock` on `.apas-team.lock` for the
+whole cycle; it releases on fd close, so a killed pane cannot wedge the project.
+
+## Terminal panes (`kind: "terminal"`)
+
+Most panes are `kind: "agent"` (the default, and what every pane written
+before this field existed deserializes as): the CLI runs the provider
+headlessly and parses stream-json into structured events.
+
+A **terminal pane** instead allocates a pty (`portable-pty`), execs the
+provider's *real interactive TUI* with no flags, and streams the raw bytes
+to xterm.js in the browser. Nothing is parsed, so nothing has to be kept in
+sync with a provider's output format — the point is to reuse the CLI as it
+ships.
+
+Only `claude` and `codex` can host one (`terminal_pane::terminal_binary_for`);
+the MiniMax/GLM/DeepSeek variants are the claude binary behind different env,
+and opencode/cursor-agent have unverified pty behaviour.
+
+**What terminal panes deliberately do not get.** Every team-mode integration
+is built on stream-json events, so a terminal pane has no usage counters, no
+pane status, no `PaneDiff`, no plan review, and no scratchpad publishing. It
+is never a Tech Lead delegation target and is forced `managed: false`. Treat
+it as a side chat with a genuine TUI, not a team member.
+
+**Transport.** Raw pty bytes never touch `CliToServer::Output` or
+`StreamMessage` — those persist into `messages.jsonl` as chat records, and
+ANSI would both bloat the store and break the message renderer. They ride
+dedicated `Terminal*` messages, base64-encoded because a pty read splits
+both UTF-8 sequences and escape sequences:
+
+- `CliToServer::TerminalOutput` / `TerminalExited`
+- `ServerToWeb::TerminalOutput` / `TerminalSnapshot` / `TerminalExited`
+- `WebToServer::TerminalInput` / `TerminalResize` / `TerminalAttach`
+- `ServerToCli::TerminalInput` / `TerminalResize`
+
+The server keeps a bounded in-memory scrollback ring per `(session, pane)`
+(`TERMINAL_SCROLLBACK_MAX_BYTES`, never written to disk) and answers
+`TerminalAttach` from it, so reattach paints instantly and works while the
+CLI is mid-reconnect. The ring is dropped when the pane is removed and when
+the CLI disconnects — those ptys died with it, and replaying their last
+frame would look like a live terminal.
+
+On the web side, frames bypass zustand entirely (`lib/terminalBus.ts`): a
+full-screen TUI repaints many times a second, and storing chunks in state
+would re-render every subscriber per frame.
+
+**Lifetime.** The pty is a child of the CLI process, so a terminal pane dies
+when `apas` restarts; the restore path re-execs with the provider's own
+continue flag (`claude --continue`, `codex resume`) as the closest available
+substitute. There is no apas-visible session id to resume a TUI.

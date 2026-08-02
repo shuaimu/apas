@@ -28,6 +28,10 @@ Thumbs.db
 # Per-project agent state (the apas binary writes these in any project
 # it runs in, including this repo when we dogfood)
 .apas-team.jsonl
+# Advisory lock the MCP team tools hold across team-todo.md read-modify-write.
+# Untracked it would show up in `git status`, which the Tech Lead reads for
+# checkout-drift detection and would escalate on.
+.apas-team.lock
 .apas-worktrees/
 team-todo.md
 suggested-workers.md

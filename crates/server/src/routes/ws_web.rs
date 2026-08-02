@@ -5,6 +5,7 @@ use axum::{
     },
     response::IntoResponse,
 };
+use base64::Engine as _;
 use futures::{SinkExt, StreamExt};
 use shared::{
     MessageInfo, ServerToCli, ServerToDaemon, ServerToWeb, SessionInfo, SessionStatus, WebToServer,
@@ -232,6 +233,10 @@ fn infer_panes_from_messages(
                 pane_id,
                 provider: shared::Provider::Claude,
                 mode,
+                // Panes reconstructed from stored chat history are agent
+                // panes by definition — a terminal pane writes no messages
+                // to reconstruct from.
+                kind: shared::PaneKind::Agent,
                 // We cannot recover provider-specific resume session IDs from historical
                 // messages alone, so we fall back to the project session ID.
                 session_id,
@@ -2089,6 +2094,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     backstory,
                     plan_review_mode,
                     managed,
+                    kind,
                 }) => {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
@@ -2099,6 +2105,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             pane_id,
                             provider,
                             mode,
+                            kind,
                             session_id: uuid::Uuid::new_v4(),
                             is_paused: false,
                             stop_requested: false,
@@ -2153,6 +2160,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 },
                             )
                             .await;
+                        // Drop any terminal scrollback for this pane so a
+                        // later pane that reuses the id doesn't inherit the
+                        // dead pane's frames on attach.
+                        state.sessions.clear_terminal_scrollback(&sid, pane_id);
                     }
                 }
                 Ok(WebToServer::UpdatePaneLabel { session_id: msg_sid, pane_id, label }) => {
@@ -2365,6 +2376,81 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             ServerToCli::DismissSuggestion {
                                 session_id: sid,
                                 suggestion_id,
+                            },
+                        )
+                        .await;
+                }
+                Ok(WebToServer::TerminalInput { session_id: msg_sid, pane_id, data_b64 }) => {
+                    let Some(sid) =
+                        resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
+                            .await
+                    else {
+                        continue;
+                    };
+                    state
+                        .sessions
+                        .route_to_cli(
+                            &sid,
+                            ServerToCli::TerminalInput {
+                                session_id: sid,
+                                pane_id,
+                                data_b64,
+                            },
+                        )
+                        .await;
+                }
+                Ok(WebToServer::TerminalResize { session_id: msg_sid, pane_id, cols, rows }) => {
+                    let Some(sid) =
+                        resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
+                            .await
+                    else {
+                        continue;
+                    };
+                    state
+                        .sessions
+                        .route_to_cli(
+                            &sid,
+                            ServerToCli::TerminalResize {
+                                session_id: sid,
+                                pane_id,
+                                cols,
+                                rows,
+                            },
+                        )
+                        .await;
+                }
+                Ok(WebToServer::TerminalAttach { session_id: msg_sid, pane_id }) => {
+                    let Some(sid) =
+                        resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
+                            .await
+                    else {
+                        continue;
+                    };
+                    // Answered straight from the server's ring buffer — no
+                    // CLI round-trip, so reattach paints instantly and works
+                    // even while the CLI is mid-reconnect.
+                    let (data_b64, seq, truncated) =
+                        match state.sessions.terminal_snapshot(&sid, pane_id) {
+                            Some((bytes, seq, truncated)) => (
+                                base64::engine::general_purpose::STANDARD.encode(&bytes),
+                                seq,
+                                truncated,
+                            ),
+                            // No output yet (pane just spawned). Reply with an
+                            // empty snapshot rather than staying silent so the
+                            // client can leave its "connecting" state.
+                            None => (String::new(), 0, false),
+                        };
+                    state
+                        .sessions
+                        .send_to_web(
+                            &connection_id,
+                            ServerToWeb::TerminalSnapshot {
+                                session_id: sid,
+                                pane_id,
+                                data_b64,
+                                seq,
+                                truncated,
                             },
                         )
                         .await;

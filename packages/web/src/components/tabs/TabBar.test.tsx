@@ -175,6 +175,7 @@ describe("TabBar coordinator close controls", () => {
       "claude",
       DEEPSEEK_DEFAULT_MODEL,
       undefined,
+      "agent",
     );
   });
 
@@ -311,7 +312,7 @@ describe("TabBar add-tab worktree controls", () => {
     fireEvent.click(screen.getByText("Claude"));
     fireEvent.click(screen.getByText("Official"));
 
-    expect(onAddTab).toHaveBeenCalledWith("claude", undefined, undefined);
+    expect(onAddTab).toHaveBeenCalledWith("claude", undefined, undefined, "agent");
   });
 
   it("passes true when isolated worktree is checked and resets it after picking", () => {
@@ -323,13 +324,38 @@ describe("TabBar add-tab worktree controls", () => {
     fireEvent.click(screen.getByText("Claude"));
     fireEvent.click(screen.getByText("Official"));
 
-    expect(onAddTab).toHaveBeenCalledWith("claude", undefined, true);
+    expect(onAddTab).toHaveBeenCalledWith("claude", undefined, true, "agent");
 
     openNewTabMenu();
     expect(isolatedWorktreeCheckbox().checked).toBe(false);
     fireEvent.click(screen.getByText("Codex"));
 
-    expect(onAddTab).toHaveBeenLastCalledWith("codex", undefined, undefined);
+    expect(onAddTab).toHaveBeenLastCalledWith("codex", undefined, undefined, "agent");
+  });
+
+  it("offers claude and codex terminal tabs and passes kind=terminal", () => {
+    const onAddTab = vi.fn();
+    renderTabBar({ onAddTab });
+
+    openNewTabMenu();
+    fireEvent.click(screen.getByText("Codex terminal"));
+
+    expect(onAddTab).toHaveBeenCalledWith("codex", undefined, undefined, "terminal");
+  });
+
+  it("does not offer a terminal tab for providers a pty can't host", () => {
+    // Mirrors `terminal_binary_for` in the CLI: MiniMax/GLM/DeepSeek are
+    // the claude binary behind different env, and opencode/cursor-agent
+    // have unverified pty behaviour. Offering them would spawn a pane the
+    // CLI immediately rejects.
+    renderTabBar();
+    openNewTabMenu();
+
+    expect(screen.getByText("Claude terminal")).toBeTruthy();
+    expect(screen.getByText("Codex terminal")).toBeTruthy();
+    for (const label of ["MiniMax terminal", "GLM terminal", "DeepSeek terminal", "OpenCode terminal"]) {
+      expect(screen.queryByText(label)).toBeNull();
+    }
   });
 
   it("closes the menu from an outside click and collapses expanded provider submenus", () => {

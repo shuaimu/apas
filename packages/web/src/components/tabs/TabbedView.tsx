@@ -1,7 +1,8 @@
 "use client";
 
 import React, { useRef, useCallback, useEffect, useState, useMemo, memo } from "react";
-import { useStore, Message, PaneConfig, PaneCleanupAction, PlanReviewMode, TeamRecord, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, paneKey, selectActiveTeamRecords } from "@/lib/store";
+import dynamic from "next/dynamic";
+import { useStore, Message, PaneConfig, PaneCleanupAction, PaneKind, PlanReviewMode, TeamRecord, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, paneKey, selectActiveTeamRecords } from "@/lib/store";
 import { ROLE_TEMPLATES, TEMPLATE_COLOR_CLASSES } from "@/lib/roleTemplates";
 import { extractTimeline, TimelineEntry } from "@/lib/timeline";
 import { OverviewView } from "../overview/OverviewView";
@@ -12,6 +13,21 @@ import { TabBar } from "./TabBar";
 import { WorkerTaskBar } from "./WorkerTaskBar";
 import { UsageLimitsDisplay } from "../UsageLimits";
 import { CodeBlock } from "../code/CodeBlock";
+
+// xterm.js touches `document` at import time, so it can't be part of the
+// server bundle. Loading it lazily also keeps the ~300 KB emulator out of
+// the initial payload for the (common) case of no terminal panes.
+const TerminalPane = dynamic(
+  () => import("./TerminalPane").then((m) => m.TerminalPane),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="flex-1 bg-[#0a0a0a] p-3 font-mono text-xs text-neutral-500">
+        Loading terminal…
+      </div>
+    ),
+  },
+);
 
 // Sentinel pane_id for the single-pane fallback (no pane system)
 const PANE_ID_MAIN = 0;
@@ -724,19 +740,22 @@ export function TabbedView({
     [cleanupDialog, removePane, activeTabId, effectiveTabs, handleSelectTab],
   );
 
-  const handleAddTab = useCallback((provider: string = "claude", model?: string, isolatedWorktree?: boolean) => {
+  const handleAddTab = useCallback((provider: string = "claude", model?: string, isolatedWorktree?: boolean, kind: PaneKind = "agent") => {
     const isMiniMax = provider === "minimax" || (provider === "claude" && isMiniMaxModel(model));
     const isGlm = provider === "glm" || (provider === "claude" && isGlmModel(model));
     const isDeepseek = provider === "deepseek" || (provider === "claude" && isDeepseekModel(model));
-    const prefix = provider === "codex"
+    const basePrefix = provider === "codex"
       ? "Codex"
       : provider === "cursor-agent"
         ? "Cursor"
         : provider === "opencode"
           ? "OpenCode"
           : isMiniMax ? "MiniMax" : isGlm ? "GLM" : isDeepseek ? "DeepSeek" : "Claude";
+    // Terminal tabs sit next to agent tabs in the same bar, so the label
+    // has to say which is which — they behave very differently.
+    const prefix = kind === "terminal" ? `${basePrefix} TTY` : basePrefix;
     const label = `${prefix} ${effectiveTabs.length + 1}`;
-    const result = addPane(provider, "interactive", label, undefined, model, isolatedWorktree);
+    const result = addPane(provider, "interactive", label, undefined, model, isolatedWorktree, undefined, false, kind);
     if (result.success) {
       setAddTabError(null);
     } else {
@@ -800,6 +819,10 @@ export function TabbedView({
   const activeStatus = activeTabId != null ? paneStatuses[paneKey(activeTabId)] || null : null;
   const activeIsPaused = activeTabId != null ? pausedPanes.includes(activeTabId) : false;
   const activeIsBot = activeConfig?.mode === "deadloop";
+  // Terminal panes take keystrokes directly in xterm.js. Showing the chat
+  // composer under one would be worse than redundant: its text goes down
+  // the agent input path, which a terminal pane has no channel for.
+  const activeIsTerminal = activeConfig?.kind === "terminal";
   const activeStopRequested = activeConfig?.stop_requested === true;
   const activeProvider = activeConfig?.provider;
   const activeIsMiniMax = activeProvider === "minimax" || (
@@ -1406,7 +1429,15 @@ export function TabbedView({
               key={tab.pane_id}
               className={isActive ? "flex-1 flex flex-col min-h-0" : "hidden"}
             >
-              {isTimeline ? (
+              {tab.kind === "terminal" ? (
+                // Terminal panes carry no messages — the pty stream goes
+                // straight to xterm.js via terminalBus, so none of the
+                // MessagePane / task-bar machinery applies here.
+                <TerminalPane
+                  key={`terminal-${sessionId}-${tab.pane_id}`}
+                  paneId={tab.pane_id}
+                />
+              ) : isTimeline ? (
                 <TimelinePane
                   key={`timeline-${sessionId}-${tab.pane_id}`}
                   messages={msgs}
@@ -1441,8 +1472,9 @@ export function TabbedView({
         </div>
       )}
 
-      {/* Input box — disabled for running deadloop panes, hidden on Overview */}
-      {activeTabId !== OVERVIEW_PANE_ID && (
+      {/* Input box — disabled for running deadloop panes, hidden on
+          Overview and on terminal panes (which take input in xterm). */}
+      {activeTabId !== OVERVIEW_PANE_ID && !activeIsTerminal && (
         <div className="p-3 border-t border-gray-200 dark:border-gray-700 flex-shrink-0">
           {activeIsBot ? (
             <div className="text-center text-sm text-gray-400 dark:text-gray-500 py-2">

@@ -2,13 +2,23 @@ import { describe, expect, it } from "vitest";
 import { ROLE_TEMPLATES } from "./roleTemplates";
 
 describe("ROLE_TEMPLATES", () => {
-  it("scratchpad-writing templates require append-time timestamps", () => {
+  it("scratchpad-writing templates publish through the MCP tools", () => {
+    // These templates previously had to teach `TS=$(date -Iseconds)`, because a
+    // reused timestamp silently broke every reader's cursor filter. publish_record
+    // and delegate stamp ts at append time and pane_id server-side, so that
+    // instruction is now not merely redundant but wrong.
+    //
+    // These are the web-spawned mirror of crates/client-cli/src/role.rs — if that
+    // file migrates and this one doesn't, panes started from the Overview get a
+    // different protocol than panes started by the CLI.
     for (const id of ["manager", "tech-lead", "developer", "qa", "reviewer", "researcher"]) {
       const template = ROLE_TEMPLATES.find((candidate) => candidate.id === id);
       expect(template, `missing template ${id}`).toBeTruthy();
-      expect(template!.backstory).toContain("generate its ts at append time");
-      expect(template!.backstory).toContain("TS=$(date -Iseconds)");
-      expect(template!.backstory).toContain("never reuse an earlier planning timestamp");
+      expect(template!.backstory).toContain("publish_record");
+      expect(template!.backstory).toContain("stamp your pane_id");
+      for (const stale of ["TS=$(date -Iseconds)", "generate its ts at append time"]) {
+        expect(template!.backstory, `${id} still hand-writes timestamps`).not.toContain(stale);
+      }
     }
   });
 

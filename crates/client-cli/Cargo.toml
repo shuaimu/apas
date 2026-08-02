@@ -58,6 +58,24 @@ dirs = "5.0"
 # every cycle just to confirm "nothing changed").
 notify = "6"
 
+# Pty host for `PaneKind::Terminal` panes, which run the provider's real
+# interactive TUI instead of the headless stream-json worker. wezterm's
+# crate; verified to build for the static musl target (it reaches libc's
+# openpty, which musl provides, and needs no extra C toolchain beyond the
+# musl-gcc already configured in .cargo/config.toml for ring).
+portable-pty = "0.9"
+
+# Pty bytes are base64'd onto the wire: a read can split both UTF-8
+# sequences and ANSI escapes, so the frames can't be typed as JSON strings.
+base64 = "0.22"
+
+# MCP server (`apas mcp-server`) — the typed front door panes use instead of
+# hand-assembling `.apas-team.jsonl` tags in bash. Official Rust SDK; verified
+# to build for the static musl target. `schemars` is what derives each tool's
+# JSON schema from its argument struct, so the schema can't drift from the code.
+rmcp = { version = "3.1", features = ["server", "transport-io", "macros"] }
+schemars = "1"
+
 # Unix process management
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -8,6 +8,8 @@ name = "apas-server"
 path = "src/main.rs"
 
 [dependencies]
+# Terminal-pane pty bytes ride the wire base64-encoded (see PaneKind::Terminal).
+base64 = "0.22"
 shared = { workspace = true }
 
 # Async runtime

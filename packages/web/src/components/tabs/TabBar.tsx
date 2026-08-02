@@ -2,7 +2,7 @@
 
 import { useCallback, useRef, useEffect, useState, type ReactNode } from "react";
 import { Bot } from "lucide-react";
-import { PaneConfig, paneKey } from "@/lib/store";
+import { PaneConfig, PaneKind, paneKey } from "@/lib/store";
 import {
   PROVIDER_MODEL_GROUPS,
   isDeepseekModel,
@@ -23,7 +23,7 @@ interface TabBarProps {
   activeTabId: number | null;
   onSelectTab: (paneId: number) => void;
   onCloseTab: (paneId: number) => void;
-  onAddTab: (provider?: string, model?: string, isolatedWorktree?: boolean) => void;
+  onAddTab: (provider?: string, model?: string, isolatedWorktree?: boolean, kind?: PaneKind) => void;
   onRenameTab?: (paneId: number, newLabel: string) => void;
   onReorderTabs?: (orderedIds: number[]) => void;
   onBootCli?: () => void;
@@ -491,7 +491,7 @@ export function TabBar({
   );
 }
 
-function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: string, isolatedWorktree?: boolean) => void }) {
+function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: string, isolatedWorktree?: boolean, kind?: PaneKind) => void }) {
   const [showMenu, setShowMenu] = useState(false);
   const [isolatedWorktree, setIsolatedWorktree] = useState(false);
   const [expandedGroup, setExpandedGroup] = useState<string | null>(null);
@@ -512,8 +512,8 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
   // isolatedWorktree stays toggled while the menu is open so the user's
   // choice persists across submenu navigation, but resets after each
   // tab creation so a second tab doesn't silently get a new worktree.
-  const handlePick = (provider: string, model?: string) => {
-    onAddTab(provider, model, isolatedWorktree || undefined);
+  const handlePick = (provider: string, model?: string, kind: PaneKind = "agent") => {
+    onAddTab(provider, model, isolatedWorktree || undefined, kind);
     setIsolatedWorktree(false);
     setShowMenu(false);
     setExpandedGroup(null);
@@ -558,6 +558,36 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
             />
             Isolated git worktree
           </label>
+
+          {/* Terminal tabs host the provider's real TUI on a pty. Only
+              claude and codex are offered — the other providers are either
+              the claude binary behind different env (MiniMax/GLM/DeepSeek)
+              or have interaction models we haven't verified render
+              correctly through a bare pty. Mirrors
+              `terminal_binary_for` in the CLI. */}
+          <div className="border-b border-gray-100 dark:border-gray-700 pb-0.5">
+            <div
+              className="px-3 pt-1.5 pb-1 text-[10px] font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500"
+              title="Runs the real interactive CLI in a terminal. No usage stats, diffs, or Tech Lead delegation — it's a side chat with a genuine TUI."
+            >
+              Terminal
+            </div>
+            {[
+              { provider: "claude", label: "Claude terminal" },
+              { provider: "codex", label: "Codex terminal" },
+            ].map((entry) => (
+              <button
+                key={entry.provider}
+                onClick={() => handlePick(entry.provider, undefined, "terminal")}
+                className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
+              >
+                <span className="flex-shrink-0 text-gray-500 dark:text-gray-400">
+                  <ProviderIcon provider={entry.provider} className="w-4 h-4" />
+                </span>
+                {entry.label}
+              </button>
+            ))}
+          </div>
 
           {PROVIDER_MODEL_GROUPS.map((group, i) => (
             <div key={group.id}>

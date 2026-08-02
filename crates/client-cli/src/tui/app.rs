@@ -67,6 +67,9 @@ pub enum TuiEvent {
         plan_review_mode: shared::PlanReviewMode,
         managed: bool,
         try_resume_first: bool,
+        /// Agent (headless worker) vs Terminal (pty-hosted TUI). Terminal
+        /// tabs skip the agent spawn entirely — see `handle_tui_events`.
+        kind: shared::PaneKind,
     },
     CloseTab {
         pane_id: u32,

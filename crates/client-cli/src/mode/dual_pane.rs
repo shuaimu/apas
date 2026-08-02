@@ -6,6 +6,7 @@
 //! Users can create and close tabs dynamically from both TUI and web UI.
 
 use anyhow::Result;
+use base64::Engine as _;
 use shared::{
     ClaudeContentBlock, ClaudeStreamMessage, CliToServer, CodexStreamMessage, PaneType, Provider,
     ServerToCli,
@@ -22,6 +23,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use uuid::Uuid;
 
 use crate::project::{get_or_create_project, save_project};
+use crate::terminal_pane::{terminal_binary_for, TerminalHandle, TerminalPanes};
 use crate::tui::{App, PaneOutput, TuiCommand, TuiEvent};
 
 /// Classic/manual single-agent fallback. Managed team panes should be created
@@ -195,6 +197,7 @@ fn spawn_missing_team_panes(
             plan_review_mode: shared::PlanReviewMode::default(),
             managed: true,
             try_resume_first: try_resume,
+            kind: shared::PaneKind::Agent,
         });
         tracing::info!(pane_id, ?manager_spec.provider, ?manager_spec.model, "spawning Manager pane (Start team)");
     }
@@ -218,6 +221,7 @@ fn spawn_missing_team_panes(
             plan_review_mode: shared::PlanReviewMode::default(),
             managed: true,
             try_resume_first: try_resume,
+            kind: shared::PaneKind::Agent,
         });
         tracing::info!(pane_id, ?tech_lead_spec.provider, ?tech_lead_spec.model, "spawning Tech Lead pane (Start team)");
     }
@@ -241,6 +245,7 @@ fn spawn_missing_team_panes(
             plan_review_mode: shared::PlanReviewMode::default(),
             managed: true,
             try_resume_first: try_resume,
+            kind: shared::PaneKind::Agent,
         });
         tracing::info!(pane_id, ?reviewer_spec.provider, ?reviewer_spec.model, "spawning Reviewer pane (Start team)");
     }
@@ -264,6 +269,7 @@ fn spawn_missing_team_panes(
             plan_review_mode: shared::PlanReviewMode::default(),
             managed: true,
             try_resume_first: try_resume,
+            kind: shared::PaneKind::Agent,
         });
         tracing::info!(pane_id, ?developer_spec.provider, ?developer_spec.model, "spawning Developer pane (Start team)");
     }
@@ -663,6 +669,61 @@ type PaneInput = (String, bool);
 /// Maps pane_id -> Sender<PaneInput> for routing input to the correct session thread.
 type InputChannels = Arc<Mutex<HashMap<u32, mpsc::Sender<PaneInput>>>>;
 
+/// Allocate a pty and start the provider's interactive TUI for a
+/// `PaneKind::Terminal` pane, registering the handle for `Terminal*`
+/// routing.
+///
+/// Errors are returned as display strings rather than bubbled: a pane
+/// that can't start should say so in its own tab, not abort CLI startup
+/// or take down the other panes.
+#[allow(clippy::too_many_arguments)]
+fn spawn_terminal_pane(
+    terminal_panes: &TerminalPanes,
+    pane_id: u32,
+    session_id: Uuid,
+    provider: &Provider,
+    working_dir: &str,
+    worktree_path: Option<&str>,
+    server_tx: &tokio_mpsc::Sender<CliToServer>,
+    resume: bool,
+) -> Result<(), String> {
+    let binary = terminal_binary_for(provider).ok_or_else(|| {
+        format!(
+            "[{} cannot host a terminal pane; only claude and codex are supported]",
+            provider_display_name(provider, None)
+        )
+    })?;
+    let binary_path = resolve_binary_path(binary);
+    let cwd = worktree_path.unwrap_or(working_dir);
+    let env = build_pane_env_overrides(provider, None)?;
+
+    let handle = TerminalHandle::spawn(
+        pane_id,
+        session_id,
+        provider,
+        &binary_path,
+        cwd,
+        &env,
+        resume,
+        server_tx.clone(),
+    )
+    .map_err(|e| format!("[Error starting terminal pane: {e:#}]"))?;
+
+    // Replace rather than shadow: reboot and the missing-input-channel
+    // recovery path can both re-enter here for a live pane, and inserting
+    // over the old handle without killing it would orphan a pty (and its
+    // reader thread) for the lifetime of the CLI.
+    let previous = terminal_panes
+        .lock()
+        .map_err(|_| "[terminal registry mutex poisoned]".to_string())?
+        .insert(pane_id, handle);
+    if let Some(previous) = previous {
+        tracing::info!(pane_id, "replacing existing terminal pty");
+        previous.shutdown();
+    }
+    Ok(())
+}
+
 /// Per-pane pause flags (for deadloop panes).
 type PanePauses = Arc<Mutex<HashMap<u32, Arc<AtomicBool>>>>;
 
@@ -740,6 +801,11 @@ struct PaneMeta {
     /// v3.5: managed vs unmanaged. Mirrored from `PaneConfig.managed`.
     /// See the field doc on `shared::PaneConfig` for semantics.
     managed: bool,
+    /// Agent (headless stream-json worker) vs Terminal (pty-hosted TUI).
+    /// Mirrored from `PaneConfig.kind`. A `Terminal` pane has no entry in
+    /// `input_channels` and none of the streaming slots above are ever
+    /// populated — its I/O lives in the `TerminalPanes` registry instead.
+    kind: shared::PaneKind,
 }
 
 #[derive(Clone, Debug)]
@@ -936,6 +1002,7 @@ fn build_agent_switch_respawn_event(
         plan_review_mode,
         managed,
         try_resume_first: false,
+        kind: shared::PaneKind::Agent,
     }
 }
 
@@ -967,6 +1034,9 @@ fn build_pane_reboot_events(
             plan_review_mode: meta.plan_review_mode,
             managed: meta.managed,
             try_resume_first: true,
+            // Rebooting a terminal pane must re-open a pty, not fall back
+            // to the agent worker.
+            kind: meta.kind,
         },
     )
 }
@@ -1324,6 +1394,7 @@ async fn run_inner(
         shared::PlanReviewMode, // plan_review_mode from .apas (Phase 3.2)
         bool,           // manual_mode from .apas (v3.2)
         bool,           // managed from .apas (v3.5)
+        shared::PaneKind, // Agent vs pty-hosted Terminal
     )> = metadata
         .panes
         .iter()
@@ -1350,6 +1421,7 @@ async fn run_inner(
                 pane.plan_review_mode,
                 pane.manual_mode,
                 pane.managed,
+                pane.kind,
             )
         })
         .collect();
@@ -1384,6 +1456,10 @@ async fn run_inner(
     // Per-pane input channels
     let input_channels: InputChannels = Arc::new(Mutex::new(HashMap::new()));
 
+    // Live pty handles for `PaneKind::Terminal` panes. Kept apart from
+    // `input_channels` so raw terminal I/O never crosses the agent path.
+    let terminal_panes: TerminalPanes = Arc::new(Mutex::new(HashMap::new()));
+
     // Track pane_id -> claude_session_id for persistence
     let pane_sessions: Arc<Mutex<HashMap<u32, Uuid>>> = Arc::new(Mutex::new(HashMap::new()));
 
@@ -1415,6 +1491,8 @@ async fn run_inner(
         mpsc::Receiver<PaneInput>,
         Arc<Mutex<Option<std::process::Child>>>,
     )> = Vec::new();
+    // (pane_id, provider, worktree_path) for pty-hosted terminal panes.
+    let mut terminal_startups: Vec<(u32, Provider, Option<String>)> = Vec::new();
     {
         let mut pauses = pane_pauses.lock().unwrap();
         let mut stop_requests = pane_stop_requests.lock().unwrap();
@@ -1440,12 +1518,14 @@ async fn run_inner(
             tab_plan_review_mode,
             tab_manual_mode,
             tab_managed,
+            tab_kind,
         ) in &tabs_to_restore
         {
             let child_proc: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
             metas.insert(
                 *pane_id,
                 PaneMeta {
+                    kind: *tab_kind,
                     mode: mode.clone(),
                     provider: *provider,
                     label: tab_label.clone(),
@@ -1470,6 +1550,15 @@ async fn run_inner(
                 },
             );
             sessions.insert(*pane_id, *pane_session_id);
+
+            // Terminal panes host a real TUI on a pty. They register no
+            // input channel and start no deadloop — the pty is driven
+            // entirely by `Terminal*` messages — so branch before the
+            // agent-worker startup bookkeeping below.
+            if tab_kind.is_terminal() {
+                terminal_startups.push((*pane_id, *provider, tab_worktree.clone()));
+                continue;
+            }
 
             if *mode == shared::PaneMode::Deadloop {
                 let pause_flag = Arc::new(AtomicBool::new(*is_paused));
@@ -1507,6 +1596,25 @@ async fn run_inner(
                     child_proc,
                 ));
             }
+        }
+    }
+
+    // Restore pty-hosted terminal panes. `resume: true` because these are
+    // panes that already existed in `.apas` — the pty itself did not
+    // survive the restart, so this is the closest we get to reattaching
+    // (claude `--continue` / codex `resume`).
+    for (pane_id, provider, worktree) in &terminal_startups {
+        if let Err(err) = spawn_terminal_pane(
+            &terminal_panes,
+            *pane_id,
+            session_id,
+            provider,
+            &working_dir_str,
+            worktree.as_deref(),
+            &server_tx,
+            true,
+        ) {
+            tracing::error!(pane_id, %err, "failed to restore terminal pane");
         }
     }
 
@@ -1549,6 +1657,7 @@ async fn run_inner(
         let input_channels = input_channels.clone();
         let pane_metas = pane_metas.clone();
         let pane_sessions = pane_sessions.clone();
+        let terminal_panes_for_server = terminal_panes.clone();
         let event_tx_for_server = event_tx.clone();
         tokio::spawn(async move {
             run_server_connection(
@@ -1564,6 +1673,7 @@ async fn run_inner(
                 input_channels,
                 pane_metas,
                 pane_sessions,
+                terminal_panes_for_server,
                 status_tx,
                 event_tx_for_server,
             )
@@ -1572,7 +1682,9 @@ async fn run_inner(
     };
 
     // Send initial messages for restored panes.
-    for (pane_id, _, label, mode, _, _, _, _, _, is_paused, _, _, _, _, _, _, _) in &tabs_to_restore {
+    for (pane_id, _, label, mode, _, _, _, _, _, is_paused, _, _, _, _, _, _, _, _) in
+        &tabs_to_restore
+    {
         let init_text = if *pane_id == shared::PANE_ID_DEADLOOP
             && *mode == shared::PaneMode::Deadloop
         {
@@ -1787,6 +1899,7 @@ async fn run_inner(
         let pane_pauses_event = pane_pauses.clone();
         let pane_stop_requests_event = pane_stop_requests.clone();
         let pane_metas_event = pane_metas.clone();
+        let terminal_panes_event = terminal_panes.clone();
         let event_tx_event = event_tx.clone();
         let default_prompt_for_events = default_prompt.clone();
         let file_watcher_for_events = file_watcher.clone();
@@ -1810,6 +1923,7 @@ async fn run_inner(
                 pane_pauses_event,
                 pane_stop_requests_event,
                 pane_metas_event,
+                terminal_panes_event,
                 &default_prompt_for_events,
                 file_watcher_for_events,
             )
@@ -2222,7 +2336,7 @@ fn save_pane_configs(
                             None,
                         )
                     };
-                let (worktree_path, role, goal, backstory, plan_review_mode, manual_mode, managed) = pane_metas
+                let (worktree_path, role, goal, backstory, plan_review_mode, manual_mode, managed, kind) = pane_metas
                     .get(&pane_id)
                     .map(|p| (
                         p.worktree_path.clone(),
@@ -2232,12 +2346,14 @@ fn save_pane_configs(
                         p.plan_review_mode,
                         p.manual_mode,
                         p.managed,
+                        p.kind,
                     ))
-                    .unwrap_or((None, None, None, None, shared::PlanReviewMode::default(), false, false));
+                    .unwrap_or((None, None, None, None, shared::PlanReviewMode::default(), false, false, shared::PaneKind::Agent));
                 shared::PaneConfig {
                     pane_id,
                     provider,
                     mode,
+                    kind,
                     session_id: claude_sid,
                     is_paused: paused.get(&pane_id).copied().unwrap_or(false),
                     stop_requested: stop_requested.get(&pane_id).copied().unwrap_or(false),
@@ -2291,6 +2407,7 @@ fn handle_tui_events(
     pane_pauses: PanePauses,
     pane_stop_requests: PaneStopRequests,
     pane_metas: PaneMetas,
+    terminal_panes: TerminalPanes,
     default_prompt: &str,
     file_watcher: Arc<crate::file_watcher::ProjectFileWatcher>,
 ) {
@@ -2323,6 +2440,7 @@ fn handle_tui_events(
                     metas.insert(
                         pane_id,
                         PaneMeta {
+                            kind: shared::PaneKind::Agent,
                             mode: mode.clone(),
                             provider: provider.clone(),
                             label: label.clone(),
@@ -2467,6 +2585,7 @@ fn handle_tui_events(
                 plan_review_mode,
                 managed,
                 try_resume_first,
+                kind,
             }) => {
                 let label =
                     pane_label_or_default(Some(&requested_label), pane_id, model.as_deref());
@@ -2494,6 +2613,7 @@ fn handle_tui_events(
                     metas.insert(
                         pane_id,
                         PaneMeta {
+                            kind,
                             mode: mode.clone(),
                             provider: provider.clone(),
                             label: label.clone(),
@@ -2539,6 +2659,31 @@ fn handle_tui_events(
                     text: format!("[New tab from web: {}]", label),
                     pane_id,
                 });
+
+                // Terminal tab: allocate a pty running the provider's real
+                // TUI and stop here. None of the agent machinery below
+                // applies — no input channel, no deadloop, no system
+                // prompt — so an early return keeps those paths honest
+                // rather than threading `kind` through all of them.
+                if kind.is_terminal() {
+                    if let Err(err) = spawn_terminal_pane(
+                        &terminal_panes,
+                        pane_id,
+                        session_id,
+                        &provider,
+                        working_dir,
+                        worktree_path.as_deref(),
+                        &server_tx,
+                        try_resume_first,
+                    ) {
+                        tracing::error!(pane_id, %err, "failed to start terminal pane");
+                        let _ = output_tx.send(PaneOutput {
+                            text: err,
+                            pane_id,
+                        });
+                    }
+                    continue;
+                }
 
                 if mode == shared::PaneMode::Deadloop {
                     // Deadloop's input_tx lives inside the streaming worker
@@ -2913,6 +3058,7 @@ fn handle_tui_events(
                     metas.insert(
                         pane_id,
                         PaneMeta {
+                            kind: shared::PaneKind::Agent,
                             mode: shared::PaneMode::Deadloop,
                             provider,
                             label: existing_label,
@@ -3347,6 +3493,7 @@ fn handle_tui_events(
                     metas.insert(
                         pane_id,
                         PaneMeta {
+                            kind: shared::PaneKind::Agent,
                             mode: shared::PaneMode::Interactive,
                             provider,
                             label: saved_label,
@@ -3531,6 +3678,7 @@ fn build_pane_list(
             pane_id,
             provider: meta.provider.clone(),
             mode: meta.mode.clone(),
+            kind: meta.kind,
             session_id: claude_sid,
             is_paused,
             stop_requested,
@@ -3557,6 +3705,10 @@ fn build_pane_list(
                 pane_id,
                 provider: shared::Provider::Claude,
                 mode: shared::PaneMode::Interactive,
+                // Panes recovered from `input_channels` alone are always
+                // agent panes — terminal panes never register an input
+                // channel (see `TerminalPanes`).
+                kind: shared::PaneKind::Agent,
                 session_id: claude_sid,
                 is_paused: false,
                 stop_requested: false,
@@ -4399,6 +4551,7 @@ mod tests {
         effort_arc: Arc<Mutex<Option<String>>>,
     ) -> PaneMeta {
         PaneMeta {
+            kind: shared::PaneKind::Agent,
             mode: shared::PaneMode::Deadloop,
             provider,
             label: "Side Developer".to_string(),
@@ -4433,6 +4586,7 @@ mod tests {
             pane_id,
             provider: Provider::Codex,
             mode,
+            kind: shared::PaneKind::Agent,
             session_id: Uuid::new_v4(),
             is_paused,
             stop_requested,
@@ -4473,6 +4627,7 @@ mod tests {
         managed: bool,
     ) -> PaneMeta {
         PaneMeta {
+            kind: shared::PaneKind::Agent,
             mode,
             provider: Provider::Claude,
             label: label.to_string(),
@@ -4535,10 +4690,15 @@ mod tests {
             plan_review_mode,
             managed,
             try_resume_first,
+            kind,
         } = event else {
             panic!("Start team should emit AddTabWithConfig events");
         };
 
+        // Managed team roles are always agent panes — a Manager or Tech
+        // Lead hosted on a pty would publish no stream events and so
+        // couldn't participate in the team loop at all.
+        assert_eq!(*kind, shared::PaneKind::Agent);
         assert!(*pane_id >= 3);
         assert_ne!(*claude_session_id, Uuid::nil());
         assert_eq!(label, expected.label);
@@ -4796,7 +4956,7 @@ mod tests {
     #[test]
     fn build_agent_args_claude_resume_keeps_full_prompt() {
         let session_id = Uuid::new_v4();
-        let (args, using_resume) = build_agent_args(
+        let (mut args, using_resume) = build_agent_args(
             &Provider::Claude,
             &session_id,
             FULL_PROMPT,
@@ -4906,7 +5066,7 @@ mod tests {
         assert!(first_message);
         assert!(!try_resume_first);
 
-        let (args, using_resume) = build_deadloop_agent_args(
+        let (mut args, using_resume) = build_deadloop_agent_args(
             &Provider::Codex,
             &session_id,
             FULL_PROMPT,
@@ -5055,6 +5215,27 @@ mod tests {
     }
 
     #[test]
+    fn pane_reboot_terminal_pane_respawns_as_terminal() {
+        let effort_arc = Arc::new(Mutex::new(None));
+        let mut meta = test_pane_meta(Provider::Codex, false, None, effort_arc);
+        meta.kind = shared::PaneKind::Terminal;
+        meta.mode = shared::PaneMode::Interactive;
+
+        let (_close, add_event) = build_pane_reboot_events(9, &meta, Some(Uuid::from_u128(3)));
+
+        // Rebooting must re-open a pty. If `kind` were dropped here the
+        // pane would silently come back as a headless agent worker and
+        // the user's terminal tab would stop echoing entirely.
+        match add_event {
+            TuiEvent::AddTabWithConfig { kind, pane_id, .. } => {
+                assert_eq!(kind, shared::PaneKind::Terminal);
+                assert_eq!(pane_id, 9);
+            }
+            _ => panic!("expected AddTabWithConfig event"),
+        }
+    }
+
+    #[test]
     fn pane_reboot_events_respawn_requested_pane_on_same_session_with_config() {
         let prior_session = Uuid::from_u128(7);
         let effort_arc = Arc::new(Mutex::new(Some("high".to_string())));
@@ -5095,11 +5276,13 @@ mod tests {
             plan_review_mode,
             managed,
             try_resume_first,
+            kind,
         } = add_event
         else {
             panic!("expected AddTabWithConfig event");
         };
 
+        assert_eq!(kind, meta.kind);
         assert_eq!(pane_id, 42);
         assert_eq!(label, "Managed Developer");
         assert_eq!(claude_session_id, prior_session);
@@ -5273,6 +5456,7 @@ mod tests {
             pane_id: 42,
             provider: Provider::Codex,
             mode: shared::PaneMode::Deadloop,
+            kind: shared::PaneKind::Agent,
             session_id: Uuid::new_v4(),
             is_paused: true,
             stop_requested: false,
@@ -5860,6 +6044,7 @@ Use a project-specific custom dispatch loop.";
             metas.insert(
                 1,
                 PaneMeta {
+                    kind: shared::PaneKind::Agent,
                     mode: shared::PaneMode::Interactive,
                     provider: Provider::Claude,
                     label: "Interactive".to_string(),
@@ -5886,6 +6071,7 @@ Use a project-specific custom dispatch loop.";
             metas.insert(
                 2,
                 PaneMeta {
+                    kind: shared::PaneKind::Agent,
                     mode: shared::PaneMode::Interactive,
                     provider: Provider::Codex,
                     label: "Tab 2".to_string(),
@@ -5927,6 +6113,7 @@ Use a project-specific custom dispatch loop.";
             metas.insert(
                 1,
                 PaneMeta {
+                    kind: shared::PaneKind::Agent,
                     mode: shared::PaneMode::Interactive,
                     provider: Provider::Claude,
                     label: "MiniMax 1".to_string(),
@@ -5968,6 +6155,7 @@ Use a project-specific custom dispatch loop.";
             metas.insert(
                 1,
                 PaneMeta {
+                    kind: shared::PaneKind::Agent,
                     mode: shared::PaneMode::Interactive,
                     provider: Provider::Claude,
                     label: "MiniMax 1".to_string(),
@@ -5994,6 +6182,7 @@ Use a project-specific custom dispatch loop.";
             metas.insert(
                 2,
                 PaneMeta {
+                    kind: shared::PaneKind::Agent,
                     mode: shared::PaneMode::Interactive,
                     provider: Provider::Codex,
                     label: "Tab 2".to_string(),
@@ -6035,6 +6224,7 @@ Use a project-specific custom dispatch loop.";
             metas.insert(
                 7,
                 PaneMeta {
+                    kind: shared::PaneKind::Agent,
                     mode: shared::PaneMode::Interactive,
                     provider: Provider::Minimax,
                     label: "MiniMax 7".to_string(),
@@ -6282,6 +6472,7 @@ Use a project-specific custom dispatch loop.";
             metas.insert(
                 9,
                 PaneMeta {
+                    kind: shared::PaneKind::Agent,
                     mode: shared::PaneMode::Interactive,
                     provider: Provider::Claude,
                     label: "GLM 9".to_string(),
@@ -6323,6 +6514,7 @@ Use a project-specific custom dispatch loop.";
             metas.insert(
                 10,
                 PaneMeta {
+                    kind: shared::PaneKind::Agent,
                     mode: shared::PaneMode::Interactive,
                     provider: Provider::Claude,
                     label: "GLM Experimental".to_string(),
@@ -6798,7 +6990,7 @@ fn run_deadloop_session_inner(
             status: Some("Thinking...".to_string()),
         });
 
-        let (args, using_resume) = build_deadloop_agent_args(
+        let (mut args, using_resume) = build_deadloop_agent_args(
             provider,
             &claude_session_id,
             iteration_prompt,
@@ -6878,6 +7070,19 @@ fn run_deadloop_session_inner(
                 continue;
             }
         };
+
+        // Point this pane at its own `apas mcp-server` child so team-mode
+        // work goes through typed tools instead of hand-rolled JSONL + jq.
+        // NOTE: the server is given the PROJECT root, not `effective_dir` —
+        // a pane running in an isolated worktree still has to read and write
+        // the project's team-todo.md / .apas-team.jsonl, which do not exist
+        // inside the worktree.
+        args.extend(crate::mcp::mcp_server_flags(
+            provider,
+            &crate::update::resolve_preferred_apas_executable().to_string_lossy(),
+            working_dir,
+            pane_id,
+        ));
 
         let mut command = Command::new(binary_path);
         command
@@ -8067,6 +8272,19 @@ fn run_pane_session_streaming(
         // on one session would interleave writes to the .jsonl.
         kill_processes_using_session(&claude_session_id.to_string());
 
+        // Point this pane at its own `apas mcp-server` child so team-mode
+        // work goes through typed tools instead of hand-rolled JSONL + jq.
+        // NOTE: the server is given the PROJECT root, not `effective_dir` —
+        // a pane running in an isolated worktree still has to read and write
+        // the project's team-todo.md / .apas-team.jsonl, which do not exist
+        // inside the worktree.
+        args.extend(crate::mcp::mcp_server_flags(
+            provider,
+            &crate::update::resolve_preferred_apas_executable().to_string_lossy(),
+            working_dir,
+            pane_id,
+        ));
+
         let mut command = Command::new(binary_path);
         command
             .args(&args)
@@ -9166,7 +9384,7 @@ fn run_pane_session(
             });
         }
 
-        let (args, using_resume) = build_agent_args(
+        let (mut args, using_resume) = build_agent_args(
             provider,
             &claude_session_id,
             &prompt,
@@ -9211,6 +9429,19 @@ fn run_pane_session(
         // on the same session would interleave writes to its .jsonl.
         // Mirrors the deadloop spawn path.
         kill_processes_using_session(&claude_session_id.to_string());
+
+        // Point this pane at its own `apas mcp-server` child so team-mode
+        // work goes through typed tools instead of hand-rolled JSONL + jq.
+        // NOTE: the server is given the PROJECT root, not `effective_dir` —
+        // a pane running in an isolated worktree still has to read and write
+        // the project's team-todo.md / .apas-team.jsonl, which do not exist
+        // inside the worktree.
+        args.extend(crate::mcp::mcp_server_flags(
+            provider,
+            &crate::update::resolve_preferred_apas_executable().to_string_lossy(),
+            working_dir,
+            pane_id,
+        ));
 
         let mut command = Command::new(binary_path);
         command
@@ -9559,6 +9790,7 @@ async fn run_server_connection(
     input_channels: InputChannels,
     pane_metas: PaneMetas,
     pane_sessions: Arc<Mutex<HashMap<u32, Uuid>>>,
+    terminal_panes: TerminalPanes,
     status_tx: mpsc::Sender<PaneOutput>,
     tui_event_tx: mpsc::Sender<TuiEvent>,
 ) -> Result<()> {
@@ -9792,6 +10024,43 @@ async fn run_server_connection(
                                                 // Exit cleanly so systemd-run / the TUI surfaces the error.
                                                 std::process::exit(2);
                                             }
+                                            ServerToCli::TerminalInput { session_id: _, pane_id, data_b64 } => {
+                                                // Keystrokes straight through to the pty. No
+                                                // auto-cancel / question bookkeeping like the agent
+                                                // path below — a TUI owns its own input state.
+                                                let handle = terminal_panes
+                                                    .lock()
+                                                    .ok()
+                                                    .and_then(|m| m.get(&pane_id).cloned());
+                                                match handle {
+                                                    Some(handle) => {
+                                                        match base64::engine::general_purpose::STANDARD.decode(&data_b64) {
+                                                            Ok(bytes) => {
+                                                                if let Err(e) = handle.write_bytes(&bytes) {
+                                                                    tracing::warn!(pane_id, error = %e, "terminal write failed");
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                tracing::warn!(pane_id, error = %e, "terminal input was not valid base64");
+                                                            }
+                                                        }
+                                                    }
+                                                    None => {
+                                                        tracing::debug!(pane_id, "terminal input for unknown pane");
+                                                    }
+                                                }
+                                            }
+                                            ServerToCli::TerminalResize { session_id: _, pane_id, cols, rows } => {
+                                                let handle = terminal_panes
+                                                    .lock()
+                                                    .ok()
+                                                    .and_then(|m| m.get(&pane_id).cloned());
+                                                if let Some(handle) = handle {
+                                                    if let Err(e) = handle.resize(cols, rows) {
+                                                        tracing::warn!(pane_id, error = %e, "terminal resize failed");
+                                                    }
+                                                }
+                                            }
                                             ServerToCli::Input { session_id: _, data, pane_id } => {
                                                 // Route to the correct pane (from_tui=false: web-originated)
                                                 let target_pane = pane_id.unwrap_or(shared::PANE_ID_INTERACTIVE);
@@ -9891,6 +10160,7 @@ async fn run_server_connection(
                                                             plan_review_mode: meta.plan_review_mode,
                                                             managed: meta.managed,
                                                             try_resume_first: true,
+                                                            kind: meta.kind,
                                                         });
                                                     } else {
                                                         tracing::warn!(
@@ -10183,6 +10453,7 @@ async fn run_server_connection(
                                                     plan_review_mode: pane_config.plan_review_mode,
                                                     managed: pane_config.managed,
                                                     try_resume_first: true,
+                                                    kind: pane_config.kind,
                                                 });
                                             }
                                             ServerToCli::RebootPane { session_id: _, pane_id: target } => {
@@ -10300,6 +10571,18 @@ async fn run_server_connection(
                                                 });
                                             }
                                             ServerToCli::RemovePane { session_id: _, pane_id: remove_id, cleanup_action } => {
+                                                // Kill the pty first if this is a terminal pane.
+                                                // Removing it from the registry drops the last
+                                                // handle, and `shutdown` marks the reader so the
+                                                // resulting EOF isn't reported as a crash.
+                                                let removed_terminal = terminal_panes
+                                                    .lock()
+                                                    .ok()
+                                                    .and_then(|mut m| m.remove(&remove_id));
+                                                if let Some(handle) = removed_terminal {
+                                                    tracing::info!(pane_id = remove_id, "shutting down terminal pane");
+                                                    handle.shutdown();
+                                                }
                                                 // Reset team-todo for this pane: drop its `## pane:<id>`
                                                 // section and, for any Global TODO that's now orphaned
                                                 // (no remaining worker subtasks across any pane), reset

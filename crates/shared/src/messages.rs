@@ -277,6 +277,37 @@ pub enum CliToServer {
         session_id: Uuid,
         suggestions: Vec<SuggestedWorkerMsg>,
     },
+
+    /// Raw pty bytes from a [`PaneKind::Terminal`] pane.
+    ///
+    /// Deliberately NOT `Output`/`StreamMessage`: those are chat records
+    /// and get persisted into `data/sessions/<id>/messages.jsonl`, which
+    /// raw ANSI would both bloat and break for the message renderer.
+    /// Terminal bytes are transient — the server keeps only a bounded
+    /// in-memory scrollback ring and never writes them to disk.
+    ///
+    /// Base64 because a pty read can split both UTF-8 sequences and ANSI
+    /// escapes mid-way; the bytes are only reassembled by the terminal
+    /// emulator in the browser.
+    TerminalOutput {
+        session_id: Uuid,
+        pane_id: u32,
+        data_b64: String,
+        /// Monotonic per-pane chunk counter, starting at 0 when the pty
+        /// is spawned. Lets the web detect a gap after a reconnect and
+        /// lets the server order a snapshot against live output.
+        seq: u64,
+    },
+
+    /// A terminal pane's child process ended. The pty is gone; the web
+    /// shows the status and offers a respawn rather than silently
+    /// freezing on the last frame.
+    TerminalExited {
+        session_id: Uuid,
+        pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
 }
 
 /// Messages sent from server to CLI client
@@ -567,6 +598,24 @@ pub enum ServerToCli {
         pane_id: u32,
         manual_mode: bool,
     },
+
+    /// Keystrokes for a [`PaneKind::Terminal`] pane, forwarded verbatim
+    /// to the pty master. Base64 so control bytes and partial UTF-8 from
+    /// the browser survive the JSON hop intact.
+    TerminalInput {
+        session_id: Uuid,
+        pane_id: u32,
+        data_b64: String,
+    },
+
+    /// Viewport size change for a terminal pane. Applied to the pty via
+    /// `TIOCSWINSZ`, which is what makes the hosted TUI re-layout.
+    TerminalResize {
+        session_id: Uuid,
+        pane_id: u32,
+        cols: u16,
+        rows: u16,
+    },
 }
 
 // ============================================================================
@@ -856,6 +905,11 @@ pub enum WebToServer {
         /// PaneConfig::managed.
         #[serde(default)]
         managed: bool,
+        /// Agent (default) vs Terminal. A Terminal pane ignores `prompt`,
+        /// `role`, `goal`, `backstory` and `plan_review_mode` — there is
+        /// no system prompt to inject into a pty-hosted TUI.
+        #[serde(default)]
+        kind: PaneKind,
     },
 
     /// Remove a pane. When the pane has an isolated worktree assigned
@@ -1188,6 +1242,34 @@ pub enum WebToServer {
         pane_id: u32,
     },
 
+    /// Keystrokes typed into a terminal pane's xterm.js view. Server
+    /// resolves the target session and forwards as
+    /// `ServerToCli::TerminalInput`.
+    TerminalInput {
+        session_id: Uuid,
+        pane_id: u32,
+        data_b64: String,
+    },
+
+    /// The browser's terminal viewport was resized (or first measured).
+    /// Forwarded to the CLI so the pty — and therefore the hosted TUI —
+    /// matches what the user actually sees.
+    TerminalResize {
+        session_id: Uuid,
+        pane_id: u32,
+        cols: u16,
+        rows: u16,
+    },
+
+    /// Web opened a terminal pane and wants the current scrollback.
+    /// Server replies `ServerToWeb::TerminalSnapshot` from its in-memory
+    /// ring buffer; no CLI round-trip, so reattach is instant and works
+    /// even while the CLI is mid-reconnect.
+    TerminalAttach {
+        session_id: Uuid,
+        pane_id: u32,
+    },
+
     /// Liveness probe from the browser. Server echoes
     /// `ServerToWeb::Heartbeat` so the client can detect silently-stale
     /// connections (mobile OS throttling, NAT timeout, swallowed RST)
@@ -1445,6 +1527,40 @@ pub enum ServerToWeb {
     SuggestedWorkersState {
         session_id: Uuid,
         suggestions: Vec<SuggestedWorkerMsg>,
+    },
+
+    /// Live pty bytes for a terminal pane, fanned out to every web
+    /// client attached to the session.
+    TerminalOutput {
+        session_id: Uuid,
+        pane_id: u32,
+        data_b64: String,
+        seq: u64,
+    },
+
+    /// Replayed scrollback in answer to `WebToServer::TerminalAttach`.
+    ///
+    /// `seq` is the sequence of the newest chunk included, so the client
+    /// can drop any live `TerminalOutput` it already buffered at or below
+    /// it instead of double-rendering. `truncated` is true when the ring
+    /// buffer dropped older bytes, which means the replay may begin
+    /// partway through an escape sequence — the client writes a reset
+    /// first so a clipped sequence can't corrupt the emulator state.
+    TerminalSnapshot {
+        session_id: Uuid,
+        pane_id: u32,
+        data_b64: String,
+        seq: u64,
+        #[serde(default)]
+        truncated: bool,
+    },
+
+    /// A terminal pane's child process ended.
+    TerminalExited {
+        session_id: Uuid,
+        pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
     },
 
     /// Echo of `WebToServer::Heartbeat`. The browser's liveness loop
@@ -1752,12 +1868,48 @@ pub enum PaneMode {
     Interactive,
 }
 
+/// How a pane hosts its agent process. Orthogonal to [`Provider`] (which
+/// binary) and [`PaneMode`] (how autonomous).
+///
+/// * [`PaneKind::Agent`] — the original path: the CLI runs the provider
+///   headlessly (`claude --print --output-format stream-json`,
+///   `codex exec --json`) and parses structured events into
+///   `CliToServer::StreamMessage`. Everything team-mode depends on —
+///   usage counters, pane status, diffs, plan review, scratchpad
+///   publishing, Tech Lead delegation — is built on those events.
+/// * [`PaneKind::Terminal`] — the pane instead hosts the provider's real
+///   interactive TUI on a pty. Raw bytes flow over the dedicated
+///   `Terminal*` messages and are rendered by xterm.js in the browser.
+///   Nothing is parsed, so a terminal pane has none of the structured
+///   integrations above and is never a delegation target; it is a side
+///   chat with a genuine terminal.
+///
+/// `#[serde(default)]` on `PaneConfig::kind` keeps `.apas` files written
+/// before this existed deserializing as `Agent`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneKind {
+    #[default]
+    Agent,
+    Terminal,
+}
+
+impl PaneKind {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, PaneKind::Terminal)
+    }
+}
+
 /// Configuration for a single pane
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaneConfig {
     pub pane_id: u32,
     pub provider: Provider,
     pub mode: PaneMode,
+    /// Agent (headless stream-json, the default) vs Terminal (pty-hosted
+    /// interactive TUI). See [`PaneKind`].
+    #[serde(default)]
+    pub kind: PaneKind,
     pub session_id: Uuid, // Provider-specific session for --resume
     #[serde(default)]
     pub is_paused: bool, // Only meaningful for deadloop
@@ -1833,6 +1985,7 @@ impl PaneConfig {
             pane_id: PANE_ID_INTERACTIVE,
             provider: Provider::Claude,
             mode: PaneMode::Interactive,
+            kind: PaneKind::Agent,
             session_id: Uuid::new_v4(),
             is_paused: false,
             stop_requested: false,
@@ -2974,5 +3127,97 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"stream_message\""));
         assert!(json.contains(&session_id.to_string()));
+    }
+
+    /// Every `.apas` written before terminal panes existed lacks `kind`.
+    /// Those panes must keep loading as `Agent` — a wrong default here
+    /// would try to spawn a pty for every restored pane in the fleet.
+    #[test]
+    fn pane_config_without_kind_deserializes_as_agent() {
+        let legacy = r#"{
+            "pane_id": 440,
+            "provider": "claude",
+            "mode": "interactive",
+            "session_id": "52443f74-5819-4502-83fe-db530fe70feb",
+            "label": "Tab 440"
+        }"#;
+        let pane: PaneConfig = serde_json::from_str(legacy).unwrap();
+        assert_eq!(pane.kind, PaneKind::Agent);
+        assert!(!pane.kind.is_terminal());
+    }
+
+    #[test]
+    fn terminal_pane_config_round_trips() {
+        let legacy = r#"{
+            "pane_id": 7,
+            "provider": "codex",
+            "mode": "interactive",
+            "kind": "terminal",
+            "session_id": "52443f74-5819-4502-83fe-db530fe70feb"
+        }"#;
+        let pane: PaneConfig = serde_json::from_str(legacy).unwrap();
+        assert_eq!(pane.kind, PaneKind::Terminal);
+
+        let json = serde_json::to_string(&pane).unwrap();
+        assert!(json.contains("\"kind\":\"terminal\""));
+        let back: PaneConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kind, PaneKind::Terminal);
+    }
+
+    #[test]
+    fn terminal_messages_tag_and_carry_session_id() {
+        let session_id = Uuid::new_v4();
+
+        let out = CliToServer::TerminalOutput {
+            session_id,
+            pane_id: 7,
+            data_b64: "aGVsbG8=".to_string(),
+            seq: 3,
+        };
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(json.contains("\"type\":\"terminal_output\""));
+        assert!(json.contains(&session_id.to_string()));
+
+        // Every web-originated pane control must carry session_id so the
+        // server can resolve the right target; a pane_id alone misroutes
+        // when several sessions are attached (mobile hits this first).
+        for msg in [
+            WebToServer::TerminalInput {
+                session_id,
+                pane_id: 7,
+                data_b64: "bHM=".to_string(),
+            },
+            WebToServer::TerminalResize {
+                session_id,
+                pane_id: 7,
+                cols: 120,
+                rows: 40,
+            },
+            WebToServer::TerminalAttach {
+                session_id,
+                pane_id: 7,
+            },
+        ] {
+            let json = serde_json::to_string(&msg).unwrap();
+            assert!(
+                json.contains(&session_id.to_string()),
+                "terminal control dropped session_id: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_snapshot_defaults_truncated_false() {
+        let json = r#"{
+            "type": "terminal_snapshot",
+            "session_id": "52443f74-5819-4502-83fe-db530fe70feb",
+            "pane_id": 7,
+            "data_b64": "",
+            "seq": 0
+        }"#;
+        match serde_json::from_str::<ServerToWeb>(json).unwrap() {
+            ServerToWeb::TerminalSnapshot { truncated, .. } => assert!(!truncated),
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 }

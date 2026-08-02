@@ -5,6 +5,7 @@ use axum::{
     },
     response::IntoResponse,
 };
+use base64::Engine as _;
 use futures::{SinkExt, StreamExt};
 use shared::{CliToServer, ServerToCli, ServerToWeb};
 use std::time::{Duration, Instant};
@@ -729,6 +730,59 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     )
                                     .await;
                             }
+                            Ok(CliToServer::TerminalOutput { session_id, pane_id, data_b64, seq }) => {
+                                // Buffer for reattach, then fan out live.
+                                // Decoded only to measure/store bytes — the
+                                // server never interprets the stream.
+                                match base64::engine::general_purpose::STANDARD.decode(data_b64.as_bytes()) {
+                                    Ok(bytes) => {
+                                        state.sessions.append_terminal_output(
+                                            &session_id,
+                                            pane_id,
+                                            &bytes,
+                                            seq,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            pane_id,
+                                            error = %e,
+                                            "terminal output was not valid base64; forwarding without buffering"
+                                        );
+                                    }
+                                }
+                                state
+                                    .sessions
+                                    .route_to_web(
+                                        &session_id,
+                                        ServerToWeb::TerminalOutput {
+                                            session_id,
+                                            pane_id,
+                                            data_b64,
+                                            seq,
+                                        },
+                                    )
+                                    .await;
+                            }
+                            Ok(CliToServer::TerminalExited { session_id, pane_id, status }) => {
+                                tracing::info!(
+                                    pane_id,
+                                    ?status,
+                                    "terminal pane exited for session {}",
+                                    session_id
+                                );
+                                state
+                                    .sessions
+                                    .route_to_web(
+                                        &session_id,
+                                        ServerToWeb::TerminalExited {
+                                            session_id,
+                                            pane_id,
+                                            status,
+                                        },
+                                    )
+                                    .await;
+                            }
                             Ok(CliToServer::TeamRecord { session_id, record }) => {
                                 tracing::info!(
                                     "Team scratchpad record for session {} (kind={}, pane={:?})",
@@ -964,6 +1018,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 e
             );
         }
+        // The ptys were children of that CLI process, so they died with
+        // it. Discard their scrollback rather than replaying a final
+        // frame that would render as a live terminal to a reattaching
+        // browser.
+        state
+            .sessions
+            .clear_session_terminal_scrollback(session_id);
     }
 
     state.sessions.unregister_cli(&cli_id);

@@ -547,6 +547,18 @@ async fn run_connection(
                         tracing::error!("Server rejected session {}: {}", rejected_id, reason);
                         std::process::exit(2);
                     }
+                    // Terminal panes are a dual-pane-mode feature: they need
+                    // the pane registry and pty lifecycle that only
+                    // `mode::dual_pane` owns. Remote mode runs a single
+                    // implicit interactive pane, so there is nothing here to
+                    // route these to — drop them rather than pretend.
+                    Ok(ServerToCli::TerminalInput { pane_id, .. })
+                    | Ok(ServerToCli::TerminalResize { pane_id, .. }) => {
+                        tracing::debug!(
+                            pane_id,
+                            "ignoring terminal message: remote mode has no terminal panes"
+                        );
+                    }
                     Err(e) => {
                         tracing::warn!("Failed to parse server message: {}", e);
                     }

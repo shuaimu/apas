@@ -163,7 +163,33 @@ pub struct SessionManager {
     /// retry + reconnect replay), and without this each retransmit was
     /// stored and displayed as a fresh message. Bounded ring per session.
     recent_input_ids: DashMap<Uuid, VecDeque<(String, String)>>,
+    /// Raw pty scrollback per (session, pane) for `PaneKind::Terminal`
+    /// panes. In memory only and deliberately never persisted: these are
+    /// ANSI byte streams, not chat records, and writing them to
+    /// `messages.jsonl` would corrupt the message store.
+    terminal_scrollback: DashMap<(Uuid, u32), TerminalScrollback>,
 }
+
+/// Bounded rolling window of a terminal pane's output.
+///
+/// Replayed verbatim when a web client attaches, which is why it stores
+/// raw bytes rather than decoded text — re-encoding would have to
+/// interpret escape sequences, and interpreting them correctly is the
+/// emulator's job, not the broker's.
+#[derive(Debug, Default)]
+pub struct TerminalScrollback {
+    buf: VecDeque<u8>,
+    /// Sequence of the newest chunk in `buf`.
+    seq: u64,
+    /// True once the cap has forced us to drop bytes off the front, which
+    /// means a replay can start mid-escape-sequence.
+    truncated: bool,
+}
+
+/// Scrollback retained per terminal pane. A full-screen TUI repaint is a
+/// few KB, so this holds a healthy number of frames while capping the
+/// worst case at a few MB across a large fleet of panes.
+const TERMINAL_SCROLLBACK_MAX_BYTES: usize = 256 * 1024;
 
 #[derive(Debug)]
 pub struct SessionState {
@@ -206,7 +232,47 @@ impl SessionManager {
             machine_projects: DashMap::new(),
             shared_project_refs: DashMap::new(),
             recent_input_ids: DashMap::new(),
+            terminal_scrollback: DashMap::new(),
         }
+    }
+
+    /// Append a terminal chunk to the pane's scrollback ring, evicting
+    /// from the front once the cap is reached.
+    pub fn append_terminal_output(&self, session_id: &Uuid, pane_id: u32, bytes: &[u8], seq: u64) {
+        let mut entry = self
+            .terminal_scrollback
+            .entry((*session_id, pane_id))
+            .or_default();
+        entry.buf.extend(bytes.iter().copied());
+        entry.seq = seq;
+        if entry.buf.len() > TERMINAL_SCROLLBACK_MAX_BYTES {
+            let overflow = entry.buf.len() - TERMINAL_SCROLLBACK_MAX_BYTES;
+            entry.buf.drain(..overflow);
+            entry.truncated = true;
+        }
+    }
+
+    /// Current scrollback for a terminal pane: `(bytes, newest_seq,
+    /// truncated)`. `None` when the pane has produced no output yet.
+    pub fn terminal_snapshot(&self, session_id: &Uuid, pane_id: u32) -> Option<(Vec<u8>, u64, bool)> {
+        self.terminal_scrollback
+            .get(&(*session_id, pane_id))
+            .map(|e| (e.buf.iter().copied().collect(), e.seq, e.truncated))
+    }
+
+    /// Drop a terminal pane's scrollback. Called when the pane is removed
+    /// so a later pane reusing the id can't inherit stale frames.
+    pub fn clear_terminal_scrollback(&self, session_id: &Uuid, pane_id: u32) {
+        self.terminal_scrollback.remove(&(*session_id, pane_id));
+    }
+
+    /// Drop every terminal pane's scrollback for a session. Used when the
+    /// CLI disconnects: those ptys died with it, so replaying their last
+    /// frames to a reattaching browser would show a live-looking terminal
+    /// that is actually dead.
+    pub fn clear_session_terminal_scrollback(&self, session_id: &Uuid) {
+        self.terminal_scrollback
+            .retain(|(sid, _), _| sid != session_id);
     }
 
     /// Returns the original `created_at` if this client_msg_id was already
@@ -1616,5 +1682,84 @@ mod tests {
             }
             other => panic!("expected original session status message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn terminal_scrollback_accumulates_and_reports_latest_seq() {
+        let sessions = SessionManager::new();
+        let sid = Uuid::new_v4();
+
+        assert!(sessions.terminal_snapshot(&sid, 7).is_none());
+
+        sessions.append_terminal_output(&sid, 7, b"hello ", 0);
+        sessions.append_terminal_output(&sid, 7, b"world", 1);
+
+        let (bytes, seq, truncated) = sessions.terminal_snapshot(&sid, 7).expect("snapshot");
+        assert_eq!(bytes, b"hello world");
+        assert_eq!(seq, 1);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn terminal_scrollback_evicts_oldest_and_flags_truncation() {
+        let sessions = SessionManager::new();
+        let sid = Uuid::new_v4();
+
+        // Overflow the cap, then verify we kept the *newest* bytes: a
+        // terminal's useful state is its latest frame, so dropping from
+        // the front is the only correct eviction direction.
+        let filler = vec![b'a'; TERMINAL_SCROLLBACK_MAX_BYTES];
+        sessions.append_terminal_output(&sid, 1, &filler, 0);
+        sessions.append_terminal_output(&sid, 1, b"TAIL", 1);
+
+        let (bytes, seq, truncated) = sessions.terminal_snapshot(&sid, 1).expect("snapshot");
+        assert_eq!(bytes.len(), TERMINAL_SCROLLBACK_MAX_BYTES);
+        assert!(bytes.ends_with(b"TAIL"));
+        assert_eq!(seq, 1);
+        assert!(
+            truncated,
+            "client must be told the replay may start mid-escape-sequence"
+        );
+    }
+
+    #[test]
+    fn terminal_scrollback_is_isolated_per_pane_and_session() {
+        let sessions = SessionManager::new();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+
+        sessions.append_terminal_output(&a, 1, b"pane-a1", 0);
+        sessions.append_terminal_output(&a, 2, b"pane-a2", 0);
+        sessions.append_terminal_output(&b, 1, b"pane-b1", 0);
+
+        assert_eq!(sessions.terminal_snapshot(&a, 1).unwrap().0, b"pane-a1");
+        assert_eq!(sessions.terminal_snapshot(&a, 2).unwrap().0, b"pane-a2");
+        assert_eq!(sessions.terminal_snapshot(&b, 1).unwrap().0, b"pane-b1");
+
+        // Removing one pane must not disturb the other panes or sessions —
+        // a pane_id is only unique within a session.
+        sessions.clear_terminal_scrollback(&a, 1);
+        assert!(sessions.terminal_snapshot(&a, 1).is_none());
+        assert_eq!(sessions.terminal_snapshot(&a, 2).unwrap().0, b"pane-a2");
+        assert_eq!(sessions.terminal_snapshot(&b, 1).unwrap().0, b"pane-b1");
+    }
+
+    #[test]
+    fn cli_disconnect_clears_only_that_sessions_terminals() {
+        let sessions = SessionManager::new();
+        let dead = Uuid::new_v4();
+        let alive = Uuid::new_v4();
+
+        sessions.append_terminal_output(&dead, 1, b"x", 0);
+        sessions.append_terminal_output(&dead, 2, b"y", 0);
+        sessions.append_terminal_output(&alive, 1, b"z", 0);
+
+        // The dead CLI's ptys are gone; replaying their last frame would
+        // render as a live terminal in a reattaching browser.
+        sessions.clear_session_terminal_scrollback(&dead);
+
+        assert!(sessions.terminal_snapshot(&dead, 1).is_none());
+        assert!(sessions.terminal_snapshot(&dead, 2).is_none());
+        assert_eq!(sessions.terminal_snapshot(&alive, 1).unwrap().0, b"z");
     }
 }

@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { decodeBase64, emitTerminal, encodeBase64 } from "./terminalBus";
 import {
   deleteSnapshot as deleteSnapshotIdb,
   loadAllSnapshots as loadAllSnapshotsIdb,
@@ -287,10 +288,19 @@ export interface ProjectUsageStats {
   last_active?: string;
 }
 
+/** How a pane hosts its agent. Mirrors `shared::PaneKind`.
+ *  - "agent": headless stream-json worker (default, everything today).
+ *  - "terminal": the provider's real TUI on a pty, rendered by xterm.js.
+ *    Terminal panes publish no stream events, so they have no usage
+ *    stats, status, diffs, or Tech Lead delegation. */
+export type PaneKind = "agent" | "terminal";
+
 export interface PaneConfig {
   pane_id: number;
   provider: Provider;
   mode: "deadloop" | "interactive";
+  /** Absent on panes persisted before terminal panes existed → "agent". */
+  kind?: PaneKind;
   session_id: string;
   is_paused: boolean;
   stop_requested?: boolean;
@@ -678,6 +688,7 @@ interface AppState {
       planReviewMode?: PlanReviewMode;
     },
     managed?: boolean,
+    kind?: PaneKind,
   ) => { success: boolean; error?: string };
   removePane: (paneId: number, cleanupAction?: PaneCleanupAction) => void;
   updatePaneLabel: (paneId: number, label: string) => void;
@@ -746,6 +757,12 @@ interface AppState {
   /** v3.5 — one-way promote: turn an unmanaged side-chat pane into
    *  a team member the Tech Lead can delegate to. There's no demote. */
   promotePaneToManaged: (paneId: number) => void;
+
+  /** Terminal panes (PaneKind "terminal"). Frames themselves arrive via
+   *  terminalBus, not through store state — see that module for why. */
+  attachTerminal: (paneId: number) => void;
+  sendTerminalInput: (paneId: number, data: string) => void;
+  sendTerminalResize: (paneId: number, cols: number, rows: number) => void;
 
   /** Ask the server (which asks the CLI) for the current team-todo.md.
    *  Reply lands in `teamTodoState` via the team_todo_state handler. */
@@ -1996,6 +2013,10 @@ export const useStore = create<AppState>((set, get) => ({
      *  + Add Worker flow (joins the team / Tech Lead can delegate to it);
      *  false (default) when it's a TabBar + side chat / experiment. */
     managed: boolean = false,
+    /** "terminal" hosts the provider's real TUI on a pty instead of the
+     *  headless stream-json worker. Such panes are never managed — they
+     *  publish no stream events, so the Tech Lead can't delegate to them. */
+    kind: PaneKind = "agent",
   ) => {
     const { ws, sessionId, isAttached } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -2020,7 +2041,8 @@ export const useStore = create<AppState>((set, get) => ({
       goal: initialRole?.goal || undefined,
       backstory: initialRole?.backstory || undefined,
       plan_review_mode: initialRole?.planReviewMode || undefined,
-      managed,
+      managed: kind === "terminal" ? false : managed,
+      kind,
     }));
     return { success: true };
   },
@@ -2272,6 +2294,48 @@ export const useStore = create<AppState>((set, get) => ({
         manual_mode: manualMode,
       }));
     }
+  },
+
+  /** Ask the server to replay this terminal pane's scrollback. Answered
+   *  from the server's ring buffer, so it lands even if the CLI is
+   *  mid-reconnect. */
+  attachTerminal: (paneId: number) => {
+    const { ws, sessionId } = get();
+    if (!sessionId || !ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({
+      type: "terminal_attach",
+      session_id: sessionId,
+      pane_id: paneId,
+    }));
+  },
+
+  /** Forward keystrokes to the pane's pty. */
+  sendTerminalInput: (paneId: number, data: string) => {
+    const { ws, sessionId } = get();
+    if (!sessionId || !ws || ws.readyState !== WebSocket.OPEN) return;
+    // xterm hands us a JS string whose code units are the input bytes
+    // (it does its own UTF-8 encoding), so treat it as binary here.
+    const bytes = new Uint8Array(data.length);
+    for (let i = 0; i < data.length; i++) bytes[i] = data.charCodeAt(i) & 0xff;
+    ws.send(JSON.stringify({
+      type: "terminal_input",
+      session_id: sessionId,
+      pane_id: paneId,
+      data_b64: encodeBase64(bytes),
+    }));
+  },
+
+  /** Tell the pty the viewport size so the hosted TUI re-lays-out. */
+  sendTerminalResize: (paneId: number, cols: number, rows: number) => {
+    const { ws, sessionId } = get();
+    if (!sessionId || !ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({
+      type: "terminal_resize",
+      session_id: sessionId,
+      pane_id: paneId,
+      cols,
+      rows,
+    }));
   },
 
   promotePaneToManaged: (paneId: number) => {
@@ -3154,7 +3218,9 @@ function requestCatchupIfNeeded(get: () => AppState, sessionId: string) {
   );
 }
 
-function handleServerMessage(
+/** Exported for tests: lets a spec drive a single server frame through
+ *  the dispatch without standing up a WebSocket. */
+export function handleServerMessage(
   data: Record<string, unknown>,
   set: (partial: Partial<AppState> | ((state: AppState) => Partial<AppState>)) => void,
   get: () => AppState
@@ -3489,6 +3555,46 @@ function handleServerMessage(
             teamRecordsBySession: bySession,
             teamRecords: state.sessionId === sessionId ? records : state.teamRecords,
           };
+        });
+      }
+      break;
+    }
+
+    // Terminal frames bypass the store entirely — see terminalBus. Putting
+    // them in zustand would re-render every subscriber on each pty chunk.
+    case "terminal_output": {
+      const paneId = data.pane_id as number | undefined;
+      const b64 = data.data_b64 as string | undefined;
+      if (typeof paneId === "number" && typeof b64 === "string") {
+        emitTerminal(paneId, {
+          kind: "output",
+          bytes: decodeBase64(b64),
+          seq: (data.seq as number) ?? 0,
+        });
+      }
+      break;
+    }
+
+    case "terminal_snapshot": {
+      const paneId = data.pane_id as number | undefined;
+      const b64 = data.data_b64 as string | undefined;
+      if (typeof paneId === "number" && typeof b64 === "string") {
+        emitTerminal(paneId, {
+          kind: "snapshot",
+          bytes: decodeBase64(b64),
+          seq: (data.seq as number) ?? 0,
+          truncated: Boolean(data.truncated),
+        });
+      }
+      break;
+    }
+
+    case "terminal_exited": {
+      const paneId = data.pane_id as number | undefined;
+      if (typeof paneId === "number") {
+        emitTerminal(paneId, {
+          kind: "exited",
+          status: data.status as string | undefined,
         });
       }
       break;
