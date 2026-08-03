@@ -14,7 +14,7 @@ use crate::{db::InvitationCode, error::AppError, routes::auth::verify_token, sta
 const WEB_UI_URL: &str = "http://apas.mpaxos.com";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectRole {
+pub(crate) enum ProjectRole {
     Owner,
     Admin,
     User,
@@ -29,12 +29,12 @@ impl ProjectRole {
         }
     }
 
-    fn can_manage_access(self) -> bool {
+    pub(crate) fn can_manage_access(self) -> bool {
         matches!(self, ProjectRole::Owner | ProjectRole::Admin)
     }
 }
 
-fn parse_share_role(raw: &str) -> ProjectRole {
+pub(crate) fn parse_share_role(raw: &str) -> ProjectRole {
     match raw.trim().to_ascii_lowercase().as_str() {
         "owner" => ProjectRole::Owner,
         "admin" => ProjectRole::Admin,

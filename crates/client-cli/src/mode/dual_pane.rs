@@ -104,22 +104,126 @@ fn truncate_str_at_char_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Persist the project-level flags and echo them back for the web.
+///
+/// Returns the echo plus whether `team_enabled` went true -> false, since the
+/// caller has to stop a running team on that transition and only this function
+/// sees the previous value.
 fn update_project_flags(
     project_dir: &Path,
     session_id: Uuid,
     auto_approve_todos: bool,
     auto_merge_prs: bool,
-) -> Result<CliToServer> {
+    team_enabled: bool,
+) -> Result<(CliToServer, bool)> {
     let mut meta = get_or_create_project(project_dir)?;
+    let team_was_enabled = meta.team_enabled;
     meta.auto_approve_todos = auto_approve_todos;
     meta.auto_merge_prs = auto_merge_prs;
+    meta.team_enabled = team_enabled;
     save_project(project_dir, &meta)?;
 
-    Ok(CliToServer::ProjectFlagsChanged {
-        session_id,
-        auto_approve_todos,
-        auto_merge_prs,
-    })
+    Ok((
+        CliToServer::ProjectFlagsChanged {
+            session_id,
+            auto_approve_todos,
+            auto_merge_prs,
+            team_enabled,
+        },
+        team_was_enabled && !team_enabled,
+    ))
+}
+
+/// Stop every managed pane, the way the web's "Stop team" button does:
+/// interrupt each pane's in-flight turn and pause the deadloop workers so they
+/// stay quiet instead of ticking again on the next file event.
+///
+/// Called when team mode is switched off. Leaving four autonomous panes running
+/// while the project says the team is off would be a lie, and those panes can
+/// open PRs.
+///
+/// Pauses *before* interrupting, where the web does the reverse: between an
+/// interrupt and the pause landing, a sibling pane's write can wake the loop
+/// for another iteration. Same end state, no gap.
+///
+/// Returns how many managed panes were stopped.
+fn stop_managed_team(pane_metas: &PaneMetas, pane_pauses: &PanePauses) -> usize {
+    struct Target {
+        pane_id: u32,
+        is_deadloop: bool,
+        soft_interrupt: Option<mpsc::Sender<()>>,
+        pid: Option<u32>,
+    }
+
+    // Snapshot without holding the meta lock across the interrupts — a worker
+    // thread may want that lock on its way out.
+    let targets: Vec<Target> = {
+        let Ok(metas) = pane_metas.lock() else {
+            return 0;
+        };
+        metas
+            .iter()
+            .filter(|(_, m)| m.managed)
+            .map(|(pane_id, m)| Target {
+                pane_id: *pane_id,
+                is_deadloop: matches!(m.mode, shared::PaneMode::Deadloop),
+                soft_interrupt: m
+                    .streaming_interrupt_tx
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.as_ref().cloned()),
+                pid: m
+                    .child_process
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.as_ref().map(|c| c.id())),
+            })
+            .collect()
+    };
+
+    for target in &targets {
+        if target.is_deadloop {
+            if let Ok(pauses) = pane_pauses.lock() {
+                if let Some(flag) = pauses.get(&target.pane_id) {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        // Soft interrupt aborts the turn but keeps the long-lived process;
+        // SIGINT is the fallback for a pane whose streaming worker is gone.
+        let soft_delivered = target
+            .soft_interrupt
+            .as_ref()
+            .map(|tx| tx.send(()).is_ok())
+            .unwrap_or(false);
+        if !soft_delivered {
+            #[cfg(unix)]
+            if let Some(pid) = target.pid {
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGINT);
+                }
+            }
+        }
+    }
+
+    targets.len()
+}
+
+/// Whether managed team mode is currently enabled for this project.
+///
+/// Read from `.apas` at the point of use rather than cached: the flag can flip
+/// from the web at any moment, and a stale `true` would let a `StartTeam` that
+/// raced the toggle spawn the very panes the owner just disabled.
+fn team_enabled_for(project_dir: &Path) -> bool {
+    match get_or_create_project(project_dir) {
+        Ok(meta) => meta.team_enabled,
+        Err(err) => {
+            // Fail closed. An unreadable `.apas` is not permission to spawn
+            // autonomous panes that can open PRs.
+            tracing::warn!(%err, "could not read .apas for team_enabled; treating team mode as off");
+            false
+        }
+    }
 }
 
 /// Spawn whichever team panes (Manager, Tech Lead, Reviewer, Developer)
@@ -2181,6 +2285,7 @@ async fn run_inner(
                             session_id,
                             auto_approve_todos: meta.auto_approve_todos,
                             auto_merge_prs: meta.auto_merge_prs,
+                            team_enabled: meta.team_enabled,
                         },
                     );
                 }
@@ -5636,18 +5741,22 @@ mod tests {
         save_project(dir.path(), &metadata).expect("seed metadata");
 
         let session_id = Uuid::new_v4();
-        let echo = update_project_flags(dir.path(), session_id, true, false)
+        let (echo, team_turned_off) = update_project_flags(dir.path(), session_id, true, false, true)
             .expect("flags should persist");
+        // Was already off, so enabling it is not a "turned off" transition.
+        assert!(!team_turned_off);
 
         match echo {
             CliToServer::ProjectFlagsChanged {
                 session_id: echoed_session_id,
                 auto_approve_todos,
                 auto_merge_prs,
+                team_enabled,
             } => {
                 assert_eq!(echoed_session_id, session_id);
                 assert!(auto_approve_todos);
                 assert!(!auto_merge_prs);
+                assert!(team_enabled);
             }
             other => panic!("unexpected echo message: {other:?}"),
         }
@@ -6795,6 +6904,107 @@ Use a project-specific custom dispatch loop.";
             shared::PlanReviewMode::Never,
         );
         assert_eq!(handled, None);
+    }
+
+    // --- team mode on/off ---------------------------------------------------
+
+    #[test]
+    fn team_mode_is_off_for_a_project_whose_apas_predates_the_flag() {
+        // The upgrade path. `.apas` files in the wild have no `team_enabled`,
+        // and absent must read as off — team mode spawns autonomous panes that
+        // can open PRs, so it must never arrive switched on.
+        let _config = crate::config::test_config::isolated_config_dir();
+        let dir = tempfile::tempdir().expect("temp project dir");
+        std::fs::write(
+            dir.path().join(".apas"),
+            r#"{
+                "id": "8c4b0c1e-0000-4000-8000-000000000001",
+                "name": "legacy",
+                "created_at": "2026-01-01T00:00:00Z",
+                "auto_approve_todos": true,
+                "auto_merge_prs": true,
+                "panes": []
+            }"#,
+        )
+        .expect("write legacy .apas");
+
+        let meta = get_or_create_project(dir.path()).expect("load legacy metadata");
+
+        assert!(!meta.team_enabled, "absent team_enabled must read as off");
+        // The neighbouring flags still round-trip, so this is the new field
+        // defaulting rather than the whole file failing to parse.
+        assert!(meta.auto_approve_todos);
+        assert!(meta.auto_merge_prs);
+    }
+
+    #[test]
+    fn team_enabled_for_fails_closed_on_an_unreadable_project() {
+        let _config = crate::config::test_config::isolated_config_dir();
+        let dir = tempfile::tempdir().expect("temp project dir");
+        std::fs::write(dir.path().join(".apas"), "{ not json").expect("write junk");
+
+        assert!(
+            !super::team_enabled_for(dir.path()),
+            "an unreadable .apas is not permission to run a team"
+        );
+    }
+
+    #[test]
+    fn disabling_team_mode_is_reported_as_a_transition_but_enabling_is_not() {
+        let _config = crate::config::test_config::isolated_config_dir();
+        let dir = tempfile::tempdir().expect("temp project dir");
+        let session_id = Uuid::new_v4();
+
+        // off -> on: nothing to stop.
+        let (_, turned_off) =
+            update_project_flags(dir.path(), session_id, false, false, true).expect("enable");
+        assert!(!turned_off);
+        assert!(get_or_create_project(dir.path()).unwrap().team_enabled);
+
+        // on -> off: the caller must stop the running team.
+        let (_, turned_off) =
+            update_project_flags(dir.path(), session_id, false, false, false).expect("disable");
+        assert!(turned_off);
+        assert!(!get_or_create_project(dir.path()).unwrap().team_enabled);
+
+        // off -> off: idempotent, so a repeated write doesn't re-stop panes.
+        let (_, turned_off) =
+            update_project_flags(dir.path(), session_id, false, false, false).expect("disable again");
+        assert!(!turned_off);
+    }
+
+    #[test]
+    fn stopping_the_team_pauses_managed_deadloops_and_leaves_side_chats_alone() {
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+        let pane_pauses: PanePauses = Arc::new(Mutex::new(HashMap::new()));
+        let panes = [
+            (11u32, "Tech Lead", shared::PaneMode::Deadloop, true),
+            (12, "Developer", shared::PaneMode::Deadloop, true),
+            (13, "Manager", shared::PaneMode::Interactive, true),
+            // A user's own side chat. Turning team mode off must not touch it.
+            (14, "Scratch", shared::PaneMode::Deadloop, false),
+        ];
+        {
+            let mut metas = pane_metas.lock().unwrap();
+            let mut pauses = pane_pauses.lock().unwrap();
+            for (id, label, mode, managed) in panes {
+                metas.insert(id, test_team_pane_meta(label, "role", mode, managed));
+                pauses.insert(id, Arc::new(AtomicBool::new(false)));
+            }
+        }
+
+        let stopped = super::stop_managed_team(&pane_metas, &pane_pauses);
+
+        assert_eq!(stopped, 3, "only the three managed panes count");
+        let pauses = pane_pauses.lock().unwrap();
+        let paused = |id: u32| pauses.get(&id).unwrap().load(Ordering::SeqCst);
+        assert!(paused(11), "managed deadloop must be paused");
+        assert!(paused(12), "managed deadloop must be paused");
+        assert!(
+            !paused(13),
+            "interactive panes have no loop to pause — interrupt only"
+        );
+        assert!(!paused(14), "an unmanaged side chat is not part of the team");
     }
 
     // --- closing a pane must not leave the agent's subtree running ---------
@@ -12022,6 +12232,20 @@ async fn run_server_connection(
                                                 reviewer,
                                                 developer,
                                             } => {
+                                                // Last line of defence. The web hides the Start-team
+                                                // UI and the server rejects the toggle from anyone
+                                                // below admin, but `.apas` is the source of truth for
+                                                // whether this project may run a team at all — and a
+                                                // StartTeam that raced the toggle would otherwise
+                                                // spawn the panes an owner just disabled.
+                                                if !team_enabled_for(std::path::Path::new(&working_dir)) {
+                                                    tracing::warn!("Start team refused — team mode is disabled for this project");
+                                                    let _ = status_tx.send(PaneOutput {
+                                                        text: "[Start team refused — team mode is disabled for this project. An owner or admin can enable it in the Overview.]".to_string(),
+                                                        pane_id: 0,
+                                                    });
+                                                    continue;
+                                                }
                                                 tracing::info!("Start team requested from web — spawning missing roles");
                                                 spawn_missing_team_panes(
                                                     &pane_metas,
@@ -12036,6 +12260,7 @@ async fn run_server_connection(
                                                 session_id: _,
                                                 auto_approve_todos,
                                                 auto_merge_prs,
+                                                team_enabled,
                                             } => {
                                                 let project_dir = std::path::Path::new(&working_dir).to_path_buf();
                                                 match update_project_flags(
@@ -12043,13 +12268,37 @@ async fn run_server_connection(
                                                     session_id,
                                                     auto_approve_todos,
                                                     auto_merge_prs,
+                                                    team_enabled,
                                                 ) {
-                                                    Ok(echo) => {
+                                                    Ok((echo, team_turned_off)) => {
                                                         tracing::info!(
                                                             auto_approve_todos,
                                                             auto_merge_prs,
-                                                            "tech-lead autonomy flags updated"
+                                                            team_enabled,
+                                                            "project flags updated"
                                                         );
+                                                        // The server already checked that this came
+                                                        // from an owner/admin; act on the transition.
+                                                        if team_turned_off {
+                                                            let stopped = stop_managed_team(&pane_metas, &pane_pauses);
+                                                            tracing::info!(stopped, "team mode disabled — stopped managed panes");
+                                                            save_pane_configs(
+                                                                working_dir,
+                                                                &pane_sessions,
+                                                                &pane_metas,
+                                                                &pane_pauses,
+                                                                &pane_stop_requests,
+                                                            );
+                                                            if stopped > 0 {
+                                                                let _ = status_tx.send(PaneOutput {
+                                                                    text: format!(
+                                                                        "[Team mode disabled — stopped {} managed pane(s)]",
+                                                                        stopped
+                                                                    ),
+                                                                    pane_id: 0,
+                                                                });
+                                                            }
+                                                        }
                                                         // Echo back so peer web clients reconcile.
                                                         if let Ok(text) = serde_json::to_string(&echo) {
                                                             let _ = ws_sender.send(Message::Text(text.into())).await;

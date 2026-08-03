@@ -862,11 +862,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 session_id,
                                 auto_approve_todos,
                                 auto_merge_prs,
+                                team_enabled,
                             }) => {
                                 tracing::debug!(
                                     %session_id,
                                     auto_approve_todos,
                                     auto_merge_prs,
+                                    team_enabled,
                                     "Project flags changed",
                                 );
                                 state
@@ -877,6 +879,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                             session_id,
                                             auto_approve_todos,
                                             auto_merge_prs,
+                                            team_enabled,
                                         },
                                     )
                                     .await;

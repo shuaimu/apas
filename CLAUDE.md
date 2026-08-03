@@ -187,6 +187,7 @@ pane state:
   "id": "uuid",
   "name": "project-name",
   "created_at": "2024-01-01T00:00:00Z",
+  "team_enabled": false,
   "auto_approve_todos": false,
   "auto_merge_prs": false,
   "panes": [
@@ -227,8 +228,10 @@ pane state:
 }
 ```
 
-`auto_approve_todos` and `auto_merge_prs` are project-level autonomy flags read
-by the Tech Lead loop. Managed pane entries are restored as team roles; unmanaged
+`team_enabled`, `auto_approve_todos`, and `auto_merge_prs` are project-level
+policy flags. `team_enabled` gates managed team mode entirely (see "Team mode is
+opt-in" below); the other two are read by the Tech Lead loop. All three are
+owner/admin-only. Managed pane entries are restored as team roles; unmanaged
 interactive panes can coexist with the team. `kind` defaults to `"agent"` when
 absent, so `.apas` files written before terminal panes existed keep loading
 unchanged — see "Terminal panes" under Key Concepts.
@@ -257,12 +260,17 @@ The `Terminal*` family is the pty byte channel for `kind: "terminal"` panes and
 is deliberately separate from `Output` / `StreamMessage` — see "Terminal panes"
 under Key Concepts for why.
 
-`WebToServer::UpdateProjectFlags` carries the Tech Lead autonomy flags
-(`auto_approve_todos` and `auto_merge_prs`) from the web to the server. The
-server forwards `ServerToCli::UpdateProjectFlags` to the CLI for `.apas`
-persistence; the CLI then emits `CliToServer::ProjectFlagsChanged`, and the
-server broadcasts `ServerToWeb::ProjectFlagsChanged`. Behavioral safeguards for
-those flags are documented in the role prompts and README.
+`WebToServer::UpdateProjectFlags` carries the project policy flags
+(`team_enabled`, `auto_approve_todos`, `auto_merge_prs`) from the web to the
+server. The server **rejects the whole message from anyone below admin**
+(`ws_web::can_manage_project_settings`) — this is the only role gate in the
+WebSocket layer, everything else there authorizes on session *access* alone.
+It then forwards `ServerToCli::UpdateProjectFlags` to the CLI for `.apas`
+persistence; the CLI emits `CliToServer::ProjectFlagsChanged`, and the server
+broadcasts `ServerToWeb::ProjectFlagsChanged`. The CLI also re-broadcasts the
+flags from `.apas` every 5s, so a web client attaching mid-session hydrates
+without asking. Behavioral safeguards for the autonomy flags are documented in
+the role prompts and README.
 
 ## Data Storage
 
@@ -403,9 +411,10 @@ ssh root@apas.mpaxos.com "cd /opt/apas/web && npm install && NEXT_PUBLIC_WEB_UI_
 
 ## Key Concepts
 
-1. **Managed Team Mode** (default): Manager, Tech Lead, Developer, and
-   Reviewer panes coordinate through `project_goal.md`, `team-todo.md`, and
-   `.apas-team.jsonl`.
+1. **Managed Team Mode** (opt-in, off by default): Manager, Tech Lead,
+   Developer, and Reviewer panes coordinate through `project_goal.md`,
+   `team-todo.md`, and `.apas-team.jsonl`. Gated on `team_enabled` — see
+   "Team mode is opt-in" below.
 2. **Dual-Pane Runtime**: The CLI restores panes from `.apas`, runs deadloop
    or interactive processes, and can isolate Developer panes in git
    worktrees.
@@ -420,6 +429,42 @@ ssh root@apas.mpaxos.com "cd /opt/apas/web && npm install && NEXT_PUBLIC_WEB_UI_
 7. **Pane kinds**: `PaneConfig.kind` picks how a pane hosts its agent, and
    is orthogonal to `provider` (which binary) and `mode` (how autonomous).
    See "Terminal panes" below.
+
+## Team mode is opt-in (`team_enabled`)
+
+Managed team mode is **off for every project** until someone turns it on, and
+only a project's **owner or admin** can turn it on or off. Users the project was
+shared with can work in it but cannot change this.
+
+Why off by default: enabling team mode spawns four autonomous panes that read
+the repo, write worktrees, and open PRs. That should never be something a
+project arrives with — it should be a decision someone made.
+
+The flag lives in `.apas` as `team_enabled` and is `#[serde(default)]`, so a
+`.apas` written before the field existed reads as **off**. Upgrading therefore
+switches team mode off on existing projects too; their panes are untouched but
+the team surfaces disappear until an owner opts back in. That is deliberate, not
+a migration gap.
+
+Three enforcement points, because each covers a different failure:
+
+- **Server** (`ws_web::can_manage_project_settings`) — the actual permission
+  check. Reuses `share::ProjectRole::can_manage_access` rather than re-deriving
+  the owner/admin boundary, so the WS and HTTP paths cannot drift. Fails closed
+  on an unknown user or a failed lookup.
+- **CLI** (`team_enabled_for`) — refuses `ServerToCli::StartTeam` while the flag
+  is false, re-reading `.apas` at the point of use. `.apas` is the source of
+  truth, and a cached `true` would let a `StartTeam` that raced the toggle spawn
+  the panes an owner just disabled. Also fails closed on an unreadable `.apas`.
+- **Web** (`lib/projectRole.ts`) — decides what to render, nothing more. Hides
+  the team surfaces and renders the settings read-only for a plain user.
+
+Turning team mode **off stops a running team**: the CLI's `stop_managed_team`
+pauses every managed deadloop and interrupts every managed pane's in-flight
+turn, the same end state as the Overview's "Stop team" button. It pauses before
+interrupting, where the web does the reverse — between an interrupt and the
+pause landing, a sibling pane's write can wake the loop for one more iteration.
+Unmanaged side chats are never touched.
 
 ## Team-mode MCP server (`apas mcp-server`)
 

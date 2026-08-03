@@ -259,6 +259,13 @@ pub enum CliToServer {
         session_id: Uuid,
         auto_approve_todos: bool,
         auto_merge_prs: bool,
+        /// Whether managed team mode is available for this project. Off for
+        /// every project that has not explicitly enabled it, including ones
+        /// whose `.apas` predates the field -- `serde(default)` makes absent
+        /// mean off, which is the intended migration. Only a project's owner
+        /// or admin can change it; see `WebToServer::UpdateProjectFlags`.
+        #[serde(default)]
+        team_enabled: bool,
     },
 
     /// CLI's view of `team-todo.md`. Pushed in response to
@@ -541,6 +548,11 @@ pub enum ServerToCli {
         session_id: Uuid,
         auto_approve_todos: bool,
         auto_merge_prs: bool,
+        /// See `CliToServer::ProjectFlagsChanged::team_enabled`. The CLI
+        /// persists this to `.apas`, refuses `StartTeam` while it is false,
+        /// and stops any running team on a true -> false transition.
+        #[serde(default)]
+        team_enabled: bool,
     },
 
     /// Spawn the default team (Manager, Tech Lead, Reviewer, Developer)
@@ -1130,6 +1142,12 @@ pub enum WebToServer {
         session_id: Option<Uuid>,
         auto_approve_todos: bool,
         auto_merge_prs: bool,
+        /// Managed team mode on/off for this project. **Owner/admin only** --
+        /// the server drops the whole message from a plain `user`, because
+        /// these are project-level policy, not per-seat preferences
+        /// (`auto_merge_prs` alone lets the Tech Lead merge PRs unattended).
+        #[serde(default)]
+        team_enabled: bool,
     },
 
     /// Spawn the four default team panes for any role that isn't
@@ -1510,6 +1528,11 @@ pub enum ServerToWeb {
         session_id: Uuid,
         auto_approve_todos: bool,
         auto_merge_prs: bool,
+        /// Drives whether the web shows any team surface at all. The CLI
+        /// re-broadcasts this every 5s from `.apas`, so a web client that
+        /// attaches mid-session hydrates without asking.
+        #[serde(default)]
+        team_enabled: bool,
     },
 
     /// Snapshot of the project's team-todo.md state. Sent in reply to

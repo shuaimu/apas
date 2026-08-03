@@ -719,6 +719,47 @@ mod machine_access_tests {
 /// don't are legacy — fall back to the connection's last-attached session.
 ///
 /// Returns `None` after pushing an `Error` to the web client.
+/// Whether this web connection may change project-level settings.
+///
+/// Owner (`sessions.user_id`) or admin only. These are project *policy*, not
+/// per-seat preference: `team_enabled` decides whether autonomous panes may run
+/// for everyone on the project, and `auto_merge_prs` alone lets the Tech Lead
+/// `gh pr merge` with no human click. A plain `user` who has been shared into
+/// the session must not be able to set either.
+///
+/// This is the first role gate in the WebSocket layer — every other handler
+/// authorizes on *access* (`check_session_access`) and stops there. Reuses
+/// `share::can_manage_access` rather than re-deriving the boundary, so the WS
+/// and HTTP paths cannot drift apart on who counts as privileged.
+///
+/// Fails closed: an unknown user, a session the user has no role on, or a
+/// failed lookup all deny.
+async fn can_manage_project_settings(
+    state: &AppState,
+    connection_id: &Uuid,
+    session_id: &Uuid,
+) -> bool {
+    let Some(user_id) = state.sessions.get_web_user(connection_id) else {
+        return false;
+    };
+    match state
+        .db
+        .get_session_role_for_user(&session_id.to_string(), &user_id.to_string())
+        .await
+    {
+        Ok(Some(role)) => super::share::parse_share_role(&role).can_manage_access(),
+        Ok(None) => false,
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                %session_id,
+                "role lookup failed; denying project settings change"
+            );
+            false
+        }
+    }
+}
+
 async fn resolve_target_session(
     state: &AppState,
     connection_id: &Uuid,
@@ -2559,14 +2600,26 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     session_id: msg_sid,
                     auto_approve_todos,
                     auto_merge_prs,
+                    team_enabled,
                 }) => {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
+                        // `resolve_target_session` only proves this user can
+                        // *reach* the session. Project flags are policy for
+                        // everyone on it, so they need the stronger check.
+                        if !can_manage_project_settings(&state, &connection_id, &sid).await {
+                            tracing::warn!(
+                                session_id = %sid,
+                                "Rejected project flags update — requires project owner or admin"
+                            );
+                            continue;
+                        }
                         tracing::info!(
                             session_id = %sid,
                             auto_approve_todos,
                             auto_merge_prs,
+                            team_enabled,
                             "Update project flags"
                         );
                         state
@@ -2577,6 +2630,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     session_id: sid,
                                     auto_approve_todos,
                                     auto_merge_prs,
+                                    team_enabled,
                                 },
                             )
                             .await;
@@ -3354,4 +3408,150 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     send_task.abort();
     state.sessions.unregister_web(&connection_id);
     tracing::info!("Web client disconnected: {}", connection_id);
+}
+
+/// Who may change project-level settings.
+///
+/// This is the first role gate in the WebSocket layer — everything else here
+/// authorizes on *access* and stops there — so it gets its own coverage rather
+/// than riding on the flags handler.
+#[cfg(test)]
+mod project_settings_permission_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::db::{Session, User};
+    use crate::db::Database;
+
+    async fn test_state() -> AppState {
+        let dir = std::env::temp_dir().join(format!("apas-project-settings-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp db dir");
+        let db_path = dir.join("apas.db").to_string_lossy().to_string();
+        let db = Database::new(&db_path).await.expect("create temp db");
+        db.run_migrations().await.expect("run migrations");
+        let mut config = Config::default();
+        config.database.path = db_path;
+        AppState::new(db, config)
+    }
+
+    fn user(id: Uuid) -> User {
+        User {
+            id: id.to_string(),
+            email: format!("{id}@example.test"),
+            password_hash: "hash".to_string(),
+            created_at: None,
+        }
+    }
+
+    fn session(session_id: Uuid, owner_id: Uuid) -> Session {
+        Session {
+            id: session_id.to_string(),
+            user_id: owner_id.to_string(),
+            cli_client_id: None,
+            working_dir: Some("/proj".to_string()),
+            hostname: Some("host".to_string()),
+            status: "connected".to_string(),
+            created_at: None,
+            updated_at: None,
+            is_paused: false,
+            project_id: Some(session_id.to_string()),
+            git_remote: None,
+            git_remote_url: None,
+        }
+    }
+
+    /// Register a web connection for `user_id` and return its connection id.
+    fn attach_web(state: &AppState, user_id: Uuid) -> Uuid {
+        let connection_id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel(4);
+        state.sessions.register_web(connection_id, tx);
+        state.sessions.set_web_user(connection_id, user_id);
+        connection_id
+    }
+
+    /// (owner, session) with the owner's web connection already attached.
+    async fn project_with_owner(state: &AppState) -> (Uuid, Uuid, Uuid) {
+        let owner_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        state.db.create_user(&user(owner_id)).await.expect("owner");
+        state
+            .db
+            .create_session(&session(session_id, owner_id))
+            .await
+            .expect("session");
+        let connection_id = attach_web(state, owner_id);
+        (owner_id, session_id, connection_id)
+    }
+
+    async fn share_with(state: &AppState, session_id: Uuid, owner_id: Uuid, role: &str) -> Uuid {
+        let member_id = Uuid::new_v4();
+        state.db.create_user(&user(member_id)).await.expect("member");
+        state
+            .db
+            .create_session_share_with_role(
+                &session_id.to_string(),
+                &member_id.to_string(),
+                &owner_id.to_string(),
+                role,
+            )
+            .await
+            .expect("share");
+        member_id
+    }
+
+    #[tokio::test]
+    async fn the_project_owner_may_change_settings() {
+        let state = test_state().await;
+        let (_owner, session_id, connection_id) = project_with_owner(&state).await;
+
+        assert!(can_manage_project_settings(&state, &connection_id, &session_id).await);
+    }
+
+    #[tokio::test]
+    async fn an_admin_may_change_settings() {
+        let state = test_state().await;
+        let (owner_id, session_id, _owner_conn) = project_with_owner(&state).await;
+        let admin_id = share_with(&state, session_id, owner_id, "admin").await;
+        let admin_conn = attach_web(&state, admin_id);
+
+        assert!(can_manage_project_settings(&state, &admin_conn, &session_id).await);
+    }
+
+    #[tokio::test]
+    async fn a_plain_user_may_not_change_settings() {
+        let state = test_state().await;
+        let (owner_id, session_id, _owner_conn) = project_with_owner(&state).await;
+        let member_id = share_with(&state, session_id, owner_id, "user").await;
+        let member_conn = attach_web(&state, member_id);
+
+        // The whole point of the feature: someone the project was shared with
+        // can use it but cannot turn team mode on or off for everyone else.
+        assert!(!can_manage_project_settings(&state, &member_conn, &session_id).await);
+    }
+
+    #[tokio::test]
+    async fn a_user_with_no_role_on_the_project_may_not_change_settings() {
+        let state = test_state().await;
+        let (_owner, session_id, _owner_conn) = project_with_owner(&state).await;
+        let stranger_id = Uuid::new_v4();
+        state
+            .db
+            .create_user(&user(stranger_id))
+            .await
+            .expect("stranger");
+        let stranger_conn = attach_web(&state, stranger_id);
+
+        assert!(!can_manage_project_settings(&state, &stranger_conn, &session_id).await);
+    }
+
+    #[tokio::test]
+    async fn an_unauthenticated_connection_may_not_change_settings() {
+        let state = test_state().await;
+        let (_owner, session_id, _owner_conn) = project_with_owner(&state).await;
+        // Registered as a web client but never associated with a user.
+        let anon_conn = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel(4);
+        state.sessions.register_web(anon_conn, tx);
+
+        assert!(!can_manage_project_settings(&state, &anon_conn, &session_id).await);
+    }
 }

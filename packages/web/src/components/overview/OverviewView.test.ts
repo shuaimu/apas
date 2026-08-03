@@ -31,12 +31,20 @@ function pane(
   };
 }
 
-function seedOverview(paneConfigs: PaneConfig[] = []) {
+function seedOverview(paneConfigs: PaneConfig[] = [], teamEnabled = true) {
   const sessionId = "overview-session";
   act(() => {
     useStore.setState({
       sessionId,
       cliClientId: "overview-cli",
+      // Team surfaces only render when the project has team mode on, so the
+      // composition tests have to opt in explicitly.
+      sessions: [
+        { id: sessionId, projectId: sessionId, status: "active", isShared: false },
+      ] as ReturnType<typeof useStore.getState>["sessions"],
+      projectFlags: {
+        [sessionId]: { autoApproveTodos: false, autoMergePrs: false, teamEnabled },
+      },
       paneConfigs,
       paneStatuses: {},
       pausedPanes: [],
@@ -178,5 +186,48 @@ describe("OverviewView composition", () => {
     expect(screen.queryByText("Team setup")).toBeNull();
     expect(screen.getByTitle("Open Developer")).toBeTruthy();
     expectOverviewSurfaces();
+  });
+
+  describe("team mode off", () => {
+    it("hides every team surface and says why", () => {
+      seedOverview([], false);
+
+      renderOverview();
+
+      // The Overview itself still renders — this is the one place that
+      // explains the absence and carries the toggle to undo it.
+      expect(screen.getByText("Team Overview")).toBeTruthy();
+      expect(screen.getByText(/Team mode is off for this project/)).toBeTruthy();
+      expect(screen.getAllByText(/Project settings/).length).toBeGreaterThan(0);
+
+      expect(screen.queryByText("Team setup")).toBeNull();
+      expect(screen.queryByText("Team TODO")).toBeNull();
+      expect(screen.queryByText("Team (managed)")).toBeNull();
+    });
+
+    it("hides them even when managed panes are still around", () => {
+      // A team that was running when the owner flipped the switch: the CLI
+      // stops those panes, but they can linger in paneConfigs until it
+      // reports back. The UI must not keep offering the team either way.
+      seedOverview(
+        [pane({ pane_id: 568, label: "Developer", role: "developer", managed: true })],
+        false,
+      );
+
+      renderOverview();
+
+      expect(screen.queryByText("Team (managed)")).toBeNull();
+      expect(screen.queryByTitle("Open Developer")).toBeNull();
+      expect(screen.getByText(/Team mode is off for this project/)).toBeTruthy();
+    });
+
+    it("keeps team surfaces once team mode is on", () => {
+      seedOverview([], true);
+
+      renderOverview();
+
+      expect(screen.queryByText(/Team mode is off for this project/)).toBeNull();
+      expect(screen.getByText("Team TODO")).toBeTruthy();
+    });
   });
 });

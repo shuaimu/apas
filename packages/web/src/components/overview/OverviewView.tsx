@@ -14,6 +14,7 @@ import { ProjectGoalBar } from "./ProjectGoalBar";
 import { TeamSetupCard } from "./TeamSetupCard";
 import { TeamTodoPanel } from "./TeamTodoPanel";
 import { TechLeadAutonomyToggles } from "./TechLeadAutonomyToggles";
+import { useTeamEnabled } from "@/lib/projectRole";
 import { SuggestedWorkersPanel } from "./SuggestedWorkersPanel";
 
 /**
@@ -96,6 +97,9 @@ export function OverviewView({
   const paneConfigs = useStore((s) => s.paneConfigs);
   const sendMessageToPane = useStore((s) => s.sendMessageToPane);
   const showToast = useStore((s) => s.showToast);
+  // Must stay with the other hooks, above any early return — a hook after one
+  // is React error #310, which takes down the whole app.
+  const teamEnabled = useTeamEnabled();
   const managerPane = useMemo(
     () =>
       paneConfigs.find((p) => {
@@ -133,14 +137,26 @@ export function OverviewView({
           own tabs.
         </p>
 
-        <TeamSetupCard />
+        {/* Team surfaces only exist when the project's owner/admin has turned
+            team mode on. The settings card always renders — it is where the
+            toggle lives, and how someone discovers why the team is missing. */}
+        {teamEnabled && <TeamSetupCard />}
 
         <ProjectGoalBar />
 
         <TechLeadAutonomyToggles />
 
-        <TeamTodoPanel />
+        {!teamEnabled && (
+          <div className="mb-4 rounded-lg border border-gray-200 bg-gray-50 px-4 py-3 text-sm text-gray-600 dark:border-gray-700 dark:bg-gray-800/40 dark:text-gray-400">
+            Team mode is off for this project, so the Manager / Tech Lead /
+            Developer / Reviewer panes are unavailable. The project owner or an
+            admin can turn it on under Project settings above.
+          </div>
+        )}
 
+        {teamEnabled && <TeamTodoPanel />}
+
+        {teamEnabled && (
         <OverviewSection title="Team (managed)">
           <PaneGrid
             kind="managed"
@@ -152,6 +168,7 @@ export function OverviewView({
             onRemovePane={onRemovePane}
           />
         </OverviewSection>
+        )}
 
         <div className="mb-4 flex flex-wrap justify-end gap-2">
           <button

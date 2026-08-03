@@ -728,11 +728,18 @@ interface AppState {
   usageStats: Record<string, ProjectUsageStats>;
   /** Tech-Lead autonomy flags per session, mirrored from the CLI's
    *  `.apas` poller. Toggled from the Overview. */
-  projectFlags: Record<string, { autoApproveTodos: boolean; autoMergePrs: boolean }>;
+  projectFlags: Record<
+    string,
+    { autoApproveTodos: boolean; autoMergePrs: boolean; teamEnabled: boolean }
+  >;
   /** Manager v2 — overwrite project_goal.md at the project root. */
   updateProjectGoal: (goal: string) => void;
   /** Push new Tech-Lead autonomy flags to the CLI. */
-  updateProjectFlags: (flags: { autoApproveTodos: boolean; autoMergePrs: boolean }) => void;
+  updateProjectFlags: (flags: {
+    autoApproveTodos: boolean;
+    autoMergePrs: boolean;
+    teamEnabled: boolean;
+  }) => void;
   /** Spawn the default team panes for any role that isn't already
    *  present. Idempotent on the CLI side. Each role's `provider` /
    *  `model` come from the Team setup card; null falls back to the
@@ -2096,6 +2103,7 @@ export const useStore = create<AppState>((set, get) => ({
         session_id: get().sessionId,
         auto_approve_todos: flags.autoApproveTodos,
         auto_merge_prs: flags.autoMergePrs,
+        team_enabled: flags.teamEnabled,
       }),
     );
     // Optimistic local update so the toggle feels instant; the CLI
@@ -3645,11 +3653,14 @@ export function handleServerMessage(
       const sessionId = data.session_id as string | undefined;
       const autoApproveTodos = data.auto_approve_todos === true;
       const autoMergePrs = data.auto_merge_prs === true;
+      // Absent means off: a CLI too old to send the field must not read as
+      // team-enabled, or the UI would offer a team the CLI will refuse.
+      const teamEnabled = data.team_enabled === true;
       if (sessionId) {
         set((state) => ({
           projectFlags: {
             ...state.projectFlags,
-            [sessionId]: { autoApproveTodos, autoMergePrs },
+            [sessionId]: { autoApproveTodos, autoMergePrs, teamEnabled },
           },
         }));
       }

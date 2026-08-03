@@ -51,6 +51,21 @@ pub struct ProjectMetadata {
     #[serde(default)]
     pub auto_merge_prs: bool,
 
+    /// Whether managed team mode (Manager / Tech Lead / Developer /
+    /// Reviewer) is available for this project.
+    ///
+    /// Off unless explicitly enabled, and `serde(default)` makes that true
+    /// for `.apas` files written before this field existed too -- an
+    /// upgrade turns team mode off everywhere until a project's owner or
+    /// admin opts back in. That is deliberate: team mode spawns autonomous
+    /// panes that can open PRs, so it should never arrive switched on.
+    ///
+    /// Only the project's owner or admin can change it, enforced server-side
+    /// in `ws_web`; the CLI treats whatever reaches it as authoritative and
+    /// refuses `StartTeam` while this is false.
+    #[serde(default)]
+    pub team_enabled: bool,
+
     // Legacy fields for backward compatibility (read-only migration)
     /// Claude session ID for the deadloop pane (legacy - use panes instead)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -73,6 +88,7 @@ impl ProjectMetadata {
             panes: PaneConfig::defaults(),
             auto_approve_todos: false,
             auto_merge_prs: false,
+            team_enabled: false,
             deadloop_claude_session_id: None,
             interactive_claude_session_id: None,
             is_paused: false,
@@ -88,6 +104,7 @@ impl ProjectMetadata {
             panes: PaneConfig::defaults(),
             auto_approve_todos: false,
             auto_merge_prs: false,
+            team_enabled: false,
             deadloop_claude_session_id: None,
             interactive_claude_session_id: None,
             is_paused: false,
@@ -470,6 +487,7 @@ pub fn get_or_create_project(dir: &Path) -> Result<ProjectMetadata> {
             panes: PaneConfig::defaults(),
             auto_approve_todos: false,
             auto_merge_prs: false,
+            team_enabled: false,
             deadloop_claude_session_id: None,
             interactive_claude_session_id: None,
             is_paused: false,
