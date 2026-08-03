@@ -14,6 +14,7 @@ import { ProjectGoalBar } from "./ProjectGoalBar";
 import { TeamSetupCard } from "./TeamSetupCard";
 import { TeamTodoPanel } from "./TeamTodoPanel";
 import { TechLeadAutonomyToggles } from "./TechLeadAutonomyToggles";
+import { TeamModeSwitch } from "./TeamModeSwitch";
 import { useTeamEnabled } from "@/lib/projectRole";
 import { SuggestedWorkersPanel } from "./SuggestedWorkersPanel";
 
@@ -137,22 +138,16 @@ export function OverviewView({
           own tabs.
         </p>
 
-        {/* Team surfaces only exist when the project's owner/admin has turned
-            team mode on. The settings card always renders — it is where the
-            toggle lives, and how someone discovers why the team is missing. */}
+        {/* First thing on the page: it decides whether the rest of it exists.
+            It also carries the explanation when off, so there is no separate
+            "why is this empty" notice to keep in sync. */}
+        <TeamModeSwitch />
+
         {teamEnabled && <TeamSetupCard />}
 
         <ProjectGoalBar />
 
-        <TechLeadAutonomyToggles />
-
-        {!teamEnabled && (
-          <div className="mb-4 rounded-lg border border-gray-200 bg-gray-50 px-4 py-3 text-sm text-gray-600 dark:border-gray-700 dark:bg-gray-800/40 dark:text-gray-400">
-            Team mode is off for this project, so the Manager / Tech Lead /
-            Developer / Reviewer panes are unavailable. The project owner or an
-            admin can turn it on under Project settings above.
-          </div>
-        )}
+        {teamEnabled && <TechLeadAutonomyToggles />}
 
         {teamEnabled && <TeamTodoPanel />}
 

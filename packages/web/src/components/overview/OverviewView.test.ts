@@ -188,21 +188,43 @@ describe("OverviewView composition", () => {
     expectOverviewSurfaces();
   });
 
+  it("puts the team switch above every other surface", () => {
+    // Placement is the point of this component: buried below the goal bar it
+    // read as a broken page rather than a switched-off one. Compared by DOM
+    // position rather than text offset — the intro paragraph mentions
+    // "Project goal", so a string search matches prose, not the bar.
+    seedOverview([], true);
+    renderOverview();
+
+    const teamSwitch = screen.getByRole("switch");
+    for (const label of ["Team setup", "Team TODO", "Team (managed)"]) {
+      const el = screen.getByText(label);
+      expect(
+        teamSwitch.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING,
+        `${label} should render after the team switch`,
+      ).toBeTruthy();
+    }
+  });
+
   describe("team mode off", () => {
     it("hides every team surface and says why", () => {
       seedOverview([], false);
 
       renderOverview();
 
-      // The Overview itself still renders — this is the one place that
-      // explains the absence and carries the toggle to undo it.
+      // The Overview itself still renders, led by the switch — that is the
+      // one thing on the page that explains the absence and can undo it.
       expect(screen.getByText("Team Overview")).toBeTruthy();
-      expect(screen.getByText(/Team mode is off for this project/)).toBeTruthy();
-      expect(screen.getAllByText(/Project settings/).length).toBeGreaterThan(0);
+      expect(screen.getByRole("switch").getAttribute("aria-checked")).toBe("false");
+      expect(screen.getByText("Off")).toBeTruthy();
+      expect(screen.getByText(/unavailable for this project/)).toBeTruthy();
 
       expect(screen.queryByText("Team setup")).toBeNull();
       expect(screen.queryByText("Team TODO")).toBeNull();
       expect(screen.queryByText("Team (managed)")).toBeNull();
+      // The Tech Lead autonomy card is team-only too — those flags mean
+      // nothing without a Tech Lead.
+      expect(screen.queryByText("Tech Lead autonomy")).toBeNull();
     });
 
     it("hides them even when managed panes are still around", () => {
@@ -218,7 +240,7 @@ describe("OverviewView composition", () => {
 
       expect(screen.queryByText("Team (managed)")).toBeNull();
       expect(screen.queryByTitle("Open Developer")).toBeNull();
-      expect(screen.getByText(/Team mode is off for this project/)).toBeTruthy();
+      expect(screen.getByText(/unavailable for this project/)).toBeTruthy();
     });
 
     it("keeps team surfaces once team mode is on", () => {
@@ -226,8 +248,9 @@ describe("OverviewView composition", () => {
 
       renderOverview();
 
-      expect(screen.queryByText(/Team mode is off for this project/)).toBeNull();
+      expect(screen.getByRole("switch").getAttribute("aria-checked")).toBe("true");
       expect(screen.getByText("Team TODO")).toBeTruthy();
+      expect(screen.getByText("Tech Lead autonomy")).toBeTruthy();
     });
   });
 });

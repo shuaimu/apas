@@ -15,10 +15,6 @@ function autoMergeCheckbox(): HTMLInputElement {
   return screen.getByLabelText(/Auto-merge PRs/) as HTMLInputElement;
 }
 
-function teamModeCheckbox(): HTMLInputElement {
-  return screen.getByLabelText(/Team mode/) as HTMLInputElement;
-}
-
 /**
  * These settings are owner/admin-only, and the component derives that from the
  * session list — so every test has to seed a session or the controls render
@@ -63,7 +59,6 @@ describe("TechLeadAutonomyToggles", () => {
 
     render(<TechLeadAutonomyToggles />);
 
-    expect(teamModeCheckbox().checked).toBe(false);
     expect(autoApproveCheckbox().checked).toBe(false);
     expect(autoMergeCheckbox().checked).toBe(false);
   });
@@ -84,7 +79,6 @@ describe("TechLeadAutonomyToggles", () => {
 
     expect(autoApproveCheckbox().checked).toBe(true);
     expect(autoMergeCheckbox().checked).toBe(false);
-    expect(teamModeCheckbox().checked).toBe(true);
   });
 
   it("explains the auto-merge repository requirement and safety gates", () => {
@@ -151,7 +145,6 @@ describe("TechLeadAutonomyToggles", () => {
 
       render(<TechLeadAutonomyToggles />);
 
-      expect(teamModeCheckbox().disabled).toBe(!expected);
       expect(autoApproveCheckbox().disabled).toBe(!expected);
       expect(autoMergeCheckbox().disabled).toBe(!expected);
     });
@@ -168,7 +161,7 @@ describe("TechLeadAutonomyToggles", () => {
       });
 
       render(<TechLeadAutonomyToggles />);
-      fireEvent.click(teamModeCheckbox());
+      fireEvent.click(autoMergeCheckbox());
 
       // The server rejects it too, but a control that silently no-ops is a
       // worse bug than a disabled one — assert the click really is inert.
@@ -189,69 +182,7 @@ describe("TechLeadAutonomyToggles", () => {
 
       render(<TechLeadAutonomyToggles />);
 
-      expect(teamModeCheckbox().disabled).toBe(true);
-    });
-  });
-
-  describe("turning team mode off", () => {
-    it("confirms first, because it stops running panes", () => {
-      const updateProjectFlags = vi.fn();
-      const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
-      act(() => {
-        useStore.setState({
-          sessionId: "session-a",
-          sessions: seedSession(),
-          projectFlags: {
-            "session-a": { ...OFF, teamEnabled: true },
-          },
-          updateProjectFlags: updateProjectFlags as StoreState["updateProjectFlags"],
-        });
-      });
-
-      render(<TechLeadAutonomyToggles />);
-      fireEvent.click(teamModeCheckbox());
-
-      expect(confirm).toHaveBeenCalled();
-      expect(updateProjectFlags).not.toHaveBeenCalled();
-    });
-
-    it("sends teamEnabled false once confirmed", () => {
-      const updateProjectFlags = vi.fn();
-      vi.spyOn(window, "confirm").mockReturnValue(true);
-      act(() => {
-        useStore.setState({
-          sessionId: "session-a",
-          sessions: seedSession(),
-          projectFlags: {
-            "session-a": { ...OFF, teamEnabled: true },
-          },
-          updateProjectFlags: updateProjectFlags as StoreState["updateProjectFlags"],
-        });
-      });
-
-      render(<TechLeadAutonomyToggles />);
-      fireEvent.click(teamModeCheckbox());
-
-      expect(updateProjectFlags).toHaveBeenCalledWith({ ...OFF, teamEnabled: false });
-    });
-
-    it("turning it ON needs no confirmation — nothing is destroyed", () => {
-      const updateProjectFlags = vi.fn();
-      const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
-      act(() => {
-        useStore.setState({
-          sessionId: "session-a",
-          sessions: seedSession(),
-          projectFlags: { "session-a": OFF },
-          updateProjectFlags: updateProjectFlags as StoreState["updateProjectFlags"],
-        });
-      });
-
-      render(<TechLeadAutonomyToggles />);
-      fireEvent.click(teamModeCheckbox());
-
-      expect(confirm).not.toHaveBeenCalled();
-      expect(updateProjectFlags).toHaveBeenCalledWith({ ...OFF, teamEnabled: true });
+      expect(autoApproveCheckbox().disabled).toBe(true);
     });
   });
 });
