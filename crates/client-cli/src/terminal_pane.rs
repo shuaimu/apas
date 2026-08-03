@@ -3,10 +3,15 @@
 //! The default pane kind runs a provider headlessly
 //! (`claude --print --output-format stream-json`) and parses structured
 //! events. A terminal pane does the opposite: it allocates a pty, execs
-//! the provider's **real interactive TUI** with no flags, and ships the
-//! raw bytes to the browser where xterm.js renders them. Nothing is
-//! parsed, so nothing needs to be kept in sync with a provider's output
+//! the provider's **real interactive TUI**, and ships the raw bytes to the
+//! browser where xterm.js renders them. Nothing is parsed, so nothing
+//! needs to be kept in sync with a provider's output
 //! format — the point of the feature is to reuse the CLI as it ships.
+//!
+//! The only flags passed are the provider's continue flag (on restore) and
+//! its permission-bypass flag: a pane driven from a browser has nobody at the
+//! keyboard to answer an approval prompt, and agent panes already launch with
+//! the same bypass. See [`permission_bypass_flag_for`].
 //!
 //! The cost is that a terminal pane has none of the structured
 //! integrations: no usage counters, no pane status, no diffs, no plan
@@ -79,6 +84,25 @@ fn resume_flag_for(provider: &Provider) -> Option<&'static str> {
     }
 }
 
+/// The provider's "don't stop to ask me" flag.
+///
+/// A terminal pane is driven from a browser, so an interactive approval prompt
+/// is a dead end in practice: the TUI blocks until someone notices the tab.
+/// Agent panes already launch with exactly these flags (see
+/// `build_agent_args`), so this makes the two pane kinds behave consistently
+/// rather than introducing a new policy.
+///
+/// Verified present on the *interactive* forms of both binaries, not just the
+/// headless ones — `claude --help` and `codex --help`. That matters because an
+/// unrecognised flag doesn't degrade, it fails the spawn outright.
+fn permission_bypass_flag_for(provider: &Provider) -> Option<&'static str> {
+    match provider {
+        Provider::Claude => Some("--dangerously-skip-permissions"),
+        Provider::Codex => Some("--dangerously-bypass-approvals-and-sandbox"),
+        _ => None,
+    }
+}
+
 /// A running pty and the handles needed to drive it.
 ///
 /// Cloneable so the message-routing loop can hold one while the reader
@@ -128,10 +152,17 @@ impl TerminalHandle {
             .context("failed to allocate pty for terminal pane")?;
 
         let mut cmd = CommandBuilder::new(binary_path);
+        // Order matters: codex's resume flag is really a *subcommand*
+        // (`codex resume`), and its bypass flag has to follow it. Claude's are
+        // both plain top-level flags, so it is order-insensitive. Appending
+        // resume first satisfies both.
         if resume {
             if let Some(flag) = resume_flag_for(provider) {
                 cmd.arg(flag);
             }
+        }
+        if let Some(flag) = permission_bypass_flag_for(provider) {
+            cmd.arg(flag);
         }
         cmd.cwd(cwd);
         // A TUI keys its capabilities off TERM. Without this it inherits
@@ -338,6 +369,58 @@ mod tests {
 
     /// End-to-end over a real pty: spawn, capture output, observe exit.
     #[test]
+    fn every_terminal_host_launches_without_permission_prompts() {
+        // A terminal pane is driven from a browser; an approval prompt there
+        // just blocks until someone notices the tab. Any provider we are
+        // willing to host must therefore have a bypass flag.
+        for p in [Provider::Claude, Provider::Codex] {
+            assert!(
+                terminal_binary_for(&p).is_some(),
+                "{p:?} should be hostable"
+            );
+            assert!(
+                permission_bypass_flag_for(&p).is_some(),
+                "{p:?} is hostable but would stop to ask for permission"
+            );
+        }
+    }
+
+    #[test]
+    fn non_hostable_providers_get_no_flags_at_all() {
+        // An unrecognised flag fails the spawn outright rather than degrading,
+        // so providers we have not verified get nothing.
+        for p in [
+            Provider::Minimax,
+            Provider::Glm,
+            Provider::Deepseek,
+            Provider::Opencode,
+            Provider::CursorAgent,
+        ] {
+            assert_eq!(permission_bypass_flag_for(&p), None, "{p:?}");
+            assert_eq!(resume_flag_for(&p), None, "{p:?}");
+        }
+    }
+
+    #[test]
+    fn codex_bypass_flag_follows_its_resume_subcommand() {
+        // `resume` is a subcommand for codex, not a flag, so the bypass flag
+        // has to come after it -- `codex resume --dangerously-...`, never
+        // `codex --dangerously-... resume`. Claude's are both top-level flags
+        // and order-insensitive. Pinning the relative order here because the
+        // spawn builds them in sequence and a swap only fails at runtime.
+        assert_eq!(resume_flag_for(&Provider::Codex), Some("resume"));
+        assert_eq!(
+            permission_bypass_flag_for(&Provider::Codex),
+            Some("--dangerously-bypass-approvals-and-sandbox")
+        );
+        assert_eq!(resume_flag_for(&Provider::Claude), Some("--continue"));
+        assert_eq!(
+            permission_bypass_flag_for(&Provider::Claude),
+            Some("--dangerously-skip-permissions")
+        );
+    }
+
+    #[test]
     fn pty_streams_output_and_reports_exit() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -386,9 +469,15 @@ mod tests {
             }
 
             assert!(exited, "reader never reported the child exit");
-            // `echo` with no args writes just a newline; the pty turns
-            // that into CRLF, which is exactly what xterm.js expects.
-            assert_eq!(String::from_utf8_lossy(&collected).trim_end(), "");
+            // `/bin/echo` prints its argv, so this doubles as end-to-end proof
+            // that the permission-bypass flag actually reaches the spawned
+            // process — not just that the mapping function returns it. The pty
+            // turns the trailing newline into CRLF, which is what xterm.js
+            // expects, so compare against the trimmed line.
+            assert_eq!(
+                String::from_utf8_lossy(&collected).trim_end(),
+                "--dangerously-skip-permissions",
+            );
             handle.shutdown();
         });
     }

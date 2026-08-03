@@ -512,7 +512,7 @@ before this field existed deserializes as): the CLI runs the provider
 headlessly and parses stream-json into structured events.
 
 A **terminal pane** instead allocates a pty (`portable-pty`), execs the
-provider's *real interactive TUI* with no flags, and streams the raw bytes
+provider's *real interactive TUI*, and streams the raw bytes
 to xterm.js in the browser. Nothing is parsed, so nothing has to be kept in
 sync with a provider's output format — the point is to reuse the CLI as it
 ships.

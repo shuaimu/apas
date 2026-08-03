@@ -134,6 +134,48 @@ fn update_project_flags(
     ))
 }
 
+/// Tell the web about the current pane roster and persist it to `.apas`.
+///
+/// Every path that creates or removes a pane owes both halves. There is no
+/// per-pane "added" message — the web learns a pane exists only from a
+/// `PaneList` — and `.apas` is what brings it back after a CLI restart. Miss
+/// the broadcast and the tab stays invisible until something else triggers a
+/// list (switching projects and back, which is how the terminal-pane bug
+/// showed up); miss the save and the pane is gone on restart.
+///
+/// Factored out because this tail was copy-pasted at three call sites, and the
+/// terminal-pane path returned early past all of them.
+#[allow(clippy::too_many_arguments)]
+fn announce_and_persist_panes(
+    server_tx: &tokio_mpsc::Sender<CliToServer>,
+    session_id: Uuid,
+    working_dir: &str,
+    pane_metas: &PaneMetas,
+    input_channels: &InputChannels,
+    pane_sessions: &Arc<Mutex<HashMap<u32, Uuid>>>,
+    pane_pauses: &PanePauses,
+    pane_stop_requests: &PaneStopRequests,
+) {
+    let _ = server_tx.blocking_send(CliToServer::PaneList {
+        session_id,
+        panes: build_pane_list(
+            pane_metas,
+            input_channels,
+            session_id,
+            pane_sessions,
+            pane_pauses,
+            pane_stop_requests,
+        ),
+    });
+    save_pane_configs(
+        working_dir,
+        pane_sessions,
+        pane_metas,
+        pane_pauses,
+        pane_stop_requests,
+    );
+}
+
 /// Stop every managed pane, the way the web's "Stop team" button does:
 /// interrupt each pane's in-flight turn and pause the deadloop workers so they
 /// stay quiet instead of ticking again on the next file event.
@@ -2794,24 +2836,13 @@ fn handle_tui_events(
                     });
                 }
 
-                // Send pane list update
-                let _ = server_tx.blocking_send(CliToServer::PaneList {
+                announce_and_persist_panes(
+                    &server_tx,
                     session_id,
-                    panes: build_pane_list(
-                        &pane_metas,
-                        &input_channels,
-                        session_id,
-                        &pane_sessions,
-                        &pane_pauses,
-                        &pane_stop_requests,
-                    ),
-                });
-
-                // Persist to .apas
-                save_pane_configs(
                     working_dir,
-                    &pane_sessions,
                     &pane_metas,
+                    &input_channels,
+                    &pane_sessions,
                     &pane_pauses,
                     &pane_stop_requests,
                 );
@@ -2931,6 +2962,22 @@ fn handle_tui_events(
                             pane_id,
                         });
                     }
+                    // Announce before returning. This early return used to skip
+                    // the shared tail below, so a new terminal tab never
+                    // reached the web — it only appeared once something else
+                    // provoked a PaneList, e.g. switching projects and back.
+                    // The pane is already in `pane_metas` (inserted above), so
+                    // the list is correct; it was simply never sent.
+                    announce_and_persist_panes(
+                        &server_tx,
+                        session_id,
+                        working_dir,
+                        &pane_metas,
+                        &input_channels,
+                        &pane_sessions,
+                        &pane_pauses,
+                        &pane_stop_requests,
+                    );
                     continue;
                 }
 
@@ -3097,24 +3144,13 @@ fn handle_tui_events(
                     });
                 }
 
-                // Send pane list update
-                let _ = server_tx.blocking_send(CliToServer::PaneList {
+                announce_and_persist_panes(
+                    &server_tx,
                     session_id,
-                    panes: build_pane_list(
-                        &pane_metas,
-                        &input_channels,
-                        session_id,
-                        &pane_sessions,
-                        &pane_pauses,
-                        &pane_stop_requests,
-                    ),
-                });
-
-                // Persist to .apas
-                save_pane_configs(
                     working_dir,
-                    &pane_sessions,
                     &pane_metas,
+                    &input_channels,
+                    &pane_sessions,
                     &pane_pauses,
                     &pane_stop_requests,
                 );
@@ -3196,24 +3232,13 @@ fn handle_tui_events(
                     });
                 }
 
-                // Send pane list update
-                let _ = server_tx.blocking_send(CliToServer::PaneList {
+                announce_and_persist_panes(
+                    &server_tx,
                     session_id,
-                    panes: build_pane_list(
-                        &pane_metas,
-                        &input_channels,
-                        session_id,
-                        &pane_sessions,
-                        &pane_pauses,
-                        &pane_stop_requests,
-                    ),
-                });
-
-                // Persist to .apas
-                save_pane_configs(
                     working_dir,
-                    &pane_sessions,
                     &pane_metas,
+                    &input_channels,
+                    &pane_sessions,
                     &pane_pauses,
                     &pane_stop_requests,
                 );
