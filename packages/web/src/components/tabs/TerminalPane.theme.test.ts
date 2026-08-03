@@ -1,0 +1,110 @@
+import { describe, expect, it } from "vitest";
+import { terminalThemeFor } from "./TerminalPane";
+
+/**
+ * The palettes matter more than they look. A TUI paints with the 16 ANSI
+ * colours, so a "light theme" that only flips background/foreground leaves
+ * dark-tuned ANSI colours on white and the output becomes unreadable. These
+ * tests pin the contrast property rather than the exact hex values.
+ */
+
+/** WCAG relative luminance, 0 (black) .. 1 (white). */
+function luminance(hex: string): number {
+  const n = parseInt(hex.slice(1), 16);
+  const channels = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((v) => {
+    const s = v / 255;
+    return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+}
+
+function contrastRatio(a: string, b: string): number {
+  const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+const ANSI_KEYS = [
+  "black",
+  "red",
+  "green",
+  "yellow",
+  "blue",
+  "magenta",
+  "cyan",
+  "white",
+  "brightBlack",
+  "brightRed",
+  "brightGreen",
+  "brightYellow",
+  "brightBlue",
+  "brightMagenta",
+  "brightCyan",
+  "brightWhite",
+] as const;
+
+describe("terminalThemeFor", () => {
+  it("returns a light palette on a light background and a dark one on dark", () => {
+    expect(terminalThemeFor(false).background).toBe("#ffffff");
+    expect(terminalThemeFor(true).background).toBe("#0a0a0a");
+  });
+
+  it("matches the app's own background variables from globals.css", () => {
+    // The terminal has to sit flush with the surrounding chrome; if these
+    // drift apart the pane reads as a pasted-in rectangle.
+    expect(terminalThemeFor(true).background).toBe("#0a0a0a");
+    expect(terminalThemeFor(false).background).toBe("#ffffff");
+    expect(terminalThemeFor(false).foreground).toBe("#171717");
+  });
+
+  it.each([
+    ["light", false],
+    ["dark", true],
+  ])("defines all 16 ANSI colours in the %s palette", (_name, dark) => {
+    const theme = terminalThemeFor(dark) as Record<string, string>;
+    for (const key of ANSI_KEYS) {
+      expect(theme[key], `${key} missing`).toMatch(/^#[0-9a-f]{6}$/i);
+    }
+  });
+
+  it.each([
+    ["light", false, []],
+    // ANSI `black` on a dark background is conventionally near-invisible —
+    // TUIs use it for shadows and dim chrome, and every terminal ships it that
+    // way (VS Code Dark puts #000000 on #1e1e1e). Raising it would change how
+    // existing dark terminals look, which is not something adding a light
+    // theme should do. Every colour a TUI actually draws *text* with is held
+    // to the floor.
+    ["dark", true, ["black"]],
+  ] as const)(
+    "keeps every ANSI text colour legible on the %s background",
+    (_name, dark, exempt) => {
+      const theme = terminalThemeFor(dark) as Record<string, string>;
+      const bg = theme.background;
+      for (const key of ANSI_KEYS) {
+        if ((exempt as readonly string[]).includes(key)) continue;
+        // 3:1 is the WCAG floor for large/bold text, the closest analogue to
+        // terminal glyphs.
+        const ratio = contrastRatio(theme[key], bg);
+        expect(ratio, `${key} (${theme[key]}) on ${bg} is only ${ratio.toFixed(2)}:1`)
+          .toBeGreaterThanOrEqual(3);
+      }
+    },
+  );
+
+  it("makes the light palette's white/brightWhite dark enough to read", () => {
+    // The trap this whole feature exists to avoid: on a light theme, ANSI
+    // "white" must not be literally white or text using it vanishes. Asserted
+    // separately because it is the single most likely thing to regress if
+    // someone later "fixes" the palette to look more literal.
+    const light = terminalThemeFor(false) as Record<string, string>;
+    expect(contrastRatio(light.white, light.background)).toBeGreaterThanOrEqual(3);
+    expect(contrastRatio(light.brightWhite, light.background)).toBeGreaterThanOrEqual(3);
+  });
+
+  it("keeps the cursor visible against its own background", () => {
+    for (const dark of [true, false]) {
+      const theme = terminalThemeFor(dark) as Record<string, string>;
+      expect(contrastRatio(theme.cursor, theme.background)).toBeGreaterThanOrEqual(3);
+    }
+  });
+});
