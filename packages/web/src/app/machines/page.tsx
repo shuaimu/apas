@@ -35,6 +35,7 @@ export default function MachinesPage() {
     setMachineMiniMaxConfig,
     setMachineGlmConfig,
     setMachineDeepseekConfig,
+    pendingInstances,
   } = useStore();
   const [minimaxDrafts, setMinimaxDrafts] = useState<Record<string, { apiKey: string }>>({});
   const [minimaxSaved, setMinimaxSaved] = useState<Record<string, boolean>>({});
@@ -336,6 +337,36 @@ export default function MachinesPage() {
             </div>
 
             <div className="divide-y divide-gray-200 dark:divide-gray-800">
+              {/* Instances still being cloned. Rendered first and from local
+                  state, so the row appears on click rather than after the
+                  daemon finishes cloning — which is the whole point. They are
+                  replaced by a real project row when the ack arrives. */}
+              {Object.values(pendingInstances)
+                .filter((p) => p.machineId === machine.machineId)
+                .map((p) => (
+                  <div
+                    key={p.requestId}
+                    className="flex flex-col gap-3 px-4 py-3 md:flex-row md:items-center md:justify-between"
+                  >
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 truncate text-sm font-medium">
+                        <span
+                          className="inline-block h-3 w-3 flex-shrink-0 animate-spin rounded-full border-2 border-gray-300 border-t-emerald-600"
+                          aria-hidden="true"
+                        />
+                        {p.instanceName}
+                      </div>
+                      <div className="truncate text-xs text-gray-500">
+                        Cloning {p.gitRemote}…
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="rounded bg-amber-100 px-2 py-1 text-xs text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">
+                        Creating…
+                      </span>
+                    </div>
+                  </div>
+                ))}
               {projects.map((project) => (
                 <div
                   key={project.projectId}

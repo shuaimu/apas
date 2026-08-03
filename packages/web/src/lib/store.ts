@@ -60,6 +60,16 @@ export interface SessionInfo {
   isActive?: boolean;
 }
 
+/** A `create_project_instance` still in flight. */
+export interface PendingInstance {
+  requestId: string;
+  machineId: string;
+  instanceName: string;
+  gitRemote: string;
+  /** Epoch ms, so the UI can show how long the clone has been running. */
+  startedAt: number;
+}
+
 export interface UsageLimitWindow {
   utilization: number; // 0.0 to 1.0+
   resetsAt?: string; // ISO 8601 timestamp
@@ -732,6 +742,12 @@ interface AppState {
     string,
     { autoApproveTodos: boolean; autoMergePrs: boolean; teamEnabled: boolean }
   >;
+  /** Instance creations we have sent but not yet heard back about, keyed by
+   *  request_id. The daemon clones the repo before acking, which can take
+   *  tens of seconds, so this is what the machines page renders as a
+   *  "Creating…" row — otherwise the click produces no visible effect at all
+   *  until the ack lands. Cleared by `project_instance_created`. */
+  pendingInstances: Record<string, PendingInstance>;
   /** Manager v2 — overwrite project_goal.md at the project root. */
   updateProjectGoal: (goal: string) => void;
   /** Push new Tech-Lead autonomy flags to the CLI. */
@@ -865,6 +881,7 @@ export const useStore = create<AppState>((set, get) => ({
   projectGoals: {},
   usageStats: {},
   projectFlags: {},
+  pendingInstances: {},
   teamRecordsBySession: new Map(),
   teamRecords: [],
   planReviewPending: [],
@@ -1384,6 +1401,22 @@ export const useStore = create<AppState>((set, get) => ({
       base_path: basePath || undefined,
       request_id: requestId,
     }));
+    // Feedback now, not when the daemon finishes. It clones the repo before
+    // acking — tens of seconds on a large one — and until this existed the
+    // click did nothing visible for that whole time.
+    set((state) => ({
+      pendingInstances: {
+        ...state.pendingInstances,
+        [requestId]: {
+          requestId,
+          machineId,
+          instanceName,
+          gitRemote,
+          startedAt: Date.now(),
+        },
+      },
+    }));
+    showToast(`Creating ${instanceName} — cloning, this can take a minute`, "info");
     return true;
   },
 
@@ -3712,11 +3745,30 @@ export function handleServerMessage(
 
     case "project_instance_created": {
       const error = data.error as string | undefined;
+      const requestId = data.request_id as string | undefined;
       const { showToast } = get();
+      // Drop the placeholder now that the real project exists (or failed).
+      // Correlating by request_id matters when several creations overlap —
+      // clearing the whole map would strand the others as permanent spinners.
+      const pending = requestId ? get().pendingInstances[requestId] : undefined;
+      if (requestId) {
+        set((state) => {
+          const next = { ...state.pendingInstances };
+          delete next[requestId];
+          return { pendingInstances: next };
+        });
+      }
+      const name = pending?.instanceName;
       if (error) {
-        showToast(`New instance failed: ${error}`, "error");
+        showToast(
+          name ? `Creating ${name} failed: ${error}` : `New instance failed: ${error}`,
+          "error",
+        );
       } else {
-        showToast("New instance created and starting…", "success");
+        showToast(
+          name ? `${name} created and starting…` : "New instance created and starting…",
+          "success",
+        );
         // Refresh the machine list so the new running project appears.
         get().listMachines();
       }
