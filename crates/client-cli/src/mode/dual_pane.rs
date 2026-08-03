@@ -1933,8 +1933,28 @@ async fn run_inner(
     // Setup Ctrl+C handler
     let shutdown_for_handler = shutdown.clone();
     let metas_for_handler = pane_metas.clone();
+    let sessions_for_handler = pane_sessions.clone();
+    let pauses_for_handler = pane_pauses.clone();
+    let stops_for_handler = pane_stop_requests.clone();
+    let working_dir_for_handler = working_dir_str.clone();
     ctrlc::set_handler(move || {
         shutdown_for_handler.store(true, Ordering::SeqCst);
+        // Persist the roster before tearing anything down. Ctrl+C is how a CLI
+        // session normally ends, and without this any pane state changed since
+        // the last explicit save is dropped — that is how a terminal tab
+        // created under an older build vanished on restart.
+        //
+        // The ctrlc crate runs this on a dedicated thread, not in an
+        // async-signal context, so file I/O here is fine. `save_project`
+        // writes via temp+rename, so racing the normal exit path at worst
+        // means last-writer-wins on identical content.
+        save_pane_configs(
+            &working_dir_for_handler,
+            &sessions_for_handler,
+            &metas_for_handler,
+            &pauses_for_handler,
+            &stops_for_handler,
+        );
         // Kill every pane's agent *subtree*. Ctrl+C reaches APAS's own process
         // group, but panes run in groups of their own, so nothing reaches the
         // agents unless we signal them here.
@@ -2530,6 +2550,18 @@ async fn run_inner(
 
         server_task.abort();
     }
+
+    // Persist before killing: `.apas` is the only record of the pane roster,
+    // and anything created since the last explicit save is lost otherwise.
+    // Saving first also means we capture the state the user left, not whatever
+    // the teardown leaves behind.
+    save_pane_configs(
+        &working_dir_str,
+        &pane_sessions,
+        &pane_metas,
+        &pane_pauses,
+        &pane_stop_requests,
+    );
 
     // Kill every pane's agent and everything it spawned. Without the group
     // kill, the agents' bash commands / subagents / mcp-servers outlive APAS.
@@ -6929,6 +6961,64 @@ Use a project-specific custom dispatch loop.";
             shared::PlanReviewMode::Never,
         );
         assert_eq!(handled, None);
+    }
+
+    #[test]
+    fn save_pane_configs_persists_terminal_panes() {
+        // The regression: a terminal pane that never reached `.apas` was gone
+        // on the next CLI start, because `.apas` is the only record of the
+        // roster. This asserts the persistence layer carries `kind`, so a
+        // restored pane comes back as a terminal rather than an agent.
+        let _config = crate::config::test_config::isolated_config_dir();
+        let dir = tempfile::tempdir().expect("temp project dir");
+        let working_dir = dir.path().to_string_lossy().to_string();
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+        let pane_sessions = Arc::new(Mutex::new(HashMap::new()));
+        let pane_pauses: PanePauses = Arc::new(Mutex::new(HashMap::new()));
+        let pane_stop_requests: PaneStopRequests = Arc::new(Mutex::new(HashMap::new()));
+
+        {
+            let mut metas = pane_metas.lock().unwrap();
+            let mut agent =
+                test_pane_meta(Provider::Claude, false, None, Arc::new(Mutex::new(None)));
+            agent.kind = shared::PaneKind::Agent;
+            metas.insert(7, agent);
+
+            let mut terminal =
+                test_pane_meta(Provider::Codex, false, None, Arc::new(Mutex::new(None)));
+            terminal.kind = shared::PaneKind::Terminal;
+            terminal.mode = shared::PaneMode::Interactive;
+            metas.insert(8, terminal);
+        }
+        {
+            let mut sessions = pane_sessions.lock().unwrap();
+            sessions.insert(7, Uuid::new_v4());
+            sessions.insert(8, Uuid::new_v4());
+        }
+
+        save_pane_configs(
+            &working_dir,
+            &pane_sessions,
+            &pane_metas,
+            &pane_pauses,
+            &pane_stop_requests,
+        );
+
+        let metadata = get_or_create_project(dir.path()).expect("metadata should reload");
+        let terminal = metadata
+            .panes
+            .iter()
+            .find(|p| p.pane_id == 8)
+            .expect("terminal pane must survive the save");
+        assert_eq!(terminal.kind, shared::PaneKind::Terminal);
+        assert_eq!(terminal.provider, Provider::Codex);
+
+        let agent = metadata
+            .panes
+            .iter()
+            .find(|p| p.pane_id == 7)
+            .expect("agent pane");
+        assert_eq!(agent.kind, shared::PaneKind::Agent);
     }
 
     // --- team mode on/off ---------------------------------------------------
