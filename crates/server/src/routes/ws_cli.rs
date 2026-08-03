@@ -863,6 +863,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 auto_approve_todos,
                                 auto_merge_prs,
                                 team_enabled,
+                                disallowed_tab_types,
                             }) => {
                                 tracing::debug!(
                                     %session_id,
@@ -880,6 +881,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                             auto_approve_todos,
                                             auto_merge_prs,
                                             team_enabled,
+                                            disallowed_tab_types,
                                         },
                                     )
                                     .await;

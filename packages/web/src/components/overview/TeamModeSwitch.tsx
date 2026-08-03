@@ -7,6 +7,7 @@ const DEFAULT_FLAGS = {
   autoApproveTodos: false,
   autoMergePrs: false,
   teamEnabled: false,
+  disallowedTabTypes: [] as string[],
 };
 
 /**

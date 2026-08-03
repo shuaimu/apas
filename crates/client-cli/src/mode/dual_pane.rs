@@ -109,18 +109,21 @@ fn truncate_str_at_char_boundary(s: &str, max_bytes: usize) -> &str {
 /// Returns the echo plus whether `team_enabled` went true -> false, since the
 /// caller has to stop a running team on that transition and only this function
 /// sees the previous value.
+#[allow(clippy::too_many_arguments)]
 fn update_project_flags(
     project_dir: &Path,
     session_id: Uuid,
     auto_approve_todos: bool,
     auto_merge_prs: bool,
     team_enabled: bool,
+    disallowed_tab_types: Vec<String>,
 ) -> Result<(CliToServer, bool)> {
     let mut meta = get_or_create_project(project_dir)?;
     let team_was_enabled = meta.team_enabled;
     meta.auto_approve_todos = auto_approve_todos;
     meta.auto_merge_prs = auto_merge_prs;
     meta.team_enabled = team_enabled;
+    meta.disallowed_tab_types = disallowed_tab_types.clone();
     save_project(project_dir, &meta)?;
 
     Ok((
@@ -129,9 +132,30 @@ fn update_project_flags(
             auto_approve_todos,
             auto_merge_prs,
             team_enabled,
+            disallowed_tab_types,
         },
         team_was_enabled && !team_enabled,
     ))
+}
+
+/// Whether this project permits creating a tab of the given kind + provider.
+///
+/// Read from `.apas` at the point of use for the same reason as
+/// `team_enabled_for`: the restriction can change from the web at any moment,
+/// and a stale answer would let a tab race the setting.
+///
+/// Fails **open** on an unreadable `.apas`, unlike `team_enabled_for`. The
+/// worst case here is a user opening a tab an owner meant to block; failing
+/// closed would make an unreadable file lock everyone out of the project
+/// entirely, which is the worse outcome for a menu restriction.
+fn tab_type_allowed_for(project_dir: &Path, kind: shared::PaneKind, provider: Provider) -> bool {
+    match get_or_create_project(project_dir) {
+        Ok(meta) => shared::tab_type_allowed(&meta.disallowed_tab_types, kind, provider),
+        Err(err) => {
+            tracing::warn!(%err, "could not read .apas for tab-type policy; allowing");
+            true
+        }
+    }
 }
 
 /// Tell the web about the current pane roster and persist it to `.apas`.
@@ -2348,6 +2372,7 @@ async fn run_inner(
                             auto_approve_todos: meta.auto_approve_todos,
                             auto_merge_prs: meta.auto_merge_prs,
                             team_enabled: meta.team_enabled,
+                            disallowed_tab_types: meta.disallowed_tab_types.clone(),
                         },
                     );
                 }
@@ -2899,6 +2924,25 @@ fn handle_tui_events(
                 try_resume_first,
                 kind,
             }) => {
+                // Tab-type policy. The web hides disallowed entries from its
+                // add-tab menu, but that is presentation — this is the check
+                // that actually holds, because the same `AddPane` message can
+                // come from a stale browser tab whose menu predates the
+                // restriction. Managed team panes are exempt: the Tech Lead
+                // spawns those from role templates, and an owner restricting
+                // *user* tab types has not asked to break their own team.
+                if !managed && !tab_type_allowed_for(std::path::Path::new(working_dir), kind, provider.clone()) {
+                    let denied = shared::tab_type_key(kind, provider.clone());
+                    tracing::warn!(pane_id, %denied, "AddPane refused — tab type not allowed on this project");
+                    let _ = output_tx.send(PaneOutput {
+                        text: format!(
+                            "[New tab refused — {} tabs are not allowed on this project. An owner or admin can change this in the Overview.]",
+                            denied
+                        ),
+                        pane_id,
+                    });
+                    continue;
+                }
                 let label =
                     pane_label_or_default(Some(&requested_label), pane_id, model.as_deref());
                 // Managed Claude panes default to max effort — the team
@@ -5798,7 +5842,7 @@ mod tests {
         save_project(dir.path(), &metadata).expect("seed metadata");
 
         let session_id = Uuid::new_v4();
-        let (echo, team_turned_off) = update_project_flags(dir.path(), session_id, true, false, true)
+        let (echo, team_turned_off) = update_project_flags(dir.path(), session_id, true, false, true, Vec::new())
             .expect("flags should persist");
         // Was already off, so enabling it is not a "turned off" transition.
         assert!(!team_turned_off);
@@ -5809,11 +5853,13 @@ mod tests {
                 auto_approve_todos,
                 auto_merge_prs,
                 team_enabled,
+                disallowed_tab_types,
             } => {
                 assert_eq!(echoed_session_id, session_id);
                 assert!(auto_approve_todos);
                 assert!(!auto_merge_prs);
                 assert!(team_enabled);
+                assert!(disallowed_tab_types.is_empty());
             }
             other => panic!("unexpected echo message: {other:?}"),
         }
@@ -7021,6 +7067,110 @@ Use a project-specific custom dispatch loop.";
         assert_eq!(agent.kind, shared::PaneKind::Agent);
     }
 
+    // --- tab-type policy ---------------------------------------------------
+
+    #[test]
+    fn tab_types_are_all_allowed_on_a_project_that_never_set_a_policy() {
+        // The upgrade path: an older `.apas` has no `disallowed_tab_types`,
+        // which must mean "no restrictions" rather than "no tabs".
+        let _config = crate::config::test_config::isolated_config_dir();
+        let dir = tempfile::tempdir().expect("temp project dir");
+        std::fs::write(
+            dir.path().join(".apas"),
+            r#"{
+                "id": "8c4b0c1e-0000-4000-8000-000000000002",
+                "name": "legacy",
+                "created_at": "2026-01-01T00:00:00Z",
+                "panes": []
+            }"#,
+        )
+        .expect("write legacy .apas");
+
+        for provider in [Provider::Claude, Provider::Codex] {
+            for kind in [shared::PaneKind::Agent, shared::PaneKind::Terminal] {
+                assert!(
+                    super::tab_type_allowed_for(dir.path(), kind, provider.clone()),
+                    "{kind:?}/{provider:?} should be allowed with no policy set"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_disallowed_tab_type_is_refused_while_its_sibling_is_not() {
+        let _config = crate::config::test_config::isolated_config_dir();
+        let dir = tempfile::tempdir().expect("temp project dir");
+        let session_id = Uuid::new_v4();
+
+        update_project_flags(
+            dir.path(),
+            session_id,
+            false,
+            false,
+            false,
+            vec!["terminal:claude".to_string()],
+        )
+        .expect("persist policy");
+
+        assert!(!super::tab_type_allowed_for(
+            dir.path(),
+            shared::PaneKind::Terminal,
+            Provider::Claude
+        ));
+        // The point of keying on kind *and* provider: blocking claude
+        // terminals must not block claude agent tabs.
+        assert!(super::tab_type_allowed_for(
+            dir.path(),
+            shared::PaneKind::Agent,
+            Provider::Claude
+        ));
+        assert!(super::tab_type_allowed_for(
+            dir.path(),
+            shared::PaneKind::Terminal,
+            Provider::Codex
+        ));
+    }
+
+    #[test]
+    fn the_tab_type_policy_round_trips_through_apas() {
+        let _config = crate::config::test_config::isolated_config_dir();
+        let dir = tempfile::tempdir().expect("temp project dir");
+        let session_id = Uuid::new_v4();
+        let deny = vec!["terminal:claude".to_string(), "agent:opencode".to_string()];
+
+        let (echo, _) =
+            update_project_flags(dir.path(), session_id, false, false, false, deny.clone())
+                .expect("persist");
+
+        assert_eq!(
+            get_or_create_project(dir.path()).unwrap().disallowed_tab_types,
+            deny
+        );
+        match echo {
+            CliToServer::ProjectFlagsChanged {
+                disallowed_tab_types,
+                ..
+            } => assert_eq!(disallowed_tab_types, deny),
+            other => panic!("unexpected echo: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unreadable_apas_leaves_tab_types_allowed() {
+        // Fails *open*, unlike team mode. The worst case is a tab an owner
+        // meant to block; failing closed would lock everyone out of the
+        // project over an unreadable file.
+        let _config = crate::config::test_config::isolated_config_dir();
+        let dir = tempfile::tempdir().expect("temp project dir");
+        std::fs::write(dir.path().join(".apas"), "{ not json").expect("write junk");
+
+        assert!(super::tab_type_allowed_for(
+            dir.path(),
+            shared::PaneKind::Terminal,
+            Provider::Claude
+        ));
+    }
+
     // --- team mode on/off ---------------------------------------------------
 
     #[test]
@@ -7072,19 +7222,19 @@ Use a project-specific custom dispatch loop.";
 
         // off -> on: nothing to stop.
         let (_, turned_off) =
-            update_project_flags(dir.path(), session_id, false, false, true).expect("enable");
+            update_project_flags(dir.path(), session_id, false, false, true, Vec::new()).expect("enable");
         assert!(!turned_off);
         assert!(get_or_create_project(dir.path()).unwrap().team_enabled);
 
         // on -> off: the caller must stop the running team.
         let (_, turned_off) =
-            update_project_flags(dir.path(), session_id, false, false, false).expect("disable");
+            update_project_flags(dir.path(), session_id, false, false, false, Vec::new()).expect("disable");
         assert!(turned_off);
         assert!(!get_or_create_project(dir.path()).unwrap().team_enabled);
 
         // off -> off: idempotent, so a repeated write doesn't re-stop panes.
         let (_, turned_off) =
-            update_project_flags(dir.path(), session_id, false, false, false).expect("disable again");
+            update_project_flags(dir.path(), session_id, false, false, false, Vec::new()).expect("disable again");
         assert!(!turned_off);
     }
 
@@ -12376,6 +12526,7 @@ async fn run_server_connection(
                                                 auto_approve_todos,
                                                 auto_merge_prs,
                                                 team_enabled,
+                                                disallowed_tab_types,
                                             } => {
                                                 let project_dir = std::path::Path::new(&working_dir).to_path_buf();
                                                 match update_project_flags(
@@ -12384,6 +12535,7 @@ async fn run_server_connection(
                                                     auto_approve_todos,
                                                     auto_merge_prs,
                                                     team_enabled,
+                                                    disallowed_tab_types,
                                                 ) {
                                                     Ok((echo, team_turned_off)) => {
                                                         tracing::info!(

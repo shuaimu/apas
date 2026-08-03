@@ -2601,6 +2601,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     auto_approve_todos,
                     auto_merge_prs,
                     team_enabled,
+                    disallowed_tab_types,
                 }) => {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
@@ -2631,6 +2632,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     auto_approve_todos,
                                     auto_merge_prs,
                                     team_enabled,
+                                    disallowed_tab_types,
                                 },
                             )
                             .await;

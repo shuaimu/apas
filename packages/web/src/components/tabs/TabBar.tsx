@@ -3,6 +3,7 @@
 import { useCallback, useRef, useEffect, useState, type ReactNode } from "react";
 import { Bot } from "lucide-react";
 import { PaneConfig, PaneKind, paneKey } from "@/lib/store";
+import { useIsTabTypeAllowed } from "@/lib/tabTypes";
 import {
   PROVIDER_MODEL_GROUPS,
   isDeepseekModel,
@@ -492,6 +493,9 @@ export function TabBar({
 }
 
 function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: string, isolatedWorktree?: boolean, kind?: PaneKind) => void }) {
+  // Presentation only — the CLI re-checks `.apas` on every AddPane, so a stale
+  // menu cannot actually create a restricted tab.
+  const isAllowed = useIsTabTypeAllowed();
   const [showMenu, setShowMenu] = useState(false);
   const [isolatedWorktree, setIsolatedWorktree] = useState(false);
   const [expandedGroup, setExpandedGroup] = useState<string | null>(null);
@@ -575,7 +579,9 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
             {[
               { provider: "claude", label: "Claude terminal" },
               { provider: "codex", label: "Codex terminal" },
-            ].map((entry) => (
+            ]
+              .filter((entry) => isAllowed("terminal", entry.provider))
+              .map((entry) => (
               <button
                 key={entry.provider}
                 onClick={() => handlePick(entry.provider, undefined, "terminal")}
@@ -589,7 +595,12 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
             ))}
           </div>
 
-          {PROVIDER_MODEL_GROUPS.map((group, i) => (
+          {PROVIDER_MODEL_GROUPS.filter((group) =>
+            // Every option in a group shares one provider — MiniMax/GLM/
+            // DeepSeek are claude *models*, not providers — so the group is
+            // allowed exactly when its provider is.
+            group.options.some((o) => isAllowed("agent", o.provider)),
+          ).map((group, i) => (
             <div key={group.id}>
               {i > 0 && (
                 <div className="border-t border-gray-100 dark:border-gray-700 my-0.5" />

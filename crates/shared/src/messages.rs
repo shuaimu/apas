@@ -266,6 +266,12 @@ pub enum CliToServer {
         /// or admin can change it; see `WebToServer::UpdateProjectFlags`.
         #[serde(default)]
         team_enabled: bool,
+        /// Tab types this project refuses to create, as `<kind>:<provider>`
+        /// keys (see `tab_type_key`). A *deny* list so that absent means
+        /// "everything allowed" — see `tab_type_allowed`. Owner/admin only,
+        /// same gate as the flags above.
+        #[serde(default)]
+        disallowed_tab_types: Vec<String>,
     },
 
     /// CLI's view of `team-todo.md`. Pushed in response to
@@ -553,6 +559,12 @@ pub enum ServerToCli {
         /// and stops any running team on a true -> false transition.
         #[serde(default)]
         team_enabled: bool,
+        /// Tab types this project refuses to create, as `<kind>:<provider>`
+        /// keys (see `tab_type_key`). A *deny* list so that absent means
+        /// "everything allowed" — see `tab_type_allowed`. Owner/admin only,
+        /// same gate as the flags above.
+        #[serde(default)]
+        disallowed_tab_types: Vec<String>,
     },
 
     /// Spawn the default team (Manager, Tech Lead, Reviewer, Developer)
@@ -1148,6 +1160,12 @@ pub enum WebToServer {
         /// (`auto_merge_prs` alone lets the Tech Lead merge PRs unattended).
         #[serde(default)]
         team_enabled: bool,
+        /// Tab types this project refuses to create, as `<kind>:<provider>`
+        /// keys (see `tab_type_key`). A *deny* list so that absent means
+        /// "everything allowed" — see `tab_type_allowed`. Owner/admin only,
+        /// same gate as the flags above.
+        #[serde(default)]
+        disallowed_tab_types: Vec<String>,
     },
 
     /// Spawn the four default team panes for any role that isn't
@@ -1533,6 +1551,12 @@ pub enum ServerToWeb {
         /// attaches mid-session hydrates without asking.
         #[serde(default)]
         team_enabled: bool,
+        /// Tab types this project refuses to create, as `<kind>:<provider>`
+        /// keys (see `tab_type_key`). A *deny* list so that absent means
+        /// "everything allowed" — see `tab_type_allowed`. Owner/admin only,
+        /// same gate as the flags above.
+        #[serde(default)]
+        disallowed_tab_types: Vec<String>,
     },
 
     /// Snapshot of the project's team-todo.md state. Sent in reply to
@@ -1921,6 +1945,66 @@ impl PaneKind {
     pub fn is_terminal(self) -> bool {
         matches!(self, PaneKind::Terminal)
     }
+}
+
+/// Canonical key for a "tab type" — the pane kind plus the provider, e.g.
+/// `agent:claude`, `terminal:codex`.
+///
+/// Kind and provider together are what the add-tab menu actually offers, and
+/// what a project owner restricts: a claude *agent* tab and a claude
+/// *terminal* tab are different capabilities (the terminal one runs the real
+/// TUI with permission prompts bypassed), so neither half alone identifies a
+/// tab type.
+///
+/// Derived from the serde names rather than hand-written, so a renamed or
+/// added `Provider` variant cannot silently produce a key that no longer
+/// matches a stored restriction.
+pub fn tab_type_key(kind: PaneKind, provider: Provider) -> String {
+    let kind = serde_json::to_value(kind)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "agent".to_string());
+    let provider = serde_json::to_value(provider)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "claude".to_string());
+    format!("{kind}:{provider}")
+}
+
+/// Every tab type a user can actually be offered, in menu order.
+///
+/// Deliberately *not* every `Provider`. MiniMax, GLM, and DeepSeek are the
+/// claude binary pointed at a different backend, so the add-tab menu offers
+/// them as claude **models**, not providers — a `Provider::Minimax` key would
+/// be a control that silently does nothing, because those tabs arrive as
+/// `provider: claude`. Restricting by model would be a different, larger
+/// feature.
+///
+/// Terminal panes exist only for claude and codex — see
+/// `terminal_pane::terminal_binary_for`, which this must stay in step with.
+pub fn all_tab_types() -> Vec<String> {
+    vec![
+        tab_type_key(PaneKind::Agent, Provider::Claude),
+        tab_type_key(PaneKind::Agent, Provider::Codex),
+        tab_type_key(PaneKind::Agent, Provider::Opencode),
+        tab_type_key(PaneKind::Agent, Provider::CursorAgent),
+        tab_type_key(PaneKind::Terminal, Provider::Claude),
+        tab_type_key(PaneKind::Terminal, Provider::Codex),
+    ]
+}
+
+/// Whether this project permits creating a tab of the given kind + provider.
+///
+/// Stored as a *deny* list rather than an allow list on purpose. An allow list
+/// read through `#[serde(default)]` would make an absent field mean "nothing
+/// permitted", so every project predating the feature would refuse to open any
+/// tab at all. Empty deny list = everything allowed = existing projects
+/// unaffected, which is the only safe default for a field arriving in an
+/// upgrade. It also means a provider added later is permitted until an owner
+/// says otherwise, rather than silently disappearing from their menu.
+pub fn tab_type_allowed(disallowed: &[String], kind: PaneKind, provider: Provider) -> bool {
+    let key = tab_type_key(kind, provider);
+    !disallowed.iter().any(|d| d.trim().eq_ignore_ascii_case(&key))
 }
 
 /// Configuration for a single pane
@@ -3242,5 +3326,89 @@ mod tests {
             ServerToWeb::TerminalSnapshot { truncated, .. } => assert!(!truncated),
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    // --- tab-type policy -------------------------------------------------
+
+    /// The web's catalog, so the two cannot drift apart unnoticed. Same trick
+    /// the CLI already uses for `providerOptions.ts`.
+    const WEB_TAB_TYPES_TS: &str = include_str!("../../../packages/web/src/lib/tabTypes.ts");
+
+    #[test]
+    fn tab_type_keys_are_kind_then_provider() {
+        assert_eq!(tab_type_key(PaneKind::Agent, Provider::Claude), "agent:claude");
+        assert_eq!(
+            tab_type_key(PaneKind::Terminal, Provider::Codex),
+            "terminal:codex"
+        );
+        // Derived from serde names, so a rename shows up here rather than
+        // silently orphaning stored restrictions.
+        assert_eq!(
+            tab_type_key(PaneKind::Agent, Provider::CursorAgent),
+            "agent:cursor-agent"
+        );
+    }
+
+    #[test]
+    fn an_empty_deny_list_allows_everything() {
+        // The upgrade path: `.apas` files predating the field deserialize to an
+        // empty Vec, which must not lock a project out of opening any tab.
+        for key in all_tab_types() {
+            let (kind, provider) = key.split_once(':').expect("kind:provider");
+            assert!(!kind.is_empty() && !provider.is_empty());
+        }
+        assert!(tab_type_allowed(&[], PaneKind::Agent, Provider::Claude));
+        assert!(tab_type_allowed(&[], PaneKind::Terminal, Provider::Codex));
+    }
+
+    #[test]
+    fn denying_one_type_leaves_its_sibling_alone() {
+        // The distinction the feature exists for: a claude agent tab and a
+        // claude terminal tab are different capabilities.
+        let deny = vec!["terminal:claude".to_string()];
+        assert!(!tab_type_allowed(&deny, PaneKind::Terminal, Provider::Claude));
+        assert!(tab_type_allowed(&deny, PaneKind::Agent, Provider::Claude));
+        assert!(tab_type_allowed(&deny, PaneKind::Terminal, Provider::Codex));
+    }
+
+    #[test]
+    fn deny_entries_tolerate_whitespace_and_case() {
+        let deny = vec!["  Agent:Claude  ".to_string()];
+        assert!(!tab_type_allowed(&deny, PaneKind::Agent, Provider::Claude));
+    }
+
+    #[test]
+    fn the_catalog_omits_providers_that_are_really_claude_models() {
+        // MiniMax/GLM/DeepSeek tabs arrive as `provider: claude`, so offering
+        // them as separate tab types would be a checkbox that does nothing.
+        let catalog = all_tab_types();
+        for absent in ["agent:minimax", "agent:glm", "agent:deepseek"] {
+            assert!(
+                !catalog.contains(&absent.to_string()),
+                "{absent} is not separately creatable"
+            );
+        }
+        assert_eq!(catalog.len(), 6, "catalog: {catalog:?}");
+    }
+
+    #[test]
+    fn rust_and_web_tab_type_catalogs_agree() {
+        for key in all_tab_types() {
+            let (kind, provider) = key.split_once(':').expect("kind:provider");
+            let needle = format!(r#"kind: "{kind}", provider: "{provider}""#);
+            assert!(
+                WEB_TAB_TYPES_TS.contains(&needle),
+                "tabTypes.ts is missing {key} — the admin UI would not offer it"
+            );
+        }
+        // And nothing extra: a type the web offers but the CLI does not know
+        // would be an unenforceable checkbox.
+        let web_entries = WEB_TAB_TYPES_TS.matches("{ kind: \"").count();
+        assert_eq!(
+            web_entries,
+            all_tab_types().len(),
+            "tabTypes.ts lists {web_entries} types, shared lists {}",
+            all_tab_types().len()
+        );
     }
 }

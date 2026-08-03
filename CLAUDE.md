@@ -228,10 +228,11 @@ pane state:
 }
 ```
 
-`team_enabled`, `auto_approve_todos`, and `auto_merge_prs` are project-level
-policy flags. `team_enabled` gates managed team mode entirely (see "Team mode is
-opt-in" below); the other two are read by the Tech Lead loop. All three are
-owner/admin-only. Managed pane entries are restored as team roles; unmanaged
+`team_enabled`, `auto_approve_todos`, `auto_merge_prs`, and
+`disallowed_tab_types` are project-level policy flags. `team_enabled` gates
+managed team mode entirely (see "Team mode is opt-in" below);
+`disallowed_tab_types` restricts which tab types users may create (see "Tab-type
+policy"); the other two are read by the Tech Lead loop. All are owner/admin-only. Managed pane entries are restored as team roles; unmanaged
 interactive panes can coexist with the team. `kind` defaults to `"agent"` when
 absent, so `.apas` files written before terminal panes existed keep loading
 unchanged — see "Terminal panes" under Key Concepts.
@@ -429,6 +430,40 @@ ssh root@apas.mpaxos.com "cd /opt/apas/web && npm install && NEXT_PUBLIC_WEB_UI_
 7. **Pane kinds**: `PaneConfig.kind` picks how a pane hosts its agent, and
    is orthogonal to `provider` (which binary) and `mode` (how autonomous).
    See "Terminal panes" below.
+
+## Tab-type policy (`disallowed_tab_types`)
+
+A project's owner or admin can restrict which tab types users may create. A
+"tab type" is a **pane kind plus a provider** — `agent:claude`,
+`terminal:codex` (`shared::tab_type_key`). Neither half alone identifies one: a
+claude agent tab and a claude terminal tab are different capabilities, since the
+terminal runs the real TUI with permission prompts bypassed.
+
+Stored as a **deny** list, presented in the UI as an allow list. An allow list
+on the wire would make an absent field mean "nothing permitted", so every
+project predating the feature would refuse to open any tab. Empty deny list =
+everything allowed = existing projects unaffected. It also means a provider
+added later is permitted until an owner says otherwise, rather than vanishing
+from their menu.
+
+The catalog is deliberately **not** every `Provider`. MiniMax, GLM and DeepSeek
+are the claude binary against a different backend, so the add-tab menu offers
+them as claude *models* — a `agent:minimax` key would be a checkbox that
+silently does nothing, because those tabs arrive as `provider: claude`.
+Restricting by model would be a separate, larger feature. `shared::all_tab_types`
+and `packages/web/src/lib/tabTypes.ts` must agree; a test in `shared` reads the
+TS file and asserts they do.
+
+Enforced in the CLI (`tab_type_allowed_for`), which re-reads `.apas` on every
+`AddPane` — the web only hides menu entries, and the same message can arrive
+from a stale browser tab whose menu predates the restriction. Unlike
+`team_enabled_for`, this fails **open** on an unreadable `.apas`: the worst case
+is a tab an owner meant to block, whereas failing closed would lock everyone out
+of the project entirely.
+
+**Managed team panes are exempt.** The Tech Lead spawns those from role
+templates, and an owner restricting *user* tab types has not asked to break
+their own team.
 
 ## Team mode is opt-in (`team_enabled`)
 

@@ -15,6 +15,7 @@ import { TeamSetupCard } from "./TeamSetupCard";
 import { TeamTodoPanel } from "./TeamTodoPanel";
 import { TechLeadAutonomyToggles } from "./TechLeadAutonomyToggles";
 import { TeamModeSwitch } from "./TeamModeSwitch";
+import { AllowedTabTypesCard } from "./AllowedTabTypesCard";
 import { useTeamEnabled } from "@/lib/projectRole";
 import { SuggestedWorkersPanel } from "./SuggestedWorkersPanel";
 
@@ -146,6 +147,9 @@ export function OverviewView({
         {teamEnabled && <TeamSetupCard />}
 
         <ProjectGoalBar />
+
+        {/* Not team-gated: user tabs exist whether or not a team is running. */}
+        <AllowedTabTypesCard />
 
         {teamEnabled && <TechLeadAutonomyToggles />}
 

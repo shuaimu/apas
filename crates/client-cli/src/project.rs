@@ -66,6 +66,17 @@ pub struct ProjectMetadata {
     #[serde(default)]
     pub team_enabled: bool,
 
+    /// Tab types this project refuses to create, as `<kind>:<provider>` keys
+    /// (`shared::tab_type_key`). Empty means everything is allowed.
+    ///
+    /// A deny list rather than an allow list so `serde(default)` on an older
+    /// `.apas` means "no restrictions" instead of "no tabs at all". Only the
+    /// project's owner or admin can change it, enforced server-side; the CLI
+    /// refuses `AddPane` for a disallowed type regardless of what the web
+    /// offered.
+    #[serde(default)]
+    pub disallowed_tab_types: Vec<String>,
+
     // Legacy fields for backward compatibility (read-only migration)
     /// Claude session ID for the deadloop pane (legacy - use panes instead)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -89,6 +100,7 @@ impl ProjectMetadata {
             auto_approve_todos: false,
             auto_merge_prs: false,
             team_enabled: false,
+            disallowed_tab_types: Vec::new(),
             deadloop_claude_session_id: None,
             interactive_claude_session_id: None,
             is_paused: false,
@@ -105,6 +117,7 @@ impl ProjectMetadata {
             auto_approve_todos: false,
             auto_merge_prs: false,
             team_enabled: false,
+            disallowed_tab_types: Vec::new(),
             deadloop_claude_session_id: None,
             interactive_claude_session_id: None,
             is_paused: false,
@@ -488,6 +501,7 @@ pub fn get_or_create_project(dir: &Path) -> Result<ProjectMetadata> {
             auto_approve_todos: false,
             auto_merge_prs: false,
             team_enabled: false,
+            disallowed_tab_types: Vec::new(),
             deadloop_claude_session_id: None,
             interactive_claude_session_id: None,
             is_paused: false,

@@ -740,7 +740,15 @@ interface AppState {
    *  `.apas` poller. Toggled from the Overview. */
   projectFlags: Record<
     string,
-    { autoApproveTodos: boolean; autoMergePrs: boolean; teamEnabled: boolean }
+    {
+      autoApproveTodos: boolean;
+      autoMergePrs: boolean;
+      teamEnabled: boolean;
+      /** `<kind>:<provider>` keys this project refuses to create. Empty means
+       *  everything is allowed — a deny list, so an older CLI that doesn't
+       *  send the field reads as "no restrictions" rather than "no tabs". */
+      disallowedTabTypes: string[];
+    }
   >;
   /** Instance creations we have sent but not yet heard back about, keyed by
    *  request_id. The daemon clones the repo before acking, which can take
@@ -755,6 +763,7 @@ interface AppState {
     autoApproveTodos: boolean;
     autoMergePrs: boolean;
     teamEnabled: boolean;
+    disallowedTabTypes: string[];
   }) => void;
   /** Spawn the default team panes for any role that isn't already
    *  present. Idempotent on the CLI side. Each role's `provider` /
@@ -2137,6 +2146,7 @@ export const useStore = create<AppState>((set, get) => ({
         auto_approve_todos: flags.autoApproveTodos,
         auto_merge_prs: flags.autoMergePrs,
         team_enabled: flags.teamEnabled,
+        disallowed_tab_types: flags.disallowedTabTypes,
       }),
     );
     // Optimistic local update so the toggle feels instant; the CLI
@@ -3689,11 +3699,14 @@ export function handleServerMessage(
       // Absent means off: a CLI too old to send the field must not read as
       // team-enabled, or the UI would offer a team the CLI will refuse.
       const teamEnabled = data.team_enabled === true;
+      const disallowedTabTypes = Array.isArray(data.disallowed_tab_types)
+        ? (data.disallowed_tab_types as string[])
+        : [];
       if (sessionId) {
         set((state) => ({
           projectFlags: {
             ...state.projectFlags,
-            [sessionId]: { autoApproveTodos, autoMergePrs, teamEnabled },
+            [sessionId]: { autoApproveTodos, autoMergePrs, teamEnabled, disallowedTabTypes },
           },
         }));
       }
