@@ -12,6 +12,7 @@ use uuid::Uuid;
 mod auth;
 mod claude;
 mod config;
+mod conversation;
 mod daemon_registry;
 mod file_watcher;
 mod manager;

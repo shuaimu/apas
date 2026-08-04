@@ -521,6 +521,45 @@ interrupting, where the web does the reverse — between an interrupt and the
 pause landing, a sibling pane's write can wake the loop for one more iteration.
 Unmanaged side chats are never touched.
 
+## Self-reported history for terminal panes (`record_turn`)
+
+An agent pane is *observed*: the CLI parses its stream-json and knows every turn
+without cooperation. A terminal pane hosts the provider's real TUI on a pty, so
+there is nothing structured to parse — which is why it had no history and no
+usage.
+
+The agent now reports its own turns through its per-pane MCP server. Each call
+appends to `.apas-conversations/pane-<id>.jsonl` (one file per pane, so appends
+need no cross-process lock — exactly one MCP server exists per pane, unlike
+`team-todo.md`). A CLI tailer forwards new turns to the server.
+
+**The turn is dressed as the stream message an agent pane would have sent**
+(`conversation_turn_to_stream_messages`). That is the whole trick: no new wire
+message, no new storage path, no new renderer. The server persists it to the
+same `messages.jsonl`, the web renders it with the same components, and usage
+accounting bills the same pane — none of which needed changing. A turn carrying
+token counts emits a second `Result` message, because `ws_cli` reads usage only
+from `extra.usage` on that variant; `total_cost_usd` stays 0 since a
+self-reporting agent cannot know what it was billed.
+
+**Two properties follow from self-report, and both are accepted trade-offs:**
+
+1. *History is only as complete as the agent's cooperation.* Nothing enforces
+   the call. The MCP server states the requirement in its `initialize`
+   instructions — for a terminal pane that is the **only** channel available,
+   since it execs the provider's TUI and there is no system prompt of ours to
+   append to. If that text stops asking, history silently stops being written
+   and nothing else fails, which is why a test asserts it still does.
+2. *The content is whatever the agent says.* `pane_id` is stamped server-side
+   from `--pane-id`, so a pane cannot forge history for **another** pane, but
+   within its own pane this records what the agent claims, not what happened.
+
+The alternative — tailing the provider's own transcript
+(`~/.claude/projects/**.jsonl`, `~/.codex/sessions/**/rollout-*.jsonl`, both of
+which carry full turns *and* token usage) — would be complete and need no
+cooperation, but only ever works for providers whose format we track. Self-report
+was chosen for provider-agnostic coverage.
+
 ## Team-mode MCP server (`apas mcp-server`)
 
 Phase 3.1 shipped delegation as `.apas-team.jsonl` tag conventions driven from
@@ -576,11 +615,12 @@ Only `claude` and `codex` can host one (`terminal_pane::terminal_binary_for`);
 the MiniMax/GLM/DeepSeek variants are the claude binary behind different env,
 and opencode/cursor-agent have unverified pty behaviour.
 
-**What terminal panes deliberately do not get.** Every team-mode integration
-is built on stream-json events, so a terminal pane has no usage counters, no
-pane status, no `PaneDiff`, no plan review, and no scratchpad publishing. It
-is never a Tech Lead delegation target and is forced `managed: false`. Treat
-it as a side chat with a genuine TUI, not a team member.
+**What terminal panes deliberately do not get.** Every other team-mode
+integration is built on stream-json events, so a terminal pane still has no
+pane status, no `PaneDiff`, and no plan review. It is never a Tech Lead
+delegation target and is forced `managed: false`.
+
+**Conversation history and usage now arrive by self-report** — see below.
 
 **Transport.** Raw pty bytes never touch `CliToServer::Output` or
 `StreamMessage` — those persist into `messages.jsonl` as chat records, and

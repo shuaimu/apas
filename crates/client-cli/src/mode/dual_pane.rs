@@ -275,6 +275,88 @@ fn stop_managed_team(pane_metas: &PaneMetas, pane_pauses: &PanePauses) -> usize 
     targets.len()
 }
 
+/// Turn a self-reported terminal-pane turn into the stream message an agent
+/// pane would have produced for the same exchange.
+///
+/// This is the whole trick that makes terminal-pane history free: rather than
+/// adding a parallel wire message, storage path, and renderer, a recorded turn
+/// is dressed as a `ClaudeStreamMessage` and sent down the existing
+/// `CliToServer::StreamMessage` channel. The server persists it to the same
+/// `messages.jsonl`, the web renders it with the same components, and usage
+/// accounting bills it to the same pane — none of which needed changing.
+///
+/// A turn with token counts yields a second `Result` message, because that is
+/// the variant the server reads usage out of (`ws_cli` looks for
+/// `extra.usage`). Without it the turn is recorded but bills nothing.
+fn conversation_turn_to_stream_messages(
+    turn: &crate::conversation::TurnRecord,
+    session_id: Uuid,
+    claude_session_id: Uuid,
+) -> Vec<CliToServer> {
+    let sid = claude_session_id.to_string();
+    let block = shared::ClaudeContentBlock::Text {
+        text: turn.text.clone(),
+    };
+    let message = if turn.is_assistant() {
+        shared::ClaudeStreamMessage::Assistant {
+            message: shared::ClaudeAssistantMessage {
+                content: vec![block],
+                model: turn.model.clone().unwrap_or_default(),
+                extra: serde_json::Value::Null,
+            },
+            session_id: sid.clone(),
+            extra: serde_json::Value::Null,
+        }
+    } else {
+        shared::ClaudeStreamMessage::User {
+            message: shared::ClaudeUserMessage {
+                content: vec![block],
+                role: turn.role.clone(),
+            },
+            session_id: sid.clone(),
+            tool_use_result: None,
+            extra: serde_json::Value::Null,
+        }
+    };
+
+    let mut out = vec![CliToServer::StreamMessage {
+        session_id,
+        message,
+        pane_type: None,
+        pane_id: Some(turn.pane_id),
+    }];
+
+    if turn.has_usage() {
+        // `subtype: "success"` is what marks the turn complete for accounting;
+        // cost is left at 0 because a self-reporting agent has no idea what it
+        // was billed, and inventing a number would corrupt the roll-up.
+        let usage = serde_json::json!({
+            "usage": {
+                "input_tokens": turn.input_tokens.unwrap_or(0),
+                "output_tokens": turn.output_tokens.unwrap_or(0),
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+            }
+        });
+        out.push(CliToServer::StreamMessage {
+            session_id,
+            message: shared::ClaudeStreamMessage::Result {
+                subtype: "success".to_string(),
+                result: String::new(),
+                total_cost_usd: 0.0,
+                duration_ms: 0,
+                session_id: sid,
+                is_error: false,
+                extra: usage,
+            },
+            pane_type: None,
+            pane_id: Some(turn.pane_id),
+        });
+    }
+
+    out
+}
+
 /// Whether managed team mode is currently enabled for this project.
 ///
 /// Read from `.apas` at the point of use rather than cached: the flag can flip
@@ -2459,6 +2541,61 @@ async fn run_inner(
     // pushes new records to the server (which forwards to web). On
     // first tick we send the existing history so newly-attached web
     // clients see what came before. Polls mtime+size — cheap; only
+    // Terminal panes have no stream-json to observe, so their history arrives
+    // as `record_turn` calls that the per-pane MCP server appends to
+    // `.apas-conversations/pane-<id>.jsonl`. This tails those files and
+    // forwards each new turn as the stream message an agent pane would have
+    // sent, which is what gets it stored, rendered, and billed for free.
+    //
+    // Polling rather than the file watcher: the watcher is mtime-gated for
+    // deadloop wake-ups and reports only *that* something changed, while this
+    // needs to know *how much* was appended so it can resume from a cursor.
+    {
+        let server_tx_for_turns = server_tx.clone();
+        let shutdown_for_turns = shutdown.clone();
+        let project_for_turns = std::path::PathBuf::from(working_dir_str.clone());
+        let pane_sessions_for_turns = pane_sessions.clone();
+        thread::spawn(move || {
+            // Per-pane cursor. Seeded to the current length on startup rather
+            // than 0, so a CLI restart does not replay a pane's entire history
+            // into the server as if it were new.
+            let mut seen: HashMap<u32, usize> = HashMap::new();
+            for pane_id in crate::conversation::panes_with_history(&project_for_turns) {
+                let existing = crate::conversation::read_all(&project_for_turns, pane_id)
+                    .map(|r| r.len())
+                    .unwrap_or(0);
+                seen.insert(pane_id, existing);
+            }
+            while !shutdown_for_turns.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_secs(2));
+                for pane_id in crate::conversation::panes_with_history(&project_for_turns) {
+                    let Ok(all) = crate::conversation::read_all(&project_for_turns, pane_id) else {
+                        continue;
+                    };
+                    let cursor = seen.entry(pane_id).or_insert(0);
+                    if all.len() <= *cursor {
+                        continue;
+                    }
+                    // The pane's own claude session id, so replayed history
+                    // groups under the right conversation server-side.
+                    let claude_sid = pane_sessions_for_turns
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.get(&pane_id).copied())
+                        .unwrap_or(session_id);
+                    for turn in &all[*cursor..] {
+                        for msg in conversation_turn_to_stream_messages(
+                            turn, session_id, claude_sid,
+                        ) {
+                            let _ = server_tx_for_turns.blocking_send(msg);
+                        }
+                    }
+                    *cursor = all.len();
+                }
+            }
+        });
+    }
+
     // re-reads on growth.
     {
         let server_tx_for_pad = server_tx.clone();
@@ -7065,6 +7202,126 @@ Use a project-specific custom dispatch loop.";
             .find(|p| p.pane_id == 7)
             .expect("agent pane");
         assert_eq!(agent.kind, shared::PaneKind::Agent);
+    }
+
+    // --- self-reported terminal-pane history ------------------------------
+
+    fn recorded_turn(role: &str, text: &str) -> crate::conversation::TurnRecord {
+        crate::conversation::TurnRecord {
+            ts: "2026-08-04T00:00:00Z".to_string(),
+            pane_id: 42,
+            role: role.to_string(),
+            text: text.to_string(),
+            model: Some("claude-opus-5".to_string()),
+            input_tokens: None,
+            output_tokens: None,
+        }
+    }
+
+    #[test]
+    fn a_reported_assistant_turn_becomes_the_message_an_agent_pane_would_send() {
+        // The point of the translation: no new wire message, storage path, or
+        // renderer — a terminal pane's history rides the agent-pane channel.
+        let sid = Uuid::new_v4();
+        let csid = Uuid::new_v4();
+        let msgs = super::conversation_turn_to_stream_messages(
+            &recorded_turn("assistant", "here is the answer"),
+            sid,
+            csid,
+        );
+
+        assert_eq!(msgs.len(), 1, "no usage reported, so no Result message");
+        match &msgs[0] {
+            CliToServer::StreamMessage {
+                session_id,
+                message: shared::ClaudeStreamMessage::Assistant { message, .. },
+                pane_id,
+                ..
+            } => {
+                assert_eq!(*session_id, sid);
+                assert_eq!(*pane_id, Some(42));
+                assert_eq!(message.model, "claude-opus-5");
+                match &message.content[0] {
+                    shared::ClaudeContentBlock::Text { text } => {
+                        assert_eq!(text, "here is the answer")
+                    }
+                    other => panic!("unexpected block: {other:?}"),
+                }
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_reported_user_turn_becomes_a_user_message() {
+        let msgs = super::conversation_turn_to_stream_messages(
+            &recorded_turn("user", "do the thing"),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        assert!(matches!(
+            &msgs[0],
+            CliToServer::StreamMessage {
+                message: shared::ClaudeStreamMessage::User { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn reported_tokens_produce_the_result_message_usage_accounting_reads() {
+        // `ws_cli` bills a turn only from a Result variant's `extra.usage`, so
+        // without this second message a turn is recorded but costs nothing.
+        let mut turn = recorded_turn("assistant", "done");
+        turn.input_tokens = Some(1200);
+        turn.output_tokens = Some(340);
+
+        let msgs = super::conversation_turn_to_stream_messages(
+            &turn,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        assert_eq!(msgs.len(), 2);
+        match &msgs[1] {
+            CliToServer::StreamMessage {
+                message:
+                    shared::ClaudeStreamMessage::Result {
+                        subtype,
+                        extra,
+                        total_cost_usd,
+                        ..
+                    },
+                pane_id,
+                ..
+            } => {
+                assert_eq!(subtype, "success");
+                assert_eq!(*pane_id, Some(42));
+                assert_eq!(extra["usage"]["input_tokens"], 1200);
+                assert_eq!(extra["usage"]["output_tokens"], 340);
+                // A self-reporting agent cannot know what it was billed;
+                // inventing a number would corrupt the roll-up.
+                assert_eq!(*total_cost_usd, 0.0);
+            }
+            other => panic!("expected a Result message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_role_still_reaches_the_web_as_a_user_message() {
+        // Degrade to "rendered plainly", never to a dropped turn.
+        let msgs = super::conversation_turn_to_stream_messages(
+            &recorded_turn("tool", "output"),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(
+            &msgs[0],
+            CliToServer::StreamMessage {
+                message: shared::ClaudeStreamMessage::User { .. },
+                ..
+            }
+        ));
     }
 
     // --- tab-type policy ---------------------------------------------------
