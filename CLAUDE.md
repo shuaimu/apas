@@ -559,6 +559,21 @@ harness's own injected context), `reasoning`, and tool calls. None of those are
 turns, and rendering them would be noise. Tool-use-only turns with no text are
 skipped rather than recorded blank.
 
+**The conversation view is writable, and that is the point on mobile.** An
+xterm TUI on a phone is close to unusable — no modifier keys, tiny hit targets,
+scrolling that fights the page — so the conversation view plus its text box is
+the practical way to drive an agent from one. Text goes straight into the pty
+via the same `TerminalInput` path the xterm view uses; the TUI cannot tell the
+difference. **MCP is not and cannot be involved**: it is agent-pull, so a tool
+server can answer a call but can never push a turn into a live conversation.
+Multi-line text is sent as a bracketed paste (`ESC[200~ … ESC[201~`) so the TUI
+takes it atomically instead of treating the first newline as submit; single-line
+text is sent bare, since a TUI that never enabled DECSET 2004 would otherwise
+show the wrapper as literal keystrokes. The carriage return is a separate write.
+The caveat is that it is sent **blind** — unlike the terminal view you cannot
+see whether the agent is mid-turn or sitting in a menu, so the UI says where the
+live state is.
+
 **The web can render a terminal pane either way.** A per-pane toggle switches
 between the live pty (xterm.js) and the same structured conversation view an
 agent pane gets — the captured turns arrive as ordinary pane messages, so

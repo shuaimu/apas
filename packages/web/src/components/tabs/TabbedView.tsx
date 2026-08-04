@@ -18,6 +18,7 @@ import { CodeBlock } from "../code/CodeBlock";
 // server bundle. Loading it lazily also keeps the ~300 KB emulator out of
 // the initial payload for the (common) case of no terminal panes.
 import { TerminalViewToggle } from "./TerminalViewToggle";
+import { TerminalChatInput } from "./TerminalChatInput";
 
 /**
  * A terminal pane with its two views.
@@ -45,12 +46,17 @@ function TerminalPaneWithViews({
         <TerminalPane key={`terminal-${sessionId}-${paneId}`} paneId={paneId} />
       </div>
       {mode === "conversation" && (
-        <MessagePane
-          key={`terminal-chat-${sessionId}-${paneId}`}
-          paneId={paneId}
-          messages={messages}
-          isActive
-        />
+        <>
+          <MessagePane
+            key={`terminal-chat-${sessionId}-${paneId}`}
+            paneId={paneId}
+            messages={messages}
+            isActive
+          />
+          {/* Writes go into the pty, not through MCP — a tool server can only
+              answer calls, never push a turn into a live conversation. */}
+          <TerminalChatInput paneId={paneId} />
+        </>
       )}
     </>
   );
