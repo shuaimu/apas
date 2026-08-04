@@ -329,12 +329,32 @@ The APAS server and web UI are deployed on an LXC container:
 
 - **Host**: `apas.mpaxos.com` (130.245.173.82)
 - **SSH**: `ssh root@apas.mpaxos.com`
-- **Edge**: **nginx** on port **80** reverse-proxies everything (config:
-  `/etc/nginx/conf.d/apas.conf`). `/ws/ /auth/ /admin/ /share/ /health` →
+- **Edge**: **nginx** on port **80** reverse-proxies everything. The config is
+  version-controlled at **`deploy/nginx-apas.conf`** and deployed to
+  `/etc/nginx/conf.d/apas.conf` — edit the repo copy, `scp` it, `nginx -t`,
+  then `systemctl reload nginx`. `/ws/ /auth/ /admin/ /share/ /health` →
   `apas-server` (`127.0.0.1:8080`); everything else → the Next.js app
   (`127.0.0.1:3000`). This exists so the web's WebSocket + HTTP API ride the
   standard port 80 (`ws://apas.mpaxos.com/ws/web`) instead of the non-standard
   `:8080`, which mobile carriers/Wi-Fi block — that broke mobile entirely.
+
+  **A proxied `location /X/` shadows the page at `/X`.** nginx answers a
+  request for a proxied prefix location *minus* its trailing slash with a 301
+  that appends one. So `/share` was redirected to `/share/`, which then matched
+  the API prefix and 404ed on `apas-server` — every share invite was dead
+  (`/share?code=...`), and the whole `/admin` page with it, while the
+  `/share/*` API endpoints looked perfectly healthy the entire time. The fix is
+  an exact-match location, which outranks the prefix and is exempt from the
+  redirect:
+
+  ```nginx
+  location = /share { proxy_pass http://127.0.0.1:3000; ... }
+  ```
+
+  `/auth`, `/admin`, and `/share` all have one. **Add another whenever you add
+  an API prefix that shares a name with a Next.js page**, and check
+  `curl -sL -o /dev/null -w '%{http_code} %{num_redirects}' <url>` — a page
+  answering `200 1` instead of `200 0` is this bug.
 - **apas-server**: `127.0.0.1:8080` — still also bound publicly on `:8080` for
   the **CLI/daemon** (`ws://apas.mpaxos.com:8080/ws/cli`); do not firewall 8080.
 - **Next.js web (apas-web)**: `127.0.0.1:3000` (moved off 80 via a systemd
