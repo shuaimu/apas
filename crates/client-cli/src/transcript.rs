@@ -1,0 +1,370 @@
+//! Reading a terminal pane's history out of the provider's own transcript.
+//!
+//! A terminal pane hosts the provider's real TUI on a pty, so there is no
+//! stream-json for the CLI to parse — which is why terminal panes had no
+//! history and no usage counters.
+//!
+//! The first attempt asked the agent to self-report each turn through an MCP
+//! tool, with the requirement stated in the MCP server's `initialize`
+//! instructions. Tested against both providers, that does not work: claude and
+//! codex each connect to the server and will call the tool when told to
+//! directly, but neither acts on the `initialize` instructions, so an ordinary
+//! task recorded nothing at all. Those instructions are advisory and the
+//! clients treat them as such.
+//!
+//! Both providers already write a complete transcript to disk, so this reads
+//! that instead. It needs no cooperation, cannot be skipped, and carries token
+//! usage the agent would have had to volunteer.
+//!
+//! **Locating the file differs by provider, and so does the confidence:**
+//!
+//! * **claude** — `--session-id <uuid>` pins the id at spawn, and APAS already
+//!   mints one per pane, so the path is exact:
+//!   `~/.claude/projects/<cwd with / as ->/<session-id>.jsonl`. No guessing.
+//! * **codex** — has no equivalent flag. Its rollout files record `cwd` and a
+//!   start `timestamp` in `session_meta`, so a pane is matched to the newest
+//!   rollout in its own directory that started at or after the pane did. That
+//!   is a heuristic: two codex panes started in the same directory within the
+//!   same second could in principle be confused. Bounded by requiring the cwd
+//!   to match exactly.
+
+use anyhow::{Context, Result};
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+
+use crate::conversation::TurnRecord;
+
+/// Directory name claude derives from a working directory: the absolute path
+/// with every `/` replaced by `-`. Verified against a live transcript rather
+/// than assumed — `/home/users/shuai/apas` becomes `-home-users-shuai-apas`.
+fn claude_dir_slug(cwd: &Path) -> String {
+    cwd.to_string_lossy().replace('/', "-")
+}
+
+/// Exact transcript path for a claude pane, given the session id we pinned.
+pub fn claude_transcript_path(home: &Path, cwd: &Path, session_id: &str) -> PathBuf {
+    home.join(".claude")
+        .join("projects")
+        .join(claude_dir_slug(cwd))
+        .join(format!("{session_id}.jsonl"))
+}
+
+/// Pull the text out of a claude content field, which is either a bare string
+/// or an array of typed blocks.
+fn claude_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// Turns from a claude transcript, oldest first.
+///
+/// Only `user` and `assistant` records become turns. The file also carries
+/// `mode`, `permission-mode`, `ai-title` and similar bookkeeping that is not
+/// conversation and would be noise in the pane's history.
+pub fn parse_claude(raw: &str) -> Vec<TurnRecord> {
+    let mut out = Vec::new();
+    for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(d) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let role = match d.get("type").and_then(Value::as_str) {
+            Some(r @ ("user" | "assistant")) => r,
+            _ => continue,
+        };
+        let msg = d.get("message").unwrap_or(&Value::Null);
+        let text = claude_text(msg.get("content").unwrap_or(&Value::Null));
+        if text.trim().is_empty() {
+            // Tool-use-only turns carry no text. Skipping keeps the history
+            // readable; the tool calls themselves are not conversation.
+            continue;
+        }
+        let usage = msg.get("usage");
+        let tok = |k: &str| usage.and_then(|u| u.get(k)).and_then(Value::as_u64);
+        out.push(TurnRecord {
+            ts: d
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            // Filled in by the caller, which knows which pane this file is for.
+            pane_id: 0,
+            role: role.to_string(),
+            text,
+            model: msg
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            input_tokens: tok("input_tokens"),
+            output_tokens: tok("output_tokens"),
+        });
+    }
+    out
+}
+
+/// Turns from a codex rollout, oldest first.
+///
+/// Codex nests the real record under `payload`. Only `message` items with a
+/// `user` or `assistant` role are conversation: `developer` messages are the
+/// harness's own injected context (permissions, plugin lists), and `reasoning`
+/// / `custom_tool_call` items are not turns.
+pub fn parse_codex(raw: &str) -> Vec<TurnRecord> {
+    let mut out = Vec::new();
+    for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(d) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if d.get("type").and_then(Value::as_str) != Some("response_item") {
+            continue;
+        }
+        let p = d.get("payload").unwrap_or(&Value::Null);
+        if p.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let role = match p.get("role").and_then(Value::as_str) {
+            Some(r @ ("user" | "assistant")) => r,
+            _ => continue,
+        };
+        let text = p
+            .get("content")
+            .and_then(Value::as_array)
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter_map(|b| b.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .unwrap_or_default();
+        if text.trim().is_empty() {
+            continue;
+        }
+        out.push(TurnRecord {
+            ts: d
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            pane_id: 0,
+            role: role.to_string(),
+            text,
+            // Codex reports usage per-request in event_msg records rather than
+            // on the message, so turns carry none here. Better to report no
+            // usage than to attribute a number to the wrong turn.
+            model: None,
+            input_tokens: None,
+            output_tokens: None,
+        });
+    }
+    out
+}
+
+/// Newest codex rollout whose `session_meta.cwd` matches `cwd`.
+///
+/// Heuristic by necessity — codex has no flag to pin a session id. Requiring an
+/// exact cwd match keeps the ambiguity to panes sharing a directory.
+pub fn find_codex_rollout(home: &Path, cwd: &Path) -> Option<PathBuf> {
+    let root = home.join(".codex").join("sessions");
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            // Only the first line is needed: session_meta leads the file.
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Some(first) = raw.lines().next() else {
+                continue;
+            };
+            let Ok(d) = serde_json::from_str::<Value>(first) else {
+                continue;
+            };
+            let meta = d.get("payload").unwrap_or(&d);
+            if meta.get("cwd").and_then(Value::as_str) != Some(&cwd.to_string_lossy()) {
+                continue;
+            }
+            let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
+                continue;
+            };
+            if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
+                best = Some((mtime, path));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// Read a transcript and stamp every turn with the pane it belongs to.
+pub fn read_turns(path: &Path, pane_id: u32, is_codex: bool) -> Result<Vec<TurnRecord>> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    };
+    let mut turns = if is_codex {
+        parse_codex(&raw)
+    } else {
+        parse_claude(&raw)
+    };
+    for t in &mut turns {
+        t.pane_id = pane_id;
+    }
+    Ok(turns)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_transcript_path_is_exact_for_a_pinned_session() {
+        // Verified against a live transcript: the directory is the absolute
+        // cwd with every slash turned into a dash.
+        let p = claude_transcript_path(
+            Path::new("/home/u"),
+            Path::new("/home/users/shuai/apas"),
+            "11111111-2222-4333-8444-555555555555",
+        );
+        assert_eq!(
+            p,
+            Path::new("/home/u/.claude/projects/-home-users-shuai-apas/11111111-2222-4333-8444-555555555555.jsonl")
+        );
+    }
+
+    #[test]
+    fn claude_turns_carry_text_and_usage() {
+        let raw = r#"
+{"type":"user","timestamp":"2026-08-04T00:00:01Z","message":{"content":"what is 6x7?"}}
+{"type":"assistant","timestamp":"2026-08-04T00:00:02Z","message":{"model":"claude-opus-5","content":[{"type":"text","text":"42"}],"usage":{"input_tokens":2,"output_tokens":3}}}
+"#;
+        let turns = parse_claude(raw);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].text, "what is 6x7?");
+        assert_eq!(turns[1].text, "42");
+        assert_eq!(turns[1].model.as_deref(), Some("claude-opus-5"));
+        // Usage the agent would otherwise have had to volunteer.
+        assert_eq!(turns[1].input_tokens, Some(2));
+        assert_eq!(turns[1].output_tokens, Some(3));
+    }
+
+    #[test]
+    fn claude_bookkeeping_records_are_not_turns() {
+        // The transcript also holds mode / ai-title / last-prompt entries.
+        // Rendering those as conversation would be noise.
+        let raw = r#"
+{"type":"mode","timestamp":"t"}
+{"type":"ai-title","timestamp":"t"}
+{"type":"assistant","timestamp":"t","message":{"content":[{"type":"text","text":"real"}]}}
+"#;
+        let turns = parse_claude(raw);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].text, "real");
+    }
+
+    #[test]
+    fn a_tool_only_turn_is_skipped_rather_than_recorded_blank() {
+        let raw = r#"{"type":"assistant","timestamp":"t","message":{"content":[{"type":"tool_use","id":"1","name":"Bash","input":{}}]}}"#;
+        assert!(parse_claude(raw).is_empty());
+    }
+
+    #[test]
+    fn codex_turns_come_from_message_items_only() {
+        let raw = r#"
+{"type":"session_meta","payload":{"cwd":"/p"}}
+{"type":"response_item","timestamp":"t1","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<permissions instructions>"}]}}
+{"type":"response_item","timestamp":"t2","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"do it"}]}}
+{"type":"response_item","timestamp":"t3","payload":{"type":"reasoning","summary":[]}}
+{"type":"response_item","timestamp":"t4","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}
+{"type":"response_item","timestamp":"t5","payload":{"type":"custom_tool_call","name":"shell"}}
+"#;
+        let turns = parse_codex(raw);
+        assert_eq!(turns.len(), 2, "developer/reasoning/tool items are not turns");
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].text, "do it");
+        assert_eq!(turns[1].role, "assistant");
+        assert_eq!(turns[1].text, "done");
+    }
+
+    #[test]
+    fn developer_messages_never_leak_into_history() {
+        // These are the harness's own injected context, not something the
+        // human or the agent said — showing them would be confusing and long.
+        let raw = r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"secret harness prompt"}]}}"#;
+        assert!(parse_codex(raw).is_empty());
+    }
+
+    #[test]
+    fn malformed_lines_do_not_cost_the_rest_of_the_history() {
+        // A transcript read while the provider is mid-write ends in a partial
+        // line; losing the whole conversation over it would be absurd.
+        let raw = "{not json\n{\"type\":\"assistant\",\"timestamp\":\"t\",\"message\":{\"content\":\"kept\"}}\n{\"typ";
+        let turns = parse_claude(raw);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].text, "kept");
+    }
+
+    #[test]
+    fn read_turns_stamps_the_owning_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"assistant","timestamp":"t","message":{"content":"hi"}}"#,
+        )
+        .unwrap();
+        let turns = read_turns(&path, 77, false).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].pane_id, 77);
+    }
+
+    #[test]
+    fn a_missing_transcript_reads_empty_rather_than_failing() {
+        // Normal before the agent's first turn.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_turns(&dir.path().join("nope.jsonl"), 1, false)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn codex_rollout_lookup_matches_on_cwd() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join(".codex/sessions/2026/08/04");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("rollout-a.jsonl"),
+            r#"{"type":"session_meta","payload":{"cwd":"/other","id":"a"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            sessions.join("rollout-b.jsonl"),
+            r#"{"type":"session_meta","payload":{"cwd":"/wanted","id":"b"}}"#,
+        )
+        .unwrap();
+
+        let found = find_codex_rollout(home.path(), Path::new("/wanted"));
+        assert_eq!(
+            found.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()),
+            Some("rollout-b.jsonl")
+        );
+        assert!(find_codex_rollout(home.path(), Path::new("/nothing-here")).is_none());
+    }
+}

@@ -126,24 +126,6 @@ fn json_result<T: Serialize>(value: &T) -> Result<CallToolResult, ErrorData> {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct RecordTurnArgs {
-    /// "user" for something the human said, "assistant" for your own reply.
-    pub role: String,
-    /// The turn's text. For your own replies, the substance of what you said —
-    /// not a summary, since this becomes the pane's history.
-    pub text: String,
-    /// Model that produced the turn, when known.
-    #[serde(default)]
-    pub model: Option<String>,
-    /// Input tokens for this turn, when the provider reports them.
-    #[serde(default)]
-    pub input_tokens: Option<u64>,
-    /// Output tokens for this turn, when the provider reports them.
-    #[serde(default)]
-    pub output_tokens: Option<u64>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
 pub struct PublishRecordArgs {
     /// Record category: "diff", "review", "decision", "status", "escalation".
     /// Convention only — not validated, matching the file format.
@@ -288,42 +270,6 @@ impl ApasMcpServer {
             scratchpad::append(self.dir(), &record)
                 .map_err(|e| internal(format!("failed to append scratchpad record: {e:#}")))?;
         }
-        json_result(&record)
-    }
-
-    #[tool(
-        description = "Record one conversation turn into this pane's history. \
-                       Call it after every exchange: once for the user's message \
-                       and once for your reply. This is the ONLY way a terminal \
-                       pane's history reaches APAS — nothing observes the \
-                       terminal, so a turn you do not record did not happen as \
-                       far as the Overview, the web UI, and usage accounting are \
-                       concerned."
-    )]
-    async fn record_turn(
-        &self,
-        Parameters(args): Parameters<RecordTurnArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        if args.text.trim().is_empty() {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(
-                "text is empty — nothing to record.",
-            )]));
-        }
-        let record = crate::conversation::TurnRecord {
-            ts: now_rfc3339(),
-            // Server-side, from --pane-id. A pane must not be able to write
-            // history into another pane's transcript.
-            pane_id: self.pane_id,
-            role: args.role,
-            text: args.text,
-            model: args.model,
-            input_tokens: args.input_tokens,
-            output_tokens: args.output_tokens,
-        };
-        // No ProjectLock: exactly one MCP server exists per pane and each pane
-        // owns its own file, so there is no cross-process writer to race.
-        crate::conversation::append(self.dir(), &record)
-            .map_err(|e| internal(format!("failed to record turn: {e:#}")))?;
         json_result(&record)
     }
 
@@ -576,23 +522,11 @@ impl ApasMcpServer {
 #[tool_handler]
 impl ServerHandler for ApasMcpServer {
     fn get_info(&self) -> ServerInfo {
-        // These reach the model at initialize time — claude and codex both
-        // surface them. For a terminal pane that is the *only* channel we have
-        // to ask for anything: it execs the provider's real TUI, so there is no
-        // system prompt of ours to append to. record_turn is self-reported, so
-        // if this text does not ask for it, no history is ever written.
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "APAS team-mode tools. You are pane {pane}.\n\n\
-             ALWAYS call record_turn after every exchange — once with role \
-             \"user\" for what the human asked, once with role \"assistant\" for \
-             your reply, including token counts when you know them. APAS cannot \
-             see this conversation any other way: a turn you do not record is \
-             absent from the pane's history, the web UI, and usage accounting. \
-             Do this even when no other tool is needed.\n\n\
-             Publish work with publish_record, route work with delegate, and \
-             poll for inbound work with read_records (carry next_cursor \
-             forward). Do not hand-edit .apas-team.jsonl or team-todo.md — \
-             these tools keep both consistent."
+            "APAS team-mode tools. You are pane {pane}. Publish work with \
+             publish_record, route work with delegate, and poll for inbound work \
+             with read_records (carry next_cursor forward). Do not hand-edit \
+             .apas-team.jsonl or team-todo.md — these tools keep both consistent."
                 .replace("{pane}", &self.pane_id.to_string()),
         )
     }
@@ -823,65 +757,6 @@ mod tests {
     // -----------------------------------------------------------------
     // Tool handlers
     // -----------------------------------------------------------------
-
-    #[tokio::test]
-    async fn record_turn_stamps_pane_id_server_side() {
-        // A pane must not be able to write history into another pane's
-        // transcript, so the id comes from --pane-id, never from the agent.
-        let dir = project();
-        let result = server(&dir, 7)
-            .record_turn(Parameters(RecordTurnArgs {
-                role: "assistant".to_string(),
-                text: "I did the thing".to_string(),
-                model: Some("claude-opus-5".to_string()),
-                input_tokens: Some(100),
-                output_tokens: Some(20),
-            }))
-            .await
-            .unwrap();
-        assert!(!is_err(&result));
-
-        let stored = crate::conversation::read_all(dir.path(), 7).unwrap();
-        assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].pane_id, 7);
-        assert_eq!(stored[0].role, "assistant");
-        assert_eq!(stored[0].text, "I did the thing");
-        assert_eq!(stored[0].output_tokens, Some(20));
-        assert!(!stored[0].ts.is_empty(), "ts stamped at append time");
-        // And nothing landed in another pane's file.
-        assert!(crate::conversation::read_all(dir.path(), 8).unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn record_turn_rejects_an_empty_turn() {
-        // An empty record is pure noise in the history and in the web UI.
-        let dir = project();
-        let result = server(&dir, 7)
-            .record_turn(Parameters(RecordTurnArgs {
-                role: "assistant".to_string(),
-                text: "   ".to_string(),
-                model: None,
-                input_tokens: None,
-                output_tokens: None,
-            }))
-            .await
-            .unwrap();
-        assert!(is_err(&result));
-        assert!(crate::conversation::read_all(dir.path(), 7).unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn server_instructions_demand_turn_recording() {
-        // For a terminal pane these instructions are the only channel we have
-        // to ask for anything — it execs the provider's TUI, so there is no
-        // system prompt of ours. If this text stops asking, history silently
-        // stops being written and nothing else fails.
-        let dir = project();
-        let info = server(&dir, 3).get_info();
-        let text = info.instructions.unwrap_or_default();
-        assert!(text.contains("record_turn"), "instructions: {text}");
-        assert!(text.contains("pane 3"), "instructions name the pane: {text}");
-    }
 
     #[tokio::test]
     async fn publish_record_stamps_pane_id_server_side() {

@@ -26,6 +26,7 @@ mod scratchpad;
 mod suggested_workers;
 mod team_todo;
 mod terminal_pane;
+mod transcript;
 mod tui;
 mod update;
 mod usage;

@@ -134,6 +134,9 @@ impl TerminalHandle {
     pub fn spawn(
         pane_id: u32,
         session_id: Uuid,
+        // The pane's own conversation id, pinned so its transcript can be
+        // located deterministically.
+        claude_session_id: Uuid,
         provider: &Provider,
         binary_path: &str,
         cwd: &str,
@@ -163,6 +166,19 @@ impl TerminalHandle {
         }
         if let Some(flag) = permission_bypass_flag_for(provider) {
             cmd.arg(flag);
+        }
+        // Pin claude's session id to the one APAS already minted for this pane.
+        // That makes the transcript path exact -- `~/.claude/projects/<cwd with
+        // / as ->/<id>.jsonl` -- which is what lets the CLI read this pane's
+        // history without guessing which file is whose. Codex has no
+        // equivalent flag; see `transcript::find_codex_rollout`.
+        //
+        // Deliberately skipped when resuming: `--continue` picks up an existing
+        // conversation that already owns an id, and forcing a different one
+        // would either be rejected or split the history in two.
+        if !resume && matches!(provider, Provider::Claude) {
+            cmd.arg("--session-id");
+            cmd.arg(claude_session_id.to_string());
         }
         cmd.cwd(cwd);
         // A TUI keys its capabilities off TERM. Without this it inherits
@@ -429,9 +445,11 @@ mod tests {
         rt.block_on(async {
             let (tx, mut rx) = tokio_mpsc::channel(64);
             let session_id = Uuid::new_v4();
+            let conv_id = Uuid::new_v4();
             let handle = TerminalHandle::spawn(
                 7,
                 session_id,
+                conv_id,
                 &Provider::Claude,
                 "/bin/echo",
                 "/tmp",
@@ -470,13 +488,17 @@ mod tests {
 
             assert!(exited, "reader never reported the child exit");
             // `/bin/echo` prints its argv, so this doubles as end-to-end proof
-            // that the permission-bypass flag actually reaches the spawned
-            // process — not just that the mapping function returns it. The pty
-            // turns the trailing newline into CRLF, which is what xterm.js
-            // expects, so compare against the trimmed line.
+            // that the flags actually reach the spawned process — not just that
+            // the mapping functions return them. The pty turns the trailing
+            // newline into CRLF, which is what xterm.js expects, so compare
+            // against the trimmed line.
+            //
+            // `--session-id` is the load-bearing one: it pins claude's
+            // conversation id to the pane's, which is the only reason the
+            // pane's transcript can be located exactly rather than guessed.
             assert_eq!(
                 String::from_utf8_lossy(&collected).trim_end(),
-                "--dangerously-skip-permissions",
+                format!("--dangerously-skip-permissions --session-id {conv_id}"),
             );
             handle.shutdown();
         });
@@ -492,6 +514,7 @@ mod tests {
             let (tx, _rx) = tokio_mpsc::channel(64);
             let handle = TerminalHandle::spawn(
                 1,
+                Uuid::new_v4(),
                 Uuid::new_v4(),
                 &Provider::Claude,
                 "/bin/cat",

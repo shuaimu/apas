@@ -521,44 +521,50 @@ interrupting, where the web does the reverse — between an interrupt and the
 pause landing, a sibling pane's write can wake the loop for one more iteration.
 Unmanaged side chats are never touched.
 
-## Self-reported history for terminal panes (`record_turn`)
+## Terminal-pane history: read the provider's transcript
 
-An agent pane is *observed*: the CLI parses its stream-json and knows every turn
-without cooperation. A terminal pane hosts the provider's real TUI on a pty, so
-there is nothing structured to parse — which is why it had no history and no
-usage.
+An agent pane is *observed* — the CLI parses its stream-json and knows every
+turn without cooperation. A terminal pane hosts the provider's real TUI on a
+pty, so there is nothing structured to parse, which is why terminal panes had
+no history and no usage counters.
 
-The agent now reports its own turns through its per-pane MCP server. Each call
-appends to `.apas-conversations/pane-<id>.jsonl` (one file per pane, so appends
-need no cross-process lock — exactly one MCP server exists per pane, unlike
-`team-todo.md`). A CLI tailer forwards new turns to the server.
+**Self-reporting via MCP was tried first and does not work.** A `record_turn`
+tool was added and the requirement stated in the MCP server's `initialize`
+instructions. Tested against both providers: each connects to the server and
+*will* call the tool when told to directly, but neither acts on the
+`initialize` instructions — an ordinary task ("what is 17 times 23?") recorded
+nothing at all. Those instructions are advisory and both clients treat them as
+such. Do not reach for that mechanism again expecting a guarantee.
 
-**The turn is dressed as the stream message an agent pane would have sent**
-(`conversation_turn_to_stream_messages`). That is the whole trick: no new wire
-message, no new storage path, no new renderer. The server persists it to the
-same `messages.jsonl`, the web renders it with the same components, and usage
-accounting bills the same pane — none of which needed changing. A turn carrying
-token counts emits a second `Result` message, because `ws_cli` reads usage only
-from `extra.usage` on that variant; `total_cost_usd` stays 0 since a
-self-reporting agent cannot know what it was billed.
+So the CLI reads the transcript each provider already writes. It needs no
+cooperation, cannot be skipped, and carries token usage the agent would
+otherwise have had to volunteer.
 
-**Two properties follow from self-report, and both are accepted trade-offs:**
+**Locating the file differs by provider, and so does the confidence:**
 
-1. *History is only as complete as the agent's cooperation.* Nothing enforces
-   the call. The MCP server states the requirement in its `initialize`
-   instructions — for a terminal pane that is the **only** channel available,
-   since it execs the provider's TUI and there is no system prompt of ours to
-   append to. If that text stops asking, history silently stops being written
-   and nothing else fails, which is why a test asserts it still does.
-2. *The content is whatever the agent says.* `pane_id` is stamped server-side
-   from `--pane-id`, so a pane cannot forge history for **another** pane, but
-   within its own pane this records what the agent claims, not what happened.
+- **claude** — spawned with `--session-id <pane's session_id>`, which APAS
+  already mints per pane. The path is then exact:
+  `~/.claude/projects/<cwd with / replaced by ->/<session-id>.jsonl`. Verified
+  against a live run, not assumed. Skipped when resuming: `--continue` picks up
+  a conversation that already owns an id, and forcing a different one would
+  split the history.
+- **codex** — has no equivalent flag. Its rollout files record `cwd` and a
+  start timestamp in `session_meta`, so a pane is matched to the newest rollout
+  in its own directory. That is a heuristic; two codex panes in the same
+  directory could in principle be confused.
 
-The alternative — tailing the provider's own transcript
-(`~/.claude/projects/**.jsonl`, `~/.codex/sessions/**/rollout-*.jsonl`, both of
-which carry full turns *and* token usage) — would be complete and need no
-cooperation, but only ever works for providers whose format we track. Self-report
-was chosen for provider-agnostic coverage.
+Parsing keeps only real conversation. claude transcripts also carry `mode`,
+`ai-title`, `last-prompt` bookkeeping; codex carries `developer` messages (the
+harness's own injected context), `reasoning`, and tool calls. None of those are
+turns, and rendering them would be noise. Tool-use-only turns with no text are
+skipped rather than recorded blank.
+
+Each turn is then dressed as the stream message an agent pane would have sent
+(`conversation_turn_to_stream_messages`). That is the trick that made this
+cheap: no new wire message, no new storage path, no new renderer, and no server
+or web change at all. A turn carrying token counts emits a second `Result`
+message, because `ws_cli` reads usage only from `extra.usage` on that variant;
+`total_cost_usd` stays 0 because the transcript reports tokens, not price.
 
 ## Team-mode MCP server (`apas mcp-server`)
 
@@ -620,7 +626,8 @@ integration is built on stream-json events, so a terminal pane still has no
 pane status, no `PaneDiff`, and no plan review. It is never a Tech Lead
 delegation target and is forced `managed: false`.
 
-**Conversation history and usage now arrive by self-report** — see below.
+**Conversation history and usage** are recovered by reading the provider's
+own transcript — see below.
 
 **Transport.** Raw pty bytes never touch `CliToServer::Output` or
 `StreamMessage` — those persist into `messages.jsonl` as chat records, and

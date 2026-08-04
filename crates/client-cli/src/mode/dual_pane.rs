@@ -1090,6 +1090,9 @@ fn spawn_terminal_pane(
     terminal_panes: &TerminalPanes,
     pane_id: u32,
     session_id: Uuid,
+    // Pinned as claude's `--session-id`, which makes this pane's transcript
+    // path exact instead of guessed.
+    claude_session_id: Uuid,
     provider: &Provider,
     working_dir: &str,
     worktree_path: Option<&str>,
@@ -1109,6 +1112,7 @@ fn spawn_terminal_pane(
     let handle = TerminalHandle::spawn(
         pane_id,
         session_id,
+        claude_session_id,
         provider,
         &binary_path,
         cwd,
@@ -1901,7 +1905,7 @@ async fn run_inner(
         Arc<Mutex<Option<std::process::Child>>>,
     )> = Vec::new();
     // (pane_id, provider, worktree_path) for pty-hosted terminal panes.
-    let mut terminal_startups: Vec<(u32, Provider, Option<String>)> = Vec::new();
+    let mut terminal_startups: Vec<(u32, Provider, Uuid, Option<String>)> = Vec::new();
     {
         let mut pauses = pane_pauses.lock().unwrap();
         let mut stop_requests = pane_stop_requests.lock().unwrap();
@@ -1965,7 +1969,12 @@ async fn run_inner(
             // entirely by `Terminal*` messages — so branch before the
             // agent-worker startup bookkeeping below.
             if tab_kind.is_terminal() {
-                terminal_startups.push((*pane_id, *provider, tab_worktree.clone()));
+                terminal_startups.push((
+                    *pane_id,
+                    *provider,
+                    *pane_session_id,
+                    tab_worktree.clone(),
+                ));
                 continue;
             }
 
@@ -2012,11 +2021,12 @@ async fn run_inner(
     // panes that already existed in `.apas` — the pty itself did not
     // survive the restart, so this is the closest we get to reattaching
     // (claude `--continue` / codex `resume`).
-    for (pane_id, provider, worktree) in &terminal_startups {
+    for (pane_id, provider, pane_session_id, worktree) in &terminal_startups {
         if let Err(err) = spawn_terminal_pane(
             &terminal_panes,
             *pane_id,
             session_id,
+            *pane_session_id,
             provider,
             &working_dir_str,
             worktree.as_deref(),
@@ -2541,11 +2551,11 @@ async fn run_inner(
     // pushes new records to the server (which forwards to web). On
     // first tick we send the existing history so newly-attached web
     // clients see what came before. Polls mtime+size — cheap; only
-    // Terminal panes have no stream-json to observe, so their history arrives
-    // as `record_turn` calls that the per-pane MCP server appends to
-    // `.apas-conversations/pane-<id>.jsonl`. This tails those files and
-    // forwards each new turn as the stream message an agent pane would have
-    // sent, which is what gets it stored, rendered, and billed for free.
+    // Terminal panes have no stream-json to observe, so their history is read
+    // out of the provider's own transcript. Self-reporting via an MCP tool was
+    // tried first and does not work: both claude and codex connect to the
+    // server and will call the tool when told to directly, but neither acts on
+    // the MCP `initialize` instructions, so an ordinary task recorded nothing.
     //
     // Polling rather than the file watcher: the watcher is mtime-gated for
     // deadloop wake-ups and reports only *that* something changed, while this
@@ -2554,44 +2564,75 @@ async fn run_inner(
         let server_tx_for_turns = server_tx.clone();
         let shutdown_for_turns = shutdown.clone();
         let project_for_turns = std::path::PathBuf::from(working_dir_str.clone());
-        let pane_sessions_for_turns = pane_sessions.clone();
+        let metas_for_turns = pane_metas.clone();
+        let sessions_for_turns = pane_sessions.clone();
         thread::spawn(move || {
-            // Per-pane cursor. Seeded to the current length on startup rather
-            // than 0, so a CLI restart does not replay a pane's entire history
-            // into the server as if it were new.
+            let Some(home) = dirs::home_dir() else {
+                tracing::warn!("no home dir; terminal pane history is unavailable");
+                return;
+            };
+            // Per-pane cursor, seeded on first sight rather than 0 so a CLI
+            // restart does not replay a pane's whole history as if it were new.
             let mut seen: HashMap<u32, usize> = HashMap::new();
-            for pane_id in crate::conversation::panes_with_history(&project_for_turns) {
-                let existing = crate::conversation::read_all(&project_for_turns, pane_id)
-                    .map(|r| r.len())
-                    .unwrap_or(0);
-                seen.insert(pane_id, existing);
-            }
+            let mut warmed: bool = false;
             while !shutdown_for_turns.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_secs(2));
-                for pane_id in crate::conversation::panes_with_history(&project_for_turns) {
-                    let Ok(all) = crate::conversation::read_all(&project_for_turns, pane_id) else {
+                thread::sleep(Duration::from_secs(3));
+
+                // Snapshot terminal panes: (pane_id, provider, conversation id).
+                let panes: Vec<(u32, Provider, Uuid)> = {
+                    let Ok(metas) = metas_for_turns.lock() else {
+                        continue;
+                    };
+                    let sessions = sessions_for_turns.lock().ok();
+                    metas
+                        .iter()
+                        .filter(|(_, m)| m.kind.is_terminal())
+                        .filter_map(|(id, m)| {
+                            let sid = sessions.as_ref()?.get(id).copied()?;
+                            Some((*id, m.provider.clone(), sid))
+                        })
+                        .collect()
+                };
+
+                for (pane_id, provider, conv_id) in panes {
+                    let is_codex = matches!(provider, Provider::Codex);
+                    let path = if is_codex {
+                        // No flag pins a codex session id, so match on cwd.
+                        match crate::transcript::find_codex_rollout(&home, &project_for_turns) {
+                            Some(p) => p,
+                            None => continue,
+                        }
+                    } else {
+                        crate::transcript::claude_transcript_path(
+                            &home,
+                            &project_for_turns,
+                            &conv_id.to_string(),
+                        )
+                    };
+
+                    let Ok(turns) = crate::transcript::read_turns(&path, pane_id, is_codex) else {
                         continue;
                     };
                     let cursor = seen.entry(pane_id).or_insert(0);
-                    if all.len() <= *cursor {
+                    if !warmed {
+                        // First pass only establishes where each transcript
+                        // already was.
+                        *cursor = turns.len();
                         continue;
                     }
-                    // The pane's own claude session id, so replayed history
-                    // groups under the right conversation server-side.
-                    let claude_sid = pane_sessions_for_turns
-                        .lock()
-                        .ok()
-                        .and_then(|m| m.get(&pane_id).copied())
-                        .unwrap_or(session_id);
-                    for turn in &all[*cursor..] {
-                        for msg in conversation_turn_to_stream_messages(
-                            turn, session_id, claude_sid,
-                        ) {
+                    if turns.len() <= *cursor {
+                        continue;
+                    }
+                    for turn in &turns[*cursor..] {
+                        for msg in
+                            conversation_turn_to_stream_messages(turn, session_id, conv_id)
+                        {
                             let _ = server_tx_for_turns.blocking_send(msg);
                         }
                     }
-                    *cursor = all.len();
+                    *cursor = turns.len();
                 }
+                warmed = true;
             }
         });
     }
@@ -3163,6 +3204,7 @@ fn handle_tui_events(
                         &terminal_panes,
                         pane_id,
                         session_id,
+                        claude_session_id,
                         &provider,
                         working_dir,
                         worktree_path.as_deref(),
