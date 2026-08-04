@@ -559,6 +559,17 @@ harness's own injected context), `reasoning`, and tool calls. None of those are
 turns, and rendering them would be noise. Tool-use-only turns with no text are
 skipped rather than recorded blank.
 
+**The web can render a terminal pane either way.** A per-pane toggle switches
+between the live pty (xterm.js) and the same structured conversation view an
+agent pane gets — the captured turns arrive as ordinary pane messages, so
+`MessagePane` renders them with no special casing. The two are not equivalent
+and the UI says so: the terminal is live and interactive, while the
+conversation is a *reading* of the transcript that lags by up to one poll,
+shows only user/assistant turns, and cannot be typed into. The terminal stays
+mounted-but-hidden behind the conversation view, because unmounting would tear
+down the xterm instance and force a re-attach, losing scroll position and focus
+on every glance at the transcript.
+
 Each turn is then dressed as the stream message an agent pane would have sent
 (`conversation_turn_to_stream_messages`). That is the trick that made this
 cheap: no new wire message, no new storage path, no new renderer, and no server

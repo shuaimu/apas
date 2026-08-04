@@ -1,0 +1,91 @@
+"use client";
+
+import { useCallback, useEffect, useState } from "react";
+
+/**
+ * How a `PaneKind: "terminal"` pane is displayed.
+ *
+ *  - `terminal` — the raw pty through xterm.js. What the pane actually is.
+ *  - `conversation` — the same structured chat view an agent pane gets, built
+ *    from the turns the CLI reads out of the provider's own transcript.
+ *
+ * The second view only became possible once terminal panes had history at all:
+ * their turns now arrive as ordinary pane messages, so the existing
+ * `MessagePane` renders them with no special casing.
+ *
+ * Note the two views are not equivalent and the difference is not cosmetic.
+ * The terminal is live and interactive; the conversation view is a *reading*
+ * of the transcript, so it lags by up to one poll interval, shows only
+ * user/assistant turns, and cannot be typed into. It is for reviewing what
+ * happened, not for driving the agent.
+ */
+export type TerminalViewMode = "terminal" | "conversation";
+
+const STORAGE_KEY = "apas_terminal_view_mode";
+
+/**
+ * Persisted per pane rather than globally: someone watching one agent work
+ * while reading another's transcript is the normal case, and a single global
+ * flag would fight them on every tab switch.
+ */
+function readAll(): Record<string, TerminalViewMode> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    return raw ? (JSON.parse(raw) as Record<string, TerminalViewMode>) : {};
+  } catch {
+    // Corrupt or unavailable storage must not take the pane down with it.
+    return {};
+  }
+}
+
+function writeAll(map: Record<string, TerminalViewMode>) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(map));
+  } catch {
+    // Private mode / quota. The choice just won't survive a reload.
+  }
+}
+
+/** Key by session too, so the same pane id in another project is independent. */
+export function viewModeKey(sessionId: string | null, paneId: number): string {
+  return `${sessionId ?? "none"}:${paneId}`;
+}
+
+/**
+ * Current view for a pane plus a setter. Defaults to `terminal` — that is what
+ * the pane *is*, and defaulting to a lagging read-only view would look like the
+ * terminal had broken.
+ */
+export function useTerminalViewMode(
+  sessionId: string | null,
+  paneId: number,
+): [TerminalViewMode, (mode: TerminalViewMode) => void] {
+  const key = viewModeKey(sessionId, paneId);
+  // Starts at the default and syncs from storage after mount: reading
+  // localStorage during render would mismatch the server-rendered HTML and
+  // trip a hydration error.
+  const [mode, setModeState] = useState<TerminalViewMode>("terminal");
+
+  useEffect(() => {
+    const stored = readAll()[key];
+    if (stored === "terminal" || stored === "conversation") {
+      setModeState(stored);
+    } else {
+      setModeState("terminal");
+    }
+  }, [key]);
+
+  const setMode = useCallback(
+    (next: TerminalViewMode) => {
+      setModeState(next);
+      const all = readAll();
+      all[key] = next;
+      writeAll(all);
+    },
+    [key],
+  );
+
+  return [mode, setMode];
+}

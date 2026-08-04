@@ -17,6 +17,47 @@ import { CodeBlock } from "../code/CodeBlock";
 // xterm.js touches `document` at import time, so it can't be part of the
 // server bundle. Loading it lazily also keeps the ~300 KB emulator out of
 // the initial payload for the (common) case of no terminal panes.
+import { TerminalViewToggle } from "./TerminalViewToggle";
+
+/**
+ * A terminal pane with its two views.
+ *
+ * Its own component because `useTerminalViewMode` is a hook and the tab list is
+ * rendered inside a `.map` — calling a hook there would break the rules-of-hooks
+ * ordering the moment the tab count changed (React error #310, which takes the
+ * whole app down).
+ */
+function TerminalPaneWithViews({
+  sessionId,
+  paneId,
+  messages,
+}: {
+  sessionId: string | null;
+  paneId: number;
+  messages: Message[];
+}) {
+  const [mode, setMode] = useTerminalViewMode(sessionId, paneId);
+  return (
+    <>
+      <TerminalViewToggle mode={mode} onChange={setMode} turnCount={messages.length} />
+      {/* Hidden rather than unmounted — see the call site. */}
+      <div className={mode === "terminal" ? "flex-1 flex flex-col min-h-0" : "hidden"}>
+        <TerminalPane key={`terminal-${sessionId}-${paneId}`} paneId={paneId} />
+      </div>
+      {mode === "conversation" && (
+        <MessagePane
+          key={`terminal-chat-${sessionId}-${paneId}`}
+          paneId={paneId}
+          messages={messages}
+          isActive
+        />
+      )}
+    </>
+  );
+}
+
+import { useTerminalViewMode } from "@/lib/terminalViewMode";
+
 const TerminalPane = dynamic(
   () => import("./TerminalPane").then((m) => m.TerminalPane),
   {
@@ -1430,12 +1471,20 @@ export function TabbedView({
               className={isActive ? "flex-1 flex flex-col min-h-0" : "hidden"}
             >
               {tab.kind === "terminal" ? (
-                // Terminal panes carry no messages — the pty stream goes
-                // straight to xterm.js via terminalBus, so none of the
-                // MessagePane / task-bar machinery applies here.
-                <TerminalPane
-                  key={`terminal-${sessionId}-${tab.pane_id}`}
+                // Two views over one pane. The pty stream still goes straight
+                // to xterm.js via terminalBus; the conversation view renders
+                // the turns the CLI reads out of the provider's transcript,
+                // which arrive as ordinary pane messages and so need no
+                // special casing in MessagePane.
+                //
+                // The terminal is kept mounted and merely hidden when the
+                // conversation is showing: unmounting would tear down the
+                // xterm instance and force a re-attach, losing scroll position
+                // and focus every time someone glanced at the transcript.
+                <TerminalPaneWithViews
+                  sessionId={sessionId}
                   paneId={tab.pane_id}
+                  messages={msgs}
                 />
               ) : isTimeline ? (
                 <TimelinePane
