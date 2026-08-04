@@ -91,8 +91,21 @@ describe("SharePage", () => {
     render(<SharePage />);
 
     await waitFor(() => {
-      expect(navigation.push).toHaveBeenCalledWith("/login?redirect=/share?code=GUEST123");
+      expect(navigation.push).toHaveBeenCalledWith(
+        "/login?redirect=%2Fshare%3Fcode%3DGUEST123",
+      );
     });
+
+    // The name of this test says "preserved", so assert that rather than the
+    // literal string: the previous unencoded form ("/login?redirect=/share?
+    // code=GUEST123") parsed as redirect=/share plus a stray top-level
+    // code=GUEST123, so the invite code never reached the login page and the
+    // recipient was stranded on the dashboard.
+    const pushed = (navigation.push as unknown as { mock: { calls: string[][] } })
+      .mock.calls[0][0];
+    const url = new URL(pushed, "http://x.test");
+    expect(url.searchParams.get("redirect")).toBe("/share?code=GUEST123");
+    expect(url.searchParams.get("code")).toBeNull();
     expect(fetchMock).not.toHaveBeenCalled();
   });
 

@@ -3,6 +3,7 @@
 import { useState, useEffect, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
+import { safeRedirect, redirectParam } from "@/lib/safeRedirect";
 import { useStore } from "@/lib/store";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://apas.mpaxos.com";
@@ -75,7 +76,7 @@ function RegisterForm() {
             setCliAuthorized(true);
             // Wait a moment to show success message
             setTimeout(() => {
-              router.push("/");
+              router.push(safeRedirect(searchParams.get("redirect")) ?? "/");
             }, 2000);
             return;
           }
@@ -84,12 +85,28 @@ function RegisterForm() {
         }
       }
 
-      router.push("/");
+      router.push(safeRedirect(searchParams.get("redirect")) ?? "/");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Registration failed");
     } finally {
       setLoading(false);
     }
+  };
+
+
+  /**
+   * Link to the sibling auth page without losing where the user was headed.
+   * An invited user who has no account yet goes /share -> /login -> "create
+   * account"; dropping the redirect here stranded them on the dashboard after
+   * signing up, with the invite unredeemed.
+   */
+  const crossLinkHref = (base: string) => {
+    const params = new URLSearchParams();
+    if (deviceCode) params.set("code", deviceCode);
+    const target = safeRedirect(searchParams.get("redirect"));
+    if (target) params.set("redirect", target);
+    const qs = params.toString();
+    return qs ? `${base}?${qs}` : base;
   };
 
   if (cliAuthorized) {
@@ -204,7 +221,7 @@ function RegisterForm() {
         <p className="mt-6 text-center text-sm text-gray-600 dark:text-gray-400">
           Already have an account?{" "}
           <Link
-            href={deviceCode ? `/login?code=${deviceCode}` : "/login"}
+            href={crossLinkHref("/login")}
             className="text-cyan-600 hover:text-cyan-500 font-medium"
           >
             Sign in

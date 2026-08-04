@@ -3,6 +3,7 @@
 import { useState, useEffect, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
+import { redirectParam } from "@/lib/safeRedirect";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://apas.mpaxos.com";
 
@@ -34,8 +35,12 @@ function ShareRedeemForm() {
 
     const authToken = token || localStorage.getItem("apas_token");
     if (!authToken) {
-      // Redirect to login with return URL
-      router.push(`/login?redirect=/share?code=${redeemCode}`);
+      // Redirect to login with return URL. The target must be encoded: it
+      // contains its own `?`, so interpolating it raw yielded
+      // `/login?redirect=/share?code=ABC`, which parses as `redirect=/share`
+      // plus a stray top-level `code=ABC` — the invite code was dropped and
+      // the recipient landed on an empty form.
+      router.push(`/login?${redirectParam(`/share?code=${redeemCode}`)}`);
       return;
     }
 
