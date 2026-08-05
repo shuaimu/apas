@@ -429,6 +429,55 @@ impl DaemonState {
         }
     }
 
+    /// Claim every project this host is already running.
+    ///
+    /// Claims are otherwise only taken in `start_project`, so a daemon that
+    /// restarts — or re-execs to self-upgrade — comes back owning nothing while
+    /// its project CLIs keep running in their own tmux sessions. During that
+    /// gap a peer sees the projects unclaimed, and its `is_headless_running_for`
+    /// only reads its *own* `/proc`, so it cannot tell they are alive here: a
+    /// `StartProjectCli` there would spawn a second CLI against the same `.apas`
+    /// and worktrees. Reconciling at startup closes the window entirely.
+    ///
+    /// A peer holding the claim for something we are running is logged rather
+    /// than seized. That combination means two CLIs are already live for one
+    /// project, which is the thing claims exist to prevent — stealing the claim
+    /// would hide it, and the operator needs to see it.
+    fn reconcile_running_claims(&mut self) {
+        let registry_dir = config_dir_for_registry();
+        for (project_id, project) in &self.projects {
+            if !is_headless_running_for(&project.path) {
+                continue;
+            }
+            match crate::daemon_registry::claim_project(
+                &registry_dir,
+                project_id,
+                &project.path.display().to_string(),
+                self.machine_info.machine_id,
+            ) {
+                Ok(crate::daemon_registry::ClaimOutcome::Acquired) => {
+                    tracing::info!(
+                        project_id,
+                        path = %project.path.display(),
+                        "reclaimed a project that was already running here"
+                    );
+                }
+                Ok(crate::daemon_registry::ClaimOutcome::AlreadyOurs) => {}
+                Ok(crate::daemon_registry::ClaimOutcome::HeldBy(peer)) => {
+                    tracing::warn!(
+                        project_id,
+                        peer = %peer.hostname,
+                        heartbeat_age_secs = peer.age_secs,
+                        "project is running here but claimed by a peer — two CLIs may be live for it"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(project_id, %err, "could not reconcile project claim");
+                }
+            }
+        }
+    }
+
     fn snapshot_projects(&self) -> Vec<MachineProjectInfo> {
         let mut projects = Vec::with_capacity(self.projects.len());
 
@@ -779,6 +828,10 @@ pub async fn run(
 
     let mut state = DaemonState::new(machine_info);
     state.refresh_projects();
+    // Adopt anything already running here before serving any request, so a
+    // restart or self-upgrade never leaves a window where our projects look
+    // unclaimed to peers.
+    state.reconcile_running_claims();
 
     let mut reconnect_delay = INITIAL_RECONNECT_DELAY;
 

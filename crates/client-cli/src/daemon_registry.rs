@@ -307,8 +307,15 @@ pub fn claim_project(
 
     if let Some(existing) = read_json::<ProjectClaim>(&path) {
         if existing.hostname == me {
+            // Take over the pid as well as the heartbeat. A claim written by a
+            // *previous* daemon on this host still carries that daemon's pid,
+            // and `refresh_own_claims` only refreshes claims whose pid matches
+            // the running process — so keeping the old pid here would leave the
+            // claim un-refreshed, stale within STALE_AFTER_SECS, and free for a
+            // peer to take while we are actively running the project.
             let refreshed = ProjectClaim {
                 heartbeat: now,
+                pid: std::process::id(),
                 ..existing
             };
             write_atomic(&path, &refreshed)?;
@@ -400,6 +407,82 @@ pub fn release_all_own_claims(config_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reclaiming_our_own_host_claim_adopts_the_current_pid() {
+        // A claim written by a *previous* daemon on this host carries that
+        // daemon's pid. `refresh_own_claims` only refreshes claims whose pid
+        // matches the running process, so if reclaiming kept the old pid the
+        // claim would stop being refreshed, go stale within STALE_AFTER_SECS,
+        // and a peer could take a project we are actively running.
+        let dir = tempfile::tempdir().unwrap();
+        let machine = Uuid::new_v4();
+
+        // Simulate a claim left by an earlier daemon on this same host.
+        let path = claim_path(dir.path(), "proj-1");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write_atomic(
+            &path,
+            &ProjectClaim {
+                project_id: "proj-1".to_string(),
+                project_path: "/p".to_string(),
+                hostname: hostname(),
+                machine_id: machine,
+                pid: 999_999, // some long-dead daemon
+                claimed_at: now_secs() - 100,
+                heartbeat: now_secs() - 100,
+            },
+        )
+        .unwrap();
+
+        let outcome = claim_project(dir.path(), "proj-1", "/p", machine).unwrap();
+        assert!(matches!(outcome, ClaimOutcome::AlreadyOurs));
+
+        let stored = read_json::<ProjectClaim>(&path).expect("claim still present");
+        assert_eq!(
+            stored.pid,
+            std::process::id(),
+            "the claim must name the live daemon, or refresh_own_claims skips it"
+        );
+
+        // And the whole point: it is now refreshable.
+        let before = stored.heartbeat;
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        refresh_own_claims(dir.path());
+        let after = read_json::<ProjectClaim>(&path).unwrap();
+        assert!(
+            after.heartbeat > before,
+            "refresh_own_claims should now keep this claim alive"
+        );
+    }
+
+    #[test]
+    fn a_live_peer_claim_is_still_refused_after_the_pid_change() {
+        // The pid adoption must apply only to our own hostname — never as a
+        // way to take a claim a live peer holds.
+        let dir = tempfile::tempdir().unwrap();
+        let path = claim_path(dir.path(), "proj-2");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write_atomic(
+            &path,
+            &ProjectClaim {
+                project_id: "proj-2".to_string(),
+                project_path: "/p".to_string(),
+                hostname: "some-other-host".to_string(),
+                machine_id: Uuid::new_v4(),
+                pid: 4242,
+                claimed_at: now_secs(),
+                heartbeat: now_secs(),
+            },
+        )
+        .unwrap();
+
+        let outcome = claim_project(dir.path(), "proj-2", "/p", Uuid::new_v4()).unwrap();
+        assert!(matches!(outcome, ClaimOutcome::HeldBy(_)));
+        let stored = read_json::<ProjectClaim>(&path).unwrap();
+        assert_eq!(stored.hostname, "some-other-host", "peer claim untouched");
+        assert_eq!(stored.pid, 4242);
+    }
     use tempfile::TempDir;
 
     fn other_host_claim(id: &str, host: &str, heartbeat: u64) -> ProjectClaim {

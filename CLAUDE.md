@@ -547,6 +547,23 @@ new file rather than editing one in place.
   against the same `.apas` and worktrees — the race the claim system exists to
   prevent.
 
+**Claims are reconciled at daemon startup.** `reconcile_running_claims` claims
+every project this host is already running, because claims are otherwise only
+taken in `start_project` — so a restarted or self-upgraded daemon would come
+back owning nothing while its project CLIs kept running. During that gap a peer
+sees the projects unclaimed, and its `is_headless_running_for` only reads its
+*own* `/proc`, so a `StartProjectCli` there would spawn a second CLI against the
+same `.apas` and worktrees. A peer holding the claim for something running here
+is logged, not seized: that means two CLIs are already live for one project,
+which is exactly what the operator needs to see.
+
+Relatedly, `claim_project` adopts the **current pid** when refreshing a claim
+owned by this hostname. A claim written by a previous daemon carries that
+daemon's pid, and `refresh_own_claims` only refreshes claims whose pid matches
+the running process — so keeping the old pid left the claim un-refreshed, stale
+within `STALE_AFTER_SECS`, and free for a peer to take while we were actively
+running the project.
+
 **Headless project CLIs are untouched.** They are owned by a per-project
 `tmux:server`, not by the daemon — the daemon has no long-lived children — so
 nothing about replacing the daemon's process image reaches them. And because
