@@ -294,37 +294,40 @@ fn conversation_turn_to_stream_messages(
     claude_session_id: Uuid,
 ) -> Vec<CliToServer> {
     let sid = claude_session_id.to_string();
-    let block = shared::ClaudeContentBlock::Text {
-        text: turn.text.clone(),
-    };
-    let message = if turn.is_assistant() {
-        shared::ClaudeStreamMessage::Assistant {
-            message: shared::ClaudeAssistantMessage {
-                content: vec![block],
-                model: turn.model.clone().unwrap_or_default(),
+
+    // Non-assistant turns go over `UserInput`, NOT as a `StreamMessage` with a
+    // `ClaudeStreamMessage::User`. That variant means "tool result" to the
+    // server: its converter walks the content blocks looking only for
+    // `ToolResult` and silently ignores anything else, so a `Text` block was
+    // dropped on the floor and every message the human typed vanished while
+    // assistant turns came through fine. `UserInput` is the channel meant for
+    // this — the server stores it as role "user" against the pane and routes
+    // it to the web.
+    let mut out = if turn.is_assistant() {
+        vec![CliToServer::StreamMessage {
+            session_id,
+            message: shared::ClaudeStreamMessage::Assistant {
+                message: shared::ClaudeAssistantMessage {
+                    content: vec![shared::ClaudeContentBlock::Text {
+                        text: turn.text.clone(),
+                    }],
+                    model: turn.model.clone().unwrap_or_default(),
+                    extra: serde_json::Value::Null,
+                },
+                session_id: sid.clone(),
                 extra: serde_json::Value::Null,
             },
-            session_id: sid.clone(),
-            extra: serde_json::Value::Null,
-        }
+            pane_type: None,
+            pane_id: Some(turn.pane_id),
+        }]
     } else {
-        shared::ClaudeStreamMessage::User {
-            message: shared::ClaudeUserMessage {
-                content: vec![block],
-                role: turn.role.clone(),
-            },
-            session_id: sid.clone(),
-            tool_use_result: None,
-            extra: serde_json::Value::Null,
-        }
+        vec![CliToServer::UserInput {
+            session_id,
+            text: turn.text.clone(),
+            pane_type: None,
+            pane_id: Some(turn.pane_id),
+        }]
     };
-
-    let mut out = vec![CliToServer::StreamMessage {
-        session_id,
-        message,
-        pane_type: None,
-        pane_id: Some(turn.pane_id),
-    }];
 
     if turn.has_usage() {
         // `subtype: "success"` is what marks the turn complete for accounting;
@@ -7295,19 +7298,25 @@ Use a project-specific custom dispatch loop.";
     }
 
     #[test]
-    fn a_reported_user_turn_becomes_a_user_message() {
+    fn a_user_turn_goes_over_user_input_not_a_stream_message() {
+        // Regression: it used to be sent as `StreamMessage` with a
+        // `ClaudeStreamMessage::User`. That variant means "tool result" to the
+        // server — its converter only looks for `ToolResult` blocks — so a
+        // `Text` block was silently dropped and every message the human typed
+        // was missing from the conversation view, while assistant turns worked.
         let msgs = super::conversation_turn_to_stream_messages(
             &recorded_turn("user", "do the thing"),
             Uuid::new_v4(),
             Uuid::new_v4(),
         );
-        assert!(matches!(
-            &msgs[0],
-            CliToServer::StreamMessage {
-                message: shared::ClaudeStreamMessage::User { .. },
-                ..
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0] {
+            CliToServer::UserInput { text, pane_id, .. } => {
+                assert_eq!(text, "do the thing");
+                assert_eq!(*pane_id, Some(42));
             }
-        ));
+            other => panic!("user turns must use UserInput, got {other:?}"),
+        }
     }
 
     #[test]
@@ -7349,7 +7358,7 @@ Use a project-specific custom dispatch loop.";
     }
 
     #[test]
-    fn an_unknown_role_still_reaches_the_web_as_a_user_message() {
+    fn an_unknown_role_still_reaches_the_web() {
         // Degrade to "rendered plainly", never to a dropped turn.
         let msgs = super::conversation_turn_to_stream_messages(
             &recorded_turn("tool", "output"),
@@ -7357,13 +7366,7 @@ Use a project-specific custom dispatch loop.";
             Uuid::new_v4(),
         );
         assert_eq!(msgs.len(), 1);
-        assert!(matches!(
-            &msgs[0],
-            CliToServer::StreamMessage {
-                message: shared::ClaudeStreamMessage::User { .. },
-                ..
-            }
-        ));
+        assert!(matches!(&msgs[0], CliToServer::UserInput { .. }));
     }
 
     // --- tab-type policy ---------------------------------------------------
