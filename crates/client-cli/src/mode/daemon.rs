@@ -303,6 +303,42 @@ struct ProjectEntry {
     last_error: Option<String>,
 }
 
+/// Re-exec into the installed binary when it is newer than the running one.
+///
+/// The daemon is the only thing that upgrades a machine unattended. Before
+/// this, `ensure_daemon_running` was the sole upgrade path and it runs on
+/// *interactive CLI startup* — so a node nobody logs into keeps its daemon
+/// forever. zoo-002 sat nine versions behind for exactly that reason.
+///
+/// Uses `exec` rather than spawn-and-exit, which matters for three reasons:
+///
+///  * the pid is preserved, so the `daemon.json` state file stays correct and
+///    `detect_running_daemon` is not briefly fooled into starting a second one,
+///  * the session is preserved, so the daemon stays `setsid`-detached without
+///    having to re-detach,
+///  * destructors do **not** run, so `RegistrationGuard` never withdraws this
+///    host's record or releases its project claims. A spawn-and-exit would open
+///    a window where a peer daemon sees the projects unclaimed and could spawn
+///    a duplicate CLI against the same `.apas` and worktrees — the exact race
+///    the claim system exists to prevent.
+///
+/// Headless project CLIs live in their own tmux sessions and are unaffected;
+/// the replacement adopts them via `is_headless_running_for` + `tmux_has_session`.
+///
+/// Returns only on failure — on success the process image is gone.
+#[cfg(unix)]
+fn exec_into_newer_binary(version: &str) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    let exe = crate::update::resolve_preferred_apas_executable();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    tracing::info!(
+        %version,
+        exe = %exe.display(),
+        "daemon upgrading itself: re-exec into newer binary"
+    );
+    std::process::Command::new(exe).args(args).exec()
+}
+
 #[derive(Debug)]
 struct DaemonState {
     machine_info: MachineInfo,
@@ -819,6 +855,11 @@ async fn run_connection(
     ws_sender.send(Message::Text(text.into())).await?;
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    // Snapshot of the installed binary at boot. A change here is what triggers
+    // the (more expensive) version comparison. Seeded now rather than left
+    // empty so an unchanged binary never provokes a check.
+    #[allow(unused_mut)]
+    let mut binary_fingerprint = crate::update::apas_binary_fingerprint();
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut usage_refresh = tokio::time::interval(USAGE_REFRESH_INTERVAL);
     usage_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -848,6 +889,25 @@ async fn run_connection(
                 refresh_usage_limits_cache().await;
             }
             _ = heartbeat.tick() => {
+                // Self-upgrade check. The stat is the gate: `apas --version`
+                // is only spawned when the binary on disk has actually
+                // changed, so the steady-state cost is one stat per tick.
+                #[cfg(unix)]
+                {
+                    let fp = crate::update::apas_binary_fingerprint();
+                    if fp != binary_fingerprint {
+                        binary_fingerprint = fp;
+                        if let Some(newer) = crate::update::newer_installed_version() {
+                            // Never returns on success.
+                            let err = exec_into_newer_binary(&newer);
+                            tracing::error!(
+                                %err,
+                                "daemon self-upgrade re-exec failed; continuing on the old binary"
+                            );
+                        }
+                    }
+                }
+
                 state.reap_exited_processes();
                 state.refresh_projects();
 

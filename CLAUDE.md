@@ -521,6 +521,37 @@ interrupting, where the web does the reverse — between an interrupt and the
 pause landing, a sibling pane's write can wake the loop for one more iteration.
 Unmanaged side chats are never touched.
 
+## The daemon upgrades itself
+
+The daemon checks on each **heartbeat (10s)** whether the installed `apas`
+binary is newer than the one it is running, and re-execs into it if so.
+
+Before this, `ensure_daemon_running` was the only upgrade path, and it runs on
+*interactive CLI startup* — so a node nobody logs into keeps its daemon
+forever. zoo-002 sat nine versions behind for exactly that reason.
+
+**Cost is one `stat` per tick.** The binary's (length, mtime) is the gate;
+`apas --version` is spawned only when that changes, since an install writes a
+new file rather than editing one in place.
+
+**It re-execs rather than spawn-and-exit**, which matters for three reasons:
+
+- the pid is preserved, so `daemon.json` stays correct and
+  `detect_running_daemon` is not briefly fooled into starting a second daemon,
+- the session is preserved, so it stays `setsid`-detached,
+- destructors do **not** run, so `RegistrationGuard` never withdraws the host
+  record or releases project claims. Spawn-and-exit would open a window where a
+  peer daemon sees those projects unclaimed and could spawn a duplicate CLI
+  against the same `.apas` and worktrees — the race the claim system exists to
+  prevent.
+
+Headless project CLIs live in their own tmux sessions and are unaffected; the
+re-exec'd daemon adopts them via `is_headless_running_for` + `tmux_has_session`.
+
+It upgrades only. Equal, older, or unparseable versions do nothing — equal would
+re-exec every tick forever, and an accidental downgrade across a cluster sharing
+one NFS home would be painful to unpick.
+
 ## Terminal-pane history: read the provider's transcript
 
 An agent pane is *observed* — the CLI parses its stream-json and knows every
