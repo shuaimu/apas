@@ -18,6 +18,14 @@ use uuid::Uuid;
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How often the daemon checks whether a newer `apas` has been installed.
+///
+/// Deliberately slow. An upgrade is never urgent — the running daemon works
+/// fine — and the check costs a `stat` plus, on change, spawning
+/// `apas --version`. Tying it to the 10s heartbeat meant the version path was
+/// exercised 360x more often than anything could benefit from.
+const UPGRADE_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const VERSION: &str = env!("APAS_VERSION");
 const TMUX_SESSION_PREFIX: &str = "apas";
@@ -860,6 +868,11 @@ async fn run_connection(
     // empty so an unchanged binary never provokes a check.
     #[allow(unused_mut)]
     let mut binary_fingerprint = crate::update::apas_binary_fingerprint();
+    let mut upgrade_check = tokio::time::interval(UPGRADE_CHECK_INTERVAL);
+    // `interval` fires immediately on first tick; that first check is harmless
+    // (the fingerprint was just seeded, so it is a no-op) and means a daemon
+    // started against an already-newer binary corrects itself at once.
+    upgrade_check.tick().await;
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut usage_refresh = tokio::time::interval(USAGE_REFRESH_INTERVAL);
     usage_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -888,10 +901,9 @@ async fn run_connection(
             _ = usage_refresh.tick() => {
                 refresh_usage_limits_cache().await;
             }
-            _ = heartbeat.tick() => {
-                // Self-upgrade check. The stat is the gate: `apas --version`
-                // is only spawned when the binary on disk has actually
-                // changed, so the steady-state cost is one stat per tick.
+            _ = upgrade_check.tick() => {
+                // The stat is the gate: `apas --version` is only spawned when
+                // the binary on disk has actually changed.
                 #[cfg(unix)]
                 {
                     let fp = crate::update::apas_binary_fingerprint();
@@ -907,7 +919,8 @@ async fn run_connection(
                         }
                     }
                 }
-
+            }
+            _ = heartbeat.tick() => {
                 state.reap_exited_processes();
                 state.refresh_projects();
 

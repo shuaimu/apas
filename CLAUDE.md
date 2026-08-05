@@ -523,8 +523,10 @@ Unmanaged side chats are never touched.
 
 ## The daemon upgrades itself
 
-The daemon checks on each **heartbeat (10s)** whether the installed `apas`
-binary is newer than the one it is running, and re-execs into it if so.
+The daemon checks **every 15 minutes** whether the installed `apas` binary is
+newer than the one it is running, and re-execs into it if so. Its own interval,
+not the 10s heartbeat: an upgrade is never urgent, and tying it to the heartbeat
+exercised the version path 360x more often than anything benefited from.
 
 Before this, `ensure_daemon_running` was the only upgrade path, and it runs on
 *interactive CLI startup* — so a node nobody logs into keeps its daemon
@@ -545,8 +547,17 @@ new file rather than editing one in place.
   against the same `.apas` and worktrees — the race the claim system exists to
   prevent.
 
-Headless project CLIs live in their own tmux sessions and are unaffected; the
-re-exec'd daemon adopts them via `is_headless_running_for` + `tmux_has_session`.
+**Headless project CLIs are untouched.** They are owned by a per-project
+`tmux:server`, not by the daemon — the daemon has no long-lived children — so
+nothing about replacing the daemon's process image reaches them. And because
+`exec` preserves the pid, even a direct child would survive.
+
+Their *reported* state survives too: `snapshot_projects` derives `is_running`
+from `headless_pid_for()`, which scans `/proc` for a headless CLI with that
+`-d <path>`, rather than from the daemon's in-memory `sessions` map. So the map
+being reset by the re-exec costs nothing — the web still shows them running. The
+map self-heals on the next `StartProjectCli`, which re-checks `/proc` before
+spawning and therefore cannot double-start a project that is already up.
 
 It upgrades only. Equal, older, or unparseable versions do nothing — equal would
 re-exec every tick forever, and an accidental downgrade across a cluster sharing
