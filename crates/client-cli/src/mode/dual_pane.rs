@@ -1632,10 +1632,11 @@ async fn run_inner(
     let mut metadata = get_or_create_project(working_dir)?;
     let session_id = metadata.id;
 
-    // Persist migrated metadata and ensure there is always at least one pane.
-    if metadata.panes.is_empty() {
-        metadata.panes = shared::PaneConfig::defaults();
-    }
+    // Deliberately no "ensure at least one pane" fallback. A project with no
+    // panes stays empty: the CLI connects, the daemon can manage it, and the
+    // user opens whatever they want from the web. Seeding a Claude pane here
+    // meant every newly launched project immediately spawned an agent process
+    // nobody had asked for.
     // One-time migration: panes saved before the `managed` field existed
     // deserialize as `managed: false`. Auto-promote orchestrator roles so
     // existing Manager / Tech Lead / Reviewer panes appear in the Team box

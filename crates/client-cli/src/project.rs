@@ -96,7 +96,10 @@ impl ProjectMetadata {
             name: None,
             created_at: chrono::Utc::now().to_rfc3339(),
             prompt: None,
-            panes: PaneConfig::defaults(),
+            // A new project starts empty. The user picks what to open;
+            // materialising a Claude pane nobody asked for meant every
+            // fresh project immediately spawned an agent process.
+            panes: Vec::new(),
             auto_approve_todos: false,
             auto_merge_prs: false,
             team_enabled: false,
@@ -113,7 +116,10 @@ impl ProjectMetadata {
             name: Some(name),
             created_at: chrono::Utc::now().to_rfc3339(),
             prompt: None,
-            panes: PaneConfig::defaults(),
+            // A new project starts empty. The user picks what to open;
+            // materialising a Claude pane nobody asked for meant every
+            // fresh project immediately spawned an agent process.
+            panes: Vec::new(),
             auto_approve_todos: false,
             auto_merge_prs: false,
             team_enabled: false,
@@ -126,7 +132,14 @@ impl ProjectMetadata {
 
     /// Migrate legacy fields to panes list if needed
     pub fn migrate_legacy(&mut self) {
-        if self.panes.is_empty() {
+        // Only migrate when there is legacy state to migrate. This used to fire
+        // on any empty pane list, and it runs on *every* load via
+        // `get_or_create_project` — so a project deliberately holding no panes
+        // had two resurrected under it on the next read. The legacy session-id
+        // fields are what distinguish a pre-`panes` file from a new project.
+        let has_legacy_state = self.deadloop_claude_session_id.is_some()
+            || self.interactive_claude_session_id.is_some();
+        if self.panes.is_empty() && has_legacy_state {
             // Migrate from legacy fields
             let deadloop_session = self.deadloop_claude_session_id.unwrap_or_else(Uuid::new_v4);
             let interactive_session = self
@@ -497,7 +510,10 @@ pub fn get_or_create_project(dir: &Path) -> Result<ProjectMetadata> {
             name,
             created_at: chrono::Utc::now().to_rfc3339(),
             prompt: None,
-            panes: PaneConfig::defaults(),
+            // A new project starts empty. The user picks what to open;
+            // materialising a Claude pane nobody asked for meant every
+            // fresh project immediately spawned an agent process.
+            panes: Vec::new(),
             auto_approve_todos: false,
             auto_merge_prs: false,
             team_enabled: false,
@@ -559,6 +575,70 @@ pub fn is_project(dir: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_new_project_starts_with_no_panes() {
+        // Materialising a Claude pane meant every fresh project immediately
+        // spawned an agent process nobody asked for.
+        assert!(ProjectMetadata::new().panes.is_empty());
+        assert!(ProjectMetadata::with_name("x".into()).panes.is_empty());
+    }
+
+    #[test]
+    fn an_empty_pane_list_survives_a_reload() {
+        // The trap: `get_or_create_project` calls `migrate_legacy` on every
+        // load, and that used to refill any empty pane list — with *two*
+        // legacy panes — so "no panes" was not representable at all.
+        let _config = crate::config::test_config::isolated_config_dir();
+        let dir = tempfile::tempdir().expect("temp project dir");
+
+        let first = get_or_create_project(dir.path()).expect("create");
+        assert!(first.panes.is_empty(), "created with no panes");
+
+        let second = get_or_create_project(dir.path()).expect("reload");
+        assert!(second.panes.is_empty(), "still no panes after a reload");
+        assert_eq!(second.id, first.id, "same project, not recreated");
+    }
+
+    #[test]
+    fn a_pre_panes_apas_is_still_migrated() {
+        // The migration must keep working for files that predate `panes` and
+        // carry the legacy session-id fields — that is the case it exists for.
+        let _config = crate::config::test_config::isolated_config_dir();
+        let dir = tempfile::tempdir().expect("temp project dir");
+        std::fs::write(
+            dir.path().join(".apas"),
+            r#"{
+                "id": "8c4b0c1e-0000-4000-8000-0000000000aa",
+                "name": "legacy",
+                "created_at": "2026-01-01T00:00:00Z",
+                "deadloop_claude_session_id": "8c4b0c1e-0000-4000-8000-0000000000bb",
+                "interactive_claude_session_id": "8c4b0c1e-0000-4000-8000-0000000000cc"
+            }"#,
+        )
+        .expect("write legacy .apas");
+
+        let meta = get_or_create_project(dir.path()).expect("load legacy");
+        assert_eq!(meta.panes.len(), 2, "legacy deadloop + interactive restored");
+        assert!(meta
+            .panes
+            .iter()
+            .any(|p| p.pane_id == shared::PANE_ID_DEADLOOP));
+        assert!(meta
+            .panes
+            .iter()
+            .any(|p| p.pane_id == shared::PANE_ID_INTERACTIVE));
+    }
+
+    #[test]
+    fn migrate_legacy_leaves_a_modern_empty_project_alone() {
+        // Same check at the unit level: no legacy fields means nothing to
+        // migrate, regardless of the pane list being empty.
+        let mut meta = ProjectMetadata::new();
+        assert!(meta.panes.is_empty());
+        meta.migrate_legacy();
+        assert!(meta.panes.is_empty(), "nothing to migrate, nothing created");
+    }
     use super::*;
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};

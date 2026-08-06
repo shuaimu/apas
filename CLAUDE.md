@@ -228,6 +228,17 @@ pane state:
 }
 ```
 
+A newly created project has **no panes**. The user opens what they want; a
+default Claude pane meant every fresh project immediately spawned an agent
+process nobody asked for. Three places used to force one into existence and all
+three are gone: the `ProjectMetadata` constructors, an "ensure there is always
+at least one pane" backfill at CLI launch, and `migrate_legacy`. That last one
+was the real blocker — it runs on *every* load via `get_or_create_project` and
+refilled any empty pane list with **two** legacy panes, so "no panes" was not
+representable at all. It is now gated on the legacy `deadloop_claude_session_id`
+/ `interactive_claude_session_id` fields actually being present, which is what
+distinguishes a pre-`panes` file from a new project.
+
 `team_enabled`, `auto_approve_todos`, `auto_merge_prs`, and
 `disallowed_tab_types` are project-level policy flags. `team_enabled` gates
 managed team mode entirely (see "Team mode is opt-in" below);
