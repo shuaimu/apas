@@ -108,3 +108,82 @@ describe("terminalThemeFor", () => {
     }
   });
 });
+
+describe("solarized terminal palettes", () => {
+  it("uses solarized ANSI values, not the default light/dark ones", () => {
+    const sd = terminalThemeFor(true, "solarized-dark") as Record<string, string>;
+    const sl = terminalThemeFor(false, "solarized-light") as Record<string, string>;
+    expect(sd.background).toBe("#002b36"); // base03
+    expect(sl.background).toBe("#fdf6e3"); // base3
+    expect(sd.blue).toBe("#268bd2");
+    expect(sl.blue).toBe("#268bd2");
+  });
+
+  it("keeps solarized's *accent* colours legible on their own background", () => {
+    // Solarized's ANSI mapping repurposes the bright slots for its base tones
+    // (brightGreen=base01, brightYellow=base00, brightBlue=base0,
+    // brightCyan=base1), and black/brightBlack are the dim-chrome slots. Those
+    // are meant to be low contrast — they are the scheme's de-emphasis colours,
+    // what it uses for comments. Only the actual accents are held to a floor.
+    //
+    // That floor is 2.9, not the 3:1 used for the built-in palettes. Solarized
+    // is designed around uniform CIELAB lightness rather than WCAG ratios, so
+    // its accents land at 2.93–2.98 on base3. Raising them would mean shipping
+    // something that is not Solarized, which is the one thing a theme by that
+    // name must not do. Measured, not guessed: min accent is cyan at 2.93.
+    const BASE_TONE_SLOTS = [
+      "black",
+      "brightBlack",
+      "brightGreen",
+      "brightYellow",
+      "brightBlue",
+      "brightCyan",
+    ];
+    const ACCENT_FLOOR = 2.9;
+
+    for (const [name, dark] of [
+      ["solarized-dark", true],
+      ["solarized-light", false],
+    ] as [string, boolean][]) {
+      const theme = terminalThemeFor(dark, name) as Record<string, string>;
+      for (const key of ANSI_KEYS) {
+        if (BASE_TONE_SLOTS.includes(key)) continue;
+        const ratio = contrastRatio(theme[key], theme.background);
+        expect(ratio, `${name} ${key} (${theme[key]}) is only ${ratio.toFixed(2)}:1`)
+          .toBeGreaterThanOrEqual(ACCENT_FLOOR);
+      }
+    }
+  });
+
+  it("keeps even the dim base-tone slots distinguishable from the background", () => {
+    // They are allowed to be low contrast, but not invisible: an actually
+    // invisible colour comes out near 1:1. `black` on solarized-dark is the
+    // conventional exception every terminal ships (it is base02 on base03).
+    for (const [name, dark] of [
+      ["solarized-dark", true],
+      ["solarized-light", false],
+    ] as [string, boolean][]) {
+      const theme = terminalThemeFor(dark, name) as Record<string, string>;
+      for (const key of ["brightBlack", "brightGreen", "brightYellow", "brightCyan"]) {
+        const ratio = contrastRatio(theme[key], theme.background);
+        expect(ratio, `${name} ${key} is ${ratio.toFixed(2)}:1 — effectively invisible`)
+          .toBeGreaterThanOrEqual(2);
+      }
+    }
+  });
+
+  it("solarized-light's ANSI white stays dark enough to read", () => {
+    // The same trap as the built-in light theme: base2/base3 here would make
+    // any text using the white slot vanish.
+    const sl = terminalThemeFor(false, "solarized-light") as Record<string, string>;
+    expect(contrastRatio(sl.white, sl.background)).toBeGreaterThanOrEqual(3);
+    expect(contrastRatio(sl.brightWhite, sl.background)).toBeGreaterThanOrEqual(3);
+  });
+
+  it("falls back to the built-in palettes for non-solarized themes", () => {
+    expect(terminalThemeFor(true, "dark").background).toBe("#0a0a0a");
+    expect(terminalThemeFor(false, "light").background).toBe("#ffffff");
+    expect(terminalThemeFor(true, "system").background).toBe("#0a0a0a");
+    expect(terminalThemeFor(false).background).toBe("#ffffff");
+  });
+});

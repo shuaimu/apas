@@ -1,15 +1,100 @@
 @import "tailwindcss";
 
+/* Tailwind v4: dark mode is driven by a class on <html>, not by
+   prefers-color-scheme. The theme applier decides, so "System" can follow the
+   OS while the explicit themes override it. All existing `dark:` utilities
+   keep working unchanged. */
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root {
   --background: #ffffff;
   --foreground: #171717;
 }
 
+/* "System" with no explicit theme chosen: follow the OS. Scoped to
+   :root:not([data-theme]) so picking a theme wins over the media query. */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme]) {
     --background: #0a0a0a;
     --foreground: #ededed;
   }
+}
+
+:root[data-theme="light"] {
+  --background: #ffffff;
+  --foreground: #171717;
+}
+
+:root[data-theme="dark"] {
+  --background: #0a0a0a;
+  --foreground: #ededed;
+}
+
+/* ---------------------------------------------------------------------------
+   Solarized.
+
+   The UI is built from ~1300 `gray`/`zinc` utilities. Rather than restyle those
+   (which would be the whole feature, and would need every future component to
+   opt in), these remap Tailwind v4's palette variables. Every existing
+   bg-gray-800 / text-gray-500 / border-zinc-700 picks up solarized for free.
+
+   Solarized only defines eight base tones, so the 50..950 ramp is those eight
+   placed on the scale, with a couple of blends where the ramp is denser than
+   the palette. Light and dark are deliberate mirrors of each other, which is
+   how the original scheme is specified.
+   --------------------------------------------------------------------------- */
+:root[data-theme="solarized-light"] {
+  --background: #fdf6e3; /* base3 */
+  --foreground: #073642; /* base02 */
+
+  --color-gray-50: #fdf6e3;
+  --color-gray-100: #f5efdc;
+  --color-gray-200: #eee8d5;
+  --color-gray-300: #ded8c5;
+  --color-gray-400: #93a1a1;
+  --color-gray-500: #839496;
+  --color-gray-600: #657b83;
+  --color-gray-700: #586e75;
+  --color-gray-800: #073642;
+  --color-gray-900: #002b36;
+  --color-gray-950: #00212b;
+}
+
+:root[data-theme="solarized-dark"] {
+  --background: #002b36; /* base03 */
+  --foreground: #93a1a1; /* base1 */
+
+  --color-gray-50: #fdf6e3;
+  --color-gray-100: #eee8d5;
+  --color-gray-200: #93a1a1;
+  --color-gray-300: #839496;
+  --color-gray-400: #657b83;
+  --color-gray-500: #586e75;
+  --color-gray-600: #4a6068;
+  --color-gray-700: #073642;
+  --color-gray-800: #01303c;
+  --color-gray-900: #002b36;
+  --color-gray-950: #00212b;
+}
+
+/* zinc and neutral are used in a minority of places; point them at the same
+   ramp so a solarized theme does not leave stray blue-grey patches. */
+:root[data-theme^="solarized-"] {
+  --color-zinc-50: var(--color-gray-50);
+  --color-zinc-100: var(--color-gray-100);
+  --color-zinc-200: var(--color-gray-200);
+  --color-zinc-300: var(--color-gray-300);
+  --color-zinc-400: var(--color-gray-400);
+  --color-zinc-500: var(--color-gray-500);
+  --color-zinc-600: var(--color-gray-600);
+  --color-zinc-700: var(--color-gray-700);
+  --color-zinc-800: var(--color-gray-800);
+  --color-zinc-900: var(--color-gray-900);
+  --color-zinc-950: var(--color-gray-950);
+  --color-neutral-100: var(--color-gray-100);
+  --color-neutral-300: var(--color-gray-300);
+  --color-neutral-700: var(--color-gray-700);
+  --color-neutral-900: var(--color-gray-900);
 }
 
 /* iOS viewport height fix - use dvh with fallback */

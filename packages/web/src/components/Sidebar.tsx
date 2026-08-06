@@ -1,6 +1,7 @@
 "use client";
 
 import { useStore } from "@/lib/store";
+import { ThemePicker } from "@/components/ThemePicker";
 import { FolderOpen, RefreshCw, Share2, Users, X, Crown, Trash2, ChevronLeft, ChevronDown, ChevronRight, BarChart3, Server, Plus } from "lucide-react";
 import { CreateInstanceModal } from "./CreateInstanceModal";
 import Link from "next/link";
@@ -888,6 +889,10 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
           cloneUrl={newInstanceRepo.cloneUrl}
         />
       )}
+      {/* Sidebar footer: low-traffic, always-visible chrome. */}
+      <div className="mt-auto flex-shrink-0 border-t border-gray-200 p-3 dark:border-gray-800">
+        <ThemePicker />
+      </div>
     </div>
   );
 }

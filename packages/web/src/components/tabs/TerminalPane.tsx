@@ -5,6 +5,8 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { useStore } from "@/lib/store";
 import { subscribeTerminal, type TerminalEvent } from "@/lib/terminalBus";
+import { SOLARIZED as SZ, readStoredTheme, themeIsDark } from "@/lib/theme";
+import { useTheme } from "@/lib/useTheme";
 import "@xterm/xterm/css/xterm.css";
 
 /**
@@ -73,12 +75,64 @@ const TERMINAL_THEMES = {
   },
 } as const;
 
+const SOLARIZED_THEMES = {
+  // Solarized began as a terminal scheme, so these are its published ANSI
+  // values rather than an approximation of the CSS palette.
+  "solarized-dark": {
+    background: SZ.base03,
+    foreground: SZ.base0,
+    cursor: SZ.base1,
+    cursorAccent: SZ.base03,
+    selectionBackground: SZ.base02,
+    black: SZ.base02,
+    red: SZ.red,
+    green: SZ.green,
+    yellow: SZ.yellow,
+    blue: SZ.blue,
+    magenta: SZ.magenta,
+    cyan: SZ.cyan,
+    white: SZ.base2,
+    brightBlack: SZ.base01,
+    brightRed: SZ.orange,
+    brightGreen: SZ.base01,
+    brightYellow: SZ.base00,
+    brightBlue: SZ.base0,
+    brightMagenta: SZ.violet,
+    brightCyan: SZ.base1,
+    brightWhite: SZ.base3,
+  },
+  "solarized-light": {
+    background: SZ.base3,
+    foreground: SZ.base00,
+    cursor: SZ.base01,
+    cursorAccent: SZ.base3,
+    selectionBackground: SZ.base2,
+    black: SZ.base02,
+    red: SZ.red,
+    green: SZ.green,
+    yellow: SZ.yellow,
+    blue: SZ.blue,
+    magenta: SZ.magenta,
+    cyan: SZ.cyan,
+    // On a light background ANSI "white" must stay dark enough to read —
+    // base2/base3 here would make that text vanish, the same trap the built-in
+    // light theme avoids.
+    white: SZ.base00,
+    brightBlack: SZ.base1,
+    brightRed: SZ.orange,
+    brightGreen: SZ.base1,
+    brightYellow: SZ.base0,
+    brightBlue: SZ.base01,
+    brightMagenta: SZ.violet,
+    brightCyan: SZ.base00,
+    brightWhite: SZ.base02,
+  },
+} as const;
+
 const DARK_QUERY = "(prefers-color-scheme: dark)";
 
 /**
- * The app has no theme toggle — Tailwind runs in its default `media` mode, so
- * everything follows the OS. The terminal does the same rather than inventing
- * a switch that nothing else in the UI has.
+ * OS preference, used only to resolve the "System" theme.
  *
  * Defaults to dark when `matchMedia` is unavailable (jsdom in tests, older
  * browsers): that matches the palette the terminal shipped with.
@@ -90,8 +144,17 @@ function prefersDark(): boolean {
   return window.matchMedia(DARK_QUERY).matches;
 }
 
-export function terminalThemeFor(dark: boolean) {
+export function terminalThemeFor(dark: boolean, theme?: string) {
+  if (theme === "solarized-dark" || theme === "solarized-light") {
+    return SOLARIZED_THEMES[theme];
+  }
   return dark ? TERMINAL_THEMES.dark : TERMINAL_THEMES.light;
+}
+
+/** The palette matching whatever theme the app is currently showing. */
+function currentTerminalTheme() {
+  const t = readStoredTheme();
+  return terminalThemeFor(themeIsDark(t, prefersDark()), t);
 }
 
 /**
@@ -118,33 +181,28 @@ export function TerminalPane({ paneId }: { paneId: number }) {
   const sendTerminalInput = useStore((s) => s.sendTerminalInput);
   const sendTerminalResize = useStore((s) => s.sendTerminalResize);
   const connected = useStore((s) => s.connected);
+  // Subscribing to the theme is what makes the *picker* reach the terminal.
+  // Watching matchMedia alone only caught OS changes, so choosing Solarized
+  // left the terminal on the old palette until the OS happened to flip.
+  const { theme, isDark } = useTheme();
 
-  // Follow the OS light/dark preference for as long as the pane is mounted.
+  // Repaint whenever the resolved theme changes, for as long as the pane is
+  // mounted.
   // Repainting in place beats recreating the terminal: the hosted TUI owns the
   // screen and would not know to redraw, so a rebuild would leave a blank pane
   // until the user pressed a key.
   useEffect(() => {
-    if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
-      return;
-    }
-    const media = window.matchMedia(DARK_QUERY);
-    const apply = (dark: boolean) => {
-      const term = termRef.current;
-      if (!term) return;
-      term.options.theme = terminalThemeFor(dark);
-      // The WebGL renderer caches glyphs with their colours baked in, so a
-      // theme swap alone can leave the old palette on screen until something
-      // else invalidates those cells.
-      term.refresh(0, term.rows - 1);
-    };
-    const onChange = (event: MediaQueryListEvent) => apply(event.matches);
-    media.addEventListener("change", onChange);
-    // The terminal is created by a later effect on first mount, so sync once
-    // here too — this effect also re-runs on nothing else, and without it a
-    // preference that changed while the pane was unmounted would be missed.
-    apply(media.matches);
-    return () => media.removeEventListener("change", onChange);
-  }, []);
+    const term = termRef.current;
+    if (!term) return;
+    term.options.theme = terminalThemeFor(isDark, theme);
+    // The WebGL renderer caches glyphs with their colours baked in, so a theme
+    // swap alone can leave the old palette on screen until something else
+    // invalidates those cells.
+    term.refresh(0, term.rows - 1);
+    // Repainting in place beats recreating the terminal: the hosted TUI owns
+    // the screen and would not know to redraw, so a rebuild would leave a blank
+    // pane until the user pressed a key.
+  }, [theme, isDark]);
 
   /** Fit to the container and report the size when it actually changed. */
   const applyFit = useCallback(() => {
@@ -181,7 +239,7 @@ export function TerminalPane({ paneId }: { paneId: number }) {
       // The hosted TUI owns the screen and scrolls itself; a large xterm
       // scrollback would just fight an alt-screen app.
       scrollback: 1000,
-      theme: terminalThemeFor(prefersDark()),
+      theme: currentTerminalTheme(),
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
