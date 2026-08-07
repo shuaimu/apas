@@ -3,7 +3,7 @@
 // goes down the agent input path, and a terminal pane has no input channel
 // on the CLI side, so the send would trigger the missing-channel pane
 // recovery instead of reaching the pty.
-import { act, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { paneKey, useStore, type PaneConfig } from "@/lib/store";
 import { TabbedView } from "./TabbedView";
@@ -52,6 +52,15 @@ function seed(panes: PaneConfig[], activePaneId: number) {
       hasMoreMessages: false,
       isLoadingMore: false,
       teamRecords: [],
+      usageLimits: new Map([
+        [
+          CLI_CLIENT_ID,
+          {
+            claude: { sevenDay: { utilization: 0.1 } },
+            codex: { sevenDay: { utilization: 0.2 } },
+          },
+        ],
+      ]),
       loadPaneMessagesIfNeeded: vi.fn(),
       loadMoreMessages: vi.fn(),
     });
@@ -73,6 +82,73 @@ afterEach(() => {
 });
 
 describe("TabbedView terminal panes", () => {
+  it("places the view switch before Codex usage and keeps the terminal mounted", async () => {
+    seed([
+      pane({ pane_id: 7, label: "Codex TTY", kind: "terminal", provider: "codex" }),
+    ], 7);
+    render(<TabbedView />);
+
+    const terminal = await screen.findByTestId("terminal-pane-7");
+    const viewSwitch = screen.getByRole("group", { name: "Terminal pane view" });
+    const usageLabel = screen.getByText("Codex Usage");
+    expect(
+      viewSwitch.compareDocumentPosition(usageLabel) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
+
+    fireEvent.click(within(viewSwitch).getByRole("button", { name: "Conversation" }));
+    expect(await screen.findByPlaceholderText("Message the agent…")).toBeTruthy();
+    expect(screen.getByTestId("terminal-pane-7")).toBe(terminal);
+
+    fireEvent.click(within(viewSwitch).getByRole("button", { name: "Terminal" }));
+    await waitFor(() => {
+      expect(screen.queryByPlaceholderText("Message the agent…")).toBeNull();
+    });
+    expect(screen.getByTestId("terminal-pane-7")).toBe(terminal);
+  });
+
+  it("restores independent view preferences when switching terminal tabs", async () => {
+    localStorage.setItem(
+      "apas_terminal_view_mode",
+      JSON.stringify({
+        [`${SESSION_ID}:7`]: "conversation",
+        [`${SESSION_ID}:8`]: "terminal",
+      }),
+    );
+    seed([
+      pane({ pane_id: 7, label: "First TTY", kind: "terminal" }),
+      pane({ pane_id: 8, label: "Second TTY", kind: "terminal" }),
+    ], 7);
+    render(<TabbedView />);
+
+    const viewSwitch = await screen.findByRole("group", { name: "Terminal pane view" });
+    await waitFor(() => {
+      expect(
+        within(viewSwitch).getByRole("button", { name: "Conversation" }).getAttribute("aria-pressed"),
+      ).toBe("true");
+    });
+    expect(screen.getByPlaceholderText("Message the agent…")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("Second TTY").closest("button")!);
+    await waitFor(() => {
+      expect(
+        within(viewSwitch).getByRole("button", { name: "Terminal" }).getAttribute("aria-pressed"),
+      ).toBe("true");
+    });
+    expect(
+      screen
+        .queryAllByPlaceholderText("Message the agent…")
+        .filter((element) => !element.closest(".hidden")),
+    ).toHaveLength(0);
+
+    fireEvent.click(screen.getByText("First TTY").closest("button")!);
+    await waitFor(() => {
+      expect(
+        within(viewSwitch).getByRole("button", { name: "Conversation" }).getAttribute("aria-pressed"),
+      ).toBe("true");
+    });
+    expect(screen.getByPlaceholderText("Message the agent…")).toBeTruthy();
+  });
+
   it("hides the chat composer on a terminal pane", async () => {
     seed([pane({ pane_id: 7, label: "Codex TTY", kind: "terminal" })], 7);
     render(<TabbedView />);
@@ -87,6 +163,13 @@ describe("TabbedView terminal panes", () => {
 
     expect(await screen.findByPlaceholderText("Type a message...")).toBeTruthy();
     expect(screen.queryByTestId("terminal-pane-8")).toBeNull();
+    expect(screen.queryByRole("group", { name: "Terminal pane view" })).toBeNull();
+    expect(screen.queryByText("Timeline")).toBeNull();
+    expect(screen.queryByTitle("Reasoning effort — persisted per tab")).toBeNull();
+    expect(screen.queryByTitle(/Claude model|Codex model/)).toBeNull();
+    expect(
+      screen.getByTitle("Agent backend — switching kills the current agent child and respawns with a fresh session id"),
+    ).toBeTruthy();
   });
 
   it("treats a pane with no kind as an agent pane", async () => {

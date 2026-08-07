@@ -62,30 +62,54 @@ export function useTerminalViewMode(
   sessionId: string | null,
   paneId: number,
 ): [TerminalViewMode, (mode: TerminalViewMode) => void] {
-  const key = viewModeKey(sessionId, paneId);
-  // Starts at the default and syncs from storage after mount: reading
-  // localStorage during render would mismatch the server-rendered HTML and
-  // trip a hydration error.
-  const [mode, setModeState] = useState<TerminalViewMode>("terminal");
-
-  useEffect(() => {
-    const stored = readAll()[key];
-    if (stored === "terminal" || stored === "conversation") {
-      setModeState(stored);
-    } else {
-      setModeState("terminal");
-    }
-  }, [key]);
+  const { modeForPane, setModeForPane } = useTerminalViewModes(sessionId);
+  const mode = modeForPane(paneId);
 
   const setMode = useCallback(
     (next: TerminalViewMode) => {
-      setModeState(next);
+      setModeForPane(paneId, next);
+    },
+    [paneId, setModeForPane],
+  );
+
+  return [mode, setMode];
+}
+
+/**
+ * Controls every terminal pane in one component without calling a hook inside
+ * a dynamic pane list. Each mounted pane keeps its own mode while a shared
+ * toolbar can read and update whichever pane is active.
+ */
+export function useTerminalViewModes(sessionId: string | null): {
+  modeForPane: (paneId: number) => TerminalViewMode;
+  setModeForPane: (paneId: number, mode: TerminalViewMode) => void;
+} {
+  // Starts empty and syncs after mount: reading localStorage during render
+  // would mismatch the server-rendered HTML and trip a hydration error.
+  const [modes, setModes] = useState<Record<string, TerminalViewMode>>({});
+
+  useEffect(() => {
+    setModes(readAll());
+  }, []);
+
+  const modeForPane = useCallback(
+    (paneId: number): TerminalViewMode => {
+      const stored = modes[viewModeKey(sessionId, paneId)];
+      return stored === "conversation" ? "conversation" : "terminal";
+    },
+    [modes, sessionId],
+  );
+
+  const setModeForPane = useCallback(
+    (paneId: number, next: TerminalViewMode) => {
+      const key = viewModeKey(sessionId, paneId);
+      setModes((previous) => ({ ...previous, [key]: next }));
       const all = readAll();
       all[key] = next;
       writeAll(all);
     },
-    [key],
+    [sessionId],
   );
 
-  return [mode, setMode];
+  return { modeForPane, setModeForPane };
 }

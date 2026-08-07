@@ -62,7 +62,6 @@ function seedTabbedView({
       loadPaneMessagesIfNeeded: vi.fn(),
       loadMoreMessages: vi.fn(),
       startBot,
-      updatePaneEffort: vi.fn(),
     });
   });
 
@@ -164,27 +163,34 @@ describe("TabbedView Start Bot prompt modal", () => {
     expect(startBot).toHaveBeenCalledWith(PANE_ID, "Keep going", 0, "default");
   });
 
-  it("forwards the ultracode effort selection through updatePaneEffort", async () => {
-    // Locks in that the new apas-only `ultracode` option survives the
-    // dropdown -> normalizeClaudeEffortOption -> updatePaneEffort wire
-    // path and reaches the server unchanged. The CLI translates it to
-    // `--effort xhigh` plus a prompt prefix; the wire value is the
-    // user-facing string.
+  it("omits toolbar model and effort selectors without mutating saved effort", async () => {
     const updatePaneEffort = vi.fn();
-    seedTabbedView({
-      paneConfig: pane({ prompt: "Saved worker loop", effort: "high" }),
+    const { startBot } = seedTabbedView({
+      paneConfig: pane({ prompt: "Saved worker loop", effort: "ultracode" }),
     });
     act(() => {
       useStore.setState({ updatePaneEffort });
     });
 
     render(<TabbedView />);
-    const effortSelect = await screen.findByTitle(
-      "Claude thinking effort — persisted per tab",
-    );
-    fireEvent.change(effortSelect, { target: { value: "ultracode" } });
+    await screen.findByTitle("Start autonomous bot execution in this tab");
+    expect(screen.queryByTitle("Reasoning effort — persisted per tab")).toBeNull();
+    expect(screen.queryByTitle(/Claude model|Codex model/)).toBeNull();
+    expect(
+      screen.getByTitle(
+        "Agent backend — switching kills the current agent child and respawns with a fresh session id",
+      ),
+    ).toBeTruthy();
+    expect(updatePaneEffort).not.toHaveBeenCalled();
 
-    expect(updatePaneEffort).toHaveBeenCalledWith(PANE_ID, "ultracode");
+    fireEvent.click(screen.getByTitle("Start autonomous bot execution in this tab"));
+    fireEvent.click(screen.getByRole("button", { name: "Start Bot" }));
+    expect(startBot).toHaveBeenCalledWith(
+      PANE_ID,
+      "Saved worker loop",
+      15,
+      "ultracode",
+    );
   });
 
   it("closes from Cancel or backdrop without starting the bot", async () => {

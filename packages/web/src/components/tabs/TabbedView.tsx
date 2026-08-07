@@ -4,7 +4,7 @@ import React, { useRef, useCallback, useEffect, useState, useMemo, memo } from "
 import dynamic from "next/dynamic";
 import { useStore, Message, PaneConfig, PaneCleanupAction, PaneKind, PlanReviewMode, TeamRecord, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, paneKey, selectActiveTeamRecords } from "@/lib/store";
 import { ROLE_TEMPLATES, TEMPLATE_COLOR_CLASSES } from "@/lib/roleTemplates";
-import { extractTimeline, TimelineEntry } from "@/lib/timeline";
+import { useTerminalViewModes, type TerminalViewMode } from "@/lib/terminalViewMode";
 import { OverviewView } from "../overview/OverviewView";
 import { UserMessage } from "../chat/UserMessage";
 import { AssistantMessage } from "../chat/AssistantMessage";
@@ -21,26 +21,22 @@ import { TerminalViewToggle } from "./TerminalViewToggle";
 import { TerminalChatInput } from "./TerminalChatInput";
 
 /**
- * A terminal pane with its two views.
- *
- * Its own component because `useTerminalViewMode` is a hook and the tab list is
- * rendered inside a `.map` — calling a hook there would break the rules-of-hooks
- * ordering the moment the tab count changed (React error #310, which takes the
- * whole app down).
+ * A terminal pane with its two controlled views. The active mode lives in
+ * `TabbedView`, where the toolbar switch is rendered.
  */
 function TerminalPaneWithViews({
   sessionId,
   paneId,
   messages,
+  mode,
 }: {
   sessionId: string | null;
   paneId: number;
   messages: Message[];
+  mode: TerminalViewMode;
 }) {
-  const [mode, setMode] = useTerminalViewMode(sessionId, paneId);
   return (
     <>
-      <TerminalViewToggle mode={mode} onChange={setMode} turnCount={messages.length} />
       {/* Hidden rather than unmounted — see the call site. */}
       <div className={mode === "terminal" ? "flex-1 flex flex-col min-h-0" : "hidden"}>
         <TerminalPane key={`terminal-${sessionId}-${paneId}`} paneId={paneId} />
@@ -61,8 +57,6 @@ function TerminalPaneWithViews({
     </>
   );
 }
-
-import { useTerminalViewMode } from "@/lib/terminalViewMode";
 
 const TerminalPane = dynamic(
   () => import("./TerminalPane").then((m) => m.TerminalPane),
@@ -311,39 +305,6 @@ function isDeepseekModel(model?: string): boolean {
   return normalized.includes("deepseek");
 }
 
-// Listed lowest → highest. xhigh sits between high and max (Opus-only
-// extra-deep tier); max is the highest level. `ultracode` is a special
-// top-of-list entry — it is NOT a strict effort tier but an apas-only
-// workflow (xhigh wire flag + auto multi-agent prompt prefix), so it
-// renders at the top of the dropdown above max despite breaking the
-// ordering invariant.
-const CLAUDE_EFFORT_OPTIONS = [
-  { value: "ultracode", label: "UltraCode" },
-  { value: "default", label: "Default" },
-  { value: "low", label: "Low" },
-  { value: "medium", label: "Medium" },
-  { value: "high", label: "High" },
-  { value: "xhigh", label: "XHigh" },
-  { value: "max", label: "Max" },
-] as const;
-type ClaudeEffortOption = (typeof CLAUDE_EFFORT_OPTIONS)[number]["value"];
-
-/// User-visible Claude model choices for the per-pane switcher.
-/// The `value` is what gets passed to `claude --model` (claude CLI
-/// understands short names like `sonnet` / `opus` / `haiku` plus the
-/// fully-qualified `claude-<family>-<version>` IDs). Default = let
-/// claude pick (currently sonnet).
-const CLAUDE_MODEL_OPTIONS = [
-  { value: "default", label: "Default" },
-  // Fable has no short alias in the claude CLI yet, so pass the
-  // fully-qualified ID (the CLI accepts both forms).
-  { value: "claude-fable-5", label: "Fable" },
-  { value: "sonnet", label: "Sonnet" },
-  { value: "opus", label: "Opus" },
-  { value: "haiku", label: "Haiku" },
-] as const;
-type ClaudeModelOption = (typeof CLAUDE_MODEL_OPTIONS)[number]["value"];
-
 /// Provider switcher options. Maps to `shared::Provider` on the wire
 /// (serde rename_all=snake_case, plus `cursor-agent` serializing as
 /// that explicit string). Order: Claude first (default), then the
@@ -363,23 +324,7 @@ const PROVIDER_LABEL: Record<ProviderOption, string> = Object.fromEntries(
   PROVIDER_OPTIONS.map((o) => [o.value, o.label]),
 ) as Record<ProviderOption, string>;
 
-function normalizeClaudeModelOption(raw?: string | null): ClaudeModelOption {
-  if (typeof raw !== "string") return "default";
-  const normalized = raw.trim().toLowerCase();
-  for (const opt of CLAUDE_MODEL_OPTIONS) {
-    if (opt.value === normalized) return opt.value;
-  }
-  // Tolerate fully-qualified IDs like `claude-sonnet-4-6` by matching
-  // the family substring; falls back to "default" for anything truly
-  // foreign so the dropdown doesn't render a blank.
-  if (normalized.includes("fable")) return "claude-fable-5";
-  if (normalized.includes("sonnet")) return "sonnet";
-  if (normalized.includes("opus")) return "opus";
-  if (normalized.includes("haiku")) return "haiku";
-  return "default";
-}
-
-function normalizeClaudeEffortOption(raw?: string | null): ClaudeEffortOption {
+function normalizeClaudeEffortOption(raw?: string | null): string {
   if (typeof raw !== "string") return "default";
   const normalized = raw.trim().toLowerCase();
   if (
@@ -397,48 +342,19 @@ function normalizeClaudeEffortOption(raw?: string | null): ClaudeEffortOption {
   return "default";
 }
 
-/// Codex per-pane model choices. `value` is passed to `codex --model`. The
-/// gpt-5.6 lineup (sol/terra/luna) from ~/.codex/models_cache.json; Default =
-/// let codex use ~/.codex/config.toml.
-const CODEX_MODEL_OPTIONS = [
-  { value: "default", label: "Default" },
-  { value: "gpt-5.6-sol", label: "Sol" },
-  { value: "gpt-5.6-terra", label: "Terra" },
-  { value: "gpt-5.6-luna", label: "Luna" },
-] as const;
-type CodexModelOption = (typeof CODEX_MODEL_OPTIONS)[number]["value"];
-
-/// Codex reasoning-effort choices, passed via codex's
-/// `-c model_reasoning_effort=<level>`. sol/terra support up to `ultra`; luna
-/// tops out at `max`. Default = codex config.toml default.
-const CODEX_EFFORT_OPTIONS = [
-  { value: "default", label: "Default" },
-  { value: "low", label: "Low" },
-  { value: "medium", label: "Medium" },
-  { value: "high", label: "High" },
-  { value: "xhigh", label: "XHigh" },
-  { value: "max", label: "Max" },
-  { value: "ultra", label: "Ultra" },
-] as const;
-type CodexEffortOption = (typeof CODEX_EFFORT_OPTIONS)[number]["value"];
-
-function normalizeCodexModelOption(raw?: string | null): CodexModelOption {
+function normalizeCodexEffortOption(raw?: string | null): string {
   if (typeof raw !== "string") return "default";
   const normalized = raw.trim().toLowerCase();
-  for (const opt of CODEX_MODEL_OPTIONS) {
-    if (opt.value === normalized) return opt.value;
-  }
-  if (normalized.includes("sol")) return "gpt-5.6-sol";
-  if (normalized.includes("terra")) return "gpt-5.6-terra";
-  if (normalized.includes("luna")) return "gpt-5.6-luna";
-  return "default";
-}
-
-function normalizeCodexEffortOption(raw?: string | null): CodexEffortOption {
-  if (typeof raw !== "string") return "default";
-  const normalized = raw.trim().toLowerCase();
-  for (const opt of CODEX_EFFORT_OPTIONS) {
-    if (opt.value === normalized) return opt.value;
+  if (
+    normalized === "default" ||
+    normalized === "low" ||
+    normalized === "medium" ||
+    normalized === "high" ||
+    normalized === "xhigh" ||
+    normalized === "max" ||
+    normalized === "ultra"
+  ) {
+    return normalized;
   }
   if (normalized === "x-high") return "xhigh";
   if (normalized === "ultracode") return "ultra"; // claude→codex bridge
@@ -528,7 +444,6 @@ export function TabbedView({
   const pausePane = useStore((s) => s.pausePane);
   const resumePane = useStore((s) => s.resumePane);
   const updatePaneLabel = useStore((s) => s.updatePaneLabel);
-  const updatePaneEffort = useStore((s) => s.updatePaneEffort);
   const updatePaneModel = useStore((s) => s.updatePaneModel);
   const interruptPane = useStore((s) => s.interruptPane);
   const reorderPanes = useStore((s) => s.reorderPanes);
@@ -578,8 +493,6 @@ export function TabbedView({
   const [roleModalPaneId, setRoleModalPaneId] = useState<number | null>(null);
   // Team scratchpad modal (Phase 2.2b). Just a boolean — content lives in store.
   const [teamModalOpen, setTeamModalOpen] = useState(false);
-  // Per-pane timeline-vs-raw-chat toggle (Phase 4.2b).
-  const [timelinePanes, setTimelinePanes] = useState<Set<number>>(new Set());
 
   // Determine effective tabs: use paneConfigs from server, or synthesize from observed messages
   const effectiveTabs = useMemo(() => {
@@ -870,6 +783,17 @@ export function TabbedView({
   // composer under one would be worse than redundant: its text goes down
   // the agent input path, which a terminal pane has no channel for.
   const activeIsTerminal = activeConfig?.kind === "terminal";
+  const { modeForPane: terminalViewModeForPane, setModeForPane: setTerminalViewModeForPane } =
+    useTerminalViewModes(sessionId);
+  const activeTerminalViewMode = terminalViewModeForPane(
+    activeTabId ?? PANE_ID_MAIN,
+  );
+  const setActiveTerminalViewMode = useCallback(
+    (mode: TerminalViewMode) => {
+      if (activeTabId != null) setTerminalViewModeForPane(activeTabId, mode);
+    },
+    [activeTabId, setTerminalViewModeForPane],
+  );
   const activeStopRequested = activeConfig?.stop_requested === true;
   const activeProvider = activeConfig?.provider;
   const activeIsMiniMax = activeProvider === "minimax" || (
@@ -897,23 +821,14 @@ export function TabbedView({
       : activeIsDeepseek
         ? "deepseek"
         : activeProvider;
-  // Model + effort switchers support Claude and Codex, each with its own
-  // option list + normalizer; other backends have their own model namespaces
-  // and no reasoning-effort knob. `activeSupportsClaudeEffort` keeps its name
-  // for history but now means "this pane has a model/effort switcher".
-  const isCodexModelEffort = activeUsageProvider === "codex";
-  const activeSupportsClaudeEffort =
-    activeUsageProvider === "claude" || isCodexModelEffort;
-  const modelSwitcherOptions: readonly { value: string; label: string }[] =
-    isCodexModelEffort ? CODEX_MODEL_OPTIONS : CLAUDE_MODEL_OPTIONS;
-  const effortSwitcherOptions: readonly { value: string; label: string }[] =
-    isCodexModelEffort ? CODEX_EFFORT_OPTIONS : CLAUDE_EFFORT_OPTIONS;
-  const activeBotEffortOption: string = isCodexModelEffort
+  // Starting a bot preserves a saved Claude/Codex effort even though effort
+  // is no longer editable from the web toolbar.
+  const isCodexEffort = activeUsageProvider === "codex";
+  const activeSupportsBotEffort =
+    activeUsageProvider === "claude" || isCodexEffort;
+  const activeBotEffortOption: string = isCodexEffort
     ? normalizeCodexEffortOption(activeConfig?.effort)
     : normalizeClaudeEffortOption(activeConfig?.effort);
-  const activeModelOption: string = isCodexModelEffort
-    ? normalizeCodexModelOption(activeConfig?.model)
-    : normalizeClaudeModelOption(activeConfig?.model);
   const activeBotPrompt = botPromptForPane(activeConfig);
   const activeBotMinIntervalMinutes = typeof activeConfig?.min_iteration_interval_minutes === "number"
     ? activeConfig.min_iteration_interval_minutes
@@ -1105,11 +1020,11 @@ export function TabbedView({
       startBotPaneId,
       trimmed.length > 0 ? botPromptDraft : defaultBotPromptForPane(startBotTargetConfig),
       minIntervalMinutes,
-      activeSupportsClaudeEffort ? botEffortDraft : undefined,
+      activeSupportsBotEffort ? botEffortDraft : undefined,
     );
     setStartBotModalOpen(false);
     setStartBotPaneId(null);
-  }, [activeSupportsClaudeEffort, botEffortDraft, botMinIntervalDraft, botPromptDraft, startBot, startBotPaneId, startBotTargetConfig]);
+  }, [activeSupportsBotEffort, botEffortDraft, botMinIntervalDraft, botPromptDraft, startBot, startBotPaneId, startBotTargetConfig]);
 
   useEffect(() => {
     if (!activeIsBot && viewBotPromptModalOpen) {
@@ -1181,10 +1096,8 @@ export function TabbedView({
         </div>
       )}
 
-      {/* Toolbar — flex-wrap so the controls (bot/effort/provider/model) wrap
-          onto a second row on narrow phones instead of overflowing past the
-          right edge, where the overflow-hidden frame would clip the rightmost
-          ones (the provider + model selectors) off-screen and unreachable. */}
+      {/* Toolbar controls wrap on narrow phones instead of overflowing past
+          the right edge of the pane frame. */}
       <div className="flex flex-wrap items-center gap-2 px-3 py-1.5 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30 flex-shrink-0">
         {/* Start/Stop Bot */}
         {isAttached && activeTabId != null && activeTabId !== PANE_ID_MAIN && (
@@ -1228,36 +1141,6 @@ export function TabbedView({
                 <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
                 Bot
               </button>
-              {activeSupportsClaudeEffort && (
-                <select
-                  value={botEffortDraft}
-                  onChange={(e) => {
-                    const next = isCodexModelEffort
-                      ? normalizeCodexEffortOption(e.target.value)
-                      : normalizeClaudeEffortOption(e.target.value);
-                    setBotEffortDraft(next);
-                    // Persist on the server (and CLI's .apas) so the choice
-                    // survives tab-switch and CLI restart.
-                    if (activeTabId != null) {
-                      updatePaneEffort(activeTabId, next === "default" ? null : next);
-                    }
-                  }}
-                  className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-1.5 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  title="Reasoning effort — persisted per tab"
-                >
-                  {effortSwitcherOptions.map((option) => (
-                    <option
-                      key={option.value}
-                      value={option.value}
-                      {...(option.value === "ultracode"
-                        ? { title: "xhigh + auto multi-agent workflows" }
-                        : {})}
-                    >
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-              )}
               {activeTabId != null && activeProvider && (
                 <select
                   value={activeProvider as ProviderOption}
@@ -1280,42 +1163,6 @@ export function TabbedView({
                   title="Agent backend — switching kills the current agent child and respawns with a fresh session id"
                 >
                   {PROVIDER_OPTIONS.map((option) => (
-                    <option key={option.value} value={option.value}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-              )}
-              {activeSupportsClaudeEffort && activeTabId != null && (
-                <select
-                  value={activeModelOption}
-                  onChange={(e) => {
-                    const next = e.target.value;
-                    if (next === activeModelOption) return;
-                    // Claude: every specific model live-swaps via
-                    // apply_flag_settings (no interrupted turn, no context
-                    // reset); only clearing to "default" respawns. Codex has
-                    // no live process to swap — it applies the model on its
-                    // next per-turn re-exec — so it skips the confirm.
-                    if (!isCodexModelEffort && next === "default") {
-                      if (
-                        !confirm(
-                          "Clear model back to Claude's default? The current turn will be interrupted and the agent will respawn with a fresh context — chat history above stays visible but is NOT in the new agent's prompt.",
-                        )
-                      ) {
-                        return;
-                      }
-                    }
-                    updatePaneModel(activeTabId, next === "default" ? null : next);
-                  }}
-                  className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-1.5 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  title={
-                    isCodexModelEffort
-                      ? "Codex model — applies on the next prompt (codex re-execs each turn; no context reset)."
-                      : "Claude model — switching between fable/sonnet/opus/haiku live-swaps via apply_flag_settings (no context reset). Clearing to default respawns."
-                  }
-                >
-                  {modelSwitcherOptions.map((option) => (
                     <option key={option.value} value={option.value}>
                       {option.label}
                     </option>
@@ -1361,28 +1208,16 @@ export function TabbedView({
                   Role
                 </button>
               )}
-              {activeTabId != null && activeTabId !== OVERVIEW_PANE_ID && activeConfig && (
-                <button
-                  onClick={() => {
-                    setTimelinePanes((prev) => {
-                      const next = new Set(prev);
-                      if (next.has(activeTabId)) next.delete(activeTabId);
-                      else next.add(activeTabId);
-                      return next;
-                    });
-                  }}
-                  className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors ${
-                    timelinePanes.has(activeTabId)
-                      ? "bg-indigo-700 hover:bg-indigo-800 text-white"
-                      : "bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-200"
-                  }`}
-                  title="Toggle between raw chat and a per-action timeline (tool name + args summary + result)"
-                >
-                  {timelinePanes.has(activeTabId) ? "Chat" : "Timeline"}
-                </button>
-              )}
             </>
           )
+        )}
+
+        {activeIsTerminal && (
+          <TerminalViewToggle
+            mode={activeTerminalViewMode}
+            onChange={setActiveTerminalViewMode}
+            turnCount={activeMessages.length}
+          />
         )}
 
         {activeUsageProvider && currentUsageLimits && (
@@ -1462,7 +1297,6 @@ export function TabbedView({
       ) : (
         effectiveTabs.map((tab) => {
           const isActive = tab.pane_id === activeTabId;
-          const isTimeline = timelinePanes.has(tab.pane_id);
           // Skip mounting panes the user hasn't activated yet for this
           // session — that's the freeze fix. The container <div> still
           // exists to keep the tab list stable; the heavy MessagePane
@@ -1491,11 +1325,7 @@ export function TabbedView({
                   sessionId={sessionId}
                   paneId={tab.pane_id}
                   messages={msgs}
-                />
-              ) : isTimeline ? (
-                <TimelinePane
-                  key={`timeline-${sessionId}-${tab.pane_id}`}
-                  messages={msgs}
+                  mode={terminalViewModeForPane(tab.pane_id)}
                 />
               ) : (
                 <>
@@ -2291,92 +2121,6 @@ function StartBotPromptModal({
           </button>
         </div>
       </div>
-    </div>
-  );
-}
-
-// --- TimelinePane (Phase 4.2b) ---
-
-interface TimelinePaneProps {
-  messages: Message[];
-}
-
-function TimelinePane({ messages }: TimelinePaneProps) {
-  const entries = useMemo(() => extractTimeline(messages), [messages]);
-  const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set());
-  if (entries.length === 0) {
-    return (
-      <div className="flex-1 overflow-auto p-4 text-sm italic text-gray-500 dark:text-gray-400">
-        No tool calls in this pane yet. The Timeline view fills in as the agent uses tools.
-      </div>
-    );
-  }
-  return (
-    <div className="flex-1 overflow-auto p-3">
-      <ul className="flex flex-col gap-1.5">
-        {entries.map((e: TimelineEntry, i: number) => {
-          const expanded = expandedIds.has(i);
-          const status = e.ok === undefined ? "•" : e.ok ? "✓" : "✗";
-          const statusColor = e.ok === undefined
-            ? "text-gray-400"
-            : e.ok ? "text-emerald-500" : "text-red-500";
-          return (
-            <li
-              key={e.toolUseId ?? `${e.tool}-${i}`}
-              className="rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800/40"
-            >
-              <button
-                type="button"
-                onClick={() => {
-                  setExpandedIds((prev) => {
-                    const next = new Set(prev);
-                    if (next.has(i)) next.delete(i);
-                    else next.add(i);
-                    return next;
-                  });
-                }}
-                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs hover:bg-gray-50 dark:hover:bg-gray-700/30"
-              >
-                <span className={`flex-shrink-0 font-bold ${statusColor}`}>{status}</span>
-                <span className="font-mono text-gray-800 dark:text-gray-200 flex-shrink-0">{e.tool}</span>
-                {e.argSummary && (
-                  <span className="truncate font-mono text-gray-600 dark:text-gray-400">
-                    {e.argSummary}
-                  </span>
-                )}
-                {e.resultSummary && (
-                  <span className="ml-auto flex-shrink-0 truncate font-mono text-gray-500 dark:text-gray-500 max-w-[40%]">
-                    → {e.resultSummary}
-                  </span>
-                )}
-                <span className="ml-2 flex-shrink-0 text-gray-400">{expanded ? "▾" : "▸"}</span>
-              </button>
-              {expanded && (
-                <div className="border-t border-gray-200 dark:border-gray-700 px-3 py-2 text-xs">
-                  <div className="mb-1 text-gray-500 dark:text-gray-400">input:</div>
-                  <pre className="mb-2 whitespace-pre-wrap break-words font-mono text-gray-800 dark:text-gray-200">
-                    {(() => {
-                      try {
-                        return JSON.stringify(e.input, null, 2);
-                      } catch {
-                        return String(e.input);
-                      }
-                    })()}
-                  </pre>
-                  {e.resultBody !== undefined && (
-                    <>
-                      <div className="mb-1 text-gray-500 dark:text-gray-400">result:</div>
-                      <pre className="whitespace-pre-wrap break-words font-mono text-gray-800 dark:text-gray-200">
-                        {e.resultBody}
-                      </pre>
-                    </>
-                  )}
-                </div>
-              )}
-            </li>
-          );
-        })}
-      </ul>
     </div>
   );
 }

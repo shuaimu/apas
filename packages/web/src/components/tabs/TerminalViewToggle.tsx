@@ -28,7 +28,7 @@ export function TerminalViewToggle({
     "bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-400 dark:hover:bg-gray-700";
 
   return (
-    <div className="flex items-center gap-2 border-b border-gray-200 px-3 py-1 dark:border-gray-700">
+    <div className="flex items-center gap-2">
       <div className="flex overflow-hidden rounded" role="group" aria-label="Terminal pane view">
         <button
           type="button"
@@ -50,7 +50,7 @@ export function TerminalViewToggle({
         </button>
       </div>
       {mode === "conversation" && (
-        <span className="text-[11px] text-gray-500 dark:text-gray-400">
+        <span className="hidden text-[11px] text-gray-500 dark:text-gray-400 xl:inline">
           {turnCount === 0
             ? "No turns captured yet — the transcript is read every few seconds."
             : `${turnCount} turn${turnCount === 1 ? "" : "s"} · read-only, type in the Terminal view`}
