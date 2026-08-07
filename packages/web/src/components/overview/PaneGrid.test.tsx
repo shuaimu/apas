@@ -60,10 +60,6 @@ function agentSelect(label: string): HTMLSelectElement {
   return within(card(label)).getByTitle(/Agent frontend \/ API backend/) as HTMLSelectElement;
 }
 
-function claudeModelSelect(label: string): HTMLSelectElement {
-  return within(card(label)).getByTitle(/Claude model/) as HTMLSelectElement;
-}
-
 function optionLabels(select: HTMLSelectElement): string[] {
   return Array.from(select.options).map((option) => option.textContent ?? "");
 }
@@ -133,7 +129,7 @@ describe("PaneGrid removal controls", () => {
   });
 });
 
-describe("PaneGrid agent and model switchers", () => {
+describe("PaneGrid existing-pane selectors", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     act(() => {
@@ -221,28 +217,35 @@ describe("PaneGrid agent and model switchers", () => {
     });
   });
 
-  it("updates Claude model selections and clears Default to null", () => {
+  it("renders no model selector and preserves launch models for managed and unmanaged panes", () => {
     const { updatePaneModel } = seedPaneGrid([
-      pane({ pane_id: 50, label: "Claude Default", role: "developer", managed: true }),
       pane({ pane_id: 51, label: "Claude Sonnet", role: "developer", managed: true, model: "sonnet" }),
+      pane({
+        pane_id: 52,
+        label: "Side Claude",
+        role: "side chat",
+        managed: false,
+        model: "claude-fable-5",
+      }),
     ]);
-    vi.spyOn(window, "confirm").mockReturnValue(true);
-    renderPaneGrid("managed");
+    const managed = renderPaneGrid("managed");
 
-    fireEvent.change(claudeModelSelect("Claude Default"), { target: { value: "opus" } });
-    fireEvent.change(claudeModelSelect("Claude Sonnet"), { target: { value: "default" } });
+    expect(within(card("Claude Sonnet")).queryByTitle(/Claude model/)).toBeNull();
+    expect(within(card("Claude Sonnet")).getAllByRole("combobox")).toHaveLength(1);
+    expect(agentSelect("Claude Sonnet").value).toBe("claude/official");
 
-    expect(updatePaneModel).toHaveBeenNthCalledWith(1, 50, "opus");
-    expect(updatePaneModel).toHaveBeenNthCalledWith(2, 51, null);
-  });
+    managed.unmount();
+    renderPaneGrid("unmanaged");
 
-  it("does not render the Claude model selector for non-Claude panes", () => {
-    seedPaneGrid([
-      pane({ pane_id: 60, label: "Codex Worker", role: "developer", managed: true, provider: "codex" }),
-    ]);
-
-    renderPaneGrid("managed");
-
-    expect(within(card("Codex Worker")).queryByTitle(/Claude model/)).toBeNull();
+    expect(within(card("Side Claude")).queryByTitle(/Claude model/)).toBeNull();
+    expect(within(card("Side Claude")).getAllByRole("combobox")).toHaveLength(1);
+    expect(agentSelect("Side Claude").value).toBe("claude/official");
+    expect(updatePaneModel).not.toHaveBeenCalled();
+    expect(useStore.getState().paneConfigs).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ pane_id: 51, model: "sonnet" }),
+        expect.objectContaining({ pane_id: 52, model: "claude-fable-5" }),
+      ]),
+    );
   });
 });

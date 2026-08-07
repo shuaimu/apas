@@ -162,13 +162,10 @@ function PaneCard({
       : "text-gray-400";
   const updatePaneModel = useStore((s) => s.updatePaneModel);
   // Inline agent switcher. Mirrors the "+" new-tab menu's
-  // frontend/backend grouping: the first select picks an
+  // frontend/backend grouping: the select picks an
   // agent-frontend × API-backend combo (e.g. "Claude / DeepSeek" =
   // claude CLI talking to deepseek's anthropic-compatible endpoint
-  // via the env-override path). The second select only appears for
-  // Claude/Official to pick the underlying Anthropic model
-  // (Sonnet/Opus/Haiku); MiniMax/GLM/DeepSeek backends lock in their
-  // own model string so the extra knob would be misleading.
+  // via the env-override path).
   const AGENT_OPTS: ReadonlyArray<{
     value: string;
     label: string;
@@ -185,24 +182,6 @@ function PaneCard({
     { value: "opencode/official", label: "OpenCode / Official", provider: "opencode", model: null },
     { value: "cursor-agent/official", label: "Cursor / Official", provider: "cursor-agent", model: null },
   ];
-  const CLAUDE_MODEL_OPTS: ReadonlyArray<{ value: string; label: string }> = [
-    { value: "default", label: "Default" },
-    // Fable has no short alias in the claude CLI yet — pass the full ID.
-    { value: "claude-fable-5", label: "Fable" },
-    { value: "sonnet", label: "Sonnet" },
-    { value: "opus", label: "Opus" },
-    { value: "haiku", label: "Haiku" },
-  ];
-  const normalizeClaudeModel = (raw?: string | null): string => {
-    if (typeof raw !== "string") return "default";
-    const v = raw.trim().toLowerCase();
-    if (CLAUDE_MODEL_OPTS.some((o) => o.value === v)) return v;
-    if (v.includes("fable")) return "claude-fable-5";
-    if (v.includes("sonnet")) return "sonnet";
-    if (v.includes("opus")) return "opus";
-    if (v.includes("haiku")) return "haiku";
-    return "default";
-  };
   // Reverse mapping from (provider, model) → agent option value, so the
   // dropdown reflects whichever combo the pane is actually running.
   // Claude with a backend-specific model classifies into the matching
@@ -225,7 +204,6 @@ function PaneCard({
     if (provider === "deepseek") return "claude/deepseek";
     return "claude/official";
   })();
-  const isClaudeOfficial = currentAgentValue === "claude/official";
   const label = pane.label || `Tab ${pane.pane_id}`;
   return (
     <button
@@ -300,36 +278,6 @@ function PaneCard({
               </option>
             ))}
           </select>
-          {isClaudeOfficial && (
-            <select
-              value={normalizeClaudeModel(pane.model)}
-              onChange={(e) => {
-                const next = e.target.value;
-                const cur = normalizeClaudeModel(pane.model);
-                if (next === cur) return;
-                // Same rule as TabbedView: specific claude model =
-                // live swap, clearing to default = respawn.
-                if (next === "default") {
-                  if (
-                    !confirm(
-                      "Clear model back to Claude's default? The current turn will be interrupted and the agent respawns with a fresh context.",
-                    )
-                  ) {
-                    return;
-                  }
-                }
-                updatePaneModel(pane.pane_id, next === "default" ? null : next);
-              }}
-              className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-1 py-0 text-[10px] font-mono text-gray-700 dark:text-gray-300 focus:outline-none"
-              title="Claude model — fable/sonnet/opus/haiku live-swap via apply_flag_settings (no context reset). Clearing to default respawns."
-            >
-              {CLAUDE_MODEL_OPTS.map((o) => (
-                <option key={o.value} value={o.value}>
-                  {o.label}
-                </option>
-              ))}
-            </select>
-          )}
         </span>
       </div>
 
