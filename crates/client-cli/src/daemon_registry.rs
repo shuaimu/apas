@@ -164,7 +164,13 @@ fn claim_path(config_dir: &Path, project_id: &str) -> PathBuf {
     // filename and must not escape the directory.
     let safe: String = project_id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     claims_dir(config_dir).join(format!("{safe}.json"))
 }
@@ -564,7 +570,10 @@ mod tests {
         write_atomic(&path, &other_host_claim("p1", "zoo-002", now_secs())).unwrap();
 
         release_project(dir.path(), "p1");
-        assert!(path.exists(), "a peer's claim must survive our release call");
+        assert!(
+            path.exists(),
+            "a peer's claim must survive our release call"
+        );
     }
 
     #[test]
@@ -585,13 +594,20 @@ mod tests {
             ("zoo-004", now.saturating_sub(STALE_AFTER_SECS + 30)),
             (&hostname(), now),
         ] {
-            write_atomic(&daemons_dir(dir.path()).join(format!("{host}.json")), &mk(host, hb))
-                .unwrap();
+            write_atomic(
+                &daemons_dir(dir.path()).join(format!("{host}.json")),
+                &mk(host, hb),
+            )
+            .unwrap();
         }
 
         let peers = live_peers(dir.path());
         let names: Vec<&str> = peers.iter().map(|p| p.hostname.as_str()).collect();
-        assert_eq!(names, vec!["zoo-002"], "self and stale hosts must be excluded");
+        assert_eq!(
+            names,
+            vec!["zoo-002"],
+            "self and stale hosts must be excluded"
+        );
     }
 
     #[test]
@@ -606,7 +622,9 @@ mod tests {
         assert!(live_peers(dir.path()).is_empty());
 
         withdraw_self(dir.path());
-        assert!(!daemons_dir(dir.path()).join(format!("{}.json", hostname())).exists());
+        assert!(!daemons_dir(dir.path())
+            .join(format!("{}.json", hostname()))
+            .exists());
     }
 
     #[test]
@@ -626,7 +644,10 @@ mod tests {
             let _guard = RegistrationGuard::new(dir.path().to_path_buf());
         } // dropped here, as it would be on any early return
 
-        assert!(!record.exists(), "daemon record should be withdrawn on drop");
+        assert!(
+            !record.exists(),
+            "daemon record should be withdrawn on drop"
+        );
         assert!(
             !claims_dir(dir.path()).join("p1.json").exists(),
             "our claims should be released on drop"

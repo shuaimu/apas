@@ -16,14 +16,7 @@ use shared::PlanReviewMode;
 /// policy is `RiskyOnly` we gate exactly these; the rest auto-approve.
 /// Conservative list: any tool that could persist a change, plus Task
 /// (since a subagent could do anything).
-const RISKY_TOOLS: &[&str] = &[
-    "Write",
-    "Edit",
-    "MultiEdit",
-    "NotebookEdit",
-    "Bash",
-    "Task",
-];
+const RISKY_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "Task"];
 
 /// Tools that bypass gating regardless of mode. AskUserQuestion has its
 /// own user-approval mechanism (Phase 1) and gating it would deadlock.
@@ -46,7 +39,14 @@ mod tests {
 
     #[test]
     fn never_mode_never_holds() {
-        for tool in ["Write", "Edit", "Bash", "Read", "AskUserQuestion", "Unknown"] {
+        for tool in [
+            "Write",
+            "Edit",
+            "Bash",
+            "Read",
+            "AskUserQuestion",
+            "Unknown",
+        ] {
             assert!(
                 !should_hold_tool(PlanReviewMode::Never, tool),
                 "Never should not hold {}",
@@ -83,7 +83,15 @@ mod tests {
 
     #[test]
     fn risky_only_mode_lets_safe_tools_through() {
-        for tool in &["Read", "Glob", "Grep", "LS", "TodoWrite", "WebFetch", "AskUserQuestion"] {
+        for tool in &[
+            "Read",
+            "Glob",
+            "Grep",
+            "LS",
+            "TodoWrite",
+            "WebFetch",
+            "AskUserQuestion",
+        ] {
             assert!(
                 !should_hold_tool(PlanReviewMode::RiskyOnly, tool),
                 "RiskyOnly should NOT hold {}",

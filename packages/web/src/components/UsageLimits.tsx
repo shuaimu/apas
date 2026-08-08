@@ -220,16 +220,12 @@ export function UsageLimitsDisplay({ limits, compact = false }: UsageLimitsDispl
 const PROVIDER_LABELS: Record<string, string> = {
   claude: "Claude",
   codex: "Codex",
-  minimax: "MiniMax",
-  glm: "GLM",
   deepseek: "DeepSeek",
 };
 
 const PROVIDER_COLORS: Record<string, string> = {
   claude: "border-l-amber-500",
   codex: "border-l-blue-500",
-  minimax: "border-l-cyan-500",
-  glm: "border-l-emerald-500",
   deepseek: "border-l-indigo-500",
 };
 
@@ -242,6 +238,7 @@ export function AllProvidersUsage() {
 
     for (const [, byProvider] of usageLimits) {
       for (const [provider, limits] of Object.entries(byProvider)) {
+        if (!(provider in PROVIDER_LABELS)) continue;
         const existing = latest[provider];
         if (!limits.fiveHour && !limits.sevenDay) continue;
         if (
@@ -306,14 +303,8 @@ export function UsageLimitsPanel() {
     const limitsByProvider = usageLimits.get(currentCliClientId);
     if (!limitsByProvider) return null;
 
-    if (limitsByProvider.glm) {
-      return { label: "GLM Usage", limits: limitsByProvider.glm };
-    }
     if (limitsByProvider.deepseek) {
       return { label: "DeepSeek Usage", limits: limitsByProvider.deepseek };
-    }
-    if (limitsByProvider.minimax) {
-      return { label: "MiniMax Usage", limits: limitsByProvider.minimax };
     }
     if (limitsByProvider.codex) {
       return { label: "Codex Usage", limits: limitsByProvider.codex };

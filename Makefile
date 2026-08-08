@@ -1,4 +1,4 @@
-.PHONY: all build test lint fmt clean dev-server dev-web
+.PHONY: all build test lint fmt clean dev-server dev-web audit-web
 
 # Default target
 all: build test
@@ -46,7 +46,12 @@ dev-web:
 
 # Install dependencies
 install:
-	cd packages/web && pnpm install
+	cd packages/web && pnpm install --frozen-lockfile
+
+# Audit both supported web dependency graphs at every severity level
+audit-web:
+	cd packages/web && npm run audit:npm
+	cd packages/web && pnpm run audit:pnpm
 
 # Watch mode for web tests
 test-watch:
@@ -66,4 +71,5 @@ help:
 	@echo "  dev-server - Run development server"
 	@echo "  dev-web    - Run web development server"
 	@echo "  install    - Install dependencies"
+	@echo "  audit-web  - Audit npm and pnpm web dependencies"
 	@echo "  test-watch - Run web tests in watch mode"

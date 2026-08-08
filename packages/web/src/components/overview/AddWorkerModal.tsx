@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useStore, type PlanReviewMode } from "@/lib/store";
 import { ROLE_TEMPLATES, TEMPLATE_COLOR_CLASSES, type RoleTemplate } from "@/lib/roleTemplates";
 import {
@@ -8,6 +8,7 @@ import {
   PROVIDER_MODEL_OPTIONS,
   findProviderModelOption,
 } from "@/lib/providerOptions";
+import { useIsLaunchProfileAllowed } from "@/lib/tabTypes";
 import { X } from "lucide-react";
 
 interface AddWorkerModalProps {
@@ -18,6 +19,10 @@ interface AddWorkerModalProps {
 export function AddWorkerModal({ open, onClose }: AddWorkerModalProps) {
   const addPane = useStore((s) => s.addPane);
   const showToast = useStore((s) => s.showToast);
+  const isAllowed = useIsLaunchProfileAllowed();
+  const allowedOptions = PROVIDER_MODEL_OPTIONS.filter((option) =>
+    isAllowed("agent", option.provider, option.model)
+  );
 
   const [template, setTemplate] = useState<RoleTemplate | null>(null);
   const [providerOptionValue, setProviderOptionValue] = useState(
@@ -30,6 +35,12 @@ export function AddWorkerModal({ open, onClose }: AddWorkerModalProps) {
   const [backstory, setBackstory] = useState("");
   const [mode, setMode] = useState<PlanReviewMode>("never");
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!allowedOptions.some((option) => option.value === providerOptionValue)) {
+      setProviderOptionValue(allowedOptions[0]?.value ?? "");
+    }
+  }, [allowedOptions, providerOptionValue]);
 
   if (!open) return null;
 
@@ -58,6 +69,10 @@ export function AddWorkerModal({ open, onClose }: AddWorkerModalProps) {
   const handleSubmit = () => {
     const cleanLabel = label.trim() || (template ? template.label : undefined);
     const providerOption = findProviderModelOption(providerOptionValue);
+    if (providerOption.supported === false) {
+      setError("Select a supported provider before adding a worker");
+      return;
+    }
     const result = addPane(
       providerOption.provider,
       "interactive",
@@ -156,7 +171,7 @@ export function AddWorkerModal({ open, onClose }: AddWorkerModalProps) {
                 onChange={(e) => setProviderOptionValue(e.target.value)}
                 className="rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-zinc-100"
               >
-                {PROVIDER_MODEL_OPTIONS.map((option) => (
+                {allowedOptions.map((option) => (
                   <option key={option.value} value={option.value}>
                     {option.label}
                   </option>

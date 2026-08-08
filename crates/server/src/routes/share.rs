@@ -16,7 +16,6 @@ const WEB_UI_URL: &str = "http://apas.mpaxos.com";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProjectRole {
     Owner,
-    Admin,
     User,
 }
 
@@ -24,33 +23,30 @@ impl ProjectRole {
     fn as_str(self) -> &'static str {
         match self {
             ProjectRole::Owner => "owner",
-            ProjectRole::Admin => "admin",
             ProjectRole::User => "user",
         }
     }
 
     pub(crate) fn can_manage_access(self) -> bool {
-        matches!(self, ProjectRole::Owner | ProjectRole::Admin)
+        matches!(self, ProjectRole::Owner)
     }
 }
 
 pub(crate) fn parse_share_role(raw: &str) -> ProjectRole {
     match raw.trim().to_ascii_lowercase().as_str() {
         "owner" => ProjectRole::Owner,
-        "admin" => ProjectRole::Admin,
         _ => ProjectRole::User,
     }
 }
 
 fn parse_assignable_share_role(raw: &str) -> Result<ProjectRole, AppError> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "admin" => Ok(ProjectRole::Admin),
         "user" => Ok(ProjectRole::User),
         "owner" => Err(AppError::BadRequest(
             "Role 'owner' is reserved for the project owner".to_string(),
         )),
         _ => Err(AppError::BadRequest(
-            "Invalid role. Expected 'admin' or 'user'".to_string(),
+            "Invalid project role. Expected 'user'".to_string(),
         )),
     }
 }
@@ -64,7 +60,17 @@ async fn extract_user_id(state: &AppState, auth_header: Option<&str>) -> Result<
         })?;
 
     let claims = verify_token(token, &state.config.auth.jwt_secret)?;
-    Ok(claims.sub)
+    let user = state
+        .db
+        .get_user_by_id(&claims.sub)
+        .await?
+        .ok_or_else(|| AppError::AuthError("Cluster account not found".to_string()))?;
+    if !user.is_active() {
+        return Err(AppError::AuthError(
+            "Cluster account is suspended".to_string(),
+        ));
+    }
+    Ok(user.id)
 }
 
 async fn get_project_role_for_user(
@@ -103,6 +109,10 @@ pub async fn generate_code(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
     let user_id = extract_user_id(&state, auth_header).await?;
+    let (_project_id, _project_guard) = state
+        .active_session_operation(&req.session_id)
+        .await
+        .map_err(|_| AppError::Conflict("Project is unavailable".to_string()))?;
 
     let actor_role = get_project_role_for_user(&state, &req.session_id, &user_id).await?;
     if !actor_role.can_manage_access() {
@@ -126,6 +136,7 @@ pub async fn generate_code(
     let invitation = InvitationCode {
         code: code.clone(),
         session_id: req.session_id.clone(),
+        project_id: None,
         created_by: user_id,
         expires_at: expires_at_str.clone(),
         redeemed_by: None,
@@ -177,6 +188,10 @@ pub async fn redeem_code(
         .get_invitation_code(&req.code)
         .await?
         .ok_or_else(|| AppError::BadRequest("Invalid invitation code".to_string()))?;
+    let (_project_id, _project_guard) = state
+        .active_session_operation(&invitation.session_id)
+        .await
+        .map_err(|_| AppError::Conflict("Project is unavailable".to_string()))?;
 
     // Check if already redeemed
     if invitation.redeemed_by.is_some() {
@@ -211,19 +226,17 @@ pub async fn redeem_code(
         }));
     }
 
-    // Create the share entry
-    state
+    if !state
         .db
-        .create_session_share_with_role(
-            &invitation.session_id,
-            &user_id,
-            &invitation.created_by,
-            "user",
-        )
-        .await?;
-
-    // Delete the used invitation code (no longer needed)
-    state.db.delete_invitation_code(&req.code).await?;
+        .redeem_project_invitation(&req.code, &user_id)
+        .await?
+    {
+        return Ok(Json(RedeemCodeResponse {
+            success: false,
+            session_id: None,
+            message: "This invitation is no longer valid for an active project".to_string(),
+        }));
+    }
 
     tracing::info!(
         "User {} redeemed share code {} for session {}",
@@ -267,6 +280,10 @@ pub async fn list_shares(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
     let user_id = extract_user_id(&state, auth_header).await?;
+    let (_project_id, _project_guard) = state
+        .active_session_operation(&session_id)
+        .await
+        .map_err(|_| AppError::Conflict("Project is unavailable".to_string()))?;
 
     let actor_role = get_project_role_for_user(&state, &session_id, &user_id).await?;
     if !actor_role.can_manage_access() {
@@ -321,6 +338,10 @@ pub async fn revoke_access(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
     let user_id = extract_user_id(&state, auth_header).await?;
+    let (_project_id, _project_guard) = state
+        .active_session_operation(&session_id)
+        .await
+        .map_err(|_| AppError::Conflict("Project is unavailable".to_string()))?;
 
     let actor_role = get_project_role_for_user(&state, &session_id, &user_id).await?;
     if !actor_role.can_manage_access() {
@@ -344,19 +365,12 @@ pub async fn revoke_access(
         .db
         .get_session_share_role(&session_id, &target_user_id)
         .await?;
-    let Some(target_role_raw) = target_role else {
+    let Some(_target_role_raw) = target_role else {
         return Ok(Json(serde_json::json!({
             "success": false,
             "message": "Share not found"
         })));
     };
-    let target_role = parse_share_role(&target_role_raw);
-    if actor_role == ProjectRole::Admin && target_role == ProjectRole::Admin {
-        return Err(AppError::AuthError(
-            "Admins cannot remove other admins".to_string(),
-        ));
-    }
-
     // Delete the share
     let deleted = state
         .db
@@ -396,6 +410,10 @@ pub async fn update_share_role(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
     let user_id = extract_user_id(&state, auth_header).await?;
+    let (_project_id, _project_guard) = state
+        .active_session_operation(&session_id)
+        .await
+        .map_err(|_| AppError::Conflict("Project is unavailable".to_string()))?;
 
     let actor_role = get_project_role_for_user(&state, &session_id, &user_id).await?;
     if !actor_role.can_manage_access() {
@@ -420,27 +438,12 @@ pub async fn update_share_role(
         .db
         .get_session_share_role(&session_id, &target_user_id)
         .await?;
-    let Some(target_role_raw) = target_role else {
+    let Some(_target_role_raw) = target_role else {
         return Ok(Json(serde_json::json!({
             "success": false,
             "message": "Share not found"
         })));
     };
-    let target_role = parse_share_role(&target_role_raw);
-
-    if actor_role == ProjectRole::Admin {
-        if target_role == ProjectRole::Admin {
-            return Err(AppError::AuthError(
-                "Admins cannot modify other admins".to_string(),
-            ));
-        }
-        if desired_role == ProjectRole::Admin {
-            return Err(AppError::AuthError(
-                "Admins cannot assign admin role".to_string(),
-            ));
-        }
-    }
-
     let _ = state
         .db
         .update_session_share_role(&session_id, &target_user_id, desired_role.as_str())

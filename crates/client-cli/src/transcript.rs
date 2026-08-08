@@ -97,10 +97,7 @@ pub fn parse_claude(raw: &str) -> Vec<TurnRecord> {
             pane_id: 0,
             role: role.to_string(),
             text,
-            model: msg
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            model: msg.get("model").and_then(Value::as_str).map(str::to_string),
             input_tokens: tok("input_tokens"),
             output_tokens: tok("output_tokens"),
         });
@@ -296,7 +293,11 @@ mod tests {
 {"type":"response_item","timestamp":"t5","payload":{"type":"custom_tool_call","name":"shell"}}
 "#;
         let turns = parse_codex(raw);
-        assert_eq!(turns.len(), 2, "developer/reasoning/tool items are not turns");
+        assert_eq!(
+            turns.len(),
+            2,
+            "developer/reasoning/tool items are not turns"
+        );
         assert_eq!(turns[0].role, "user");
         assert_eq!(turns[0].text, "do it");
         assert_eq!(turns[1].role, "assistant");
@@ -362,7 +363,10 @@ mod tests {
 
         let found = find_codex_rollout(home.path(), Path::new("/wanted"));
         assert_eq!(
-            found.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()),
+            found
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
             Some("rollout-b.jsonl")
         );
         assert!(find_codex_rollout(home.path(), Path::new("/nothing-here")).is_none());

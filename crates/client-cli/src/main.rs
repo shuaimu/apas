@@ -371,7 +371,11 @@ async fn main() -> Result<()> {
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                 match action {
-                    WorktreeAction::Add { pane_id, branch, path } => {
+                    WorktreeAction::Add {
+                        pane_id,
+                        branch,
+                        path,
+                    } => {
                         worktree::add(&project_dir, pane_id, branch, path)?;
                     }
                     WorktreeAction::Remove { pane_id } => {
@@ -703,21 +707,30 @@ fn is_apas_daemon_process(pid: u32) -> bool {
     has_apas_binary && has_daemon_arg
 }
 
-const CONFIG_KEYS: &str = "server, token, claude_path, minimax_path, codex_path, minimax_api_base_url, minimax_api_key, glm_api_base_url, glm_api_key, deepseek_api_base_url, deepseek_api_key, daemon_machine_id, daemon_roots";
+const CONFIG_KEYS: &str = "server, token, claude_path, codex_path, opencode_path, cursor_agent_path, deepseek_api_base_url, deepseek_api_key, daemon_machine_id, daemon_roots";
 
 fn set_config_value(config: &mut config::Config, key: &str, value: String) -> Result<()> {
     match key {
         "server" => config.remote.server = Some(value),
         "token" => config.remote.token = Some(value),
         "claude_path" => config.local.claude_path = value,
-        "minimax_path" => config.local.minimax_path = value,
         "codex_path" => config.local.codex_path = value,
-        "minimax_api_base_url" => config.local.minimax_api_base_url = if value.trim().is_empty() { None } else { Some(value) },
-        "minimax_api_key" => config.local.minimax_api_key = if value.trim().is_empty() { None } else { Some(value) },
-        "glm_api_base_url" => config.local.glm_api_base_url = if value.trim().is_empty() { None } else { Some(value) },
-        "glm_api_key" => config.local.glm_api_key = if value.trim().is_empty() { None } else { Some(value) },
-        "deepseek_api_base_url" => config.local.deepseek_api_base_url = if value.trim().is_empty() { None } else { Some(value) },
-        "deepseek_api_key" => config.local.deepseek_api_key = if value.trim().is_empty() { None } else { Some(value) },
+        "opencode_path" => config.local.opencode_path = value,
+        "cursor_agent_path" => config.local.cursor_agent_path = value,
+        "deepseek_api_base_url" => {
+            config.local.deepseek_api_base_url = if value.trim().is_empty() {
+                None
+            } else {
+                Some(value)
+            }
+        }
+        "deepseek_api_key" => {
+            config.local.deepseek_api_key = if value.trim().is_empty() {
+                None
+            } else {
+                Some(value)
+            }
+        }
         "daemon_machine_id" => config.daemon.machine_id = Some(value),
         "daemon_roots" => {
             config.daemon.project_roots = value
@@ -744,10 +757,21 @@ mod tests {
     #[test]
     fn deepseek_config_get_masks_api_key() {
         let mut config = config::Config::default();
-        set_config_value(&mut config, "deepseek_api_key", "sk-deepseek-secret".to_string()).unwrap();
+        set_config_value(
+            &mut config,
+            "deepseek_api_key",
+            "sk-deepseek-secret".to_string(),
+        )
+        .unwrap();
 
-        assert_eq!(config.local.deepseek_api_key.as_deref(), Some("sk-deepseek-secret"));
-        assert_eq!(get_config_value(&config, "deepseek_api_key").unwrap(), "****");
+        assert_eq!(
+            config.local.deepseek_api_key.as_deref(),
+            Some("sk-deepseek-secret")
+        );
+        assert_eq!(
+            get_config_value(&config, "deepseek_api_key").unwrap(),
+            "****"
+        );
     }
 
     #[test]
@@ -855,7 +879,10 @@ mod tests {
 
         fs::write(&pid_path, "not-a-pid\n").expect("write invalid pid");
         assert_eq!(read_legacy_daemon_pid(&pid_path), None);
-        assert_eq!(read_legacy_daemon_pid(&dir.path().join("missing.pid")), None);
+        assert_eq!(
+            read_legacy_daemon_pid(&dir.path().join("missing.pid")),
+            None
+        );
     }
 
     #[test]
@@ -898,12 +925,11 @@ mod tests {
         .expect("write daemon state");
         fs::write(&legacy_pid_path, "99\n").expect("write legacy pid");
 
-        let running = detect_running_daemon_with_process_check(
-            &state_path,
-            &legacy_pid_path,
-            |pid| pid == 99,
-        )
-        .expect("detect legacy daemon");
+        let running =
+            detect_running_daemon_with_process_check(&state_path, &legacy_pid_path, |pid| {
+                pid == 99
+            })
+            .expect("detect legacy daemon");
 
         assert_eq!(running.pid, 99);
         assert_eq!(running.version, None);
@@ -929,23 +955,33 @@ mod tests {
 fn get_config_value(config: &config::Config, key: &str) -> Result<String> {
     let value = match key {
         "server" => config.remote.server.clone().unwrap_or_default(),
-        "token" => config.remote.token.as_ref().map(|_| "****".to_string()).unwrap_or_default(),
+        "token" => config
+            .remote
+            .token
+            .as_ref()
+            .map(|_| "****".to_string())
+            .unwrap_or_default(),
         "claude_path" => config.local.claude_path.clone(),
-        "minimax_path" => config.local.minimax_path.clone(),
         "codex_path" => config.local.codex_path.clone(),
-        "minimax_api_base_url" => config.local.minimax_api_base_url.clone().unwrap_or_default(),
-        "minimax_api_key" => config.local.minimax_api_key.as_ref().map(|_| "****".to_string()).unwrap_or_default(),
-        "glm_api_base_url" => config.local.glm_api_base_url.clone().unwrap_or_default(),
-        "glm_api_key" => config.local.glm_api_key.as_ref().map(|_| "****".to_string()).unwrap_or_default(),
-        "deepseek_api_base_url" => config.local.deepseek_api_base_url.clone().unwrap_or_default(),
-        "deepseek_api_key" => config.local.deepseek_api_key.as_ref().map(|_| "****".to_string()).unwrap_or_default(),
+        "opencode_path" => config.local.opencode_path.clone(),
+        "cursor_agent_path" => config.local.cursor_agent_path.clone(),
+        "deepseek_api_base_url" => config
+            .local
+            .deepseek_api_base_url
+            .clone()
+            .unwrap_or_default(),
+        "deepseek_api_key" => config
+            .local
+            .deepseek_api_key
+            .as_ref()
+            .map(|_| "****".to_string())
+            .unwrap_or_default(),
         "daemon_machine_id" => config.daemon.machine_id.clone().unwrap_or_default(),
         "daemon_roots" => config.daemon.project_roots.join(","),
         _ => anyhow::bail!("Unknown config key: {}. Valid keys: {}", key, CONFIG_KEYS),
     };
     Ok(value)
 }
-
 
 async fn handle_config_command(action: ConfigAction) -> Result<()> {
     match action {
@@ -968,34 +1004,9 @@ async fn handle_config_command(action: ConfigAction) -> Result<()> {
                 config.remote.token.map(|_| "****").unwrap_or_default()
             );
             println!("claude_path: {}", config.local.claude_path);
-            println!("minimax_path: {}", config.local.minimax_path);
             println!("codex_path: {}", config.local.codex_path);
-            println!(
-                "minimax_api_base_url: {}",
-                config.local.minimax_api_base_url.unwrap_or_default()
-            );
-            println!(
-                "minimax_api_key: {}",
-                config
-                    .local
-                    .minimax_api_key
-                    .as_ref()
-                    .map(|_| "****")
-                    .unwrap_or("")
-            );
-            println!(
-                "glm_api_base_url: {}",
-                config.local.glm_api_base_url.unwrap_or_default()
-            );
-            println!(
-                "glm_api_key: {}",
-                config
-                    .local
-                    .glm_api_key
-                    .as_ref()
-                    .map(|_| "****")
-                    .unwrap_or("")
-            );
+            println!("opencode_path: {}", config.local.opencode_path);
+            println!("cursor_agent_path: {}", config.local.cursor_agent_path);
             println!(
                 "deepseek_api_base_url: {}",
                 config.local.deepseek_api_base_url.unwrap_or_default()

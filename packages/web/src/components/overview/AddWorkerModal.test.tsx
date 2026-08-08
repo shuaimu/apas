@@ -83,7 +83,7 @@ describe("AddWorkerModal", () => {
 
     selectDeveloperTemplate();
     fireEvent.change(screen.getByLabelText("Provider"), {
-      target: { value: "codex" },
+      target: { value: "codex/official" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Add worker" }));
 

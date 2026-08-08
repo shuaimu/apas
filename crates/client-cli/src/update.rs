@@ -195,7 +195,10 @@ pub fn apas_binary_fingerprint() -> Option<(u64, i64)> {
 /// itself knows what it is.
 fn installed_binary_version() -> Option<String> {
     let path = resolve_preferred_apas_executable();
-    let out = std::process::Command::new(path).arg("--version").output().ok()?;
+    let out = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -488,7 +491,10 @@ fn is_build_irrelevant_path(path: &str) -> bool {
     }
     // The Next.js frontend, docs, and CI — never linked into the binary.
     const IRRELEVANT_PREFIXES: &[&str] = &["packages/", "docs/", ".github/"];
-    if IRRELEVANT_PREFIXES.iter().any(|prefix| p.starts_with(prefix)) {
+    if IRRELEVANT_PREFIXES
+        .iter()
+        .any(|prefix| p.starts_with(prefix))
+    {
         return true;
     }
     const IRRELEVANT_EXACT: &[&str] = &[".gitignore", ".gitattributes", "LICENSE"];

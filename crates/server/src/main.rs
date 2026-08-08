@@ -4,6 +4,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod config;
 mod db;
 mod error;
+mod project_lifecycle;
 mod routes;
 mod session;
 mod state;
@@ -42,9 +43,20 @@ async fn async_main() -> Result<()> {
     // Initialize database
     let db = db::Database::new(&config.database.path).await?;
     db.run_migrations().await?;
+    if !config.auth.bootstrap_admin_email.trim().is_empty()
+        && !db
+            .bootstrap_cluster_admin(&config.auth.bootstrap_admin_email)
+            .await?
+    {
+        tracing::debug!(
+            bootstrap_email = %config.auth.bootstrap_admin_email,
+            "Cluster administrator already exists or bootstrap account is not registered"
+        );
+    }
 
     // Create app state
     let state = AppState::new(db, config.clone());
+    project_lifecycle::recover_interrupted_deletions(&state).await?;
 
     // Spawn the message GC task. Runs once at boot to catch the backlog,
     // then every 24h. Pure delete — drops messages with created_at older

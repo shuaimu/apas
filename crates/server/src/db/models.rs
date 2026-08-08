@@ -1,4 +1,87 @@
+use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterRole {
+    Admin,
+    #[default]
+    User,
+}
+
+impl ClusterRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Admin => "admin",
+            Self::User => "user",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Self {
+        if raw.trim().eq_ignore_ascii_case("admin") {
+            Self::Admin
+        } else {
+            Self::User
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountStatus {
+    Suspended,
+    #[default]
+    Active,
+}
+
+impl AccountStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Suspended => "suspended",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Self {
+        if raw.trim().eq_ignore_ascii_case("suspended") {
+            Self::Suspended
+        } else {
+            Self::Active
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectLifecycle {
+    Suspended,
+    /// Internal, irreversible cleanup state. This value is never selectable
+    /// from the cluster-administration lifecycle API.
+    Deleting,
+    #[default]
+    Active,
+}
+
+impl ProjectLifecycle {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Suspended => "suspended",
+            Self::Deleting => "deleting",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "active" => Self::Active,
+            "suspended" => Self::Suspended,
+            "deleting" => Self::Deleting,
+            // Unknown persisted lifecycle values must fail closed. Treating
+            // them as active would reopen a project written by newer code.
+            _ => Self::Deleting,
+        }
+    }
+}
 
 #[derive(Debug, Clone, FromRow)]
 pub struct User {
@@ -6,6 +89,115 @@ pub struct User {
     pub email: String,
     pub password_hash: String,
     pub created_at: Option<String>,
+    #[sqlx(default)]
+    pub cluster_role: String,
+    #[sqlx(default)]
+    pub account_status: String,
+}
+
+impl User {
+    pub fn role(&self) -> ClusterRole {
+        ClusterRole::parse(&self.cluster_role)
+    }
+
+    pub fn status(&self) -> AccountStatus {
+        AccountStatus::parse(&self.account_status)
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.status() == AccountStatus::Active
+    }
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct Project {
+    pub id: String,
+    pub owner_user_id: String,
+    pub lifecycle_status: String,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+impl Project {
+    pub fn lifecycle(&self) -> ProjectLifecycle {
+        ProjectLifecycle::parse(&self.lifecycle_status)
+    }
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct ProjectMember {
+    pub project_id: String,
+    pub user_id: String,
+    pub invited_by: String,
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct ClusterInvitation {
+    pub code: String,
+    pub email: String,
+    pub created_by: String,
+    pub expires_at: String,
+    pub redeemed_at: Option<String>,
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct AdminAuditEvent {
+    pub id: i64,
+    pub actor_user_id: String,
+    pub action: String,
+    pub target_type: String,
+    pub target_id: String,
+    pub project_id: Option<String>,
+    pub details: Option<String>,
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectDeletionManifest {
+    pub project_id: String,
+    pub owner_user_id: String,
+    pub session_ids: Vec<String>,
+    pub affected_user_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct ClusterUserSummary {
+    pub id: String,
+    pub email: String,
+    pub cluster_role: String,
+    pub account_status: String,
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct ProjectMemberInfo {
+    pub user_id: String,
+    pub email: String,
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct AdminProjectSummary {
+    pub id: String,
+    pub owner_user_id: String,
+    pub owner_email: String,
+    pub lifecycle_status: String,
+    pub member_count: i64,
+    pub active_session_count: i64,
+    pub last_activity: Option<String>,
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectPolicyOverride {
+    pub project_id: String,
+    pub team_available: Option<bool>,
+    pub allowed_launch_profiles: Option<Vec<String>>,
+    pub version: i64,
+    pub legacy_imported: bool,
+    pub legacy_conflict: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -95,6 +287,8 @@ pub struct SessionShare {
 pub struct InvitationCode {
     pub code: String,
     pub session_id: String,
+    #[sqlx(default)]
+    pub project_id: Option<String>,
     pub created_by: String,
     pub expires_at: String,
     pub redeemed_by: Option<String>,

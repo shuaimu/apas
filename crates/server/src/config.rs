@@ -26,6 +26,14 @@ pub struct DatabaseConfig {
 pub struct AuthConfig {
     pub jwt_secret: String,
     pub token_expiry_hours: u64,
+    /// One-time migration/bootstrap identity. Consulted only while the
+    /// database has no active cluster administrator.
+    #[serde(default = "default_bootstrap_admin_email")]
+    pub bootstrap_admin_email: String,
+}
+
+fn default_bootstrap_admin_email() -> String {
+    "shuai@cs.stonybrook.edu".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +93,7 @@ impl Default for Config {
             auth: AuthConfig {
                 jwt_secret: "change-me-in-production".to_string(),
                 token_expiry_hours: 876000, // ~100 years (never expire)
+                bootstrap_admin_email: default_bootstrap_admin_email(),
             },
             smtp: SmtpConfig::default(),
         }

@@ -1,8 +1,8 @@
 use dashmap::DashMap;
 use shared::{
-    CliClientInfo, CliClientStatus, DeepseekBackendInfo, GlmBackendInfo, MachineInfo,
-    MachineProjectInfo, MachineWithProjects, MiniMaxBackendInfo, PaneConfig, PaneType, Provider,
-    ServerToCli, ServerToDaemon, ServerToWeb, TerminalLifecycle, UsageLimits,
+    CliClientInfo, CliClientStatus, DeepseekBackendInfo, MachineInfo, MachineProjectInfo,
+    MachineWithProjects, PaneConfig, PaneType, ProjectAccessChange, Provider, ServerToCli,
+    ServerToDaemon, ServerToWeb, TerminalLifecycle, UsageLimits,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -30,68 +30,6 @@ fn normalize_optional_string(raw: Option<String>) -> Option<String> {
             Some(trimmed.to_string())
         }
     })
-}
-
-fn merge_minimax_backend(
-    existing: Option<MiniMaxBackendInfo>,
-    incoming: Option<MiniMaxBackendInfo>,
-) -> Option<MiniMaxBackendInfo> {
-    match (existing, incoming) {
-        (None, None) => None,
-        (Some(existing), None) => Some(existing),
-        (None, Some(mut incoming)) => {
-            incoming.api_base_url = normalize_optional_string(incoming.api_base_url);
-            incoming.api_key = normalize_optional_string(incoming.api_key);
-            incoming.api_key_configured = incoming.api_key.is_some() || incoming.api_key_configured;
-            Some(incoming)
-        }
-        (Some(existing), Some(mut incoming)) => {
-            incoming.api_base_url = normalize_optional_string(incoming.api_base_url)
-                .or_else(|| normalize_optional_string(existing.api_base_url));
-
-            let incoming_key = normalize_optional_string(incoming.api_key);
-            incoming.api_key = incoming_key.or_else(|| {
-                if incoming.api_key_configured {
-                    normalize_optional_string(existing.api_key)
-                } else {
-                    None
-                }
-            });
-            incoming.api_key_configured = incoming.api_key.is_some() || incoming.api_key_configured;
-            Some(incoming)
-        }
-    }
-}
-
-fn merge_glm_backend(
-    existing: Option<GlmBackendInfo>,
-    incoming: Option<GlmBackendInfo>,
-) -> Option<GlmBackendInfo> {
-    match (existing, incoming) {
-        (None, None) => None,
-        (Some(existing), None) => Some(existing),
-        (None, Some(mut incoming)) => {
-            incoming.api_base_url = normalize_optional_string(incoming.api_base_url);
-            incoming.api_key = normalize_optional_string(incoming.api_key);
-            incoming.api_key_configured = incoming.api_key.is_some() || incoming.api_key_configured;
-            Some(incoming)
-        }
-        (Some(existing), Some(mut incoming)) => {
-            incoming.api_base_url = normalize_optional_string(incoming.api_base_url)
-                .or_else(|| normalize_optional_string(existing.api_base_url));
-
-            let incoming_key = normalize_optional_string(incoming.api_key);
-            incoming.api_key = incoming_key.or_else(|| {
-                if incoming.api_key_configured {
-                    normalize_optional_string(existing.api_key)
-                } else {
-                    None
-                }
-            });
-            incoming.api_key_configured = incoming.api_key.is_some() || incoming.api_key_configured;
-            Some(incoming)
-        }
-    }
 }
 
 fn merge_deepseek_backend(
@@ -141,12 +79,21 @@ pub struct SessionManager {
     cli_users: DashMap<Uuid, Uuid>,
     /// Map of CLI client ID -> reported CLI version
     cli_versions: DashMap<Uuid, String>,
+    /// Protocol capabilities negotiated by each connected CLI.
+    cli_capabilities: DashMap<Uuid, HashSet<String>>,
+    /// Stable project identity for each live session, populated from
+    /// `CliToServer::SessionStart` and used for lifecycle/policy fan-out.
+    session_projects: DashMap<Uuid, String>,
     /// Map of (CLI client ID, provider) -> latest usage limits
     cli_usage_limits: DashMap<(Uuid, Provider), UsageLimits>,
     /// Map of machine ID -> sender to daemon
     daemon_senders: DashMap<Uuid, mpsc::Sender<ServerToDaemon>>,
     /// Map of machine ID -> user ID (owner)
     daemon_users: DashMap<Uuid, Uuid>,
+    /// Protocol capabilities negotiated by each connected daemon.
+    daemon_capabilities: DashMap<Uuid, HashSet<String>>,
+    /// Protocol capabilities negotiated by each authenticated web socket.
+    web_capabilities: DashMap<Uuid, HashSet<String>>,
     /// Map of machine ID -> machine metadata
     machine_infos: DashMap<Uuid, MachineInfo>,
     /// Map of machine ID -> project list
@@ -263,9 +210,13 @@ impl SessionManager {
             cli_sessions: DashMap::new(),
             cli_users: DashMap::new(),
             cli_versions: DashMap::new(),
+            cli_capabilities: DashMap::new(),
+            session_projects: DashMap::new(),
             cli_usage_limits: DashMap::new(),
             daemon_senders: DashMap::new(),
             daemon_users: DashMap::new(),
+            daemon_capabilities: DashMap::new(),
+            web_capabilities: DashMap::new(),
             machine_infos: DashMap::new(),
             machine_projects: DashMap::new(),
             shared_project_refs: DashMap::new(),
@@ -484,6 +435,7 @@ impl SessionManager {
         self.cli_senders.remove(cli_id);
         let owner = self.cli_users.remove(cli_id).map(|(_, uid)| uid);
         self.cli_versions.remove(cli_id);
+        self.cli_capabilities.remove(cli_id);
         let keys_to_remove: Vec<(Uuid, Provider)> = self
             .cli_usage_limits
             .iter()
@@ -516,9 +468,215 @@ impl SessionManager {
         }
     }
 
+    pub fn set_session_project(&self, session_id: Uuid, project_id: String) {
+        self.session_projects.insert(session_id, project_id);
+    }
+
+    pub fn set_cli_capabilities(&self, cli_id: Uuid, capabilities: Vec<String>) {
+        self.cli_capabilities
+            .insert(cli_id, capabilities.into_iter().collect());
+    }
+
+    pub fn session_supports_capability(&self, session_id: &Uuid, capability: &str) -> bool {
+        self.sessions
+            .get(session_id)
+            .and_then(|session| session.cli_client_id)
+            .and_then(|cli_id| self.cli_capabilities.get(&cli_id))
+            .is_some_and(|capabilities| capabilities.contains(capability))
+    }
+
+    pub fn set_web_capabilities(&self, connection_id: Uuid, capabilities: Vec<String>) {
+        self.web_capabilities
+            .insert(connection_id, capabilities.into_iter().collect());
+    }
+
+    pub fn web_supports_capability(&self, connection_id: &Uuid, capability: &str) -> bool {
+        self.web_capabilities
+            .get(connection_id)
+            .is_some_and(|capabilities| capabilities.contains(capability))
+    }
+
+    pub fn set_daemon_capabilities(&self, machine_id: Uuid, capabilities: Vec<String>) {
+        self.daemon_capabilities
+            .insert(machine_id, capabilities.into_iter().collect());
+    }
+
+    pub fn daemon_supports_capability(&self, machine_id: &Uuid, capability: &str) -> bool {
+        self.daemon_capabilities
+            .get(machine_id)
+            .is_some_and(|capabilities| capabilities.contains(capability))
+    }
+
+    pub fn project_for_session(&self, session_id: &Uuid) -> Option<String> {
+        self.session_projects
+            .get(session_id)
+            .map(|entry| entry.clone())
+    }
+
+    pub fn is_project_connected(&self, project_id: &str) -> bool {
+        self.session_projects.iter().any(|entry| {
+            entry.value().as_str() == project_id && self.is_session_active(entry.key())
+        })
+    }
+
+    /// Best-effort immediate revocation after account suspension. Persistent
+    /// route guards remain authoritative if a socket races this fan-out.
+    pub async fn disconnect_user(&self, user_id: &str) {
+        let Ok(user_uuid) = Uuid::parse_str(user_id) else {
+            return;
+        };
+        let web_ids = self
+            .web_users
+            .iter()
+            .filter(|entry| *entry.value() == user_uuid)
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
+        for connection_id in web_ids {
+            let _ = self
+                .send_to_web(
+                    &connection_id,
+                    ServerToWeb::AuthenticationFailed {
+                        reason: "Cluster account is suspended".to_string(),
+                    },
+                )
+                .await;
+            self.unregister_web(&connection_id);
+        }
+
+        let cli_ids = self
+            .cli_users
+            .iter()
+            .filter(|entry| *entry.value() == user_uuid)
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
+        for cli_id in cli_ids {
+            let _ = self
+                .send_to_cli(
+                    &cli_id,
+                    ServerToCli::RegistrationFailed {
+                        reason: "Cluster account is suspended".to_string(),
+                    },
+                )
+                .await;
+            self.unregister_cli(&cli_id);
+        }
+
+        let daemon_ids = self
+            .daemon_users
+            .iter()
+            .filter(|entry| *entry.value() == user_uuid)
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
+        for machine_id in daemon_ids {
+            let _ = self
+                .send_to_daemon(
+                    &machine_id,
+                    ServerToDaemon::RegistrationFailed {
+                        reason: "Cluster account is suspended".to_string(),
+                    },
+                )
+                .await;
+            self.unregister_daemon(&machine_id);
+        }
+    }
+
+    pub fn notify_project_access_changed(
+        &self,
+        user_id: &Uuid,
+        project_id: &str,
+        change: ProjectAccessChange,
+        role: Option<&str>,
+    ) {
+        let message = ServerToWeb::ProjectAccessChanged {
+            project_id: project_id.to_string(),
+            change,
+            role: role.map(ToString::to_string),
+        };
+        for entry in self.web_users.iter() {
+            if entry.value() != user_id {
+                continue;
+            }
+            if let Some(sender) = self.web_senders.get(entry.key()) {
+                let _ = sender.try_send(message.clone());
+            }
+        }
+    }
+
+    /// Revoke one user's live project associations without stopping another
+    /// member's runtime. Database membership remains authoritative.
+    pub async fn revoke_project_access_for_user(&self, project_id: &str, user_id: &Uuid) -> usize {
+        let web_ids = self
+            .web_users
+            .iter()
+            .filter(|entry| entry.value() == user_id)
+            .map(|entry| *entry.key())
+            .collect::<HashSet<_>>();
+        let session_ids = self
+            .session_projects
+            .iter()
+            .filter(|entry| entry.value().as_str() == project_id)
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
+        let mut affected = 0;
+        let mut revoked_cli_ids = HashSet::new();
+
+        for session_id in session_ids {
+            let mut revoked_cli = None;
+            if let Some(mut session) = self.sessions.get_mut(&session_id) {
+                let before = session.web_connection_ids.len();
+                session
+                    .web_connection_ids
+                    .retain(|connection_id| !web_ids.contains(connection_id));
+                affected += before - session.web_connection_ids.len();
+                if let Some(cli_id) = session.cli_client_id {
+                    if self
+                        .cli_users
+                        .get(&cli_id)
+                        .is_some_and(|owner| owner.value() == user_id)
+                    {
+                        session.cli_client_id = None;
+                        revoked_cli = Some(cli_id);
+                    }
+                }
+            }
+            if let Some(cli_id) = revoked_cli {
+                let _ = self
+                    .send_to_cli(
+                        &cli_id,
+                        ServerToCli::SessionRejected {
+                            session_id,
+                            reason: "Project membership was revoked".to_string(),
+                        },
+                    )
+                    .await;
+                if let Some(mut sessions) = self.cli_sessions.get_mut(&cli_id) {
+                    sessions.retain(|tracked| *tracked != session_id);
+                    if sessions.is_empty() {
+                        revoked_cli_ids.insert(cli_id);
+                    }
+                }
+                affected += 1;
+            }
+        }
+        for cli_id in revoked_cli_ids {
+            self.unregister_cli(&cli_id);
+        }
+        self.shared_project_refs.remove(user_id);
+        self.notify_project_access_changed(user_id, project_id, ProjectAccessChange::Revoked, None);
+        affected
+    }
+
     /// Check if a CLI client is currently connected (has an active sender)
     pub fn is_cli_connected(&self, cli_id: &Uuid) -> bool {
         self.cli_senders.contains_key(cli_id)
+    }
+
+    pub fn is_web_connected(&self, connection_id: &Uuid) -> bool {
+        self.web_senders.contains_key(connection_id)
+    }
+
+    pub fn is_daemon_connected(&self, machine_id: &Uuid) -> bool {
+        self.daemon_senders.contains_key(machine_id)
     }
 
     // Daemon management
@@ -530,22 +688,12 @@ impl SessionManager {
         mut machine: MachineInfo,
         projects: Vec<MachineProjectInfo>,
     ) {
-        let existing_minimax = self
-            .machine_infos
-            .get(&machine_id)
-            .and_then(|m| m.minimax_backend.clone());
-        let existing_glm = self
-            .machine_infos
-            .get(&machine_id)
-            .and_then(|m| m.glm_backend.clone());
         let existing_deepseek = self
             .machine_infos
             .get(&machine_id)
             .and_then(|m| m.deepseek_backend.clone());
         machine.machine_id = machine_id;
         machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
-        machine.minimax_backend = merge_minimax_backend(existing_minimax, machine.minimax_backend);
-        machine.glm_backend = merge_glm_backend(existing_glm, machine.glm_backend);
         machine.deepseek_backend =
             merge_deepseek_backend(existing_deepseek, machine.deepseek_backend);
         self.daemon_senders.insert(machine_id, sender);
@@ -566,6 +714,7 @@ impl SessionManager {
     pub fn unregister_daemon(&self, machine_id: &Uuid) {
         let owner = self.daemon_users.get(machine_id).map(|entry| *entry);
         self.daemon_senders.remove(machine_id);
+        self.daemon_capabilities.remove(machine_id);
         // Keep machine metadata/project snapshot to avoid UI flicker during transient daemon reconnects.
         if let Some(mut machine) = self.machine_infos.get_mut(machine_id) {
             machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
@@ -591,12 +740,10 @@ impl SessionManager {
     pub fn update_daemon_projects(&self, machine_id: &Uuid, projects: Vec<MachineProjectInfo>) {
         let running_count = projects.iter().filter(|p| p.is_running).count();
         // Log when project count or running set changes (not every heartbeat)
-        let prev = self.machine_projects.get(machine_id).map(|p| {
-            (
-                p.len(),
-                p.iter().filter(|pp| pp.is_running).count(),
-            )
-        });
+        let prev = self
+            .machine_projects
+            .get(machine_id)
+            .map(|p| (p.len(), p.iter().filter(|pp| pp.is_running).count()));
         let current = (projects.len(), running_count);
         if prev != Some(current) {
             tracing::info!(
@@ -616,106 +763,17 @@ impl SessionManager {
     }
 
     pub fn update_daemon_machine_info(&self, machine_id: &Uuid, mut machine: MachineInfo) {
-        let existing_minimax = self
-            .machine_infos
-            .get(machine_id)
-            .and_then(|m| m.minimax_backend.clone());
-        let existing_glm = self
-            .machine_infos
-            .get(machine_id)
-            .and_then(|m| m.glm_backend.clone());
         let existing_deepseek = self
             .machine_infos
             .get(machine_id)
             .and_then(|m| m.deepseek_backend.clone());
         machine.machine_id = *machine_id;
         machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
-        machine.minimax_backend = merge_minimax_backend(existing_minimax, machine.minimax_backend);
-        machine.glm_backend = merge_glm_backend(existing_glm, machine.glm_backend);
         machine.deepseek_backend =
             merge_deepseek_backend(existing_deepseek, machine.deepseek_backend);
         self.machine_infos.insert(*machine_id, machine);
         if let Some(owner) = self.daemon_users.get(machine_id).map(|entry| *entry) {
             self.broadcast_machines_update_for_user(&owner);
-        }
-    }
-
-    pub fn apply_web_minimax_config(
-        &self,
-        machine_id: &Uuid,
-        api_base_url: Option<String>,
-        api_key: Option<String>,
-        clear_api_key: bool,
-    ) {
-        let owner = self.daemon_users.get(machine_id).map(|entry| *entry);
-        if let Some(mut machine) = self.machine_infos.get_mut(machine_id) {
-            let mut backend = machine
-                .minimax_backend
-                .clone()
-                .unwrap_or(MiniMaxBackendInfo {
-                    api_base_url: None,
-                    api_key: None,
-                    api_key_configured: false,
-                });
-
-            if let Some(url) = normalize_optional_string(api_base_url) {
-                backend.api_base_url = Some(url);
-            }
-
-            if clear_api_key {
-                backend.api_key = None;
-                backend.api_key_configured = false;
-            } else if let Some(key) = normalize_optional_string(api_key) {
-                backend.api_key = Some(key);
-                backend.api_key_configured = true;
-            } else {
-                backend.api_key_configured = backend.api_key.is_some();
-            }
-
-            machine.minimax_backend = Some(backend);
-            machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
-        }
-
-        if let Some(user_id) = owner {
-            self.broadcast_machines_update_for_user(&user_id);
-        }
-    }
-
-    pub fn apply_web_glm_config(
-        &self,
-        machine_id: &Uuid,
-        api_base_url: Option<String>,
-        api_key: Option<String>,
-        clear_api_key: bool,
-    ) {
-        let owner = self.daemon_users.get(machine_id).map(|entry| *entry);
-        if let Some(mut machine) = self.machine_infos.get_mut(machine_id) {
-            let mut backend = machine.glm_backend.clone().unwrap_or(GlmBackendInfo {
-                api_base_url: None,
-                api_key: None,
-                api_key_configured: false,
-            });
-
-            if let Some(url) = normalize_optional_string(api_base_url) {
-                backend.api_base_url = Some(url);
-            }
-
-            if clear_api_key {
-                backend.api_key = None;
-                backend.api_key_configured = false;
-            } else if let Some(key) = normalize_optional_string(api_key) {
-                backend.api_key = Some(key);
-                backend.api_key_configured = true;
-            } else {
-                backend.api_key_configured = backend.api_key.is_some();
-            }
-
-            machine.glm_backend = Some(backend);
-            machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
-        }
-
-        if let Some(user_id) = owner {
-            self.broadcast_machines_update_for_user(&user_id);
         }
     }
 
@@ -769,6 +827,182 @@ impl SessionManager {
             )
         } else {
             false
+        }
+    }
+
+    pub async fn stop_project_runtime(&self, project_id: &str) -> usize {
+        self.stop_project_runtime_with_reason(
+            project_id,
+            format!("Project {project_id} runtime was stopped by a cluster administrator"),
+        )
+        .await
+    }
+
+    pub async fn stop_project_runtime_with_reason(
+        &self,
+        project_id: &str,
+        reason: String,
+    ) -> usize {
+        let affected_sessions = self
+            .session_projects
+            .iter()
+            .filter(|entry| entry.value().as_str() == project_id)
+            .filter_map(|entry| {
+                let session_id = *entry.key();
+                self.sessions.get(&session_id).map(|session| {
+                    (
+                        session_id,
+                        session.cli_client_id,
+                        session.web_connection_ids.clone(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut cli_ids = HashSet::new();
+        let mut sent = 0;
+        for (session_id, cli_id, web_ids) in &affected_sessions {
+            if let Some(cli_id) = cli_id {
+                if self
+                    .send_to_cli(
+                        cli_id,
+                        ServerToCli::SessionRejected {
+                            session_id: *session_id,
+                            reason: reason.clone(),
+                        },
+                    )
+                    .await
+                {
+                    sent += 1;
+                }
+                cli_ids.insert(*cli_id);
+            }
+            for web_id in web_ids {
+                let _ = self
+                    .send_to_web(
+                        web_id,
+                        ServerToWeb::Error {
+                            message: reason.clone(),
+                        },
+                    )
+                    .await;
+            }
+            if let Some(mut session) = self.sessions.get_mut(session_id) {
+                session.web_connection_ids.clear();
+            }
+        }
+        for cli_id in cli_ids {
+            self.unregister_cli(&cli_id);
+        }
+
+        let machine_ids = self
+            .machine_projects
+            .iter()
+            .filter(|entry| entry.iter().any(|project| project.project_id == project_id))
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
+        for machine_id in machine_ids {
+            if self
+                .send_to_daemon(
+                    &machine_id,
+                    ServerToDaemon::StopProjectCli {
+                        project_id: project_id.to_string(),
+                    },
+                )
+                .await
+            {
+                sent += 1;
+            }
+        }
+        sent
+    }
+
+    /// Stop transports and erase all in-memory session state scoped to one
+    /// canonical project. Daemon machine inventory represents the local
+    /// checkout and intentionally remains available for a later fresh start.
+    pub async fn purge_project_state(&self, project_id: &str, affected_user_ids: &[Uuid]) -> usize {
+        let sent = self
+            .stop_project_runtime_with_reason(
+                project_id,
+                "Project was permanently deleted from the APAS server".to_string(),
+            )
+            .await;
+        let session_ids = self
+            .session_projects
+            .iter()
+            .filter(|entry| entry.value().as_str() == project_id)
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
+        let session_set = session_ids.iter().copied().collect::<HashSet<_>>();
+
+        for session_id in &session_ids {
+            self.sessions.remove(session_id);
+            self.session_projects.remove(session_id);
+            self.recent_input_ids.remove(session_id);
+        }
+        let terminal_keys = self
+            .terminal_states
+            .iter()
+            .filter(|entry| session_set.contains(&entry.key().0))
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
+        for key in terminal_keys {
+            self.terminal_states.remove(&key);
+        }
+        for mut tracked in self.cli_sessions.iter_mut() {
+            tracked.retain(|session_id| !session_set.contains(session_id));
+        }
+        for user_id in affected_user_ids {
+            self.shared_project_refs.remove(user_id);
+        }
+        sent
+    }
+
+    pub async fn broadcast_project_policy(
+        &self,
+        project_id: &str,
+        policy: shared::EffectiveProjectPolicy,
+    ) {
+        let session_ids = self
+            .session_projects
+            .iter()
+            .filter(|entry| entry.value().as_str() == project_id)
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
+        for session_id in session_ids {
+            let noncompliant_pane_ids = self
+                .sessions
+                .get(&session_id)
+                .map(|session| {
+                    session
+                        .panes
+                        .iter()
+                        .filter(|pane| {
+                            (!policy.team_available && pane.managed)
+                                || !policy.allows(pane.kind, pane.provider, pane.model.as_deref())
+                        })
+                        .map(|pane| pane.pane_id)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let _ = self
+                .route_to_cli(
+                    &session_id,
+                    ServerToCli::ProjectPolicy {
+                        session_id,
+                        policy: policy.clone(),
+                    },
+                )
+                .await;
+            let _ = self
+                .route_to_web(
+                    &session_id,
+                    ServerToWeb::ProjectPolicyChanged {
+                        session_id,
+                        policy: policy.clone(),
+                        noncompliant_pane_ids,
+                    },
+                )
+                .await;
         }
     }
 
@@ -997,6 +1231,7 @@ impl SessionManager {
     pub fn unregister_web(&self, connection_id: &Uuid) {
         self.web_senders.remove(connection_id);
         self.web_users.remove(connection_id);
+        self.web_capabilities.remove(connection_id);
         // Remove this connection from any sessions it was viewing
         for mut session in self.sessions.iter_mut() {
             session.web_connection_ids.retain(|id| id != connection_id);
@@ -1173,11 +1408,7 @@ impl SessionManager {
     /// session_id — without this gate, a connection could route input to
     /// sessions it never asked to observe (and that the user-access check
     /// at attach time vouched for).
-    pub fn is_web_attached_to_session(
-        &self,
-        session_id: &Uuid,
-        web_connection_id: &Uuid,
-    ) -> bool {
+    pub fn is_web_attached_to_session(&self, session_id: &Uuid, web_connection_id: &Uuid) -> bool {
         self.sessions
             .get(session_id)
             .map(|s| s.web_connection_ids.contains(web_connection_id))
@@ -1333,7 +1564,6 @@ impl SessionManager {
             })
             .unwrap_or_default()
     }
-
 
     // Message routing
     pub async fn send_to_cli(&self, cli_id: &Uuid, msg: ServerToCli) -> bool {
@@ -1512,6 +1742,9 @@ impl SessionManager {
 
     /// Update usage limits for a CLI client and broadcast to the owning user's web clients
     pub fn update_usage_limits(&self, cli_id: Uuid, provider: Provider, limits: UsageLimits) {
+        if shared::is_retired_provider(provider) {
+            return;
+        }
         self.cli_usage_limits
             .insert((cli_id, provider.clone()), limits.clone());
 
@@ -1576,7 +1809,11 @@ mod project_goal_tests {
         sessions.register_web(web_id, web_tx);
 
         assert!(sessions.attach_web_to_session(&session_id, web_id, Some(cli_id)));
-        assert!(sessions.replay_project_goal_to_web(&session_id, &web_id).await);
+        assert!(
+            sessions
+                .replay_project_goal_to_web(&session_id, &web_id)
+                .await
+        );
 
         match web_rx.recv().await.expect("project goal replay") {
             ServerToWeb::ProjectGoalChanged {
@@ -1608,8 +1845,6 @@ mod tests {
             os: "linux".to_string(),
             arch: "x86_64".to_string(),
             daemon_version: None,
-            minimax_backend: None,
-            glm_backend: None,
             deepseek_backend: None,
             last_seen: None,
         }
@@ -1822,6 +2057,184 @@ mod tests {
             }
             other => panic!("expected original session status message, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn stopping_project_runtime_disconnects_cli_and_detaches_web_viewers() {
+        let mgr = SessionManager::new();
+        let session_id = Uuid::new_v4();
+        let cli_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let web_id = Uuid::new_v4();
+        let (cli_tx, mut cli_rx) = mpsc::channel(4);
+        mgr.register_cli(cli_id, user_id, cli_tx, None);
+        mgr.create_cli_session(session_id, cli_id, None, None);
+        mgr.set_session_project(session_id, "project-a".to_string());
+        let (web_tx, mut web_rx) = mpsc::channel(4);
+        mgr.register_web(web_id, web_tx);
+        assert!(mgr.attach_web_to_session(&session_id, web_id, Some(cli_id)));
+
+        assert_eq!(mgr.stop_project_runtime("project-a").await, 1);
+        assert!(!mgr.is_cli_connected(&cli_id));
+        assert!(matches!(
+            cli_rx.try_recv(),
+            Ok(ServerToCli::SessionRejected { session_id: got, .. }) if got == session_id
+        ));
+        assert!(matches!(web_rx.try_recv(), Ok(ServerToWeb::Error { .. })));
+        assert!(
+            !mgr.route_to_web(
+                &session_id,
+                ServerToWeb::SessionStatus {
+                    status: shared::SessionStatus::Connected,
+                },
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn project_access_revocation_is_targeted_and_project_purge_clears_all_state() {
+        let mgr = SessionManager::new();
+        let owner_user = Uuid::new_v4();
+        let member_user = Uuid::new_v4();
+        let owner_cli = Uuid::new_v4();
+        let member_cli = Uuid::new_v4();
+        let owner_session = Uuid::new_v4();
+        let member_session = Uuid::new_v4();
+        let owner_web = Uuid::new_v4();
+        let member_web = Uuid::new_v4();
+
+        let (owner_cli_tx, _owner_cli_rx) = mpsc::channel(8);
+        let (member_cli_tx, mut member_cli_rx) = mpsc::channel(8);
+        mgr.register_cli(owner_cli, owner_user, owner_cli_tx, None);
+        mgr.register_cli(member_cli, member_user, member_cli_tx, None);
+        mgr.create_cli_session(owner_session, owner_cli, None, None);
+        mgr.create_cli_session(member_session, member_cli, None, None);
+        mgr.set_session_project(owner_session, "project-a".to_string());
+        mgr.set_session_project(member_session, "project-a".to_string());
+
+        let (owner_web_tx, mut owner_web_rx) = mpsc::channel(8);
+        let (member_web_tx, mut member_web_rx) = mpsc::channel(8);
+        mgr.register_web(owner_web, owner_web_tx);
+        mgr.set_web_user(owner_web, owner_user);
+        mgr.register_web(member_web, member_web_tx);
+        mgr.set_web_user(member_web, member_user);
+        assert!(mgr.attach_web_to_session(&owner_session, owner_web, Some(owner_cli)));
+        assert!(mgr.attach_web_to_session(&owner_session, member_web, None));
+        assert!(mgr.attach_web_to_session(&member_session, member_web, Some(member_cli)));
+
+        mgr.notify_project_access_changed(
+            &owner_user,
+            "project-a",
+            ProjectAccessChange::Transferred,
+            Some("user"),
+        );
+        assert!(matches!(
+            owner_web_rx.try_recv(),
+            Ok(ServerToWeb::ProjectAccessChanged {
+                change: ProjectAccessChange::Transferred,
+                role: Some(role),
+                ..
+            }) if role == "user"
+        ));
+        assert!(
+            mgr.is_cli_connected(&owner_cli),
+            "transfer does not stop runtime"
+        );
+        while member_web_rx.try_recv().is_ok() {}
+
+        let revoked = mgr
+            .revoke_project_access_for_user("project-a", &member_user)
+            .await;
+        assert!(revoked >= 2);
+        assert!(mgr.is_cli_connected(&owner_cli));
+        assert!(!mgr.is_cli_connected(&member_cli));
+        assert!(matches!(
+            member_cli_rx.try_recv(),
+            Ok(ServerToCli::SessionRejected { session_id, .. }) if session_id == member_session
+        ));
+        assert!((0..8).any(|_| matches!(
+            member_web_rx.try_recv(),
+            Ok(ServerToWeb::ProjectAccessChanged {
+                change: ProjectAccessChange::Revoked,
+                ..
+            })
+        )));
+        assert!(mgr
+            .sessions
+            .get(&owner_session)
+            .is_some_and(|session| !session.web_connection_ids.contains(&member_web)
+                && session.web_connection_ids.contains(&owner_web)));
+
+        mgr.append_terminal_output(&owner_session, 9, None, b"secret", 1);
+        mgr.record_input_id(owner_session, "input".to_string(), "time".to_string());
+        mgr.purge_project_state("project-a", &[owner_user, member_user])
+            .await;
+        assert!(!mgr.is_cli_connected(&owner_cli));
+        assert!(mgr.project_for_session(&owner_session).is_none());
+        assert!(mgr.project_for_session(&member_session).is_none());
+        assert!(!mgr.sessions.contains_key(&owner_session));
+        assert!(!mgr.sessions.contains_key(&member_session));
+        assert!(mgr.terminal_snapshot(&owner_session, 9).is_none());
+        assert!(mgr.seen_input_id(&owner_session, "input").is_none());
+    }
+
+    #[test]
+    fn project_policy_capabilities_are_explicit_and_peer_scoped() {
+        let mgr = SessionManager::new();
+        let cli_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let (cli_tx, _cli_rx) = mpsc::channel(1);
+        mgr.register_cli(cli_id, user_id, cli_tx, None);
+        mgr.create_cli_session(session_id, cli_id, None, None);
+        assert!(!mgr.session_supports_capability(&session_id, shared::PROJECT_POLICY_CAPABILITY,));
+        mgr.set_cli_capabilities(cli_id, vec![shared::PROJECT_POLICY_CAPABILITY.to_string()]);
+        assert!(mgr.session_supports_capability(&session_id, shared::PROJECT_POLICY_CAPABILITY,));
+    }
+
+    #[tokio::test]
+    async fn effective_policy_broadcast_reaches_cli_and_web() {
+        let mgr = SessionManager::new();
+        let session_id = Uuid::new_v4();
+        let cli_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let web_id = Uuid::new_v4();
+        let (cli_tx, mut cli_rx) = mpsc::channel(2);
+        let (web_tx, mut web_rx) = mpsc::channel(2);
+
+        mgr.register_cli(cli_id, user_id, cli_tx, None);
+        mgr.create_cli_session(session_id, cli_id, None, None);
+        mgr.set_session_project(session_id, "project-a".to_string());
+        mgr.register_web(web_id, web_tx);
+        assert!(mgr.attach_web_to_session(&session_id, web_id, Some(cli_id)));
+
+        let policy = shared::EffectiveProjectPolicy {
+            team_available: false,
+            allowed_launch_profiles: vec!["agent:codex:official:default".to_string()],
+            version: 42,
+            project_suspended: false,
+        };
+        mgr.broadcast_project_policy("project-a", policy.clone())
+            .await;
+
+        assert!(matches!(
+            cli_rx.try_recv(),
+            Ok(ServerToCli::ProjectPolicy {
+                session_id: got_session,
+                policy: got_policy,
+            }) if got_session == session_id && got_policy == policy
+        ));
+        assert!(matches!(
+            web_rx.try_recv(),
+            Ok(ServerToWeb::ProjectPolicyChanged {
+                session_id: got_session,
+                policy: got_policy,
+                noncompliant_pane_ids,
+            }) if got_session == session_id
+                && got_policy == policy
+                && noncompliant_pane_ids.is_empty()
+        ));
     }
 
     #[test]

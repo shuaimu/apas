@@ -16,9 +16,8 @@ pub fn goal_path(project_dir: &Path) -> PathBuf {
 /// Overwrite `project_goal.md` with `goal`. Creates the file if absent.
 pub fn write_project_goal(project_dir: &Path, goal: &str) -> Result<()> {
     let path = goal_path(project_dir);
-    std::fs::write(&path, goal).with_context(|| {
-        format!("writing project goal to {}", path.display())
-    })?;
+    std::fs::write(&path, goal)
+        .with_context(|| format!("writing project goal to {}", path.display()))?;
     Ok(())
 }
 

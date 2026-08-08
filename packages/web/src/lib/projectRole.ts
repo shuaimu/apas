@@ -1,10 +1,10 @@
 import { useStore } from "@/lib/store";
 
-export type ProjectRole = "owner" | "admin" | "user";
+export type ProjectRole = "owner" | "user";
 
 export function normalizeProjectRole(raw: string | undefined | null): ProjectRole {
   const normalized = (raw ?? "").trim().toLowerCase();
-  if (normalized === "owner" || normalized === "admin") return normalized;
+  if (normalized === "owner") return normalized;
   return "user";
 }
 
@@ -25,7 +25,7 @@ export function canManageProject(session: {
 }): boolean {
   if (!session.isShared) return true;
   const role = normalizeProjectRole(session.shareRole);
-  return role === "owner" || role === "admin";
+  return role === "owner";
 }
 
 /**
@@ -52,7 +52,8 @@ export function useCanManageCurrentProject(): boolean {
  */
 export function useTeamEnabled(): boolean {
   const sessionId = useStore((s) => s.sessionId);
-  const projectFlags = useStore((s) => s.projectFlags);
+  const projectPolicies = useStore((s) => s.projectPolicies);
   if (!sessionId) return false;
-  return projectFlags[sessionId]?.teamEnabled === true;
+  const policy = projectPolicies?.[sessionId];
+  return policy?.teamAvailable === true && policy.projectSuspended !== true;
 }

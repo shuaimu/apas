@@ -45,18 +45,25 @@ function LoginForm() {
         throw new Error(data.message || "Login failed");
       }
 
-      const { token, user_id, user_email } = await res.json();
+      const { token, user_id, user_email, cluster_role, account_status } = await res.json();
 
       // Store auth in app state + localStorage
       // If server doesn't return user_email (older backend), use the login email input.
-      login(token, user_id, user_email || email);
+      if (cluster_role && account_status) {
+        login(token, user_id, user_email || email, cluster_role, account_status);
+      } else {
+        login(token, user_id, user_email || email);
+      }
 
       // If device code present, complete CLI authorization
       if (deviceCode) {
         try {
           const completeRes = await fetch(`${API_URL}/auth/device-complete`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${token}`,
+            },
             body: JSON.stringify({ code: deviceCode, user_id }),
           });
 
@@ -91,6 +98,8 @@ function LoginForm() {
   const crossLinkHref = (base: string) => {
     const params = new URLSearchParams();
     if (deviceCode) params.set("code", deviceCode);
+    const invitation = searchParams.get("invitation");
+    if (invitation) params.set("invitation", invitation);
     const target = safeRedirect(searchParams.get("redirect"));
     if (target) params.set("redirect", target);
     const qs = params.toString();

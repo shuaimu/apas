@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Play } from "lucide-react";
 import { useStore, type PaneConfig } from "@/lib/store";
 import {
@@ -8,6 +8,7 @@ import {
   PROVIDER_MODEL_OPTIONS,
   findProviderModelOption,
 } from "@/lib/providerOptions";
+import { useIsLaunchProfileAllowed } from "@/lib/tabTypes";
 
 /**
  * Pre-launch team setup. Renders 4 role rows (Manager, Tech Lead,
@@ -48,6 +49,10 @@ function isTeamRole(p: PaneConfig): boolean {
 export function TeamSetupCard() {
   const paneConfigs = useStore((s) => s.paneConfigs);
   const startTeam = useStore((s) => s.startTeam);
+  const isAllowed = useIsLaunchProfileAllowed();
+  const allowedOptions = PROVIDER_MODEL_OPTIONS.filter((option) =>
+    isAllowed("agent", option.provider, option.model)
+  );
 
   const [picks, setPicks] = useState<Record<RoleKey, string>>({
     manager: DEFAULT_PROVIDER_MODEL_OPTION.value,
@@ -57,6 +62,19 @@ export function TeamSetupCard() {
   });
 
   const teamPresent = useMemo(() => paneConfigs.some(isTeamRole), [paneConfigs]);
+  useEffect(() => {
+    const fallback = allowedOptions[0]?.value;
+    if (!fallback) return;
+    setPicks((current) => {
+      let changed = false;
+      const next = Object.fromEntries(Object.entries(current).map(([role, value]) => {
+        if (allowedOptions.some((option) => option.value === value)) return [role, value];
+        changed = true;
+        return [role, fallback];
+      })) as Record<RoleKey, string>;
+      return changed ? next : current;
+    });
+  }, [allowedOptions]);
   if (teamPresent) return null;
 
   const specForValue = (value: string) => {
@@ -65,12 +83,14 @@ export function TeamSetupCard() {
   };
 
   const handleStart = () => {
-    startTeam({
+    const specs = {
       manager: specForValue(picks.manager),
       techLead: specForValue(picks.techLead),
       reviewer: specForValue(picks.reviewer),
       developer: specForValue(picks.developer),
-    });
+    };
+    if (Object.values(specs).some((spec) => spec.provider === "unsupported")) return;
+    startTeam(specs);
   };
 
   return (
@@ -87,6 +107,7 @@ export function TeamSetupCard() {
         </div>
         <button
           onClick={handleStart}
+          disabled={allowedOptions.length === 0}
           className="inline-flex items-center justify-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white shadow-sm transition hover:bg-indigo-700 dark:bg-indigo-500 dark:hover:bg-indigo-400"
         >
           <Play className="h-3.5 w-3.5" />
@@ -118,7 +139,7 @@ export function TeamSetupCard() {
               className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-2 py-0.5 text-xs font-mono text-gray-700 dark:text-gray-300 focus:outline-none focus:ring-1 focus:ring-indigo-400"
               title="Agent frontend × API backend"
             >
-              {PROVIDER_MODEL_OPTIONS.map((o) => (
+              {allowedOptions.map((o) => (
                 <option key={o.value} value={o.value}>
                   {o.label}
                 </option>

@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Capability advertised by web, CLI, and daemon peers that understand the
+/// server-owned effective project policy protocol.
+pub const PROJECT_POLICY_CAPABILITY: &str = "project_policy_v1";
+
 /// One published artifact in the team scratchpad (`.apas-team.jsonl`),
 /// mirroring the CLI's `crate::scratchpad::TeamRecord`. Separate type
 /// here so the wire shape is stable across CLI/server/web even if the
@@ -93,6 +97,8 @@ pub enum CliToServer {
         token: String,
         #[serde(default)]
         version: Option<String>,
+        #[serde(default)]
+        capabilities: Vec<String>,
     },
 
     /// CLI starts a local session (hybrid mode)
@@ -259,10 +265,7 @@ pub enum CliToServer {
     /// CLI persisted it, an outside editor touched it). The web mirrors
     /// the latest value per session and hydrates the textbox when not
     /// being actively edited.
-    ProjectGoalChanged {
-        session_id: Uuid,
-        content: String,
-    },
+    ProjectGoalChanged { session_id: Uuid, content: String },
 
     /// Tech-Lead autonomy flags. `auto_approve_todos` lets the Tech
     /// Lead flip Global TODOs from `proposed` → `approved` without a
@@ -286,6 +289,16 @@ pub enum CliToServer {
         /// keys (see `tab_type_key`). A *deny* list so that absent means
         /// "everything allowed" — see `tab_type_allowed`. Owner/admin only,
         /// same gate as the flags above.
+        #[serde(default)]
+        disallowed_tab_types: Vec<String>,
+    },
+
+    /// One-time migration snapshot from a compatible CLI. Once accepted, the
+    /// server owns policy and subsequent local `.apas` changes are advisory
+    /// only.
+    ProjectPolicySnapshot {
+        session_id: Uuid,
+        team_enabled: bool,
         #[serde(default)]
         disallowed_tab_types: Vec<String>,
     },
@@ -441,10 +454,7 @@ pub enum ServerToCli {
     /// Flip a pane's `managed` field from false to true. CLI updates
     /// PaneMeta + persists to .apas + re-broadcasts the PaneList.
     /// One-way; there's no demote.
-    PromotePaneToManaged {
-        session_id: Uuid,
-        pane_id: u32,
-    },
+    PromotePaneToManaged { session_id: Uuid, pane_id: u32 },
 
     /// Pause the deadloop (legacy - use PausePane for new code)
     PauseDeadloop { session_id: Uuid },
@@ -602,6 +612,21 @@ pub enum ServerToCli {
         disallowed_tab_types: Vec<String>,
     },
 
+    /// Owner-operable workflow settings after cluster policy is split out of
+    /// the legacy combined flags payload.
+    UpdateProjectOperations {
+        session_id: Uuid,
+        auto_approve_todos: bool,
+        auto_merge_prs: bool,
+    },
+
+    /// Server-authoritative capability policy. The CLI persists the version
+    /// separately from owner-editable `.apas` state and enforces it at spawn.
+    ProjectPolicy {
+        session_id: Uuid,
+        policy: EffectiveProjectPolicy,
+    },
+
     /// Spawn the default team (Manager, Tech Lead, Reviewer, Developer)
     /// for any role that isn't already present. Triggered by the "Start
     /// team" button on the Overview. Idempotent — extra clicks just
@@ -690,6 +715,8 @@ pub enum DaemonToServer {
         token: String,
         machine: MachineInfo,
         projects: Vec<MachineProjectInfo>,
+        #[serde(default)]
+        capabilities: Vec<String>,
     },
 
     /// Periodic heartbeat with latest project states
@@ -724,7 +751,14 @@ pub enum ServerToDaemon {
     RegistrationFailed { reason: String },
 
     /// Start APAS CLI for a project on this machine
-    StartProjectCli { project_id: String },
+    StartProjectCli {
+        project_id: String,
+        /// Current server-authoritative policy. A capable daemon refuses a
+        /// start command without it, which makes mixed-version rollout fail
+        /// closed instead of reviving a suspended project.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy: Option<EffectiveProjectPolicy>,
+    },
 
     /// Stop APAS CLI for a project on this machine
     StopProjectCli { project_id: String },
@@ -748,7 +782,10 @@ pub enum ServerToDaemon {
     /// Request a fresh project scan/update push
     RefreshProjects,
 
-    /// Update machine-level MiniMax backend API configuration
+    /// Compatibility tombstone for older daemons. Upgraded daemons must
+    /// reject this inbound mutation and must never emit it.
+    #[deprecated(note = "MiniMax support has been retired")]
+    #[serde(alias = "set_minimax_config")]
     SetMiniMaxConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         api_base_url: Option<String>,
@@ -758,7 +795,9 @@ pub enum ServerToDaemon {
         clear_api_key: bool,
     },
 
-    /// Update machine-level GLM backend API configuration
+    /// Compatibility tombstone for older daemons. Upgraded daemons must
+    /// reject this inbound mutation and must never emit it.
+    #[deprecated(note = "GLM support has been retired")]
     SetGlmConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         api_base_url: Option<String>,
@@ -771,7 +810,7 @@ pub enum ServerToDaemon {
     /// Update machine-level DeepSeek backend API configuration. DeepSeek
     /// ships an Anthropic-compatible endpoint at <api_base_url>/anthropic
     /// so it reuses the Claude CLI binary with `ANTHROPIC_BASE_URL` /
-    /// `ANTHROPIC_API_KEY` env overrides, same shape as the GLM bridge.
+    /// `ANTHROPIC_API_KEY` environment overrides.
     SetDeepseekConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         api_base_url: Option<String>,
@@ -794,7 +833,11 @@ pub enum ServerToDaemon {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WebToServer {
     /// Authenticate with JWT token
-    Authenticate { token: String },
+    Authenticate {
+        token: String,
+        #[serde(default)]
+        capabilities: Vec<String>,
+    },
 
     /// List available CLI clients
     ListCliClients,
@@ -1099,7 +1142,10 @@ pub enum WebToServer {
         request_id: Option<String>,
     },
 
-    /// Update machine-level MiniMax backend API configuration
+    /// Compatibility tombstone for stale web clients. Upgraded servers must
+    /// reject this inbound mutation and must never forward its credential.
+    #[deprecated(note = "MiniMax support has been retired")]
+    #[serde(alias = "set_machine_minimax_config")]
     SetMachineMiniMaxConfig {
         machine_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1110,7 +1156,9 @@ pub enum WebToServer {
         clear_api_key: bool,
     },
 
-    /// Update machine-level GLM backend API configuration
+    /// Compatibility tombstone for stale web clients. Upgraded servers must
+    /// reject this inbound mutation and must never forward its credential.
+    #[deprecated(note = "GLM support has been retired")]
     SetMachineGlmConfig {
         machine_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1201,6 +1249,13 @@ pub enum WebToServer {
         /// same gate as the flags above.
         #[serde(default)]
         disallowed_tab_types: Vec<String>,
+    },
+
+    UpdateProjectOperations {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
+        auto_approve_todos: bool,
+        auto_merge_prs: bool,
     },
 
     /// Spawn the four default team panes for any role that isn't
@@ -1308,10 +1363,7 @@ pub enum WebToServer {
     /// One-way promote: flip an unmanaged side-chat pane to a managed
     /// team member. CLI sets PaneMeta.managed = true and re-broadcasts
     /// the PaneList. There's no demote — keep it simple.
-    PromotePaneToManaged {
-        session_id: Uuid,
-        pane_id: u32,
-    },
+    PromotePaneToManaged { session_id: Uuid, pane_id: u32 },
 
     /// Keystrokes typed into a terminal pane's xterm.js view. Server
     /// resolves the target session and forwards as
@@ -1336,10 +1388,7 @@ pub enum WebToServer {
     /// Server replies `ServerToWeb::TerminalSnapshot` from its in-memory
     /// ring buffer; no CLI round-trip, so reattach is instant and works
     /// even while the CLI is mid-reconnect.
-    TerminalAttach {
-        session_id: Uuid,
-        pane_id: u32,
-    },
+    TerminalAttach { session_id: Uuid, pane_id: u32 },
 
     /// Liveness probe from the browser. Server echoes
     /// `ServerToWeb::Heartbeat` so the client can detect silently-stale
@@ -1349,6 +1398,14 @@ pub enum WebToServer {
 }
 
 /// Messages sent from server to web client
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectAccessChange {
+    Transferred,
+    Revoked,
+    Deleted,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToWeb {
@@ -1359,6 +1416,10 @@ pub enum ServerToWeb {
         user_email: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         server_version: Option<String>,
+        #[serde(default)]
+        cluster_role: String,
+        #[serde(default)]
+        account_status: String,
     },
 
     /// Authentication failed
@@ -1422,6 +1483,15 @@ pub enum ServerToWeb {
 
     /// List of persisted sessions
     Sessions { sessions: Vec<SessionInfo> },
+
+    /// Project-wide authorization changed outside this socket. Clients use
+    /// this as a refresh hint; the server remains the authorization boundary.
+    ProjectAccessChanged {
+        project_id: String,
+        change: ProjectAccessChange,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+    },
 
     /// Messages for a session
     SessionMessages {
@@ -1548,10 +1618,7 @@ pub enum ServerToWeb {
     /// Forwarded from `CliToServer::ProjectGoalChanged`. The web caches
     /// this per-session and refreshes the Project goal textbox when the
     /// user isn't actively editing.
-    ProjectGoalChanged {
-        session_id: Uuid,
-        content: String,
-    },
+    ProjectGoalChanged { session_id: Uuid, content: String },
 
     /// Per-project and per-pane usage stats (prompt/token/cost counts) for
     /// the Overview. Pushed after each turn is recorded and replayed on
@@ -1592,6 +1659,14 @@ pub enum ServerToWeb {
         /// same gate as the flags above.
         #[serde(default)]
         disallowed_tab_types: Vec<String>,
+    },
+
+    /// Effective cluster-governed policy for the attached project.
+    ProjectPolicyChanged {
+        session_id: Uuid,
+        policy: EffectiveProjectPolicy,
+        #[serde(default)]
+        noncompliant_pane_ids: Vec<u32>,
     },
 
     /// Snapshot of the project's team-todo.md state. Sent in reply to
@@ -1855,28 +1930,6 @@ pub struct MessageInfo {
 // Shared Types
 // ============================================================================
 
-/// Machine-level MiniMax backend status safe to expose to web UI.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MiniMaxBackendInfo {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_base_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
-    #[serde(default)]
-    pub api_key_configured: bool,
-}
-
-/// Machine-level GLM backend status safe to expose to web UI.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GlmBackendInfo {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_base_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
-    #[serde(default)]
-    pub api_key_configured: bool,
-}
-
 /// Machine-level DeepSeek backend status safe to expose to web UI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeepseekBackendInfo {
@@ -1897,10 +1950,6 @@ pub struct MachineInfo {
     pub arch: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_version: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub minimax_backend: Option<MiniMaxBackendInfo>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub glm_backend: Option<GlmBackendInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deepseek_backend: Option<DeepseekBackendInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1957,7 +2006,11 @@ pub enum Provider {
     #[serde(alias = "claude-old", alias = "claude_old")]
     Claude,
     Codex,
+    /// Decode-only compatibility tombstone. MiniMax is not launchable.
+    #[deprecated(note = "MiniMax support has been retired")]
     Minimax,
+    /// Decode-only compatibility tombstone. GLM is not launchable.
+    #[deprecated(note = "GLM support has been retired")]
     Glm,
     Deepseek,
     Opencode,
@@ -2031,12 +2084,9 @@ pub fn tab_type_key(kind: PaneKind, provider: Provider) -> String {
 
 /// Every tab type a user can actually be offered, in menu order.
 ///
-/// Deliberately *not* every `Provider`. MiniMax, GLM, and DeepSeek are the
-/// claude binary pointed at a different backend, so the add-tab menu offers
-/// them as claude **models**, not providers — a `Provider::Minimax` key would
-/// be a control that silently does nothing, because those tabs arrive as
-/// `provider: claude`. Restricting by model would be a different, larger
-/// feature.
+/// Deliberately *not* every `Provider`. The retired compatibility tombstones
+/// are never advertised, and DeepSeek is offered as a Claude model because it
+/// uses the Anthropic-compatible bridge.
 ///
 /// Terminal panes exist only for claude and codex — see
 /// `terminal_pane::terminal_binary_for`, which this must stay in step with.
@@ -2062,7 +2112,232 @@ pub fn all_tab_types() -> Vec<String> {
 /// says otherwise, rather than silently disappearing from their menu.
 pub fn tab_type_allowed(disallowed: &[String], kind: PaneKind, provider: Provider) -> bool {
     let key = tab_type_key(kind, provider);
-    !disallowed.iter().any(|d| d.trim().eq_ignore_ascii_case(&key))
+    !disallowed
+        .iter()
+        .any(|d| d.trim().eq_ignore_ascii_case(&key))
+}
+
+/// A stable, cluster-governed launch capability. Unlike the legacy tab-type
+/// key, this identifies the frontend/backend/model combination as well as the
+/// pane kind, so administrators can allow Claude Official without also
+/// allowing every Anthropic-compatible backend.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LaunchProfile {
+    pub key: String,
+    pub label: String,
+    pub kind: PaneKind,
+    pub provider: Provider,
+    pub backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+fn launch_profile(
+    key: &str,
+    label: &str,
+    kind: PaneKind,
+    provider: Provider,
+    backend: &str,
+    model: Option<&str>,
+) -> LaunchProfile {
+    LaunchProfile {
+        key: key.to_string(),
+        label: label.to_string(),
+        kind,
+        provider,
+        backend: backend.to_string(),
+        model: model.map(str::to_string),
+    }
+}
+
+/// Canonical registry used by migration defaults, server validation, CLI
+/// enforcement, and the web admin policy editor.
+pub fn supported_launch_profiles() -> Vec<LaunchProfile> {
+    vec![
+        launch_profile(
+            "agent:claude:official:default",
+            "Claude / Official",
+            PaneKind::Agent,
+            Provider::Claude,
+            "official",
+            None,
+        ),
+        launch_profile(
+            "agent:claude:official:claude-fable-5",
+            "Claude / Fable",
+            PaneKind::Agent,
+            Provider::Claude,
+            "official",
+            Some("claude-fable-5"),
+        ),
+        launch_profile(
+            "agent:claude:deepseek:deepseek-v4-pro",
+            "Claude / DeepSeek",
+            PaneKind::Agent,
+            Provider::Claude,
+            "deepseek",
+            Some("deepseek-v4-pro"),
+        ),
+        launch_profile(
+            "agent:codex:official:default",
+            "Codex / Official",
+            PaneKind::Agent,
+            Provider::Codex,
+            "official",
+            None,
+        ),
+        launch_profile(
+            "agent:opencode:official:default",
+            "OpenCode / Official",
+            PaneKind::Agent,
+            Provider::Opencode,
+            "official",
+            None,
+        ),
+        launch_profile(
+            "agent:cursor-agent:official:default",
+            "Cursor / Official",
+            PaneKind::Agent,
+            Provider::CursorAgent,
+            "official",
+            None,
+        ),
+        launch_profile(
+            "terminal:claude:official:default",
+            "Claude Terminal",
+            PaneKind::Terminal,
+            Provider::Claude,
+            "official",
+            None,
+        ),
+        launch_profile(
+            "terminal:codex:official:default",
+            "Codex Terminal",
+            PaneKind::Terminal,
+            Provider::Codex,
+            "official",
+            None,
+        ),
+    ]
+}
+
+fn normalized_model(model: Option<&str>) -> String {
+    model
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| "default".to_string())
+}
+
+/// Whether an explicit provider value is a decode-only retirement tombstone.
+#[allow(deprecated)]
+pub fn is_retired_provider(provider: Provider) -> bool {
+    matches!(provider, Provider::Minimax | Provider::Glm)
+}
+
+/// Whether a historical model name selects a retired backend.
+pub fn is_retired_model(model: Option<&str>) -> bool {
+    let normalized = normalized_model(model);
+    normalized.contains("minimax")
+        || normalized.starts_with("m2")
+        || normalized.starts_with("glm")
+        || normalized.contains("glm-")
+}
+
+/// Whether a backend name identifies a retired Anthropic-compatible bridge.
+pub fn is_retired_backend(backend: &str) -> bool {
+    matches!(
+        backend.trim().to_ascii_lowercase().as_str(),
+        "minimax" | "mini_max" | "m2" | "glm" | "zai" | "z.ai" | "zhipu"
+    )
+}
+
+/// Whether a stable launch-profile key refers to a retired provider, backend,
+/// or model. This accepts historical keys without treating arbitrary
+/// substrings in unrelated labels as capabilities.
+pub fn is_retired_launch_profile_key(key: &str) -> bool {
+    let segments = key.trim().split(':').map(str::trim).collect::<Vec<_>>();
+    if segments.len() < 2 {
+        return false;
+    }
+
+    segments
+        .get(1)
+        .is_some_and(|provider| is_retired_backend(provider))
+        || segments
+            .get(2)
+            .is_some_and(|backend| is_retired_backend(backend))
+        || segments
+            .last()
+            .is_some_and(|model| is_retired_model(Some(model)) || is_retired_backend(model))
+}
+
+/// Whether a launch request names a retired provider through either its
+/// explicit provider value or a historical backend-selecting model.
+pub fn is_retired_launch(provider: Provider, model: Option<&str>) -> bool {
+    is_retired_provider(provider) || is_retired_model(model)
+}
+
+/// Derive the registry key for a launch request. Unknown model IDs still get
+/// a deterministic key and are therefore denied by an explicit allowlist.
+#[allow(deprecated)]
+pub fn launch_profile_key(kind: PaneKind, provider: Provider, model: Option<&str>) -> String {
+    if is_retired_launch(provider, model) {
+        return "unsupported:retired".to_string();
+    }
+    let kind_name = if kind == PaneKind::Terminal {
+        "terminal"
+    } else {
+        "agent"
+    };
+    let provider_name = match provider {
+        #[allow(deprecated)]
+        Provider::Claude | Provider::Deepseek => "claude",
+        Provider::Codex => "codex",
+        Provider::Opencode => "opencode",
+        Provider::CursorAgent => "cursor-agent",
+        Provider::Minimax | Provider::Glm => "unsupported",
+    };
+    let normalized = normalized_model(model);
+    let backend = if normalized.contains("deepseek") || provider == Provider::Deepseek {
+        "deepseek"
+    } else {
+        "official"
+    };
+    format!("{kind_name}:{provider_name}:{backend}:{normalized}")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EffectiveProjectPolicy {
+    pub team_available: bool,
+    pub allowed_launch_profiles: Vec<String>,
+    pub version: i64,
+    #[serde(default)]
+    pub project_suspended: bool,
+}
+
+impl Default for EffectiveProjectPolicy {
+    fn default() -> Self {
+        Self {
+            team_available: false,
+            allowed_launch_profiles: supported_launch_profiles()
+                .into_iter()
+                .map(|profile| profile.key)
+                .collect(),
+            version: 1,
+            project_suspended: false,
+        }
+    }
+}
+
+impl EffectiveProjectPolicy {
+    pub fn allows(&self, kind: PaneKind, provider: Provider, model: Option<&str>) -> bool {
+        !is_retired_launch(provider, model)
+            && !self.project_suspended
+            && self.allowed_launch_profiles.iter().any(|allowed| {
+                allowed.eq_ignore_ascii_case(&launch_profile_key(kind, provider, model))
+            })
+    }
 }
 
 /// Configuration for a single pane
@@ -2087,7 +2362,7 @@ pub struct PaneConfig {
     #[serde(default)]
     pub label: Option<String>, // User-facing label like "Deadloop" or "Interactive"
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>, // Optional model/backend override (e.g., "o3", "MiniMax-M2.7")
+    pub model: Option<String>, // Optional model/backend override (e.g., "o3", "deepseek-v4-pro")
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>, // Optional Claude thinking effort override (e.g., "high", "max", "ultracode").
     // `ultracode` is apas-only: it spawns claude with `--effort xhigh` and prepends
@@ -2729,6 +3004,7 @@ mod tests {
         let msg = CliToServer::Register {
             token: "test-token".to_string(),
             version: Some("1.0.0".to_string()),
+            capabilities: Vec::new(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"register\""));
@@ -2869,10 +3145,18 @@ mod tests {
                 let usage = extra.get("usage").expect("usage present in extra");
                 // input_tokens is reported disjoint from the cached subset
                 // (1234 full - 56 cached) to match Anthropic's token model.
-                assert_eq!(usage.get("input_tokens").and_then(|v| v.as_u64()), Some(1178));
-                assert_eq!(usage.get("output_tokens").and_then(|v| v.as_u64()), Some(78));
                 assert_eq!(
-                    usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()),
+                    usage.get("input_tokens").and_then(|v| v.as_u64()),
+                    Some(1178)
+                );
+                assert_eq!(
+                    usage.get("output_tokens").and_then(|v| v.as_u64()),
+                    Some(78)
+                );
+                assert_eq!(
+                    usage
+                        .get("cache_read_input_tokens")
+                        .and_then(|v| v.as_u64()),
                     Some(56)
                 );
             }
@@ -2886,7 +3170,11 @@ mod tests {
         let legacy = r#"{"type":"input","text":"hi","pane_id":205}"#;
         let parsed: WebToServer = serde_json::from_str(legacy).unwrap();
         match parsed {
-            WebToServer::Input { client_msg_id, text, .. } => {
+            WebToServer::Input {
+                client_msg_id,
+                text,
+                ..
+            } => {
                 assert_eq!(client_msg_id, None);
                 assert_eq!(text, "hi");
             }
@@ -2922,7 +3210,9 @@ mod tests {
             created_at: None,
             client_msg_id: None,
         };
-        assert!(!serde_json::to_string(&no_id).unwrap().contains("client_msg_id"));
+        assert!(!serde_json::to_string(&no_id)
+            .unwrap()
+            .contains("client_msg_id"));
     }
 
     #[test]
@@ -2987,6 +3277,7 @@ mod tests {
     fn test_web_to_server_serialization() {
         let msg = WebToServer::Authenticate {
             token: "jwt-token".to_string(),
+            capabilities: Vec::new(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"authenticate\""));
@@ -3102,8 +3393,6 @@ mod tests {
             os: "linux".to_string(),
             arch: "x86_64".to_string(),
             daemon_version: Some("26.06.1".to_string()),
-            minimax_backend: None,
-            glm_backend: None,
             deepseek_backend: Some(DeepseekBackendInfo {
                 api_base_url: Some("https://api.deepseek.com/anthropic".to_string()),
                 api_key: None,
@@ -3125,6 +3414,48 @@ mod tests {
         );
         assert!(backend.api_key_configured);
         assert_eq!(backend.api_key, None);
+    }
+
+    #[test]
+    fn legacy_machine_backend_fields_are_ignored_and_not_reemitted() {
+        let machine_id = Uuid::new_v4();
+        let json = serde_json::json!({
+            "machine_id": machine_id,
+            "hostname": "legacy-host",
+            "os": "linux",
+            "arch": "x86_64",
+            "minimax_backend": {"api_key": "must-not-survive"},
+            "glm_backend": {"api_key": "must-not-survive"}
+        });
+        let machine: MachineInfo = serde_json::from_value(json).unwrap();
+        let encoded = serde_json::to_value(machine).unwrap();
+        assert!(encoded.get("minimax_backend").is_none());
+        assert!(encoded.get("glm_backend").is_none());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn legacy_configuration_messages_remain_decodable() {
+        let daemon = serde_json::json!({
+            "type": "set_minimax_config",
+            "api_key": "discard-me",
+            "clear_api_key": false
+        });
+        assert!(matches!(
+            serde_json::from_value::<ServerToDaemon>(daemon).unwrap(),
+            ServerToDaemon::SetMiniMaxConfig { .. }
+        ));
+
+        let web = serde_json::json!({
+            "type": "set_machine_glm_config",
+            "machine_id": Uuid::new_v4(),
+            "api_key": "discard-me",
+            "clear_api_key": false
+        });
+        assert!(matches!(
+            serde_json::from_value::<WebToServer>(web).unwrap(),
+            WebToServer::SetMachineGlmConfig { .. }
+        ));
     }
 
     #[test]
@@ -3468,7 +3799,10 @@ mod tests {
 
     #[test]
     fn tab_type_keys_are_kind_then_provider() {
-        assert_eq!(tab_type_key(PaneKind::Agent, Provider::Claude), "agent:claude");
+        assert_eq!(
+            tab_type_key(PaneKind::Agent, Provider::Claude),
+            "agent:claude"
+        );
         assert_eq!(
             tab_type_key(PaneKind::Terminal, Provider::Codex),
             "terminal:codex"
@@ -3498,7 +3832,11 @@ mod tests {
         // The distinction the feature exists for: a claude agent tab and a
         // claude terminal tab are different capabilities.
         let deny = vec!["terminal:claude".to_string()];
-        assert!(!tab_type_allowed(&deny, PaneKind::Terminal, Provider::Claude));
+        assert!(!tab_type_allowed(
+            &deny,
+            PaneKind::Terminal,
+            Provider::Claude
+        ));
         assert!(tab_type_allowed(&deny, PaneKind::Agent, Provider::Claude));
         assert!(tab_type_allowed(&deny, PaneKind::Terminal, Provider::Codex));
     }
@@ -3510,9 +3848,7 @@ mod tests {
     }
 
     #[test]
-    fn the_catalog_omits_providers_that_are_really_claude_models() {
-        // MiniMax/GLM/DeepSeek tabs arrive as `provider: claude`, so offering
-        // them as separate tab types would be a checkbox that does nothing.
+    fn the_catalog_omits_retired_providers_and_deepseek_provider_alias() {
         let catalog = all_tab_types();
         for absent in ["agent:minimax", "agent:glm", "agent:deepseek"] {
             assert!(
@@ -3542,5 +3878,105 @@ mod tests {
             "tabTypes.ts lists {web_entries} types, shared lists {}",
             all_tab_types().len()
         );
+    }
+
+    #[test]
+    fn launch_profile_registry_keys_are_unique_and_derived_from_profiles() {
+        let profiles = supported_launch_profiles();
+        let keys = profiles
+            .iter()
+            .map(|profile| profile.key.clone())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(keys.len(), profiles.len());
+        for profile in profiles {
+            assert_eq!(
+                profile.key,
+                launch_profile_key(profile.kind, profile.provider, profile.model.as_deref())
+            );
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn retired_provider_values_deserialize_but_are_never_supported() {
+        for (json, provider) in [
+            ("\"minimax\"", Provider::Minimax),
+            ("\"glm\"", Provider::Glm),
+        ] {
+            assert_eq!(serde_json::from_str::<Provider>(json).unwrap(), provider);
+            assert!(is_retired_provider(provider));
+            assert!(!EffectiveProjectPolicy::default().allows(PaneKind::Agent, provider, None));
+        }
+    }
+
+    #[test]
+    fn retirement_classifier_covers_historical_forms() {
+        for model in ["MiniMax-M2.7", "minimax-m2", "M2.1", "glm-5.1", "GLM4"] {
+            assert!(is_retired_model(Some(model)), "model: {model}");
+        }
+        for backend in ["minimax", "mini_max", "glm", "z.ai", "zhipu"] {
+            assert!(is_retired_backend(backend), "backend: {backend}");
+        }
+        for key in [
+            "agent:claude:minimax:minimax-m2.7",
+            "agent:minimax:official:default",
+            "agent:claude:glm:glm-5.1",
+            "agent:glm:official:default",
+        ] {
+            assert!(is_retired_launch_profile_key(key), "profile: {key}");
+        }
+        for supported in [
+            "agent:claude:official:default",
+            "agent:claude:deepseek:deepseek-v4-pro",
+            "agent:codex:official:o3",
+        ] {
+            assert!(
+                !is_retired_launch_profile_key(supported),
+                "profile: {supported}"
+            );
+        }
+    }
+
+    #[test]
+    fn supported_profiles_and_default_policy_exclude_retired_backends() {
+        let profiles = supported_launch_profiles();
+        assert!(profiles.iter().all(|profile| {
+            !is_retired_provider(profile.provider)
+                && !is_retired_backend(&profile.backend)
+                && !is_retired_model(profile.model.as_deref())
+                && !is_retired_launch_profile_key(&profile.key)
+        }));
+        let policy = EffectiveProjectPolicy::default();
+        assert!(policy
+            .allowed_launch_profiles
+            .iter()
+            .all(|key| !is_retired_launch_profile_key(key)));
+        for expected in [
+            "agent:claude:official:default",
+            "agent:claude:deepseek:deepseek-v4-pro",
+            "agent:codex:official:default",
+            "agent:opencode:official:default",
+            "agent:cursor-agent:official:default",
+            "terminal:claude:official:default",
+            "terminal:codex:official:default",
+        ] {
+            assert!(policy
+                .allowed_launch_profiles
+                .contains(&expected.to_string()));
+        }
+    }
+
+    #[test]
+    fn explicit_launch_allowlist_rejects_unknown_models_and_suspension() {
+        let mut policy = EffectiveProjectPolicy {
+            team_available: true,
+            allowed_launch_profiles: vec!["agent:codex:official:default".to_string()],
+            version: 4,
+            project_suspended: false,
+        };
+        assert!(policy.allows(PaneKind::Agent, Provider::Codex, None));
+        assert!(!policy.allows(PaneKind::Agent, Provider::Claude, Some("future-model")));
+        policy.project_suspended = true;
+        assert!(!policy.allows(PaneKind::Agent, Provider::Codex, None));
     }
 }

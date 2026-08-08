@@ -11,12 +11,24 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "audit:npm": "npm audit --audit-level=low",
+    "audit:pnpm": "pnpm audit --audit-level=low"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "packageManager": "pnpm@10.28.0",
+  "overrides": {
+    "vite": {
+      "esbuild": "0.28.1"
+    }
+  },
+  "pnpm": {
+    "overrides": {
+      "vite>esbuild": "0.28.1"
+    }
+  },
   "dependencies": {
     "@tailwindcss/typography": "^0.5.19",
     "@xterm/addon-fit": "^0.11.0",
@@ -24,7 +36,7 @@
     "@xterm/xterm": "^6.0.0",
     "idb-keyval": "^6.2.2",
     "lucide-react": "^0.562.0",
-    "next": "^16.1.1",
+    "next": "^16.3.0",
     "react": "^19.2.3",
     "react-dom": "^19.2.3",
     "react-markdown": "^10.1.0",
@@ -40,16 +52,17 @@
     "@types/react": "^19.2.8",
     "@types/react-dom": "^19.2.3",
     "@types/react-syntax-highlighter": "^15.5.13",
-    "@vitejs/plugin-react": "^5.1.2",
+    "@vitejs/plugin-react": "^6.0.5",
     "autoprefixer": "^10.4.23",
     "eslint": "^9.39.2",
-    "eslint-config-next": "^16.1.1",
+    "eslint-config-next": "^16.3.0",
     "eslint-plugin-react-hooks": "^7.0.1",
     "jsdom": "^27.4.0",
-    "postcss": "^8.5.6",
+    "postcss": "^8.5.26",
     "tailwindcss": "^4.1.18",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.53.0",
-    "vitest": "^4.0.17"
+    "vite": "^8.2.1",
+    "vitest": "^4.1.10"
   }
 }

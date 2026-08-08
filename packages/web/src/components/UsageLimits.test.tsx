@@ -229,10 +229,10 @@ describe("AllProvidersUsage", () => {
         ],
         [
           "cli-mixed",
-          {
+          ({
             glm: usage(0.4, "2026-06-17T11:30:00Z"),
             minimax: {},
-          },
+          } as unknown as UsageLimitsByProvider),
         ],
       ]),
     });
@@ -249,10 +249,10 @@ describe("AllProvidersUsage", () => {
 
     expect(within(providerCard("Claude")).getByText("70%")).toBeTruthy();
     expect(within(providerCard("DeepSeek")).getByText("50%")).toBeTruthy();
-    expect(within(providerCard("GLM")).getByText("40%")).toBeTruthy();
     expect(screen.queryByText("20%")).toBeNull();
     expect(screen.queryByText("Codex")).toBeNull();
     expect(screen.queryByText("MiniMax")).toBeNull();
+    expect(screen.queryByText("GLM")).toBeNull();
   });
 });
 
@@ -273,19 +273,19 @@ describe("UsageLimitsPanel", () => {
       usageLimits: usageByClient([
         [
           "cli-current",
-          {
+          ({
             glm: usage(0.42),
             deepseek: usage(0.8),
-          },
+          } as unknown as UsageLimitsByProvider),
         ],
       ]),
     });
 
     render(<UsageLimitsPanel />);
 
-    expect(screen.getByText("GLM Usage")).toBeTruthy();
-    expect(screen.getByText("42%")).toBeTruthy();
-    expect(screen.queryByText("DeepSeek Usage")).toBeNull();
+    expect(screen.getByText("DeepSeek Usage")).toBeTruthy();
+    expect(screen.getByText("80%")).toBeTruthy();
+    expect(screen.queryByText("GLM Usage")).toBeNull();
   });
 
   it("falls back to the persisted session CLI client id", () => {
@@ -329,37 +329,14 @@ describe("UsageLimitsPanel", () => {
 
   it.each([
     [
-      "GLM",
-      {
-        glm: usage(0.11),
-        deepseek: usage(0.22),
-        minimax: usage(0.33),
-        codex: usage(0.44),
-        claude: usage(0.55),
-      },
-      "GLM Usage",
-      "11%",
-    ],
-    [
       "DeepSeek",
       {
         deepseek: usage(0.22),
-        minimax: usage(0.33),
         codex: usage(0.44),
         claude: usage(0.55),
       },
       "DeepSeek Usage",
       "22%",
-    ],
-    [
-      "MiniMax",
-      {
-        minimax: usage(0.33),
-        codex: usage(0.44),
-        claude: usage(0.55),
-      },
-      "MiniMax Usage",
-      "33%",
     ],
     [
       "Codex",

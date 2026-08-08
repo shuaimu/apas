@@ -20,6 +20,8 @@ const initialStore = useStore.getInitialState();
 const DOWNLOAD_SESSION_ID = "session-tabbed-download";
 const DOWNLOAD_CLI_CLIENT_ID = "cli-tabbed-download";
 const DOWNLOAD_PANE_ID = 42;
+const ZERO_PANE_SESSION_ID = "session-zero-pane";
+const ZERO_PANE_CLI_CLIENT_ID = "cli-zero-pane";
 
 function activeTabKey(): string {
   return `apas_layout_${DOWNLOAD_CLI_CLIENT_ID}_active_tab`;
@@ -79,6 +81,65 @@ function seedDownloadTabbedView({
   return { downloadSession, rebootPane, requestPaneDiff };
 }
 
+function seedZeroPaneTabbedView(
+  allowedLaunchProfiles = ["agent:claude:official:default"],
+) {
+  const addPane = vi.fn(() => ({ success: true }));
+
+  act(() => {
+    useStore.setState({
+      connected: true,
+      isAttached: true,
+      isDualPane: true,
+      sessionId: ZERO_PANE_SESSION_ID,
+      cliClientId: ZERO_PANE_CLI_CLIENT_ID,
+      sessions: [{
+        id: ZERO_PANE_SESSION_ID,
+        projectId: ZERO_PANE_SESSION_ID,
+        status: "active",
+        isShared: false,
+      }],
+      messages: [],
+      paneConfigs: [],
+      paneMessages: {},
+      paneHasMore: {},
+      paneStatuses: {},
+      paneModes: {},
+      pausedPanes: [],
+      loadingMorePane: null,
+      hasMoreMessages: false,
+      isLoadingMore: false,
+      teamRecords: [],
+      projectFlags: {
+        [ZERO_PANE_SESSION_ID]: {
+          autoApproveTodos: false,
+          autoMergePrs: false,
+          teamEnabled: false,
+          disallowedTabTypes: [],
+        },
+      },
+      projectPolicies: {
+        [ZERO_PANE_SESSION_ID]: {
+          teamAvailable: false,
+          allowedLaunchProfiles,
+          version: 1,
+          projectSuspended: false,
+          noncompliantPaneIds: [],
+        },
+      },
+      addPane,
+      loadPaneMessagesIfNeeded: vi.fn(),
+      loadMoreMessages: vi.fn(),
+      fetchTeamTodo: vi.fn(),
+      fetchSuggestedWorkers: vi.fn(),
+      sendMessageToPane: vi.fn(() => ({ success: true })),
+      showToast: vi.fn(),
+    });
+  });
+
+  return { addPane };
+}
+
 describe("deriveInitialActiveTabId", () => {
   const base = {
     activeTabId: null,
@@ -133,6 +194,29 @@ describe("deriveInitialActiveTabId", () => {
         ...base,
         managerTabId: null,
         savedActiveTab: "999",
+      }),
+    ).toBe(OVERVIEW_PANE_ID);
+  });
+
+  it("lands on Overview when the selected project has no real panes", () => {
+    expect(
+      deriveInitialActiveTabId({
+        ...base,
+        paneConfigsLength: 0,
+        tabIds: [],
+      }),
+    ).toBe(OVERVIEW_PANE_ID);
+  });
+
+  it("replaces an outgoing project's active pane with Overview for a zero-pane project", () => {
+    expect(
+      deriveInitialActiveTabId({
+        ...base,
+        activeTabId: 20,
+        clientChanged: true,
+        paneConfigsLength: 0,
+        savedActiveTab: "20",
+        tabIds: [],
       }),
     ).toBe(OVERVIEW_PANE_ID);
   });
@@ -199,6 +283,81 @@ describe("TabbedView session download actions", () => {
     expect(rebootPane).not.toHaveBeenCalled();
     expect(requestPaneDiff).not.toHaveBeenCalled();
     expect(localStorage.getItem(activeTabKey())).toBe(String(DOWNLOAD_PANE_ID));
+  });
+});
+
+describe("TabbedView zero-pane projects", () => {
+  beforeEach(() => {
+    Element.prototype.scrollIntoView = vi.fn();
+    localStorage.clear();
+    act(() => {
+      useStore.setState(initialStore, true);
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    localStorage.clear();
+    act(() => {
+      useStore.setState(initialStore, true);
+    });
+  });
+
+  it("renders Overview and the first-pane control for an attached zero-pane project", async () => {
+    const { addPane } = seedZeroPaneTabbedView();
+
+    render(<TabbedView />);
+
+    expect(await screen.findByText("Team Overview")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Overview" })).toBeTruthy();
+    expect(screen.getByTitle("New tab")).toBeTruthy();
+    expect(screen.queryByText("Waiting for activity...")).toBeNull();
+    expect(addPane).not.toHaveBeenCalled();
+  });
+
+  it("creates the first pane through the existing policy-aware action", async () => {
+    const { addPane } = seedZeroPaneTabbedView();
+
+    render(<TabbedView />);
+    await screen.findByText("Team Overview");
+
+    fireEvent.click(screen.getByTitle("New tab"));
+    fireEvent.click(screen.getByText("Claude"));
+    fireEvent.click(screen.getByText("Official"));
+
+    expect(addPane).toHaveBeenCalledWith(
+      "claude",
+      "interactive",
+      "Claude 1",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      false,
+      "agent",
+    );
+  });
+
+  it("does not offer a disallowed launch profile for the first pane", async () => {
+    const { addPane } = seedZeroPaneTabbedView(["agent:codex:official:default"]);
+
+    render(<TabbedView />);
+    await screen.findByText("Team Overview");
+    fireEvent.click(screen.getByTitle("New tab"));
+
+    expect(screen.queryByText("Claude")).toBeNull();
+    expect(screen.getByText("Codex")).toBeTruthy();
+    expect(addPane).not.toHaveBeenCalled();
+  });
+
+  it("keeps the fallback and hides project controls when no session is selected", () => {
+    render(<TabbedView />);
+
+    expect(screen.getByText("No messages yet")).toBeTruthy();
+    expect(screen.getByText("Waiting for activity...")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Overview" })).toBeNull();
+    expect(screen.queryByTitle("New tab")).toBeNull();
+    expect(screen.queryByText("Team Overview")).toBeNull();
   });
 });
 

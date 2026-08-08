@@ -292,10 +292,9 @@ impl App {
     fn drain_outputs(&mut self) {
         while let Ok(out) = self.output_rx.try_recv() {
             self.output_lines_total = self.output_lines_total.saturating_add(1);
-            let entry = self
-                .panes
-                .entry(out.pane_id)
-                .or_insert_with(|| PaneSummary::new(format!("pane {}", out.pane_id), PaneMode::Interactive));
+            let entry = self.panes.entry(out.pane_id).or_insert_with(|| {
+                PaneSummary::new(format!("pane {}", out.pane_id), PaneMode::Interactive)
+            });
             entry.last_activity = Instant::now();
             entry.last_text = out.text.clone();
             if looks_like_error(&out.text) {
@@ -348,13 +347,15 @@ impl App {
                 ),
             ]),
         ];
-        let header = Paragraph::new(header_lines)
-            .block(Block::default().borders(Borders::BOTTOM));
+        let header = Paragraph::new(header_lines).block(Block::default().borders(Borders::BOTTOM));
         f.render_widget(header, chunks[0]);
 
         // ---- Pane table
-        let header_row = Row::new(vec!["id", "label", "mode", "errs", "last activity"])
-            .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
+        let header_row = Row::new(vec!["id", "label", "mode", "errs", "last activity"]).style(
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
         let rows: Vec<Row> = self
             .panes
             .iter()
@@ -472,7 +473,9 @@ mod tests {
         assert!(looks_like_error("[stderr] Error: thread/resume failed"));
         assert!(!looks_like_error("> hi"));
         assert!(!looks_like_error("[Thinking...]"));
-        assert!(!looks_like_error("normal output mentioning error in passing"));
+        assert!(!looks_like_error(
+            "normal output mentioning error in passing"
+        ));
     }
 
     #[test]

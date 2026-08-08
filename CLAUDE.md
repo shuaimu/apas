@@ -55,7 +55,7 @@ apas/
 │   ├── client-cli/      # CLI binary (apas)
 │   │   ├── src/
 │   │   │   ├── main.rs        # CLI entry point and config commands
-│   │   │   ├── config.rs      # User/machine config, provider API keys
+│   │   │   ├── config.rs      # User/machine config and supported backend settings
 │   │   │   ├── project.rs     # .apas project metadata
 │   │   │   ├── role.rs        # Built-in Manager/Tech Lead/Developer/Reviewer prompts
 │   │   │   ├── team_todo.rs   # team-todo.md parsing/state helpers
@@ -406,6 +406,12 @@ journalctl -u nginx -f
 #### Deploying Updates
 
 ```bash
+# Verify both supported web dependency graphs in separate clean trees before
+# deployment. Both audits include development dependencies and fail on low or
+# higher severity findings.
+(cd packages/web && npm ci && npm run audit:npm)
+(cd packages/web && pnpm install --frozen-lockfile && pnpm run audit:pnpm)
+
 # Build locally
 # cargo build -p apas-server --release
 cargo build --release
@@ -423,11 +429,15 @@ ssh root@apas.mpaxos.com "systemctl restart apas-server"
 
 sleep 1
 
+# Back up the currently deployed web source and build before synchronization.
+web_backup_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+ssh root@apas.mpaxos.com "install -d -m 700 /opt/apas/backups/web-${web_backup_stamp} && tar -C /opt/apas --exclude='web/node_modules' -czf /opt/apas/backups/web-${web_backup_stamp}/web.tgz web"
+
 # For web updates. `--delete` is important: without it, files removed
 # locally (renamed/retired components) stay on the server and the next
 # `npm run build` fails because those files still reference removed
-# store actions or types. Use `-n` (dry-run) first if you're not sure
-# what will get cleaned up.
+# store actions or types. Always inspect the dry-run before synchronizing.
+rsync -avn --delete --exclude 'node_modules' --exclude '.next' --exclude '.apas-version' packages/web/ root@apas.mpaxos.com:/opt/apas/web/
 rsync -av --delete --exclude 'node_modules' --exclude '.next' --exclude '.apas-version' packages/web/ root@apas.mpaxos.com:/opt/apas/web/
 
 # Restart apas-web (compute version locally since server lacks git history).
@@ -435,11 +445,22 @@ rsync -av --delete --exclude 'node_modules' --exclude '.next' --exclude '.apas-v
 # which fails the build on React Rules-of-Hooks violations (e.g. a hook after an
 # early return -> React error #310 -> whole-app crash). So a lint failure here
 # aborts the deploy before restart — fix the reported hook error, don't bypass it.
-# Requires devDependencies installed (the plain `npm install` above does this).
+# `npm ci` installs the exact reviewed package-lock graph, including devDependencies.
 month_start="$(date +%Y-%m-01) 00:00:00"
 web_version="$(date +%y.%m).$(git rev-list --count --since="$month_start" HEAD)"
-ssh root@apas.mpaxos.com "cd /opt/apas/web && npm install && NEXT_PUBLIC_WEB_UI_VERSION=${web_version} npm run build && systemctl restart apas-web"
+ssh root@apas.mpaxos.com "cd /opt/apas/web && npm ci && NEXT_PUBLIC_WEB_UI_VERSION=${web_version} npm run build && systemctl restart apas-web"
+
+# Verify service state, public pages, API health, referenced /_next/static assets,
+# WebSocket/terminal attachment from the UI, and recent service errors.
+for path in / /login /machines /share /admin /health; do curl -fsSL "http://apas.mpaxos.com${path}" >/dev/null; done
+ssh root@apas.mpaxos.com "systemctl is-active apas-web apas-server && journalctl -u apas-web --since '5 minutes ago' -p err --no-pager -q && journalctl -u apas-server --since '5 minutes ago' -p err --no-pager -q"
 ```
+
+For rollback, move the failed `/opt/apas/web` directory aside, extract the
+selected `/opt/apas/backups/web-<timestamp>/web.tgz` under `/opt/apas`, run
+`npm ci` and the versioned build from that restored tree, then restart and
+repeat every smoke check above. This emergency rollback restores the previous
+vulnerable dependency graph; follow it with a corrected patched deployment.
 
 ## Key Concepts
 
@@ -477,13 +498,10 @@ everything allowed = existing projects unaffected. It also means a provider
 added later is permitted until an owner says otherwise, rather than vanishing
 from their menu.
 
-The catalog is deliberately **not** every `Provider`. MiniMax, GLM and DeepSeek
-are the claude binary against a different backend, so the add-tab menu offers
-them as claude *models* — a `agent:minimax` key would be a checkbox that
-silently does nothing, because those tabs arrive as `provider: claude`.
-Restricting by model would be a separate, larger feature. `shared::all_tab_types`
-and `packages/web/src/lib/tabTypes.ts` must agree; a test in `shared` reads the
-TS file and asserts they do.
+The catalog is deliberately **not** every `Provider`. DeepSeek is the Claude
+binary against a different backend, so the add-tab menu offers it as a Claude
+model. `shared::all_tab_types` and `packages/web/src/lib/tabTypes.ts` must
+agree; a test in `shared` reads the TS file and asserts they do.
 
 Enforced in the CLI (`tab_type_allowed_for`), which re-reads `.apas` on every
 `AddPane` — the web only hides menu entries, and the same message can arrive
@@ -687,11 +705,10 @@ server-side: an agent can neither publish as another pane nor forget to
 identify itself. Note `--project-dir` is the **project root**, never a pane's
 worktree — worktrees contain no `team-todo.md` / `.apas-team.jsonl`.
 
-Provider wiring reuses existing channels: claude (and the MiniMax/GLM/DeepSeek
-variants, which are the claude binary behind different env) via `--mcp-config`;
-codex via `-c mcp_servers.apas.*`, the same `-c` override that already carries
-`model_reasoning_effort`. opencode/cursor-agent get no flags — unverified, and a
-bad flag breaks the spawn outright.
+Provider wiring reuses existing channels: Claude and DeepSeek use
+`--mcp-config`; Codex uses `-c mcp_servers.apas.*`, the same `-c` override that
+already carries `model_reasoning_effort`. OpenCode/Cursor Agent get no flags —
+unverified, and a bad flag breaks the spawn outright.
 
 **Concurrency.** `team-todo.md` mutations are a load → mutate → save cycle, and
 every pane runs its own server process (rmcp also serves calls concurrently
@@ -714,8 +731,7 @@ sync with a provider's output format — the point is to reuse the CLI as it
 ships.
 
 Only `claude` and `codex` can host one (`terminal_pane::terminal_binary_for`);
-the MiniMax/GLM/DeepSeek variants are the claude binary behind different env,
-and opencode/cursor-agent have unverified pty behaviour.
+DeepSeek, OpenCode, and Cursor Agent have unverified pty behaviour.
 
 **What terminal panes deliberately do not get.** Every other team-mode
 integration is built on stream-json events, so a terminal pane still has no

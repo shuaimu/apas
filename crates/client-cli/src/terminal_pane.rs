@@ -55,13 +55,13 @@ const DEFAULT_ROWS: u16 = 24;
 
 /// Which binaries a terminal pane may host.
 ///
-/// Deliberately not every [`Provider`]: the MiniMax/GLM/DeepSeek variants
-/// are the `claude` binary pointed at a different backend through env, and
-/// opencode/cursor-agent have their own interaction models that we have
+/// Deliberately not every [`Provider`]: only Claude and Codex have verified
+/// terminal behavior. Other providers have interaction models that we have
 /// not verified render correctly through a bare pty. Returning `None`
 /// here makes the caller reject the pane rather than spawn something that
 /// paints garbage into xterm.js.
 pub fn terminal_binary_for(provider: &Provider) -> Option<&'static str> {
+    #[allow(deprecated)]
     match provider {
         Provider::Claude => Some("claude"),
         Provider::Codex => Some("codex"),
@@ -441,6 +441,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(deprecated)]
     fn only_claude_and_codex_can_host_a_terminal() {
         assert_eq!(terminal_binary_for(&Provider::Claude), Some("claude"));
         assert_eq!(terminal_binary_for(&Provider::Codex), Some("codex"));
@@ -478,6 +479,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn non_hostable_providers_get_no_flags_at_all() {
         // An unrecognised flag fails the spawn outright rather than degrading,
         // so providers we have not verified get nothing.

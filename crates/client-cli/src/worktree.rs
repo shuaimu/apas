@@ -94,8 +94,7 @@ pub fn add(
     branch: Option<String>,
     custom_path: Option<PathBuf>,
 ) -> Result<()> {
-    let mut metadata = project::get_or_create_project(project_dir)
-        .context("reading .apas")?;
+    let mut metadata = project::get_or_create_project(project_dir).context("reading .apas")?;
     metadata.migrate_legacy();
 
     let pane = metadata
@@ -137,8 +136,7 @@ pub fn add(
 }
 
 pub fn remove(project_dir: &Path, pane_id: u32) -> Result<()> {
-    let mut metadata = project::get_or_create_project(project_dir)
-        .context("reading .apas")?;
+    let mut metadata = project::get_or_create_project(project_dir).context("reading .apas")?;
 
     let pane = metadata
         .get_pane_mut(pane_id)
@@ -149,7 +147,10 @@ pub fn remove(project_dir: &Path, pane_id: u32) -> Result<()> {
 
     match prev {
         Some(p) => {
-            println!("✓ Cleared worktree assignment for pane {} (was: {}).", pane_id, p);
+            println!(
+                "✓ Cleared worktree assignment for pane {} (was: {}).",
+                pane_id, p
+            );
             println!(
                 "The git worktree itself was NOT removed. To delete it: `git worktree remove {}`.",
                 p,
@@ -161,8 +162,7 @@ pub fn remove(project_dir: &Path, pane_id: u32) -> Result<()> {
 }
 
 pub fn list(project_dir: &Path) -> Result<()> {
-    let metadata = project::get_or_create_project(project_dir)
-        .context("reading .apas")?;
+    let metadata = project::get_or_create_project(project_dir).context("reading .apas")?;
 
     let mut found = false;
     for pane in &metadata.panes {
@@ -267,11 +267,14 @@ pub fn compute_pane_diff(
     let worktree = worktree_path.ok_or_else(|| {
         anyhow!("pane has no isolated worktree — nothing to diff. Use the \"Isolated git worktree\" checkbox when creating the pane, or `apas worktree add <pane-id>`.")
     })?;
-    let project_str = project_dir.to_str().ok_or_else(|| {
-        anyhow!("project dir is not valid UTF-8: {}", project_dir.display())
-    })?;
+    let project_str = project_dir
+        .to_str()
+        .ok_or_else(|| anyhow!("project dir is not valid UTF-8: {}", project_dir.display()))?;
     let branch = current_branch_in(worktree).ok_or_else(|| {
-        anyhow!("worktree at {} is on detached HEAD; nothing to diff", worktree)
+        anyhow!(
+            "worktree at {} is on detached HEAD; nothing to diff",
+            worktree
+        )
     })?;
     // Diff three-dot syntax (A...B) shows what's on the worktree branch
     // since it diverged from the project's HEAD — the right semantics for
@@ -295,7 +298,10 @@ pub fn create_pr_for_pane(worktree_path: Option<&str>) -> Result<String> {
         anyhow!("pane has no isolated worktree — nothing to PR. Add a worktree to this pane first.")
     })?;
     let branch = current_branch_in(worktree).ok_or_else(|| {
-        anyhow!("worktree at {} is on detached HEAD; cannot push or open a PR", worktree)
+        anyhow!(
+            "worktree at {} is on detached HEAD; cannot push or open a PR",
+            worktree
+        )
     })?;
 
     // 1. Push the branch to origin (creating the remote ref if needed). The
@@ -785,12 +791,7 @@ mod tests {
             assert!(status.success(), "git {} failed", args.join(" "));
         };
         run(&["init", "-q", "-b", "main"]);
-        run(&[
-            "remote",
-            "add",
-            "origin",
-            "git@github.com:Shuaimu/APAS.git",
-        ]);
+        run(&["remote", "add", "origin", "git@github.com:Shuaimu/APAS.git"]);
         assert_eq!(
             normalized_git_remote(tmp.path()).as_deref(),
             Some("github.com/shuaimu/apas")
@@ -824,13 +825,7 @@ mod tests {
         run(&["commit", "-q", "--allow-empty", "-m", "init"]);
         let wt = proj.join(".apas-worktrees").join("pane-2");
         std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
-        run(&[
-            "worktree",
-            "add",
-            wt.to_str().unwrap(),
-            "-b",
-            "apas-pane-2",
-        ]);
+        run(&["worktree", "add", wt.to_str().unwrap(), "-b", "apas-pane-2"]);
         (tmp, proj, wt)
     }
 
@@ -845,7 +840,10 @@ mod tests {
     }
 
     fn run_git_stdout(cwd: &Path, args: &[&str]) -> String {
-        run_git_path(cwd, args).expect("git stdout").trim().to_string()
+        run_git_path(cwd, args)
+            .expect("git stdout")
+            .trim()
+            .to_string()
     }
 
     #[test]
@@ -969,17 +967,35 @@ mod tests {
 
         // Second poll without changes: nothing should fire.
         let second = poll_changed_diffs(&proj, &mut state, &panes);
-        assert!(second.is_empty(), "no SHA change should produce no emissions");
+        assert!(
+            second.is_empty(),
+            "no SHA change should produce no emissions"
+        );
 
         // Commit something on the branch — third poll should fire.
         std::fs::write(wt.join("a.txt"), b"a").unwrap();
         assert!(Command::new("git")
-            .arg("-C").arg(&wt_str)
-            .args(["add", "a.txt"]).status().unwrap().success());
+            .arg("-C")
+            .arg(&wt_str)
+            .args(["add", "a.txt"])
+            .status()
+            .unwrap()
+            .success());
         assert!(Command::new("git")
-            .arg("-C").arg(&wt_str)
-            .args(["-c", "user.email=t@e", "-c", "user.name=t", "commit", "-m", "a"])
-            .status().unwrap().success());
+            .arg("-C")
+            .arg(&wt_str)
+            .args([
+                "-c",
+                "user.email=t@e",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "a"
+            ])
+            .status()
+            .unwrap()
+            .success());
         let third = poll_changed_diffs(&proj, &mut state, &panes);
         assert_eq!(third.len(), 1, "branch tip moved → should re-emit");
         assert!(third[0].3.contains("a.txt"));
@@ -987,7 +1003,10 @@ mod tests {
         // Pane disappears: last_seen entry should be reaped.
         assert!(state.last_seen.contains_key(&2));
         let _ = poll_changed_diffs(&proj, &mut state, &[]);
-        assert!(!state.last_seen.contains_key(&2), "stale entry should be dropped");
+        assert!(
+            !state.last_seen.contains_key(&2),
+            "stale entry should be dropped"
+        );
     }
 
     #[test]
@@ -997,19 +1016,41 @@ mod tests {
         std::fs::write(wt.join("feature.txt"), b"hello").unwrap();
         let wt_str = wt.to_str().unwrap();
         assert!(Command::new("git")
-            .arg("-C").arg(wt_str)
+            .arg("-C")
+            .arg(wt_str)
             .args(["add", "feature.txt"])
-            .status().unwrap().success());
+            .status()
+            .unwrap()
+            .success());
         assert!(Command::new("git")
-            .arg("-C").arg(wt_str)
-            .args(["-c", "user.email=t@e", "-c", "user.name=t", "commit", "-m", "feature"])
-            .status().unwrap().success());
+            .arg("-C")
+            .arg(wt_str)
+            .args([
+                "-c",
+                "user.email=t@e",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "feature"
+            ])
+            .status()
+            .unwrap()
+            .success());
 
         let (branch, base, diff) = compute_pane_diff(&proj, Some(wt_str)).expect("diff");
         assert_eq!(branch, "apas-pane-2");
         assert_eq!(base, "HEAD");
-        assert!(diff.contains("feature.txt"), "diff should mention the new file: {}", diff);
-        assert!(diff.contains("+hello"), "diff should show the addition: {}", diff);
+        assert!(
+            diff.contains("feature.txt"),
+            "diff should mention the new file: {}",
+            diff
+        );
+        assert!(
+            diff.contains("+hello"),
+            "diff should show the addition: {}",
+            diff
+        );
     }
 
     #[test]
@@ -1066,8 +1107,14 @@ mod tests {
             .expect("merge_and_remove");
         assert!(!wt.exists());
         let branches = run_git_cd(proj_str, &["branch", "--list", "apas-pane-2"]).unwrap();
-        assert!(!branches.contains("apas-pane-2"), "branch deleted post-merge");
+        assert!(
+            !branches.contains("apas-pane-2"),
+            "branch deleted post-merge"
+        );
         // The feature file should now be in main.
-        assert!(proj.join("feature.txt").exists(), "merge brought in the file");
+        assert!(
+            proj.join("feature.txt").exists(),
+            "merge brought in the file"
+        );
     }
 }

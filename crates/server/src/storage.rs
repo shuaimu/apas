@@ -2,10 +2,10 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::io::SeekFrom;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
@@ -229,6 +229,38 @@ impl FileStorage {
         let data = fs::read(file_path).await?;
         let panes = serde_json::from_slice::<Vec<shared::PaneConfig>>(&data)?;
         Ok(panes)
+    }
+
+    /// Permanently remove all file-backed artifacts for the supplied sessions.
+    /// Callers must first exclude new project writes; the per-session locks
+    /// drain any append or GC operation that was already in flight.
+    pub async fn delete_session_dirs(&self, session_ids: &[Uuid]) -> Result<()> {
+        let mut ordered = session_ids.to_vec();
+        ordered.sort_unstable();
+        ordered.dedup();
+
+        for session_id in ordered {
+            let lock = self.session_lock(&session_id);
+            let guard = lock.lock().await;
+            match fs::remove_dir_all(self.session_dir(&session_id)).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            drop(guard);
+
+            // Remove only the same lock and only when no append/GC caller has
+            // already cloned it. A waiter retains its Arc and keeps the lock
+            // alive even if a future session reuses this UUID.
+            let mut locks = self.session_locks.lock().expect("session_locks poisoned");
+            if locks
+                .get(&session_id)
+                .is_some_and(|stored| Arc::ptr_eq(stored, &lock) && Arc::strong_count(stored) == 2)
+            {
+                locks.remove(&session_id);
+            }
+        }
+        Ok(())
     }
 
     /// Copy historical artifacts from `source_session_id` into `target_session_id`
@@ -523,11 +555,7 @@ impl FileStorage {
         // nothing newer can possibly turn up. An empty watermark map
         // (client knows nothing) treats every line as kept; we still
         // cap at CATCHUP_LIMIT via the per-line consumer.
-        let min_cutoff: String = pane_watermarks
-            .values()
-            .min()
-            .cloned()
-            .unwrap_or_default();
+        let min_cutoff: String = pane_watermarks.values().min().cloned().unwrap_or_default();
 
         let mut file = fs::File::open(&file_path).await?;
         let mut found: Vec<StoredMessage> = Vec::new();
@@ -1004,11 +1032,7 @@ impl FileStorage {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "GC failed for session {}: {} — leaving file intact",
-                        sid,
-                        e
-                    );
+                    tracing::warn!("GC failed for session {}: {} — leaving file intact", sid, e);
                 }
             }
         }
@@ -1172,12 +1196,12 @@ fn consume_per_pane_line(
         // messages exist, so flag has_more for the paginator.
         *has_more = true;
         *slack += 1;
-        let all_full = !buckets.is_empty()
-            && buckets.values().all(|b| b.len() >= limit_per_pane);
+        let all_full = !buckets.is_empty() && buckets.values().all(|b| b.len() >= limit_per_pane);
         return !(all_full && *slack >= slack_limit);
     }
 
-    msg.content = truncate_message_content(msg.content, &msg.message_type, max_content, "initial load");
+    msg.content =
+        truncate_message_content(msg.content, &msg.message_type, max_content, "initial load");
     bucket.push(msg);
     // A new bucket or a fresh push extends the discovery horizon — reset
     // the slack counter so we don't bail too early on a sparse pane.
@@ -1419,7 +1443,10 @@ mod gc_tests {
         for m in &got {
             *per_pane.entry(m.pane_type.as_deref().unwrap()).or_insert(0) += 1;
         }
-        assert_eq!(per_pane.values().copied().collect::<Vec<_>>(), vec![100, 100, 100]);
+        assert_eq!(
+            per_pane.values().copied().collect::<Vec<_>>(),
+            vec![100, 100, 100]
+        );
     }
 
     #[tokio::test]
@@ -1480,7 +1507,9 @@ mod gc_tests {
         assert_eq!(parsed["is_error"], false);
         assert_eq!(parsed["tool_use_id"], "toolu_abc");
         // Inner content is a truncated string, with marker.
-        let inner = parsed["content"].as_str().expect("inner content stays a string");
+        let inner = parsed["content"]
+            .as_str()
+            .expect("inner content stays a string");
         assert!(inner.contains("truncated for catchup"));
         // The bulky tool_use_result was dropped on truncation.
         assert!(parsed.get("tool_use_result").is_none());
@@ -1509,7 +1538,9 @@ mod gc_tests {
             .expect("truncated tool_use must remain valid JSON");
         assert_eq!(parsed["id"], "toolu_bash");
         assert_eq!(parsed["name"], "Bash");
-        let input = parsed["input"].as_str().expect("string input stays a string");
+        let input = parsed["input"]
+            .as_str()
+            .expect("string input stays a string");
         assert!(input.starts_with("run run"));
         assert!(input.contains("truncated for catchup"));
     }
@@ -1715,10 +1746,7 @@ mod gc_tests {
     async fn gc_no_op_on_missing_file_is_zero() {
         let storage = fresh_storage();
         let sid = Uuid::new_v4();
-        let (kept, dropped, freed) = storage
-            .gc_session_before(&sid, Utc::now())
-            .await
-            .unwrap();
+        let (kept, dropped, freed) = storage.gc_session_before(&sid, Utc::now()).await.unwrap();
         assert_eq!((kept, dropped, freed), (0, 0, 0));
     }
 
@@ -1753,6 +1781,39 @@ mod gc_tests {
         assert_eq!(stats.sessions_modified, 1);
         assert_eq!(stats.messages_kept, 2);
         assert_eq!(stats.messages_dropped, 1);
+    }
+
+    #[tokio::test]
+    async fn session_directory_deletion_drains_an_earlier_append_and_is_idempotent() {
+        let storage = fresh_storage();
+        let sid = Uuid::new_v4();
+        let lock = storage.session_lock(&sid);
+        let held = lock.lock().await;
+
+        // Tokio mutex waiters are FIFO: queue the append first and deletion
+        // second, then prove cleanup removes what the in-flight append wrote.
+        let append_storage = storage.clone();
+        let append = tokio::spawn(async move {
+            append_storage
+                .append_message(&sid, &make_msg("in-flight", &Utc::now().to_rfc3339()))
+                .await
+        });
+        tokio::task::yield_now().await;
+        let delete_storage = storage.clone();
+        let delete = tokio::spawn(async move { delete_storage.delete_session_dirs(&[sid]).await });
+        tokio::task::yield_now().await;
+        drop(held);
+        drop(lock);
+
+        append.await.unwrap().unwrap();
+        delete.await.unwrap().unwrap();
+        assert!(!storage.session_dir(&sid).exists());
+        storage.delete_session_dirs(&[sid]).await.unwrap();
+        assert!(!storage
+            .session_locks
+            .lock()
+            .expect("session_locks poisoned")
+            .contains_key(&sid));
     }
 }
 

@@ -387,6 +387,8 @@ mod session_download_tests {
             email: format!("{user_id}@example.test"),
             password_hash: "hash".to_string(),
             created_at: None,
+            cluster_role: "user".to_string(),
+            account_status: "active".to_string(),
         }
     }
 
@@ -535,8 +537,6 @@ mod machine_access_tests {
             os: "linux".to_string(),
             arch: "x86_64".to_string(),
             daemon_version: None,
-            minimax_backend: None,
-            glm_backend: None,
             deepseek_backend: None,
             last_seen: None,
         }
@@ -560,6 +560,8 @@ mod machine_access_tests {
             email: email.to_string(),
             password_hash: "hash".to_string(),
             created_at: None,
+            cluster_role: "user".to_string(),
+            account_status: "active".to_string(),
         }
     }
 
@@ -761,6 +763,355 @@ async fn can_manage_project_settings(
     }
 }
 
+async fn send_policy_error(state: &AppState, connection_id: &Uuid, message: impl Into<String>) {
+    state
+        .sessions
+        .send_to_web(
+            connection_id,
+            ServerToWeb::Error {
+                message: message.into(),
+            },
+        )
+        .await;
+}
+
+/// Load the latest effective policy for a launch-like mutation. Both ends of
+/// the data-plane must understand server-owned policy before a launch is
+/// routed; otherwise an older peer could silently apply local `.apas` state.
+async fn effective_policy_for_launch(
+    state: &AppState,
+    connection_id: &Uuid,
+    session_id: &Uuid,
+) -> Option<shared::EffectiveProjectPolicy> {
+    if !state
+        .sessions
+        .web_supports_capability(connection_id, shared::PROJECT_POLICY_CAPABILITY)
+    {
+        send_policy_error(
+            state,
+            connection_id,
+            "This web client is incompatible with cluster project policy; reload after updating the web deployment",
+        )
+        .await;
+        return None;
+    }
+    if !state
+        .sessions
+        .session_supports_capability(session_id, shared::PROJECT_POLICY_CAPABILITY)
+    {
+        send_policy_error(
+            state,
+            connection_id,
+            "The project host CLI is incompatible with cluster project policy; update and reconnect it before launching panes",
+        )
+        .await;
+        return None;
+    }
+    let project = match state
+        .db
+        .get_project_for_session(&session_id.to_string())
+        .await
+    {
+        Ok(Some(project)) => project,
+        Ok(None) => {
+            send_policy_error(state, connection_id, "Project policy is unavailable").await;
+            return None;
+        }
+        Err(err) => {
+            tracing::warn!(%err, %session_id, "project policy lookup failed");
+            send_policy_error(state, connection_id, "Could not verify project policy").await;
+            return None;
+        }
+    };
+    match state.db.get_effective_project_policy(&project.id).await {
+        Ok(policy) if !policy.project_suspended => Some(policy),
+        Ok(_) => {
+            send_policy_error(
+                state,
+                connection_id,
+                "This project is suspended; reactivate it before launching panes",
+            )
+            .await;
+            None
+        }
+        Err(err) => {
+            tracing::warn!(%err, project_id = %project.id, "effective project policy lookup failed");
+            send_policy_error(state, connection_id, "Could not verify project policy").await;
+            None
+        }
+    }
+}
+
+async fn authorize_profile_launch(
+    state: &AppState,
+    connection_id: &Uuid,
+    session_id: &Uuid,
+    kind: shared::PaneKind,
+    provider: shared::Provider,
+    model: Option<&str>,
+    managed: bool,
+) -> bool {
+    if shared::is_retired_launch(provider, model) {
+        send_policy_error(
+            state,
+            connection_id,
+            "Unsupported provider: this backend has been retired",
+        )
+        .await;
+        return false;
+    }
+    let Some(policy) = effective_policy_for_launch(state, connection_id, session_id).await else {
+        return false;
+    };
+    if managed && !policy.team_available {
+        send_policy_error(
+            state,
+            connection_id,
+            format!(
+                "Managed pane launch is disabled by cluster policy (policy version {})",
+                policy.version
+            ),
+        )
+        .await;
+        return false;
+    }
+    if policy.allows(kind, provider, model) {
+        return true;
+    }
+    send_policy_error(
+        state,
+        connection_id,
+        format!(
+            "Launch profile '{}' is disabled by cluster policy (policy version {})",
+            shared::launch_profile_key(kind, provider, model),
+            policy.version
+        ),
+    )
+    .await;
+    false
+}
+
+async fn authorize_existing_pane_launch(
+    state: &AppState,
+    connection_id: &Uuid,
+    session_id: &Uuid,
+    pane_id: u32,
+) -> bool {
+    let pane = state
+        .sessions
+        .get_session_panes(session_id)
+        .into_iter()
+        .find(|pane| pane.pane_id == pane_id);
+    let Some(pane) = pane else {
+        send_policy_error(state, connection_id, "Pane not found").await;
+        return false;
+    };
+    authorize_profile_launch(
+        state,
+        connection_id,
+        session_id,
+        pane.kind,
+        pane.provider,
+        pane.model.as_deref(),
+        pane.managed,
+    )
+    .await
+}
+
+async fn authorize_team_launch(
+    state: &AppState,
+    connection_id: &Uuid,
+    session_id: &Uuid,
+    roles: &[&shared::TeamRoleSpec],
+) -> bool {
+    for role in roles {
+        let provider = role.provider.unwrap_or(shared::Provider::Claude);
+        if shared::is_retired_launch(provider, role.model.as_deref()) {
+            send_policy_error(
+                state,
+                connection_id,
+                "Unsupported provider in managed team: this backend has been retired",
+            )
+            .await;
+            return false;
+        }
+    }
+    let Some(policy) = effective_policy_for_launch(state, connection_id, session_id).await else {
+        return false;
+    };
+    if !policy.team_available {
+        send_policy_error(
+            state,
+            connection_id,
+            format!(
+                "Team launch is disabled by cluster policy (policy version {})",
+                policy.version
+            ),
+        )
+        .await;
+        return false;
+    }
+    for role in roles {
+        let provider = role.provider.unwrap_or(shared::Provider::Claude);
+        if !policy.allows(shared::PaneKind::Agent, provider, role.model.as_deref()) {
+            send_policy_error(
+                state,
+                connection_id,
+                format!(
+                    "Team launch profile '{}' is disabled by cluster policy (policy version {})",
+                    shared::launch_profile_key(
+                        shared::PaneKind::Agent,
+                        provider,
+                        role.model.as_deref(),
+                    ),
+                    policy.version
+                ),
+            )
+            .await;
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod retired_launch_authorization_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::db::{Database, Session, User};
+
+    async fn policy_state() -> (
+        AppState,
+        Uuid,
+        Uuid,
+        mpsc::Receiver<ServerToWeb>,
+        mpsc::Receiver<ServerToCli>,
+    ) {
+        let dir = std::env::temp_dir().join(format!("apas-retired-auth-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp db dir");
+        let db_path = dir.join("apas.db").to_string_lossy().to_string();
+        let db = Database::new(&db_path).await.expect("create temp db");
+        db.run_migrations().await.expect("run migrations");
+        let user_id = Uuid::new_v4();
+        db.create_user(&User {
+            id: user_id.to_string(),
+            email: format!("{user_id}@example.test"),
+            password_hash: "hash".to_string(),
+            created_at: None,
+            cluster_role: "user".to_string(),
+            account_status: "active".to_string(),
+        })
+        .await
+        .expect("create user");
+        let session_id = Uuid::new_v4();
+        db.create_session(&Session {
+            id: session_id.to_string(),
+            user_id: user_id.to_string(),
+            cli_client_id: None,
+            working_dir: Some("/project".to_string()),
+            hostname: Some("host".to_string()),
+            status: "connected".to_string(),
+            created_at: None,
+            updated_at: None,
+            is_paused: false,
+            project_id: Some(session_id.to_string()),
+            git_remote: None,
+            git_remote_url: None,
+        })
+        .await
+        .expect("create session");
+
+        let mut config = Config::default();
+        config.database.path = db_path;
+        let state = AppState::new(db, config);
+        let connection_id = Uuid::new_v4();
+        let (web_tx, web_rx) = mpsc::channel(8);
+        state.sessions.register_web(connection_id, web_tx);
+        state.sessions.set_web_capabilities(
+            connection_id,
+            vec![shared::PROJECT_POLICY_CAPABILITY.to_string()],
+        );
+        state
+            .sessions
+            .create_session(session_id, user_id, connection_id);
+        let cli_id = Uuid::new_v4();
+        let (cli_tx, cli_rx) = mpsc::channel(8);
+        state.sessions.register_cli(cli_id, user_id, cli_tx, None);
+        assert!(state.sessions.assign_cli_to_session(&session_id, cli_id));
+        state
+            .sessions
+            .set_cli_capabilities(cli_id, vec![shared::PROJECT_POLICY_CAPABILITY.to_string()]);
+        (state, connection_id, session_id, web_rx, cli_rx)
+    }
+
+    #[tokio::test]
+    async fn retired_profile_is_rejected_before_routing() {
+        let (state, connection_id, session_id, mut web_rx, mut cli_rx) = policy_state().await;
+
+        assert!(
+            !authorize_profile_launch(
+                &state,
+                &connection_id,
+                &session_id,
+                shared::PaneKind::Agent,
+                shared::Provider::Claude,
+                Some("MiniMax-M2.7"),
+                false,
+            )
+            .await
+        );
+
+        let ServerToWeb::Error { message } = web_rx.try_recv().expect("explicit web error") else {
+            panic!("expected policy error")
+        };
+        assert!(message.contains("Unsupported provider"));
+        assert!(
+            cli_rx.try_recv().is_err(),
+            "retired request must not reach CLI"
+        );
+    }
+
+    #[tokio::test]
+    async fn retired_team_role_is_classified_before_policy_lookup() {
+        let (state, connection_id, _session_id, mut web_rx, mut cli_rx) = policy_state().await;
+        let role = shared::TeamRoleSpec {
+            provider: Some(shared::Provider::Claude),
+            model: Some("glm-5.1".to_string()),
+        };
+
+        assert!(!authorize_team_launch(&state, &connection_id, &Uuid::new_v4(), &[&role],).await);
+
+        let ServerToWeb::Error { message } = web_rx.try_recv().expect("explicit web error") else {
+            panic!("expected policy error")
+        };
+        assert!(message.contains("Unsupported provider"));
+        assert!(!message.contains("incompatible"));
+        assert!(
+            cli_rx.try_recv().is_err(),
+            "retired team must not reach CLI"
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_profile_remains_authorized() {
+        let (state, connection_id, session_id, mut web_rx, _cli_rx) = policy_state().await;
+
+        assert!(
+            authorize_profile_launch(
+                &state,
+                &connection_id,
+                &session_id,
+                shared::PaneKind::Agent,
+                shared::Provider::Codex,
+                None,
+                false,
+            )
+            .await
+        );
+        assert!(web_rx.try_recv().is_err());
+    }
+}
+
 async fn resolve_target_session(
     state: &AppState,
     connection_id: &Uuid,
@@ -768,8 +1119,27 @@ async fn resolve_target_session(
     fallback: Option<Uuid>,
 ) -> Option<Uuid> {
     if let Some(sid) = msg_session_id {
-        if state.sessions.is_web_attached_to_session(&sid, connection_id) {
-            return Some(sid);
+        if state
+            .sessions
+            .is_web_attached_to_session(&sid, connection_id)
+        {
+            if state
+                .active_session_operation(&sid.to_string())
+                .await
+                .is_ok()
+            {
+                return Some(sid);
+            }
+            state
+                .sessions
+                .send_to_web(
+                    connection_id,
+                    ServerToWeb::Error {
+                        message: "Project is unavailable".to_string(),
+                    },
+                )
+                .await;
+            return None;
         }
         // Not registered as attached — but the web client may legitimately
         // own/have access to this session and simply hasn't finished its
@@ -785,6 +1155,13 @@ async fn resolve_target_session(
                 .await
                 .unwrap_or(false);
             if has_access {
+                if state
+                    .active_session_operation(&sid.to_string())
+                    .await
+                    .is_err()
+                {
+                    return None;
+                }
                 let cli_client_id = match state.db.get_session(&sid.to_string()).await {
                     Ok(Some(db_session)) => db_session
                         .cli_client_id
@@ -820,7 +1197,23 @@ async fn resolve_target_session(
         return None;
     }
     if let Some(sid) = fallback {
-        return Some(sid);
+        if state
+            .active_session_operation(&sid.to_string())
+            .await
+            .is_ok()
+        {
+            return Some(sid);
+        }
+        state
+            .sessions
+            .send_to_web(
+                connection_id,
+                ServerToWeb::Error {
+                    message: "Project is unavailable".to_string(),
+                },
+            )
+            .await;
+        return None;
     }
     state
         .sessions
@@ -857,6 +1250,10 @@ async fn handle_web_input(
 ) {
     let Some(sid) =
         resolve_target_session(state, connection_id, msg_sid, fallback_session_id).await
+    else {
+        return;
+    };
+    let Ok((_project_id, _project_guard)) = state.active_session_operation(&sid.to_string()).await
     else {
         return;
     };
@@ -985,9 +1382,43 @@ mod reboot_route_tests {
         std::fs::create_dir_all(&dir).expect("temp db dir");
         let db_path = dir.join("apas.db").to_string_lossy().to_string();
         let db = Database::new(&db_path).await.expect("create temp db");
+        db.run_migrations().await.expect("run migrations");
         let mut config = Config::default();
         config.database.path = db_path;
         AppState::new(db, config)
+    }
+
+    async fn persist_session(state: &AppState, user_id: Uuid, session_id: Uuid) {
+        state
+            .db
+            .create_user(&crate::db::User {
+                id: user_id.to_string(),
+                email: format!("{user_id}@test"),
+                password_hash: "hash".to_string(),
+                created_at: None,
+                cluster_role: "user".to_string(),
+                account_status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .create_session(&crate::db::Session {
+                id: session_id.to_string(),
+                user_id: user_id.to_string(),
+                cli_client_id: None,
+                working_dir: None,
+                hostname: None,
+                status: "active".to_string(),
+                created_at: None,
+                updated_at: None,
+                is_paused: false,
+                project_id: Some(session_id.to_string()),
+                git_remote: None,
+                git_remote_url: None,
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -997,6 +1428,7 @@ mod reboot_route_tests {
         let web_connection_id = Uuid::new_v4();
         let session_id = Uuid::new_v4();
         let cli_id = Uuid::new_v4();
+        persist_session(&state, user_id, session_id).await;
 
         let (web_tx, _web_rx) = mpsc::channel(4);
         state.sessions.register_web(web_connection_id, web_tx);
@@ -1040,6 +1472,7 @@ mod reboot_route_tests {
         let web_connection_id = Uuid::new_v4();
         let session_id = Uuid::new_v4();
         let cli_id = Uuid::new_v4();
+        persist_session(&state, user_id, session_id).await;
 
         let (web_tx, _web_rx) = mpsc::channel(4);
         state.sessions.register_web(web_connection_id, web_tx);
@@ -1089,9 +1522,43 @@ mod web_input_route_tests {
         std::fs::create_dir_all(&dir).expect("temp db dir");
         let db_path = dir.join("apas.db").to_string_lossy().to_string();
         let db = Database::new(&db_path).await.expect("create temp db");
+        db.run_migrations().await.expect("run migrations");
         let mut config = Config::default();
         config.database.path = db_path;
         AppState::new(db, config)
+    }
+
+    async fn persist_session(state: &AppState, user_id: Uuid, session_id: Uuid) {
+        state
+            .db
+            .create_user(&crate::db::User {
+                id: user_id.to_string(),
+                email: format!("{user_id}@test"),
+                password_hash: "hash".to_string(),
+                created_at: None,
+                cluster_role: "user".to_string(),
+                account_status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .create_session(&crate::db::Session {
+                id: session_id.to_string(),
+                user_id: user_id.to_string(),
+                cli_client_id: None,
+                working_dir: None,
+                hostname: None,
+                status: "active".to_string(),
+                created_at: None,
+                updated_at: None,
+                is_paused: false,
+                project_id: Some(session_id.to_string()),
+                git_remote: None,
+                git_remote_url: None,
+            })
+            .await
+            .unwrap();
     }
 
     fn assert_cli_input(msg: ServerToCli, session_id: Uuid, text: &str, pane_id: Option<u32>) {
@@ -1132,6 +1599,16 @@ mod web_input_route_tests {
         }
     }
 
+    fn next_user_input(rx: &mut mpsc::Receiver<ServerToWeb>) -> ServerToWeb {
+        for _ in 0..8 {
+            let message = rx.try_recv().expect("web response");
+            if matches!(message, ServerToWeb::UserInput { .. }) {
+                return message;
+            }
+        }
+        panic!("no UserInput response found");
+    }
+
     async fn setup_connected_session() -> (
         AppState,
         Uuid,
@@ -1144,6 +1621,7 @@ mod web_input_route_tests {
         let web_connection_id = Uuid::new_v4();
         let session_id = Uuid::new_v4();
         let cli_id = Uuid::new_v4();
+        persist_session(&state, user_id, session_id).await;
 
         let (web_tx, web_rx) = mpsc::channel(8);
         state.sessions.register_web(web_connection_id, web_tx);
@@ -1182,7 +1660,7 @@ mod web_input_route_tests {
             Some(7),
         );
         let created_at = assert_user_input_echo(
-            web_rx.try_recv().expect("first input echoed to web"),
+            next_user_input(&mut web_rx),
             session_id,
             "first send",
             Some("client-1"),
@@ -1212,9 +1690,7 @@ mod web_input_route_tests {
             Err(mpsc::error::TryRecvError::Empty)
         ));
         let duplicate_created_at = assert_user_input_echo(
-            web_rx
-                .try_recv()
-                .expect("duplicate input re-acked to sender"),
+            next_user_input(&mut web_rx),
             session_id,
             "first send",
             Some("client-1"),
@@ -1260,18 +1736,8 @@ mod web_input_route_tests {
             "legacy two",
             None,
         );
-        assert_user_input_echo(
-            web_rx.try_recv().expect("first legacy input echoed"),
-            session_id,
-            "legacy one",
-            None,
-        );
-        assert_user_input_echo(
-            web_rx.try_recv().expect("second legacy input echoed"),
-            session_id,
-            "legacy two",
-            None,
-        );
+        assert_user_input_echo(next_user_input(&mut web_rx), session_id, "legacy one", None);
+        assert_user_input_echo(next_user_input(&mut web_rx), session_id, "legacy two", None);
 
         let messages = state
             .storage
@@ -1317,28 +1783,70 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // Handle incoming messages
     while let Some(Ok(msg)) = receiver.next().await {
         if let Message::Text(text) = msg {
+            if user_id.is_some() && !state.sessions.is_web_connected(&connection_id) {
+                break;
+            }
             let parsed: Result<WebToServer, _> = serde_json::from_str(&text);
             match parsed {
-                Ok(WebToServer::Authenticate { token }) => {
+                Ok(WebToServer::Authenticate {
+                    token,
+                    capabilities,
+                }) => {
                     // Validate JWT token
                     match verify_token(&token, &state.config.auth.jwt_secret) {
                         Ok(claims) => {
                             match Uuid::parse_str(&claims.sub) {
                                 Ok(uid) => {
-                                    user_id = Some(uid);
-                                    let user_email =
+                                    let cluster_user =
                                         match state.db.get_user_by_id(&uid.to_string()).await {
-                                            Ok(Some(user)) => Some(user.email),
-                                            Ok(None) => None,
+                                            Ok(Some(user)) if user.is_active() => user,
+                                            Ok(Some(_)) => {
+                                                state
+                                                    .sessions
+                                                    .send_to_web(
+                                                        &connection_id,
+                                                        ServerToWeb::AuthenticationFailed {
+                                                            reason: "Cluster account is suspended"
+                                                                .to_string(),
+                                                        },
+                                                    )
+                                                    .await;
+                                                continue;
+                                            }
+                                            Ok(None) => {
+                                                state
+                                                    .sessions
+                                                    .send_to_web(
+                                                        &connection_id,
+                                                        ServerToWeb::AuthenticationFailed {
+                                                            reason: "Cluster account not found"
+                                                                .to_string(),
+                                                        },
+                                                    )
+                                                    .await;
+                                                continue;
+                                            }
                                             Err(err) => {
                                                 tracing::warn!(
-                                                    "Failed to fetch email for user {}: {}",
+                                                    "Failed to fetch cluster account {}: {}",
                                                     uid,
                                                     err
                                                 );
-                                                None
+                                                state
+                                                    .sessions
+                                                    .send_to_web(
+                                                        &connection_id,
+                                                        ServerToWeb::AuthenticationFailed {
+                                                            reason:
+                                                                "Could not load cluster account"
+                                                                    .to_string(),
+                                                        },
+                                                    )
+                                                    .await;
+                                                continue;
                                             }
                                         };
+                                    user_id = Some(uid);
                                     tracing::info!(
                                         "Web client {} authenticated as user {}",
                                         connection_id,
@@ -1347,12 +1855,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     state.sessions.set_web_user(connection_id, uid);
                                     state
                                         .sessions
+                                        .set_web_capabilities(connection_id, capabilities);
+                                    state
+                                        .sessions
                                         .send_to_web(
                                             &connection_id,
                                             ServerToWeb::Authenticated {
                                                 user_id: uid,
-                                                user_email,
+                                                user_email: Some(cluster_user.email),
                                                 server_version: Some(SERVER_VERSION.to_string()),
+                                                cluster_role: cluster_user.cluster_role,
+                                                account_status: cluster_user.account_status,
                                             },
                                         )
                                         .await;
@@ -1615,7 +2128,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         )
                         .await;
                 }
-                Ok(WebToServer::PauseDeadloop { session_id: msg_sid }) => {
+                Ok(WebToServer::PauseDeadloop {
+                    session_id: msg_sid,
+                }) => {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
@@ -1626,10 +2141,29 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::ResumeDeadloop { session_id: msg_sid }) => {
+                Ok(WebToServer::ResumeDeadloop {
+                    session_id: msg_sid,
+                }) => {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
+                        if let Some(pane) = state
+                            .sessions
+                            .get_session_panes(&sid)
+                            .into_iter()
+                            .find(|pane| pane.mode == shared::PaneMode::Deadloop)
+                        {
+                            if !authorize_existing_pane_launch(
+                                &state,
+                                &connection_id,
+                                &sid,
+                                pane.pane_id,
+                            )
+                            .await
+                            {
+                                continue;
+                            }
+                        }
                         tracing::info!("Resuming deadloop for session {}", sid);
                         state
                             .sessions
@@ -1637,10 +2171,57 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::RebootCli { session_id: msg_sid }) => {
+                Ok(WebToServer::RebootCli {
+                    session_id: msg_sid,
+                }) => {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
+                        let Some(policy) =
+                            effective_policy_for_launch(&state, &connection_id, &sid).await
+                        else {
+                            continue;
+                        };
+                        if let Some(pane) =
+                            state
+                                .sessions
+                                .get_session_panes(&sid)
+                                .into_iter()
+                                .find(|pane| {
+                                    shared::is_retired_launch(pane.provider, pane.model.as_deref())
+                                })
+                        {
+                            send_policy_error(
+                                &state,
+                                &connection_id,
+                                format!(
+                                    "Pane {} uses an unsupported retired provider and blocks CLI reboot",
+                                    pane.pane_id
+                                ),
+                            )
+                            .await;
+                            continue;
+                        }
+                        if let Some(pane) =
+                            state
+                                .sessions
+                                .get_session_panes(&sid)
+                                .into_iter()
+                                .find(|pane| {
+                                    !policy.allows(pane.kind, pane.provider, pane.model.as_deref())
+                                })
+                        {
+                            send_policy_error(
+                                &state,
+                                &connection_id,
+                                format!(
+                                    "Pane {} is noncompliant with cluster policy and blocks CLI reboot",
+                                    pane.pane_id
+                                ),
+                            )
+                            .await;
+                            continue;
+                        }
                         tracing::info!("Rebooting CLI for session {}", sid);
                         state
                             .sessions
@@ -1667,7 +2248,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                     tracing::info!(
                         "StartMachineProjectCli: user={} machine={} project={}",
-                        uid, machine_id, project_id
+                        uid,
+                        machine_id,
+                        project_id
                     );
                     let allowed = state
                         .sessions
@@ -1703,7 +2286,75 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                     if !state
                         .sessions
-                        .send_to_daemon(&machine_id, ServerToDaemon::StartProjectCli { project_id })
+                        .web_supports_capability(&connection_id, shared::PROJECT_POLICY_CAPABILITY)
+                        || !state.sessions.daemon_supports_capability(
+                            &machine_id,
+                            shared::PROJECT_POLICY_CAPABILITY,
+                        )
+                    {
+                        send_policy_error(
+                            &state,
+                            &connection_id,
+                            "The web client or machine daemon is incompatible with cluster project policy",
+                        )
+                        .await;
+                        continue;
+                    }
+                    let daemon_policy = match state.db.get_project(&project_id).await {
+                        Ok(Some(project)) if project.lifecycle_status == "suspended" => {
+                            send_policy_error(
+                                &state,
+                                &connection_id,
+                                "This project is suspended; reactivate it before starting the CLI",
+                            )
+                            .await;
+                            continue;
+                        }
+                        Ok(Some(project)) => {
+                            match state.db.get_effective_project_policy(&project.id).await {
+                                Ok(policy) => policy,
+                                Err(err) => {
+                                    tracing::warn!(%err, %project_id, "project policy lookup failed");
+                                    send_policy_error(
+                                        &state,
+                                        &connection_id,
+                                        "Could not verify project policy",
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            send_policy_error(
+                                &state,
+                                &connection_id,
+                                "Canonical project metadata is unavailable",
+                            )
+                            .await;
+                            continue;
+                        }
+                        Err(err) => {
+                            tracing::warn!(%err, %project_id, "project lifecycle lookup failed");
+                            send_policy_error(
+                                &state,
+                                &connection_id,
+                                "Could not verify project lifecycle",
+                            )
+                            .await;
+                            continue;
+                        }
+                    };
+
+                    if !state
+                        .sessions
+                        .send_to_daemon(
+                            &machine_id,
+                            ServerToDaemon::StartProjectCli {
+                                project_id,
+                                policy: Some(daemon_policy),
+                            },
+                        )
                         .await
                     {
                         state
@@ -1826,7 +2477,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                     tracing::info!(
                         "CreateProjectInstance: user={} machine={} repo={} name={}",
-                        uid, machine_id, git_remote, instance_name
+                        uid,
+                        machine_id,
+                        git_remote,
+                        instance_name
                     );
 
                     if !state
@@ -1855,146 +2509,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::SetMachineMiniMaxConfig {
-                    machine_id,
-                    api_base_url,
-                    api_key,
-                    clear_api_key,
-                }) => {
-                    let Some(uid) = user_id else {
-                        state
-                            .sessions
-                            .send_to_web(
-                                &connection_id,
-                                ServerToWeb::Error {
-                                    message: "Not authenticated".to_string(),
-                                },
-                            )
-                            .await;
-                        continue;
-                    };
-
-                    let owned = state
+                #[allow(deprecated)]
+                Ok(WebToServer::SetMachineMiniMaxConfig { .. })
+                | Ok(WebToServer::SetMachineGlmConfig { .. }) => {
+                    // Decode stale-client messages so the WebSocket remains
+                    // usable, but discard credentials without logging or
+                    // forwarding them to a daemon.
+                    state
                         .sessions
-                        .get_machines_for_user(&uid)
-                        .into_iter()
-                        .any(|m| m.machine.machine_id == machine_id);
-
-                    if !owned {
-                        state
-                            .sessions
-                            .send_to_web(
-                                &connection_id,
-                                ServerToWeb::Error {
-                                    message: "Machine not found".to_string(),
-                                },
-                            )
-                            .await;
-                        continue;
-                    }
-
-                    let req_api_base_url = api_base_url.clone();
-                    let req_api_key = api_key.clone();
-                    if !state
-                        .sessions
-                        .send_to_daemon(
-                            &machine_id,
-                            ServerToDaemon::SetMiniMaxConfig {
-                                api_base_url,
-                                api_key,
-                                clear_api_key,
+                        .send_to_web(
+                            &connection_id,
+                            ServerToWeb::Error {
+                                message: "Unsupported provider: this backend has been retired"
+                                    .to_string(),
                             },
                         )
-                        .await
-                    {
-                        state
-                            .sessions
-                            .send_to_web(
-                                &connection_id,
-                                ServerToWeb::Error {
-                                    message: "Daemon is offline".to_string(),
-                                },
-                            )
-                            .await;
-                    } else {
-                        // Optimistically reflect updated config in machine snapshot for web UI.
-                        state.sessions.apply_web_minimax_config(
-                            &machine_id,
-                            req_api_base_url,
-                            req_api_key,
-                            clear_api_key,
-                        );
-                    }
-                }
-                Ok(WebToServer::SetMachineGlmConfig {
-                    machine_id,
-                    api_base_url,
-                    api_key,
-                    clear_api_key,
-                }) => {
-                    let Some(uid) = user_id else {
-                        state
-                            .sessions
-                            .send_to_web(
-                                &connection_id,
-                                ServerToWeb::Error {
-                                    message: "Not authenticated".to_string(),
-                                },
-                            )
-                            .await;
-                        continue;
-                    };
-
-                    let owned = state
-                        .sessions
-                        .get_machines_for_user(&uid)
-                        .into_iter()
-                        .any(|m| m.machine.machine_id == machine_id);
-
-                    if !owned {
-                        state
-                            .sessions
-                            .send_to_web(
-                                &connection_id,
-                                ServerToWeb::Error {
-                                    message: "Machine not found".to_string(),
-                                },
-                            )
-                            .await;
-                        continue;
-                    }
-
-                    let req_api_base_url = api_base_url.clone();
-                    let req_api_key = api_key.clone();
-                    if !state
-                        .sessions
-                        .send_to_daemon(
-                            &machine_id,
-                            ServerToDaemon::SetGlmConfig {
-                                api_base_url,
-                                api_key,
-                                clear_api_key,
-                            },
-                        )
-                        .await
-                    {
-                        state
-                            .sessions
-                            .send_to_web(
-                                &connection_id,
-                                ServerToWeb::Error {
-                                    message: "Daemon is offline".to_string(),
-                                },
-                            )
-                            .await;
-                    } else {
-                        state.sessions.apply_web_glm_config(
-                            &machine_id,
-                            req_api_base_url,
-                            req_api_key,
-                            clear_api_key,
-                        );
-                    }
+                        .await;
                 }
                 Ok(WebToServer::SetMachineDeepseekConfig {
                     machine_id,
@@ -2096,6 +2626,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     else {
                         continue;
                     };
+                    if !authorize_existing_pane_launch(&state, &connection_id, &sid, pane_id).await
+                    {
+                        continue;
+                    }
                     tracing::info!("Resuming pane {} for session {}", pane_id, sid);
                     state
                         .sessions
@@ -2117,6 +2651,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     else {
                         continue;
                     };
+                    if !authorize_existing_pane_launch(&state, &connection_id, &sid, pane_id).await
+                    {
+                        continue;
+                    }
                     tracing::info!("Rebooting pane {} for session {}", pane_id, sid);
                     state
                         .sessions
@@ -2141,6 +2679,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
+                        if !authorize_profile_launch(
+                            &state,
+                            &connection_id,
+                            &sid,
+                            kind,
+                            provider,
+                            model.as_deref(),
+                            managed,
+                        )
+                        .await
+                        {
+                            continue;
+                        }
                         // Generate a unique pane_id starting from 3 (1 and 2 are reserved for legacy deadloop/interactive)
                         let pane_id = 3 + (uuid::Uuid::new_v4().as_u128() % 1000) as u32;
                         let pane_config = shared::PaneConfig {
@@ -2166,7 +2717,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         };
                         tracing::info!(
                             "Adding pane {} to session {} (isolated_worktree={})",
-                            pane_id, sid, isolated_worktree,
+                            pane_id,
+                            sid,
+                            isolated_worktree,
                         );
                         state
                             .sessions
@@ -2183,13 +2736,24 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         // (CLI will send back updated pane config)
                     }
                 }
-                Ok(WebToServer::RemovePane { session_id: msg_sid, pane_id, cleanup_action }) => {
+                Ok(WebToServer::RemovePane {
+                    session_id: msg_sid,
+                    pane_id,
+                    cleanup_action,
+                }) => {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
+                        let Ok((_project_id, _project_guard)) =
+                            state.active_session_operation(&sid.to_string()).await
+                        else {
+                            continue;
+                        };
                         tracing::info!(
                             "Removing pane {} from session {} (cleanup_action={:?})",
-                            pane_id, sid, cleanup_action,
+                            pane_id,
+                            sid,
+                            cleanup_action,
                         );
                         state
                             .sessions
@@ -2208,10 +2772,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         state.sessions.clear_terminal_scrollback(&sid, pane_id);
                     }
                 }
-                Ok(WebToServer::UpdatePaneLabel { session_id: msg_sid, pane_id, label }) => {
+                Ok(WebToServer::UpdatePaneLabel {
+                    session_id: msg_sid,
+                    pane_id,
+                    label,
+                }) => {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
+                        let Ok((_project_id, _project_guard)) =
+                            state.active_session_operation(&sid.to_string()).await
+                        else {
+                            continue;
+                        };
                         tracing::info!("Updating pane {} label in session {}", pane_id, sid);
                         let mut panes = state.sessions.get_session_panes(&sid);
                         if let Some(pane) = panes.iter_mut().find(|p| p.pane_id == pane_id) {
@@ -2246,7 +2819,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::InterruptPane { session_id: msg_sid, pane_id }) => {
+                Ok(WebToServer::InterruptPane {
+                    session_id: msg_sid,
+                    pane_id,
+                }) => {
                     let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     else {
@@ -2264,13 +2840,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         )
                         .await;
                 }
-                Ok(WebToServer::PlanReviewAnswer { session_id: msg_sid, tool_use_id, approve }) => {
+                Ok(WebToServer::PlanReviewAnswer {
+                    session_id: msg_sid,
+                    tool_use_id,
+                    approve,
+                }) => {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
                         tracing::info!(
                             "Plan review answer for session {}: {} → {}",
-                            sid, tool_use_id, approve,
+                            sid,
+                            tool_use_id,
+                            approve,
                         );
                         state
                             .sessions
@@ -2285,13 +2867,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::UpdatePaneReviewMode { session_id: msg_sid, pane_id, mode }) => {
+                Ok(WebToServer::UpdatePaneReviewMode {
+                    session_id: msg_sid,
+                    pane_id,
+                    mode,
+                }) => {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
                         tracing::info!(
                             "Update pane {} plan_review_mode for session {} → {:?}",
-                            pane_id, sid, mode,
+                            pane_id,
+                            sid,
+                            mode,
                         );
                         state
                             .sessions
@@ -2306,13 +2894,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::UpdatePaneManualMode { session_id: msg_sid, pane_id, manual_mode }) => {
+                Ok(WebToServer::UpdatePaneManualMode {
+                    session_id: msg_sid,
+                    pane_id,
+                    manual_mode,
+                }) => {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
                         tracing::info!(
                             "Update pane {} manual_mode for session {} → {}",
-                            pane_id, sid, manual_mode,
+                            pane_id,
+                            sid,
+                            manual_mode,
                         );
                         state
                             .sessions
@@ -2327,7 +2921,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::FetchTeamTodo { session_id: msg_sid }) => {
+                Ok(WebToServer::FetchTeamTodo {
+                    session_id: msg_sid,
+                }) => {
                     let Some(sid) =
                         resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
                             .await
@@ -2339,7 +2935,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         .route_to_cli(&sid, ServerToCli::FetchTeamTodo { session_id: sid })
                         .await;
                 }
-                Ok(WebToServer::TodoApproval { session_id: msg_sid, todo_id, action }) => {
+                Ok(WebToServer::TodoApproval {
+                    session_id: msg_sid,
+                    todo_id,
+                    action,
+                }) => {
                     let Some(sid) =
                         resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
                             .await
@@ -2348,7 +2948,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     };
                     tracing::info!(
                         "Todo approval for session {}: {} → {}",
-                        sid, todo_id, action
+                        sid,
+                        todo_id,
+                        action
                     );
                     state
                         .sessions
@@ -2362,7 +2964,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         )
                         .await;
                 }
-                Ok(WebToServer::AddTodo { session_id: msg_sid, title, body }) => {
+                Ok(WebToServer::AddTodo {
+                    session_id: msg_sid,
+                    title,
+                    body,
+                }) => {
                     let Some(sid) =
                         resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
                             .await
@@ -2371,7 +2977,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     };
                     tracing::info!(
                         "Add TODO for session {}: {} ({} bytes)",
-                        sid, title, body.len()
+                        sid,
+                        title,
+                        body.len()
                     );
                     state
                         .sessions
@@ -2385,7 +2993,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         )
                         .await;
                 }
-                Ok(WebToServer::FetchSuggestedWorkers { session_id: msg_sid }) => {
+                Ok(WebToServer::FetchSuggestedWorkers {
+                    session_id: msg_sid,
+                }) => {
                     let Some(sid) =
                         resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
                             .await
@@ -2394,23 +3004,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     };
                     state
                         .sessions
-                        .route_to_cli(
-                            &sid,
-                            ServerToCli::FetchSuggestedWorkers { session_id: sid },
-                        )
+                        .route_to_cli(&sid, ServerToCli::FetchSuggestedWorkers { session_id: sid })
                         .await;
                 }
-                Ok(WebToServer::DismissSuggestion { session_id: msg_sid, suggestion_id }) => {
+                Ok(WebToServer::DismissSuggestion {
+                    session_id: msg_sid,
+                    suggestion_id,
+                }) => {
                     let Some(sid) =
                         resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
                             .await
                     else {
                         continue;
                     };
-                    tracing::info!(
-                        "Dismiss suggestion {} for session {}",
-                        suggestion_id, sid
-                    );
+                    tracing::info!("Dismiss suggestion {} for session {}", suggestion_id, sid);
                     state
                         .sessions
                         .route_to_cli(
@@ -2422,7 +3029,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         )
                         .await;
                 }
-                Ok(WebToServer::TerminalInput { session_id: msg_sid, pane_id, data_b64 }) => {
+                Ok(WebToServer::TerminalInput {
+                    session_id: msg_sid,
+                    pane_id,
+                    data_b64,
+                }) => {
                     let Some(sid) =
                         resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
                             .await
@@ -2441,7 +3052,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         )
                         .await;
                 }
-                Ok(WebToServer::TerminalResize { session_id: msg_sid, pane_id, cols, rows }) => {
+                Ok(WebToServer::TerminalResize {
+                    session_id: msg_sid,
+                    pane_id,
+                    cols,
+                    rows,
+                }) => {
                     let Some(sid) =
                         resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
                             .await
@@ -2461,7 +3077,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         )
                         .await;
                 }
-                Ok(WebToServer::TerminalAttach { session_id: msg_sid, pane_id }) => {
+                Ok(WebToServer::TerminalAttach {
+                    session_id: msg_sid,
+                    pane_id,
+                }) => {
                     let Some(sid) =
                         resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
                             .await
@@ -2511,17 +3130,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         )
                         .await;
                 }
-                Ok(WebToServer::PromotePaneToManaged { session_id: msg_sid, pane_id }) => {
+                Ok(WebToServer::PromotePaneToManaged {
+                    session_id: msg_sid,
+                    pane_id,
+                }) => {
                     let Some(sid) =
                         resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
                             .await
                     else {
                         continue;
                     };
-                    tracing::info!(
-                        "Promote pane {} → managed for session {}",
-                        pane_id, sid
-                    );
+                    tracing::info!("Promote pane {} → managed for session {}", pane_id, sid);
                     state
                         .sessions
                         .route_to_cli(
@@ -2533,13 +3152,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         )
                         .await;
                 }
-                Ok(WebToServer::UpdatePaneRole { session_id: msg_sid, pane_id, role, goal, backstory }) => {
+                Ok(WebToServer::UpdatePaneRole {
+                    session_id: msg_sid,
+                    pane_id,
+                    role,
+                    goal,
+                    backstory,
+                }) => {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
                         tracing::info!(
                             "Updating pane {} role for session {} (role={:?}, goal={:?})",
-                            pane_id, sid, role, goal,
+                            pane_id,
+                            sid,
+                            role,
+                            goal,
                         );
                         state
                             .sessions
@@ -2556,11 +3184,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::RequestPaneDiff { session_id: msg_sid, pane_id }) => {
+                Ok(WebToServer::RequestPaneDiff {
+                    session_id: msg_sid,
+                    pane_id,
+                }) => {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
-                        tracing::info!("Requesting pane diff for pane {} in session {}", pane_id, sid);
+                        tracing::info!(
+                            "Requesting pane diff for pane {} in session {}",
+                            pane_id,
+                            sid
+                        );
                         state
                             .sessions
                             .route_to_cli(
@@ -2573,7 +3208,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::CreatePr { session_id: msg_sid, pane_id }) => {
+                Ok(WebToServer::CreatePr {
+                    session_id: msg_sid,
+                    pane_id,
+                }) => {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
@@ -2590,7 +3228,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::UpdateProjectGoal { session_id: msg_sid, goal }) => {
+                Ok(WebToServer::UpdateProjectGoal {
+                    session_id: msg_sid,
+                    goal,
+                }) => {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
@@ -2638,16 +3279,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             team_enabled,
                             "Update project flags"
                         );
+                        // Governed team/profile policy is intentionally ignored
+                        // here. Legacy clients may still send the combined
+                        // payload, but project owners can mutate only workflow
+                        // settings; cluster policy has a separate admin API.
+                        let _ = (team_enabled, disallowed_tab_types);
                         state
                             .sessions
                             .route_to_cli(
                                 &sid,
-                                ServerToCli::UpdateProjectFlags {
+                                ServerToCli::UpdateProjectOperations {
                                     session_id: sid,
                                     auto_approve_todos,
                                     auto_merge_prs,
-                                    team_enabled,
-                                    disallowed_tab_types,
                                 },
                             )
                             .await;
@@ -2663,6 +3307,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
+                        if !authorize_team_launch(
+                            &state,
+                            &connection_id,
+                            &sid,
+                            &[&manager, &tech_lead, &reviewer, &developer],
+                        )
+                        .await
+                        {
+                            continue;
+                        }
                         tracing::info!(session_id = %sid, "Start team");
                         state
                             .sessions
@@ -2679,7 +3333,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::AnswerQuestion { session_id: msg_sid, tool_use_id, answers }) => {
+                Ok(WebToServer::AnswerQuestion {
+                    session_id: msg_sid,
+                    tool_use_id,
+                    answers,
+                }) => {
                     // Relay the user's AskUserQuestion answers down to the CLI
                     // streaming worker. The worker matches by tool_use_id
                     // against its pending_questions map and writes the
@@ -2713,14 +3371,25 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::UpdatePaneEffort { session_id: msg_sid, pane_id, effort }) => {
+                Ok(WebToServer::UpdatePaneEffort {
+                    session_id: msg_sid,
+                    pane_id,
+                    effort,
+                }) => {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
+                        let Ok((_project_id, _project_guard)) =
+                            state.active_session_operation(&sid.to_string()).await
+                        else {
+                            continue;
+                        };
                         let normalized = effort.as_deref().and_then(normalize_start_bot_effort);
                         tracing::info!(
                             "Updating pane {} effort in session {} to {:?}",
-                            pane_id, sid, normalized
+                            pane_id,
+                            sid,
+                            normalized
                         );
                         let mut panes = state.sessions.get_session_panes(&sid);
                         if let Some(pane) = panes.iter_mut().find(|p| p.pane_id == pane_id) {
@@ -2752,18 +3421,54 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         }
                     }
                 }
-                Ok(WebToServer::UpdatePaneModel { session_id: msg_sid, pane_id, provider, model }) => {
+                Ok(WebToServer::UpdatePaneModel {
+                    session_id: msg_sid,
+                    pane_id,
+                    provider,
+                    model,
+                }) => {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
+                        let Ok((_project_id, _project_guard)) =
+                            state.active_session_operation(&sid.to_string()).await
+                        else {
+                            continue;
+                        };
                         let trimmed = model
                             .as_deref()
                             .map(str::trim)
                             .filter(|s| !s.is_empty())
                             .map(str::to_string);
+                        let existing = state
+                            .sessions
+                            .get_session_panes(&sid)
+                            .into_iter()
+                            .find(|pane| pane.pane_id == pane_id);
+                        let Some(existing) = existing else {
+                            send_policy_error(&state, &connection_id, "Pane not found").await;
+                            continue;
+                        };
+                        let desired_provider = provider.unwrap_or(existing.provider);
+                        if !authorize_profile_launch(
+                            &state,
+                            &connection_id,
+                            &sid,
+                            existing.kind,
+                            desired_provider,
+                            trimmed.as_deref(),
+                            existing.managed,
+                        )
+                        .await
+                        {
+                            continue;
+                        }
                         tracing::info!(
                             "Switching pane {} agent in session {} to provider={:?} model={:?}",
-                            pane_id, sid, provider, trimmed
+                            pane_id,
+                            sid,
+                            provider,
+                            trimmed
                         );
                         let mut panes = state.sessions.get_session_panes(&sid);
                         if let Some(pane) = panes.iter_mut().find(|p| p.pane_id == pane_id) {
@@ -2798,14 +3503,25 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::ReorderPanes { session_id: msg_sid, pane_ids }) => {
+                Ok(WebToServer::ReorderPanes {
+                    session_id: msg_sid,
+                    pane_ids,
+                }) => {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
+                        let Ok((_project_id, _project_guard)) =
+                            state.active_session_operation(&sid.to_string()).await
+                        else {
+                            continue;
+                        };
                         tracing::info!("Reordering panes in session {}", sid);
                         let panes = state.sessions.get_session_panes(&sid);
-                        let order_map: std::collections::HashMap<u32, usize> =
-                            pane_ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+                        let order_map: std::collections::HashMap<u32, usize> = pane_ids
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &id)| (id, i))
+                            .collect();
                         let mut ordered: Vec<shared::PaneConfig> = Vec::new();
                         let mut remaining: Vec<shared::PaneConfig> = Vec::new();
                         for pane in panes {
@@ -2815,7 +3531,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 remaining.push(pane);
                             }
                         }
-                        ordered.sort_by_key(|p| order_map.get(&p.pane_id).copied().unwrap_or(usize::MAX));
+                        ordered.sort_by_key(|p| {
+                            order_map.get(&p.pane_id).copied().unwrap_or(usize::MAX)
+                        });
                         let new_panes = [ordered, remaining].concat();
                         state.sessions.set_session_panes(&sid, new_panes.clone());
                         let _ = state.storage.save_pane_list(&sid, &new_panes).await;
@@ -2841,6 +3559,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
+                        let Ok((_project_id, _project_guard)) =
+                            state.active_session_operation(&sid.to_string()).await
+                        else {
+                            continue;
+                        };
+                        if !authorize_existing_pane_launch(&state, &connection_id, &sid, pane_id)
+                            .await
+                        {
+                            continue;
+                        }
                         tracing::info!("Starting bot on pane {} for session {}", pane_id, sid);
                         state
                             .sessions
@@ -2883,10 +3611,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         }
                     }
                 }
-                Ok(WebToServer::StopBot { session_id: msg_sid, pane_id }) => {
+                Ok(WebToServer::StopBot {
+                    session_id: msg_sid,
+                    pane_id,
+                }) => {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
+                        let Ok((_project_id, _project_guard)) =
+                            state.active_session_operation(&sid.to_string()).await
+                        else {
+                            continue;
+                        };
                         tracing::info!("Stopping bot on pane {} for session {}", pane_id, sid);
                         let routed = state
                             .sessions
@@ -2963,6 +3699,21 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                         continue;
                     }
+
+                    let Ok((_project_id, _project_guard)) =
+                        state.active_session_operation(&sid.to_string()).await
+                    else {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Project is unavailable".to_string(),
+                                },
+                            )
+                            .await;
+                        continue;
+                    };
 
                     // Look up CLI client ID from database, but only trust it if
                     // the CLI is actually connected (prevents stale IDs after server restart)
@@ -3107,10 +3858,58 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     &connection_id,
                                     ServerToWeb::PaneList {
                                         session_id: sid,
-                                        panes: panes_to_send,
+                                        panes: panes_to_send.clone(),
                                     },
                                 )
                                 .await;
+                        }
+
+                        if state.sessions.web_supports_capability(
+                            &connection_id,
+                            shared::PROJECT_POLICY_CAPABILITY,
+                        ) {
+                            match state.db.get_project_for_session(&sid.to_string()).await {
+                                Ok(Some(project)) => {
+                                    match state.db.get_effective_project_policy(&project.id).await {
+                                        Ok(policy) => {
+                                            let noncompliant_pane_ids = panes_to_send
+                                                .iter()
+                                                .filter(|pane| {
+                                                    (!policy.team_available && pane.managed)
+                                                        || !policy.allows(
+                                                            pane.kind,
+                                                            pane.provider,
+                                                            pane.model.as_deref(),
+                                                        )
+                                                })
+                                                .map(|pane| pane.pane_id)
+                                                .collect();
+                                            state
+                                                .sessions
+                                                .send_to_web(
+                                                    &connection_id,
+                                                    ServerToWeb::ProjectPolicyChanged {
+                                                        session_id: sid,
+                                                        policy,
+                                                        noncompliant_pane_ids,
+                                                    },
+                                                )
+                                                .await;
+                                        }
+                                        Err(err) => tracing::warn!(
+                                            %err,
+                                            session_id = %sid,
+                                            "failed to load policy on web attach"
+                                        ),
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(err) => tracing::warn!(
+                                    %err,
+                                    session_id = %sid,
+                                    "failed to resolve project on web attach"
+                                ),
+                            }
                         }
 
                         // Request fresh pane list from CLI to correct any stale cached data
@@ -3291,6 +4090,31 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     after_created_at,
                     pane_watermarks,
                 }) => {
+                    let Some(uid) = user_id else {
+                        continue;
+                    };
+                    if !state
+                        .db
+                        .check_session_access(&sid.to_string(), &uid.to_string())
+                        .await
+                        .unwrap_or(false)
+                    {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Access denied".to_string(),
+                                },
+                            )
+                            .await;
+                        continue;
+                    }
+                    let Ok((_project_id, _project_guard)) =
+                        state.active_session_operation(&sid.to_string()).await
+                    else {
+                        continue;
+                    };
                     // Get messages for a specific session from file storage with pagination
                     let limit = limit.unwrap_or(100);
                     // Use pane_id for filtering if provided, otherwise fall back to pane_type
@@ -3305,9 +4129,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     // dropped messages for slow panes when fast panes had advanced
                     // the watermark past their tails. Both flag `catchup: true`.
                     let is_catchup = after_created_at.is_some() || pane_watermarks.is_some();
-                    let is_initial_load = !is_catchup
-                        && before_id.is_none()
-                        && effective_pane_filter.is_none();
+                    let is_initial_load =
+                        !is_catchup && before_id.is_none() && effective_pane_filter.is_none();
                     let fetch_result = if let Some(watermarks) = pane_watermarks.as_ref() {
                         // Wire keys are strings (JSON object keys); storage
                         // keys by numeric pane id. Parse back to u32, dropping
@@ -3340,8 +4163,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             )
                             .await
                     };
-                    match fetch_result
-                    {
+                    match fetch_result {
                         Ok((stored_messages, has_more)) => {
                             let messages: Vec<MessageInfo> =
                                 stored_messages.into_iter().map(to_message_info).collect();
@@ -3349,7 +4171,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             if is_initial_load {
                                 let mut panes_to_send = state.sessions.get_session_panes(&sid);
                                 if panes_to_send.is_empty() {
-                                    if let Ok(stored_panes) = state.storage.load_pane_list(&sid).await {
+                                    if let Ok(stored_panes) =
+                                        state.storage.load_pane_list(&sid).await
+                                    {
                                         if !stored_panes.is_empty() {
                                             state
                                                 .sessions
@@ -3408,9 +4232,53 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                 }
                 Ok(WebToServer::DownloadSession { session_id: sid }) => {
+                    let Some(uid) = user_id else {
+                        continue;
+                    };
+                    if !state
+                        .db
+                        .check_session_access(&sid.to_string(), &uid.to_string())
+                        .await
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let Ok((_project_id, _project_guard)) =
+                        state.active_session_operation(&sid.to_string()).await
+                    else {
+                        continue;
+                    };
                     tracing::info!("Downloading session data for {}", sid);
                     let response = session_download_response(&state, sid).await;
                     state.sessions.send_to_web(&connection_id, response).await;
+                }
+                Ok(WebToServer::UpdateProjectOperations {
+                    session_id: msg_sid,
+                    auto_approve_todos,
+                    auto_merge_prs,
+                }) => {
+                    if let Some(sid) =
+                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    {
+                        if !can_manage_project_settings(&state, &connection_id, &sid).await {
+                            tracing::warn!(
+                                session_id = %sid,
+                                "Rejected project workflow update — requires project owner"
+                            );
+                            continue;
+                        }
+                        state
+                            .sessions
+                            .route_to_cli(
+                                &sid,
+                                ServerToCli::UpdateProjectOperations {
+                                    session_id: sid,
+                                    auto_approve_todos,
+                                    auto_merge_prs,
+                                },
+                            )
+                            .await;
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("Failed to parse message: {}", e);
@@ -3436,8 +4304,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 mod project_settings_permission_tests {
     use super::*;
     use crate::config::Config;
-    use crate::db::{Session, User};
     use crate::db::Database;
+    use crate::db::{Session, User};
 
     async fn test_state() -> AppState {
         let dir = std::env::temp_dir().join(format!("apas-project-settings-{}", Uuid::new_v4()));
@@ -3456,6 +4324,8 @@ mod project_settings_permission_tests {
             email: format!("{id}@example.test"),
             password_hash: "hash".to_string(),
             created_at: None,
+            cluster_role: "user".to_string(),
+            account_status: "active".to_string(),
         }
     }
 
@@ -3501,7 +4371,11 @@ mod project_settings_permission_tests {
 
     async fn share_with(state: &AppState, session_id: Uuid, owner_id: Uuid, role: &str) -> Uuid {
         let member_id = Uuid::new_v4();
-        state.db.create_user(&user(member_id)).await.expect("member");
+        state
+            .db
+            .create_user(&user(member_id))
+            .await
+            .expect("member");
         state
             .db
             .create_session_share_with_role(
@@ -3524,13 +4398,26 @@ mod project_settings_permission_tests {
     }
 
     #[tokio::test]
-    async fn an_admin_may_change_settings() {
+    async fn a_legacy_project_admin_assignment_is_rejected() {
         let state = test_state().await;
         let (owner_id, session_id, _owner_conn) = project_with_owner(&state).await;
-        let admin_id = share_with(&state, session_id, owner_id, "admin").await;
-        let admin_conn = attach_web(&state, admin_id);
-
-        assert!(can_manage_project_settings(&state, &admin_conn, &session_id).await);
+        let member_id = Uuid::new_v4();
+        state
+            .db
+            .create_user(&user(member_id))
+            .await
+            .expect("member");
+        let error = state
+            .db
+            .create_session_share_with_role(
+                &session_id.to_string(),
+                &member_id.to_string(),
+                &owner_id.to_string(),
+                "admin",
+            )
+            .await
+            .expect_err("project admin must no longer be assignable");
+        assert!(error.to_string().contains("only 'user' is assignable"));
     }
 
     #[tokio::test]

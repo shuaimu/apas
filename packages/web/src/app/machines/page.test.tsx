@@ -19,15 +19,6 @@ function machineEntry(): MachineWithProjects {
       os: "linux",
       arch: "x64",
       lastSeen: "2026-06-17T05:00:00Z",
-      minimaxBackend: {
-        apiBaseUrl: "https://api.minimax.io/anthropic",
-        apiKey: "sk-minimax",
-        apiKeyConfigured: true,
-      },
-      glmBackend: {
-        apiBaseUrl: "https://api.z.ai/api/anthropic",
-        apiKeyConfigured: false,
-      },
       deepseekBackend: {
         apiBaseUrl: "https://api.deepseek.com/anthropic",
         apiKey: "sk-deepseek",
@@ -59,8 +50,6 @@ function seedMachines(machines: MachineWithProjects[] = [machineEntry()]) {
     listMachines: vi.fn(),
     startMachineProjectCli: vi.fn(),
     stopMachineProjectCli: vi.fn(),
-    setMachineMiniMaxConfig: vi.fn(),
-    setMachineGlmConfig: vi.fn(),
     setMachineDeepseekConfig: vi.fn(),
   };
 
@@ -87,7 +76,7 @@ afterEach(() => {
 });
 
 describe("MachinesPage", () => {
-  it("renders machine identity, provider backend states, projects, and the empty state", () => {
+  it("renders machine identity, supported backend state, projects, and the empty state", () => {
     const actions = seedMachines();
 
     const { unmount } = render(<MachinesPage />);
@@ -95,11 +84,10 @@ describe("MachinesPage", () => {
     expect(actions.listMachines).toHaveBeenCalledTimes(1);
     expect(screen.getByText("build-host")).toBeTruthy();
     expect(screen.getByText(/linux\/x64/)).toBeTruthy();
-    expect(screen.getByText("MiniMax Backend (Claude Runtime)")).toBeTruthy();
-    expect(screen.getByText("GLM Backend (Claude Runtime)")).toBeTruthy();
     expect(screen.getByText("DeepSeek Backend (Claude Runtime)")).toBeTruthy();
-    expect(screen.getAllByText("API key configured")).toHaveLength(2);
-    expect(screen.getByText("API key not configured")).toBeTruthy();
+    expect(screen.getByText("API key configured")).toBeTruthy();
+    expect(screen.queryByText(/MiniMax/i)).toBeNull();
+    expect(screen.queryByText(/GLM/i)).toBeNull();
     expect(screen.getByText("Active API")).toBeTruthy();
     expect(screen.getByText("Stopped API")).toBeTruthy();
     expect(screen.getByText(/Running.*pid 4242/)).toBeTruthy();
@@ -113,34 +101,10 @@ describe("MachinesPage", () => {
     expect(screen.getByText(/No machines reported yet/)).toBeTruthy();
   });
 
-  it("wires MiniMax, GLM, and DeepSeek Save and Clear controls to store actions", () => {
+  it("wires DeepSeek Save and Clear controls to the retained store action", () => {
     const actions = seedMachines();
 
     render(<MachinesPage />);
-
-    fireEvent.change(screen.getByLabelText("MiniMax API key for build-host"), {
-      target: { value: "  sk-minimax-new  " },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Save MiniMax API key for build-host" }));
-    expect(actions.setMachineMiniMaxConfig).toHaveBeenCalledWith(
-      "machine-1",
-      "sk-minimax-new",
-      false,
-    );
-    fireEvent.click(screen.getByRole("button", { name: "Clear MiniMax API key for build-host" }));
-    expect(actions.setMachineMiniMaxConfig).toHaveBeenLastCalledWith("machine-1", undefined, true);
-
-    fireEvent.change(screen.getByLabelText("GLM API key for build-host"), {
-      target: { value: "  sk-glm-new  " },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Save GLM API key for build-host" }));
-    expect(actions.setMachineGlmConfig).toHaveBeenCalledWith(
-      "machine-1",
-      "sk-glm-new",
-      false,
-    );
-    fireEvent.click(screen.getByRole("button", { name: "Clear GLM API key for build-host" }));
-    expect(actions.setMachineGlmConfig).toHaveBeenLastCalledWith("machine-1", undefined, true);
 
     fireEvent.change(screen.getByLabelText("DeepSeek API key for build-host"), {
       target: { value: "  sk-deepseek-new  " },

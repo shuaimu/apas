@@ -18,13 +18,11 @@ import {
 } from "@/lib/store";
 import {
   DEEPSEEK_DEFAULT_MODEL,
-  GLM_DEFAULT_MODEL,
-  MINIMAX_DEFAULT_MODEL,
   isDeepseekModel,
-  isGlmModel,
-  isMiniMaxModel,
+  isRetiredProviderModel,
 } from "@/lib/providerOptions";
 import { ActivitySparkline } from "./ActivitySparkline";
+import { useIsLaunchProfileAllowed } from "@/lib/tabTypes";
 
 interface PaneGridProps {
   onOpenPane: (paneId: number) => void;
@@ -145,15 +143,20 @@ function PaneCard({
   onPromote,
 }: PaneCardProps) {
   const isBot = pane.mode === "deadloop";
+  const isUnsupported = isRetiredProviderModel(pane.provider, pane.model);
   const isThinking = !!status && !isPaused;
-  const modeIndicator = isBot
+  const modeIndicator = isUnsupported
+    ? { icon: "!", label: "unsupported provider" }
+    : isBot
     ? isPaused
       ? { icon: "⏸", label: "paused" }
       : { icon: "⏵", label: "running" }
     : isThinking
       ? { icon: "●", label: "thinking" }
       : { icon: "•", label: "idle" };
-  const modeColor = isBot
+  const modeColor = isUnsupported
+    ? "text-red-500"
+    : isBot
     ? isPaused
       ? "text-amber-500"
       : "text-emerald-500"
@@ -161,6 +164,7 @@ function PaneCard({
       ? "text-blue-500 animate-pulse"
       : "text-gray-400";
   const updatePaneModel = useStore((s) => s.updatePaneModel);
+  const isLaunchProfileAllowed = useIsLaunchProfileAllowed();
   // Inline agent switcher. Mirrors the "+" new-tab menu's
   // frontend/backend grouping: the select picks an
   // agent-frontend × API-backend combo (e.g. "Claude / DeepSeek" =
@@ -175,8 +179,6 @@ function PaneCard({
     model: string | null;
   }> = [
     { value: "claude/official", label: "Claude / Official", provider: "claude", model: null },
-    { value: "claude/minimax", label: "Claude / MiniMax 2.7", provider: "claude", model: MINIMAX_DEFAULT_MODEL },
-    { value: "claude/glm", label: "Claude / GLM 5.1", provider: "claude", model: GLM_DEFAULT_MODEL },
     { value: "claude/deepseek", label: "Claude / DeepSeek", provider: "claude", model: DEEPSEEK_DEFAULT_MODEL },
     { value: "codex/official", label: "Codex / Official", provider: "codex", model: null },
     { value: "opencode/official", label: "OpenCode / Official", provider: "opencode", model: null },
@@ -188,22 +190,22 @@ function PaneCard({
   // sub-option even if the user typed a variant string.
   const currentAgentValue = ((): string => {
     const provider = pane.provider;
+    if (isUnsupported) return "unsupported";
     if (provider === "claude") {
-      if (isMiniMaxModel(pane.model)) return "claude/minimax";
-      if (isGlmModel(pane.model)) return "claude/glm";
       if (isDeepseekModel(pane.model)) return "claude/deepseek";
       return "claude/official";
     }
     if (provider === "codex") return "codex/official";
     if (provider === "opencode") return "opencode/official";
     if (provider === "cursor-agent") return "cursor-agent/official";
-    // Legacy provider strings (raw "minimax"/"glm"/"deepseek" from older
-    // panes) collapse to their Claude/backend equivalents.
-    if (provider === "minimax") return "claude/minimax";
-    if (provider === "glm") return "claude/glm";
     if (provider === "deepseek") return "claude/deepseek";
-    return "claude/official";
+    return "unsupported";
   })();
+  const visibleAgentOptions = AGENT_OPTS.filter(
+    (option) =>
+      option.value === currentAgentValue
+      || isLaunchProfileAllowed("agent", option.provider, option.model ?? undefined),
+  );
   const label = pane.label || `Tab ${pane.pane_id}`;
   return (
     <button
@@ -226,7 +228,7 @@ function PaneCard({
             panes and for Manager/Tech-Lead panes (those have their own
             semantics — Manager is always user-facing, Tech Lead is the
             orchestrator itself, not a delegation target). */}
-        {pane.pane_id !== PANE_ID_INTERACTIVE &&
+        {!isUnsupported && pane.pane_id !== PANE_ID_INTERACTIVE &&
           pane.pane_id !== PANE_ID_DEADLOOP &&
           !isManagerOrTechLead(pane.role) && (
             <WorkerModeToggle
@@ -234,10 +236,11 @@ function PaneCard({
               manualMode={pane.manual_mode === true}
             />
           )}
-        <span
-          className="ml-auto flex items-center gap-1"
-          onClick={(e) => e.stopPropagation()}
-        >
+        {isUnsupported ? (
+          <span className="ml-auto rounded bg-red-100 px-2 py-0.5 text-[10px] font-medium text-red-700 dark:bg-red-900/40 dark:text-red-300">
+            Unsupported provider
+          </span>
+        ) : <span className="ml-auto flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
           <select
             value={currentAgentValue}
             onChange={(e) => {
@@ -247,11 +250,9 @@ function PaneCard({
               if (!picked) return;
               // Live-swap eligibility mirrors the CLI's fast path in
               // UpdatePaneModel: pane stays on Claude AND neither the
-              // old nor the new model is a backend-swap (deepseek/glm/
-              // minimax pin ANTHROPIC_BASE_URL at spawn — can't be
-              // swapped on a running process).
+              // old nor the new model uses DeepSeek's backend bridge.
               const isBackendSwap = (model?: string | null) =>
-                isDeepseekModel(model) || isGlmModel(model) || isMiniMaxModel(model);
+                isDeepseekModel(model);
               const stayingOnClaude =
                 pane.provider === "claude" && picked.provider === "claude";
               const canLiveSwap =
@@ -272,13 +273,17 @@ function PaneCard({
             className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-1 py-0 text-[10px] font-mono text-gray-700 dark:text-gray-300 focus:outline-none"
             title="Agent frontend / API backend — Claude→Claude with no backend swap is a live swap (next turn takes effect); provider change or backend swap respawns with a fresh session id"
           >
-            {AGENT_OPTS.map((o) => (
-              <option key={o.value} value={o.value}>
+            {visibleAgentOptions.map((o) => (
+              <option
+                key={o.value}
+                value={o.value}
+                disabled={!isLaunchProfileAllowed("agent", o.provider, o.model ?? undefined)}
+              >
                 {o.label}
               </option>
             ))}
           </select>
-        </span>
+        </span>}
       </div>
 
       {pane.goal && (
@@ -324,18 +329,20 @@ function PaneCard({
               Diff
             </span>
           )}
-          <span
-            className="rounded border border-purple-400 dark:border-purple-700 bg-purple-50 dark:bg-purple-900/30 px-1.5 py-0.5 text-purple-700 dark:text-purple-300 hover:bg-purple-100 dark:hover:bg-purple-900/50"
-            role="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              onOpenRole();
-            }}
-            title="Edit role / goal / backstory"
-          >
-            Role
-          </span>
-          {isBot && (
+          {!isUnsupported && (
+            <span
+              className="rounded border border-purple-400 dark:border-purple-700 bg-purple-50 dark:bg-purple-900/30 px-1.5 py-0.5 text-purple-700 dark:text-purple-300 hover:bg-purple-100 dark:hover:bg-purple-900/50"
+              role="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpenRole();
+              }}
+              title="Edit role / goal / backstory"
+            >
+              Role
+            </span>
+          )}
+          {!isUnsupported && isBot && (
             isPaused ? (
               <span
                 className="rounded border border-emerald-400 dark:border-emerald-700 bg-emerald-50 dark:bg-emerald-900/30 px-1.5 py-0.5 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/50"
@@ -362,7 +369,7 @@ function PaneCard({
               </span>
             )
           )}
-          {onPromote && (
+          {!isUnsupported && onPromote && (
             <span
               className="rounded border border-blue-500 bg-blue-600 px-1.5 py-0.5 text-white hover:bg-blue-500"
               role="button"
@@ -375,9 +382,12 @@ function PaneCard({
               + Add to team
             </span>
           )}
-          {pane.pane_id !== PANE_ID_INTERACTIVE &&
+          {(isUnsupported || (
+            pane.pane_id !== PANE_ID_INTERACTIVE &&
             pane.pane_id !== PANE_ID_DEADLOOP &&
-            !(pane.managed && isManagerOrTechLead(pane.role)) && (
+            !(pane.managed && isManagerOrTechLead(pane.role))
+          )) && pane.pane_id !== PANE_ID_INTERACTIVE &&
+            pane.pane_id !== PANE_ID_DEADLOOP && (
               <span
                 className="rounded border border-red-400 dark:border-red-700 bg-red-50 dark:bg-red-900/30 px-1.5 py-0.5 text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/50"
                 role="button"

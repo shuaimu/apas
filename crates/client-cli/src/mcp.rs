@@ -347,7 +347,11 @@ impl ApasMcpServer {
                 Some(cursor) => r.ts.as_str() > cursor,
                 None => true,
             })
-            .filter(|r| args.tags.iter().all(|want| r.tags.iter().any(|t| t == want)))
+            .filter(|r| {
+                args.tags
+                    .iter()
+                    .all(|want| r.tags.iter().any(|t| t == want))
+            })
             .collect();
 
         let limit = args
@@ -382,19 +386,19 @@ impl ApasMcpServer {
         })
     }
 
-    #[tool(description = "Read the current team-todo.md state: Global TODOs, their \
-                          statuses, and per-pane subtasks.")]
+    #[tool(
+        description = "Read the current team-todo.md state: Global TODOs, their \
+                          statuses, and per-pane subtasks."
+    )]
     async fn read_team_todo(&self) -> Result<CallToolResult, ErrorData> {
         let todo = team_todo::load(self.dir())
             .map_err(|e| internal(format!("failed to load team-todo.md: {e:#}")))?;
         json_result(&team_todo::to_wire(&todo))
     }
 
-    #[tool(
-        description = "Propose a new Global TODO. Lands as status: proposed, \
+    #[tool(description = "Propose a new Global TODO. Lands as status: proposed, \
                        origin: tech-lead, awaiting human approval in the Overview \
-                       (unless the project has auto_approve_todos enabled)."
-    )]
+                       (unless the project has auto_approve_todos enabled).")]
     async fn propose_todo(
         &self,
         Parameters(args): Parameters<ProposeTodoArgs>,
@@ -421,8 +425,10 @@ impl ApasMcpServer {
         json_result(&serde_json::json!({ "todo_id": id, "status": "proposed" }))
     }
 
-    #[tool(description = "Move a Global TODO to a new status (proposed, approved, \
-                          rejected, in_progress, under_review, pr_open, done).")]
+    #[tool(
+        description = "Move a Global TODO to a new status (proposed, approved, \
+                          rejected, in_progress, under_review, pr_open, done)."
+    )]
     async fn update_todo_status(
         &self,
         Parameters(args): Parameters<UpdateTodoStatusArgs>,
@@ -452,8 +458,10 @@ impl ApasMcpServer {
         }))
     }
 
-    #[tool(description = "Read project_goal.md, the human-facing statement of what \
-                          the team is building.")]
+    #[tool(
+        description = "Read project_goal.md, the human-facing statement of what \
+                          the team is building."
+    )]
     async fn read_project_goal(&self) -> Result<CallToolResult, ErrorData> {
         Ok(CallToolResult::success(vec![ContentBlock::text(
             crate::manager::read_project_goal(self.dir()),
@@ -560,13 +568,9 @@ pub fn mcp_server_flags(
         pane_id.to_string(),
     ]);
 
+    #[allow(deprecated)]
     match provider {
-        // MiniMax / GLM / DeepSeek are the claude binary pointed at another
-        // backend, so they take the claude flag shape too.
-        shared::Provider::Claude
-        | shared::Provider::Minimax
-        | shared::Provider::Glm
-        | shared::Provider::Deepseek => {
+        shared::Provider::Claude | shared::Provider::Deepseek => {
             let config = serde_json::json!({
                 "mcpServers": {
                     SERVER_NAME: { "command": apas_bin, "args": args }
@@ -583,6 +587,7 @@ pub fn mcp_server_flags(
         // Not verified against these runtimes; a bad flag would break the
         // spawn outright, so stay out of their way.
         shared::Provider::Opencode | shared::Provider::CursorAgent => Vec::new(),
+        shared::Provider::Minimax | shared::Provider::Glm => Vec::new(),
     }
 }
 
@@ -885,7 +890,11 @@ mod tests {
             .iter()
             .map(|r| r["body"].as_str().unwrap())
             .collect();
-        assert_eq!(bodies, vec!["second"], "cursor must exclude the first record");
+        assert_eq!(
+            bodies,
+            vec!["second"],
+            "cursor must exclude the first record"
+        );
     }
 
     #[tokio::test]
@@ -967,7 +976,10 @@ mod tests {
             .await
             .unwrap();
         assert!(is_err(&bad_status));
-        assert!(text_of(&bad_status).contains("Valid:"), "lists valid statuses");
+        assert!(
+            text_of(&bad_status).contains("Valid:"),
+            "lists valid statuses"
+        );
 
         let bad_id = srv
             .update_todo_status(Parameters(UpdateTodoStatusArgs {
@@ -1031,12 +1043,16 @@ mod tests {
     }
 
     #[test]
-    fn claude_backed_providers_all_get_the_claude_shape() {
-        // MiniMax/GLM/DeepSeek run the claude binary behind different env, so
-        // they must take `--mcp-config`, not codex's `-c` overrides.
-        for p in [Provider::Minimax, Provider::Glm, Provider::Deepseek] {
-            let flags = mcp_server_flags(&p, "/bin/apas", "/proj", 1);
-            assert_eq!(flags[0], "--mcp-config", "{p:?} should use claude flags");
+    fn deepseek_gets_the_claude_shape() {
+        let flags = mcp_server_flags(&Provider::Deepseek, "/bin/apas", "/proj", 1);
+        assert_eq!(flags[0], "--mcp-config");
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn retired_providers_get_no_mcp_flags() {
+        for provider in [Provider::Minimax, Provider::Glm] {
+            assert!(mcp_server_flags(&provider, "/bin/apas", "/proj", 1).is_empty());
         }
     }
 

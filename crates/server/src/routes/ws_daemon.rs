@@ -25,6 +25,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let user_id: Uuid;
     let machine_info: MachineInfo;
     let initial_projects: Vec<shared::MachineProjectInfo>;
+    let daemon_capabilities: Vec<String>;
 
     // Registration handshake.
     loop {
@@ -36,6 +37,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         token,
                         machine,
                         projects,
+                        capabilities,
                     }) => {
                         match validate_daemon_registration(
                             &token,
@@ -44,10 +46,43 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             &state.config.auth.jwt_secret,
                         ) {
                             Ok(registration) => {
+                                match state
+                                    .db
+                                    .get_user_by_id(&registration.user_id.to_string())
+                                    .await
+                                {
+                                    Ok(Some(user)) if user.is_active() => {}
+                                    Ok(Some(_)) => {
+                                        let text = serde_json::to_string(&registration_failed(
+                                            "Cluster account is suspended",
+                                        ))
+                                        .unwrap();
+                                        let _ = sender.send(Message::Text(text.into())).await;
+                                        return;
+                                    }
+                                    Ok(None) => {
+                                        let text = serde_json::to_string(&registration_failed(
+                                            "Cluster account not found",
+                                        ))
+                                        .unwrap();
+                                        let _ = sender.send(Message::Text(text.into())).await;
+                                        return;
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!("Daemon account lookup failed: {}", err);
+                                        let text = serde_json::to_string(&registration_failed(
+                                            "Could not load cluster account",
+                                        ))
+                                        .unwrap();
+                                        let _ = sender.send(Message::Text(text.into())).await;
+                                        return;
+                                    }
+                                }
                                 machine_id = registration.machine_id;
                                 user_id = registration.user_id;
                                 machine_info = registration.machine;
                                 initial_projects = registration.projects;
+                                daemon_capabilities = capabilities;
                                 break;
                             }
                             Err(response) => {
@@ -93,6 +128,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         machine_info.clone(),
         initial_projects,
     );
+    state
+        .sessions
+        .set_daemon_capabilities(machine_id, daemon_capabilities);
     let registered_text = serde_json::to_string(&registered_msg).unwrap();
     if sender
         .send(Message::Text(registered_text.into()))
@@ -121,6 +159,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             incoming = receiver.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
+                        if !state.sessions.is_daemon_connected(&machine_id) {
+                            break;
+                        }
                         let parsed: Result<DaemonToServer, _> = serde_json::from_str(&text);
                         match parsed {
                             Ok(message) => apply_registered_daemon_message(
@@ -262,8 +303,6 @@ mod tests {
             os: "linux".to_string(),
             arch: "x86_64".to_string(),
             daemon_version: Some("test-daemon".to_string()),
-            minimax_backend: None,
-            glm_backend: None,
             deepseek_backend: None,
             last_seen: None,
         }
@@ -384,12 +423,6 @@ mod tests {
         assert_eq!(machine.projects[0].project_id, "new");
         assert!(!machine.projects[0].is_running);
 
-        sessions.apply_web_minimax_config(
-            &machine_id,
-            Some("https://minimax.example".to_string()),
-            Some("secret-key".to_string()),
-            false,
-        );
         apply_registered_daemon_message(
             &sessions,
             &machine_id,
@@ -401,16 +434,6 @@ mod tests {
         let machine = registered_machine(&sessions, &user_id, &machine_id);
         assert_eq!(machine.machine.hostname, "updated-host");
         assert_eq!(machine.machine.machine_id, machine_id);
-        let backend = machine
-            .machine
-            .minimax_backend
-            .expect("minimax backend should be preserved");
-        assert_eq!(
-            backend.api_base_url.as_deref(),
-            Some("https://minimax.example")
-        );
-        assert_eq!(backend.api_key.as_deref(), Some("secret-key"));
-        assert!(backend.api_key_configured);
     }
 
     #[tokio::test]

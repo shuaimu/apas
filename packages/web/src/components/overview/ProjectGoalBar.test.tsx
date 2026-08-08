@@ -6,6 +6,7 @@ import { useStore, type PaneConfig } from "@/lib/store";
 
 const DEFAULT_SESSION_ID = "test-session";
 const PROJECT_GOAL_SESSION_ID = "session-project-goal";
+type StoreState = ReturnType<typeof useStore.getState>;
 
 function seedProjectGoalBar(overrides: Partial<{
   sessionId: string;
@@ -26,12 +27,12 @@ function seedProjectGoalBar(overrides: Partial<{
       projectGoals: overrides.projectGoals ?? { [sessionId]: "Ship APAS team mode" },
       paneConfigs: overrides.paneConfigs ?? [],
       pausedPanes: overrides.pausedPanes ?? [],
-      addPane: overrides.addPane ?? vi.fn(() => ({ success: true })),
-      updateProjectGoal: overrides.updateProjectGoal ?? vi.fn(),
-      pausePane: overrides.pausePane ?? vi.fn(),
-      resumePane: overrides.resumePane ?? vi.fn(),
+      addPane: (overrides.addPane ?? vi.fn(() => ({ success: true }))) as StoreState["addPane"],
+      updateProjectGoal: (overrides.updateProjectGoal ?? vi.fn()) as StoreState["updateProjectGoal"],
+      pausePane: (overrides.pausePane ?? vi.fn()) as StoreState["pausePane"],
+      resumePane: (overrides.resumePane ?? vi.fn()) as StoreState["resumePane"],
       interruptPane: vi.fn(),
-      sendMessageToPane: overrides.sendMessageToPane ?? vi.fn(() => ({ success: true })),
+      sendMessageToPane: (overrides.sendMessageToPane ?? vi.fn(() => ({ success: true }))) as StoreState["sendMessageToPane"],
       showToast: vi.fn(),
     });
   });
@@ -84,7 +85,7 @@ describe("ProjectGoalBar team role slots", () => {
   });
 
   it("launches a missing developer with selected provider/model and template metadata", () => {
-    const addPane = vi.fn(() => ({ success: true }));
+    const addPane = vi.fn<StoreState["addPane"]>(() => ({ success: true }));
     seedProjectGoalBar({ addPane });
     render(<ProjectGoalBar />);
 
@@ -117,7 +118,7 @@ describe("ProjectGoalBar team role slots", () => {
   });
 
   it("launches a missing developer with the shared Claude Fable option", () => {
-    const addPane = vi.fn(() => ({ success: true }));
+    const addPane = vi.fn<StoreState["addPane"]>(() => ({ success: true }));
     seedProjectGoalBar({ addPane });
     render(<ProjectGoalBar />);
 
@@ -148,7 +149,7 @@ describe("ProjectGoalBar team role slots", () => {
   });
 
   it("launches a missing Manager with the current goal and managed role metadata", async () => {
-    const addPane = vi.fn(() => ({ success: true }));
+    const addPane = vi.fn<StoreState["addPane"]>(() => ({ success: true }));
     const updateProjectGoal = vi.fn();
     seedProjectGoalBar({ addPane, updateProjectGoal });
     render(<ProjectGoalBar />);
@@ -181,7 +182,7 @@ describe("ProjectGoalBar team role slots", () => {
   });
 
   it("launches a missing Tech Lead with remote-aware survey prompt", () => {
-    const addPane = vi.fn(() => ({ success: true }));
+    const addPane = vi.fn<StoreState["addPane"]>(() => ({ success: true }));
     seedProjectGoalBar({ addPane });
     render(<ProjectGoalBar />);
 
@@ -360,7 +361,7 @@ describe("ProjectGoalBar team role slots", () => {
     );
   });
 
-  it("shows launched slots with pane id and pause/resume controls", () => {
+  it("shows historical retired slots as unsupported without resume controls", () => {
     const resumePane = vi.fn();
     seedProjectGoalBar({
       paneConfigs: [
@@ -380,15 +381,15 @@ describe("ProjectGoalBar team role slots", () => {
 
     render(<ProjectGoalBar />);
 
-    expect(screen.getByText("paused")).toBeTruthy();
+    expect(screen.getByText("unsupported")).toBeTruthy();
     expect(screen.getByText("77")).toBeTruthy();
-    expect(screen.getAllByText("Claude / MiniMax 2.7").length).toBeGreaterThan(0);
-    fireEvent.click(screen.getByTitle("Resume Tech Lead"));
-    expect(resumePane).toHaveBeenCalledWith(77);
+    expect(screen.queryByText(/MiniMax/)).toBeNull();
+    expect(screen.queryByTitle("Resume Tech Lead")).toBeNull();
+    expect(resumePane).not.toHaveBeenCalled();
   });
 
   it("asks the Manager to scan team-mode sources when auto-generating the goal", () => {
-    const sendMessageToPane = vi.fn(() => ({ success: true }));
+    const sendMessageToPane = vi.fn<StoreState["sendMessageToPane"]>(() => ({ success: true }));
     seedProjectGoalBar({
       sendMessageToPane,
       paneConfigs: [
@@ -422,8 +423,8 @@ describe("ProjectGoalBar team role slots", () => {
   });
 
   it("launches Manager and queues auto-generate when no Manager exists yet", async () => {
-    const addPane = vi.fn(() => ({ success: true }));
-    const sendMessageToPane = vi.fn(() => ({ success: true }));
+    const addPane = vi.fn<StoreState["addPane"]>(() => ({ success: true }));
+    const sendMessageToPane = vi.fn<StoreState["sendMessageToPane"]>(() => ({ success: true }));
     seedProjectGoalBar({ addPane, sendMessageToPane });
     render(<ProjectGoalBar />);
 
@@ -476,7 +477,7 @@ describe("ProjectGoalBar team role slots", () => {
   });
 
   it("does not show duplicate launches for existing Manager and Tech Lead panes", () => {
-    const addPane = vi.fn(() => ({ success: true }));
+    const addPane = vi.fn<StoreState["addPane"]>(() => ({ success: true }));
     const pausePane = vi.fn();
     seedProjectGoalBar({
       addPane,

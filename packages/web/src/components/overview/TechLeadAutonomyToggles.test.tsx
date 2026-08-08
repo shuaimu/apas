@@ -33,7 +33,12 @@ function seedSession(overrides: Record<string, unknown> = {}) {
   ] as StoreState["sessions"];
 }
 
-const OFF = { autoApproveTodos: false, autoMergePrs: false, teamEnabled: false };
+const OFF = {
+  autoApproveTodos: false,
+  autoMergePrs: false,
+  teamEnabled: false,
+  disallowedTabTypes: [],
+};
 
 describe("TechLeadAutonomyToggles", () => {
   afterEach(() => {
@@ -69,8 +74,8 @@ describe("TechLeadAutonomyToggles", () => {
         sessionId: "session-a",
         sessions: seedSession(),
         projectFlags: {
-          "session-a": { autoApproveTodos: true, autoMergePrs: false, teamEnabled: true },
-          "session-b": { autoApproveTodos: false, autoMergePrs: true, teamEnabled: false },
+          "session-a": { autoApproveTodos: true, autoMergePrs: false, teamEnabled: true, disallowedTabTypes: [] },
+          "session-b": { autoApproveTodos: false, autoMergePrs: true, teamEnabled: false, disallowedTabTypes: [] },
         },
       });
     });
@@ -106,7 +111,7 @@ describe("TechLeadAutonomyToggles", () => {
         sessionId: "session-a",
         sessions: seedSession(),
         projectFlags: {
-          "session-a": { autoApproveTodos: true, autoMergePrs: false, teamEnabled: true },
+          "session-a": { autoApproveTodos: true, autoMergePrs: false, teamEnabled: true, disallowedTabTypes: [] },
         },
         updateProjectFlags: updateProjectFlags as StoreState["updateProjectFlags"],
       });
@@ -119,6 +124,7 @@ describe("TechLeadAutonomyToggles", () => {
       autoApproveTodos: true,
       autoMergePrs: true,
       teamEnabled: true,
+      disallowedTabTypes: [],
     });
 
     fireEvent.click(autoApproveCheckbox());
@@ -126,13 +132,15 @@ describe("TechLeadAutonomyToggles", () => {
       autoApproveTodos: false,
       autoMergePrs: false,
       teamEnabled: true,
+      disallowedTabTypes: [],
     });
   });
 
   describe("owner/admin gating", () => {
     it.each([
       ["owner", true],
-      ["admin", true],
+      // Legacy project-admin shares are compatibility-read as ordinary users.
+      ["admin", false],
       ["user", false],
     ])("shared project role %s can manage: %s", (role, expected) => {
       act(() => {

@@ -105,10 +105,7 @@ impl ProjectFileWatcher {
             let watched = working_dir.to_path_buf();
             match notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
                 let Ok(event) = res else { return };
-                let touched = event
-                    .paths
-                    .iter()
-                    .any(|p| is_watched_relative(p, &watched));
+                let touched = event.paths.iter().any(|p| is_watched_relative(p, &watched));
                 if !touched {
                     return;
                 }

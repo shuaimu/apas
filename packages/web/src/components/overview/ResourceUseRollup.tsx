@@ -7,14 +7,12 @@
  * one row per provider that actually has limits cached.
  */
 import { useMemo } from "react";
-import { useStore, Provider, UsageLimits } from "@/lib/store";
+import { useStore, SupportedProvider, UsageLimits } from "@/lib/store";
 import { UsageLimitsDisplay } from "../UsageLimits";
 
-const PROVIDER_LABELS: Record<Provider, string> = {
+const PROVIDER_LABELS: Record<SupportedProvider, string> = {
   claude: "Claude",
   codex: "Codex",
-  minimax: "MiniMax",
-  glm: "GLM",
   deepseek: "DeepSeek",
   opencode: "OpenCode",
   "cursor-agent": "Cursor",
@@ -28,18 +26,20 @@ export function ResourceUseRollup() {
   // Providers that this project's panes actually use (so we don't list
   // limits for providers the user hasn't opted into).
   const providers = useMemo(() => {
-    const set = new Set<Provider>();
+    const set = new Set<SupportedProvider>();
     for (const p of paneConfigs) {
-      set.add(p.provider);
+      if (p.provider !== "minimax" && p.provider !== "glm") {
+        set.add(p.provider);
+      }
     }
     return Array.from(set);
   }, [paneConfigs]);
 
   const limitsForClient = cliClientId ? usageLimits.get(cliClientId) : undefined;
 
-  const rows: Array<{ provider: Provider; limits: UsageLimits }> = useMemo(() => {
+  const rows: Array<{ provider: SupportedProvider; limits: UsageLimits }> = useMemo(() => {
     if (!limitsForClient) return [];
-    const out: Array<{ provider: Provider; limits: UsageLimits }> = [];
+    const out: Array<{ provider: SupportedProvider; limits: UsageLimits }> = [];
     for (const p of providers) {
       const l = limitsForClient[p];
       if (l && (l.fiveHour || l.sevenDay)) {

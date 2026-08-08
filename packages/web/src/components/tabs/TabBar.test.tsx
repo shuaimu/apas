@@ -10,13 +10,14 @@ import {
 function pane(overrides: Partial<PaneConfig> & Pick<PaneConfig, "pane_id" | "label" | "role">): PaneConfig {
   return {
     pane_id: overrides.pane_id,
-    provider: "claude",
+    provider: overrides.provider ?? "claude",
     mode: "deadloop",
     session_id: `pane-${overrides.pane_id}`,
     is_paused: false,
     label: overrides.label,
     role: overrides.role,
     managed: overrides.managed,
+    model: overrides.model,
   };
 }
 
@@ -48,12 +49,12 @@ function renderTabBar(
     <TabBar
       tabs={tabs}
       activeTabId={overrides.activeTabId ?? 12}
-      onSelectTab={onSelectTab}
+      onSelectTab={onSelectTab as Parameters<typeof TabBar>[0]["onSelectTab"]}
       onCloseTab={onCloseTab}
-      onAddTab={onAddTab}
-      onRenameTab={onRenameTab}
-      onReorderTabs={onReorderTabs}
-      onRebootCli={overrides.onRebootCli}
+      onAddTab={onAddTab as Parameters<typeof TabBar>[0]["onAddTab"]}
+      onRenameTab={onRenameTab as Parameters<typeof TabBar>[0]["onRenameTab"]}
+      onReorderTabs={onReorderTabs as Parameters<typeof TabBar>[0]["onReorderTabs"]}
+      onRebootCli={overrides.onRebootCli as Parameters<typeof TabBar>[0]["onRebootCli"]}
       showRebootButton={overrides.showRebootButton}
       paneStatuses={{}}
       pausedPanes={[]}
@@ -344,10 +345,8 @@ describe("TabBar add-tab worktree controls", () => {
   });
 
   it("does not offer a terminal tab for providers a pty can't host", () => {
-    // Mirrors `terminal_binary_for` in the CLI: MiniMax/GLM/DeepSeek are
-    // the claude binary behind different env, and opencode/cursor-agent
-    // have unverified pty behaviour. Offering them would spawn a pane the
-    // CLI immediately rejects.
+    // Mirrors `terminal_binary_for` in the CLI. Only Claude and Codex have
+    // verified pty behavior.
     renderTabBar();
     openNewTabMenu();
 
@@ -356,6 +355,23 @@ describe("TabBar add-tab worktree controls", () => {
     for (const label of ["MiniMax terminal", "GLM terminal", "DeepSeek terminal", "OpenCode terminal"]) {
       expect(screen.queryByText(label)).toBeNull();
     }
+  });
+
+  it("marks a historical retired tab unsupported without branding it", () => {
+    const { container } = renderTabBar({
+      tabs: [pane({
+        pane_id: 81,
+        label: "Historical",
+        role: "developer",
+        provider: "minimax",
+        model: "MiniMax-M2.7",
+      })],
+      activeTabId: 81,
+    });
+
+    const tab = tabButton(container, 81);
+    expect(tab.querySelector('[title="Unsupported provider"]')).toBeTruthy();
+    expect(tab.textContent).toContain("!");
   });
 
   it("closes the menu from an outside click and collapses expanded provider submenus", () => {

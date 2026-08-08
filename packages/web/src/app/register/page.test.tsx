@@ -202,12 +202,12 @@ describe("RegisterPage", () => {
     const originalSetTimeout = globalThis.setTimeout;
     const setTimeoutSpy = vi
       .spyOn(globalThis, "setTimeout")
-      .mockImplementation((callback: TimerHandler, timeout?: number) => {
-        if (timeout === 2000 && typeof callback === "function") {
-          callback();
+      .mockImplementation((callback, timeout, ...args) => {
+        if (timeout === 2000) {
+          callback(...args);
           return 0 as unknown as ReturnType<typeof setTimeout>;
         }
-        return originalSetTimeout(callback, timeout);
+        return originalSetTimeout(callback, timeout, ...args);
       });
     navigation.code = "CLI123";
     mockRegisterSuccess();
@@ -230,7 +230,10 @@ describe("RegisterPage", () => {
       "http://apas.mpaxos.com/auth/device-complete",
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer token-123",
+        },
         body: JSON.stringify({ code: "CLI123", user_id: "user-1" }),
       },
     );

@@ -43,7 +43,21 @@ function seedOverview(paneConfigs: PaneConfig[] = [], teamEnabled = true) {
         { id: sessionId, projectId: sessionId, status: "active", isShared: false },
       ] as ReturnType<typeof useStore.getState>["sessions"],
       projectFlags: {
-        [sessionId]: { autoApproveTodos: false, autoMergePrs: false, teamEnabled },
+        [sessionId]: {
+          autoApproveTodos: false,
+          autoMergePrs: false,
+          teamEnabled,
+          disallowedTabTypes: [],
+        },
+      },
+      projectPolicies: {
+        [sessionId]: {
+          teamAvailable: teamEnabled,
+          allowedLaunchProfiles: ["agent:claude:official:default"],
+          version: 3,
+          projectSuspended: false,
+          noncompliantPaneIds: [],
+        },
       },
       paneConfigs,
       paneStatuses: {},
@@ -51,7 +65,6 @@ function seedOverview(paneConfigs: PaneConfig[] = [], teamEnabled = true) {
       paneMessages: {},
       paneDiffs: {},
       teamRecords: [],
-      teamTodoState: emptyTeamTodo(),
       teamTodoStates: new Map([[sessionId, emptyTeamTodo()]]),
       suggestedWorkersBySession: new Map([[sessionId, []]]),
       usageLimits: new Map(),
@@ -196,12 +209,12 @@ describe("OverviewView composition", () => {
     seedOverview([], true);
     renderOverview();
 
-    const teamSwitch = screen.getByRole("switch");
+    const teamPolicy = screen.getByText("Team mode");
     for (const label of ["Team setup", "Team TODO", "Team (managed)"]) {
       const el = screen.getByText(label);
       expect(
-        teamSwitch.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING,
-        `${label} should render after the team switch`,
+        teamPolicy.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING,
+        `${label} should render after the team policy`,
       ).toBeTruthy();
     }
   });
@@ -212,12 +225,11 @@ describe("OverviewView composition", () => {
 
       renderOverview();
 
-      // The Overview itself still renders, led by the switch — that is the
-      // one thing on the page that explains the absence and can undo it.
+      // The Overview still renders, led by the read-only policy status that
+      // explains why team surfaces are absent.
       expect(screen.getByText("Team Overview")).toBeTruthy();
-      expect(screen.getByRole("switch").getAttribute("aria-checked")).toBe("false");
-      expect(screen.getByText("Off")).toBeTruthy();
-      expect(screen.getByText(/unavailable for this project/)).toBeTruthy();
+      expect(screen.getByText("Unavailable")).toBeTruthy();
+      expect(screen.getByText(/disabled by the current cluster policy/)).toBeTruthy();
 
       expect(screen.queryByText("Team setup")).toBeNull();
       expect(screen.queryByText("Team TODO")).toBeNull();
@@ -240,7 +252,7 @@ describe("OverviewView composition", () => {
 
       expect(screen.queryByText("Team (managed)")).toBeNull();
       expect(screen.queryByTitle("Open Developer")).toBeNull();
-      expect(screen.getByText(/unavailable for this project/)).toBeTruthy();
+      expect(screen.getByText(/disabled by the current cluster policy/)).toBeTruthy();
     });
 
     it("keeps team surfaces once team mode is on", () => {
@@ -248,7 +260,7 @@ describe("OverviewView composition", () => {
 
       renderOverview();
 
-      expect(screen.getByRole("switch").getAttribute("aria-checked")).toBe("true");
+      expect(screen.getByText("Available")).toBeTruthy();
       expect(screen.getByText("Team TODO")).toBeTruthy();
       expect(screen.getByText("Tech Lead autonomy")).toBeTruthy();
     });

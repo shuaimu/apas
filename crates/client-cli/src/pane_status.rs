@@ -31,7 +31,10 @@ pub fn pane_status_from_tool_use(tool_name: &str, input: &Value) -> Option<Strin
         )),
         "Glob" => Some(format!(
             "Looking for {}",
-            input.get("pattern").and_then(|v| v.as_str()).unwrap_or("files"),
+            input
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("files"),
         )),
         "Grep" => Some(format!(
             "Searching for {}",
@@ -128,7 +131,10 @@ mod tests {
 
     #[test]
     fn edit_pulls_file_path() {
-        let got = pane_status_from_tool_use("Edit", &json!({"file_path": "src/foo.rs", "old_string": "x", "new_string": "y"}));
+        let got = pane_status_from_tool_use(
+            "Edit",
+            &json!({"file_path": "src/foo.rs", "old_string": "x", "new_string": "y"}),
+        );
         assert_eq!(got.as_deref(), Some("Editing src/foo.rs"));
     }
 
@@ -140,7 +146,11 @@ mod tests {
         let long = "echo ".to_string() + &"a".repeat(200);
         let got = pane_status_from_tool_use("Bash", &json!({"command": long})).unwrap();
         assert!(got.starts_with("Running: echo "));
-        assert!(got.ends_with('…'), "long commands should be truncated: {}", got);
+        assert!(
+            got.ends_with('…'),
+            "long commands should be truncated: {}",
+            got
+        );
         assert!(got.len() < 90, "got: {} (len {})", got, got.len());
     }
 

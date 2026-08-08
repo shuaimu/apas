@@ -27,8 +27,19 @@ function fakeSocket() {
 
 beforeEach(() => {
   __resetTerminalBus();
-  useStore.setState({ ws: null, sessionId: null });
+  useStore.setState({ ws: null, sessionId: null, projectPolicies: {} });
 });
+
+const permissivePolicy = {
+  teamAvailable: true,
+  allowedLaunchProfiles: [
+    "terminal:codex:official:default",
+    "agent:claude:official:default",
+  ],
+  version: 1,
+  projectSuspended: false,
+  noncompliantPaneIds: [],
+};
 
 describe("terminal server frames", () => {
   it("routes terminal_output to the bus, not into store state", () => {
@@ -198,7 +209,12 @@ describe("terminal outbound controls", () => {
 
   it("addPane forces a terminal pane to be unmanaged", () => {
     const { ws, sent } = fakeSocket();
-    useStore.setState({ ws, sessionId: SID, isAttached: true });
+    useStore.setState({
+      ws,
+      sessionId: SID,
+      isAttached: true,
+      projectPolicies: { [SID]: permissivePolicy },
+    });
 
     // Terminal panes publish no stream events, so the Tech Lead must never
     // treat one as a delegation target even if a caller asks for managed.
@@ -212,10 +228,36 @@ describe("terminal outbound controls", () => {
 
   it("addPane defaults to an agent pane and preserves managed", () => {
     const { ws, sent } = fakeSocket();
-    useStore.setState({ ws, sessionId: SID, isAttached: true });
+    useStore.setState({
+      ws,
+      sessionId: SID,
+      isAttached: true,
+      projectPolicies: { [SID]: permissivePolicy },
+    });
 
     useStore.getState().addPane("claude", "interactive", "Claude 2", undefined, undefined, undefined, undefined, true);
 
     expect(sent[0]).toMatchObject({ kind: "agent", managed: true });
+  });
+
+  it("fails closed before policy arrives and rejects disallowed profiles", () => {
+    const { ws, sent } = fakeSocket();
+    useStore.setState({ ws, sessionId: SID, isAttached: true, projectPolicies: {} });
+    const pending = useStore.getState().addPane("codex", "interactive");
+    expect(pending.success).toBe(false);
+    expect(pending.error).toMatch(/authoritative cluster policy/);
+
+    useStore.setState({
+      projectPolicies: {
+        [SID]: {
+          ...permissivePolicy,
+          allowedLaunchProfiles: ["agent:claude:official:default"],
+        },
+      },
+    });
+    const denied = useStore.getState().addPane("codex", "interactive");
+    expect(denied.success).toBe(false);
+    expect(denied.error).toMatch(/disabled by cluster policy v1/);
+    expect(sent).toHaveLength(0);
   });
 });

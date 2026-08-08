@@ -1,8 +1,7 @@
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
 use shared::{
-    DaemonToServer, DeepseekBackendInfo, GlmBackendInfo, MachineInfo, MachineProjectInfo,
-    MiniMaxBackendInfo, ServerToDaemon,
+    DaemonToServer, DeepseekBackendInfo, MachineInfo, MachineProjectInfo, ServerToDaemon,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -29,8 +28,6 @@ const UPGRADE_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const VERSION: &str = env!("APAS_VERSION");
 const TMUX_SESSION_PREFIX: &str = "apas";
-const MINIMAX_API_BASE_URL: &str = "https://api.minimax.io/anthropic";
-const GLM_API_BASE_URL: &str = "https://api.z.ai/api/anthropic";
 const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com/anthropic";
 
 fn resolve_user_shell_path() -> Option<String> {
@@ -74,64 +71,6 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
             Some(trimmed.to_string())
         }
     })
-}
-
-fn minimax_backend_info_from_config(config: &crate::config::Config) -> Option<MiniMaxBackendInfo> {
-    let api_base_url = Some(MINIMAX_API_BASE_URL.to_string());
-    let api_key = normalize_optional_string(config.local.minimax_api_key.clone());
-    let api_key_configured = api_key.is_some();
-    Some(MiniMaxBackendInfo {
-        api_base_url,
-        api_key,
-        api_key_configured,
-    })
-}
-
-fn update_local_minimax_backend_config(
-    _api_base_url: Option<String>,
-    api_key: Option<String>,
-    clear_api_key: bool,
-) -> Result<Option<MiniMaxBackendInfo>> {
-    let mut config = crate::config::Config::load().unwrap_or_default();
-    config.local.minimax_api_base_url = Some(MINIMAX_API_BASE_URL.to_string());
-
-    if clear_api_key {
-        config.local.minimax_api_key = None;
-    } else if let Some(key) = api_key {
-        config.local.minimax_api_key = normalize_optional_string(Some(key));
-    }
-
-    config.save()?;
-    Ok(minimax_backend_info_from_config(&config))
-}
-
-fn glm_backend_info_from_config(config: &crate::config::Config) -> Option<GlmBackendInfo> {
-    let api_base_url = Some(GLM_API_BASE_URL.to_string());
-    let api_key = normalize_optional_string(config.local.glm_api_key.clone());
-    let api_key_configured = api_key.is_some();
-    Some(GlmBackendInfo {
-        api_base_url,
-        api_key,
-        api_key_configured,
-    })
-}
-
-fn update_local_glm_backend_config(
-    _api_base_url: Option<String>,
-    api_key: Option<String>,
-    clear_api_key: bool,
-) -> Result<Option<GlmBackendInfo>> {
-    let mut config = crate::config::Config::load().unwrap_or_default();
-    config.local.glm_api_base_url = Some(GLM_API_BASE_URL.to_string());
-
-    if clear_api_key {
-        config.local.glm_api_key = None;
-    } else if let Some(key) = api_key {
-        config.local.glm_api_key = normalize_optional_string(Some(key));
-    }
-
-    config.save()?;
-    Ok(glm_backend_info_from_config(&config))
 }
 
 fn deepseek_backend_info_from_config(
@@ -206,7 +145,6 @@ fn headless_pids_for(project_path: &Path) -> Vec<u32> {
 fn headless_pid_for(project_path: &Path) -> Option<u32> {
     headless_pids_for(project_path).into_iter().next()
 }
-
 
 /// NFS-shared config dir, where the peer registry and project claims live.
 /// Distinct from `Config::runtime_dir()`, which is host-local.
@@ -738,8 +676,7 @@ impl DaemonState {
             }
         }
         for project in self.projects.values() {
-            if crate::worktree::normalized_git_remote(&project.path).as_deref()
-                == Some(git_remote)
+            if crate::worktree::normalized_git_remote(&project.path).as_deref() == Some(git_remote)
             {
                 if let Some(raw) = crate::worktree::raw_git_remote(&project.path) {
                     return raw;
@@ -783,8 +720,6 @@ pub async fn run(
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         daemon_version: Some(VERSION.to_string()),
-        minimax_backend: minimax_backend_info_from_config(&config),
-        glm_backend: glm_backend_info_from_config(&config),
         deepseek_backend: deepseek_backend_info_from_config(&config),
         last_seen: None,
     };
@@ -876,6 +811,7 @@ async fn run_connection(
         token: token.to_string(),
         machine: state.machine_info.clone(),
         projects: state.snapshot_projects(),
+        capabilities: vec![shared::PROJECT_POLICY_CAPABILITY.to_string()],
     };
     ws_sender
         .send(Message::Text(serde_json::to_string(&register)?.into()))
@@ -946,8 +882,7 @@ async fn run_connection(
         // Keep our record and our project claims fresh. If these age past
         // STALE_AFTER_SECS a peer will conclude this host died and take over
         // projects we are actively running.
-        let _ =
-            crate::daemon_registry::publish_self(&registry_dir, self_machine_id, VERSION);
+        let _ = crate::daemon_registry::publish_self(&registry_dir, self_machine_id, VERSION);
         crate::daemon_registry::refresh_own_claims(&registry_dir);
 
         tokio::select! {
@@ -992,7 +927,22 @@ async fn run_connection(
                             ServerToDaemon::RegistrationFailed { reason } => {
                                 return Err(anyhow::anyhow!("Daemon auth dropped: {}", reason));
                             }
-                            ServerToDaemon::StartProjectCli { project_id } => {
+                            ServerToDaemon::StartProjectCli { project_id, policy } => {
+                                let Some(policy) = policy else {
+                                    tracing::warn!(
+                                        "Refusing to start project {} without authoritative cluster policy",
+                                        project_id
+                                    );
+                                    continue;
+                                };
+                                if policy.project_suspended {
+                                    tracing::warn!(
+                                        "Refusing to start suspended project {} (policy version {})",
+                                        project_id,
+                                        policy.version
+                                    );
+                                    continue;
+                                }
                                 if let Err(err) = state.start_project(&project_id, server_url, token) {
                                     tracing::warn!("Failed to start project {}: {}", project_id, err);
                                 }
@@ -1073,57 +1023,15 @@ async fn run_connection(
                                 let text = serde_json::to_string(&refresh_msg)?;
                                 ws_sender.send(Message::Text(text.into())).await?;
                             }
-                            ServerToDaemon::SetMiniMaxConfig {
-                                api_base_url,
-                                api_key,
-                                clear_api_key,
-                            } => {
-                                match update_local_minimax_backend_config(
-                                    api_base_url,
-                                    api_key,
-                                    clear_api_key,
-                                ) {
-                                    Ok(minimax_backend) => {
-                                        state.machine_info.minimax_backend = minimax_backend;
-                                        let update = DaemonToServer::MachineInfoUpdate {
-                                            machine: state.machine_info.clone(),
-                                        };
-                                        let text = serde_json::to_string(&update)?;
-                                        ws_sender.send(Message::Text(text.into())).await?;
-                                    }
-                                    Err(err) => {
-                                        tracing::warn!(
-                                            "Failed to update MiniMax backend config: {}",
-                                            err
-                                        );
-                                    }
-                                }
-                            }
-                            ServerToDaemon::SetGlmConfig {
-                                api_base_url,
-                                api_key,
-                                clear_api_key,
-                            } => {
-                                match update_local_glm_backend_config(
-                                    api_base_url,
-                                    api_key,
-                                    clear_api_key,
-                                ) {
-                                    Ok(glm_backend) => {
-                                        state.machine_info.glm_backend = glm_backend;
-                                        let update = DaemonToServer::MachineInfoUpdate {
-                                            machine: state.machine_info.clone(),
-                                        };
-                                        let text = serde_json::to_string(&update)?;
-                                        ws_sender.send(Message::Text(text.into())).await?;
-                                    }
-                                    Err(err) => {
-                                        tracing::warn!(
-                                            "Failed to update GLM backend config: {}",
-                                            err
-                                        );
-                                    }
-                                }
+                            #[allow(deprecated)]
+                            ServerToDaemon::SetMiniMaxConfig { .. }
+                            | ServerToDaemon::SetGlmConfig { .. } => {
+                                // Keep the connection alive for an older
+                                // server, but deliberately discard the
+                                // retired credential payload.
+                                tracing::warn!(
+                                    "ignored machine configuration for a retired provider"
+                                );
                             }
                             ServerToDaemon::SetDeepseekConfig {
                                 api_base_url,
@@ -1184,15 +1092,5 @@ async fn refresh_usage_limits_cache() {
     match crate::usage::refresh_codex_usage_limits().await {
         Ok(_) => tracing::debug!("Refreshed Codex usage limits cache"),
         Err(err) => tracing::debug!("Failed to refresh Codex usage limits cache: {}", err),
-    }
-
-    match crate::usage::refresh_minimax_usage_limits().await {
-        Ok(_) => tracing::debug!("Refreshed MiniMax usage limits cache"),
-        Err(err) => tracing::debug!("Failed to refresh MiniMax usage limits cache: {}", err),
-    }
-
-    match crate::usage::refresh_glm_usage_limits().await {
-        Ok(_) => tracing::debug!("Refreshed GLM usage limits cache"),
-        Err(err) => tracing::debug!("Failed to refresh GLM usage limits cache: {}", err),
     }
 }

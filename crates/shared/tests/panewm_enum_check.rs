@@ -21,8 +21,14 @@ fn pane_watermarks_string_keys_deserialize_in_webtoserver() {
             pane_watermarks: Some(wm),
             ..
         } => {
-            assert_eq!(wm.get("2").map(String::as_str), Some("2026-07-05T00:00:00Z"));
-            assert_eq!(wm.get("97").map(String::as_str), Some("2026-07-05T00:01:00Z"));
+            assert_eq!(
+                wm.get("2").map(String::as_str),
+                Some("2026-07-05T00:00:00Z")
+            );
+            assert_eq!(
+                wm.get("97").map(String::as_str),
+                Some("2026-07-05T00:01:00Z")
+            );
         }
         other => panic!("expected GetSessionMessages with pane_watermarks, got {other:?}"),
     }

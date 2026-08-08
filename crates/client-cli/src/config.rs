@@ -22,22 +22,12 @@ pub struct RemoteConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalConfig {
     pub claude_path: String,
-    #[serde(default = "default_minimax_path")]
-    pub minimax_path: String,
     #[serde(default = "default_codex_path")]
     pub codex_path: String,
     #[serde(default = "default_opencode_path")]
     pub opencode_path: String,
     #[serde(default = "default_cursor_agent_path")]
     pub cursor_agent_path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub minimax_api_base_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub minimax_api_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub glm_api_base_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub glm_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deepseek_api_base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -50,10 +40,6 @@ pub struct DaemonConfig {
     pub machine_id: Option<String>,
     #[serde(default)]
     pub project_roots: Vec<String>,
-}
-
-fn default_minimax_path() -> String {
-    "claude2".to_string()
 }
 
 fn default_codex_path() -> String {
@@ -72,14 +58,9 @@ impl Default for LocalConfig {
     fn default() -> Self {
         Self {
             claude_path: "claude".to_string(),
-            minimax_path: default_minimax_path(),
             codex_path: default_codex_path(),
             opencode_path: default_opencode_path(),
             cursor_agent_path: default_cursor_agent_path(),
-            minimax_api_base_url: None,
-            minimax_api_key: None,
-            glm_api_base_url: None,
-            glm_api_key: None,
             deepseek_api_base_url: None,
             deepseek_api_key: None,
         }
@@ -233,5 +214,39 @@ impl Config {
         let content = toml::to_string_pretty(self)?;
         std::fs::write(path, content)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn retired_legacy_local_keys_are_ignored_and_not_serialized() {
+        let config: Config = toml::from_str(
+            r#"
+            [local]
+            claude_path = "claude"
+            codex_path = "codex"
+            minimax_path = "legacy-wrapper"
+            minimax_api_base_url = "https://legacy.invalid"
+            minimax_api_key = "must-not-survive"
+            glm_api_base_url = "https://legacy.invalid"
+            glm_api_key = "must-not-survive"
+            deepseek_api_key = "supported-key"
+            "#,
+        )
+        .expect("legacy fields should be ignored");
+
+        assert_eq!(config.local.claude_path, "claude");
+        assert_eq!(config.local.codex_path, "codex");
+        assert_eq!(
+            config.local.deepseek_api_key.as_deref(),
+            Some("supported-key")
+        );
+        let saved = toml::to_string(&config).unwrap();
+        assert!(!saved.contains("minimax"));
+        assert!(!saved.contains("glm_api"));
+        assert!(!saved.contains("must-not-survive"));
     }
 }

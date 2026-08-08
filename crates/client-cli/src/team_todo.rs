@@ -50,8 +50,8 @@ pub fn load(project_dir: &Path) -> Result<TeamTodo> {
     if !path.exists() {
         return Ok(TeamTodo::default());
     }
-    let s = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let s =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     parse(&s)
 }
 
@@ -64,8 +64,7 @@ pub fn save(project_dir: &Path, todo: &TeamTodo) -> Result<()> {
     }
     let body = serialize(todo);
     let tmp = team_todo_tmp_path(&path);
-    std::fs::write(&tmp, body)
-        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::write(&tmp, body).with_context(|| format!("writing {}", tmp.display()))?;
     if let Err(err) = std::fs::rename(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(err)
@@ -346,7 +345,10 @@ impl SubStatus {
 enum Section {
     Outside,
     Global,
-    Worker { pane_id: u32, role_hint: Option<String> },
+    Worker {
+        pane_id: u32,
+        role_hint: Option<String>,
+    },
 }
 
 /// Parse a `team-todo.md` document. Missing / malformed sections are
@@ -656,13 +658,7 @@ pub fn serialize(todo: &TeamTodo) -> String {
                 } else {
                     match annotation {
                         Some(annotation) => {
-                            let _ = writeln!(
-                                out,
-                                "pr: {} {} {}",
-                                pr.pane_id,
-                                pr.url,
-                                annotation
-                            );
+                            let _ = writeln!(out, "pr: {} {} {}", pr.pane_id, pr.url, annotation);
                         }
                         None => {
                             let _ = writeln!(out, "pr: {} {}", pr.pane_id, pr.url);
@@ -782,9 +778,7 @@ impl TeamTodo {
             .map(|w| {
                 w.subtasks
                     .iter()
-                    .filter(|s| {
-                        !matches!(s.status, SubStatus::Done | SubStatus::Approved)
-                    })
+                    .filter(|s| !matches!(s.status, SubStatus::Done | SubStatus::Approved))
                     .map(|s| s.parent.clone())
                     .collect()
             })
@@ -819,11 +813,7 @@ impl TeamTodo {
         Ok(())
     }
 
-    pub fn set_subtask_status(
-        &mut self,
-        subtask_id: &str,
-        status: SubStatus,
-    ) -> Option<SubStatus> {
+    pub fn set_subtask_status(&mut self, subtask_id: &str, status: SubStatus) -> Option<SubStatus> {
         for w in self.workers.iter_mut() {
             if let Some(s) = w.subtasks.iter_mut().find(|s| s.id == subtask_id) {
                 let prev = s.status;
@@ -851,9 +841,7 @@ impl TeamTodo {
         let expand_next = self
             .globals
             .iter()
-            .find(|g| {
-                g.status == GlobalStatus::Approved && self.subtasks_for(&g.id).is_empty()
-            })
+            .find(|g| g.status == GlobalStatus::Approved && self.subtasks_for(&g.id).is_empty())
             .map(|g| g.id.clone());
 
         let dispatch: Vec<DispatchHint> = self
@@ -888,9 +876,9 @@ impl TeamTodo {
             .filter(|g| {
                 let subs = self.subtasks_for(&g.id);
                 !subs.is_empty()
-                    && subs.iter().all(|s| {
-                        matches!(s.status, SubStatus::Done | SubStatus::Approved)
-                    })
+                    && subs
+                        .iter()
+                        .all(|s| matches!(s.status, SubStatus::Done | SubStatus::Approved))
             })
             .map(|g| g.id.clone())
             .collect();
@@ -916,7 +904,10 @@ impl TeamTodo {
         let max = self
             .globals
             .iter()
-            .filter_map(|g| g.id.strip_prefix("TODO-").and_then(|n| n.parse::<u32>().ok()))
+            .filter_map(|g| {
+                g.id.strip_prefix("TODO-")
+                    .and_then(|n| n.parse::<u32>().ok())
+            })
             .max()
             .unwrap_or(0);
         format!("TODO-{:03}", max + 1)
@@ -964,8 +955,7 @@ mod tests {
             .expect("read temp project dir")
             .filter_map(|entry| {
                 let name = entry.ok()?.file_name().into_string().ok()?;
-                (name.starts_with("team-todo.md.") && name.ends_with(".tmp"))
-                    .then_some(name)
+                (name.starts_with("team-todo.md.") && name.ends_with(".tmp")).then_some(name)
             })
             .collect();
         entries.sort();
@@ -1139,10 +1129,15 @@ The test fixtures bake session cookies in; replace with a JWT minter.\n\
 
     #[test]
     fn skips_subtask_missing_required_parent_field() {
-        let s = "# Team TODO\n\n## pane:5 \u{2014} role\n\n### [foo] Title\nstatus: pending\n\nbody\n";
+        let s =
+            "# Team TODO\n\n## pane:5 \u{2014} role\n\n### [foo] Title\nstatus: pending\n\nbody\n";
         let t = parse(s).unwrap();
         assert_eq!(t.workers.len(), 1);
-        assert_eq!(t.workers[0].subtasks.len(), 0, "must skip subtask with no parent");
+        assert_eq!(
+            t.workers[0].subtasks.len(),
+            0,
+            "must skip subtask with no parent"
+        );
     }
 
     #[test]
@@ -1159,10 +1154,7 @@ The test fixtures bake session cookies in; replace with a JWT minter.\n\
 
     #[test]
     fn parse_worker_heading_handles_separators() {
-        assert_eq!(
-            parse_worker_heading("pane:218"),
-            Some((218, None))
-        );
+        assert_eq!(parse_worker_heading("pane:218"), Some((218, None)));
         assert_eq!(
             parse_worker_heading("pane:218 \u{2014} Frontend developer"),
             Some((218, Some("Frontend developer".to_string())))
@@ -1206,34 +1198,52 @@ The test fixtures bake session cookies in; replace with a JWT minter.\n\
         });
         // Pane 5: TODO-001 (in_progress) + TODO-002 (in_progress)
         t.upsert_worker_section(5, None);
-        t.push_subtask(5, WorkerSubtask {
-            id: "TODO-001 · a".into(),
-            title: "x".into(),
-            status: SubStatus::InProgress,
-            parent: "TODO-001".into(),
-            body: String::new(),
-        }).unwrap();
-        t.push_subtask(5, WorkerSubtask {
-            id: "TODO-002 · a".into(),
-            title: "y".into(),
-            status: SubStatus::InProgress,
-            parent: "TODO-002".into(),
-            body: String::new(),
-        }).unwrap();
+        t.push_subtask(
+            5,
+            WorkerSubtask {
+                id: "TODO-001 · a".into(),
+                title: "x".into(),
+                status: SubStatus::InProgress,
+                parent: "TODO-001".into(),
+                body: String::new(),
+            },
+        )
+        .unwrap();
+        t.push_subtask(
+            5,
+            WorkerSubtask {
+                id: "TODO-002 · a".into(),
+                title: "y".into(),
+                status: SubStatus::InProgress,
+                parent: "TODO-002".into(),
+                body: String::new(),
+            },
+        )
+        .unwrap();
         // Pane 7: TODO-002 (pending) — still has a contributor after pane 5 leaves
         t.upsert_worker_section(7, None);
-        t.push_subtask(7, WorkerSubtask {
-            id: "TODO-002 · b".into(),
-            title: "z".into(),
-            status: SubStatus::Pending,
-            parent: "TODO-002".into(),
-            body: String::new(),
-        }).unwrap();
+        t.push_subtask(
+            7,
+            WorkerSubtask {
+                id: "TODO-002 · b".into(),
+                title: "z".into(),
+                status: SubStatus::Pending,
+                parent: "TODO-002".into(),
+                body: String::new(),
+            },
+        )
+        .unwrap();
 
         let orphaned = t.remove_pane_subtasks(5);
         assert_eq!(orphaned, vec!["TODO-001".to_string()]);
-        assert!(t.worker_section(5).is_none(), "pane 5 section should be gone");
-        assert!(t.worker_section(7).is_some(), "pane 7 section should remain");
+        assert!(
+            t.worker_section(5).is_none(),
+            "pane 5 section should be gone"
+        );
+        assert!(
+            t.worker_section(7).is_some(),
+            "pane 7 section should remain"
+        );
     }
 
     #[test]
@@ -1249,13 +1259,17 @@ The test fixtures bake session cookies in; replace with a JWT minter.\n\
             body: String::new(),
         });
         t.upsert_worker_section(5, None);
-        t.push_subtask(5, WorkerSubtask {
-            id: "TODO-001 · a".into(),
-            title: "x".into(),
-            status: SubStatus::Done,
-            parent: "TODO-001".into(),
-            body: String::new(),
-        }).unwrap();
+        t.push_subtask(
+            5,
+            WorkerSubtask {
+                id: "TODO-001 · a".into(),
+                title: "x".into(),
+                status: SubStatus::Done,
+                parent: "TODO-001".into(),
+                body: String::new(),
+            },
+        )
+        .unwrap();
         let orphaned = t.remove_pane_subtasks(5);
         assert!(orphaned.is_empty(), "done subtasks don't trigger reset");
     }
@@ -1263,10 +1277,17 @@ The test fixtures bake session cookies in; replace with a JWT minter.\n\
     #[test]
     fn set_global_status_returns_previous_value() {
         let mut t = parse(sample_doc()).unwrap();
-        let prev = t.set_global_status("TODO-002", GlobalStatus::Approved).unwrap();
+        let prev = t
+            .set_global_status("TODO-002", GlobalStatus::Approved)
+            .unwrap();
         assert_eq!(prev, GlobalStatus::Proposed);
-        assert_eq!(t.find_global("TODO-002").unwrap().status, GlobalStatus::Approved);
-        assert!(t.set_global_status("nonexistent", GlobalStatus::Done).is_none());
+        assert_eq!(
+            t.find_global("TODO-002").unwrap().status,
+            GlobalStatus::Approved
+        );
+        assert!(t
+            .set_global_status("nonexistent", GlobalStatus::Done)
+            .is_none());
     }
 
     #[test]
@@ -1278,17 +1299,31 @@ The test fixtures bake session cookies in; replace with a JWT minter.\n\
             .unwrap();
 
         assert_eq!(prev, GlobalStatus::Proposed);
-        assert_eq!(t.find_global("TODO-002").unwrap().status, GlobalStatus::Approved);
-        assert_eq!(t.find_global("TODO-001").unwrap().status, GlobalStatus::Approved);
+        assert_eq!(
+            t.find_global("TODO-002").unwrap().status,
+            GlobalStatus::Approved
+        );
+        assert_eq!(
+            t.find_global("TODO-001").unwrap().status,
+            GlobalStatus::Approved
+        );
 
         let prev = apply_todo_approval(&mut t, "TODO-001", "reject")
             .unwrap()
             .unwrap();
 
         assert_eq!(prev, GlobalStatus::Approved);
-        assert_eq!(t.find_global("TODO-001").unwrap().status, GlobalStatus::Rejected);
-        assert_eq!(t.find_global("TODO-002").unwrap().status, GlobalStatus::Approved);
-        assert!(apply_todo_approval(&mut t, "TODO-999", "approve").unwrap().is_none());
+        assert_eq!(
+            t.find_global("TODO-001").unwrap().status,
+            GlobalStatus::Rejected
+        );
+        assert_eq!(
+            t.find_global("TODO-002").unwrap().status,
+            GlobalStatus::Approved
+        );
+        assert!(apply_todo_approval(&mut t, "TODO-999", "approve")
+            .unwrap()
+            .is_none());
         assert!(apply_todo_approval(&mut t, "TODO-001", "hold").is_err());
     }
 
@@ -1324,10 +1359,7 @@ The test fixtures bake session cookies in; replace with a JWT minter.\n\
             .set_subtask_status("TODO-001 \u{00b7} backend-2", SubStatus::Done)
             .unwrap();
         assert_eq!(prev, SubStatus::Pending);
-        assert_eq!(
-            t.workers[0].subtasks[1].status,
-            SubStatus::Done
-        );
+        assert_eq!(t.workers[0].subtasks[1].status, SubStatus::Done);
     }
 
     #[test]
@@ -1446,9 +1478,7 @@ audit body.\n";
         );
 
         let rendered = serialize(&t);
-        assert!(rendered.contains(
-            "note: auto-approved by tech-lead at 2026-06-16T10:03:48-04:00"
-        ));
+        assert!(rendered.contains("note: auto-approved by tech-lead at 2026-06-16T10:03:48-04:00"));
         let reparsed = parse(&rendered).unwrap();
         assert_eq!(reparsed, t);
     }
@@ -1555,8 +1585,15 @@ old format.\n";
         let mut t = parse(sample_doc()).unwrap();
 
         let n = t.next_actions();
-        assert!(n.expand_next.is_none(), "approved global has subtasks already");
-        assert_eq!(n.dispatch.len(), 0, "pane 578 is busy, pane 612 has no work");
+        assert!(
+            n.expand_next.is_none(),
+            "approved global has subtasks already"
+        );
+        assert_eq!(
+            n.dispatch.len(),
+            0,
+            "pane 578 is busy, pane 612 has no work"
+        );
         assert_eq!(n.pending_proposals, vec!["TODO-002".to_string()]);
         assert!(n.ready_for_review.is_empty());
 
@@ -1661,8 +1698,7 @@ old format.\n";
 
         let previous = apply_todo_approval(&mut t, "TODO-001", "approve").unwrap();
         assert_eq!(previous, Some(GlobalStatus::Proposed));
-        let added_id =
-            add_user_todo(&mut t, "user request", "user body".to_string()).unwrap();
+        let added_id = add_user_todo(&mut t, "user request", "user body".to_string()).unwrap();
         assert_eq!(added_id, "TODO-002");
 
         save(tmp.path(), &t).unwrap();

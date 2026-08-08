@@ -483,6 +483,7 @@ async fn connect_to_server(
     let register_msg = CliToServer::Register {
         token: token.to_string(),
         version: Some(VERSION.to_string()),
+        capabilities: Vec::new(),
     };
     let msg_text = serde_json::to_string(&register_msg)?;
     ws_sender.send(Message::Text(msg_text.into())).await?;
@@ -528,8 +529,7 @@ async fn connect_to_server(
 
     // Send SessionStart to register our local session with the server
     let hostname = hostname::get().ok().and_then(|h| h.into_string().ok());
-    let git_remote =
-        crate::worktree::normalized_git_remote(std::path::Path::new(working_dir));
+    let git_remote = crate::worktree::normalized_git_remote(std::path::Path::new(working_dir));
     let git_remote_url = crate::worktree::raw_git_remote(std::path::Path::new(working_dir));
     let session_start_msg = CliToServer::SessionStart {
         session_id,

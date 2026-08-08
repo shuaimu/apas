@@ -55,8 +55,7 @@ pub fn load(project_dir: &Path) -> Result<SuggestedWorkers> {
     if !p.exists() {
         return Ok(SuggestedWorkers::default());
     }
-    let s = std::fs::read_to_string(&p)
-        .with_context(|| format!("reading {}", p.display()))?;
+    let s = std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
     Ok(parse(&s))
 }
 
@@ -67,12 +66,10 @@ pub fn save(project_dir: &Path, sw: &SuggestedWorkers) -> Result<()> {
     }
     let body = serialize(sw);
     let tmp = suggested_workers_tmp_path(&p);
-    std::fs::write(&tmp, body)
-        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::write(&tmp, body).with_context(|| format!("writing {}", tmp.display()))?;
     if let Err(err) = std::fs::rename(&tmp, &p) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(err)
-            .with_context(|| format!("renaming {} -> {}", tmp.display(), p.display()));
+        return Err(err).with_context(|| format!("renaming {} -> {}", tmp.display(), p.display()));
     }
     Ok(())
 }
@@ -135,8 +132,7 @@ pub fn parse(src: &str) -> SuggestedWorkers {
                         "backstory" => entry.backstory = val.to_string(),
                         "needs_worktree" | "needs-worktree" | "worktree" => {
                             let v = val.to_ascii_lowercase();
-                            entry.needs_worktree =
-                                matches!(v.as_str(), "yes" | "y" | "true" | "1");
+                            entry.needs_worktree = matches!(v.as_str(), "yes" | "y" | "true" | "1");
                         }
                         _ => {}
                     }

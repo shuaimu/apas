@@ -289,6 +289,7 @@ async fn run_connection(
     let register_msg = CliToServer::Register {
         token: token.to_string(),
         version: Some(VERSION.to_string()),
+        capabilities: Vec::new(),
     };
     let msg_text = serde_json::to_string(&register_msg)?;
     ws_sender.send(Message::Text(msg_text.into())).await?;
@@ -517,6 +518,8 @@ async fn run_connection(
                     | Ok(ServerToCli::CreatePr { .. })
                     | Ok(ServerToCli::UpdateProjectGoal { .. })
                     | Ok(ServerToCli::UpdateProjectFlags { .. })
+                    | Ok(ServerToCli::UpdateProjectOperations { .. })
+                    | Ok(ServerToCli::ProjectPolicy { .. })
                     | Ok(ServerToCli::StartTeam { .. })
                     | Ok(ServerToCli::UpdatePaneRole { .. })
                     | Ok(ServerToCli::PlanReviewAnswer { .. })

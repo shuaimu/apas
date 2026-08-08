@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { storeDebugLog, useStore, paneWatermarksToRecord, type Message, type CliClient, type TeamRecord, type SessionCacheEntry } from './store';
+import { handleServerMessage, storeDebugLog, useStore, paneWatermarksToRecord, type Message, type CliClient, type TeamRecord, type SessionCacheEntry } from './store';
 
 describe('useStore', () => {
   beforeEach(() => {
@@ -16,6 +16,7 @@ describe('useStore', () => {
       machines: [],
       projectGoals: {},
       projectFlags: {},
+      projectPolicies: {},
       teamRecords: [],
       teamRecordsBySession: new Map(),
     });
@@ -55,6 +56,85 @@ describe('useStore', () => {
       expect(state.ws).toBeNull();
       expect(state.cliClients).toEqual([]);
       expect(state.messages).toEqual([]);
+    });
+  });
+
+  describe('cluster policy snapshots', () => {
+    it('stores the versioned policy and noncompliant running pane ids', () => {
+      handleServerMessage({
+        type: 'project_policy_changed',
+        session_id: 'policy-session',
+        policy: {
+          team_available: false,
+          allowed_launch_profiles: ['agent:codex:official:default'],
+          version: 12,
+          project_suspended: false,
+        },
+        noncompliant_pane_ids: [4, 8],
+      }, useStore.setState, useStore.getState);
+
+      expect(useStore.getState().projectPolicies['policy-session']).toEqual({
+        teamAvailable: false,
+        allowedLaunchProfiles: ['agent:codex:official:default'],
+        version: 12,
+        projectSuspended: false,
+        noncompliantPaneIds: [4, 8],
+      });
+    });
+  });
+
+  describe('project access changes', () => {
+    it('refreshes transferred roles and removes revoked project state', () => {
+      const listSessions = vi.fn();
+      useStore.setState({
+        listSessions,
+        sessionId: 'session-a',
+        isAttached: true,
+        messages: [{
+          id: 'secret',
+          role: 'assistant',
+          content: 'project content',
+          timestamp: new Date(),
+        }],
+        paneConfigs: [{ pane_id: 1 } as never],
+        sessions: [
+          {
+            id: 'session-a',
+            projectId: 'project-a',
+            status: 'active',
+            shareRole: 'owner',
+          },
+          {
+            id: 'session-b',
+            projectId: 'project-b',
+            status: 'active',
+            shareRole: 'owner',
+          },
+        ],
+      });
+
+      handleServerMessage({
+        type: 'project_access_changed',
+        project_id: 'project-a',
+        change: 'transferred',
+        role: 'user',
+      }, useStore.setState, useStore.getState);
+      expect(useStore.getState().sessions[0]).toMatchObject({
+        shareRole: 'user',
+        isShared: true,
+      });
+
+      handleServerMessage({
+        type: 'project_access_changed',
+        project_id: 'project-a',
+        change: 'revoked',
+      }, useStore.setState, useStore.getState);
+      expect(useStore.getState().sessions.map((session) => session.id)).toEqual(['session-b']);
+      expect(useStore.getState().sessionId).toBeNull();
+      expect(useStore.getState().isAttached).toBe(false);
+      expect(useStore.getState().messages).toEqual([]);
+      expect(useStore.getState().paneConfigs).toEqual([]);
+      expect(listSessions).toHaveBeenCalledTimes(2);
     });
   });
 
@@ -314,15 +394,32 @@ describe('useStore', () => {
       }));
     });
 
-    it('startTeam sends exact role specs and omits null models', () => {
+    it('startTeam sends exact retained role specs and omits null models', () => {
       const ws = makeOpenWs();
-      useStore.setState({ ws, sessionId: 'session-team' });
+      useStore.setState({
+        ws,
+        sessionId: 'session-team',
+        projectPolicies: {
+          'session-team': {
+            teamAvailable: true,
+            allowedLaunchProfiles: [
+              'agent:claude:official:claude-sonnet-4',
+              'agent:codex:official:default',
+              'agent:opencode:official:default',
+              'agent:cursor-agent:official:default',
+            ],
+            version: 1,
+            projectSuspended: false,
+            noncompliantPaneIds: [],
+          },
+        },
+      });
 
       useStore.getState().startTeam({
         manager: { provider: 'claude', model: 'claude-sonnet-4' },
         techLead: { provider: 'codex', model: null },
-        reviewer: { provider: 'minimax', model: 'MiniMax-M2.7' },
-        developer: { provider: 'glm', model: 'glm-5.1' },
+        reviewer: { provider: 'opencode', model: null },
+        developer: { provider: 'cursor-agent', model: null },
       });
 
       expect(ws.send).toHaveBeenCalledOnce();
@@ -332,10 +429,29 @@ describe('useStore', () => {
         session_id: 'session-team',
         manager: { provider: 'claude', model: 'claude-sonnet-4' },
         tech_lead: { provider: 'codex' },
-        reviewer: { provider: 'minimax', model: 'MiniMax-M2.7' },
-        developer: { provider: 'glm', model: 'glm-5.1' },
+        reviewer: { provider: 'opencode' },
+        developer: { provider: 'cursor-agent' },
       });
       expect(payload.tech_lead).not.toHaveProperty('model');
+    });
+
+    it('startTeam rejects a retired role before sending', () => {
+      const ws = makeOpenWs();
+      const showToast = vi.fn();
+      useStore.setState({ ws, showToast, sessionId: 'session-team' });
+
+      useStore.getState().startTeam({
+        manager: { provider: 'claude', model: null },
+        techLead: { provider: 'claude', model: null },
+        reviewer: { provider: 'minimax', model: 'MiniMax-M2.7' },
+        developer: { provider: 'claude', model: null },
+      });
+
+      expect(ws.send).not.toHaveBeenCalled();
+      expect(showToast).toHaveBeenCalledWith(
+        expect.stringContaining('no longer supported'),
+        'error',
+      );
     });
 
     it('startTeam shows an error toast and does not send when disconnected', () => {
@@ -367,7 +483,26 @@ describe('useStore', () => {
 
     it('rebootPane sends a reboot_pane request for the active session and target pane', () => {
       const ws = makeWs();
-      useStore.setState({ sessionId: 'session-pane-reboot', ws });
+      useStore.setState({
+        sessionId: 'session-pane-reboot',
+        ws,
+        paneConfigs: [{
+          pane_id: 42,
+          provider: 'codex',
+          mode: 'interactive',
+          session_id: 'session-pane-reboot',
+          is_paused: false,
+        }],
+        projectPolicies: {
+          'session-pane-reboot': {
+            teamAvailable: true,
+            allowedLaunchProfiles: ['agent:codex:official:default'],
+            version: 1,
+            projectSuspended: false,
+            noncompliantPaneIds: [],
+          },
+        },
+      });
 
       useStore.getState().rebootPane(42);
 
@@ -380,7 +515,20 @@ describe('useStore', () => {
 
     it('rebootCli sends only the full CLI reboot request over an open websocket', () => {
       const ws = makeWs();
-      useStore.setState({ sessionId: 'session-cli-reboot', ws });
+      useStore.setState({
+        sessionId: 'session-cli-reboot',
+        ws,
+        paneConfigs: [],
+        projectPolicies: {
+          'session-cli-reboot': {
+            teamAvailable: true,
+            allowedLaunchProfiles: [],
+            version: 1,
+            projectSuspended: false,
+            noncompliantPaneIds: [],
+          },
+        },
+      });
 
       useStore.getState().rebootCli();
 
@@ -545,24 +693,41 @@ describe('useStore', () => {
         ws,
         sessionId: 'session-flags-a',
         projectFlags: {
-          'session-flags-b': { autoApproveTodos: false, autoMergePrs: true },
+          'session-flags-b': {
+            autoApproveTodos: false,
+            autoMergePrs: true,
+            teamEnabled: false,
+            disallowedTabTypes: [],
+          },
         },
       });
 
       useStore.getState().updateProjectFlags({
         autoApproveTodos: true,
         autoMergePrs: false,
+        teamEnabled: true,
+        disallowedTabTypes: [],
       });
 
       expect(ws.send).toHaveBeenCalledWith(JSON.stringify({
-        type: 'update_project_flags',
+        type: 'update_project_operations',
         session_id: 'session-flags-a',
         auto_approve_todos: true,
         auto_merge_prs: false,
       }));
       expect(useStore.getState().projectFlags).toEqual({
-        'session-flags-a': { autoApproveTodos: true, autoMergePrs: false },
-        'session-flags-b': { autoApproveTodos: false, autoMergePrs: true },
+        'session-flags-a': {
+          autoApproveTodos: true,
+          autoMergePrs: false,
+          teamEnabled: true,
+          disallowedTabTypes: [],
+        },
+        'session-flags-b': {
+          autoApproveTodos: false,
+          autoMergePrs: true,
+          teamEnabled: false,
+          disallowedTabTypes: [],
+        },
       });
     });
 
@@ -633,6 +798,55 @@ describe('OutputType parsing', () => {
     expect(messages[0].outputType?.type).toBe('text');
     expect(messages[1].outputType?.type).toBe('code');
     expect(messages[2].outputType?.type).toBe('error');
+  });
+});
+
+describe('retired provider web guards', () => {
+  it('blocks every pane relaunch and input action before sending a websocket message', () => {
+    const send = vi.fn();
+    const ws = {
+      readyState: WebSocket.OPEN,
+      send,
+      close: vi.fn(),
+    } as unknown as WebSocket;
+    const showToast = vi.fn();
+    useStore.setState({
+      ws,
+      showToast,
+      isAttached: true,
+      sessionId: 'retired-session',
+      paneConfigs: [{
+        pane_id: 91,
+        provider: 'claude',
+        model: 'MiniMax-M2.7',
+        mode: 'deadloop',
+        session_id: 'retired-session',
+        is_paused: true,
+      }],
+      projectPolicies: {
+        'retired-session': {
+          teamAvailable: true,
+          allowedLaunchProfiles: [
+            'agent:claude:minimax:minimax-m2.7',
+            'agent:claude:official:default',
+          ],
+          version: 3,
+          projectSuspended: false,
+          noncompliantPaneIds: [91],
+        },
+      },
+    });
+
+    expect(useStore.getState().addPane('glm', 'interactive', undefined, undefined, 'glm-5.1'))
+      .toEqual(expect.objectContaining({ success: false }));
+    expect(useStore.getState().sendMessageToPane('hello', 91).success).toBe(false);
+    useStore.getState().resumePane(91);
+    useStore.getState().rebootPane(91);
+    useStore.getState().updatePaneModel(91, null, 'codex');
+    useStore.getState().startBot(91);
+
+    expect(send).not.toHaveBeenCalled();
+    expect(showToast).toHaveBeenCalledTimes(4);
   });
 });
 
@@ -712,6 +926,14 @@ describe('DeepSeek machine config', () => {
               api_base_url: 'https://api.deepseek.com/anthropic',
               api_key_configured: true,
             },
+            minimax_backend: {
+              api_key: 'must-not-survive',
+              api_key_configured: true,
+            },
+            glm_backend: {
+              api_key: 'must-not-survive',
+              api_key_configured: true,
+            },
           },
           projects: [{
             project_id: 'project-1',
@@ -728,6 +950,26 @@ describe('DeepSeek machine config', () => {
       apiKey: 'sk-existing',
       apiKeyConfigured: true,
     });
+    expect(entry.machine).not.toHaveProperty('minimaxBackend');
+    expect(entry.machine).not.toHaveProperty('glmBackend');
+  });
+
+  it('ignores retired usage messages from a mixed-version server', async () => {
+    useStore.getState().connect();
+    await new Promise(resolve => setTimeout(resolve, 10));
+    const ws = useStore.getState().ws as unknown as { onmessage?: (event: MessageEvent) => void };
+    useStore.setState({ usageLimits: new Map() });
+
+    ws.onmessage?.(new MessageEvent('message', {
+      data: JSON.stringify({
+        type: 'usage_limits',
+        cli_client_id: 'legacy-cli',
+        provider: 'glm',
+        limits: { seven_day: { utilization: 0.75 } },
+      }),
+    }));
+
+    expect(useStore.getState().usageLimits.has('legacy-cli')).toBe(false);
   });
 });
 

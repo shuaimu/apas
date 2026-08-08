@@ -9,3 +9,7 @@ path = "./data/apas.db"
 # IMPORTANT: Change this in production!
 jwt_secret = "change-me-in-production-use-a-secure-random-string"
 token_expiry_hours = 24
+# One-time migration/bootstrap identity. Set this to an existing account
+# before the first upgraded server start. It is ignored once an active
+# cluster administrator exists.
+bootstrap_admin_email = "shuai@cs.stonybrook.edu"

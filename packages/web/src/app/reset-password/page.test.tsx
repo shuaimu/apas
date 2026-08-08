@@ -139,12 +139,12 @@ describe("ResetPasswordPage", () => {
     const originalSetTimeout = globalThis.setTimeout;
     const setTimeoutSpy = vi
       .spyOn(globalThis, "setTimeout")
-      .mockImplementation((callback: TimerHandler, timeout?: number) => {
-        if (timeout === 3000 && typeof callback === "function") {
-          callback();
+      .mockImplementation((callback, timeout, ...args) => {
+        if (timeout === 3000) {
+          callback(...args);
           return 0 as unknown as ReturnType<typeof setTimeout>;
         }
-        return originalSetTimeout(callback, timeout);
+        return originalSetTimeout(callback, timeout, ...args);
       });
     fetchMock.mockResolvedValueOnce(jsonResponse({ success: true }));
 

@@ -2,183 +2,215 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import AdminPage from "./page";
 
-const ADMIN_USER_ID = "88b6016d-a8b4-400c-bdc9-f0120504a4fc";
-
-const router = vi.hoisted(() => ({
-  push: vi.fn(),
-}));
-
+const router = vi.hoisted(() => ({ push: vi.fn(), replace: vi.fn() }));
 const store = vi.hoisted(() => ({
   state: {
-    isAuthenticated: false,
     token: null as string | null,
-    userId: null as string | null,
+    clusterRole: null as "admin" | "user" | null,
   },
 }));
 
-vi.mock("next/navigation", () => ({
-  useRouter: () => router,
-}));
-
-vi.mock("@/lib/store", () => ({
-  useStore: () => store.state,
-}));
+vi.mock("next/navigation", () => ({ useRouter: () => router }));
+vi.mock("@/lib/store", () => ({ useStore: () => store.state }));
 
 const originalFetch = globalThis.fetch;
 const fetchMock = vi.fn();
 
-function seedStore({
-  isAuthenticated = true,
-  token = "admin-token",
-  userId = ADMIN_USER_ID,
-}: {
-  isAuthenticated?: boolean;
-  token?: string | null;
-  userId?: string | null;
-} = {}) {
-  store.state = {
-    isAuthenticated,
-    token,
-    userId,
-  };
+const policy = {
+  team_available: true,
+  allowed_launch_profiles: ["agent:codex:official:default"],
+  version: 6,
+  project_suspended: false,
+};
+
+function response(body: unknown, ok = true, status = ok ? 200 : 500) {
+  return { ok, status, json: vi.fn().mockResolvedValue(body) };
 }
 
-function statsFixture() {
-  return {
-    total_users: 42,
-    recent_users_7d: 3,
-    total_sessions: 128,
-    active_sessions_24h: 12,
-    total_cli_clients: 7,
-    online_cli_clients: 2,
-    total_shares: 9,
-    recent_users: [
-      { email: "new-user@example.com", created_at: "2026-06-15T12:00:00Z" },
-      { email: "unknown-date@example.com", created_at: null },
-    ],
-    sessions_per_day: [
-      { date: "2026-06-16", count: 5 },
-      { date: "2026-06-17", count: 10 },
-    ],
-  };
-}
-
-function jsonResponse(body: unknown, ok = true, status = ok ? 200 : 500) {
-  return {
-    ok,
-    status,
-    json: vi.fn().mockResolvedValue(body),
-  };
+function installApiFixtures() {
+  fetchMock.mockImplementation(async (input: string | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith("/admin/stats")) {
+      return response({
+        total_users: 4,
+        recent_users_7d: 1,
+        total_sessions: 8,
+        active_sessions_24h: 2,
+        total_cli_clients: 3,
+        online_cli_clients: 2,
+        total_shares: 0,
+      });
+    }
+    if (url.endsWith("/admin/launch-profiles")) {
+      return response([
+        { key: "agent:codex:official:default", label: "Codex / Official" },
+        { key: "agent:claude:glm:glm-5.1", label: "Legacy GLM" },
+      ]);
+    }
+    if (url.endsWith("/admin/policy/default")) return response(policy);
+    if (url.includes("/admin/users/invitations")) {
+      return response({ registration_url: "http://apas.mpaxos.com/register?invitation=invite-1" });
+    }
+    if (url.match(/\/admin\/users\/user-1$/) && init?.method === "PATCH") {
+      return response({ id: "user-1", email: "member@example.com", cluster_role: "admin", account_status: "active" });
+    }
+    if (url.includes("/admin/users?")) {
+      return response({
+        items: [{ id: "user-1", email: "member@example.com", cluster_role: "user", account_status: "active" }],
+        limit: 200,
+        offset: 0,
+      });
+    }
+    if (url.includes("/admin/projects?")) {
+      return response({
+        items: [{
+          id: "project-a",
+          owner_user_id: "owner-1",
+          owner_email: "owner@example.com",
+          lifecycle_status: "active",
+          member_count: 1,
+          active_session_count: 1,
+          connected: true,
+          effective_policy: policy,
+        }],
+        limit: 200,
+        offset: 0,
+      });
+    }
+    if (url.match(/\/admin\/projects\/project-a$/)) {
+      return response({
+        project: {
+          id: "project-a",
+          owner_user_id: "owner-1",
+          owner_email: "owner@example.com",
+          lifecycle_status: "active",
+          member_count: 1,
+          active_session_count: 1,
+        },
+        members: [{ user_id: "user-1", email: "member@example.com" }],
+        policy,
+      });
+    }
+    if (url.includes("/admin/audit?")) {
+      return response({
+        items: [{
+          id: 9,
+          actor_user_id: "admin-1",
+          action: "project.policy_updated",
+          target_type: "project",
+          target_id: "project-a",
+          details: "{\"version\":6}",
+          created_at: "2026-08-07T10:00:00Z",
+        }],
+        limit: 50,
+        offset: 0,
+      });
+    }
+    return response({ success: true });
+  });
 }
 
 describe("AdminPage", () => {
   beforeEach(() => {
     router.push.mockReset();
+    router.replace.mockReset();
     fetchMock.mockReset();
     globalThis.fetch = fetchMock as unknown as typeof fetch;
-    seedStore({ isAuthenticated: false, token: null, userId: null });
+    store.state = { token: null, clusterRole: null };
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
     globalThis.fetch = originalFetch;
-    document.body.innerHTML = "";
   });
 
-  it("redirects unauthenticated users to login without fetching stats", async () => {
+  it("redirects unauthenticated visitors without loading control-plane data", async () => {
     render(<AdminPage />);
-
-    await waitFor(() => {
-      expect(router.push).toHaveBeenCalledWith("/login");
-    });
+    await waitFor(() => expect(router.replace).toHaveBeenCalledWith("/login?redirect=/admin"));
     expect(fetchMock).not.toHaveBeenCalled();
-    expect(document.body.textContent).toBe("");
   });
 
-  it("redirects authenticated non-admin users home without fetching stats", async () => {
-    seedStore({ userId: "regular-user" });
-
+  it("uses the persisted cluster role instead of a hard-coded user id", async () => {
+    store.state = { token: "user-token", clusterRole: "user" };
     render(<AdminPage />);
-
-    await waitFor(() => {
-      expect(router.push).toHaveBeenCalledWith("/");
-    });
+    await waitFor(() => expect(router.replace).toHaveBeenCalledWith("/"));
     expect(fetchMock).not.toHaveBeenCalled();
-    expect(document.body.textContent).toBe("");
   });
 
-  it("fetches and renders admin stats, recent users, and session bars", async () => {
-    seedStore();
-    fetchMock.mockResolvedValueOnce(jsonResponse(statsFixture()));
-
+  it("loads overview statistics and editable cluster defaults for admins", async () => {
+    store.state = { token: "admin-token", clusterRole: "admin" };
+    installApiFixtures();
     render(<AdminPage />);
 
-    await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledWith("http://apas.mpaxos.com/admin/stats", {
-        headers: {
-          Authorization: "Bearer admin-token",
-        },
-      });
-    });
-
-    expect(await screen.findByText("System Dashboard")).toBeTruthy();
-    expect(screen.getByText("Total Users")).toBeTruthy();
-    expect(screen.getByText("42")).toBeTruthy();
-    expect(screen.getByText("+3 this week")).toBeTruthy();
-    expect(screen.getByText("Total Sessions")).toBeTruthy();
-    expect(screen.getByText("128")).toBeTruthy();
-    expect(screen.getByText("12 active (24h)")).toBeTruthy();
-    expect(screen.getByText("CLI Clients")).toBeTruthy();
-    expect(screen.getByText("7")).toBeTruthy();
-    expect(screen.getByText("2 online now")).toBeTruthy();
-    expect(screen.getByText("Session Shares")).toBeTruthy();
-    expect(screen.getByText("9")).toBeTruthy();
-    expect(screen.getByText("new-user@example.com")).toBeTruthy();
-    expect(screen.getByText("unknown-date@example.com")).toBeTruthy();
-    expect(screen.getByText("N/A")).toBeTruthy();
-    expect(screen.getByText("Sessions (Last 14 Days)")).toBeTruthy();
-    expect(screen.getByText("2026-06-16")).toBeTruthy();
-    expect(screen.getByText("2026-06-17")).toBeTruthy();
-    expect(screen.getByText("10")).toBeTruthy();
-
-    const smallerDayRow = screen.getByText("2026-06-16").parentElement;
-    const largerDayRow = screen.getByText("2026-06-17").parentElement;
-    expect(smallerDayRow?.querySelector(".bg-blue-500")?.getAttribute("style")).toContain(
-      "width: 50%",
-    );
-    expect(largerDayRow?.querySelector(".bg-blue-500")?.getAttribute("style")).toContain(
-      "width: 100%",
+    expect(await screen.findByText("Cluster Administration")).toBeTruthy();
+    expect(await screen.findByText("Cluster users")).toBeTruthy();
+    expect(screen.getByText("Cluster default policy")).toBeTruthy();
+    expect(screen.getByText("Codex / Official")).toBeTruthy();
+    expect(screen.queryByText("Legacy GLM")).toBeNull();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://apas.mpaxos.com/admin/stats",
+      expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer admin-token" }) }),
     );
   });
 
-  it.each([401, 403])("renders access denied for %i stats responses", async (status) => {
-    seedStore();
-    fetchMock.mockResolvedValueOnce(jsonResponse({}, false, status));
-
+  it("supports account invitation and role changes from the Users view", async () => {
+    store.state = { token: "admin-token", clusterRole: "admin" };
+    installApiFixtures();
     render(<AdminPage />);
+    await screen.findByText("Cluster Administration");
+    fireEvent.click(screen.getByRole("button", { name: "users" }));
 
-    expect(await screen.findByText("Access denied")).toBeTruthy();
+    expect(await screen.findByText("member@example.com")).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Invitation email"), { target: { value: "new@example.com" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create invitation" }));
+    expect(await screen.findByText(/register\?invitation=invite-1/)).toBeTruthy();
+
+    fireEvent.change(screen.getByLabelText("Role for member@example.com"), { target: { value: "admin" } });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "http://apas.mpaxos.com/admin/users/user-1",
+      expect.objectContaining({ method: "PATCH", body: JSON.stringify({ cluster_role: "admin" }) }),
+    ));
   });
 
-  it("renders a generic failure message for non-auth stats failures", async () => {
-    seedStore();
-    fetchMock.mockResolvedValueOnce(jsonResponse({}, false, 500));
-
+  it("loads metadata-only project administration and can clear an override", async () => {
+    store.state = { token: "admin-token", clusterRole: "admin" };
+    installApiFixtures();
     render(<AdminPage />);
+    await screen.findByText("Cluster Administration");
+    fireEvent.click(screen.getByRole("button", { name: "projects" }));
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
 
-    expect(await screen.findByText("Failed to fetch stats")).toBeTruthy();
+    expect(await screen.findByText("Project control")).toBeTruthy();
+    expect(screen.getByText("member@example.com")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Use cluster defaults" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "http://apas.mpaxos.com/admin/projects/project-a/policy",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ team_available: null, allowed_launch_profiles: null }),
+      }),
+    ));
+    expect(fetchMock.mock.calls.some(([url]) => /\/messages|\/terminal|\/diff|\/files/.test(String(url)))).toBe(false);
   });
 
-  it("routes home when the Back button is clicked", async () => {
-    seedStore();
-    fetchMock.mockResolvedValueOnce(jsonResponse(statsFixture()));
-
+  it("renders paginated audit metadata", async () => {
+    store.state = { token: "admin-token", clusterRole: "admin" };
+    installApiFixtures();
     render(<AdminPage />);
+    await screen.findByText("Cluster Administration");
+    fireEvent.click(screen.getByRole("button", { name: "audit" }));
 
-    await screen.findByText("System Dashboard");
-    router.push.mockClear();
-    fireEvent.click(screen.getByRole("button"));
+    expect(await screen.findByText("project.policy_updated")).toBeTruthy();
+    expect(screen.getByText("project: project-a")).toBeTruthy();
+    expect(screen.getByText("admin-1")).toBeTruthy();
+  });
 
+  it("returns to the cluster workspace from Back", async () => {
+    store.state = { token: "admin-token", clusterRole: "admin" };
+    installApiFixtures();
+    render(<AdminPage />);
+    await screen.findByText("Cluster Administration");
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
     expect(router.push).toHaveBeenCalledWith("/");
   });
 });

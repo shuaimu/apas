@@ -351,7 +351,9 @@ mod tests {
         assert!(DEFAULT_DEVELOPER_BACKSTORY.contains("do not edit `team-todo.md` directly"));
         assert!(WORKER_NOTE.contains("pr-comments:<url>"));
         assert!(WORKER_NOTE.contains("Worker panes don't write `team-todo.md` directly"));
-        assert!(WORKER_NOTE.contains("Do not edit `team-todo.md`, add PR lines there, or mark the subtask done yourself"));
+        assert!(WORKER_NOTE.contains(
+            "Do not edit `team-todo.md`, add PR lines there, or mark the subtask done yourself"
+        ));
         assert!(!WORKER_NOTE.contains("mark the subtask done after publishing `pr-opened`"));
         assert!(!WORKER_NOTE.contains(&["self-evident", "bugfix"].join(" ")));
 
@@ -720,9 +722,8 @@ mod tests {
             approval_pos < pr_create_pos,
             "Reviewer approval should be described before gh pr create"
         );
-        assert!(WORKER_NOTE.contains(
-            "Do not run `gh pr create --fill` before that approval record exists"
-        ));
+        assert!(WORKER_NOTE
+            .contains("Do not run `gh pr create --fill` before that approval record exists"));
         assert!(!WORKER_NOTE.contains(&["self-evident", "bugfix"].join(" ")));
     }
 
@@ -863,7 +864,9 @@ mod tests {
         assert!(got.contains("After opening the PR"));
         assert!(got.contains("do not idle-poll your own PR state or comments"));
         assert!(got.contains("The Tech Lead owns PR state tracking"));
-        assert!(got.contains("Do not edit `team-todo.md`, add PR lines there, or mark the subtask done yourself"));
+        assert!(got.contains(
+            "Do not edit `team-todo.md`, add PR lines there, or mark the subtask done yourself"
+        ));
         assert!(got.contains("pr-comments:<url>"));
         assert!(!got.contains("If `OPEN`"));
         assert!(!got.contains("If `MERGED`"));

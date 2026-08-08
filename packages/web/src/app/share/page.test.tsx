@@ -56,12 +56,12 @@ describe("SharePage", () => {
     const originalSetTimeout = globalThis.setTimeout;
     const setTimeoutSpy = vi
       .spyOn(globalThis, "setTimeout")
-      .mockImplementation((callback: TimerHandler, timeout?: number) => {
-        if (timeout === 2000 && typeof callback === "function") {
-          callback();
+      .mockImplementation((callback, timeout, ...args) => {
+        if (timeout === 2000) {
+          callback(...args);
           return 0 as unknown as ReturnType<typeof setTimeout>;
         }
-        return originalSetTimeout(callback, timeout);
+        return originalSetTimeout(callback, timeout, ...args);
       });
     navigation.code = "INVITE42";
     localStorage.setItem("apas_token", "token-123");

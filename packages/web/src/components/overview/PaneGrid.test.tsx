@@ -148,8 +148,6 @@ describe("PaneGrid existing-pane selectors", () => {
 
     expect(optionLabels(managedSelect)).toEqual([
       "Claude / Official",
-      "Claude / MiniMax 2.7",
-      "Claude / GLM 5.1",
       "Claude / DeepSeek",
       "Codex / Official",
       "OpenCode / Official",
@@ -247,5 +245,30 @@ describe("PaneGrid existing-pane selectors", () => {
         expect.objectContaining({ pane_id: 52, model: "claude-fable-5" }),
       ]),
     );
+  });
+
+  it("renders a retired historical pane as unsupported and read-only", () => {
+    const { updatePaneModel, promotePaneToManaged } = seedPaneGrid([
+      pane({
+        pane_id: 61,
+        label: "Historical Worker",
+        role: "developer",
+        managed: false,
+        provider: "claude",
+        model: "glm-5.1",
+      }),
+    ]);
+    const { onRemovePane } = renderPaneGrid("unmanaged");
+    const retiredCard = card("Historical Worker");
+
+    expect(within(retiredCard).getByText("Unsupported provider")).toBeTruthy();
+    expect(within(retiredCard).queryByRole("combobox")).toBeNull();
+    expect(within(retiredCard).queryByText("Role")).toBeNull();
+    expect(within(retiredCard).queryByText("Resume")).toBeNull();
+    expect(within(retiredCard).queryByText("+ Add to team")).toBeNull();
+    fireEvent.click(within(retiredCard).getByText("Remove"));
+    expect(onRemovePane).toHaveBeenCalledWith(61);
+    expect(updatePaneModel).not.toHaveBeenCalled();
+    expect(promotePaneToManaged).not.toHaveBeenCalled();
   });
 });

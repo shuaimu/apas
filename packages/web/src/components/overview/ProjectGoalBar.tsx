@@ -34,8 +34,10 @@ import {
 import {
   PROVIDER_MODEL_OPTIONS,
   findProviderModelOption,
+  isRetiredProviderModel,
   providerModelValue,
 } from "@/lib/providerOptions";
+import { useIsLaunchProfileAllowed } from "@/lib/tabTypes";
 
 /**
  * Deadloop prompt for the Tech Lead. Read at every iteration; tells the
@@ -143,6 +145,10 @@ export function ProjectGoalBar() {
   const resumePane = useStore((s) => s.resumePane);
   const interruptPane = useStore((s) => s.interruptPane);
   const showToast = useStore((s) => s.showToast);
+  const isLaunchProfileAllowed = useIsLaunchProfileAllowed();
+  const allowedProviderOptions = PROVIDER_MODEL_OPTIONS.filter((option) =>
+    isLaunchProfileAllowed("agent", option.provider, option.model)
+  );
 
   // Local mirror of the on-disk project_goal.md. The CLI polls the file's
   // mtime every 3s and pushes ProjectGoalChanged when it changes; we
@@ -187,7 +193,9 @@ export function ProjectGoalBar() {
     [paneConfigs],
   );
   const managedDeadloopPanes = useMemo(
-    () => managedPanes.filter((p) => p.mode === "deadloop"),
+    () => managedPanes.filter(
+      (p) => p.mode === "deadloop" && !isRetiredProviderModel(p.provider, p.model),
+    ),
     [managedPanes],
   );
   // "Team paused" = every managed deadloop pane is in pausedPanes.
@@ -294,11 +302,17 @@ export function ProjectGoalBar() {
         template.recommendedProvider ?? "claude",
         template.recommendedModel,
       );
-    return findProviderModelOption(value);
+    const selected = findProviderModelOption(value);
+    return allowedProviderOptions.find((option) => option.value === selected.value)
+      ?? allowedProviderOptions[0];
   };
 
   const launchTeamRole = (template: RoleTemplate): boolean => {
     const picked = selectedProviderOption(template);
+    if (!picked) {
+      showToast(`No launch profile is allowed for ${template.label}.`, "error");
+      return false;
+    }
     const mode = template.teamMode ?? (template.id === "manager" ? "interactive" : "deadloop");
     const prompt = template.id === "tech-lead" ? TECH_LEAD_DEADLOOP_PROMPT : undefined;
     const goal =
@@ -419,7 +433,8 @@ export function ProjectGoalBar() {
               template={template}
               pane={pane}
               paused={pane ? pausedPanes.includes(pane.pane_id) : false}
-              selectionValue={selected.value}
+              selectionValue={selected?.value ?? ""}
+              providerOptions={allowedProviderOptions}
               onSelectionChange={(value) =>
                 setSlotSelections((current) => ({
                   ...current,
@@ -522,6 +537,7 @@ function TeamRoleSlot({
   pane,
   paused,
   selectionValue,
+  providerOptions,
   onSelectionChange,
   onLaunch,
   onPause,
@@ -531,17 +547,23 @@ function TeamRoleSlot({
   pane?: PaneConfig;
   paused: boolean;
   selectionValue: string;
+  providerOptions: typeof PROVIDER_MODEL_OPTIONS;
   onSelectionChange: (value: string) => void;
   onLaunch: () => void;
   onPause: () => void;
   onResume: () => void;
 }) {
   const launched = pane !== undefined;
+  const unsupported = pane
+    ? isRetiredProviderModel(pane.provider, pane.model)
+    : false;
   const currentOption = launched
     ? findProviderModelOption(providerModelValue(pane.provider, pane.model))
     : findProviderModelOption(selectionValue);
   const statusLabel = !pane
     ? "not created"
+    : unsupported
+      ? "unsupported"
     : pane.mode === "deadloop"
       ? paused
         ? "paused"
@@ -561,7 +583,9 @@ function TeamRoleSlot({
             </span>
             <span
               className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
-                launched
+                unsupported
+                  ? "bg-red-100 text-red-800 dark:bg-red-950/40 dark:text-red-300"
+                : launched
                   ? paused
                     ? "bg-amber-100 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300"
                     : "bg-emerald-100 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300"
@@ -591,7 +615,7 @@ function TeamRoleSlot({
           </div>
         </div>
 
-        {pane && pane.mode === "deadloop" && (
+        {pane && !unsupported && pane.mode === "deadloop" && (
           paused ? (
             <button
               type="button"
@@ -624,7 +648,7 @@ function TeamRoleSlot({
               aria-label={`${template.label} provider/model`}
               className="rounded border border-violet-300 bg-white px-2 py-1 text-xs font-mono text-gray-900 dark:border-violet-800 dark:bg-gray-900 dark:text-gray-100"
             >
-              {PROVIDER_MODEL_OPTIONS.map((option) => (
+              {providerOptions.map((option) => (
                 <option key={option.value} value={option.value}>
                   {option.label}
                 </option>
@@ -634,7 +658,8 @@ function TeamRoleSlot({
           <button
             type="button"
             onClick={onLaunch}
-            className="flex items-center gap-1 rounded border border-violet-500 bg-violet-600 px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-violet-500"
+            disabled={providerOptions.length === 0}
+            className="flex items-center gap-1 rounded border border-violet-500 bg-violet-600 px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-50"
           >
             {template.id === "tech-lead" ? (
               <Bot className="h-3 w-3" />

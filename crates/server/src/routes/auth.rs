@@ -27,6 +27,8 @@ use lettre::{
 pub struct RegisterRequest {
     pub email: String,
     pub password: String,
+    #[serde(default)]
+    pub invitation_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -40,12 +42,16 @@ pub struct AuthResponse {
     pub token: String,
     pub user_id: String,
     pub user_email: String,
+    pub cluster_role: String,
+    pub account_status: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct MeResponse {
     pub user_id: String,
     pub user_email: String,
+    pub cluster_role: String,
+    pub account_status: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -63,6 +69,39 @@ pub async fn register(
         return Err(AppError::BadRequest("Email already registered".to_string()));
     }
 
+    let email = req.email.trim().to_ascii_lowercase();
+    let is_bootstrap = email.eq_ignore_ascii_case(&state.config.auth.bootstrap_admin_email)
+        && state
+            .db
+            .list_cluster_users(None, 200, 0)
+            .await?
+            .iter()
+            .all(|user| user.cluster_role != "admin" || user.account_status != "active");
+    let invitation = if is_bootstrap {
+        None
+    } else {
+        let code = req
+            .invitation_code
+            .as_deref()
+            .ok_or_else(|| AppError::AuthError("A cluster invitation is required".to_string()))?;
+        let invitation = state
+            .db
+            .get_cluster_invitation(code)
+            .await?
+            .ok_or_else(|| AppError::AuthError("Invalid cluster invitation".to_string()))?;
+        if invitation.redeemed_at.is_some()
+            || !invitation.email.eq_ignore_ascii_case(&email)
+            || chrono::DateTime::parse_from_rfc3339(&invitation.expires_at)
+                .map(|expires| expires.with_timezone(&Utc) <= Utc::now())
+                .unwrap_or(true)
+        {
+            return Err(AppError::AuthError(
+                "Invalid or expired cluster invitation".to_string(),
+            ));
+        }
+        Some(invitation)
+    };
+
     // Hash password
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
@@ -75,11 +114,25 @@ pub async fn register(
     let user_id = Uuid::new_v4().to_string();
     let user = User {
         id: user_id.clone(),
-        email: req.email,
+        email,
         password_hash,
         created_at: None,
+        cluster_role: if is_bootstrap { "admin" } else { "user" }.to_string(),
+        account_status: "active".to_string(),
     };
-    state.db.create_user(&user).await?;
+    if let Some(invitation) = invitation {
+        if !state
+            .db
+            .create_user_redeeming_cluster_invitation(&user, &invitation.code)
+            .await?
+        {
+            return Err(AppError::AuthError(
+                "Cluster invitation was already redeemed or expired".to_string(),
+            ));
+        }
+    } else {
+        state.db.create_user(&user).await?;
+    }
 
     // Generate token
     let token = generate_token(&user_id, &state.config.auth)?;
@@ -88,6 +141,8 @@ pub async fn register(
         token,
         user_id,
         user_email: user.email,
+        cluster_role: user.cluster_role,
+        account_status: user.account_status,
     }))
 }
 
@@ -108,6 +163,11 @@ pub async fn login(
     Argon2::default()
         .verify_password(req.password.as_bytes(), &parsed_hash)
         .map_err(|_| AppError::AuthError("Invalid email or password".to_string()))?;
+    if !user.is_active() {
+        return Err(AppError::AuthError(
+            "Cluster account is suspended".to_string(),
+        ));
+    }
 
     // Generate token
     let token = generate_token(&user.id, &state.config.auth)?;
@@ -116,6 +176,8 @@ pub async fn login(
         token,
         user_id: user.id,
         user_email: user.email,
+        cluster_role: user.cluster_role,
+        account_status: user.account_status,
     }))
 }
 
@@ -139,10 +201,17 @@ pub async fn me(
         .get_user_by_id(&claims.sub)
         .await?
         .ok_or_else(|| AppError::AuthError("User not found".to_string()))?;
+    if !user.is_active() {
+        return Err(AppError::AuthError(
+            "Cluster account is suspended".to_string(),
+        ));
+    }
 
     Ok(Json(MeResponse {
         user_id: user.id,
         user_email: user.email,
+        cluster_role: user.cluster_role,
+        account_status: user.account_status,
     }))
 }
 
@@ -276,6 +345,16 @@ pub async fn device_poll(
             } else if let Some(user_id) = code_state.user_id {
                 // User has completed login - generate token
                 tracing::info!("Device code {} - user_id is Some, generating token", code);
+                let user = state
+                    .db
+                    .get_user_by_id(&user_id.to_string())
+                    .await?
+                    .ok_or_else(|| AppError::AuthError("Cluster account not found".to_string()))?;
+                if !user.is_active() {
+                    return Err(AppError::AuthError(
+                        "Cluster account is suspended".to_string(),
+                    ));
+                }
                 let token = generate_token(&user_id.to_string(), &state.config.auth)?;
                 tracing::info!("Device code {} completed for user {}", code, user_id);
                 Ok(Json(DevicePollResponse::Success {
@@ -300,10 +379,32 @@ pub async fn device_poll(
 /// POST /auth/device-complete
 pub async fn device_complete(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<DeviceCompleteRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| AppError::AuthError("Authentication required".to_string()))?;
+    let claims = verify_token(token, &state.config.auth.jwt_secret)?;
+    let user = state
+        .db
+        .get_user_by_id(&claims.sub)
+        .await?
+        .ok_or_else(|| AppError::AuthError("Cluster account not found".to_string()))?;
+    if !user.is_active() {
+        return Err(AppError::AuthError(
+            "Cluster account is suspended".to_string(),
+        ));
+    }
     let user_id = Uuid::parse_str(&req.user_id)
         .map_err(|_| AppError::BadRequest("Invalid user_id".to_string()))?;
+    if user_id.to_string() != user.id {
+        return Err(AppError::AuthError(
+            "Device authorization user does not match the authenticated account".to_string(),
+        ));
+    }
 
     match state.device_codes.get_mut(&req.code) {
         Some(mut code_state) => {
@@ -511,73 +612,4 @@ async fn send_password_reset_email(
     }
 
     Ok(())
-}
-
-// Admin impersonate endpoint for debugging
-#[derive(Debug, Deserialize)]
-pub struct ImpersonateRequest {
-    pub email: String,
-    pub admin_secret: String,
-}
-
-pub async fn admin_impersonate(
-    State(state): State<AppState>,
-    Json(req): Json<ImpersonateRequest>,
-) -> Result<Json<AuthResponse>, AppError> {
-    // Check admin secret (use JWT secret as admin secret for simplicity)
-    if req.admin_secret != state.config.auth.jwt_secret {
-        return Err(AppError::AuthError("Invalid admin secret".to_string()));
-    }
-
-    // Find user by email
-    let user = state
-        .db
-        .get_user_by_email(&req.email)
-        .await?
-        .ok_or_else(|| AppError::BadRequest(format!("User not found: {}", req.email)))?;
-
-    // Generate token for the user
-    let token = generate_token(&user.id, &state.config.auth)?;
-
-    tracing::warn!("Admin impersonating user: {} ({})", user.email, user.id);
-
-    Ok(Json(AuthResponse {
-        token,
-        user_id: user.id,
-        user_email: user.email,
-    }))
-}
-
-// List all users (admin only)
-#[derive(Debug, Deserialize)]
-pub struct AdminRequest {
-    pub admin_secret: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct UserInfo {
-    pub id: String,
-    pub email: String,
-}
-
-pub async fn admin_list_users(
-    State(state): State<AppState>,
-    Json(req): Json<AdminRequest>,
-) -> Result<Json<Vec<UserInfo>>, AppError> {
-    // Check admin secret
-    if req.admin_secret != state.config.auth.jwt_secret {
-        return Err(AppError::AuthError("Invalid admin secret".to_string()));
-    }
-
-    let users = state.db.get_all_users().await?;
-
-    Ok(Json(
-        users
-            .into_iter()
-            .map(|u| UserInfo {
-                id: u.id,
-                email: u.email,
-            })
-            .collect(),
-    ))
 }

@@ -42,7 +42,7 @@ function setProjectLayout(cliClientId: string | null | undefined, key: string, v
 
 export default function Home() {
   const router = useRouter();
-  const { connected, connect, disconnect, sessionId, isAuthenticated, logout, token, userId, userEmail, serverVersion, cliClientId, cliClients, setUserEmail } = useStore();
+  const { connected, connect, disconnect, sessionId, isAuthenticated, logout, token, userId, userEmail, clusterRole, serverVersion, cliClientId, cliClients, setUserEmail, setClusterIdentity } = useStore();
   const [isCheckingAuth, setIsCheckingAuth] = useState(true);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -110,20 +110,23 @@ export default function Home() {
     connect();
   }, [connect, router]);
 
-  // Fetch user email if missing (e.g., existing sessions or legacy logins)
+  // Refresh mutable identity from the server. Role/status deliberately are
+  // not trusted from JWT claims or stale local storage.
   useEffect(() => {
-    if (userEmail) return;
+    if (userEmail && clusterRole) return;
     const authToken = token || (typeof window !== "undefined" ? localStorage.getItem("apas_token") : null);
     if (!authToken) return;
     const controller = new AbortController();
-    fetch(`${API_URL}/auth/me`, {
+    Promise.resolve(fetch(`${API_URL}/auth/me`, {
       headers: { Authorization: `Bearer ${authToken}` },
       signal: controller.signal,
-    })
+    }))
       .then(async (res) => {
-        if (!res.ok) return;
+        if (!res?.ok) return;
         const data = await res.json();
-        if (data?.user_email) {
+        if (data?.user_email && data?.cluster_role && data?.account_status && setClusterIdentity) {
+          setClusterIdentity(data.user_email, data.cluster_role, data.account_status);
+        } else if (data?.user_email) {
           setUserEmail(data.user_email);
         }
       })
@@ -131,7 +134,7 @@ export default function Home() {
         // Ignore fetch errors - keep best-effort behavior
       });
     return () => controller.abort();
-  }, [token, userEmail, setUserEmail]);
+  }, [token, userEmail, clusterRole, setUserEmail, setClusterIdentity]);
 
   // Handle auth failure - redirect to login
   useEffect(() => {

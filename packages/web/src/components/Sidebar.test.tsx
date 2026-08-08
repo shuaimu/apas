@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { AnchorHTMLAttributes, ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -58,17 +58,20 @@ function seedSidebarState({
   cliClients = [],
   machines = [],
   attachSession = vi.fn(),
+  forgetProject = vi.fn(),
 }: {
   sessions: SessionInfo[];
   cliClients?: CliClient[];
   machines?: MachineWithProjects[];
   attachSession?: StoreState["attachSession"];
+  forgetProject?: StoreState["forgetProject"];
 }) {
   act(() => {
     useStore.setState({
       attachSession,
       cliClients,
       connected: true,
+      forgetProject,
       listSessions: vi.fn(),
       machines,
       refreshCliClients: vi.fn(),
@@ -95,6 +98,7 @@ function projectRow(workingDir: string): HTMLElement {
 describe("Sidebar project list", () => {
   afterEach(() => {
     vi.clearAllMocks();
+    vi.unstubAllGlobals();
     // Collapse state persists to localStorage; clear it so a group collapsed in
     // one test doesn't start collapsed in the next.
     window.localStorage.clear();
@@ -282,5 +286,119 @@ describe("Sidebar project list", () => {
 
     fireEvent.click(header);
     expect(screen.getByText("/repo/apas")).toBeTruthy();
+  });
+
+  it("shows leave-only actions to an ordinary project user", async () => {
+    seedSidebarState({
+      sessions: [makeSession({
+        id: "representative-session",
+        projectId: "canonical-project",
+        workingDir: "/repo/shared",
+        isShared: true,
+        shareRole: "user",
+      })],
+    });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<Sidebar />);
+    fireEvent.click(screen.getByTitle("Project actions"));
+
+    expect(await screen.findByRole("button", { name: "Leave project" })).toBeTruthy();
+    expect(screen.queryByText("Invite")).toBeNull();
+    expect(screen.queryByTitle("Transfer ownership")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Permanently delete project" })).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("uses the canonical project id for transfer and exact deletion confirmation", async () => {
+    seedSidebarState({
+      sessions: [makeSession({
+        id: "representative-session",
+        projectId: "canonical-project",
+        workingDir: "/repo/owned",
+        isShared: false,
+        shareRole: "owner",
+      })],
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ code: "CODE", share_url: "http://share" }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          owner: { user_id: "owner", user_email: "owner@test" },
+          shares: [{ user_id: "member", user_email: "member@test", role: "user" }],
+          viewer_role: "owner",
+          can_manage: true,
+        }),
+      })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ success: true }) });
+    vi.stubGlobal("fetch", fetchMock);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<Sidebar />);
+    fireEvent.click(screen.getByTitle("Manage project access"));
+    fireEvent.click(await screen.findByText("Manage Access"));
+    fireEvent.click(await screen.findByTitle("Transfer ownership"));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    expect(fetchMock.mock.calls[2][0]).toBe(
+      "http://apas.mpaxos.com/projects/canonical-project/owner",
+    );
+    expect(fetchMock.mock.calls[2][1]).toMatchObject({
+      method: "PATCH",
+      body: JSON.stringify({ user_id: "member" }),
+    });
+
+    // Reopen to inspect the owner danger section after transfer closed it.
+    fetchMock
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ code: "CODE2", share_url: "http://share2" }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ owner: null, shares: [], viewer_role: "owner", can_manage: true }),
+      });
+    fireEvent.click(screen.getByTitle("Manage project access"));
+    fireEvent.click(await screen.findByText("Manage Access"));
+    const deleteButton = await screen.findByRole("button", { name: "Permanently delete project" }) as HTMLButtonElement;
+    expect(deleteButton.disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText("Project deletion confirmation"), {
+      target: { value: "wrong" },
+    });
+    expect(deleteButton.disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText("Project deletion confirmation"), {
+      target: { value: "canonical-project" },
+    });
+    expect(deleteButton.disabled).toBe(false);
+    expect(screen.queryByRole("button", { name: "Leave project" })).toBeNull();
+  });
+
+  it("keeps project state and shows the server error when leave fails", async () => {
+    const forgetProject = vi.fn();
+    seedSidebarState({
+      forgetProject,
+      sessions: [makeSession({
+        id: "shared-session",
+        projectId: "shared-project",
+        workingDir: "/repo/shared-error",
+        isShared: true,
+        shareRole: "user",
+      })],
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      status: 409,
+      json: async () => ({ error: "Membership changed concurrently" }),
+    }));
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<Sidebar />);
+    fireEvent.click(screen.getByTitle("Project actions"));
+    fireEvent.click(await screen.findByRole("button", { name: "Leave project" }));
+
+    expect(await screen.findByText("Membership changed concurrently")).toBeTruthy();
+    expect(forgetProject).not.toHaveBeenCalled();
   });
 });

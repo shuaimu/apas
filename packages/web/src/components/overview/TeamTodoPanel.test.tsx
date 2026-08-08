@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { parsePrLine } from "./TeamTodoPanel";
 import { TeamTodoPanel } from "./TeamTodoPanel";
-import { paneKey, useStore, type PaneConfig, type TeamTodoState } from "@/lib/store";
+import { paneKey, useStore, type Message, type PaneConfig, type TeamTodoState } from "@/lib/store";
 
 describe("parsePrLine", () => {
   it("parses a well-formed line", () => {
@@ -86,7 +86,6 @@ function seedTeamTodo(state: TeamTodoState) {
   act(() => {
     useStore.setState({
       sessionId: "test-session",
-      teamTodoState: state,
       teamTodoStates: new Map([["test-session", state]]),
       fetchTeamTodo: vi.fn(),
     });
@@ -153,12 +152,22 @@ function seedAgentStatus({
 }) {
   const paneId = 178;
   const reviewerPaneId = 4;
-  const messages: Record<string, { timestamp: Date }[]> = {};
+  const messages: Record<string, Message[]> = {};
   if (lastActivity != null) {
-    messages[paneKey(paneId)] = [{ timestamp: lastActivity }];
+    messages[paneKey(paneId)] = [{
+      id: "tech-lead-activity",
+      role: "assistant",
+      content: "activity",
+      timestamp: lastActivity,
+    }];
   }
   if (reviewerLastActivity != null) {
-    messages[paneKey(reviewerPaneId)] = [{ timestamp: reviewerLastActivity }];
+    messages[paneKey(reviewerPaneId)] = [{
+      id: "reviewer-activity",
+      role: "assistant",
+      content: "activity",
+      timestamp: reviewerLastActivity,
+    }];
   }
   const techLeadPane: PaneConfig = {
     pane_id: paneId,
@@ -183,7 +192,6 @@ function seedAgentStatus({
   act(() => {
     useStore.setState({
       sessionId: "test-session",
-      teamTodoState: emptyTeamTodo(),
       teamTodoStates: new Map([
         [
           "test-session",
@@ -214,7 +222,6 @@ describe("PrStateBadge fetch-driven color", () => {
     act(() => {
       useStore.setState({
         sessionId: null,
-        teamTodoState: null,
         teamTodoStates: new Map(),
       });
     });
@@ -573,7 +580,6 @@ describe("active TODO status groups", () => {
     act(() => {
       useStore.setState({
         sessionId: null,
-        teamTodoState: null,
         teamTodoStates: new Map(),
       });
     });
@@ -661,7 +667,6 @@ describe("team TODO search filter", () => {
     act(() => {
       useStore.setState({
         sessionId: null,
-        teamTodoState: null,
         teamTodoStates: new Map(),
       });
     });
@@ -769,7 +774,6 @@ describe("worker subtask lifecycle rows", () => {
     act(() => {
       useStore.setState({
         sessionId: null,
-        teamTodoState: null,
         teamTodoStates: new Map(),
       });
     });
@@ -877,7 +881,6 @@ describe("AgentStatusRow accessible indicators", () => {
     act(() => {
       useStore.setState({
         sessionId: null,
-        teamTodoState: null,
         teamTodoStates: new Map(),
         paneConfigs: [],
         paneMessages: {},
@@ -952,7 +955,6 @@ describe("waiting-for-PR hint", () => {
     act(() => {
       useStore.setState({
         sessionId: null,
-        teamTodoState: null,
         teamTodoStates: new Map(),
         paneConfigs: [],
         paneMessages: {},

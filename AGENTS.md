@@ -26,11 +26,23 @@ scp target/release/apas-server root@apas.mpaxos.com:/tmp/apas-server
 ssh root@apas.mpaxos.com "mv /tmp/apas-server /opt/apas/apas-server && chmod +x /opt/apas/apas-server && systemctl restart apas-server"
 
 # Run web
-rsync -av --exclude 'node_modules' --exclude '.next' packages/web/ root@apas.mpaxos.com:/opt/apas/web/
+# Before release, verify `npm ci && npm run audit:npm` and, in a separate clean
+# tree, `pnpm install --frozen-lockfile && pnpm run audit:pnpm`.
+web_backup_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+ssh root@apas.mpaxos.com "install -d -m 700 /opt/apas/backups/web-${web_backup_stamp} && tar -C /opt/apas --exclude='web/node_modules' -czf /opt/apas/backups/web-${web_backup_stamp}/web.tgz web"
+rsync -avn --delete --exclude 'node_modules' --exclude '.next' packages/web/ root@apas.mpaxos.com:/opt/apas/web/
+rsync -av --delete --exclude 'node_modules' --exclude '.next' packages/web/ root@apas.mpaxos.com:/opt/apas/web/
 month_start="$(date +%Y-%m-01) 00:00:00"
 web_version="$(date +%y.%m).$(git rev-list --count --since="$month_start" HEAD)"
-ssh root@apas.mpaxos.com "cd /opt/apas/web && npm install && NEXT_PUBLIC_WEB_UI_VERSION=${web_version} npm run build && systemctl restart apas-web"
+ssh root@apas.mpaxos.com "cd /opt/apas/web && npm ci && NEXT_PUBLIC_WEB_UI_VERSION=${web_version} npm run build && systemctl restart apas-web"
+for path in / /login /machines /share /admin /health; do curl -fsSL "http://apas.mpaxos.com${path}" >/dev/null; done
+ssh root@apas.mpaxos.com "systemctl is-active apas-web apas-server && journalctl -u apas-web --since '5 minutes ago' -p err --no-pager -q"
 ```
+
+For rollback, move the failed `/opt/apas/web` aside, extract the selected
+`/opt/apas/backups/web-<timestamp>/web.tgz` under `/opt/apas`, run `npm ci` and
+the versioned build, restart `apas-web`, and repeat the checks. This temporarily
+restores the vulnerable dependency graph and requires a corrected redeployment.
 
 ## Web UI
 

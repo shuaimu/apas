@@ -3,12 +3,11 @@
 import { useCallback, useRef, useEffect, useState, type ReactNode } from "react";
 import { Bot } from "lucide-react";
 import { PaneConfig, PaneKind, paneKey } from "@/lib/store";
-import { useIsTabTypeAllowed } from "@/lib/tabTypes";
+import { useIsLaunchProfileAllowed } from "@/lib/tabTypes";
 import {
   PROVIDER_MODEL_GROUPS,
   isDeepseekModel,
-  isGlmModel,
-  isMiniMaxModel,
+  isRetiredProviderModel,
 } from "@/lib/providerOptions";
 
 /** v3.3 — Manager and Tech Lead panes are always-there; hide the close
@@ -40,27 +39,10 @@ interface TabBarProps {
   trailing?: ReactNode;
 }
 
-function isMiniMaxTab(provider: string, model?: string, label?: string): boolean {
-  if (provider === "minimax") return true;
-  if (provider !== "claude") return false;
-  if (isMiniMaxModel(model)) return true;
-  return typeof label === "string" && label.toLowerCase().includes("minimax");
-}
-
-function isGlmTab(provider: string, model?: string, label?: string): boolean {
-  if (provider === "glm") return true;
-  if (provider !== "claude") return false;
-  if (isMiniMaxModel(model)) return false;
-  if (isDeepseekModel(model)) return false;
-  if (isGlmModel(model)) return true;
-  return typeof label === "string" && label.toLowerCase().includes("glm");
-}
-
 function isDeepseekTab(provider: string, model?: string, label?: string): boolean {
   if (provider === "deepseek") return true;
   if (provider !== "claude") return false;
-  if (isMiniMaxModel(model)) return false;
-  if (isGlmModel(model)) return false;
+  if (isRetiredProviderModel(provider, model)) return false;
   if (isDeepseekModel(model)) return true;
   return typeof label === "string" && label.toLowerCase().includes("deepseek");
 }
@@ -84,21 +66,8 @@ function ProviderIcon({
       </svg>
     );
   }
-  if (isMiniMaxTab(provider, model, label)) {
-    // MiniMax logo — abstract "M" shape
-    return (
-      <svg className={className} viewBox="0 0 24 24" fill="currentColor" aria-label="MiniMax">
-        <path d="M3 3h4.5L12 10l4.5-7H21v18h-4v-9.5L13 17h-2L7 11.5V21H3V3z" />
-      </svg>
-    );
-  }
-  if (isGlmTab(provider, model, label)) {
-    // GLM / Zhipu AI logo — abstract "Z" shape
-    return (
-      <svg className={className} viewBox="0 0 24 24" fill="currentColor" aria-label="GLM">
-        <path d="M4 4h16v3H9l11 13H4v-3h11L4 4zm0 0" />
-      </svg>
-    );
+  if (isRetiredProviderModel(provider, model)) {
+    return <span className={`${className} text-center font-bold`} aria-label="Unsupported provider">!</span>;
   }
   if (isDeepseekTab(provider, model, label)) {
     // DeepSeek logo — stylized whale silhouette (abstracted as a "D" with fin)
@@ -305,8 +274,7 @@ export function TabBar({
         {tabs.map((tab, index) => {
           const isActive = tab.pane_id === activeTabId;
           const isBot = tab.mode === "deadloop";
-          const isMiniMax = isMiniMaxTab(tab.provider, tab.model, tab.label);
-          const isGlm = isGlmTab(tab.provider, tab.model, tab.label);
+          const isUnsupported = isRetiredProviderModel(tab.provider, tab.model);
           const isPaused = pausedPanes.includes(tab.pane_id);
           const status = paneStatuses[paneKey(tab.pane_id)];
           const hasActivity = !!status;
@@ -348,10 +316,8 @@ export function TabBar({
                       ? "text-sky-500"
                       : tab.provider === "opencode"
                         ? "text-orange-500"
-                        : isMiniMax
-                          ? "text-cyan-500"
-                          : isGlm
-                            ? "text-emerald-500"
+                        : isUnsupported
+                          ? "text-red-500"
                             : "text-blue-500"
                 }`}
                 title={
@@ -361,10 +327,8 @@ export function TabBar({
                       ? "Cursor"
                       : tab.provider === "opencode"
                         ? "OpenCode"
-                        : isMiniMax
-                          ? "MiniMax"
-                          : isGlm
-                            ? "GLM"
+                        : isUnsupported
+                          ? "Unsupported provider"
                             : "Claude"
                 }
               >
@@ -493,9 +457,9 @@ export function TabBar({
 }
 
 function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: string, isolatedWorktree?: boolean, kind?: PaneKind) => void }) {
-  // Presentation only — the CLI re-checks `.apas` on every AddPane, so a stale
-  // menu cannot actually create a restricted tab.
-  const isAllowed = useIsTabTypeAllowed();
+  // Presentation filter; the server and CLI independently enforce the same
+  // effective profile policy when a launch is submitted.
+  const isAllowed = useIsLaunchProfileAllowed();
   const [showMenu, setShowMenu] = useState(false);
   const [isolatedWorktree, setIsolatedWorktree] = useState(false);
   const [expandedGroup, setExpandedGroup] = useState<string | null>(null);
@@ -564,10 +528,7 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
           </label>
 
           {/* Terminal tabs host the provider's real TUI on a pty. Only
-              claude and codex are offered — the other providers are either
-              the claude binary behind different env (MiniMax/GLM/DeepSeek)
-              or have interaction models we haven't verified render
-              correctly through a bare pty. Mirrors
+              claude and codex are offered. Mirrors
               `terminal_binary_for` in the CLI. */}
           <div className="border-b border-gray-100 dark:border-gray-700 pb-0.5">
             <div
@@ -596,10 +557,10 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
           </div>
 
           {PROVIDER_MODEL_GROUPS.filter((group) =>
-            // Every option in a group shares one provider — MiniMax/GLM/
-            // DeepSeek are claude *models*, not providers — so the group is
+            // Every option in a group shares one provider. DeepSeek is a
+            // Claude model, not a provider, so the group is
             // allowed exactly when its provider is.
-            group.options.some((o) => isAllowed("agent", o.provider)),
+            group.options.some((o) => isAllowed("agent", o.provider, o.model)),
           ).map((group, i) => (
             <div key={group.id}>
               {i > 0 && (
@@ -611,7 +572,7 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
                     const option = group.options[0];
                     handlePick(option.provider, option.model);
                   }}
-                  className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
+                  className={`w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 items-center gap-2 ${isAllowed("agent", group.options[0].provider, group.options[0].model) ? "flex" : "hidden"}`}
                 >
                   <span className={`${group.toneClass} flex-shrink-0`}>
                     <ProviderIcon
@@ -642,7 +603,9 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
                   </button>
                   {expandedGroup === group.id && (
                     <div className="bg-gray-50 dark:bg-gray-900/40">
-                      {group.options.map((option) => (
+                      {group.options.filter((option) =>
+                        isAllowed("agent", option.provider, option.model)
+                      ).map((option) => (
                         <button
                           key={option.value}
                           onClick={() => handlePick(option.provider, option.model)}

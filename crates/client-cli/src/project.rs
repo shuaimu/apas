@@ -456,11 +456,7 @@ pub fn get_or_create_project(dir: &Path) -> Result<ProjectMetadata> {
         let mut metadata: ProjectMetadata = match serde_json::from_str(&content) {
             Ok(m) => m,
             Err(err) => {
-                tracing::warn!(
-                    "Corrupt .apas file {:?}: {}. Regenerating.",
-                    apas_path,
-                    err
-                );
+                tracing::warn!("Corrupt .apas file {:?}: {}. Regenerating.", apas_path, err);
                 // Fall through to recreate — remove the corrupt file and regenerate
                 let _ = std::fs::remove_file(&apas_path);
                 return get_or_create_project(dir);
@@ -619,7 +615,11 @@ mod tests {
         .expect("write legacy .apas");
 
         let meta = get_or_create_project(dir.path()).expect("load legacy");
-        assert_eq!(meta.panes.len(), 2, "legacy deadloop + interactive restored");
+        assert_eq!(
+            meta.panes.len(),
+            2,
+            "legacy deadloop + interactive restored"
+        );
         assert!(meta
             .panes
             .iter()

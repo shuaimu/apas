@@ -75,8 +75,7 @@ describe("MessageList", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.clearAllMocks();
-    delete (Element.prototype as Element & { scrollIntoView?: unknown })
-      .scrollIntoView;
+    Reflect.deleteProperty(Element.prototype, "scrollIntoView");
     act(() => {
       useStore.setState(initialStore, true);
     });

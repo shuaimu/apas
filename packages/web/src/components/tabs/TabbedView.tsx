@@ -2,7 +2,7 @@
 
 import React, { useRef, useCallback, useEffect, useState, useMemo, memo } from "react";
 import dynamic from "next/dynamic";
-import { useStore, Message, PaneConfig, PaneCleanupAction, PaneKind, PlanReviewMode, TeamRecord, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, paneKey, selectActiveTeamRecords } from "@/lib/store";
+import { useStore, Message, PaneConfig, PaneCleanupAction, PaneKind, PlanReviewMode, TeamRecord, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, paneKey, selectActiveTeamRecords, type SupportedProvider } from "@/lib/store";
 import { ROLE_TEMPLATES, TEMPLATE_COLOR_CLASSES } from "@/lib/roleTemplates";
 import { useTerminalViewModes, type TerminalViewMode } from "@/lib/terminalViewMode";
 import { OverviewView } from "../overview/OverviewView";
@@ -13,6 +13,8 @@ import { TabBar } from "./TabBar";
 import { WorkerTaskBar } from "./WorkerTaskBar";
 import { UsageLimitsDisplay } from "../UsageLimits";
 import { CodeBlock } from "../code/CodeBlock";
+import { useIsLaunchProfileAllowed } from "@/lib/tabTypes";
+import { isRetiredProviderModel } from "@/lib/providerOptions";
 
 // xterm.js touches `document` at import time, so it can't be part of the
 // server bundle. Loading it lazily also keeps the ~300 KB emulator out of
@@ -191,7 +193,11 @@ export function deriveInitialActiveTabId(args: {
   savedActiveTab: string;
   tabIds: number[];
 }): number | null {
-  if (args.tabIds.length === 0) return null;
+  // A selected project with no real panes is a valid workspace state. Keep
+  // its navigation anchored on the Overview pseudo-tab so the tab bar can
+  // expose the first-pane action instead of inheriting a stale pane id from
+  // the previously selected project.
+  if (args.tabIds.length === 0) return OVERVIEW_PANE_ID;
 
   const isValidTab = (paneId: number) =>
     paneId === OVERVIEW_PANE_ID || args.tabIds.includes(paneId);
@@ -287,18 +293,6 @@ function normalizeComparablePath(path: string | undefined): string | null {
   return normalized;
 }
 
-function isMiniMaxModel(model?: string): boolean {
-  if (typeof model !== "string") return false;
-  const normalized = model.trim().toLowerCase();
-  return normalized.includes("minimax") || normalized.startsWith("m2");
-}
-
-function isGlmModel(model?: string): boolean {
-  if (typeof model !== "string") return false;
-  const normalized = model.trim().toLowerCase();
-  return normalized.startsWith("glm") || normalized.includes("glm-");
-}
-
 function isDeepseekModel(model?: string): boolean {
   if (typeof model !== "string") return false;
   const normalized = model.trim().toLowerCase();
@@ -315,8 +309,6 @@ const PROVIDER_OPTIONS = [
   { value: "codex", label: "Codex" },
   { value: "cursor-agent", label: "Cursor" },
   { value: "opencode", label: "OpenCode" },
-  { value: "minimax", label: "MiniMax" },
-  { value: "glm", label: "GLM" },
   { value: "deepseek", label: "DeepSeek" },
 ] as const;
 type ProviderOption = (typeof PROVIDER_OPTIONS)[number]["value"];
@@ -433,6 +425,7 @@ export function TabbedView({
   const cliClientId = useStore((s) => s.cliClientId);
   const sessions = useStore((s) => s.sessions);
   const machines = useStore((s) => s.machines);
+  const isLaunchProfileAllowed = useIsLaunchProfileAllowed();
 
   const sendMessageToPane = useStore((s) => s.sendMessageToPane);
   const loadMoreMessages = useStore((s) => s.loadMoreMessages);
@@ -581,8 +574,6 @@ export function TabbedView({
   // tab the user last actually chose.
   useEffect(() => {
     const ids = tabIds.split(",").filter(Boolean).map(Number);
-    if (ids.length === 0) return;
-
     const clientChanged = lastDerivedForRef.current !== cliClientId;
     lastDerivedForRef.current = cliClientId;
 
@@ -701,8 +692,6 @@ export function TabbedView({
   );
 
   const handleAddTab = useCallback((provider: string = "claude", model?: string, isolatedWorktree?: boolean, kind: PaneKind = "agent") => {
-    const isMiniMax = provider === "minimax" || (provider === "claude" && isMiniMaxModel(model));
-    const isGlm = provider === "glm" || (provider === "claude" && isGlmModel(model));
     const isDeepseek = provider === "deepseek" || (provider === "claude" && isDeepseekModel(model));
     const basePrefix = provider === "codex"
       ? "Codex"
@@ -710,7 +699,7 @@ export function TabbedView({
         ? "Cursor"
         : provider === "opencode"
           ? "OpenCode"
-          : isMiniMax ? "MiniMax" : isGlm ? "GLM" : isDeepseek ? "DeepSeek" : "Claude";
+          : isDeepseek ? "DeepSeek" : "Claude";
     // Terminal tabs sit next to agent tabs in the same bar, so the label
     // has to say which is which — they behave very differently.
     const prefix = kind === "terminal" ? `${basePrefix} TTY` : basePrefix;
@@ -774,6 +763,15 @@ export function TabbedView({
   );
 
   const activeConfig = effectiveTabs.find((t) => t.pane_id === activeTabId);
+  const visibleProviderOptions = PROVIDER_OPTIONS.filter(
+    (option) =>
+      option.value === activeConfig?.provider
+      || isLaunchProfileAllowed(
+        activeConfig?.kind ?? "agent",
+        option.value,
+        undefined,
+      ),
+  );
   const activeHasMore = activeTabId === PANE_ID_MAIN ? hasMoreMessages : (activeTabId != null ? paneHasMore[paneKey(activeTabId)] || false : false);
   const activeIsLoading = activeTabId === PANE_ID_MAIN ? isLoadingMore : loadingMorePane === activeTabId;
   const activeStatus = activeTabId != null ? paneStatuses[paneKey(activeTabId)] || null : null;
@@ -796,17 +794,9 @@ export function TabbedView({
   );
   const activeStopRequested = activeConfig?.stop_requested === true;
   const activeProvider = activeConfig?.provider;
-  const activeIsMiniMax = activeProvider === "minimax" || (
-    activeProvider === "claude" && (
-      isMiniMaxModel(activeConfig?.model) ||
-      (typeof activeConfig?.label === "string" && activeConfig.label.toLowerCase().includes("minimax"))
-    )
-  );
-  const activeIsGlm = activeProvider === "glm" || (
-    activeProvider === "claude" && (
-      isGlmModel(activeConfig?.model) ||
-      (typeof activeConfig?.label === "string" && activeConfig.label.toLowerCase().includes("glm"))
-    )
+  const activeIsUnsupported = isRetiredProviderModel(
+    activeProvider,
+    activeConfig?.model,
   );
   const activeIsDeepseek = activeProvider === "deepseek" || (
     activeProvider === "claude" && (
@@ -814,13 +804,14 @@ export function TabbedView({
       (typeof activeConfig?.label === "string" && activeConfig.label.toLowerCase().includes("deepseek"))
     )
   );
-  const activeUsageProvider = activeIsMiniMax
-    ? "minimax"
-    : activeIsGlm
-      ? "glm"
-      : activeIsDeepseek
-        ? "deepseek"
-        : activeProvider;
+  const activeUsageProvider: SupportedProvider | null = activeIsUnsupported
+    || !activeProvider
+    || activeProvider === "minimax"
+    || activeProvider === "glm"
+    ? null
+    : activeIsDeepseek
+      ? "deepseek"
+      : activeProvider;
   // Starting a bot preserves a saved Claude/Codex effort even though effort
   // is no longer editable from the web toolbar.
   const isCodexEffort = activeUsageProvider === "codex";
@@ -855,8 +846,6 @@ export function TabbedView({
   const usageLabel = useMemo(() => {
     if (!activeUsageProvider) return "Usage";
     if (activeUsageProvider === "codex") return "Codex Usage";
-    if (activeUsageProvider === "minimax") return "MiniMax Usage";
-    if (activeUsageProvider === "glm") return "GLM Usage";
     if (activeUsageProvider === "deepseek") return "DeepSeek Usage";
     return "Claude Usage";
   }, [activeUsageProvider]);
@@ -949,6 +938,12 @@ export function TabbedView({
   const handleSend = useCallback(
     (text: string) => {
       if (activeTabId == null) return { success: false, error: "No active tab" };
+      if (activeIsUnsupported) {
+        return {
+          success: false,
+          error: "This pane uses a retired provider and cannot be relaunched or receive input.",
+        };
+      }
       if (activeIsBot) {
         return {
           success: false,
@@ -974,11 +969,11 @@ export function TabbedView({
       }
       return sendMessageToPane(text, activeTabId);
     },
-    [activeIsBot, activeTabId, effectiveTabs, sendMessageToPane],
+    [activeIsBot, activeIsUnsupported, activeTabId, effectiveTabs, sendMessageToPane],
   );
 
   const handleStartBot = useCallback(() => {
-    if (activeTabId == null) return;
+    if (activeTabId == null || activeIsUnsupported) return;
     setStartBotPaneId(activeTabId);
     const savedMinInterval = typeof activeConfig?.min_iteration_interval_minutes === "number"
       ? activeConfig.min_iteration_interval_minutes
@@ -987,7 +982,7 @@ export function TabbedView({
     setBotMinIntervalDraft(String(savedMinInterval));
     setBotEffortDraft(activeBotEffortOption);
     setStartBotModalOpen(true);
-  }, [activeBotEffortOption, activeConfig?.min_iteration_interval_minutes, activeConfig?.prompt, activeTabId]);
+  }, [activeBotEffortOption, activeConfig?.min_iteration_interval_minutes, activeConfig?.prompt, activeIsUnsupported, activeTabId]);
 
   const handleStopBot = useCallback(() => {
     if (activeTabId == null) return;
@@ -1032,8 +1027,10 @@ export function TabbedView({
     }
   }, [activeIsBot, viewBotPromptModalOpen]);
 
-  // No session or no tabs - empty state
-  if (!sessionId || effectiveTabs.length === 0) {
+  // No selected project/session — keep this distinct from a selected project
+  // whose authoritative pane list is empty. The latter continues into the
+  // normal workspace so Overview and the first-pane action remain available.
+  if (!sessionId) {
     return (
       <div className="flex-1 flex flex-col min-h-0">
         {/* On mobile the tab bar (which holds the ☰ menu) isn't rendered in
@@ -1100,7 +1097,14 @@ export function TabbedView({
           the right edge of the pane frame. */}
       <div className="flex flex-wrap items-center gap-2 px-3 py-1.5 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30 flex-shrink-0">
         {/* Start/Stop Bot */}
-        {isAttached && activeTabId != null && activeTabId !== PANE_ID_MAIN && (
+        {activeIsUnsupported ? (
+          <div
+            className="rounded border border-red-300 bg-red-50 px-2.5 py-1 text-xs font-medium text-red-700 dark:border-red-800 dark:bg-red-950/40 dark:text-red-300"
+            role="status"
+          >
+            Unsupported provider — history is read-only
+          </div>
+        ) : isAttached && activeTabId != null && activeTabId !== PANE_ID_MAIN && (
           activeIsBot ? (
             <>
               {activeStopRequested ? (
@@ -1162,8 +1166,16 @@ export function TabbedView({
                   className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-1.5 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500"
                   title="Agent backend — switching kills the current agent child and respawns with a fresh session id"
                 >
-                  {PROVIDER_OPTIONS.map((option) => (
-                    <option key={option.value} value={option.value}>
+                  {visibleProviderOptions.map((option) => (
+                    <option
+                      key={option.value}
+                      value={option.value}
+                      disabled={!isLaunchProfileAllowed(
+                        activeConfig?.kind ?? "agent",
+                        option.value,
+                        undefined,
+                      )}
+                    >
                       {option.label}
                     </option>
                   ))}
@@ -1212,7 +1224,7 @@ export function TabbedView({
           )
         )}
 
-        {activeIsTerminal && (
+        {activeIsTerminal && !activeIsUnsupported && (
           <TerminalViewToggle
             mode={activeTerminalViewMode}
             onChange={setActiveTerminalViewMode}
@@ -1232,13 +1244,15 @@ export function TabbedView({
         <div className="flex-1" />
 
         {/* Actions */}
-        <button
-          onClick={() => setTeamModalOpen(true)}
-          className="inline-flex items-center px-2.5 py-1 text-xs font-medium rounded transition-colors bg-amber-600 hover:bg-amber-700 text-white"
-          title="Team scratchpad — append-only timeline of artifacts (diffs, reviews, decisions) shared across panes via .apas-team.jsonl"
-        >
-          Team{teamRecords.length > 0 ? ` (${teamRecords.length})` : ""}
-        </button>
+        {!activeIsUnsupported && (
+          <button
+            onClick={() => setTeamModalOpen(true)}
+            className="inline-flex items-center px-2.5 py-1 text-xs font-medium rounded transition-colors bg-amber-600 hover:bg-amber-700 text-white"
+            title="Team scratchpad — append-only timeline of artifacts (diffs, reviews, decisions) shared across panes via .apas-team.jsonl"
+          >
+            Team{teamRecords.length > 0 ? ` (${teamRecords.length})` : ""}
+          </button>
+        )}
         <button
           onClick={downloadSession}
           className="hidden md:inline-flex items-center px-2.5 py-1 text-xs font-medium rounded transition-colors bg-blue-500 hover:bg-blue-600 text-white"
@@ -1246,7 +1260,7 @@ export function TabbedView({
         >
           Download
         </button>
-        {shouldShowPaneRebootButton(activeTabId) && (
+        {!activeIsUnsupported && shouldShowPaneRebootButton(activeTabId) && (
           <button
             onClick={() => {
               requestConfirmedPaneReboot(
@@ -1297,6 +1311,7 @@ export function TabbedView({
       ) : (
         effectiveTabs.map((tab) => {
           const isActive = tab.pane_id === activeTabId;
+          const tabIsUnsupported = isRetiredProviderModel(tab.provider, tab.model);
           // Skip mounting panes the user hasn't activated yet for this
           // session — that's the freeze fix. The container <div> still
           // exists to keep the tab list stable; the heavy MessagePane
@@ -1310,7 +1325,23 @@ export function TabbedView({
               key={tab.pane_id}
               className={isActive ? "flex-1 flex flex-col min-h-0" : "hidden"}
             >
-              {tab.kind === "terminal" ? (
+              {tabIsUnsupported ? (
+                <>
+                  <div className="border-b border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300">
+                    This historical pane uses a retired provider. Its history is available, but it cannot receive input or be restarted.
+                  </div>
+                  <MessagePane
+                    key={`${sessionId}-${tab.pane_id}-unsupported`}
+                    paneId={tab.pane_id}
+                    messages={msgs}
+                    onLoadMore={() => loadMoreMessages(tab.pane_id)}
+                    isLoading={loadingMorePane === tab.pane_id}
+                    hasMore={paneHasMore[paneKey(tab.pane_id)] || false}
+                    isActive={isActive}
+                    role={tab.role}
+                  />
+                </>
+              ) : tab.kind === "terminal" ? (
                 // Two views over one pane. The pty stream still goes straight
                 // to xterm.js via terminalBus; the conversation view renders
                 // the turns the CLI reads out of the provider's transcript,
@@ -1359,7 +1390,7 @@ export function TabbedView({
 
       {/* Input box — disabled for running deadloop panes, hidden on
           Overview and on terminal panes (which take input in xterm). */}
-      {activeTabId !== OVERVIEW_PANE_ID && !activeIsTerminal && (
+      {activeTabId !== OVERVIEW_PANE_ID && !activeIsTerminal && !activeIsUnsupported && (
         <div className="p-3 border-t border-gray-200 dark:border-gray-700 flex-shrink-0">
           {activeIsBot ? (
             <div className="text-center text-sm text-gray-400 dark:text-gray-500 py-2">

@@ -10,6 +10,7 @@ import {
   loadAllSnapshots as loadAllSnapshotsIdb,
   saveSnapshot as saveSnapshotIdb,
 } from "./sessionCacheDb";
+import { isRetiredProviderModel } from "./providerOptions";
 
 // UUID generator with fallback for environments without crypto.randomUUID
 function generateId(): string {
@@ -61,7 +62,7 @@ export interface SessionInfo {
   createdAt?: string;
   isShared?: boolean;
   ownerEmail?: string;
-  shareRole?: "owner" | "admin" | "user";
+  shareRole?: "owner" | "user";
   isActive?: boolean;
 }
 
@@ -88,7 +89,9 @@ export interface UsageLimits {
 
 export type Provider = "claude" | "codex" | "minimax" | "glm" | "deepseek" | "opencode" | "cursor-agent";
 
-export type UsageLimitsByProvider = Partial<Record<Provider, UsageLimits>>;
+export type SupportedProvider = Exclude<Provider, "minimax" | "glm">;
+
+export type UsageLimitsByProvider = Partial<Record<SupportedProvider, UsageLimits>>;
 
 export interface CliUsageLimits {
   cliClientId: string;
@@ -101,16 +104,6 @@ export interface MachineInfo {
   os: string;
   arch: string;
   daemonVersion?: string;
-  minimaxBackend?: {
-    apiBaseUrl?: string;
-    apiKey?: string;
-    apiKeyConfigured: boolean;
-  };
-  glmBackend?: {
-    apiBaseUrl?: string;
-    apiKey?: string;
-    apiKeyConfigured: boolean;
-  };
   deepseekBackend?: {
     apiBaseUrl?: string;
     apiKey?: string;
@@ -303,6 +296,43 @@ export interface ProjectUsageStats {
   last_active?: string;
 }
 
+export interface EffectiveProjectPolicy {
+  teamAvailable: boolean;
+  allowedLaunchProfiles: string[];
+  version: number;
+  projectSuspended: boolean;
+  noncompliantPaneIds: number[];
+}
+
+export function launchProfileKey(
+  kind: PaneKind,
+  provider: Provider,
+  model?: string | null,
+): string {
+  const normalized = model?.trim().toLowerCase() || "default";
+  if (isRetiredProviderModel(provider, model)) return "unsupported:retired";
+  const frontend = provider === "deepseek"
+    ? "claude"
+    : provider;
+  const backend = normalized.includes("deepseek") || provider === "deepseek"
+      ? "deepseek"
+      : "official";
+  return `${kind}:${frontend}:${backend}:${normalized}`;
+}
+
+function policyAllowsLaunch(
+  policy: EffectiveProjectPolicy | undefined,
+  kind: PaneKind,
+  provider: Provider,
+  model?: string | null,
+): boolean {
+  return !!policy
+    && !policy.projectSuspended
+    && policy.allowedLaunchProfiles.some(
+      (key) => key.toLowerCase() === launchProfileKey(kind, provider, model).toLowerCase(),
+    );
+}
+
 /** How a pane hosts its agent. Mirrors `shared::PaneKind`.
  *  - "agent": headless stream-json worker (default, everything today).
  *  - "terminal": the provider's real TUI on a pty, rendered by xterm.js.
@@ -430,7 +460,9 @@ function collectPaneProviders(paneConfigs: PaneConfig[]): Set<Provider> {
   const seenProviders = new Set<Provider>();
   for (const pane of paneConfigs) {
     const normalized = normalizeProvider(pane.provider);
-    if (normalized) seenProviders.add(normalized);
+    if (normalized && normalized !== "minimax" && normalized !== "glm") {
+      seenProviders.add(normalized);
+    }
   }
   return seenProviders;
 }
@@ -457,14 +489,6 @@ function inferUsageProvider(
       usageProviderHints.set(cliClientId, "codex");
       return "codex";
     }
-    if (seenProviders.has("minimax")) {
-      usageProviderHints.set(cliClientId, "minimax");
-      return "minimax";
-    }
-    if (seenProviders.has("glm")) {
-      usageProviderHints.set(cliClientId, "glm");
-      return "glm";
-    }
     if (seenProviders.has("deepseek")) {
       usageProviderHints.set(cliClientId, "deepseek");
       return "deepseek";
@@ -481,6 +505,8 @@ interface AppState {
   token: string | null;
   userId: string | null;
   userEmail: string | null;
+  clusterRole: "admin" | "user" | null;
+  accountStatus: "active" | "suspended" | null;
   serverVersion: string | null;
   isAuthenticated: boolean;
 
@@ -622,8 +648,19 @@ interface AppState {
   machines: MachineWithProjects[];
 
   // Auth actions
-  login: (token: string, userId: string, userEmail: string) => void;
+  login: (
+    token: string,
+    userId: string,
+    userEmail: string,
+    clusterRole?: "admin" | "user",
+    accountStatus?: "active" | "suspended",
+  ) => void;
   setUserEmail: (userEmail: string) => void;
+  setClusterIdentity: (
+    userEmail: string,
+    clusterRole: "admin" | "user",
+    accountStatus: "active" | "suspended",
+  ) => void;
   logout: () => void;
 
   // Actions
@@ -639,6 +676,8 @@ interface AppState {
   clearMessages: () => void;
   startSession: (cliClientId?: string) => void;
   attachSession: (sessionId: string, forceReload?: boolean) => void;
+  /** Remove all browser-side projections for a project after access loss. */
+  forgetProject: (projectId: string) => void;
   refreshCliClients: () => void;
   listMachines: () => void;
   startMachineProjectCli: (machineId: string, projectId: string) => void;
@@ -651,16 +690,6 @@ interface AppState {
     cloneUrl?: string,
     basePath?: string,
   ) => boolean;
-  setMachineMiniMaxConfig: (
-    machineId: string,
-    apiKey?: string,
-    clearApiKey?: boolean,
-  ) => void;
-  setMachineGlmConfig: (
-    machineId: string,
-    apiKey?: string,
-    clearApiKey?: boolean,
-  ) => void;
   setMachineDeepseekConfig: (
     machineId: string,
     apiKey?: string,
@@ -710,7 +739,7 @@ interface AppState {
   updatePaneEffort: (paneId: number, effort: string | null) => void;
   /** Switch a pane's agent backend (provider + model). Pass `provider`
    *  to swap the underlying CLI (claude / codex / cursor-agent /
-   *  opencode / minimax / glm); pass `null` to keep current. Pass
+   *  opencode); pass `null` to keep current. Pass
    *  `model` to set / `null` to clear back to the provider's default.
    *  Kills the current agent child + respawns the worker on a fresh
    *  session id; chat history stays visible client-side but is NOT
@@ -755,6 +784,8 @@ interface AppState {
       disallowedTabTypes: string[];
     }
   >;
+  /** Server-authoritative effective policy per attached session. */
+  projectPolicies: Record<string, EffectiveProjectPolicy>;
   /** Instance creations we have sent but not yet heard back about, keyed by
    *  request_id. The daemon clones the repo before acking, which can take
    *  tens of seconds, so this is what the machines page renders as a
@@ -856,8 +887,6 @@ export interface PlanReviewPendingItem {
 }
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://apas.mpaxos.com";
-const MINIMAX_API_BASE_URL = "https://api.minimax.io/anthropic";
-const GLM_API_BASE_URL = "https://api.z.ai/api/anthropic";
 const DEEPSEEK_API_BASE_URL = "https://api.deepseek.com/anthropic";
 
 export const useStore = create<AppState>((set, get) => ({
@@ -865,6 +894,12 @@ export const useStore = create<AppState>((set, get) => ({
   token: typeof window !== 'undefined' ? localStorage.getItem("apas_token") : null,
   userId: typeof window !== 'undefined' ? localStorage.getItem("apas_user_id") : null,
   userEmail: typeof window !== 'undefined' ? localStorage.getItem("apas_user_email") : null,
+  clusterRole: typeof window !== 'undefined'
+    ? (localStorage.getItem("apas_cluster_role") as "admin" | "user" | null)
+    : null,
+  accountStatus: typeof window !== 'undefined'
+    ? (localStorage.getItem("apas_account_status") as "active" | "suspended" | null)
+    : null,
   serverVersion: null,
   isAuthenticated: false,
 
@@ -895,6 +930,7 @@ export const useStore = create<AppState>((set, get) => ({
   projectGoals: {},
   usageStats: {},
   projectFlags: {},
+  projectPolicies: {},
   pendingInstances: {},
   teamRecordsBySession: new Map(),
   teamRecords: [],
@@ -924,11 +960,13 @@ export const useStore = create<AppState>((set, get) => ({
   usageLimits: new Map(),
   machines: [],
 
-  login: (token: string, userId: string, userEmail: string) => {
+  login: (token, userId, userEmail, clusterRole = "user", accountStatus = "active") => {
     localStorage.setItem("apas_token", token);
     localStorage.setItem("apas_user_id", userId);
     localStorage.setItem("apas_user_email", userEmail);
-    set({ token, userId, userEmail, isAuthenticated: true });
+    localStorage.setItem("apas_cluster_role", clusterRole);
+    localStorage.setItem("apas_account_status", accountStatus);
+    set({ token, userId, userEmail, clusterRole, accountStatus, isAuthenticated: true });
   },
 
   setUserEmail: (userEmail: string) => {
@@ -936,10 +974,19 @@ export const useStore = create<AppState>((set, get) => ({
     set({ userEmail });
   },
 
+  setClusterIdentity: (userEmail, clusterRole, accountStatus) => {
+    localStorage.setItem("apas_user_email", userEmail);
+    localStorage.setItem("apas_cluster_role", clusterRole);
+    localStorage.setItem("apas_account_status", accountStatus);
+    set({ userEmail, clusterRole, accountStatus });
+  },
+
   logout: () => {
     localStorage.removeItem("apas_token");
     localStorage.removeItem("apas_user_id");
     localStorage.removeItem("apas_user_email");
+    localStorage.removeItem("apas_cluster_role");
+    localStorage.removeItem("apas_account_status");
     localStorage.removeItem("apas_session_id");
     const { ws, reconnectTimeout, visibilityHandler } = get();
 
@@ -960,6 +1007,8 @@ export const useStore = create<AppState>((set, get) => ({
       token: null,
       userId: null,
       userEmail: null,
+      clusterRole: null,
+      accountStatus: null,
       isAuthenticated: false,
       connected: false,
       ws: null,
@@ -971,6 +1020,7 @@ export const useStore = create<AppState>((set, get) => ({
       sessions: [],
       machines: [],
       paneModes: {},
+      projectPolicies: {},
       reconnectAttempts: 0,
       reconnectTimeout: null,
       visibilityHandler: null,
@@ -1043,7 +1093,11 @@ export const useStore = create<AppState>((set, get) => ({
       set({ reconnectAttempts: 0 });
       lastIncomingAt = Date.now();
       // Send token for authentication
-      ws.send(JSON.stringify({ type: "authenticate", token }));
+      ws.send(JSON.stringify({
+        type: "authenticate",
+        token,
+        capabilities: ["project_policy_v1"],
+      }));
     };
 
     ws.onmessage = (event) => {
@@ -1348,6 +1402,64 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
+  forgetProject: (projectId: string) => {
+    set((state) => {
+      const removedSessionIds = new Set(
+        state.sessions
+          .filter((session) => (session.projectId ?? session.id) === projectId)
+          .map((session) => session.id),
+      );
+      const sessionCache = new Map(state.sessionCache);
+      const teamRecordsBySession = new Map(state.teamRecordsBySession);
+      const teamTodoStates = new Map(state.teamTodoStates);
+      const suggestedWorkersBySession = new Map(state.suggestedWorkersBySession);
+      for (const id of removedSessionIds) {
+        sessionCache.delete(id);
+        teamRecordsBySession.delete(id);
+        teamTodoStates.delete(id);
+        suggestedWorkersBySession.delete(id);
+        void deleteSnapshotIdb(id);
+      }
+      const activeRemoved = Boolean(
+        state.sessionId && removedSessionIds.has(state.sessionId),
+      );
+      if (activeRemoved && typeof window !== "undefined") {
+        localStorage.removeItem("apas_session_id");
+        localStorage.removeItem("apas_cli_client_id");
+      }
+      return {
+        sessions: state.sessions.filter(
+          (session) => (session.projectId ?? session.id) !== projectId,
+        ),
+        sessionCache,
+        teamRecordsBySession,
+        teamTodoStates,
+        suggestedWorkersBySession,
+        ...(activeRemoved
+          ? {
+              sessionId: null,
+              cliClientId: null,
+              isAttached: false,
+              messages: [],
+              paneMessages: {},
+              paneHasMore: {},
+              paneStatuses: {},
+              paneModes: {},
+              pausedPanes: [],
+              paneConfigs: [],
+              teamRecords: [],
+              deadloopMessages: [],
+              interactiveMessages: [],
+              isDualPane: false,
+              isDeadloopPaused: false,
+              interactiveStatus: null,
+              deadloopStatus: null,
+            }
+          : {}),
+      };
+    });
+  },
+
   refreshCliClients: () => {
     const { ws } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -1432,91 +1544,6 @@ export const useStore = create<AppState>((set, get) => ({
     }));
     showToast(`Creating ${instanceName} — cloning, this can take a minute`, "info");
     return true;
-  },
-
-  setMachineMiniMaxConfig: (
-    machineId: string,
-    apiKey?: string,
-    clearApiKey: boolean = false,
-  ) => {
-    const { ws } = get();
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      return;
-    }
-    const normalizedApiKey =
-      apiKey && apiKey.trim().length > 0 ? apiKey.trim() : undefined;
-
-    // Reflect the key change in UI immediately so users can verify what was saved.
-    set((state) => ({
-      machines: state.machines.map((entry) => {
-        if (entry.machine.machineId !== machineId) return entry;
-        const existingBackend = entry.machine.minimaxBackend;
-        const nextApiKey = clearApiKey
-          ? undefined
-          : (normalizedApiKey ?? existingBackend?.apiKey);
-        return {
-          ...entry,
-          machine: {
-            ...entry.machine,
-            minimaxBackend: {
-              apiBaseUrl: MINIMAX_API_BASE_URL,
-              apiKey: nextApiKey,
-              apiKeyConfigured: Boolean(nextApiKey),
-            },
-          },
-        };
-      }),
-    }));
-
-    ws.send(JSON.stringify({
-      type: "set_machine_mini_max_config",
-      machine_id: machineId,
-      api_base_url: MINIMAX_API_BASE_URL,
-      api_key: normalizedApiKey,
-      clear_api_key: clearApiKey,
-    }));
-  },
-
-  setMachineGlmConfig: (
-    machineId: string,
-    apiKey?: string,
-    clearApiKey: boolean = false,
-  ) => {
-    const { ws } = get();
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      return;
-    }
-    const normalizedApiKey =
-      apiKey && apiKey.trim().length > 0 ? apiKey.trim() : undefined;
-
-    set((state) => ({
-      machines: state.machines.map((entry) => {
-        if (entry.machine.machineId !== machineId) return entry;
-        const existingBackend = entry.machine.glmBackend;
-        const nextApiKey = clearApiKey
-          ? undefined
-          : (normalizedApiKey ?? existingBackend?.apiKey);
-        return {
-          ...entry,
-          machine: {
-            ...entry.machine,
-            glmBackend: {
-              apiBaseUrl: GLM_API_BASE_URL,
-              apiKey: nextApiKey,
-              apiKeyConfigured: Boolean(nextApiKey),
-            },
-          },
-        };
-      }),
-    }));
-
-    ws.send(JSON.stringify({
-      type: "set_machine_glm_config",
-      machine_id: machineId,
-      api_base_url: GLM_API_BASE_URL,
-      api_key: normalizedApiKey,
-      clear_api_key: clearApiKey,
-    }));
   },
 
   setMachineDeepseekConfig: (
@@ -1833,7 +1860,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   sendMessageToPane: (text: string, pane: PaneType | number): { success: boolean; error?: string } => {
-    const { ws, sessionId, isAttached } = get();
+    const { ws, sessionId, isAttached, paneConfigs } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       console.error("WebSocket not connected");
       return { success: false, error: "Not connected to server" };
@@ -1846,6 +1873,15 @@ export const useStore = create<AppState>((set, get) => ({
 
     const paneId = typeof pane === "number" ? pane : normalizePaneId(pane, undefined);
     const paneType = legacyPaneType(paneId) || (typeof pane === "string" ? pane : undefined);
+    const paneConfig = paneId == null
+      ? undefined
+      : paneConfigs.find((candidate) => candidate.pane_id === paneId);
+    if (paneConfig && isRetiredProviderModel(paneConfig.provider, paneConfig.model)) {
+      return {
+        success: false,
+        error: "This pane uses a retired provider and is read-only.",
+      };
+    }
 
     // One shared id for the optimistic placeholder + the pending-send
     // queue entry — lets the `user_input` ack handler strip the
@@ -2014,7 +2050,12 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   resumeDeadloop: () => {
-    const { ws, sessionId } = get();
+    const { ws, sessionId, paneConfigs, showToast } = get();
+    const pane = paneConfigs.find((candidate) => candidate.pane_id === PANE_ID_DEADLOOP);
+    if (pane && isRetiredProviderModel(pane.provider, pane.model)) {
+      showToast("This pane uses a retired provider and cannot be resumed", "error");
+      return;
+    }
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "resume_deadloop", session_id: get().sessionId }));
       // Also send new pane-specific resume
@@ -2034,7 +2075,17 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   resumePane: (paneId: number) => {
-    const { ws, sessionId } = get();
+    const { ws, sessionId, paneConfigs, projectPolicies, showToast } = get();
+    const pane = paneConfigs.find((candidate) => candidate.pane_id === paneId);
+    const policy = sessionId ? projectPolicies[sessionId] : undefined;
+    if (pane && isRetiredProviderModel(pane.provider, pane.model)) {
+      showToast("This pane uses a retired provider and cannot be resumed", "error");
+      return;
+    }
+    if (!sessionId || !pane || (pane.managed && !policy?.teamAvailable) || !policyAllowsLaunch(policy, pane.kind ?? "agent", pane.provider, pane.model)) {
+      showToast("Resume refused by the current cluster policy", "error");
+      return;
+    }
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "resume_pane", session_id: sessionId, pane_id: paneId }));
       if (paneId === PANE_ID_DEADLOOP) {
@@ -2044,7 +2095,17 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   rebootPane: (paneId: number) => {
-    const { ws, sessionId } = get();
+    const { ws, sessionId, paneConfigs, projectPolicies, showToast } = get();
+    const pane = paneConfigs.find((candidate) => candidate.pane_id === paneId);
+    const policy = sessionId ? projectPolicies[sessionId] : undefined;
+    if (pane && isRetiredProviderModel(pane.provider, pane.model)) {
+      showToast("This pane uses a retired provider and cannot be rebooted", "error");
+      return;
+    }
+    if (!sessionId || !pane || (pane.managed && !policy?.teamAvailable) || !policyAllowsLaunch(policy, pane.kind ?? "agent", pane.provider, pane.model)) {
+      showToast("Reboot refused by the current cluster policy", "error");
+      return;
+    }
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "reboot_pane", session_id: sessionId, pane_id: paneId }));
     }
@@ -2072,7 +2133,7 @@ export const useStore = create<AppState>((set, get) => ({
      *  publish no stream events, so the Tech Lead can't delegate to them. */
     kind: PaneKind = "agent",
   ) => {
-    const { ws, sessionId, isAttached } = get();
+    const { ws, sessionId, isAttached, projectPolicies } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return { success: false, error: "Not connected to server" };
     }
@@ -2081,6 +2142,26 @@ export const useStore = create<AppState>((set, get) => ({
     }
     if (!isAttached) {
       return { success: false, error: "Project is not running. Start the CLI client first." };
+    }
+    const policy = projectPolicies[sessionId];
+    const typedProvider = provider as Provider;
+    if (isRetiredProviderModel(provider, model)) {
+      return { success: false, error: "MiniMax and GLM providers are no longer supported." };
+    }
+    if (!policy) {
+      return { success: false, error: "Waiting for an authoritative cluster policy; reload or update the project host CLI." };
+    }
+    if (policy.projectSuspended) {
+      return { success: false, error: "This project is suspended by a cluster administrator." };
+    }
+    if (managed && !policy.teamAvailable) {
+      return { success: false, error: `Team launch is disabled by cluster policy v${policy.version}.` };
+    }
+    if (!policyAllowsLaunch(policy, kind, typedProvider, model)) {
+      return {
+        success: false,
+        error: `Launch profile ${launchProfileKey(kind, typedProvider, model)} is disabled by cluster policy v${policy.version}.`,
+      };
     }
     ws.send(JSON.stringify({
       type: "add_pane",
@@ -2146,12 +2227,10 @@ export const useStore = create<AppState>((set, get) => ({
     }
     ws.send(
       JSON.stringify({
-        type: "update_project_flags",
+        type: "update_project_operations",
         session_id: get().sessionId,
         auto_approve_todos: flags.autoApproveTodos,
         auto_merge_prs: flags.autoMergePrs,
-        team_enabled: flags.teamEnabled,
-        disallowed_tab_types: flags.disallowedTabTypes,
       }),
     );
     // Optimistic local update so the toggle feels instant; the CLI
@@ -2164,9 +2243,21 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   startTeam: (specs) => {
-    const { ws, showToast } = get();
+    const { ws, showToast, sessionId, projectPolicies } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       showToast("Not connected — cannot start team", "error");
+      return;
+    }
+    const policy = sessionId ? projectPolicies[sessionId] : undefined;
+    const roles = [specs.manager, specs.techLead, specs.reviewer, specs.developer];
+    if (roles.some((role) => isRetiredProviderModel(role.provider, role.model))) {
+      showToast("MiniMax and GLM team roles are no longer supported", "error");
+      return;
+    }
+    if (!policy || policy.projectSuspended || !policy.teamAvailable || roles.some((role) =>
+      !policyAllowsLaunch(policy, "agent", role.provider as Provider, role.model)
+    )) {
+      showToast("This team configuration is unavailable under the current cluster policy", "error");
       return;
     }
     const toSpec = (s: { provider: string; model: string | null }) => ({
@@ -2461,7 +2552,28 @@ export const useStore = create<AppState>((set, get) => ({
     model: string | null,
     provider?: string | null,
   ) => {
-    const { ws, sessionId } = get();
+    const { ws, sessionId, paneConfigs, projectPolicies, showToast } = get();
+    const pane = paneConfigs.find((candidate) => candidate.pane_id === paneId);
+    const desiredProvider = (provider || pane?.provider) as Provider | undefined;
+    const policy = sessionId ? projectPolicies[sessionId] : undefined;
+    if (
+      pane && (
+        isRetiredProviderModel(pane.provider, pane.model)
+        || isRetiredProviderModel(desiredProvider, model)
+      )
+    ) {
+      showToast("This provider is retired; model and provider switches are disabled", "error");
+      return;
+    }
+    if (!sessionId || !pane || !desiredProvider || (pane.managed && !policy?.teamAvailable) || !policyAllowsLaunch(
+      policy,
+      pane.kind ?? "agent",
+      desiredProvider,
+      model,
+    )) {
+      showToast("Model switch refused by the current cluster policy", "error");
+      return;
+    }
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(
         JSON.stringify({
@@ -2504,7 +2616,22 @@ export const useStore = create<AppState>((set, get) => ({
     minIterationIntervalMinutes?: number,
     effort?: string,
   ) => {
-    const { ws } = get();
+    const { ws, sessionId, paneConfigs, projectPolicies, showToast } = get();
+    const pane = paneConfigs.find((candidate) => candidate.pane_id === paneId);
+    const policy = sessionId ? projectPolicies[sessionId] : undefined;
+    if (pane && isRetiredProviderModel(pane.provider, pane.model)) {
+      showToast("This pane uses a retired provider and cannot be started", "error");
+      return;
+    }
+    if (!sessionId || !pane || (pane.managed && !policy?.teamAvailable) || !policyAllowsLaunch(
+      policy,
+      pane.kind ?? "agent",
+      pane.provider,
+      pane.model,
+    )) {
+      showToast("Start refused by the current cluster policy", "error");
+      return;
+    }
     if (ws && ws.readyState === WebSocket.OPEN) {
       const trimmedEffort = typeof effort === "string" ? effort.trim() : "";
       ws.send(JSON.stringify({
@@ -2528,7 +2655,15 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   rebootCli: () => {
-    const { ws } = get();
+    const { ws, sessionId, paneConfigs, projectPolicies, showToast } = get();
+    const policy = sessionId ? projectPolicies[sessionId] : undefined;
+    if (!policy || paneConfigs.some((pane) =>
+      (pane.managed && !policy.teamAvailable)
+      || !policyAllowsLaunch(policy, pane.kind ?? "agent", pane.provider, pane.model)
+    )) {
+      showToast("CLI reboot refused because one or more panes are outside cluster policy", "error");
+      return;
+    }
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "reboot_cli", session_id: get().sessionId }));
     }
@@ -3297,10 +3432,19 @@ export function handleServerMessage(
         isAuthenticated: true,
         userId: data.user_id as string,
         userEmail: (data.user_email as string | undefined) ?? get().userEmail,
+        clusterRole: (data.cluster_role as "admin" | "user" | undefined) ?? null,
+        accountStatus:
+          (data.account_status as "active" | "suspended" | undefined) ?? null,
         serverVersion: (data.server_version as string | undefined) ?? null,
       });
       if (data.user_email) {
         localStorage.setItem("apas_user_email", data.user_email as string);
+      }
+      if (data.cluster_role) {
+        localStorage.setItem("apas_cluster_role", data.cluster_role as string);
+      }
+      if (data.account_status) {
+        localStorage.setItem("apas_account_status", data.account_status as string);
       }
       storeDebugLog("Authenticated as user:", data.user_id);
       get().refreshCliClients();
@@ -3395,12 +3539,16 @@ export function handleServerMessage(
       localStorage.removeItem("apas_token");
       localStorage.removeItem("apas_user_id");
       localStorage.removeItem("apas_user_email");
+      localStorage.removeItem("apas_cluster_role");
+      localStorage.removeItem("apas_account_status");
       set({
         connected: false,
         isAuthenticated: false,
         token: null,
         userId: null,
         userEmail: null,
+        clusterRole: null,
+        accountStatus: null,
         serverVersion: null,
       });
       break;
@@ -3454,24 +3602,6 @@ export function handleServerMessage(
             os: machine.os as string,
             arch: machine.arch as string,
             daemonVersion: machine.daemon_version as string | undefined,
-            minimaxBackend: machine.minimax_backend
-              ? {
-                  apiBaseUrl: ((machine.minimax_backend as Record<string, unknown>).api_base_url as string | undefined),
-                  apiKey: ((machine.minimax_backend as Record<string, unknown>).api_key as string | undefined),
-                  apiKeyConfigured: Boolean(
-                    (machine.minimax_backend as Record<string, unknown>).api_key_configured
-                  ),
-                }
-              : undefined,
-            glmBackend: machine.glm_backend
-              ? {
-                  apiBaseUrl: ((machine.glm_backend as Record<string, unknown>).api_base_url as string | undefined),
-                  apiKey: ((machine.glm_backend as Record<string, unknown>).api_key as string | undefined),
-                  apiKeyConfigured: Boolean(
-                    (machine.glm_backend as Record<string, unknown>).api_key_configured
-                  ),
-                }
-              : undefined,
             deepseekBackend: machine.deepseek_backend
               ? {
                   apiBaseUrl: ((machine.deepseek_backend as Record<string, unknown>).api_base_url as string | undefined),
@@ -3501,32 +3631,6 @@ export function handleServerMessage(
         );
         const merged = parsed.map((entry) => {
           const previous = previousById.get(entry.machine.machineId);
-          const minimaxBackend = entry.machine.minimaxBackend;
-          const previousMiniMaxKey = previous?.machine.minimaxBackend?.apiKey;
-          const mergedMiniMax =
-            minimaxBackend &&
-            minimaxBackend.apiKey === undefined &&
-            minimaxBackend.apiKeyConfigured &&
-            previousMiniMaxKey
-              ? {
-                  ...minimaxBackend,
-                  apiKey: previousMiniMaxKey,
-                }
-              : minimaxBackend;
-
-          const glmBackend = entry.machine.glmBackend;
-          const previousGlmKey = previous?.machine.glmBackend?.apiKey;
-          const mergedGlm =
-            glmBackend &&
-            glmBackend.apiKey === undefined &&
-            glmBackend.apiKeyConfigured &&
-            previousGlmKey
-              ? {
-                  ...glmBackend,
-                  apiKey: previousGlmKey,
-                }
-              : glmBackend;
-
           const deepseekBackend = entry.machine.deepseekBackend;
           const previousDeepseekKey = previous?.machine.deepseekBackend?.apiKey;
           const mergedDeepseek =
@@ -3544,8 +3648,6 @@ export function handleServerMessage(
             ...entry,
             machine: {
               ...entry.machine,
-              minimaxBackend: mergedMiniMax,
-              glmBackend: mergedGlm,
               deepseekBackend: mergedDeepseek,
             },
           };
@@ -3745,6 +3847,36 @@ export function handleServerMessage(
       break;
     }
 
+    case "project_policy_changed": {
+      const sessionId = data.session_id as string | undefined;
+      const raw = data.policy as Record<string, unknown> | undefined;
+      if (sessionId && raw) {
+        const policy: EffectiveProjectPolicy = {
+          teamAvailable: raw.team_available === true,
+          allowedLaunchProfiles: Array.isArray(raw.allowed_launch_profiles)
+            ? raw.allowed_launch_profiles as string[]
+            : [],
+          version: typeof raw.version === "number" ? raw.version : 0,
+          projectSuspended: raw.project_suspended === true,
+          noncompliantPaneIds: Array.isArray(data.noncompliant_pane_ids)
+            ? data.noncompliant_pane_ids as number[]
+            : [],
+        };
+        set((state) => ({
+          projectPolicies: { ...state.projectPolicies, [sessionId]: policy },
+        }));
+        if (policy.projectSuspended) {
+          get().showToast("This project is suspended by a cluster administrator", "error");
+        } else if (policy.noncompliantPaneIds.length > 0) {
+          get().showToast(
+            `Panes ${policy.noncompliantPaneIds.join(", ")} are outside cluster policy and cannot be relaunched`,
+            "info",
+          );
+        }
+      }
+      break;
+    }
+
     case "team_todo_state": {
       const responseSessionId = data.session_id as string | undefined;
       if (!responseSessionId) break;
@@ -3928,9 +4060,33 @@ export function handleServerMessage(
       set((state) => ({ messages: [...state.messages, errorMessage] }));
       break;
 
+    case "project_access_changed": {
+      const projectId = data.project_id as string | undefined;
+      const change = data.change as "transferred" | "revoked" | "deleted" | undefined;
+      if (!projectId || !change) break;
+      if (change === "transferred") {
+        const role = data.role === "owner" ? "owner" : "user";
+        set((state) => ({
+          sessions: state.sessions.map((session) =>
+            (session.projectId ?? session.id) === projectId
+              ? {
+                  ...session,
+                  shareRole: role,
+                  isShared: role === "user",
+                }
+              : session,
+          ),
+        }));
+      } else {
+        get().forgetProject(projectId);
+      }
+      get().listSessions();
+      break;
+    }
+
     case "sessions": {
       const sessions = (data.sessions as Array<Record<string, unknown>>) || [];
-      const parsedSessions = sessions.map((s) => ({
+      const parsedSessions: SessionInfo[] = sessions.map((s) => ({
         id: s.id as string,
         projectId: (s.project_id as string | undefined) ?? (s.id as string),
         cliClientId: s.cli_client_id as string | undefined,
@@ -3942,7 +4098,7 @@ export function handleServerMessage(
         createdAt: s.created_at as string | undefined,
         isShared: s.is_shared as boolean | undefined,
         ownerEmail: s.owner_email as string | undefined,
-        shareRole: s.share_role as "owner" | "admin" | "user" | undefined,
+        shareRole: s.share_role === "owner" ? "owner" : s.share_role ? "user" : undefined,
         isActive: s.is_active as boolean | undefined,
       }));
 
@@ -4673,8 +4829,7 @@ export function handleServerMessage(
         const duration = msg.duration_ms;
 
         // Threshold for "substantial" content that shouldn't be crammed into system metadata.
-        // Multi-line content or content > 150 chars is treated as actual response content
-        // (MiniMax sends full responses in the result field instead of via Assistant messages).
+        // Multi-line content or content > 150 chars is treated as actual response content.
         const isSubstantialContent = resultContent && (
           resultContent.includes("\n") ||
           resultContent.length > 150
@@ -4682,8 +4837,7 @@ export function handleServerMessage(
 
         if (isSubstantialContent) {
           // Only create an assistant message if the text wasn't already streamed
-          // via an earlier "assistant" event (Claude/Codex stream text blocks first,
-          // but MiniMax only puts the full response in the result field).
+          // via an earlier "assistant" event.
           const normalizedPaneId = normalizePaneId(paneType, normalizeRawPaneId(paneId));
           // Look in the right bucket — current session uses live state,
           // background sessions use the cached snapshot.
@@ -4803,6 +4957,12 @@ export function handleServerMessage(
         const provider =
           directProvider ??
           inferUsageProvider(cliClientId, get().paneConfigs);
+
+        // Mixed-version servers may still send retired telemetry. Ignore it
+        // rather than inserting a provider card or retaining the payload.
+        if (provider === "minimax" || provider === "glm") {
+          break;
+        }
 
         if (directProvider) {
           usageProviderHints.set(cliClientId, directProvider);

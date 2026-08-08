@@ -26,6 +26,8 @@ use crate::project::{get_or_create_project, save_project};
 use crate::terminal_pane::{terminal_binary_for, TerminalHandle, TerminalPanes};
 use crate::tui::{App, PaneOutput, TuiCommand, TuiEvent};
 
+type ProjectPolicyState = Arc<Mutex<Option<shared::EffectiveProjectPolicy>>>;
+
 /// Classic/manual single-agent fallback. Managed team panes should be created
 /// from role templates / canonical role prompts instead of this TODO.md loop.
 const DEFAULT_PROMPT: &str = r#"Work on tasks defined in TODO.md. Do the following steps. Don't ask me for advice, just pick the best option you think that is honest, complete, and not corner-cutting:
@@ -61,25 +63,6 @@ fn resolve_binary_path(name: &str) -> String {
     name.to_string()
 }
 
-fn is_minimax_model(model: Option<&str>) -> bool {
-    model
-        .map(|m| {
-            let normalized = m.trim().to_ascii_lowercase();
-            !normalized.is_empty()
-                && (normalized.contains("minimax") || normalized.starts_with("m2"))
-        })
-        .unwrap_or(false)
-}
-
-fn is_glm_model(model: Option<&str>) -> bool {
-    model
-        .map(|m| {
-            let normalized = m.trim().to_ascii_lowercase();
-            !normalized.is_empty() && (normalized.starts_with("glm") || normalized.contains("glm-"))
-        })
-        .unwrap_or(false)
-}
-
 fn is_deepseek_model(model: Option<&str>) -> bool {
     model
         .map(|m| {
@@ -104,38 +87,28 @@ fn truncate_str_at_char_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
-/// Persist the project-level flags and echo them back for the web.
-///
-/// Returns the echo plus whether `team_enabled` went true -> false, since the
-/// caller has to stop a running team on that transition and only this function
-/// sees the previous value.
-#[allow(clippy::too_many_arguments)]
-fn update_project_flags(
+/// Persist only owner-operable workflow settings. Cluster-governed team and
+/// launch-profile fields remain untouched even when an older server sends the
+/// legacy combined message.
+fn update_project_operations(
     project_dir: &Path,
     session_id: Uuid,
     auto_approve_todos: bool,
     auto_merge_prs: bool,
-    team_enabled: bool,
-    disallowed_tab_types: Vec<String>,
-) -> Result<(CliToServer, bool)> {
+) -> Result<CliToServer> {
     let mut meta = get_or_create_project(project_dir)?;
-    let team_was_enabled = meta.team_enabled;
     meta.auto_approve_todos = auto_approve_todos;
     meta.auto_merge_prs = auto_merge_prs;
-    meta.team_enabled = team_enabled;
-    meta.disallowed_tab_types = disallowed_tab_types.clone();
+    let team_enabled = meta.team_enabled;
+    let disallowed_tab_types = meta.disallowed_tab_types.clone();
     save_project(project_dir, &meta)?;
-
-    Ok((
-        CliToServer::ProjectFlagsChanged {
-            session_id,
-            auto_approve_todos,
-            auto_merge_prs,
-            team_enabled,
-            disallowed_tab_types,
-        },
-        team_was_enabled && !team_enabled,
-    ))
+    Ok(CliToServer::ProjectFlagsChanged {
+        session_id,
+        auto_approve_todos,
+        auto_merge_prs,
+        team_enabled,
+        disallowed_tab_types,
+    })
 }
 
 /// Whether this project permits creating a tab of the given kind + provider.
@@ -148,14 +121,37 @@ fn update_project_flags(
 /// worst case here is a user opening a tab an owner meant to block; failing
 /// closed would make an unreadable file lock everyone out of the project
 /// entirely, which is the worse outcome for a menu restriction.
-fn tab_type_allowed_for(project_dir: &Path, kind: shared::PaneKind, provider: Provider) -> bool {
-    match get_or_create_project(project_dir) {
-        Ok(meta) => shared::tab_type_allowed(&meta.disallowed_tab_types, kind, provider),
-        Err(err) => {
-            tracing::warn!(%err, "could not read .apas for tab-type policy; allowing");
-            true
-        }
-    }
+fn launch_allowed_by_server_policy(
+    policy_state: &ProjectPolicyState,
+    kind: shared::PaneKind,
+    provider: Provider,
+    model: Option<&str>,
+) -> bool {
+    policy_state
+        .lock()
+        .ok()
+        .and_then(|policy| policy.clone())
+        .is_some_and(|policy| policy.allows(kind, provider, model))
+}
+
+fn team_allowed_by_server_policy(
+    policy_state: &ProjectPolicyState,
+    roles: &[&shared::TeamRoleSpec],
+) -> bool {
+    policy_state
+        .lock()
+        .ok()
+        .and_then(|policy| policy.clone())
+        .is_some_and(|policy| {
+            policy.team_available
+                && roles.iter().all(|role| {
+                    policy.allows(
+                        shared::PaneKind::Agent,
+                        role.provider.unwrap_or(Provider::Claude),
+                        role.model.as_deref(),
+                    )
+                })
+        })
 }
 
 /// Tell the web about the current pane roster and persist it to `.apas`.
@@ -275,6 +271,69 @@ fn stop_managed_team(pane_metas: &PaneMetas, pane_pauses: &PanePauses) -> usize 
     targets.len()
 }
 
+/// Stop only panes whose persisted provider/model identifies a retired
+/// backend. Their metadata remains in `pane_metas` for history and deletion,
+/// but no input or process handle remains capable of relaunching them.
+fn stop_retired_panes(
+    pane_metas: &PaneMetas,
+    pane_pauses: &PanePauses,
+    input_channels: &InputChannels,
+    terminal_panes: &TerminalPanes,
+) -> Vec<u32> {
+    struct Target {
+        pane_id: u32,
+        is_deadloop: bool,
+        soft_interrupt: Option<mpsc::Sender<()>>,
+        child_process: Arc<Mutex<Option<std::process::Child>>>,
+    }
+
+    let targets = pane_metas
+        .lock()
+        .map(|metas| {
+            metas
+                .iter()
+                .filter(|(_, meta)| shared::is_retired_launch(meta.provider, meta.model.as_deref()))
+                .map(|(pane_id, meta)| Target {
+                    pane_id: *pane_id,
+                    is_deadloop: meta.mode == shared::PaneMode::Deadloop,
+                    soft_interrupt: meta
+                        .streaming_interrupt_tx
+                        .lock()
+                        .ok()
+                        .and_then(|sender| sender.as_ref().cloned()),
+                    child_process: meta.child_process.clone(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    for target in &targets {
+        if target.is_deadloop {
+            if let Ok(pauses) = pane_pauses.lock() {
+                if let Some(flag) = pauses.get(&target.pane_id) {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        if let Some(sender) = &target.soft_interrupt {
+            let _ = sender.send(());
+        }
+        if let Ok(mut channels) = input_channels.lock() {
+            channels.remove(&target.pane_id);
+        }
+        if let Some(handle) = terminal_panes
+            .lock()
+            .ok()
+            .and_then(|mut terminals| terminals.remove(&target.pane_id))
+        {
+            handle.shutdown();
+        }
+        shutdown_pane_child(&target.child_process);
+    }
+
+    targets.into_iter().map(|target| target.pane_id).collect()
+}
+
 /// Turn a self-reported terminal-pane turn into the stream message an agent
 /// pane would have produced for the same exchange.
 ///
@@ -360,23 +419,6 @@ fn conversation_turn_to_stream_messages(
     out
 }
 
-/// Whether managed team mode is currently enabled for this project.
-///
-/// Read from `.apas` at the point of use rather than cached: the flag can flip
-/// from the web at any moment, and a stale `true` would let a `StartTeam` that
-/// raced the toggle spawn the very panes the owner just disabled.
-fn team_enabled_for(project_dir: &Path) -> bool {
-    match get_or_create_project(project_dir) {
-        Ok(meta) => meta.team_enabled,
-        Err(err) => {
-            // Fail closed. An unreadable `.apas` is not permission to spawn
-            // autonomous panes that can open PRs.
-            tracing::warn!(%err, "could not read .apas for team_enabled; treating team mode as off");
-            false
-        }
-    }
-}
-
 /// Spawn whichever team panes (Manager, Tech Lead, Reviewer, Developer)
 /// are missing for this project. Idempotent: each role is gated on
 /// whether a managed pane with that role already exists in
@@ -409,9 +451,7 @@ fn spawn_missing_team_panes(
     });
     let has_tech_lead = metas_guard.values().any(|m| {
         let lower = m.role.as_deref().unwrap_or("").to_ascii_lowercase();
-        m.managed
-            && lower.contains("tech lead")
-            && matches!(m.mode, shared::PaneMode::Deadloop)
+        m.managed && lower.contains("tech lead") && matches!(m.mode, shared::PaneMode::Deadloop)
     });
     let has_reviewer = metas_guard.values().any(|m| {
         let lower = m.role.as_deref().unwrap_or("").to_ascii_lowercase();
@@ -534,8 +574,7 @@ fn default_pane_label(pane_id: u32, model: Option<&str>) -> String {
     match pane_id {
         shared::PANE_ID_DEADLOOP => "Deadloop".to_string(),
         shared::PANE_ID_INTERACTIVE => "Interactive".to_string(),
-        _ if is_minimax_model(model) => format!("MiniMax {}", pane_id),
-        _ if is_glm_model(model) => format!("GLM {}", pane_id),
+        _ if shared::is_retired_model(model) => format!("Unsupported {}", pane_id),
         _ if is_deepseek_model(model) => format!("DeepSeek {}", pane_id),
         _ => format!("Tab {}", pane_id),
     }
@@ -556,10 +595,7 @@ fn pane_label_or_default(raw_label: Option<&str>, pane_id: u32, model: Option<&s
     if trimmed.is_empty() {
         return default;
     }
-    if is_minimax_model(model) && is_generic_tab_label(trimmed, pane_id) {
-        return default;
-    }
-    if is_glm_model(model) && is_generic_tab_label(trimmed, pane_id) {
+    if shared::is_retired_model(model) && is_generic_tab_label(trimmed, pane_id) {
         return default;
     }
     if is_deepseek_model(model) && is_generic_tab_label(trimmed, pane_id) {
@@ -570,33 +606,35 @@ fn pane_label_or_default(raw_label: Option<&str>, pane_id: u32, model: Option<&s
 
 fn resolve_pane_binary_path(
     provider: Provider,
-    _model: Option<&str>,
+    model: Option<&str>,
     claude_path: &str,
-    _minimax_path: &str,
     codex_path: &str,
     opencode_path: &str,
     cursor_agent_path: &str,
 ) -> String {
+    if shared::is_retired_launch(provider, model) {
+        return String::new();
+    }
     match provider {
-        Provider::Claude
-        | Provider::Minimax
-        | Provider::Glm
-        | Provider::Deepseek => claude_path.to_string(),
+        Provider::Claude | Provider::Deepseek => claude_path.to_string(),
         Provider::Codex => codex_path.to_string(),
         Provider::Opencode => opencode_path.to_string(),
         Provider::CursorAgent => cursor_agent_path.to_string(),
+        #[allow(deprecated)]
+        Provider::Minimax | Provider::Glm => String::new(),
     }
 }
 
 fn provider_display_name(provider: &Provider, model: Option<&str>) -> &'static str {
+    if shared::is_retired_launch(*provider, model) {
+        return "Unsupported provider";
+    }
     match provider {
-        Provider::Claude if is_minimax_model(model) => "MiniMax",
-        Provider::Claude if is_glm_model(model) => "GLM",
         Provider::Claude if is_deepseek_model(model) => "DeepSeek",
         Provider::Claude => "Claude",
         Provider::Codex => "Codex",
-        Provider::Minimax => "MiniMax",
-        Provider::Glm => "GLM",
+        #[allow(deprecated)]
+        Provider::Minimax | Provider::Glm => "Unsupported provider",
         Provider::Deepseek => "DeepSeek",
         Provider::Opencode => "OpenCode",
         Provider::CursorAgent => "Cursor",
@@ -604,21 +642,20 @@ fn provider_display_name(provider: &Provider, model: Option<&str>) -> &'static s
 }
 
 fn provider_config_key(provider: &Provider, model: Option<&str>) -> &'static str {
+    if shared::is_retired_launch(*provider, model) {
+        return "unsupported_provider";
+    }
     match provider {
-        Provider::Claude if is_minimax_model(model) => "claude_path",
         Provider::Claude => "claude_path",
         Provider::Codex => "codex_path",
-        Provider::Minimax => "claude_path",
-        Provider::Glm => "claude_path",
         Provider::Deepseek => "claude_path",
         Provider::Opencode => "opencode_path",
         Provider::CursorAgent => "cursor_agent_path",
+        #[allow(deprecated)]
+        Provider::Minimax | Provider::Glm => "unsupported_provider",
     }
 }
 
-const MINIMAX_API_BASE_URL: &str = "https://api.minimax.io/anthropic";
-const GLM_API_BASE_URL: &str = "https://api.z.ai/api/anthropic";
-const GLM_DEFAULT_HAIKU_MODEL: &str = "glm-4.5-air";
 const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com/anthropic";
 // Keep in sync with packages/web/src/lib/providerOptions.ts; the
 // `deepseek_default_model_matches_web_provider_options` test guards drift.
@@ -795,7 +832,9 @@ fn kill_all_pane_children(pane_metas: &PaneMetas) {
     let mut group_led = Vec::new();
     for slot in slots {
         let Ok(mut guard) = slot.lock() else { continue };
-        let Some(child) = guard.as_mut() else { continue };
+        let Some(child) = guard.as_mut() else {
+            continue;
+        };
         if sigterm_pane_child_group(child.id()) {
             drop(guard);
             group_led.push(slot);
@@ -897,30 +936,6 @@ fn build_user_envelope_line(prompt: &str, live_effort: Option<&str>) -> String {
     format!("{}\n", envelope)
 }
 
-#[derive(Debug, Clone, Default)]
-struct MiniMaxBackendRuntimeConfig {
-    api_key: Option<String>,
-}
-
-fn load_minimax_backend_runtime_config() -> MiniMaxBackendRuntimeConfig {
-    let config = crate::config::Config::load().unwrap_or_default();
-    MiniMaxBackendRuntimeConfig {
-        api_key: trim_to_option(config.local.minimax_api_key),
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct GlmBackendRuntimeConfig {
-    api_key: Option<String>,
-}
-
-fn load_glm_backend_runtime_config() -> GlmBackendRuntimeConfig {
-    let config = crate::config::Config::load().unwrap_or_default();
-    GlmBackendRuntimeConfig {
-        api_key: trim_to_option(config.local.glm_api_key),
-    }
-}
-
 struct DeepseekBackendRuntimeConfig {
     api_key: Option<String>,
 }
@@ -935,44 +950,22 @@ fn load_deepseek_backend_runtime_config() -> DeepseekBackendRuntimeConfig {
 fn build_pane_env_overrides_from_keys(
     provider: &Provider,
     model: Option<&str>,
-    minimax_api_key: Option<String>,
-    glm_api_key: Option<String>,
     deepseek_api_key: Option<String>,
 ) -> Result<Vec<(String, String)>, String> {
-    if !matches!(
-        provider,
-        Provider::Claude | Provider::Minimax | Provider::Glm | Provider::Deepseek
-    ) {
+    if shared::is_retired_launch(*provider, model) {
+        return Err("Unsupported provider: this backend has been retired".to_string());
+    }
+    if !matches!(provider, Provider::Claude | Provider::Deepseek) {
         return Ok(Vec::new());
     }
-    let is_minimax = matches!(provider, Provider::Minimax) || is_minimax_model(model);
-    let is_glm = !is_minimax && (matches!(provider, Provider::Glm) || is_glm_model(model));
-    let is_deepseek = !is_minimax
-        && !is_glm
-        && (matches!(provider, Provider::Deepseek) || is_deepseek_model(model));
-    if !is_minimax && !is_glm && !is_deepseek {
+    let is_deepseek = matches!(provider, Provider::Deepseek) || is_deepseek_model(model);
+    if !is_deepseek {
         return Ok(Vec::new());
     }
 
-    let (api_base_url, api_key, missing_key_message) = if is_minimax {
-        (
-            MINIMAX_API_BASE_URL.to_string(),
-            minimax_api_key,
-            "MiniMax backend is not configured (missing minimax_api_key). Update it on the Machines page or run: apas config set minimax_api_key <key>.".to_string(),
-        )
-    } else if is_glm {
-        (
-            GLM_API_BASE_URL.to_string(),
-            glm_api_key,
-            "GLM backend is not configured (missing glm_api_key). Update it on the Machines page or run: apas config set glm_api_key <key>.".to_string(),
-        )
-    } else {
-        (
-            DEEPSEEK_API_BASE_URL.to_string(),
-            deepseek_api_key,
-            "DeepSeek backend is not configured (missing deepseek_api_key). Update it on the Machines page or run: apas config set deepseek_api_key <key>.".to_string(),
-        )
-    };
+    let api_base_url = DEEPSEEK_API_BASE_URL.to_string();
+    let api_key = deepseek_api_key;
+    let missing_key_message = "DeepSeek backend is not configured (missing deepseek_api_key). Update it on the Machines page or run: apas config set deepseek_api_key <key>.".to_string();
     let api_key = api_key.ok_or(missing_key_message)?;
 
     let mut env = vec![
@@ -982,43 +975,16 @@ fn build_pane_env_overrides_from_keys(
         ("ANTHROPIC_API_KEY".to_string(), api_key),
     ];
     if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
-        if is_minimax {
-            env.push(("ANTHROPIC_MODEL".to_string(), model.to_string()));
-        } else if is_glm {
-            // Z.AI's Claude bridge expects model switching via default model
-            // mapping variables instead of ANTHROPIC_MODEL for GLM-5.x.
-            env.push((
-                "ANTHROPIC_DEFAULT_SONNET_MODEL".to_string(),
-                model.to_string(),
-            ));
-            env.push((
-                "ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(),
-                model.to_string(),
-            ));
-            env.push((
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
-                GLM_DEFAULT_HAIKU_MODEL.to_string(),
-            ));
-        } else if is_deepseek {
-            // Same trap GLM hit: Claude CLI's pre-flight model check
-            // rejects non-Claude names set via ANTHROPIC_MODEL before
-            // the request reaches the bridge. Route through the
-            // ANTHROPIC_DEFAULT_*_MODEL aliases so claude self-reports
-            // as sonnet/opus/haiku and the bridge substitutes.
-            env.push((
-                "ANTHROPIC_DEFAULT_SONNET_MODEL".to_string(),
-                model.to_string(),
-            ));
-            env.push((
-                "ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(),
-                model.to_string(),
-            ));
-            env.push((
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
-                model.to_string(),
-            ));
+        // Claude CLI's pre-flight model check rejects non-Claude names set
+        // via ANTHROPIC_MODEL before the request reaches the DeepSeek bridge.
+        for variable in [
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        ] {
+            env.push((variable.to_string(), model.to_string()));
         }
-    } else if is_deepseek {
+    } else {
         // No explicit model — pin the alias mapping to the default
         // chat model so Claude CLI's pre-flight check sees valid
         // sonnet/opus/haiku targets.
@@ -1042,16 +1008,8 @@ fn build_pane_env_overrides(
     provider: &Provider,
     model: Option<&str>,
 ) -> Result<Vec<(String, String)>, String> {
-    let minimax_runtime = load_minimax_backend_runtime_config();
-    let glm_runtime = load_glm_backend_runtime_config();
     let deepseek_runtime = load_deepseek_backend_runtime_config();
-    build_pane_env_overrides_from_keys(
-        provider,
-        model,
-        minimax_runtime.api_key,
-        glm_runtime.api_key,
-        deepseek_runtime.api_key,
-    )
+    build_pane_env_overrides_from_keys(provider, model, deepseek_runtime.api_key)
 }
 
 fn format_spawn_error(
@@ -1366,18 +1324,18 @@ fn current_managed_builtin_prompt(kind: ManagedBuiltInPromptKind) -> Option<&'st
         ManagedBuiltInPromptKind::Manager => None,
         ManagedBuiltInPromptKind::TechLead => Some(crate::role::TECH_LEAD_DEADLOOP_PROMPT),
         ManagedBuiltInPromptKind::Reviewer => Some(crate::role::REVIEWER_DEADLOOP_PROMPT),
-        ManagedBuiltInPromptKind::DefaultDeveloper => Some(
-            crate::role::DEFAULT_DEVELOPER_DEADLOOP_PROMPT,
-        ),
+        ManagedBuiltInPromptKind::DefaultDeveloper => {
+            Some(crate::role::DEFAULT_DEVELOPER_DEADLOOP_PROMPT)
+        }
     }
 }
 
 fn prompt_matches_known_stale_builtin(kind: ManagedBuiltInPromptKind, prompt: &str) -> bool {
     match kind {
         ManagedBuiltInPromptKind::TechLead => {
-            prompt.starts_with(
-                "You are this project's Tech Lead, running as an autonomous deadloop.",
-            ) && prompt.contains("Every iteration, in order:")
+            prompt
+                .starts_with("You are this project's Tech Lead, running as an autonomous deadloop.")
+                && prompt.contains("Every iteration, in order:")
                 && prompt.contains("2. Walk the Global TODOs and act on each.")
                 && prompt.contains("`status: approved` with no subtasks under it")
                 && prompt.contains("expand: write per-worker subtask entries")
@@ -1421,8 +1379,7 @@ fn refresh_stale_managed_builtin_prompts(panes: &mut [shared::PaneConfig]) -> us
 
 fn boot_restore_try_resume_first(provider: &Provider, model: Option<&str>) -> bool {
     matches!(provider, Provider::Claude)
-        && !is_minimax_model(model)
-        && !is_glm_model(model)
+        && !shared::is_retired_model(model)
         && !is_deepseek_model(model)
 }
 
@@ -1665,8 +1622,6 @@ async fn run_inner(
     // Resolve binary paths to absolute paths at startup (while PATH is correct).
     // Systemd-run environments may have a minimal PATH that misses nvm/cargo bins.
     let claude_path = resolve_binary_path(&config.local.claude_path);
-    // Legacy compatibility only: MiniMax now uses claude_path + backend env config.
-    let minimax_path = resolve_binary_path(&config.local.minimax_path);
     let codex_path = resolve_binary_path(&config.local.codex_path);
     let opencode_path = resolve_binary_path(&config.local.opencode_path);
     let cursor_agent_path = resolve_binary_path(&config.local.cursor_agent_path);
@@ -1674,6 +1629,10 @@ async fn run_inner(
     // Load or create project metadata
     let mut metadata = get_or_create_project(working_dir)?;
     let session_id = metadata.id;
+    // `None` means the authoritative server policy has not arrived yet and
+    // launch-like mutations fail closed. Existing processes may keep running
+    // and will be reported as noncompliant rather than terminated.
+    let project_policy: ProjectPolicyState = Arc::new(Mutex::new(None));
 
     // Deliberately no "ensure at least one pane" fallback. A project with no
     // panes stays empty: the CLI connects, the daemon can manage it, and the
@@ -1823,7 +1782,10 @@ async fn run_inner(
                     }
                 }
                 if let Err(e) = crate::team_todo::save(working_dir, &todo) {
-                    tracing::warn!("Failed to save team-todo.md after boot orphan cleanup: {}", e);
+                    tracing::warn!(
+                        "Failed to save team-todo.md after boot orphan cleanup: {}",
+                        e
+                    );
                 }
             }
         }
@@ -1847,14 +1809,14 @@ async fn run_inner(
         Option<String>,
         Option<u64>,
         bool,
-        Option<String>, // worktree_path from .apas (Phase 1.1)
-        Option<String>, // role from .apas (Phase 2.1)
-        Option<String>, // goal from .apas (Phase 2.1)
-        Option<String>, // backstory from .apas (Phase 2.1)
+        Option<String>,         // worktree_path from .apas (Phase 1.1)
+        Option<String>,         // role from .apas (Phase 2.1)
+        Option<String>,         // goal from .apas (Phase 2.1)
+        Option<String>,         // backstory from .apas (Phase 2.1)
         shared::PlanReviewMode, // plan_review_mode from .apas (Phase 3.2)
-        bool,           // manual_mode from .apas (v3.2)
-        bool,           // managed from .apas (v3.5)
-        shared::PaneKind, // Agent vs pty-hosted Terminal
+        bool,                   // manual_mode from .apas (v3.2)
+        bool,                   // managed from .apas (v3.5)
+        shared::PaneKind,       // Agent vs pty-hosted Terminal
     )> = metadata
         .panes
         .iter()
@@ -2011,6 +1973,18 @@ async fn run_inner(
             );
             sessions.insert(*pane_id, *pane_session_id);
 
+            if shared::is_retired_launch(*provider, tab_model.as_deref()) {
+                if *mode == shared::PaneMode::Deadloop {
+                    pauses.insert(*pane_id, Arc::new(AtomicBool::new(true)));
+                }
+                let _ = output_tx.send(PaneOutput {
+                    text: "[Unsupported provider — this historical pane remains stopped]"
+                        .to_string(),
+                    pane_id: *pane_id,
+                });
+                continue;
+            }
+
             // Terminal panes host a real TUI on a pty. They register no
             // input channel and start no deadloop — the pty is driven
             // entirely by `Terminal*` messages — so branch before the
@@ -2139,6 +2113,7 @@ async fn run_inner(
         let pane_sessions = pane_sessions.clone();
         let terminal_panes_for_server = terminal_panes.clone();
         let event_tx_for_server = event_tx.clone();
+        let project_policy_for_server = project_policy.clone();
         tokio::spawn(async move {
             run_server_connection(
                 &server_url,
@@ -2156,6 +2131,7 @@ async fn run_inner(
                 terminal_panes_for_server,
                 status_tx,
                 event_tx_for_server,
+                project_policy_for_server,
             )
             .await
         })
@@ -2223,35 +2199,51 @@ async fn run_inner(
             provider,
             model.as_deref(),
             &claude_path,
-            &minimax_path,
             &codex_path,
             &opencode_path,
             &cursor_agent_path,
         );
-        let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt, pr_mode_arc, pr_pending) = pane_metas
+        let (
+            interrupt_slot,
+            control_resp_slot,
+            pending_qs,
+            effort_arc,
+            worktree_path,
+            system_prompt,
+            pr_mode_arc,
+            pr_pending,
+        ) = pane_metas
             .lock()
             .unwrap()
             .get(&pane_id)
-            .map(|m| (
-                m.streaming_interrupt_tx.clone(),
-                m.control_response_tx.clone(),
-                m.pending_questions.clone(),
-                m.effort_arc.clone(),
-                m.worktree_path.clone(),
-                crate::role::compose_system_prompt(m.role.as_deref(), m.goal.as_deref(), m.backstory.as_deref()),
-                m.plan_review_mode_arc.clone(),
-                m.pending_plan_reviews.clone(),
-            ))
-            .unwrap_or_else(|| (
-                Arc::new(Mutex::new(None)),
-                Arc::new(Mutex::new(None)),
-                Arc::new(Mutex::new(HashMap::new())),
-                Arc::new(Mutex::new(None)),
-                None,
-                None,
-                Arc::new(Mutex::new(shared::PlanReviewMode::default())),
-                Arc::new(Mutex::new(HashMap::new())),
-            ));
+            .map(|m| {
+                (
+                    m.streaming_interrupt_tx.clone(),
+                    m.control_response_tx.clone(),
+                    m.pending_questions.clone(),
+                    m.effort_arc.clone(),
+                    m.worktree_path.clone(),
+                    crate::role::compose_system_prompt(
+                        m.role.as_deref(),
+                        m.goal.as_deref(),
+                        m.backstory.as_deref(),
+                    ),
+                    m.plan_review_mode_arc.clone(),
+                    m.pending_plan_reviews.clone(),
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    Arc::new(Mutex::new(None)),
+                    Arc::new(Mutex::new(None)),
+                    Arc::new(Mutex::new(HashMap::new())),
+                    Arc::new(Mutex::new(None)),
+                    None,
+                    None,
+                    Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                    Arc::new(Mutex::new(HashMap::new())),
+                )
+            });
         let file_watcher_for_dl = file_watcher.clone();
         pane_threads.push(thread::spawn(move || {
             run_deadloop_session(
@@ -2295,7 +2287,9 @@ async fn run_inner(
         }));
     }
 
-    for (pane_id, pane_session_id, provider, model, effort, input_rx, child_proc) in interactive_startups {
+    for (pane_id, pane_session_id, provider, model, effort, input_rx, child_proc) in
+        interactive_startups
+    {
         let output_tx = output_tx.clone();
         let server_tx = server_tx.clone();
         let shutdown = shutdown.clone();
@@ -2305,35 +2299,51 @@ async fn run_inner(
             provider,
             model.as_deref(),
             &claude_path,
-            &minimax_path,
             &codex_path,
             &opencode_path,
             &cursor_agent_path,
         );
-        let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt, pr_mode_arc, pr_pending) = pane_metas
+        let (
+            interrupt_slot,
+            control_resp_slot,
+            pending_qs,
+            effort_arc,
+            worktree_path,
+            system_prompt,
+            pr_mode_arc,
+            pr_pending,
+        ) = pane_metas
             .lock()
             .unwrap()
             .get(&pane_id)
-            .map(|m| (
-                m.streaming_interrupt_tx.clone(),
-                m.control_response_tx.clone(),
-                m.pending_questions.clone(),
-                m.effort_arc.clone(),
-                m.worktree_path.clone(),
-                crate::role::compose_system_prompt(m.role.as_deref(), m.goal.as_deref(), m.backstory.as_deref()),
-                m.plan_review_mode_arc.clone(),
-                m.pending_plan_reviews.clone(),
-            ))
-            .unwrap_or_else(|| (
-                Arc::new(Mutex::new(None)),
-                Arc::new(Mutex::new(None)),
-                Arc::new(Mutex::new(HashMap::new())),
-                Arc::new(Mutex::new(None)),
-                None,
-                None,
-                Arc::new(Mutex::new(shared::PlanReviewMode::default())),
-                Arc::new(Mutex::new(HashMap::new())),
-            ));
+            .map(|m| {
+                (
+                    m.streaming_interrupt_tx.clone(),
+                    m.control_response_tx.clone(),
+                    m.pending_questions.clone(),
+                    m.effort_arc.clone(),
+                    m.worktree_path.clone(),
+                    crate::role::compose_system_prompt(
+                        m.role.as_deref(),
+                        m.goal.as_deref(),
+                        m.backstory.as_deref(),
+                    ),
+                    m.plan_review_mode_arc.clone(),
+                    m.pending_plan_reviews.clone(),
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    Arc::new(Mutex::new(None)),
+                    Arc::new(Mutex::new(None)),
+                    Arc::new(Mutex::new(HashMap::new())),
+                    Arc::new(Mutex::new(None)),
+                    None,
+                    None,
+                    Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                    Arc::new(Mutex::new(HashMap::new())),
+                )
+            });
         pane_threads.push(thread::spawn(move || {
             run_pane_session(
                 &binary_path,
@@ -2371,7 +2381,6 @@ async fn run_inner(
         let input_channels_event = input_channels.clone();
         let working_dir_event = working_dir_str.clone();
         let claude_path_event = claude_path.clone();
-        let minimax_path_event = minimax_path.clone();
         let codex_path_event = codex_path.clone();
         let opencode_path_event = opencode_path.clone();
         let cursor_agent_path_event = cursor_agent_path.clone();
@@ -2383,6 +2392,7 @@ async fn run_inner(
         let event_tx_event = event_tx.clone();
         let default_prompt_for_events = default_prompt.clone();
         let file_watcher_for_events = file_watcher.clone();
+        let project_policy_for_events = project_policy.clone();
         thread::spawn(move || {
             handle_tui_events(
                 event_rx,
@@ -2393,7 +2403,6 @@ async fn run_inner(
                 input_channels_event,
                 session_id,
                 &claude_path_event,
-                &minimax_path_event,
                 &codex_path_event,
                 &opencode_path_event,
                 &cursor_agent_path_event,
@@ -2406,6 +2415,7 @@ async fn run_inner(
                 terminal_panes_event,
                 &default_prompt_for_events,
                 file_watcher_for_events,
+                project_policy_for_events,
             )
         })
     };
@@ -2436,22 +2446,19 @@ async fn run_inner(
                     let metas = pane_metas_for_poll.lock().unwrap();
                     metas
                         .iter()
-                        .filter_map(|(id, m)| {
-                            m.worktree_path.as_ref().map(|wt| (*id, wt.clone()))
-                        })
+                        .filter_map(|(id, m)| m.worktree_path.as_ref().map(|wt| (*id, wt.clone())))
                         .collect()
                 };
                 let updates = crate::worktree::poll_changed_diffs(&project, &mut state, &panes);
                 for (pane_id, branch, base, diff) in updates {
-                    let _ = server_tx_for_poll
-                        .blocking_send(CliToServer::PaneDiff {
-                            session_id,
-                            pane_id,
-                            branch: Some(branch),
-                            base: Some(base),
-                            diff: Some(diff),
-                            error: None,
-                        });
+                    let _ = server_tx_for_poll.blocking_send(CliToServer::PaneDiff {
+                        session_id,
+                        pane_id,
+                        branch: Some(branch),
+                        base: Some(base),
+                        diff: Some(diff),
+                        error: None,
+                    });
                 }
                 thread::sleep(Duration::from_secs(3));
             }
@@ -2479,12 +2486,10 @@ async fn run_inner(
             while !shutdown_for_goal.load(Ordering::SeqCst) {
                 if path.exists() {
                     if let Ok(content) = std::fs::read_to_string(&path) {
-                        let _ = server_tx_for_goal.blocking_send(
-                            CliToServer::ProjectGoalChanged {
-                                session_id,
-                                content,
-                            },
-                        );
+                        let _ = server_tx_for_goal.blocking_send(CliToServer::ProjectGoalChanged {
+                            session_id,
+                            content,
+                        });
                     }
                 }
                 thread::sleep(Duration::from_secs(3));
@@ -2505,15 +2510,13 @@ async fn run_inner(
             let project = std::path::PathBuf::from(working_dir_for_flags);
             while !shutdown_for_flags.load(Ordering::SeqCst) {
                 if let Ok(meta) = crate::project::get_or_create_project(&project) {
-                    let _ = server_tx_for_flags.blocking_send(
-                        CliToServer::ProjectFlagsChanged {
-                            session_id,
-                            auto_approve_todos: meta.auto_approve_todos,
-                            auto_merge_prs: meta.auto_merge_prs,
-                            team_enabled: meta.team_enabled,
-                            disallowed_tab_types: meta.disallowed_tab_types.clone(),
-                        },
-                    );
+                    let _ = server_tx_for_flags.blocking_send(CliToServer::ProjectFlagsChanged {
+                        session_id,
+                        auto_approve_todos: meta.auto_approve_todos,
+                        auto_merge_prs: meta.auto_merge_prs,
+                        team_enabled: meta.team_enabled,
+                        disallowed_tab_types: meta.disallowed_tab_types.clone(),
+                    });
                 }
                 thread::sleep(Duration::from_secs(5));
             }
@@ -2535,20 +2538,15 @@ async fn run_inner(
             let mut last_mtime: Option<std::time::SystemTime> = None;
             let mut first_tick = true;
             while !shutdown_for_tt.load(Ordering::SeqCst) {
-                let cur_mtime = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .ok();
+                let cur_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
                 let changed = first_tick || cur_mtime != last_mtime;
                 if changed {
                     let todo = crate::team_todo::load(&project).unwrap_or_default();
-                    let state_msg =
-                        crate::team_todo::to_wire_with_cursors(&todo, &project);
-                    let _ = server_tx_for_tt.blocking_send(
-                        CliToServer::TeamTodoState {
-                            session_id,
-                            state: state_msg,
-                        },
-                    );
+                    let state_msg = crate::team_todo::to_wire_with_cursors(&todo, &project);
+                    let _ = server_tx_for_tt.blocking_send(CliToServer::TeamTodoState {
+                        session_id,
+                        state: state_msg,
+                    });
                     last_mtime = cur_mtime;
                     first_tick = false;
                 }
@@ -2574,18 +2572,14 @@ async fn run_inner(
             let mut last_mtime: Option<std::time::SystemTime> = None;
             let mut first_tick = true;
             while !shutdown_for_sw.load(Ordering::SeqCst) {
-                let cur_mtime = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .ok();
+                let cur_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
                 let changed = first_tick || cur_mtime != last_mtime;
                 if changed {
                     let sw = crate::suggested_workers::load(&project).unwrap_or_default();
-                    let _ = server_tx_for_sw.blocking_send(
-                        CliToServer::SuggestedWorkersState {
-                            session_id,
-                            suggestions: crate::suggested_workers::to_wire(&sw),
-                        },
-                    );
+                    let _ = server_tx_for_sw.blocking_send(CliToServer::SuggestedWorkersState {
+                        session_id,
+                        suggestions: crate::suggested_workers::to_wire(&sw),
+                    });
                     last_mtime = cur_mtime;
                     first_tick = false;
                 }
@@ -2671,9 +2665,7 @@ async fn run_inner(
                         continue;
                     }
                     for turn in &turns[*cursor..] {
-                        for msg in
-                            conversation_turn_to_stream_messages(turn, session_id, conv_id)
-                        {
+                        for msg in conversation_turn_to_stream_messages(turn, session_id, conv_id) {
                             let _ = server_tx_for_turns.blocking_send(msg);
                         }
                     }
@@ -2730,7 +2722,8 @@ async fn run_inner(
                             // Phase 3.1a: route delegate-to:<id> records
                             // into the target pane's input queue. Only
                             // for NEW records — never replay history.
-                            if let Some(target_pane_id) = crate::scratchpad::delegate_target_pane(r) {
+                            if let Some(target_pane_id) = crate::scratchpad::delegate_target_pane(r)
+                            {
                                 let routed = {
                                     let channels = input_channels_for_pad.lock().unwrap();
                                     if let Some(tx) = channels.get(&target_pane_id) {
@@ -2909,19 +2902,39 @@ fn save_pane_configs(
                             None,
                         )
                     };
-                let (worktree_path, role, goal, backstory, plan_review_mode, manual_mode, managed, kind) = pane_metas
+                let (
+                    worktree_path,
+                    role,
+                    goal,
+                    backstory,
+                    plan_review_mode,
+                    manual_mode,
+                    managed,
+                    kind,
+                ) = pane_metas
                     .get(&pane_id)
-                    .map(|p| (
-                        p.worktree_path.clone(),
-                        p.role.clone(),
-                        p.goal.clone(),
-                        p.backstory.clone(),
-                        p.plan_review_mode,
-                        p.manual_mode,
-                        p.managed,
-                        p.kind,
-                    ))
-                    .unwrap_or((None, None, None, None, shared::PlanReviewMode::default(), false, false, shared::PaneKind::Agent));
+                    .map(|p| {
+                        (
+                            p.worktree_path.clone(),
+                            p.role.clone(),
+                            p.goal.clone(),
+                            p.backstory.clone(),
+                            p.plan_review_mode,
+                            p.manual_mode,
+                            p.managed,
+                            p.kind,
+                        )
+                    })
+                    .unwrap_or((
+                        None,
+                        None,
+                        None,
+                        None,
+                        shared::PlanReviewMode::default(),
+                        false,
+                        false,
+                        shared::PaneKind::Agent,
+                    ));
                 shared::PaneConfig {
                     pane_id,
                     provider,
@@ -2970,7 +2983,6 @@ fn handle_tui_events(
     input_channels: InputChannels,
     session_id: Uuid,
     claude_path: &str,
-    minimax_path: &str,
     codex_path: &str,
     opencode_path: &str,
     cursor_agent_path: &str,
@@ -2983,6 +2995,7 @@ fn handle_tui_events(
     terminal_panes: TerminalPanes,
     default_prompt: &str,
     file_watcher: Arc<crate::file_watcher::ProjectFileWatcher>,
+    project_policy: ProjectPolicyState,
 ) {
     while !shutdown.load(Ordering::SeqCst) {
         match event_rx.recv_timeout(Duration::from_millis(100)) {
@@ -3031,7 +3044,9 @@ fn handle_tui_events(
                             goal: None,
                             backstory: None,
                             plan_review_mode: shared::PlanReviewMode::default(),
-                            plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                            plan_review_mode_arc: Arc::new(Mutex::new(
+                                shared::PlanReviewMode::default(),
+                            )),
                             pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                             manual_mode: false,
                             managed: false,
@@ -3060,36 +3075,52 @@ fn handle_tui_events(
                         Provider::Claude,
                         None,
                         claude_path,
-                        minimax_path,
                         codex_path,
                         opencode_path,
                         cursor_agent_path,
                     );
                     let working_dir = working_dir.to_string();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt, pr_mode_arc, pr_pending) = pane_metas
+                    let (
+                        interrupt_slot,
+                        control_resp_slot,
+                        pending_qs,
+                        effort_arc,
+                        worktree_path,
+                        system_prompt,
+                        pr_mode_arc,
+                        pr_pending,
+                    ) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
-                        .map(|m| (
-                            m.streaming_interrupt_tx.clone(),
-                            m.control_response_tx.clone(),
-                            m.pending_questions.clone(),
-                            m.effort_arc.clone(),
-                            m.worktree_path.clone(),
-                            crate::role::compose_system_prompt(m.role.as_deref(), m.goal.as_deref(), m.backstory.as_deref()),
-                            m.plan_review_mode_arc.clone(),
-                            m.pending_plan_reviews.clone(),
-                        ))
-                        .unwrap_or_else(|| (
-                            Arc::new(Mutex::new(None)),
-                            Arc::new(Mutex::new(None)),
-                            Arc::new(Mutex::new(HashMap::new())),
-                            Arc::new(Mutex::new(None)),
-                            None,
-                            None,
-                            Arc::new(Mutex::new(shared::PlanReviewMode::default())),
-                            Arc::new(Mutex::new(HashMap::new())),
-                        ));
+                        .map(|m| {
+                            (
+                                m.streaming_interrupt_tx.clone(),
+                                m.control_response_tx.clone(),
+                                m.pending_questions.clone(),
+                                m.effort_arc.clone(),
+                                m.worktree_path.clone(),
+                                crate::role::compose_system_prompt(
+                                    m.role.as_deref(),
+                                    m.goal.as_deref(),
+                                    m.backstory.as_deref(),
+                                ),
+                                m.plan_review_mode_arc.clone(),
+                                m.pending_plan_reviews.clone(),
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            (
+                                Arc::new(Mutex::new(None)),
+                                Arc::new(Mutex::new(None)),
+                                Arc::new(Mutex::new(HashMap::new())),
+                                Arc::new(Mutex::new(None)),
+                                None,
+                                None,
+                                Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                                Arc::new(Mutex::new(HashMap::new())),
+                            )
+                        });
                     thread::spawn(move || {
                         run_pane_session(
                             &binary_path,
@@ -3149,19 +3180,36 @@ fn handle_tui_events(
                 try_resume_first,
                 kind,
             }) => {
-                // Tab-type policy. The web hides disallowed entries from its
-                // add-tab menu, but that is presentation — this is the check
-                // that actually holds, because the same `AddPane` message can
-                // come from a stale browser tab whose menu predates the
-                // restriction. Managed team panes are exempt: the Tech Lead
-                // spawns those from role templates, and an owner restricting
-                // *user* tab types has not asked to break their own team.
-                if !managed && !tab_type_allowed_for(std::path::Path::new(working_dir), kind, provider.clone()) {
-                    let denied = shared::tab_type_key(kind, provider.clone());
-                    tracing::warn!(pane_id, %denied, "AddPane refused — tab type not allowed on this project");
+                if shared::is_retired_launch(provider, model.as_deref()) {
+                    tracing::warn!(pane_id, "AddPane refused for retired provider");
+                    let _ = output_tx.send(PaneOutput {
+                        text: "[New tab refused — unsupported provider has been retired]"
+                            .to_string(),
+                        pane_id,
+                    });
+                    continue;
+                }
+                // Last-line launch enforcement. This applies equally to
+                // managed panes and direct TUI events, and fails closed until
+                // the server's effective policy has arrived.
+                if (managed
+                    && !project_policy
+                        .lock()
+                        .ok()
+                        .and_then(|policy| policy.clone())
+                        .is_some_and(|policy| policy.team_available))
+                    || !launch_allowed_by_server_policy(
+                        &project_policy,
+                        kind,
+                        provider,
+                        model.as_deref(),
+                    )
+                {
+                    let denied = shared::launch_profile_key(kind, provider, model.as_deref());
+                    tracing::warn!(pane_id, %denied, "AddPane refused by cluster policy");
                     let _ = output_tx.send(PaneOutput {
                         text: format!(
-                            "[New tab refused — {} tabs are not allowed on this project. An owner or admin can change this in the Overview.]",
+                            "[New tab refused — launch profile {} is unavailable under the current cluster policy]",
                             denied
                         ),
                         pane_id,
@@ -3223,7 +3271,6 @@ fn handle_tui_events(
                     provider,
                     model.as_deref(),
                     claude_path,
-                    minimax_path,
                     codex_path,
                     opencode_path,
                     cursor_agent_path,
@@ -3259,10 +3306,7 @@ fn handle_tui_events(
                         try_resume_first,
                     ) {
                         tracing::error!(pane_id, %err, "failed to start terminal pane");
-                        let _ = output_tx.send(PaneOutput {
-                            text: err,
-                            pane_id,
-                        });
+                        let _ = output_tx.send(PaneOutput { text: err, pane_id });
                     }
                     // Announce before returning. This early return used to skip
                     // the shared tail below, so a new terminal tab never
@@ -3314,30 +3358,47 @@ fn handle_tui_events(
                     let event_tx = event_tx.clone();
                     let working_dir = working_dir.to_string();
                     let input_channels_for_dl = input_channels.clone();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt, pr_mode_arc, pr_pending) = pane_metas
+                    let (
+                        interrupt_slot,
+                        control_resp_slot,
+                        pending_qs,
+                        effort_arc,
+                        worktree_path,
+                        system_prompt,
+                        pr_mode_arc,
+                        pr_pending,
+                    ) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
-                        .map(|m| (
-                            m.streaming_interrupt_tx.clone(),
-                            m.control_response_tx.clone(),
-                            m.pending_questions.clone(),
-                            m.effort_arc.clone(),
-                            m.worktree_path.clone(),
-                            crate::role::compose_system_prompt(m.role.as_deref(), m.goal.as_deref(), m.backstory.as_deref()),
-                            m.plan_review_mode_arc.clone(),
-                            m.pending_plan_reviews.clone(),
-                        ))
-                        .unwrap_or_else(|| (
-                            Arc::new(Mutex::new(None)),
-                            Arc::new(Mutex::new(None)),
-                            Arc::new(Mutex::new(HashMap::new())),
-                            Arc::new(Mutex::new(None)),
-                            None,
-                            None,
-                            Arc::new(Mutex::new(shared::PlanReviewMode::default())),
-                            Arc::new(Mutex::new(HashMap::new())),
-                        ));
+                        .map(|m| {
+                            (
+                                m.streaming_interrupt_tx.clone(),
+                                m.control_response_tx.clone(),
+                                m.pending_questions.clone(),
+                                m.effort_arc.clone(),
+                                m.worktree_path.clone(),
+                                crate::role::compose_system_prompt(
+                                    m.role.as_deref(),
+                                    m.goal.as_deref(),
+                                    m.backstory.as_deref(),
+                                ),
+                                m.plan_review_mode_arc.clone(),
+                                m.pending_plan_reviews.clone(),
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            (
+                                Arc::new(Mutex::new(None)),
+                                Arc::new(Mutex::new(None)),
+                                Arc::new(Mutex::new(HashMap::new())),
+                                Arc::new(Mutex::new(None)),
+                                None,
+                                None,
+                                Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                                Arc::new(Mutex::new(HashMap::new())),
+                            )
+                        });
                     let file_watcher_for_dl = file_watcher.clone();
                     thread::spawn(move || {
                         run_deadloop_session(
@@ -3394,30 +3455,47 @@ fn handle_tui_events(
                     let server_tx = server_tx.clone();
                     let shutdown = shutdown.clone();
                     let working_dir = working_dir.to_string();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt, pr_mode_arc, pr_pending) = pane_metas
+                    let (
+                        interrupt_slot,
+                        control_resp_slot,
+                        pending_qs,
+                        effort_arc,
+                        worktree_path,
+                        system_prompt,
+                        pr_mode_arc,
+                        pr_pending,
+                    ) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
-                        .map(|m| (
-                            m.streaming_interrupt_tx.clone(),
-                            m.control_response_tx.clone(),
-                            m.pending_questions.clone(),
-                            m.effort_arc.clone(),
-                            m.worktree_path.clone(),
-                            crate::role::compose_system_prompt(m.role.as_deref(), m.goal.as_deref(), m.backstory.as_deref()),
-                            m.plan_review_mode_arc.clone(),
-                            m.pending_plan_reviews.clone(),
-                        ))
-                        .unwrap_or_else(|| (
-                            Arc::new(Mutex::new(None)),
-                            Arc::new(Mutex::new(None)),
-                            Arc::new(Mutex::new(HashMap::new())),
-                            Arc::new(Mutex::new(None)),
-                            None,
-                            None,
-                            Arc::new(Mutex::new(shared::PlanReviewMode::default())),
-                            Arc::new(Mutex::new(HashMap::new())),
-                        ));
+                        .map(|m| {
+                            (
+                                m.streaming_interrupt_tx.clone(),
+                                m.control_response_tx.clone(),
+                                m.pending_questions.clone(),
+                                m.effort_arc.clone(),
+                                m.worktree_path.clone(),
+                                crate::role::compose_system_prompt(
+                                    m.role.as_deref(),
+                                    m.goal.as_deref(),
+                                    m.backstory.as_deref(),
+                                ),
+                                m.plan_review_mode_arc.clone(),
+                                m.pending_plan_reviews.clone(),
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            (
+                                Arc::new(Mutex::new(None)),
+                                Arc::new(Mutex::new(None)),
+                                Arc::new(Mutex::new(HashMap::new())),
+                                Arc::new(Mutex::new(None)),
+                                None,
+                                None,
+                                Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                                Arc::new(Mutex::new(HashMap::new())),
+                            )
+                        });
                     thread::spawn(move || {
                         run_pane_session(
                             &binary_path,
@@ -3457,7 +3535,10 @@ fn handle_tui_events(
                     &pane_stop_requests,
                 );
             }
-            Ok(TuiEvent::CloseTab { pane_id, cleanup_action }) => {
+            Ok(TuiEvent::CloseTab {
+                pane_id,
+                cleanup_action,
+            }) => {
                 // Remove input channel (causes interactive session thread to exit)
                 {
                     let mut channels = input_channels.lock().unwrap();
@@ -3520,14 +3601,11 @@ fn handle_tui_events(
                 // for cleanup, run the requested action. Errors are reported
                 // back via the chat stream — we don't fail the close itself.
                 if let (Some(path), Some(action)) = (worktree_path.as_deref(), cleanup_action) {
-                    let cleanup_msg = match crate::worktree::cleanup_on_close(
-                        working_dir,
-                        path,
-                        action,
-                    ) {
-                        Ok(text) => text,
-                        Err(err) => format!("[Worktree cleanup failed: {}]", err),
-                    };
+                    let cleanup_msg =
+                        match crate::worktree::cleanup_on_close(working_dir, path, action) {
+                            Ok(text) => text,
+                            Err(err) => format!("[Worktree cleanup failed: {}]", err),
+                        };
                     let _ = output_tx.send(PaneOutput {
                         text: cleanup_msg,
                         pane_id,
@@ -3559,6 +3637,7 @@ fn handle_tui_events(
                     existing_model,
                     existing_effort,
                     existing_min_interval_minutes,
+                    existing_kind,
                     preserved_fields,
                 ) = {
                     let metas = pane_metas.lock().unwrap();
@@ -3570,6 +3649,7 @@ fn handle_tui_events(
                             meta.model.clone(),
                             meta.effort.clone(),
                             meta.min_iteration_interval_minutes,
+                            meta.kind,
                             start_bot_preserved_fields(Some(meta)),
                         ),
                         None => (
@@ -3579,6 +3659,7 @@ fn handle_tui_events(
                             None,
                             None,
                             None,
+                            shared::PaneKind::Agent,
                             start_bot_preserved_fields(None),
                         ),
                     }
@@ -3592,6 +3673,44 @@ fn handle_tui_events(
                 let resolved_min_interval_minutes = min_iteration_interval_minutes
                     .or(existing_min_interval_minutes)
                     .unwrap_or(DEFAULT_MIN_ITERATION_INTERVAL_MINUTES);
+
+                if shared::is_retired_launch(provider, existing_model.as_deref()) {
+                    tracing::warn!(pane_id, "StartBot refused for retired provider");
+                    let _ = output_tx.send(PaneOutput {
+                        text: "[Start refused — unsupported provider has been retired]".to_string(),
+                        pane_id,
+                    });
+                    continue;
+                }
+
+                if (preserved_fields.managed
+                    && !project_policy
+                        .lock()
+                        .ok()
+                        .and_then(|policy| policy.clone())
+                        .is_some_and(|policy| policy.team_available))
+                    || !launch_allowed_by_server_policy(
+                        &project_policy,
+                        existing_kind,
+                        provider,
+                        existing_model.as_deref(),
+                    )
+                {
+                    let denied = shared::launch_profile_key(
+                        existing_kind,
+                        provider,
+                        existing_model.as_deref(),
+                    );
+                    tracing::warn!(pane_id, %denied, "StartBot refused by cluster policy");
+                    let _ = output_tx.send(PaneOutput {
+                        text: format!(
+                            "[Start refused — launch profile {} is unavailable under the current cluster policy]",
+                            denied
+                        ),
+                        pane_id,
+                    });
+                    continue;
+                }
 
                 // Kill any old child process and wait for it to fully exit
                 // so the Claude session ID is released before we --resume.
@@ -3662,7 +3781,9 @@ fn handle_tui_events(
                             goal: preserved_fields.goal,
                             backstory: preserved_fields.backstory,
                             plan_review_mode: preserved_fields.plan_review_mode,
-                            plan_review_mode_arc: Arc::new(Mutex::new(preserved_fields.plan_review_mode)),
+                            plan_review_mode_arc: Arc::new(Mutex::new(
+                                preserved_fields.plan_review_mode,
+                            )),
                             pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                             manual_mode: preserved_fields.manual_mode,
                             managed: preserved_fields.managed,
@@ -3693,7 +3814,6 @@ fn handle_tui_events(
                     provider,
                     existing_model.as_deref(),
                     claude_path,
-                    minimax_path,
                     codex_path,
                     opencode_path,
                     cursor_agent_path,
@@ -3705,30 +3825,47 @@ fn handle_tui_events(
                     let event_tx = event_tx.clone();
                     let working_dir = working_dir.to_string();
                     let input_channels_for_dl = input_channels.clone();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt, pr_mode_arc, pr_pending) = pane_metas
+                    let (
+                        interrupt_slot,
+                        control_resp_slot,
+                        pending_qs,
+                        effort_arc,
+                        worktree_path,
+                        system_prompt,
+                        pr_mode_arc,
+                        pr_pending,
+                    ) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
-                        .map(|m| (
-                            m.streaming_interrupt_tx.clone(),
-                            m.control_response_tx.clone(),
-                            m.pending_questions.clone(),
-                            m.effort_arc.clone(),
-                            m.worktree_path.clone(),
-                            crate::role::compose_system_prompt(m.role.as_deref(), m.goal.as_deref(), m.backstory.as_deref()),
-                            m.plan_review_mode_arc.clone(),
-                            m.pending_plan_reviews.clone(),
-                        ))
-                        .unwrap_or_else(|| (
-                            Arc::new(Mutex::new(None)),
-                            Arc::new(Mutex::new(None)),
-                            Arc::new(Mutex::new(HashMap::new())),
-                            Arc::new(Mutex::new(None)),
-                            None,
-                            None,
-                            Arc::new(Mutex::new(shared::PlanReviewMode::default())),
-                            Arc::new(Mutex::new(HashMap::new())),
-                        ));
+                        .map(|m| {
+                            (
+                                m.streaming_interrupt_tx.clone(),
+                                m.control_response_tx.clone(),
+                                m.pending_questions.clone(),
+                                m.effort_arc.clone(),
+                                m.worktree_path.clone(),
+                                crate::role::compose_system_prompt(
+                                    m.role.as_deref(),
+                                    m.goal.as_deref(),
+                                    m.backstory.as_deref(),
+                                ),
+                                m.plan_review_mode_arc.clone(),
+                                m.pending_plan_reviews.clone(),
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            (
+                                Arc::new(Mutex::new(None)),
+                                Arc::new(Mutex::new(None)),
+                                Arc::new(Mutex::new(HashMap::new())),
+                                Arc::new(Mutex::new(None)),
+                                None,
+                                None,
+                                Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                                Arc::new(Mutex::new(HashMap::new())),
+                            )
+                        });
                     let file_watcher_for_dl = file_watcher.clone();
                     thread::spawn(move || {
                         run_deadloop_session(
@@ -3804,10 +3941,17 @@ fn handle_tui_events(
                         let metas = pane_metas.lock().unwrap();
                         match metas.get(&pane_id) {
                             Some(m) => {
-                                let soft = m.streaming_interrupt_tx.lock().ok()
+                                let soft = m
+                                    .streaming_interrupt_tx
+                                    .lock()
+                                    .ok()
                                     .and_then(|g| g.as_ref().cloned());
-                                let present = m.child_process.lock().ok()
-                                    .map(|g| g.is_some()).unwrap_or(false);
+                                let present = m
+                                    .child_process
+                                    .lock()
+                                    .ok()
+                                    .map(|g| g.is_some())
+                                    .unwrap_or(false);
                                 (soft, present)
                             }
                             None => (None, false),
@@ -3938,9 +4082,15 @@ fn handle_tui_events(
                         let metas = pane_metas.lock().unwrap();
                         match metas.get(&pane_id) {
                             Some(m) => {
-                                let soft = m.streaming_interrupt_tx.lock().ok()
+                                let soft = m
+                                    .streaming_interrupt_tx
+                                    .lock()
+                                    .ok()
                                     .and_then(|g| g.as_ref().cloned());
-                                let pid = m.child_process.lock().ok()
+                                let pid = m
+                                    .child_process
+                                    .lock()
+                                    .ok()
                                     .and_then(|g| g.as_ref().map(|c| c.id()));
                                 (soft, pid)
                             }
@@ -3963,9 +4113,8 @@ fn handle_tui_events(
                                 let pane_for_log = pane_id;
                                 std::thread::spawn(move || {
                                     std::thread::sleep(Duration::from_secs(3));
-                                    let alive = std::path::Path::new(&format!(
-                                        "/proc/{}", pid
-                                    )).exists();
+                                    let alive =
+                                        std::path::Path::new(&format!("/proc/{}", pid)).exists();
                                     if alive {
                                         tracing::warn!(
                                             pane_id = pane_for_log,
@@ -4097,7 +4246,9 @@ fn handle_tui_events(
                             goal: None,
                             backstory: None,
                             plan_review_mode: shared::PlanReviewMode::default(),
-                            plan_review_mode_arc: Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                            plan_review_mode_arc: Arc::new(Mutex::new(
+                                shared::PlanReviewMode::default(),
+                            )),
                             pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
                             manual_mode: false,
                             managed: false,
@@ -4143,7 +4294,6 @@ fn handle_tui_events(
                     provider,
                     saved_model.as_deref(),
                     claude_path,
-                    minimax_path,
                     codex_path,
                     opencode_path,
                     cursor_agent_path,
@@ -4153,30 +4303,47 @@ fn handle_tui_events(
                     let server_tx = server_tx.clone();
                     let shutdown = shutdown.clone();
                     let working_dir = working_dir.to_string();
-                    let (interrupt_slot, control_resp_slot, pending_qs, effort_arc, worktree_path, system_prompt, pr_mode_arc, pr_pending) = pane_metas
+                    let (
+                        interrupt_slot,
+                        control_resp_slot,
+                        pending_qs,
+                        effort_arc,
+                        worktree_path,
+                        system_prompt,
+                        pr_mode_arc,
+                        pr_pending,
+                    ) = pane_metas
                         .lock()
                         .unwrap()
                         .get(&pane_id)
-                        .map(|m| (
-                            m.streaming_interrupt_tx.clone(),
-                            m.control_response_tx.clone(),
-                            m.pending_questions.clone(),
-                            m.effort_arc.clone(),
-                            m.worktree_path.clone(),
-                            crate::role::compose_system_prompt(m.role.as_deref(), m.goal.as_deref(), m.backstory.as_deref()),
-                            m.plan_review_mode_arc.clone(),
-                            m.pending_plan_reviews.clone(),
-                        ))
-                        .unwrap_or_else(|| (
-                            Arc::new(Mutex::new(None)),
-                            Arc::new(Mutex::new(None)),
-                            Arc::new(Mutex::new(HashMap::new())),
-                            Arc::new(Mutex::new(None)),
-                            None,
-                            None,
-                            Arc::new(Mutex::new(shared::PlanReviewMode::default())),
-                            Arc::new(Mutex::new(HashMap::new())),
-                        ));
+                        .map(|m| {
+                            (
+                                m.streaming_interrupt_tx.clone(),
+                                m.control_response_tx.clone(),
+                                m.pending_questions.clone(),
+                                m.effort_arc.clone(),
+                                m.worktree_path.clone(),
+                                crate::role::compose_system_prompt(
+                                    m.role.as_deref(),
+                                    m.goal.as_deref(),
+                                    m.backstory.as_deref(),
+                                ),
+                                m.plan_review_mode_arc.clone(),
+                                m.pending_plan_reviews.clone(),
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            (
+                                Arc::new(Mutex::new(None)),
+                                Arc::new(Mutex::new(None)),
+                                Arc::new(Mutex::new(HashMap::new())),
+                                Arc::new(Mutex::new(None)),
+                                None,
+                                None,
+                                Arc::new(Mutex::new(shared::PlanReviewMode::default())),
+                                Arc::new(Mutex::new(HashMap::new())),
+                            )
+                        });
                     thread::spawn(move || {
                         run_pane_session(
                             &binary_path,
@@ -4384,25 +4551,13 @@ fn promote_pane_to_managed(pane_metas: &PaneMetas, promote_id: u32) -> bool {
     }
 }
 
-fn active_usage_providers(pane_metas: &PaneMetas) -> (bool, bool, bool, bool, bool) {
+#[allow(deprecated)]
+fn active_usage_providers(pane_metas: &PaneMetas) -> (bool, bool, bool) {
     let metas = pane_metas.lock().unwrap();
     let mut has_claude = false;
     let mut has_codex = false;
-    let mut has_minimax = false;
-    let mut has_glm = false;
     let mut has_deepseek = false;
 
-    let looks_like_minimax_label = |label: &str| {
-        let normalized = label.trim().to_ascii_lowercase();
-        normalized.contains("minimax") || normalized.contains("mini max")
-    };
-    let looks_like_glm_label = |label: &str| {
-        let normalized = label.trim().to_ascii_lowercase();
-        normalized.contains("glm")
-            || normalized.contains("z.ai")
-            || normalized.contains("zai")
-            || normalized.contains("zhipu")
-    };
     let looks_like_deepseek_label = |label: &str| {
         let normalized = label.trim().to_ascii_lowercase();
         normalized.contains("deepseek")
@@ -4410,40 +4565,27 @@ fn active_usage_providers(pane_metas: &PaneMetas) -> (bool, bool, bool, bool, bo
 
     for meta in metas.values() {
         match meta.provider {
-            // MiniMax tabs run through Claude CLI transport, but Anthropic usage
-            // limits are not meaningful for them.
-            Provider::Claude
-                if is_minimax_model(meta.model.as_deref()) || looks_like_minimax_label(&meta.label) =>
-            {
-                has_minimax = true
-            }
-            // GLM tabs also run through Claude transport and should not map to
-            // Anthropic usage limits.
-            Provider::Claude
-                if is_glm_model(meta.model.as_deref()) || looks_like_glm_label(&meta.label) =>
-            {
-                has_glm = true
-            }
+            Provider::Claude if shared::is_retired_model(meta.model.as_deref()) => {}
             // DeepSeek tabs likewise.
             Provider::Claude
-                if is_deepseek_model(meta.model.as_deref()) || looks_like_deepseek_label(&meta.label) =>
+                if is_deepseek_model(meta.model.as_deref())
+                    || looks_like_deepseek_label(&meta.label) =>
             {
                 has_deepseek = true
             }
             Provider::Claude => has_claude = true,
             Provider::Codex => has_codex = true,
-            Provider::Minimax => has_minimax = true,
-            Provider::Glm => has_glm = true,
+            Provider::Minimax | Provider::Glm => {}
             Provider::Deepseek => has_deepseek = true,
             Provider::Opencode => {}
             Provider::CursorAgent => {}
         }
-        if has_claude && has_codex && has_minimax && has_glm && has_deepseek {
+        if has_claude && has_codex && has_deepseek {
             break;
         }
     }
 
-    (has_claude, has_codex, has_minimax, has_glm, has_deepseek)
+    (has_claude, has_codex, has_deepseek)
 }
 
 /// Kill any OS processes whose command line contains the given session ID.
@@ -4475,8 +4617,11 @@ fn build_agent_args(
     first_message: bool,
     try_resume: bool,
 ) -> (Vec<String>, bool) {
+    if shared::is_retired_launch(*provider, model) {
+        return (Vec::new(), false);
+    }
     match provider {
-        Provider::Claude | Provider::Minimax | Provider::Glm | Provider::Deepseek => {
+        Provider::Claude | Provider::Deepseek => {
             let mut base = vec![
                 "--print".to_string(),
                 "--output-format".to_string(),
@@ -4486,22 +4631,14 @@ fn build_agent_args(
             ];
             if let Some(model) = model {
                 let trimmed = model.trim();
-                // MiniMax/GLM/DeepSeek panes use dedicated backend env
-                // configuration. Keep model selection in env
+                // DeepSeek panes use dedicated backend env configuration.
+                // Keep model selection in env
                 // (ANTHROPIC_MODEL etc), not CLI flags.
-                if !trimmed.is_empty()
-                    && !is_minimax_model(Some(trimmed))
-                    && !is_glm_model(Some(trimmed))
-                    && !is_deepseek_model(Some(trimmed))
-                {
+                if !trimmed.is_empty() && !is_deepseek_model(Some(trimmed)) {
                     base.extend_from_slice(&["--model".to_string(), trimmed.to_string()]);
                 }
             }
-            if matches!(provider, Provider::Claude)
-                && !is_minimax_model(model)
-                && !is_glm_model(model)
-                && !is_deepseek_model(model)
-            {
+            if matches!(provider, Provider::Claude) && !is_deepseek_model(model) {
                 if let Some(normalized_effort) = normalize_effort_level(effort) {
                     let claude_flag = effort_to_claude_flag(&normalized_effort).to_string();
                     tracing::info!(
@@ -4608,9 +4745,15 @@ fn build_agent_args(
                 (base, true)
             }
         }
+        #[allow(deprecated)]
+        Provider::Minimax | Provider::Glm => (Vec::new(), false),
         Provider::Opencode => {
             // OpenCode uses: opencode run --format json [-m model] [-c -s session_id] -- <prompt>
-            let mut base = vec!["run".to_string(), "--format".to_string(), "json".to_string()];
+            let mut base = vec![
+                "run".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+            ];
             if let Some(model) = model {
                 let trimmed = model.trim();
                 if !trimmed.is_empty() {
@@ -4738,7 +4881,10 @@ fn try_handle_control_request(
         Some(r) => r,
         None => return Some(true),
     };
-    let subtype = request.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
+    let subtype = request
+        .get("subtype")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     if subtype != "can_use_tool" {
         tracing::debug!(
             pane_id,
@@ -4757,7 +4903,10 @@ fn try_handle_control_request(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let input = request.get("input").cloned().unwrap_or(serde_json::Value::Null);
+    let input = request
+        .get("input")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
 
     if tool_name == "AskUserQuestion" {
         // Park the request so the AnswerQuestion handler can echo back the
@@ -4887,11 +5036,17 @@ fn try_handle_control_response(
         // (it's not a stream message anyway), but no chat feedback.
         return true;
     }
-    let subtype = response.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
+    let subtype = response
+        .get("subtype")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let text = if subtype == "success" {
         "[✓ Effort change confirmed by claude]".to_string()
     } else {
-        let err = response.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error");
+        let err = response
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
         format!("[✗ Effort change rejected by claude: {}]", err)
     };
     let msg = CliToServer::Output {
@@ -4919,7 +5074,7 @@ fn parse_agent_output(
     session_id_str: &str,
 ) -> Option<ClaudeStreamMessage> {
     match provider {
-        Provider::Claude | Provider::Minimax | Provider::Glm | Provider::Deepseek => {
+        Provider::Claude | Provider::Deepseek => {
             serde_json::from_str::<ClaudeStreamMessage>(line).ok()
         }
         Provider::Codex => match serde_json::from_str::<CodexStreamMessage>(line) {
@@ -4934,29 +5089,32 @@ fn parse_agent_output(
             // cursor-agent --output-format stream-json emits Claude-compatible events
             serde_json::from_str::<ClaudeStreamMessage>(line).ok()
         }
+        #[allow(deprecated)]
+        Provider::Minimax | Provider::Glm => None,
     }
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::{
-        active_usage_providers, auto_cancel_pending_questions_for_new_input, build_agent_args,
-        build_agent_switch_respawn_event, build_deadloop_agent_args, build_pane_reboot_events,
-        build_pane_env_overrides_from_keys, build_pane_list, boot_restore_try_resume_first,
-        build_user_envelope_line, deadloop_wait_plan, evaluate_deadloop_watchdog,
-        is_codex_stale_session_error, manual_create_pr_worktree_path, normalize_codex_effort,
-        normalize_effort_level,
-        pane_label_or_default, promote_pane_to_managed, reset_deadloop_codex_stale_session,
-        resolve_pane_binary_path, route_web_input_to_pane, refresh_stale_managed_builtin_prompts,
-        restored_pane_mode_and_pause, run_deadloop_session_inner, save_pane_configs,
-        should_recover_deadloop_stale_session, start_bot_preserved_fields,
-        terminal_state_reports, truncate_str_at_char_boundary, update_project_flags,
-        DeadloopWatchdogDecision,
-        DeadloopWatchdogState, ASK_USER_QUESTION_AUTO_CANCEL_STATUS, InputChannels,
-        PaneInputRouteResult, PaneMeta, PaneMetas, PanePauses, PaneStopRequests,
-        PendingAskQuestion, DEEPSEEK_DEFAULT_MODEL, MANAGED_PANE_CREATE_PR_ERROR,
+        active_usage_providers, auto_cancel_pending_questions_for_new_input,
+        boot_restore_try_resume_first, build_agent_args, build_agent_switch_respawn_event,
+        build_deadloop_agent_args, build_pane_env_overrides_from_keys, build_pane_list,
+        build_pane_reboot_events, build_user_envelope_line, deadloop_wait_plan,
+        evaluate_deadloop_watchdog, is_codex_stale_session_error, manual_create_pr_worktree_path,
+        normalize_codex_effort, normalize_effort_level, promote_pane_to_managed,
+        refresh_stale_managed_builtin_prompts, reset_deadloop_codex_stale_session,
+        resolve_pane_binary_path, restored_pane_mode_and_pause, retired_launch_rejection_output,
+        route_web_input_to_pane, run_deadloop_session_inner, save_pane_configs,
+        should_recover_deadloop_stale_session, start_bot_preserved_fields, stop_retired_panes,
+        terminal_state_reports, truncate_str_at_char_boundary, update_project_operations,
+        DeadloopWatchdogDecision, DeadloopWatchdogState, InputChannels, PaneInputRouteResult,
+        PaneMeta, PaneMetas, PanePauses, PaneStopRequests, PendingAskQuestion,
+        ASK_USER_QUESTION_AUTO_CANCEL_STATUS, DEEPSEEK_DEFAULT_MODEL, MANAGED_PANE_CREATE_PR_ERROR,
     };
     use crate::project::{get_or_create_project, save_project};
+    use crate::terminal_pane::TerminalPanes;
     use crate::tui::{PaneOutput, TuiEvent};
     use shared::{CliToServer, Provider};
     use std::collections::{HashMap, HashSet};
@@ -4985,10 +5143,7 @@ mod tests {
         assert_eq!(plan.cursor, wait_entry_at);
         assert!(plan.cursor > self_write_at);
         assert_ne!(plan.cursor, last_started_at);
-        assert_eq!(
-            plan.remaining,
-            min_interval - Duration::from_millis(50)
-        );
+        assert_eq!(plan.remaining, min_interval - Duration::from_millis(50));
     }
 
     fn extract_ts_string_const<'a>(source: &'a str, name: &str) -> Option<&'a str> {
@@ -5002,8 +5157,9 @@ mod tests {
 
     #[test]
     fn deepseek_default_model_matches_web_provider_options() {
-        let web_default = extract_ts_string_const(WEB_PROVIDER_OPTIONS_TS, "DEEPSEEK_DEFAULT_MODEL")
-            .expect("web providerOptions.ts exports DEEPSEEK_DEFAULT_MODEL");
+        let web_default =
+            extract_ts_string_const(WEB_PROVIDER_OPTIONS_TS, "DEEPSEEK_DEFAULT_MODEL")
+                .expect("web providerOptions.ts exports DEEPSEEK_DEFAULT_MODEL");
 
         assert_eq!(DEEPSEEK_DEFAULT_MODEL, web_default);
     }
@@ -5019,14 +5175,8 @@ mod tests {
         state.last_activity = previous_activity;
         let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(123);
 
-        let decision = evaluate_deadloop_watchdog(
-            &mut state,
-            start,
-            idle_threshold,
-            Some(mtime),
-            true,
-            true,
-        );
+        let decision =
+            evaluate_deadloop_watchdog(&mut state, start, idle_threshold, Some(mtime), true, true);
 
         assert_eq!(decision, DeadloopWatchdogDecision::Noop);
         assert_eq!(state.last_mtime, Some(mtime));
@@ -5106,26 +5256,14 @@ mod tests {
         let mut state = DeadloopWatchdogState::new(start);
         let stale_at = start + idle_threshold;
 
-        let decision = evaluate_deadloop_watchdog(
-            &mut state,
-            stale_at,
-            idle_threshold,
-            None,
-            true,
-            false,
-        );
+        let decision =
+            evaluate_deadloop_watchdog(&mut state, stale_at, idle_threshold, None, true, false);
 
         assert_eq!(decision, DeadloopWatchdogDecision::Noop);
         assert_eq!(state.last_nudge, None);
 
-        let decision = evaluate_deadloop_watchdog(
-            &mut state,
-            stale_at,
-            idle_threshold,
-            None,
-            false,
-            true,
-        );
+        let decision =
+            evaluate_deadloop_watchdog(&mut state, stale_at, idle_threshold, None, false, true);
 
         assert_eq!(decision, DeadloopWatchdogDecision::Noop);
         assert_eq!(state.last_nudge, None);
@@ -5161,6 +5299,71 @@ mod tests {
             manual_mode: true,
             managed,
         }
+    }
+
+    #[test]
+    fn retired_rejection_is_sent_as_legacy_compatible_system_output() {
+        let session_id = Uuid::new_v4();
+        let message = retired_launch_rejection_output(
+            session_id,
+            29,
+            "[New pane refused — unsupported provider has been retired]",
+        );
+
+        assert!(matches!(
+            &message,
+            CliToServer::Output {
+                session_id: got_session,
+                data,
+                output_type: shared::OutputType::System,
+                pane_type: None,
+                pane_id: Some(29),
+            } if *got_session == session_id && data.contains("unsupported provider")
+        ));
+        let encoded = serde_json::to_value(message).unwrap();
+        assert_eq!(encoded["type"], "output");
+        assert_eq!(encoded["pane_id"], 29);
+    }
+
+    #[test]
+    fn stop_retired_panes_is_selective_and_preserves_metadata() {
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+        let mut retired = test_pane_meta(Provider::Claude, true, None, Arc::new(Mutex::new(None)));
+        retired.model = Some("MiniMax-M2.7".to_string());
+        let (interrupt_tx, interrupt_rx) = mpsc::channel();
+        retired.streaming_interrupt_tx = Arc::new(Mutex::new(Some(interrupt_tx)));
+        pane_metas.lock().unwrap().insert(7, retired);
+        pane_metas.lock().unwrap().insert(
+            8,
+            test_pane_meta(Provider::Codex, true, None, Arc::new(Mutex::new(None))),
+        );
+
+        let retired_pause = Arc::new(AtomicBool::new(false));
+        let supported_pause = Arc::new(AtomicBool::new(false));
+        let pane_pauses: PanePauses = Arc::new(Mutex::new(HashMap::from([
+            (7, retired_pause.clone()),
+            (8, supported_pause.clone()),
+        ])));
+        let (retired_input_tx, _retired_input_rx) = mpsc::channel();
+        let (supported_input_tx, _supported_input_rx) = mpsc::channel();
+        let input_channels: InputChannels = Arc::new(Mutex::new(HashMap::from([
+            (7, retired_input_tx),
+            (8, supported_input_tx),
+        ])));
+        let terminal_panes: TerminalPanes = Arc::new(Mutex::new(HashMap::new()));
+
+        assert_eq!(
+            stop_retired_panes(&pane_metas, &pane_pauses, &input_channels, &terminal_panes,),
+            vec![7],
+        );
+        assert!(retired_pause.load(Ordering::SeqCst));
+        assert!(!supported_pause.load(Ordering::SeqCst));
+        assert!(interrupt_rx.try_recv().is_ok());
+        assert!(!input_channels.lock().unwrap().contains_key(&7));
+        assert!(input_channels.lock().unwrap().contains_key(&8));
+        let metas = pane_metas.lock().unwrap();
+        assert!(metas.contains_key(&7));
+        assert!(metas.contains_key(&8));
     }
 
     fn test_pane_config(
@@ -5278,7 +5481,8 @@ mod tests {
             managed,
             try_resume_first,
             kind,
-        } = event else {
+        } = event
+        else {
             panic!("Start team should emit AddTabWithConfig events");
         };
 
@@ -5318,8 +5522,8 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let manager = team_role_spec(Provider::Codex, "gpt-5");
         let tech_lead = team_role_spec(Provider::Claude, "claude-sonnet-4");
-        let reviewer = team_role_spec(Provider::Minimax, "MiniMax-M2.7");
-        let developer = team_role_spec(Provider::Glm, "glm-5.1");
+        let reviewer = team_role_spec(Provider::CursorAgent, "cursor-default");
+        let developer = team_role_spec(Provider::Opencode, "opencode-default");
 
         super::spawn_missing_team_panes(
             &pane_metas,
@@ -5366,8 +5570,8 @@ mod tests {
             ExpectedTeamPane {
                 label: "Reviewer",
                 mode: shared::PaneMode::Deadloop,
-                provider: Provider::Minimax,
-                model: "MiniMax-M2.7",
+                provider: Provider::CursorAgent,
+                model: "cursor-default",
                 prompt: Some(crate::role::REVIEWER_DEADLOOP_PROMPT),
                 effort: Some("max"),
                 role: crate::role::DEFAULT_REVIEWER_ROLE,
@@ -5380,8 +5584,8 @@ mod tests {
             ExpectedTeamPane {
                 label: "Developer",
                 mode: shared::PaneMode::Deadloop,
-                provider: Provider::Glm,
-                model: "glm-5.1",
+                provider: Provider::Opencode,
+                model: "opencode-default",
                 prompt: Some(crate::role::DEFAULT_DEVELOPER_DEADLOOP_PROMPT),
                 effort: None,
                 role: crate::role::DEFAULT_DEVELOPER_ROLE,
@@ -5406,10 +5610,7 @@ mod tests {
 
             {
                 let mut metas = pane_metas.lock().unwrap();
-                metas.insert(
-                    10,
-                    test_team_pane_meta(suppressed_label, role, mode, true),
-                );
+                metas.insert(10, test_team_pane_meta(suppressed_label, role, mode, true));
                 metas.insert(
                     11,
                     test_team_pane_meta(
@@ -5500,12 +5701,7 @@ mod tests {
         let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
         pane_metas.lock().unwrap().insert(
             42,
-            test_pane_meta(
-                Provider::Claude,
-                true,
-                None,
-                Arc::new(Mutex::new(None)),
-            ),
+            test_pane_meta(Provider::Claude, true, None, Arc::new(Mutex::new(None))),
         );
 
         let err = manual_create_pr_worktree_path(&pane_metas, 42).unwrap_err();
@@ -5518,12 +5714,7 @@ mod tests {
         let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
         pane_metas.lock().unwrap().insert(
             42,
-            test_pane_meta(
-                Provider::Claude,
-                false,
-                None,
-                Arc::new(Mutex::new(None)),
-            ),
+            test_pane_meta(Provider::Claude, false, None, Arc::new(Mutex::new(None))),
         );
 
         let worktree_path = manual_create_pr_worktree_path(&pane_metas, 42).unwrap();
@@ -5543,7 +5734,7 @@ mod tests {
     #[test]
     fn build_agent_args_claude_resume_keeps_full_prompt() {
         let session_id = Uuid::new_v4();
-        let (mut args, using_resume) = build_agent_args(
+        let (args, using_resume) = build_agent_args(
             &Provider::Claude,
             &session_id,
             FULL_PROMPT,
@@ -5601,22 +5792,44 @@ mod tests {
     #[test]
     fn build_agent_args_codex_omits_model_effort_when_unset() {
         let session_id = Uuid::new_v4();
-        let (args, _) =
-            build_agent_args(&Provider::Codex, &session_id, FULL_PROMPT, None, None, true, false);
+        let (args, _) = build_agent_args(
+            &Provider::Codex,
+            &session_id,
+            FULL_PROMPT,
+            None,
+            None,
+            true,
+            false,
+        );
         assert!(!args.iter().any(|a| a == "--model"));
         assert!(!args.iter().any(|a| a == "-c"));
     }
 
     #[test]
     fn normalize_codex_effort_maps_levels() {
-        assert_eq!(normalize_codex_effort(Some("high")).as_deref(), Some("high"));
-        assert_eq!(normalize_codex_effort(Some("xhigh")).as_deref(), Some("xhigh"));
+        assert_eq!(
+            normalize_codex_effort(Some("high")).as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            normalize_codex_effort(Some("xhigh")).as_deref(),
+            Some("xhigh")
+        );
         assert_eq!(normalize_codex_effort(Some("max")).as_deref(), Some("max"));
         // apas-only ultracode + codex ultra both land on codex's `ultra`.
-        assert_eq!(normalize_codex_effort(Some("ultra")).as_deref(), Some("ultra"));
-        assert_eq!(normalize_codex_effort(Some("ultracode")).as_deref(), Some("ultra"));
+        assert_eq!(
+            normalize_codex_effort(Some("ultra")).as_deref(),
+            Some("ultra")
+        );
+        assert_eq!(
+            normalize_codex_effort(Some("ultracode")).as_deref(),
+            Some("ultra")
+        );
         // minimal floors to low (gpt-5.6 has no minimal).
-        assert_eq!(normalize_codex_effort(Some("minimal")).as_deref(), Some("low"));
+        assert_eq!(
+            normalize_codex_effort(Some("minimal")).as_deref(),
+            Some("low")
+        );
         // default / empty → None (codex uses its config.toml default).
         assert_eq!(normalize_codex_effort(Some("default")), None);
         assert_eq!(normalize_codex_effort(Some("  ")), None);
@@ -5625,10 +5838,8 @@ mod tests {
 
     #[test]
     fn codex_stale_session_recovery_resets_first_resumed_message_for_fresh_retry() {
-        let old_session_id =
-            Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
-        let fresh_session_id =
-            Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
+        let old_session_id = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let fresh_session_id = Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
         let mut session_id = old_session_id;
         let mut first_message = true;
         let mut try_resume_first = true;
@@ -5653,7 +5864,7 @@ mod tests {
         assert!(first_message);
         assert!(!try_resume_first);
 
-        let (mut args, using_resume) = build_deadloop_agent_args(
+        let (args, using_resume) = build_deadloop_agent_args(
             &Provider::Codex,
             &session_id,
             FULL_PROMPT,
@@ -5673,8 +5884,7 @@ mod tests {
 
     #[test]
     fn codex_stale_session_recovery_ignores_mid_loop_ordinary_failure() {
-        let session_id = Uuid::parse_str("00000000-0000-4000-8000-000000000003")
-            .unwrap();
+        let session_id = Uuid::parse_str("00000000-0000-4000-8000-000000000003").unwrap();
         let first_message = false;
         let try_resume_first = true;
 
@@ -5961,14 +6171,20 @@ mod tests {
 
         assert!(preserved.managed);
         assert!(preserved.manual_mode);
-        assert_eq!(preserved.worktree_path.as_deref(), Some("/tmp/apas-side-dev"));
+        assert_eq!(
+            preserved.worktree_path.as_deref(),
+            Some("/tmp/apas-side-dev")
+        );
         assert_eq!(preserved.role.as_deref(), Some("developer"));
         assert_eq!(preserved.goal.as_deref(), Some("Ship the side quest"));
         assert_eq!(
             preserved.backstory.as_deref(),
             Some("A manually added helper pane"),
         );
-        assert_eq!(preserved.plan_review_mode, shared::PlanReviewMode::RiskyOnly);
+        assert_eq!(
+            preserved.plan_review_mode,
+            shared::PlanReviewMode::RiskyOnly
+        );
     }
 
     #[test]
@@ -6068,12 +6284,14 @@ mod tests {
     }
 
     #[test]
-    fn update_project_flags_persists_flags_and_preserves_panes() {
+    fn update_project_operations_persists_flags_and_preserves_panes() {
         let _config = crate::config::test_config::isolated_config_dir();
         let dir = tempfile::tempdir().expect("temp project dir");
         let mut metadata = get_or_create_project(dir.path()).expect("metadata should initialize");
         metadata.auto_approve_todos = false;
         metadata.auto_merge_prs = false;
+        metadata.team_enabled = true;
+        metadata.disallowed_tab_types = vec!["terminal:codex".to_string()];
         metadata.panes = vec![shared::PaneConfig {
             pane_id: 42,
             provider: Provider::Codex,
@@ -6099,10 +6317,8 @@ mod tests {
         save_project(dir.path(), &metadata).expect("seed metadata");
 
         let session_id = Uuid::new_v4();
-        let (echo, team_turned_off) = update_project_flags(dir.path(), session_id, true, false, true, Vec::new())
+        let echo = update_project_operations(dir.path(), session_id, true, false)
             .expect("flags should persist");
-        // Was already off, so enabling it is not a "turned off" transition.
-        assert!(!team_turned_off);
 
         match echo {
             CliToServer::ProjectFlagsChanged {
@@ -6116,7 +6332,7 @@ mod tests {
                 assert!(auto_approve_todos);
                 assert!(!auto_merge_prs);
                 assert!(team_enabled);
-                assert!(disallowed_tab_types.is_empty());
+                assert_eq!(disallowed_tab_types, vec!["terminal:codex"]);
             }
             other => panic!("unexpected echo message: {other:?}"),
         }
@@ -6124,6 +6340,8 @@ mod tests {
         let reloaded = get_or_create_project(dir.path()).expect("metadata should reload");
         assert!(reloaded.auto_approve_todos);
         assert!(!reloaded.auto_merge_prs);
+        assert!(reloaded.team_enabled);
+        assert_eq!(reloaded.disallowed_tab_types, vec!["terminal:codex"]);
         assert_eq!(reloaded.panes.len(), 1);
         let pane = &reloaded.panes[0];
         assert_eq!(pane.pane_id, original_pane.pane_id);
@@ -6355,7 +6573,7 @@ Use a project-specific custom dispatch loop.";
     }
 
     #[test]
-    fn build_agent_args_claude_with_non_minimax_model_includes_model_flag() {
+    fn build_agent_args_claude_with_supported_model_includes_model_flag() {
         let session_id = Uuid::new_v4();
         let (args, _) = build_agent_args(
             &Provider::Claude,
@@ -6371,7 +6589,7 @@ Use a project-specific custom dispatch loop.";
     }
 
     #[test]
-    fn build_agent_args_claude_with_minimax_model_omits_model_flag() {
+    fn build_agent_args_retired_model_returns_no_spawn_arguments() {
         let session_id = Uuid::new_v4();
         let (args, _) = build_agent_args(
             &Provider::Claude,
@@ -6383,7 +6601,7 @@ Use a project-specific custom dispatch loop.";
             false,
         );
 
-        assert!(!args.iter().any(|arg| arg == "--model"));
+        assert!(args.is_empty());
     }
 
     #[test]
@@ -6408,22 +6626,6 @@ Use a project-specific custom dispatch loop.";
     }
 
     #[test]
-    fn build_agent_args_claude_with_glm_model_omits_model_flag() {
-        let session_id = Uuid::new_v4();
-        let (args, _) = build_agent_args(
-            &Provider::Claude,
-            &session_id,
-            FULL_PROMPT,
-            Some("glm-5.1"),
-            None,
-            true,
-            false,
-        );
-
-        assert!(!args.iter().any(|arg| arg == "--model"));
-    }
-
-    #[test]
     fn build_agent_args_claude_with_deepseek_model_omits_model_flag() {
         let session_id = Uuid::new_v4();
         let (args, _) = build_agent_args(
@@ -6441,8 +6643,7 @@ Use a project-specific custom dispatch loop.";
 
     #[test]
     fn deepseek_env_overrides_require_api_key() {
-        let err = build_pane_env_overrides_from_keys(&Provider::Deepseek, None, None, None, None)
-            .unwrap_err();
+        let err = build_pane_env_overrides_from_keys(&Provider::Deepseek, None, None).unwrap_err();
 
         assert!(err.contains("missing deepseek_api_key"));
     }
@@ -6452,19 +6653,29 @@ Use a project-specific custom dispatch loop.";
         let env = build_pane_env_overrides_from_keys(
             &Provider::Deepseek,
             None,
-            None,
-            None,
             Some("sk-deepseek".to_string()),
         )
         .unwrap();
-        let get = |key: &str| env.iter().find_map(|(k, v)| (k == key).then_some(v.as_str()));
+        let get = |key: &str| {
+            env.iter()
+                .find_map(|(k, v)| (k == key).then_some(v.as_str()))
+        };
 
-        assert_eq!(get("ANTHROPIC_BASE_URL"), Some("https://api.deepseek.com/anthropic"));
+        assert_eq!(
+            get("ANTHROPIC_BASE_URL"),
+            Some("https://api.deepseek.com/anthropic")
+        );
         assert_eq!(get("ANTHROPIC_API_KEY"), Some("sk-deepseek"));
         assert_eq!(get("ANTHROPIC_AUTH_TOKEN"), Some("sk-deepseek"));
-        assert_eq!(get("ANTHROPIC_DEFAULT_SONNET_MODEL"), Some("deepseek-v4-pro"));
+        assert_eq!(
+            get("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+            Some("deepseek-v4-pro")
+        );
         assert_eq!(get("ANTHROPIC_DEFAULT_OPUS_MODEL"), Some("deepseek-v4-pro"));
-        assert_eq!(get("ANTHROPIC_DEFAULT_HAIKU_MODEL"), Some("deepseek-v4-pro"));
+        assert_eq!(
+            get("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+            Some("deepseek-v4-pro")
+        );
         assert_eq!(get("ANTHROPIC_MODEL"), None);
     }
 
@@ -6473,14 +6684,18 @@ Use a project-specific custom dispatch loop.";
         let env = build_pane_env_overrides_from_keys(
             &Provider::Claude,
             Some("deepseek-chat"),
-            None,
-            None,
             Some("sk-deepseek".to_string()),
         )
         .unwrap();
-        let get = |key: &str| env.iter().find_map(|(k, v)| (k == key).then_some(v.as_str()));
+        let get = |key: &str| {
+            env.iter()
+                .find_map(|(k, v)| (k == key).then_some(v.as_str()))
+        };
 
-        assert_eq!(get("ANTHROPIC_BASE_URL"), Some("https://api.deepseek.com/anthropic"));
+        assert_eq!(
+            get("ANTHROPIC_BASE_URL"),
+            Some("https://api.deepseek.com/anthropic")
+        );
         assert_eq!(get("ANTHROPIC_API_KEY"), Some("sk-deepseek"));
         assert_eq!(get("ANTHROPIC_DEFAULT_SONNET_MODEL"), Some("deepseek-chat"));
         assert_eq!(get("ANTHROPIC_DEFAULT_OPUS_MODEL"), Some("deepseek-chat"));
@@ -6581,49 +6796,11 @@ Use a project-specific custom dispatch loop.";
     }
 
     #[test]
-    fn build_agent_args_claude_minimax_backend_ignores_effort_flag() {
-        let session_id = Uuid::new_v4();
-        let (args, _) = build_agent_args(
-            &Provider::Claude,
-            &session_id,
-            FULL_PROMPT,
-            Some("MiniMax-M2.7"),
-            Some("max"),
-            true,
-            false,
-        );
-
-        assert!(!args.iter().any(|arg| arg == "--effort"));
-    }
-
-    #[test]
-    fn resolve_pane_binary_path_uses_claude_for_minimax_model() {
-        let path = resolve_pane_binary_path(
-            Provider::Claude,
-            Some("MiniMax-M2.7"),
-            "claude",
-            "claude2",
-            "codex",
-            "opencode",
-            "cursor-agent",
-        );
-        assert_eq!(path, "claude");
-    }
-
-    #[test]
-    fn resolve_pane_binary_path_uses_claude_for_m2_alias_model() {
-        let path =
-            resolve_pane_binary_path(Provider::Claude, Some("m2.7"), "claude", "claude2", "codex", "opencode", "cursor-agent");
-        assert_eq!(path, "claude");
-    }
-
-    #[test]
-    fn resolve_pane_binary_path_uses_default_claude_for_non_minimax_model() {
+    fn resolve_pane_binary_path_uses_default_claude_for_supported_model() {
         let path = resolve_pane_binary_path(
             Provider::Claude,
             Some("sonnet"),
             "claude",
-            "claude2",
             "codex",
             "opencode",
             "cursor-agent",
@@ -6632,35 +6809,19 @@ Use a project-specific custom dispatch loop.";
     }
 
     #[test]
-    fn resolve_pane_binary_path_keeps_absolute_claude_path_for_minimax_model() {
-        let path = resolve_pane_binary_path(
-            Provider::Claude,
-            Some("MiniMax-M2.7"),
-            "/opt/bin/claude",
-            "claude2",
-            "codex",
-            "opencode",
-            "cursor-agent",
-        );
-        assert_eq!(path, "/opt/bin/claude");
-    }
-
-    #[test]
-    fn pane_label_or_default_rebrands_generic_minimax_tab_label() {
-        let label = pane_label_or_default(Some("Tab 42"), 42, Some("MiniMax-M2.7"));
-        assert_eq!(label, "MiniMax 42");
-    }
-
-    #[test]
-    fn pane_label_or_default_preserves_custom_label() {
-        let label = pane_label_or_default(Some("Research"), 42, Some("MiniMax-M2.7"));
-        assert_eq!(label, "Research");
-    }
-
-    #[test]
-    fn pane_label_or_default_rebrands_generic_glm_tab_label() {
-        let label = pane_label_or_default(Some("Tab 11"), 11, Some("glm-5.1"));
-        assert_eq!(label, "GLM 11");
+    fn retired_models_are_rejected_before_environment_construction() {
+        for model in ["MiniMax-M2.7", "m2.7", "glm-5.1"] {
+            let err = build_pane_env_overrides_from_keys(
+                &Provider::Claude,
+                Some(model),
+                Some("supported-key-must-not-be-used".to_string()),
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("retired"),
+                "unexpected error for {model}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -6726,10 +6887,7 @@ Use a project-specific custom dispatch loop.";
             );
         }
 
-        assert_eq!(
-            active_usage_providers(&pane_metas),
-            (true, true, false, false, false)
-        );
+        assert_eq!(active_usage_providers(&pane_metas), (true, true, false));
     }
 
     #[test]
@@ -6768,10 +6926,7 @@ Use a project-specific custom dispatch loop.";
             );
         }
 
-        assert_eq!(
-            active_usage_providers(&pane_metas),
-            (false, false, true, false, false)
-        );
+        assert_eq!(active_usage_providers(&pane_metas), (false, false, false));
     }
 
     #[test]
@@ -6837,10 +6992,7 @@ Use a project-specific custom dispatch loop.";
             );
         }
 
-        assert_eq!(
-            active_usage_providers(&pane_metas),
-            (false, true, true, false, false)
-        );
+        assert_eq!(active_usage_providers(&pane_metas), (false, true, false));
     }
 
     #[test]
@@ -6879,10 +7031,7 @@ Use a project-specific custom dispatch loop.";
             );
         }
 
-        assert_eq!(
-            active_usage_providers(&pane_metas),
-            (false, false, true, false, false)
-        );
+        assert_eq!(active_usage_providers(&pane_metas), (false, false, false));
     }
 
     #[test]
@@ -6972,22 +7121,12 @@ Use a project-specific custom dispatch loop.";
         let (target_tx, target_rx) = mpsc::channel::<String>();
         let (other_tx, other_rx) = mpsc::channel::<String>();
 
-        let target_meta = test_pane_meta(
-            Provider::Claude,
-            true,
-            None,
-            Arc::new(Mutex::new(None)),
-        );
+        let target_meta = test_pane_meta(Provider::Claude, true, None, Arc::new(Mutex::new(None)));
         *target_meta.control_response_tx.lock().unwrap() = Some(target_tx);
         seed_pending_question(&target_meta, "toolu-a", "req-a");
         seed_pending_question(&target_meta, "toolu-b", "req-b");
 
-        let other_meta = test_pane_meta(
-            Provider::Claude,
-            true,
-            None,
-            Arc::new(Mutex::new(None)),
-        );
+        let other_meta = test_pane_meta(Provider::Claude, true, None, Arc::new(Mutex::new(None)));
         *other_meta.control_response_tx.lock().unwrap() = Some(other_tx);
         seed_pending_question(&other_meta, "toolu-other", "req-other");
 
@@ -7026,7 +7165,10 @@ Use a project-specific custom dispatch loop.";
                     .as_str()
                     .unwrap()
                     .to_string(),
-                value["response"]["request_id"].as_str().unwrap().to_string(),
+                value["response"]["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
             );
         }
 
@@ -7042,12 +7184,8 @@ Use a project-specific custom dispatch loop.";
     #[test]
     fn auto_cancel_no_sender_and_missing_meta_still_allow_input_forwarding() {
         let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
-        let no_sender_meta = test_pane_meta(
-            Provider::Claude,
-            true,
-            None,
-            Arc::new(Mutex::new(None)),
-        );
+        let no_sender_meta =
+            test_pane_meta(Provider::Claude, true, None, Arc::new(Mutex::new(None)));
         seed_pending_question(&no_sender_meta, "toolu-waiting", "req-waiting");
         pane_metas.lock().unwrap().insert(9, no_sender_meta);
 
@@ -7070,10 +7208,7 @@ Use a project-specific custom dispatch loop.";
         );
 
         let (missing_meta_tx, missing_meta_rx) = mpsc::channel::<(String, bool)>();
-        input_channels
-            .lock()
-            .unwrap()
-            .insert(99, missing_meta_tx);
+        input_channels.lock().unwrap().insert(99, missing_meta_tx);
 
         let cancelled = auto_cancel_pending_questions_for_new_input(&pane_metas, 99);
         let routed = route_web_input_to_pane(&input_channels, 99, "prompt for missing meta");
@@ -7092,7 +7227,7 @@ Use a project-specific custom dispatch loop.";
     }
 
     #[test]
-    fn active_usage_providers_detects_glm_only_claude() {
+    fn active_usage_providers_ignores_retired_glm_model() {
         let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
         let child_process = Arc::new(Mutex::new(None));
 
@@ -7127,14 +7262,11 @@ Use a project-specific custom dispatch loop.";
             );
         }
 
-        assert_eq!(
-            active_usage_providers(&pane_metas),
-            (false, false, false, true, false)
-        );
+        assert_eq!(active_usage_providers(&pane_metas), (false, false, false));
     }
 
     #[test]
-    fn active_usage_providers_detects_glm_label_without_model() {
+    fn active_usage_providers_does_not_infer_provider_from_label() {
         let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
         let child_process = Arc::new(Mutex::new(None));
 
@@ -7169,18 +7301,15 @@ Use a project-specific custom dispatch loop.";
             );
         }
 
-        assert_eq!(
-            active_usage_providers(&pane_metas),
-            (false, false, false, true, false)
-        );
+        assert_eq!(active_usage_providers(&pane_metas), (true, false, false));
     }
 
     #[test]
     fn control_request_parser_parks_ask_user_question() {
         use super::{try_handle_control_request, PendingAskQuestion};
         use shared::CliToServer;
-        use std::sync::{Arc, Mutex};
         use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
 
         let pending: Arc<Mutex<HashMap<String, PendingAskQuestion>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -7211,8 +7340,8 @@ Use a project-specific custom dispatch loop.";
     fn control_request_parser_auto_approves_other_tools() {
         use super::{try_handle_control_request, PendingAskQuestion};
         use shared::CliToServer;
-        use std::sync::{Arc, Mutex};
         use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
 
         let pending: Arc<Mutex<HashMap<String, PendingAskQuestion>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -7232,7 +7361,9 @@ Use a project-specific custom dispatch loop.";
             shared::PlanReviewMode::Never,
         );
         assert_eq!(handled, Some(true));
-        let payload = cr_rx.try_recv().expect("auto-approve should send a control_response");
+        let payload = cr_rx
+            .try_recv()
+            .expect("auto-approve should send a control_response");
         assert!(payload.contains("\"behavior\":\"allow\""));
         assert!(payload.contains("\"request_id\":\"req-2\""));
         assert!(payload.contains("\"toolUseID\":\"toolu_xyz\""));
@@ -7242,8 +7373,8 @@ Use a project-specific custom dispatch loop.";
     fn control_request_parser_ignores_non_control_lines() {
         use super::{try_handle_control_request, PendingAskQuestion};
         use shared::CliToServer;
-        use std::sync::{Arc, Mutex};
         use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
 
         let pending: Arc<Mutex<HashMap<String, PendingAskQuestion>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -7402,11 +7533,8 @@ Use a project-specific custom dispatch loop.";
         turn.input_tokens = Some(1200);
         turn.output_tokens = Some(340);
 
-        let msgs = super::conversation_turn_to_stream_messages(
-            &turn,
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-        );
+        let msgs =
+            super::conversation_turn_to_stream_messages(&turn, Uuid::new_v4(), Uuid::new_v4());
         assert_eq!(msgs.len(), 2);
         match &msgs[1] {
             CliToServer::StreamMessage {
@@ -7444,111 +7572,70 @@ Use a project-specific custom dispatch loop.";
         assert!(matches!(&msgs[0], CliToServer::UserInput { .. }));
     }
 
-    // --- tab-type policy ---------------------------------------------------
-
     #[test]
-    fn tab_types_are_all_allowed_on_a_project_that_never_set_a_policy() {
-        // The upgrade path: an older `.apas` has no `disallowed_tab_types`,
-        // which must mean "no restrictions" rather than "no tabs".
+    fn operational_updates_cannot_change_cluster_governed_local_fields() {
         let _config = crate::config::test_config::isolated_config_dir();
         let dir = tempfile::tempdir().expect("temp project dir");
-        std::fs::write(
-            dir.path().join(".apas"),
-            r#"{
-                "id": "8c4b0c1e-0000-4000-8000-000000000002",
-                "name": "legacy",
-                "created_at": "2026-01-01T00:00:00Z",
-                "panes": []
-            }"#,
-        )
-        .expect("write legacy .apas");
+        let mut meta = get_or_create_project(dir.path()).expect("project");
+        meta.team_enabled = true;
+        meta.disallowed_tab_types = vec!["terminal:codex".to_string()];
+        save_project(dir.path(), &meta).expect("legacy policy");
 
-        for provider in [Provider::Claude, Provider::Codex] {
-            for kind in [shared::PaneKind::Agent, shared::PaneKind::Terminal] {
-                assert!(
-                    super::tab_type_allowed_for(dir.path(), kind, provider.clone()),
-                    "{kind:?}/{provider:?} should be allowed with no policy set"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_disallowed_tab_type_is_refused_while_its_sibling_is_not() {
-        let _config = crate::config::test_config::isolated_config_dir();
-        let dir = tempfile::tempdir().expect("temp project dir");
-        let session_id = Uuid::new_v4();
-
-        update_project_flags(
-            dir.path(),
-            session_id,
-            false,
-            false,
-            false,
-            vec!["terminal:claude".to_string()],
-        )
-        .expect("persist policy");
-
-        assert!(!super::tab_type_allowed_for(
-            dir.path(),
-            shared::PaneKind::Terminal,
-            Provider::Claude
-        ));
-        // The point of keying on kind *and* provider: blocking claude
-        // terminals must not block claude agent tabs.
-        assert!(super::tab_type_allowed_for(
-            dir.path(),
-            shared::PaneKind::Agent,
-            Provider::Claude
-        ));
-        assert!(super::tab_type_allowed_for(
-            dir.path(),
-            shared::PaneKind::Terminal,
-            Provider::Codex
-        ));
-    }
-
-    #[test]
-    fn the_tab_type_policy_round_trips_through_apas() {
-        let _config = crate::config::test_config::isolated_config_dir();
-        let dir = tempfile::tempdir().expect("temp project dir");
-        let session_id = Uuid::new_v4();
-        let deny = vec!["terminal:claude".to_string(), "agent:opencode".to_string()];
-
-        let (echo, _) =
-            update_project_flags(dir.path(), session_id, false, false, false, deny.clone())
-                .expect("persist");
-
-        assert_eq!(
-            get_or_create_project(dir.path()).unwrap().disallowed_tab_types,
-            deny
-        );
-        match echo {
+        let echo = update_project_operations(dir.path(), Uuid::new_v4(), true, true)
+            .expect("update workflow operations");
+        let after = get_or_create_project(dir.path()).expect("reload project");
+        assert!(after.team_enabled);
+        assert_eq!(after.disallowed_tab_types, vec!["terminal:codex"]);
+        assert!(matches!(
+            echo,
             CliToServer::ProjectFlagsChanged {
-                disallowed_tab_types,
+                auto_approve_todos: true,
+                auto_merge_prs: true,
+                team_enabled: true,
                 ..
-            } => assert_eq!(disallowed_tab_types, deny),
-            other => panic!("unexpected echo: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn an_unreadable_apas_leaves_tab_types_allowed() {
-        // Fails *open*, unlike team mode. The worst case is a tab an owner
-        // meant to block; failing closed would lock everyone out of the
-        // project over an unreadable file.
-        let _config = crate::config::test_config::isolated_config_dir();
-        let dir = tempfile::tempdir().expect("temp project dir");
-        std::fs::write(dir.path().join(".apas"), "{ not json").expect("write junk");
-
-        assert!(super::tab_type_allowed_for(
-            dir.path(),
-            shared::PaneKind::Terminal,
-            Provider::Claude
+            }
         ));
     }
 
     // --- team mode on/off ---------------------------------------------------
+
+    #[test]
+    fn server_policy_checks_fail_closed_and_validate_team_profiles() {
+        let policy = Arc::new(Mutex::new(None));
+        assert!(!super::launch_allowed_by_server_policy(
+            &policy,
+            shared::PaneKind::Agent,
+            Provider::Codex,
+            None,
+        ));
+
+        *policy.lock().unwrap() = Some(shared::EffectiveProjectPolicy {
+            team_available: true,
+            allowed_launch_profiles: vec!["agent:codex:official:default".to_string()],
+            version: 8,
+            project_suspended: false,
+        });
+        assert!(super::launch_allowed_by_server_policy(
+            &policy,
+            shared::PaneKind::Agent,
+            Provider::Codex,
+            None,
+        ));
+        assert!(!super::launch_allowed_by_server_policy(
+            &policy,
+            shared::PaneKind::Agent,
+            Provider::Claude,
+            None,
+        ));
+        let codex = shared::TeamRoleSpec {
+            provider: Some(Provider::Codex),
+            model: None,
+        };
+        assert!(super::team_allowed_by_server_policy(&policy, &[&codex]));
+
+        policy.lock().unwrap().as_mut().unwrap().team_available = false;
+        assert!(!super::team_allowed_by_server_policy(&policy, &[&codex]));
+    }
 
     #[test]
     fn team_mode_is_off_for_a_project_whose_apas_predates_the_flag() {
@@ -7577,42 +7664,6 @@ Use a project-specific custom dispatch loop.";
         // defaulting rather than the whole file failing to parse.
         assert!(meta.auto_approve_todos);
         assert!(meta.auto_merge_prs);
-    }
-
-    #[test]
-    fn team_enabled_for_fails_closed_on_an_unreadable_project() {
-        let _config = crate::config::test_config::isolated_config_dir();
-        let dir = tempfile::tempdir().expect("temp project dir");
-        std::fs::write(dir.path().join(".apas"), "{ not json").expect("write junk");
-
-        assert!(
-            !super::team_enabled_for(dir.path()),
-            "an unreadable .apas is not permission to run a team"
-        );
-    }
-
-    #[test]
-    fn disabling_team_mode_is_reported_as_a_transition_but_enabling_is_not() {
-        let _config = crate::config::test_config::isolated_config_dir();
-        let dir = tempfile::tempdir().expect("temp project dir");
-        let session_id = Uuid::new_v4();
-
-        // off -> on: nothing to stop.
-        let (_, turned_off) =
-            update_project_flags(dir.path(), session_id, false, false, true, Vec::new()).expect("enable");
-        assert!(!turned_off);
-        assert!(get_or_create_project(dir.path()).unwrap().team_enabled);
-
-        // on -> off: the caller must stop the running team.
-        let (_, turned_off) =
-            update_project_flags(dir.path(), session_id, false, false, false, Vec::new()).expect("disable");
-        assert!(turned_off);
-        assert!(!get_or_create_project(dir.path()).unwrap().team_enabled);
-
-        // off -> off: idempotent, so a repeated write doesn't re-stop panes.
-        let (_, turned_off) =
-            update_project_flags(dir.path(), session_id, false, false, false, Vec::new()).expect("disable again");
-        assert!(!turned_off);
     }
 
     #[test]
@@ -7646,7 +7697,10 @@ Use a project-specific custom dispatch loop.";
             !paused(13),
             "interactive panes have no loop to pause — interrupt only"
         );
-        assert!(!paused(14), "an unmanaged side chat is not part of the team");
+        assert!(
+            !paused(14),
+            "an unmanaged side chat is not part of the team"
+        );
     }
 
     // --- closing a pane must not leave the agent's subtree running ---------
@@ -7946,14 +8000,11 @@ fn run_deadloop_session_inner(
             file_watcher,
         );
     }
-    let effective_dir: String = worktree_path
-        .as_deref()
-        .unwrap_or(working_dir)
-        .to_string();
+    let effective_dir: String = worktree_path.as_deref().unwrap_or(working_dir).to_string();
     let _ = system_prompt; // codex/cursor/etc. ignored for now — see role.rs note.
     let _ = plan_review_mode_arc; // non-claude legacy path doesn't gate
     let _ = pending_plan_reviews;
-    let _ = input_channels; // legacy non-streaming codex/glm path doesn't register
+    let _ = input_channels; // non-streaming provider paths do not register
     let _ = interrupt_tx_slot; // unused for legacy path
     let _ = control_response_tx_slot; // unused for legacy path
     let _ = pending_questions; // unused for legacy path
@@ -8272,8 +8323,7 @@ fn run_deadloop_session_inner(
                                     // found" phrasing and the JSON-RPC
                                     // "thread/resume failed" prefix.
                                     if is_codex_stale_session_error(&line) {
-                                        stale_flag_for_stderr
-                                            .store(true, Ordering::SeqCst);
+                                        stale_flag_for_stderr.store(true, Ordering::SeqCst);
                                     }
                                     let _ = output_tx_stderr.send(PaneOutput {
                                         text: format!("[stderr] {}", line),
@@ -8381,10 +8431,8 @@ fn run_deadloop_session_inner(
 
                             match parse_agent_output(provider, &line, &session_id_str) {
                                 Some(message) => {
-                                    let is_result = matches!(
-                                        message,
-                                        ClaudeStreamMessage::Result { .. }
-                                    );
+                                    let is_result =
+                                        matches!(message, ClaudeStreamMessage::Result { .. });
                                     if let ClaudeStreamMessage::Result { is_error, .. } = &message {
                                         if *is_error {
                                             had_error = true;
@@ -8522,7 +8570,8 @@ fn run_deadloop_session_inner(
                         // module directly: read .apas, mutate the matching
                         // pane's session_id, write back.
                         let project_dir = std::path::Path::new(working_dir);
-                        if let Ok(mut metadata) = crate::project::get_or_create_project(project_dir) {
+                        if let Ok(mut metadata) = crate::project::get_or_create_project(project_dir)
+                        {
                             if let Some(pane) = metadata.get_pane_mut(pane_id) {
                                 pane.session_id = claude_session_id;
                                 let _ = crate::project::save_project(project_dir, &metadata);
@@ -8713,10 +8762,7 @@ fn poll_background_tasks(
     // idle at" timestamp. We only fire auto-wake for task output that grew
     // AFTER this mtime — output produced during a turn is part of the turn
     // and claude already saw it, so it shouldn't trigger a new prompt.
-    let stop_marker_path = std::path::PathBuf::from(format!(
-        "/tmp/apas-stop-marks/{}",
-        session_id
-    ));
+    let stop_marker_path = std::path::PathBuf::from(format!("/tmp/apas-stop-marks/{}", session_id));
 
     // task_id -> (last_seen_size, last_seen_mtime, fired_for_this_episode)
     let mut state: HashMap<String, (u64, std::time::SystemTime, bool)> = HashMap::new();
@@ -8815,7 +8861,9 @@ fn poll_background_tasks(
             if entry_state.2 {
                 continue;
             }
-            let Some(stop_mtime) = stop_mtime else { continue };
+            let Some(stop_mtime) = stop_mtime else {
+                continue;
+            };
             if entry_state.1 <= stop_mtime {
                 continue;
             }
@@ -8936,7 +8984,9 @@ fn tail_session_jsonl(
     shutdown: Arc<AtomicBool>,
     pane_type: PaneType,
 ) {
-    let Some(home) = std::env::var_os("HOME") else { return };
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
     let encoded: String = working_dir
         .chars()
         .map(|c| if c == '/' { '-' } else { c })
@@ -9042,11 +9092,8 @@ fn tail_session_jsonl(
                     }
                     set.insert(uuid.clone());
                 }
-                let Some(message) = parse_agent_output(
-                    &Provider::Claude,
-                    line,
-                    &session_id_str,
-                ) else {
+                let Some(message) = parse_agent_output(&Provider::Claude, line, &session_id_str)
+                else {
                     continue;
                 };
                 let _ = server_tx.blocking_send(CliToServer::StreamMessage {
@@ -9175,13 +9222,13 @@ fn run_pane_session_streaming(
     // effective_dir is what we pass to claude as cwd and what we use to
     // locate its session jsonl / background-task tmp dir. With no worktree
     // set, this collapses to the project working_dir (legacy behaviour).
-    let effective_dir: String = worktree_path
-        .as_deref()
-        .unwrap_or(working_dir)
-        .to_string();
+    let effective_dir: String = worktree_path.as_deref().unwrap_or(working_dir).to_string();
 
     let _ = output_tx.send(PaneOutput {
-        text: format!("[Session: {} (streaming)]", &claude_session_id.to_string()[..8]),
+        text: format!(
+            "[Session: {} (streaming)]",
+            &claude_session_id.to_string()[..8]
+        ),
         pane_id,
     });
 
@@ -9334,15 +9381,12 @@ fn run_pane_session_streaming(
         }
         args.push(claude_session_id.to_string());
         if let Some(m) = model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            if !is_minimax_model(Some(m)) && !is_glm_model(Some(m)) && !is_deepseek_model(Some(m)) {
+            if !shared::is_retired_model(Some(m)) && !is_deepseek_model(Some(m)) {
                 args.push("--model".into());
                 args.push(m.to_string());
             }
         }
-        if !is_minimax_model(model.as_deref())
-            && !is_glm_model(model.as_deref())
-            && !is_deepseek_model(model.as_deref())
-        {
+        if !shared::is_retired_model(model.as_deref()) && !is_deepseek_model(model.as_deref()) {
             // Re-read effort from the shared cell at every spawn so a
             // UpdatePaneEffort that fires between spawns picks up the
             // latest value. The `effort` function param is the seed for
@@ -9564,7 +9608,11 @@ fn run_pane_session_streaming(
                             ClaudeStreamMessage::Assistant { message: msg, .. } => {
                                 for block in &msg.content {
                                     if let ClaudeContentBlock::ToolUse { id, name, input } = block {
-                                        if let Some(pill) = crate::pane_status::pane_status_from_tool_use(name, input) {
+                                        if let Some(pill) =
+                                            crate::pane_status::pane_status_from_tool_use(
+                                                name, input,
+                                            )
+                                        {
                                             latest_pill = Some(pill);
                                         }
                                         if name == "Task" {
@@ -9583,9 +9631,8 @@ fn run_pane_session_streaming(
                                         // never gets re-checked stays out
                                         // of the set → no wake noise.
                                         if name == "Monitor" || name == "BashOutput" {
-                                            if let Some(tid) = input
-                                                .get("task_id")
-                                                .and_then(|v| v.as_str())
+                                            if let Some(tid) =
+                                                input.get("task_id").and_then(|v| v.as_str())
                                             {
                                                 let mut w = reader_watched.lock().unwrap();
                                                 if w.insert(tid.to_string()) {
@@ -9603,10 +9650,8 @@ fn run_pane_session_streaming(
                             }
                             ClaudeStreamMessage::User { message: msg, .. } => {
                                 for block in &msg.content {
-                                    if let ClaudeContentBlock::ToolResult {
-                                        tool_use_id,
-                                        ..
-                                    } = block
+                                    if let ClaudeContentBlock::ToolResult { tool_use_id, .. } =
+                                        block
                                     {
                                         let mut s = reader_in_flight.lock().unwrap();
                                         if s.remove(tool_use_id) {
@@ -9905,11 +9950,8 @@ fn run_pane_session_streaming(
             //    fire next_prompt the moment the reader thread observes
             //    fully-idle (Result + subagents=0) and updates the shared
             //    state.
-            let next_prompt: Option<(String, bool, bool)> = if !busy {
-                pending.pop_front()
-            } else {
-                None
-            };
+            let next_prompt: Option<(String, bool, bool)> =
+                if !busy { pending.pop_front() } else { None };
 
             match next_prompt {
                 Some((prompt, from_tui, is_auto_wake)) => {
@@ -9929,10 +9971,7 @@ fn run_pane_session_streaming(
                     if let Ok(mut t) = thinking.lock() {
                         *t = true;
                     }
-                    let n_subagents = in_flight_subagents
-                        .lock()
-                        .map(|s| s.len())
-                        .unwrap_or(0);
+                    let n_subagents = in_flight_subagents.lock().map(|s| s.len()).unwrap_or(0);
                     let _ = server_tx.blocking_send(CliToServer::PaneStatus {
                         session_id,
                         pane_type,
@@ -9951,10 +9990,7 @@ fn run_pane_session_streaming(
                     // pane prepends the workflow keyword to each prompt.
                     // This is the only behavioural difference between
                     // `ultracode` and `xhigh` — the wire flag is the same.
-                    let live_effort = effort_arc
-                        .lock()
-                        .ok()
-                        .and_then(|g| g.clone());
+                    let live_effort = effort_arc.lock().ok().and_then(|g| g.clone());
                     let line = build_user_envelope_line(&prompt, live_effort.as_deref());
                     if let Err(e) = stdin.write_all(line.as_bytes()) {
                         let _ = output_tx.send(PaneOutput {
@@ -10310,16 +10346,14 @@ fn run_deadloop_session_streaming(
                 .as_ref()
                 .and_then(|p| std::fs::metadata(p).ok())
                 .and_then(|m| m.modified().ok());
-            if let DeadloopWatchdogDecision::Nudge { idle_minutes } =
-                evaluate_deadloop_watchdog(
-                    &mut watchdog_state,
-                    now,
-                    idle_threshold,
-                    session_mtime,
-                    watchdog_jsonl.is_some(),
-                    true,
-                )
-            {
+            if let DeadloopWatchdogDecision::Nudge { idle_minutes } = evaluate_deadloop_watchdog(
+                &mut watchdog_state,
+                now,
+                idle_threshold,
+                session_mtime,
+                watchdog_jsonl.is_some(),
+                true,
+            ) {
                 tracing::warn!(
                     pane_id,
                     idle_minutes,
@@ -10348,8 +10382,9 @@ fn run_deadloop_session_streaming(
                     // inner worker normally respawns claude itself, so
                     // a dead channel means the pane is being torn down.
                     let _ = output_tx.send(PaneOutput {
-                        text: "[Watchdog: streaming worker gone — cannot nudge; pane needs a Reboot.]"
-                            .to_string(),
+                        text:
+                            "[Watchdog: streaming worker gone — cannot nudge; pane needs a Reboot.]"
+                                .to_string(),
                         pane_id,
                     });
                 }
@@ -10392,9 +10427,8 @@ fn run_pane_session(
     // path derives this from disk and ignores this knob.
     initial_try_resume: bool,
 ) {
-    // Provider::Claude → long-lived stream-json process. Other providers
-    // (Codex, Cursor, OpenCode, MiniMax, GLM) → legacy per-turn --print
-    // spawn below.
+    // Provider::Claude → long-lived stream-json process. Other supported
+    // providers use the per-turn worker path below.
     if matches!(provider, Provider::Claude) {
         return run_pane_session_streaming(
             binary_path,
@@ -10425,10 +10459,7 @@ fn run_pane_session(
     let _ = plan_review_mode_arc; // non-claude legacy path doesn't gate
     let _ = pending_plan_reviews;
     let _ = system_prompt; // codex/cursor/etc. ignored for now — see role.rs note.
-    let effective_dir: String = worktree_path
-        .as_deref()
-        .unwrap_or(working_dir)
-        .to_string();
+    let effective_dir: String = worktree_path.as_deref().unwrap_or(working_dir).to_string();
     let _ = interrupt_tx_slot; // unused for legacy path
     let _ = control_response_tx_slot; // unused for legacy path
     let _ = pending_questions; // unused for legacy path
@@ -10677,10 +10708,8 @@ fn run_pane_session(
                                     // spawned background children like `tail -F`). Without
                                     // this, the UI shows "Thinking..." forever after the user
                                     // already sees the final answer + cost.
-                                    let is_result = matches!(
-                                        message,
-                                        ClaudeStreamMessage::Result { .. }
-                                    );
+                                    let is_result =
+                                        matches!(message, ClaudeStreamMessage::Result { .. });
                                     let display_text = format_stream_message(&message);
                                     let _ = output_tx.send(PaneOutput {
                                         text: display_text,
@@ -10884,6 +10913,45 @@ fn format_stream_message(message: &ClaudeStreamMessage) -> String {
     }
 }
 
+/// Report a host-side retirement rejection both locally and to the server.
+/// Older servers can route requests that upgraded servers reject themselves;
+/// sending the system output back keeps stale web clients informed without
+/// closing the mixed-version connection.
+fn retired_launch_rejection_output(session_id: Uuid, pane_id: u32, text: &str) -> CliToServer {
+    CliToServer::Output {
+        session_id,
+        data: text.to_string(),
+        output_type: shared::OutputType::System,
+        pane_type: None,
+        pane_id: Some(pane_id),
+    }
+}
+
+async fn report_retired_launch_rejection<S>(
+    status_tx: &mpsc::Sender<PaneOutput>,
+    ws_sender: &mut S,
+    session_id: Uuid,
+    pane_id: u32,
+    text: &str,
+) where
+    S: futures::Sink<tokio_tungstenite::tungstenite::Message> + Unpin,
+{
+    use futures::SinkExt;
+
+    let _ = status_tx.send(PaneOutput {
+        text: text.to_string(),
+        pane_id,
+    });
+    let message = retired_launch_rejection_output(session_id, pane_id, text);
+    if let Ok(encoded) = serde_json::to_string(&message) {
+        let _ = ws_sender
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                encoded.into(),
+            ))
+            .await;
+    }
+}
+
 /// Run server connection with automatic reconnection
 async fn run_server_connection(
     server_url: &str,
@@ -10901,6 +10969,7 @@ async fn run_server_connection(
     terminal_panes: TerminalPanes,
     status_tx: mpsc::Sender<PaneOutput>,
     tui_event_tx: mpsc::Sender<TuiEvent>,
+    project_policy: ProjectPolicyState,
 ) -> Result<()> {
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -10929,6 +10998,9 @@ async fn run_server_connection(
 
         match connect_async(&ws_url).await {
             Ok((ws_stream, _)) => {
+                if let Ok(mut policy) = project_policy.lock() {
+                    *policy = None;
+                }
                 connection_count += 1;
                 reconnect_delay = std::time::Duration::from_secs(1);
                 let (mut ws_sender, mut ws_receiver) = ws_stream.split();
@@ -10937,6 +11009,7 @@ async fn run_server_connection(
                 let register_msg = CliToServer::Register {
                     token: token.to_string(),
                     version: Some(env!("APAS_VERSION").to_string()),
+                    capabilities: vec![shared::PROJECT_POLICY_CAPABILITY.to_string()],
                 };
                 let msg_text = match serde_json::to_string(&register_msg) {
                     Ok(t) => t,
@@ -11080,6 +11153,20 @@ async fn run_server_connection(
                     continue;
                 }
 
+                // One-time migration input. The server accepts the first
+                // snapshot only when no authoritative override exists and
+                // returns the effective policy separately.
+                if let Ok(meta) = get_or_create_project(Path::new(working_dir)) {
+                    let snapshot = CliToServer::ProjectPolicySnapshot {
+                        session_id,
+                        team_enabled: meta.team_enabled,
+                        disallowed_tab_types: meta.disallowed_tab_types,
+                    };
+                    if let Ok(text) = serde_json::to_string(&snapshot) {
+                        let _ = ws_sender.send(Message::Text(text.into())).await;
+                    }
+                }
+
                 // Send PaneList separately too
                 let pane_list_msg = CliToServer::PaneList {
                     session_id,
@@ -11144,6 +11231,92 @@ async fn run_server_connection(
                                 Some(Ok(Message::Text(text))) => {
                                     if let Ok(server_msg) = serde_json::from_str::<ServerToCli>(&text) {
                                         match server_msg {
+                                            ServerToCli::ProjectPolicy {
+                                                session_id: policy_session_id,
+                                                policy,
+                                            } => {
+                                                if policy_session_id != session_id {
+                                                    continue;
+                                                }
+                                                let noncompliant = pane_metas
+                                                    .lock()
+                                                    .map(|panes| {
+                                                        panes
+                                                            .iter()
+                                                            .filter(|(_, pane)| {
+                                                                !shared::is_retired_launch(
+                                                                    pane.provider,
+                                                                    pane.model.as_deref(),
+                                                                ) && ((!policy.team_available && pane.managed)
+                                                                    || !policy.allows(
+                                                                        pane.kind,
+                                                                        pane.provider,
+                                                                        pane.model.as_deref(),
+                                                                    ))
+                                                            })
+                                                            .map(|(pane_id, _)| *pane_id)
+                                                            .collect::<Vec<_>>()
+                                                    })
+                                                    .unwrap_or_default();
+                                                if let Ok(mut current) = project_policy.lock() {
+                                                    *current = Some(policy.clone());
+                                                }
+                                                let retired = stop_retired_panes(
+                                                    &pane_metas,
+                                                    &pane_pauses,
+                                                    &input_channels,
+                                                    &terminal_panes,
+                                                );
+                                                if !retired.is_empty() {
+                                                    save_pane_configs(
+                                                        working_dir,
+                                                        &pane_sessions,
+                                                        &pane_metas,
+                                                        &pane_pauses,
+                                                        &pane_stop_requests,
+                                                    );
+                                                    let _ = status_tx.send(PaneOutput {
+                                                        text: format!(
+                                                            "[Stopped unsupported retired-provider panes {:?}; supported panes were left running]",
+                                                            retired,
+                                                        ),
+                                                        pane_id: 0,
+                                                    });
+                                                }
+                                                if !policy.team_available {
+                                                    let stopped = stop_managed_team(
+                                                        &pane_metas,
+                                                        &pane_pauses,
+                                                    );
+                                                    if stopped > 0 {
+                                                        save_pane_configs(
+                                                            working_dir,
+                                                            &pane_sessions,
+                                                            &pane_metas,
+                                                            &pane_pauses,
+                                                            &pane_stop_requests,
+                                                        );
+                                                        let _ = status_tx.send(PaneOutput {
+                                                            text: format!(
+                                                                "[Cluster policy v{} disabled team mode; interrupted and paused {} managed pane(s)]",
+                                                                policy.version,
+                                                                stopped,
+                                                            ),
+                                                            pane_id: 0,
+                                                        });
+                                                    }
+                                                }
+                                                if !noncompliant.is_empty() {
+                                                    let _ = status_tx.send(PaneOutput {
+                                                        text: format!(
+                                                            "[Cluster policy v{} marks panes {:?} noncompliant; they may keep running but cannot be relaunched]",
+                                                            policy.version,
+                                                            noncompliant
+                                                        ),
+                                                        pane_id: 0,
+                                                    });
+                                                }
+                                            }
                                             ServerToCli::SessionRejected { session_id: rejected_id, reason } => {
                                                 eprintln!(
                                                     "\n[APAS] Server rejected session {}: {}\n",
@@ -11389,6 +11562,25 @@ async fn run_server_connection(
                                             }
                                             ServerToCli::ResumeDeadloop { .. } => {
                                                 // Legacy: resume the default deadloop pane
+                                                let retired = pane_metas
+                                                    .lock()
+                                                    .ok()
+                                                    .and_then(|panes| panes.get(&shared::PANE_ID_DEADLOOP).cloned())
+                                                    .is_some_and(|pane| shared::is_retired_launch(
+                                                        pane.provider,
+                                                        pane.model.as_deref(),
+                                                    ));
+                                                if retired {
+                                                    report_retired_launch_rejection(
+                                                        &status_tx,
+                                                        &mut ws_sender,
+                                                        session_id,
+                                                        shared::PANE_ID_DEADLOOP,
+                                                        "[Resume refused — unsupported provider has been retired]",
+                                                    )
+                                                    .await;
+                                                    continue;
+                                                }
                                                 if let Ok(pauses) = pane_pauses.lock() {
                                                     if let Some(flag) = pauses.get(&shared::PANE_ID_DEADLOOP) {
                                                         flag.store(false, Ordering::SeqCst);
@@ -11447,6 +11639,49 @@ async fn run_server_connection(
                                                 }
                                             }
                                             ServerToCli::ResumePane { session_id: _, pane_id: target_pane } => {
+                                                let retired = pane_metas
+                                                    .lock()
+                                                    .ok()
+                                                    .and_then(|panes| panes.get(&target_pane).cloned())
+                                                    .is_some_and(|pane| shared::is_retired_launch(
+                                                        pane.provider,
+                                                        pane.model.as_deref(),
+                                                    ));
+                                                if retired {
+                                                    report_retired_launch_rejection(
+                                                        &status_tx,
+                                                        &mut ws_sender,
+                                                        session_id,
+                                                        target_pane,
+                                                        "[Resume refused — unsupported provider has been retired]",
+                                                    )
+                                                    .await;
+                                                    continue;
+                                                }
+                                                let allowed = pane_metas
+                                                    .lock()
+                                                    .ok()
+                                                    .and_then(|panes| panes.get(&target_pane).cloned())
+                                                    .is_some_and(|pane| {
+                                                        (!pane.managed || project_policy
+                                                            .lock()
+                                                            .ok()
+                                                            .and_then(|policy| policy.clone())
+                                                            .is_some_and(|policy| policy.team_available))
+                                                            && launch_allowed_by_server_policy(
+                                                            &project_policy,
+                                                            pane.kind,
+                                                            pane.provider,
+                                                            pane.model.as_deref(),
+                                                        )
+                                                    });
+                                                if !allowed {
+                                                    let _ = status_tx.send(PaneOutput {
+                                                        text: "[Resume refused by the current cluster policy]".to_string(),
+                                                        pane_id: target_pane,
+                                                    });
+                                                    continue;
+                                                }
                                                 if let Ok(pauses) = pane_pauses.lock() {
                                                     if let Some(flag) = pauses.get(&target_pane) {
                                                         flag.store(false, Ordering::SeqCst);
@@ -11513,6 +11748,20 @@ async fn run_server_connection(
                                                 }
                                             }
                                             ServerToCli::AddPane { session_id: _, pane_config, isolated_worktree } => {
+                                                if shared::is_retired_launch(
+                                                    pane_config.provider,
+                                                    pane_config.model.as_deref(),
+                                                ) {
+                                                    report_retired_launch_rejection(
+                                                        &status_tx,
+                                                        &mut ws_sender,
+                                                        session_id,
+                                                        pane_config.pane_id,
+                                                        "[New pane refused — unsupported provider has been retired]",
+                                                    )
+                                                    .await;
+                                                    continue;
+                                                }
                                                 let label = pane_config.label.clone().unwrap_or_else(|| format!("Tab {}", pane_config.pane_id));
                                                 // Phase 1.1e: if the web asked for an isolated worktree, create
                                                 // it now (synchronously) and surface any error back to the user
@@ -11611,6 +11860,37 @@ async fn run_server_connection(
                                                     });
                                                     continue;
                                                 };
+                                                if shared::is_retired_launch(
+                                                    meta.provider,
+                                                    meta.model.as_deref(),
+                                                ) {
+                                                    report_retired_launch_rejection(
+                                                        &status_tx,
+                                                        &mut ws_sender,
+                                                        session_id,
+                                                        target,
+                                                        "[Reboot refused — unsupported provider has been retired]",
+                                                    )
+                                                    .await;
+                                                    continue;
+                                                }
+                                                if (meta.managed && !project_policy
+                                                    .lock()
+                                                    .ok()
+                                                    .and_then(|policy| policy.clone())
+                                                    .is_some_and(|policy| policy.team_available))
+                                                    || !launch_allowed_by_server_policy(
+                                                    &project_policy,
+                                                    meta.kind,
+                                                    meta.provider,
+                                                    meta.model.as_deref(),
+                                                ) {
+                                                    let _ = status_tx.send(PaneOutput {
+                                                        text: "[Reboot refused by the current cluster policy]".to_string(),
+                                                        pane_id: target,
+                                                    });
+                                                    continue;
+                                                }
                                                 let prior_session_id = {
                                                     let sessions = pane_sessions.lock().unwrap();
                                                     sessions.get(&target).copied()
@@ -11766,6 +12046,25 @@ async fn run_server_connection(
                                                 min_iteration_interval_minutes,
                                                 effort,
                                             } => {
+                                                let retired = pane_metas
+                                                    .lock()
+                                                    .ok()
+                                                    .and_then(|panes| panes.get(&target_pane).cloned())
+                                                    .is_some_and(|pane| shared::is_retired_launch(
+                                                        pane.provider,
+                                                        pane.model.as_deref(),
+                                                    ));
+                                                if retired {
+                                                    report_retired_launch_rejection(
+                                                        &status_tx,
+                                                        &mut ws_sender,
+                                                        session_id,
+                                                        target_pane,
+                                                        "[Start refused — unsupported provider has been retired]",
+                                                    )
+                                                    .await;
+                                                    continue;
+                                                }
                                                 let _ = tui_event_tx.send(TuiEvent::StartBot {
                                                     pane_id: target_pane,
                                                     prompt: bot_prompt,
@@ -11779,6 +12078,26 @@ async fn run_server_connection(
                                                 });
                                             }
                                             ServerToCli::RebootCli { .. } => {
+                                                let retired = pane_metas
+                                                    .lock()
+                                                    .map(|panes| panes.values().any(|pane| {
+                                                        shared::is_retired_launch(
+                                                            pane.provider,
+                                                            pane.model.as_deref(),
+                                                        )
+                                                    }))
+                                                    .unwrap_or(false);
+                                                if retired {
+                                                    report_retired_launch_rejection(
+                                                        &status_tx,
+                                                        &mut ws_sender,
+                                                        session_id,
+                                                        0,
+                                                        "[CLI reboot refused while a historical retired-provider pane is present]",
+                                                    )
+                                                    .await;
+                                                    continue;
+                                                }
                                                 // Before tearing down the WS for a possibly
                                                 // minutes-long update + rebuild, flag every pane
                                                 // as "Rebooting…" so the web shows a live status
@@ -12027,9 +12346,9 @@ async fn run_server_connection(
                                                 //        reset. Fires when the transition stays on
                                                 //        provider Claude AND neither the old nor
                                                 //        the new model triggers a backend-swap env
-                                                //        override (deepseek/glm/minimax pin
-                                                //        ANTHROPIC_BASE_URL at spawn — can't be
-                                                //        changed on a running process). Matches
+                                                //        override (DeepSeek pins ANTHROPIC_BASE_URL
+                                                //        at spawn and cannot be changed on a running
+                                                //        process). Matches
                                                 //        the effort-live pattern at ~10422.
                                                 //
                                                 // (slow) Kill + respawn with a fresh session id.
@@ -12043,6 +12362,56 @@ async fn run_server_connection(
                                                     .filter(|s| !s.is_empty())
                                                     .map(str::to_string);
 
+                                                let retired = pane_metas
+                                                    .lock()
+                                                    .ok()
+                                                    .and_then(|panes| panes.get(&target_pane).cloned())
+                                                    .is_some_and(|pane| {
+                                                        shared::is_retired_launch(
+                                                            pane.provider,
+                                                            pane.model.as_deref(),
+                                                        ) || shared::is_retired_launch(
+                                                            provider.unwrap_or(pane.provider),
+                                                            trimmed.as_deref(),
+                                                        )
+                                                    });
+                                                if retired {
+                                                    report_retired_launch_rejection(
+                                                        &status_tx,
+                                                        &mut ws_sender,
+                                                        session_id,
+                                                        target_pane,
+                                                        "[Model switch refused — unsupported provider has been retired]",
+                                                    )
+                                                    .await;
+                                                    continue;
+                                                }
+
+                                                let allowed = pane_metas
+                                                    .lock()
+                                                    .ok()
+                                                    .and_then(|panes| panes.get(&target_pane).cloned())
+                                                    .is_some_and(|pane| {
+                                                        (!pane.managed || project_policy
+                                                            .lock()
+                                                            .ok()
+                                                            .and_then(|policy| policy.clone())
+                                                            .is_some_and(|policy| policy.team_available))
+                                                            && launch_allowed_by_server_policy(
+                                                            &project_policy,
+                                                            pane.kind,
+                                                            provider.unwrap_or(pane.provider),
+                                                            trimmed.as_deref(),
+                                                        )
+                                                    });
+                                                if !allowed {
+                                                    let _ = status_tx.send(PaneOutput {
+                                                        text: "[Model switch refused by the current cluster policy]".to_string(),
+                                                        pane_id: target_pane,
+                                                    });
+                                                    continue;
+                                                }
+
                                                 // --- Fast path attempt ------------------------
                                                 let fast_path_taken = 'fast: {
                                                     let metas = pane_metas.lock().unwrap();
@@ -12055,11 +12424,9 @@ async fn run_server_connection(
                                                         shared::Provider::Claude,
                                                     ) && matches!(meta.provider, shared::Provider::Claude);
                                                     let old_backend_swap = is_deepseek_model(meta.model.as_deref())
-                                                        || is_glm_model(meta.model.as_deref())
-                                                        || is_minimax_model(meta.model.as_deref());
+                                                        || shared::is_retired_model(meta.model.as_deref());
                                                     let new_backend_swap = is_deepseek_model(trimmed.as_deref())
-                                                        || is_glm_model(trimmed.as_deref())
-                                                        || is_minimax_model(trimmed.as_deref());
+                                                        || shared::is_retired_model(trimmed.as_deref());
                                                     // Only attempt live swap when the pane stays on
                                                     // provider=Claude, neither side is a backend
                                                     // swap, and the user picked an explicit new
@@ -12898,16 +13265,33 @@ async fn run_server_connection(
                                                 reviewer,
                                                 developer,
                                             } => {
-                                                // Last line of defence. The web hides the Start-team
-                                                // UI and the server rejects the toggle from anyone
-                                                // below admin, but `.apas` is the source of truth for
-                                                // whether this project may run a team at all — and a
-                                                // StartTeam that raced the toggle would otherwise
-                                                // spawn the panes an owner just disabled.
-                                                if !team_enabled_for(std::path::Path::new(&working_dir)) {
-                                                    tracing::warn!("Start team refused — team mode is disabled for this project");
+                                                if [&manager, &tech_lead, &reviewer, &developer]
+                                                    .iter()
+                                                    .any(|role| {
+                                                        shared::is_retired_launch(
+                                                            role.provider.unwrap_or(Provider::Claude),
+                                                            role.model.as_deref(),
+                                                        )
+                                                    })
+                                                {
+                                                    tracing::warn!("Start team refused for retired provider");
+                                                    report_retired_launch_rejection(
+                                                        &status_tx,
+                                                        &mut ws_sender,
+                                                        session_id,
+                                                        0,
+                                                        "[Start team refused — unsupported provider has been retired]",
+                                                    )
+                                                    .await;
+                                                    continue;
+                                                }
+                                                if !team_allowed_by_server_policy(
+                                                    &project_policy,
+                                                    &[&manager, &tech_lead, &reviewer, &developer],
+                                                ) {
+                                                    tracing::warn!("Start team refused by cluster policy");
                                                     let _ = status_tx.send(PaneOutput {
-                                                        text: "[Start team refused — team mode is disabled for this project. An owner or admin can enable it in the Overview.]".to_string(),
+                                                        text: "[Start team refused — the current cluster policy does not allow this team configuration]".to_string(),
                                                         pane_id: 0,
                                                     });
                                                     continue;
@@ -12926,54 +13310,33 @@ async fn run_server_connection(
                                                 session_id: _,
                                                 auto_approve_todos,
                                                 auto_merge_prs,
-                                                team_enabled,
-                                                disallowed_tab_types,
+                                                team_enabled: _,
+                                                disallowed_tab_types: _,
+                                            }
+                                            | ServerToCli::UpdateProjectOperations {
+                                                session_id: _,
+                                                auto_approve_todos,
+                                                auto_merge_prs,
                                             } => {
                                                 let project_dir = std::path::Path::new(&working_dir).to_path_buf();
-                                                match update_project_flags(
+                                                match update_project_operations(
                                                     &project_dir,
                                                     session_id,
                                                     auto_approve_todos,
                                                     auto_merge_prs,
-                                                    team_enabled,
-                                                    disallowed_tab_types,
                                                 ) {
-                                                    Ok((echo, team_turned_off)) => {
+                                                    Ok(echo) => {
                                                         tracing::info!(
                                                             auto_approve_todos,
                                                             auto_merge_prs,
-                                                            team_enabled,
-                                                            "project flags updated"
+                                                            "project workflow settings updated"
                                                         );
-                                                        // The server already checked that this came
-                                                        // from an owner/admin; act on the transition.
-                                                        if team_turned_off {
-                                                            let stopped = stop_managed_team(&pane_metas, &pane_pauses);
-                                                            tracing::info!(stopped, "team mode disabled — stopped managed panes");
-                                                            save_pane_configs(
-                                                                working_dir,
-                                                                &pane_sessions,
-                                                                &pane_metas,
-                                                                &pane_pauses,
-                                                                &pane_stop_requests,
-                                                            );
-                                                            if stopped > 0 {
-                                                                let _ = status_tx.send(PaneOutput {
-                                                                    text: format!(
-                                                                        "[Team mode disabled — stopped {} managed pane(s)]",
-                                                                        stopped
-                                                                    ),
-                                                                    pane_id: 0,
-                                                                });
-                                                            }
-                                                        }
-                                                        // Echo back so peer web clients reconcile.
                                                         if let Ok(text) = serde_json::to_string(&echo) {
                                                             let _ = ws_sender.send(Message::Text(text.into())).await;
                                                         }
                                                     }
                                                     Err(err) => {
-                                                        tracing::warn!("failed to persist project flags: {}", err);
+                                                        tracing::warn!("failed to persist project workflow settings: {}", err);
                                                     }
                                                 }
                                             }
@@ -13056,7 +13419,7 @@ async fn run_server_connection(
                             }
                         }
                         _ = usage_interval.tick() => {
-                            let (has_claude, has_codex, has_minimax, has_glm, has_deepseek) =
+                            let (has_claude, has_codex, has_deepseek) =
                                 active_usage_providers(&pane_metas);
                             let max_age = chrono::Duration::minutes(USAGE_CACHE_MAX_AGE_MINUTES);
 
@@ -13088,38 +13451,7 @@ async fn run_server_connection(
                                 }
                             }
 
-                            if has_minimax {
-                                if let Some(limits) =
-                                    crate::usage::read_cached_minimax_usage_limits(Some(max_age))
-                                {
-                                    let usage_msg = CliToServer::UsageLimits { provider: Provider::Minimax, limits };
-                                    let msg_text = serde_json::to_string(&usage_msg).unwrap_or_default();
-                                    if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
-                                        tracing::warn!("Failed to send MiniMax usage limits to server");
-                                    }
-                                } else {
-                                    tracing::debug!("No fresh cached MiniMax usage limits available");
-                                }
-                            }
-
-                            // Always publish fresh cached GLM usage when available.
-                            // GLM usage comes from daemon-level polling and should be visible
-                            // on Machines page even if current pane metadata is legacy/missing.
-                            if let Some(limits) =
-                                crate::usage::read_cached_glm_usage_limits(Some(max_age))
-                            {
-                                let usage_msg = CliToServer::UsageLimits {
-                                    provider: Provider::Glm,
-                                    limits,
-                                };
-                                let msg_text = serde_json::to_string(&usage_msg).unwrap_or_default();
-                                if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
-                                    tracing::warn!("Failed to send GLM usage limits to server");
-                                }
-                            } else if has_glm {
-                                tracing::debug!("No fresh cached GLM usage limits available");
-                            }
-
+                            if has_deepseek {
                             if let Some(limits) =
                                 crate::usage::read_cached_deepseek_usage_limits(Some(max_age))
                             {
@@ -13131,8 +13463,9 @@ async fn run_server_connection(
                                 if ws_sender.send(Message::Text(msg_text.into())).await.is_err() {
                                     tracing::warn!("Failed to send DeepSeek usage limits to server");
                                 }
-                            } else if has_deepseek {
+                            } else {
                                 tracing::debug!("No fresh cached DeepSeek usage limits available");
+                            }
                             }
                         }
                     }
@@ -13170,12 +13503,4 @@ async fn run_server_connection(
     }
 
     Ok(())
-}
-
-/// Helper to get claude path from config
-fn config_claude_path(_working_dir: &str) -> String {
-    crate::config::Config::load()
-        .unwrap_or_default()
-        .local
-        .claude_path
 }

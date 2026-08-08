@@ -1,5 +1,5 @@
-import { useStore } from "@/lib/store";
-import type { PaneKind } from "@/lib/store";
+import { launchProfileKey, useStore } from "@/lib/store";
+import type { PaneKind, Provider } from "@/lib/store";
 
 /**
  * A "tab type" is a pane kind plus a provider — the unit the add-tab menu
@@ -25,10 +25,8 @@ export interface TabTypeOption {
  * Every tab type, in menu order. Must stay in step with `shared::all_tab_types`
  * — a Rust test reads this file and asserts the two agree.
  *
- * Deliberately not every provider: MiniMax, GLM and DeepSeek are the claude
- * binary against a different backend, so `PROVIDER_MODEL_GROUPS` offers them
- * as claude *models*. Listing them here would give an admin a checkbox that
- * does nothing, since those tabs arrive as `provider: claude`.
+ * DeepSeek is offered as a Claude backend/model rather than a distinct tab
+ * type, because those panes arrive as `provider: claude`.
  *
  * Terminal exists only for claude and codex, mirroring
  * `terminal_pane::terminal_binary_for` in the CLI.
@@ -83,4 +81,22 @@ export function isTabTypeAllowed(
 export function useIsTabTypeAllowed(): (kind: PaneKind, provider: string) => boolean {
   const disallowed = useDisallowedTabTypes();
   return (kind, provider) => isTabTypeAllowed(disallowed, kind, provider);
+}
+
+/** Current server-authoritative launch allowlist, including backend/model. */
+export function useIsLaunchProfileAllowed(): (
+  kind: PaneKind,
+  provider: string,
+  model?: string,
+) => boolean {
+  const sessionId = useStore((state) => state.sessionId);
+  const policy = useStore((state) => sessionId ? state.projectPolicies?.[sessionId] : undefined);
+  return (kind, provider, model) => {
+    // Until the attach snapshot arrives, keep the menu structurally usable;
+    // the submit path remains fail-closed and reports incompatibility.
+    if (!policy) return true;
+    if (policy.projectSuspended) return false;
+    const key = launchProfileKey(kind, provider as Provider, model).toLowerCase();
+    return policy.allowedLaunchProfiles.some((allowed) => allowed.toLowerCase() === key);
+  };
 }

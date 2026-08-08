@@ -2,7 +2,7 @@
 
 import { useStore } from "@/lib/store";
 import { ThemePicker } from "@/components/ThemePicker";
-import { FolderOpen, RefreshCw, Share2, Users, X, Crown, Trash2, ChevronLeft, ChevronDown, ChevronRight, BarChart3, Server, Plus } from "lucide-react";
+import { FolderOpen, RefreshCw, Share2, Users, X, Crown, Trash2, ChevronLeft, ChevronDown, ChevronRight, BarChart3, Server, Plus, LogOut, ArrowRightLeft, AlertTriangle, MoreHorizontal } from "lucide-react";
 import { CreateInstanceModal } from "./CreateInstanceModal";
 import Link from "next/link";
 import { useMemo, useState, useEffect } from "react";
@@ -50,7 +50,7 @@ interface SidebarProps {
 }
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://apas.mpaxos.com";
-type ProjectRole = "owner" | "admin" | "user";
+type ProjectRole = "owner" | "user";
 
 // Group key + localStorage key for collapsed repo groups in the sidebar.
 const NO_REMOTE_KEY = "__no_remote__";
@@ -68,21 +68,15 @@ function repoDisplayLabel(remote: string): string {
 function parseProjectRole(raw: unknown): ProjectRole {
   if (typeof raw !== "string") return "user";
   const normalized = raw.trim().toLowerCase();
-  if (normalized === "owner" || normalized === "admin" || normalized === "user") {
-    return normalized;
-  }
-  return "user";
+  return normalized === "owner" ? "owner" : "user";
 }
 
-function canManageProject(project: { isShared?: boolean; shareRole?: ProjectRole }): boolean {
-  if (!project.isShared) return true;
-  return project.shareRole === "owner" || project.shareRole === "admin";
+function projectRole(project: { isShared?: boolean; shareRole?: ProjectRole }): ProjectRole {
+  return project.shareRole ?? (project.isShared ? "user" : "owner");
 }
 
-function canAdminActOnRole(viewerRole: ProjectRole, targetRole: ProjectRole): boolean {
-  if (viewerRole === "owner") return true;
-  if (viewerRole !== "admin") return false;
-  return targetRole !== "admin";
+function canAdminActOnRole(viewerRole: ProjectRole, _targetRole: ProjectRole): boolean {
+  return viewerRole === "owner";
 }
 
 function roleLabel(role: ProjectRole): string {
@@ -104,10 +98,8 @@ interface ShareListState {
   canManage: boolean;
 }
 
-const ADMIN_USER_ID = "88b6016d-a8b4-400c-bdc9-f0120504a4fc";
-
 export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
-  const { cliClients, sessions, machines, attachSession, refreshCliClients, listSessions, sessionId, connected, token, userId } = useStore();
+  const { cliClients, sessions, machines, attachSession, forgetProject, refreshCliClients, listSessions, sessionId, connected, token, clusterRole } = useStore();
   const unreadSessions = useStore((s) => s.unreadSessions);
   const [shareModalOpen, setShareModalOpen] = useState(false);
   const [mounted, setMounted] = useState(false);
@@ -117,6 +109,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
     setMounted(true);
   }, []);
   const [shareSessionId, setShareSessionId] = useState<string | null>(null);
+  const [shareProjectId, setShareProjectId] = useState<string | null>(null);
   const [shareCode, setShareCode] = useState<string | null>(null);
   const [shareUrl, setShareUrl] = useState<string | null>(null);
   const [shareLoading, setShareLoading] = useState(false);
@@ -130,7 +123,10 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
   });
   const [manageLoading, setManageLoading] = useState(false);
   const [removingUserId, setRemovingUserId] = useState<string | null>(null);
-  const [updatingRoleUserId, setUpdatingRoleUserId] = useState<string | null>(null);
+  const [transferringUserId, setTransferringUserId] = useState<string | null>(null);
+  const [lifecycleLoading, setLifecycleLoading] = useState(false);
+  const [deleteConfirmation, setDeleteConfirmation] = useState("");
+  const [deletionInProgress, setDeletionInProgress] = useState(false);
 
   // Merge CLI clients (active) and sessions (historical) into unified project list.
   // Deduplicate by project_id (the stable .apas id) so moving a project directory
@@ -138,6 +134,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
   const projects = useMemo(() => {
     const projectMap = new Map<string, {
       id: string;
+      projectId: string;
       name: string;
       workingDir: string;
       hostname?: string;
@@ -170,6 +167,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
       if (!existing || (session.isActive && !existing.isActive)) {
         projectMap.set(projectKey, {
           id: session.id,
+          projectId: projectKey,
           name,
           workingDir,
           hostname: session.hostname,
@@ -314,20 +312,29 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
     onClose?.();
   };
 
-  const handleShareClick = async (e: React.MouseEvent, projectId: string) => {
+  const handleShareClick = async (
+    e: React.MouseEvent,
+    representativeSessionId: string,
+    canonicalProjectId: string,
+    role: ProjectRole,
+  ) => {
     e.stopPropagation();
-    setShareSessionId(projectId);
-    setShareTab("invite");
+    setShareSessionId(representativeSessionId);
+    setShareProjectId(canonicalProjectId);
+    setShareTab(role === "owner" ? "invite" : "manage");
     setShareCode(null);
     setShareUrl(null);
     setShareError(null);
     setShareUsers({
       owner: undefined,
       shares: [],
-      viewerRole: "user",
-      canManage: false,
+      viewerRole: role,
+      canManage: role === "owner",
     });
+    setDeleteConfirmation("");
+    setDeletionInProgress(false);
     setShareModalOpen(true);
+    if (role !== "owner") return;
     setShareLoading(true);
 
     try {
@@ -337,12 +344,12 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ session_id: projectId }),
+        body: JSON.stringify({ session_id: representativeSessionId }),
       });
 
       if (!response.ok) {
         const error = await response.json();
-        throw new Error(error.message || "Failed to generate share code");
+        throw new Error(error.error || error.message || "Failed to generate share code");
       }
 
       const data = await response.json();
@@ -463,37 +470,110 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
     }
   };
 
-  const handleUpdateUserRole = async (targetUserId: string, role: ProjectRole) => {
-    if (!shareSessionId) return;
-    setUpdatingRoleUserId(targetUserId);
+  const handleTransferOwner = async (user: ShareUser) => {
+    if (!shareProjectId) return;
+    if (!window.confirm(
+      `Transfer this project to ${user.user_email}? You will become an ordinary project user.`,
+    )) return;
+    setTransferringUserId(user.user_id);
+    setShareError(null);
     try {
-      const response = await fetch(`${API_URL}/share/${shareSessionId}/${targetUserId}/role`, {
+      const response = await fetch(`${API_URL}/projects/${shareProjectId}/owner`, {
         method: "PATCH",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ role }),
+        body: JSON.stringify({ user_id: user.user_id }),
       });
-
       if (!response.ok) {
         const error = await response.json().catch(() => null);
-        throw new Error(error?.message || "Failed to update role");
+        throw new Error(error?.error || error?.message || "Failed to transfer ownership");
       }
-
-      await fetchShareUsers(shareSessionId);
+      setShareModalOpen(false);
+      listSessions();
     } catch (err) {
-      const message = err instanceof Error ? err.message : "Failed to update role";
-      console.error("Failed to update role:", message);
-      setShareError(message);
+      setShareError(err instanceof Error ? err.message : "Failed to transfer ownership");
     } finally {
-      setUpdatingRoleUserId(null);
+      setTransferringUserId(null);
+    }
+  };
+
+  const handleLeaveProject = async () => {
+    if (!shareProjectId) return;
+    if (!window.confirm(
+      "Leave this project? You will immediately lose access to every instance and its history.",
+    )) return;
+    setLifecycleLoading(true);
+    setShareError(null);
+    try {
+      const response = await fetch(`${API_URL}/projects/${shareProjectId}/members/me`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!response.ok) {
+        const error = await response.json().catch(() => null);
+        throw new Error(error?.error || error?.message || "Failed to leave project");
+      }
+      forgetProject(shareProjectId);
+      setShareModalOpen(false);
+      listSessions();
+    } catch (err) {
+      setShareError(err instanceof Error ? err.message : "Failed to leave project");
+    } finally {
+      setLifecycleLoading(false);
+    }
+  };
+
+  const waitForDeletion = async (projectId: string) => {
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const response = await fetch(`${API_URL}/projects/${projectId}/deletion`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (response.status === 404) {
+        forgetProject(projectId);
+        setShareModalOpen(false);
+        listSessions();
+        return;
+      }
+      if (!response.ok && response.status !== 409) {
+        const error = await response.json().catch(() => null);
+        throw new Error(error?.error || error?.message || "Failed to check deletion status");
+      }
+    }
+    throw new Error("Deletion is still in progress. You can safely close this dialog.");
+  };
+
+  const handleDeleteProject = async () => {
+    if (!shareProjectId || deleteConfirmation !== shareProjectId) return;
+    setLifecycleLoading(true);
+    setShareError(null);
+    try {
+      const response = await fetch(`${API_URL}/projects/${shareProjectId}/delete`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ confirmation: deleteConfirmation }),
+      });
+      if (response.status !== 202) {
+        const error = await response.json().catch(() => null);
+        throw new Error(error?.error || error?.message || "Failed to delete project");
+      }
+      setDeletionInProgress(true);
+      setLifecycleLoading(false);
+      await waitForDeletion(shareProjectId);
+    } catch (err) {
+      setShareError(err instanceof Error ? err.message : "Failed to delete project");
+      setLifecycleLoading(false);
     }
   };
 
   const handleTabChange = (tab: "invite" | "manage") => {
     setShareTab(tab);
-    if (tab === "manage" && shareSessionId) {
+    if (tab === "manage" && shareSessionId && shareUsers.viewerRole === "owner") {
       fetchShareUsers(shareSessionId);
     }
   };
@@ -624,7 +704,6 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                         <span className="flex items-center gap-1 text-blue-500">
                           <Users className="w-3 h-3" />
                           Shared by {project.ownerEmail}
-                          {project.shareRole === "admin" && " · Admin"}
                         </span>
                       ) : project.isActive ? (
                         "Active"
@@ -635,15 +714,22 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                       )}
                     </div>
                   </div>
-                  {canManageProject(project) && (
-                    <button
-                      onClick={(e) => handleShareClick(e, project.id)}
-                      className="p-1 hover:bg-gray-300 dark:hover:bg-gray-600 rounded opacity-50 hover:opacity-100 flex-shrink-0"
-                      title="Share this session"
-                    >
+                  <button
+                    onClick={(e) => handleShareClick(
+                      e,
+                      project.id,
+                      project.projectId,
+                      projectRole(project),
+                    )}
+                    className="p-1 hover:bg-gray-300 dark:hover:bg-gray-600 rounded opacity-50 hover:opacity-100 flex-shrink-0"
+                    title={projectRole(project) === "owner" ? "Manage project access" : "Project actions"}
+                  >
+                    {projectRole(project) === "owner" ? (
                       <Share2 className="w-4 h-4" />
-                    </button>
-                  )}
+                    ) : (
+                      <MoreHorizontal className="w-4 h-4" />
+                    )}
+                  </button>
                 </div>
               </div>
                       ))}
@@ -666,15 +752,15 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
         </Link>
       </div>
 
-      {/* Admin link - only visible to admin user */}
-      {userId === ADMIN_USER_ID && (
+      {/* Cluster control plane is visible only to server-authorized admins. */}
+      {clusterRole === "admin" && (
         <div className="border-t border-gray-200 dark:border-gray-800 p-2 flex-shrink-0">
           <Link
             href="/admin"
             className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors"
           >
             <BarChart3 className="w-4 h-4" />
-            System Dashboard
+            Cluster Administration
           </Link>
         </div>
       )}
@@ -685,7 +771,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
           <div className="bg-white dark:bg-gray-800 rounded-lg max-w-md w-full mx-4 shadow-xl" onClick={(e) => e.stopPropagation()}>
             {/* Header */}
             <div className="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
-              <h3 className="text-lg font-semibold">Share Session</h3>
+              <h3 className="text-lg font-semibold">Project Access</h3>
               <button
                 onClick={() => setShareModalOpen(false)}
                 className="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 rounded"
@@ -696,16 +782,18 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
 
             {/* Tabs */}
             <div className="flex border-b border-gray-200 dark:border-gray-700">
-              <button
-                onClick={() => handleTabChange("invite")}
-                className={`flex-1 px-4 py-2 text-sm font-medium transition-colors ${
-                  shareTab === "invite"
-                    ? "border-b-2 border-blue-500 text-blue-600 dark:text-blue-400"
-                    : "text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
-                }`}
-              >
-                Invite
-              </button>
+              {shareUsers.viewerRole === "owner" && (
+                <button
+                  onClick={() => handleTabChange("invite")}
+                  className={`flex-1 px-4 py-2 text-sm font-medium transition-colors ${
+                    shareTab === "invite"
+                      ? "border-b-2 border-blue-500 text-blue-600 dark:text-blue-400"
+                      : "text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
+                  }`}
+                >
+                  Invite
+                </button>
+              )}
               <button
                 onClick={() => handleTabChange("manage")}
                 className={`flex-1 px-4 py-2 text-sm font-medium transition-colors ${
@@ -766,6 +854,24 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                     </div>
                   )}
                 </>
+              ) : shareUsers.viewerRole === "user" ? (
+                <div className="space-y-4">
+                  <div>
+                    <h4 className="font-medium">Leave project</h4>
+                    <p className="mt-1 text-sm text-gray-600 dark:text-gray-400">
+                      You will immediately lose access to every project instance and its history.
+                    </p>
+                  </div>
+                  {shareError && <p className="text-sm text-red-500">{shareError}</p>}
+                  <button
+                    onClick={handleLeaveProject}
+                    disabled={lifecycleLoading}
+                    className="flex w-full items-center justify-center gap-2 rounded bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
+                  >
+                    <LogOut className="h-4 w-4" />
+                    {lifecycleLoading ? "Leaving…" : "Leave project"}
+                  </button>
+                </div>
               ) : (
                 <>
                   {manageLoading ? (
@@ -784,12 +890,6 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                       {shareError && (
                         <p className="text-sm text-red-500 mb-3">{shareError}</p>
                       )}
-                      {!shareUsers.canManage && (
-                        <p className="text-xs text-amber-600 dark:text-amber-400 mb-3">
-                          You can view access, but only owner/admin can make changes.
-                        </p>
-                      )}
-
                       {/* Owner */}
                       {shareUsers.owner && (
                         <div className="flex items-center justify-between gap-3 p-3 bg-gray-50 dark:bg-gray-700 rounded-lg">
@@ -814,13 +914,6 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                       ) : (
                         shareUsers.shares.map((user) => {
                           const canActOnUser = shareUsers.canManage && canAdminActOnRole(shareUsers.viewerRole, user.role);
-                          const canChangeRole = canActOnUser && user.role !== "owner";
-                          const baseRoleOptions: ProjectRole[] =
-                            shareUsers.viewerRole === "owner" ? ["user", "admin"] : ["user"];
-                          const roleOptions = baseRoleOptions.includes(user.role)
-                            ? baseRoleOptions
-                            : [user.role, ...baseRoleOptions];
-                          const roleUpdatePending = updatingRoleUserId === user.user_id;
                           const removePending = removingUserId === user.user_id;
 
                           return (
@@ -840,22 +933,24 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                                 </div>
                               </div>
                               <div className="flex items-center gap-2">
-                                <select
-                                  value={user.role}
-                                  onChange={(e) => handleUpdateUserRole(user.user_id, parseProjectRole(e.target.value))}
-                                  disabled={!canChangeRole || roleUpdatePending}
-                                  className="text-xs px-2 py-1 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-800 disabled:opacity-60"
-                                  title="User role"
+                                <span className="text-xs px-2 py-1 rounded bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300">
+                                  User
+                                </span>
+                                <button
+                                  onClick={() => handleTransferOwner(user)}
+                                  disabled={!canActOnUser || transferringUserId !== null}
+                                  className="p-2 text-amber-600 hover:bg-amber-100 dark:hover:bg-amber-900/30 rounded transition-colors disabled:opacity-50"
+                                  title="Transfer ownership"
                                 >
-                                  {roleOptions.map((role) => (
-                                    <option key={role} value={role}>
-                                      {roleLabel(role)}
-                                    </option>
-                                  ))}
-                                </select>
+                                  {transferringUserId === user.user_id ? (
+                                    <div className="w-4 h-4 border-2 border-amber-600 border-t-transparent rounded-full animate-spin" />
+                                  ) : (
+                                    <ArrowRightLeft className="w-4 h-4" />
+                                  )}
+                                </button>
                                 <button
                                   onClick={() => handleRemoveUser(user.user_id)}
-                                  disabled={!canActOnUser || removePending || roleUpdatePending}
+                                  disabled={!canActOnUser || removePending}
                                   className="p-2 text-red-500 hover:bg-red-100 dark:hover:bg-red-900/30 rounded transition-colors disabled:opacity-50"
                                   title="Remove access"
                                 >
@@ -870,6 +965,44 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                           );
                         })
                       )}
+
+                      <div className="mt-6 border-t border-red-200 pt-4 dark:border-red-900/60">
+                        <div className="flex items-center gap-2 text-red-600 dark:text-red-400">
+                          <AlertTriangle className="h-4 w-4" />
+                          <h4 className="font-semibold">Danger zone</h4>
+                        </div>
+                        <p className="mt-2 text-xs text-gray-600 dark:text-gray-400">
+                          Permanently deletes APAS project sessions, messages, terminal state, invitations, and audit records. Type the canonical project ID to confirm:
+                        </p>
+                        <code className="mt-2 block break-all rounded bg-gray-100 p-2 text-xs dark:bg-gray-900">
+                          {shareProjectId}
+                        </code>
+                        <input
+                          aria-label="Project deletion confirmation"
+                          value={deleteConfirmation}
+                          onChange={(event) => setDeleteConfirmation(event.target.value)}
+                          disabled={deletionInProgress}
+                          className="mt-2 w-full rounded border border-red-300 bg-transparent px-3 py-2 text-sm dark:border-red-800"
+                          placeholder="Type the project ID"
+                        />
+                        <button
+                          onClick={handleDeleteProject}
+                          disabled={
+                            lifecycleLoading ||
+                            deletionInProgress ||
+                            !shareProjectId ||
+                            deleteConfirmation !== shareProjectId
+                          }
+                          className="mt-2 flex w-full items-center justify-center gap-2 rounded bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                          {deletionInProgress
+                            ? "Deletion in progress…"
+                            : lifecycleLoading
+                              ? "Starting deletion…"
+                              : "Permanently delete project"}
+                        </button>
+                      </div>
                     </div>
                   )}
                 </>
