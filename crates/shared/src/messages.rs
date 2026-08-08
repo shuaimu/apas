@@ -43,6 +43,22 @@ pub enum PlanReviewMode {
     Never,
 }
 
+/// Last server-observable state of a pty-hosted terminal pane.
+///
+/// `Disconnected` means the CLI transport went away while the terminal was
+/// last known to be running; it does not claim the provider process exited.
+/// `Unknown` is the rollout-safe default for peers predating lifecycle
+/// reconciliation and after a server restart before the CLI reports state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalLifecycle {
+    #[default]
+    Unknown,
+    Running,
+    Disconnected,
+    Exited,
+}
+
 /// What to do with an isolated git worktree (and its branch) when the pane
 /// that owns it is closed. Selected by the web UI before sending
 /// `WebToServer::RemovePane` so the CLI knows which git commands to run.
@@ -305,6 +321,10 @@ pub enum CliToServer {
     TerminalOutput {
         session_id: Uuid,
         pane_id: u32,
+        /// Identifies one spawned pty process. Optional so a new server can
+        /// continue accepting output from CLIs predating reconciliation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance_id: Option<Uuid>,
         data_b64: String,
         /// Monotonic per-pane chunk counter, starting at 0 when the pty
         /// is spawned. Lets the web detect a gap after a reconnect and
@@ -318,6 +338,21 @@ pub enum CliToServer {
     TerminalExited {
         session_id: Uuid,
         pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+
+    /// Authoritative terminal state, emitted on spawn/exit and for every
+    /// configured terminal immediately after each CLI session reconnect.
+    TerminalState {
+        session_id: Uuid,
+        pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance_id: Option<Uuid>,
+        #[serde(default)]
+        lifecycle: TerminalLifecycle,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
@@ -1581,6 +1616,8 @@ pub enum ServerToWeb {
     TerminalOutput {
         session_id: Uuid,
         pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance_id: Option<Uuid>,
         data_b64: String,
         seq: u64,
     },
@@ -1596,16 +1633,37 @@ pub enum ServerToWeb {
     TerminalSnapshot {
         session_id: Uuid,
         pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance_id: Option<Uuid>,
         data_b64: String,
         seq: u64,
         #[serde(default)]
         truncated: bool,
+        #[serde(default)]
+        lifecycle: TerminalLifecycle,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
     },
 
     /// A terminal pane's child process ended.
     TerminalExited {
         session_id: Uuid,
         pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+
+    /// Live terminal lifecycle change. Snapshot carries the same fields for
+    /// clients that attach after this event was emitted.
+    TerminalState {
+        session_id: Uuid,
+        pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance_id: Option<Uuid>,
+        #[serde(default)]
+        lifecycle: TerminalLifecycle,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
@@ -3278,6 +3336,7 @@ mod tests {
         let out = CliToServer::TerminalOutput {
             session_id,
             pane_id: 7,
+            instance_id: None,
             data_b64: "aGVsbG8=".to_string(),
             seq: 3,
         };
@@ -3314,7 +3373,19 @@ mod tests {
     }
 
     #[test]
-    fn terminal_snapshot_defaults_truncated_false() {
+    fn legacy_terminal_messages_default_lifecycle_and_instance() {
+        let output = r#"{
+            "type": "terminal_output",
+            "session_id": "52443f74-5819-4502-83fe-db530fe70feb",
+            "pane_id": 7,
+            "data_b64": "aGVsbG8=",
+            "seq": 2
+        }"#;
+        match serde_json::from_str::<CliToServer>(output).unwrap() {
+            CliToServer::TerminalOutput { instance_id, .. } => assert!(instance_id.is_none()),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
         let json = r#"{
             "type": "terminal_snapshot",
             "session_id": "52443f74-5819-4502-83fe-db530fe70feb",
@@ -3323,7 +3394,68 @@ mod tests {
             "seq": 0
         }"#;
         match serde_json::from_str::<ServerToWeb>(json).unwrap() {
-            ServerToWeb::TerminalSnapshot { truncated, .. } => assert!(!truncated),
+            ServerToWeb::TerminalSnapshot {
+                instance_id,
+                truncated,
+                lifecycle,
+                status,
+                ..
+            } => {
+                assert!(instance_id.is_none());
+                assert!(!truncated);
+                assert_eq!(lifecycle, TerminalLifecycle::Unknown);
+                assert!(status.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminal_state_messages_round_trip_lifecycle_metadata() {
+        let session_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let cli = CliToServer::TerminalState {
+            session_id,
+            pane_id: 11,
+            instance_id: Some(instance_id),
+            lifecycle: TerminalLifecycle::Exited,
+            status: Some("exited with status 1".to_string()),
+        };
+        let json = serde_json::to_string(&cli).unwrap();
+        match serde_json::from_str::<CliToServer>(&json).unwrap() {
+            CliToServer::TerminalState {
+                session_id: got_session,
+                pane_id,
+                instance_id: got_instance,
+                lifecycle,
+                status,
+            } => {
+                assert_eq!(got_session, session_id);
+                assert_eq!(pane_id, 11);
+                assert_eq!(got_instance, Some(instance_id));
+                assert_eq!(lifecycle, TerminalLifecycle::Exited);
+                assert_eq!(status.as_deref(), Some("exited with status 1"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let web = ServerToWeb::TerminalState {
+            session_id,
+            pane_id: 11,
+            instance_id: Some(instance_id),
+            lifecycle: TerminalLifecycle::Disconnected,
+            status: None,
+        };
+        let json = serde_json::to_string(&web).unwrap();
+        match serde_json::from_str::<ServerToWeb>(&json).unwrap() {
+            ServerToWeb::TerminalState {
+                instance_id: got_instance,
+                lifecycle,
+                ..
+            } => {
+                assert_eq!(got_instance, Some(instance_id));
+                assert_eq!(lifecycle, TerminalLifecycle::Disconnected);
+            }
             other => panic!("unexpected variant: {other:?}"),
         }
     }

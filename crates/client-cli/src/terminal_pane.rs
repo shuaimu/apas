@@ -26,7 +26,7 @@
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
-use shared::{CliToServer, Provider};
+use shared::{CliToServer, Provider, TerminalLifecycle};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -110,6 +110,9 @@ fn permission_bypass_flag_for(provider: &Provider) -> Option<&'static str> {
 #[derive(Clone)]
 pub struct TerminalHandle {
     pane_id: u32,
+    /// Stable for exactly one spawned provider process, including across
+    /// any number of CLI WebSocket reconnects.
+    instance_id: Uuid,
     /// Writer half of the pty master. Keystrokes go here.
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// Master pty, retained for `TIOCSWINSZ` on resize.
@@ -122,6 +125,9 @@ pub struct TerminalHandle {
     shutting_down: Arc<AtomicBool>,
     /// Last size we applied, so a redundant resize doesn't churn the TUI.
     last_size: Arc<Mutex<(u16, u16)>>,
+    /// Retained after the reader exits so a later reconnect can report a
+    /// dead provider even though no browser saw the live exit event.
+    lifecycle: Arc<Mutex<(TerminalLifecycle, Option<String>)>>,
 }
 
 impl TerminalHandle {
@@ -212,12 +218,14 @@ impl TerminalHandle {
 
         let handle = Self {
             pane_id,
+            instance_id: Uuid::new_v4(),
             writer: Arc::new(Mutex::new(writer)),
             master: Arc::new(Mutex::new(pair.master)),
             child: Arc::new(Mutex::new(child)),
             seq: Arc::new(AtomicU64::new(0)),
             shutting_down: Arc::new(AtomicBool::new(false)),
             last_size: Arc::new(Mutex::new((DEFAULT_COLS, DEFAULT_ROWS))),
+            lifecycle: Arc::new(Mutex::new((TerminalLifecycle::Running, None))),
         };
 
         handle.start_reader(session_id, reader, server_tx);
@@ -248,10 +256,22 @@ impl TerminalHandle {
         let seq = Arc::clone(&self.seq);
         let shutting_down = Arc::clone(&self.shutting_down);
         let child = Arc::clone(&self.child);
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let instance_id = self.instance_id;
 
         thread::Builder::new()
             .name(format!("apas-term-{pane_id}"))
             .spawn(move || {
+                // Announce the generation from this blocking thread before it
+                // can emit output. `spawn` may itself run inside tokio, where
+                // `blocking_send` would panic.
+                let _ = server_tx.blocking_send(CliToServer::TerminalState {
+                    session_id,
+                    pane_id,
+                    instance_id: Some(instance_id),
+                    lifecycle: TerminalLifecycle::Running,
+                    status: None,
+                });
                 let mut buf = vec![0u8; READ_CHUNK_BYTES];
                 loop {
                     match reader.read(&mut buf) {
@@ -262,6 +282,7 @@ impl TerminalHandle {
                             let msg = CliToServer::TerminalOutput {
                                 session_id,
                                 pane_id,
+                                instance_id: Some(instance_id),
                                 data_b64,
                                 seq: seq.fetch_add(1, Ordering::Relaxed),
                             };
@@ -293,10 +314,22 @@ impl TerminalHandle {
                     .and_then(|mut c| c.wait().ok())
                     .map(|s| format!("exited with status {s:?}"));
 
+                if let Ok(mut state) = lifecycle.lock() {
+                    *state = (TerminalLifecycle::Exited, status.clone());
+                }
+
                 tracing::info!(pane_id, ?status, "terminal pane process ended");
+                let _ = server_tx.blocking_send(CliToServer::TerminalState {
+                    session_id,
+                    pane_id,
+                    instance_id: Some(instance_id),
+                    lifecycle: TerminalLifecycle::Exited,
+                    status: status.clone(),
+                });
                 let _ = server_tx.blocking_send(CliToServer::TerminalExited {
                     session_id,
                     pane_id,
+                    instance_id: Some(instance_id),
                     status,
                 });
             })
@@ -344,6 +377,49 @@ impl TerminalHandle {
             })
             .context("pty resize failed")?;
         Ok(())
+    }
+
+    pub fn instance_id(&self) -> Uuid {
+        self.instance_id
+    }
+
+    /// Reconcile the child before reporting cached lifecycle. Usually the
+    /// reader thread records an exit first; `try_wait` closes the smaller
+    /// race where reconnect lands after process death but before pty EOF.
+    pub fn state_message(&self, session_id: Uuid) -> CliToServer {
+        let already_exited = self
+            .lifecycle
+            .lock()
+            .map(|state| state.0 == TerminalLifecycle::Exited)
+            .unwrap_or(false);
+        if !already_exited && !self.shutting_down.load(Ordering::Relaxed) {
+            let observed = self
+                .child
+                .lock()
+                .ok()
+                .and_then(|mut child| child.try_wait().ok().flatten())
+                .map(|status| format!("exited with status {status:?}"));
+            if let Some(status) = observed {
+                if let Ok(mut state) = self.lifecycle.lock() {
+                    *state = (TerminalLifecycle::Exited, Some(status));
+                }
+            }
+        }
+        self.state_message_from_cache(session_id)
+    }
+
+    fn state_message_from_cache(&self, session_id: Uuid) -> CliToServer {
+        let (lifecycle, status) = self.lifecycle.lock().map(|state| state.clone()).unwrap_or((
+            TerminalLifecycle::Unknown,
+            Some("terminal lifecycle lock poisoned".to_string()),
+        ));
+        CliToServer::TerminalState {
+            session_id,
+            pane_id: self.pane_id,
+            instance_id: Some(self.instance_id),
+            lifecycle,
+            status,
+        }
     }
 
     /// Kill the hosted process and stop the reader thread.
@@ -458,27 +534,51 @@ mod tests {
                 tx,
             )
             .expect("spawn pty");
+            let instance_id = handle.instance_id();
 
             let mut collected = Vec::new();
             let mut exited = false;
+            let mut running_state_seen = false;
+            let mut exited_state_seen = false;
             while let Some(msg) = rx.recv().await {
                 match msg {
                     CliToServer::TerminalOutput {
                         pane_id,
+                        instance_id: got_instance,
                         data_b64,
                         session_id: got,
                         ..
                     } => {
                         assert_eq!(pane_id, 7);
                         assert_eq!(got, session_id);
+                        assert_eq!(got_instance, Some(instance_id));
                         collected.extend(
                             base64::engine::general_purpose::STANDARD
                                 .decode(data_b64)
                                 .unwrap(),
                         );
                     }
-                    CliToServer::TerminalExited { pane_id, .. } => {
+                    CliToServer::TerminalState {
+                        pane_id,
+                        instance_id: got_instance,
+                        lifecycle,
+                        ..
+                    } => {
                         assert_eq!(pane_id, 7);
+                        assert_eq!(got_instance, Some(instance_id));
+                        match lifecycle {
+                            TerminalLifecycle::Running => running_state_seen = true,
+                            TerminalLifecycle::Exited => exited_state_seen = true,
+                            other => panic!("unexpected lifecycle: {other:?}"),
+                        }
+                    }
+                    CliToServer::TerminalExited {
+                        pane_id,
+                        instance_id: got_instance,
+                        ..
+                    } => {
+                        assert_eq!(pane_id, 7);
+                        assert_eq!(got_instance, Some(instance_id));
                         exited = true;
                         break;
                     }
@@ -487,6 +587,19 @@ mod tests {
             }
 
             assert!(exited, "reader never reported the child exit");
+            assert!(running_state_seen, "spawn never reported running state");
+            assert!(exited_state_seen, "reader never retained exited state");
+            match handle.state_message(session_id) {
+                CliToServer::TerminalState {
+                    instance_id: got_instance,
+                    lifecycle,
+                    ..
+                } => {
+                    assert_eq!(got_instance, Some(instance_id));
+                    assert_eq!(lifecycle, TerminalLifecycle::Exited);
+                }
+                other => panic!("unexpected state report: {other:?}"),
+            }
             // `/bin/echo` prints its argv, so this doubles as end-to-end proof
             // that the flags actually reach the spawned process — not just that
             // the mapping functions return them. The pty turns the trailing
@@ -501,6 +614,48 @@ mod tests {
                 format!("--dangerously-skip-permissions --session-id {conv_id}"),
             );
             handle.shutdown();
+        });
+    }
+
+    #[test]
+    fn terminal_instance_identity_is_stable_and_unique_per_spawn() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (tx, _rx) = tokio_mpsc::channel(64);
+            let session_id = Uuid::new_v4();
+            let first = TerminalHandle::spawn(
+                1,
+                session_id,
+                Uuid::new_v4(),
+                &Provider::Claude,
+                "/bin/cat",
+                "/tmp",
+                &[],
+                false,
+                tx.clone(),
+            )
+            .expect("spawn first pty");
+            let second = TerminalHandle::spawn(
+                1,
+                session_id,
+                Uuid::new_v4(),
+                &Provider::Claude,
+                "/bin/cat",
+                "/tmp",
+                &[],
+                false,
+                tx,
+            )
+            .expect("spawn replacement pty");
+
+            let first_id = first.instance_id();
+            assert_eq!(first.instance_id(), first_id);
+            assert_ne!(first_id, second.instance_id());
+            first.shutdown();
+            second.shutdown();
         });
     }
 

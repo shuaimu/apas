@@ -4,7 +4,16 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { useStore } from "@/lib/store";
-import { subscribeTerminal, type TerminalEvent } from "@/lib/terminalBus";
+import {
+  subscribeTerminal,
+  type TerminalEvent,
+  type TerminalLifecycle,
+} from "@/lib/terminalBus";
+import {
+  applyTerminalEvent,
+  createTerminalRenderState,
+  terminalLifecycleBanner,
+} from "@/lib/terminalReconciler";
 import { SOLARIZED as SZ, readStoredTheme, themeIsDark } from "@/lib/theme";
 import { useTheme } from "@/lib/useTheme";
 import "@xterm/xterm/css/xterm.css";
@@ -168,13 +177,14 @@ export function TerminalPane({ paneId }: { paneId: number }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
-  const [exitStatus, setExitStatus] = useState<string | null>(null);
+  const renderStateRef = useRef(createTerminalRenderState());
+  const [lifecycleView, setLifecycleView] = useState<{
+    lifecycle?: TerminalLifecycle;
+    status?: string;
+  }>({ lifecycle: undefined });
 
-  // Snapshot/live reconciliation state. Refs rather than closure variables
-  // so the reconnect effect can reset them without tearing down the
-  // terminal (which would drop the user's focus and scroll position).
-  const snapshotSeenRef = useRef(false);
-  const pendingRef = useRef<{ bytes: Uint8Array; seq: number }[]>([]);
+  // Snapshot/live reconciliation state lives in a ref so reconnects do not
+  // tear down the terminal (which would drop focus and scroll position).
   const lastSizeRef = useRef<{ cols: number; rows: number }>({ cols: 0, rows: 0 });
 
   const attachTerminal = useStore((s) => s.attachTerminal);
@@ -264,30 +274,18 @@ export function TerminalPane({ paneId }: { paneId: number }) {
     })();
 
     const unsubscribe = subscribeTerminal(paneId, (event: TerminalEvent) => {
-      if (event.kind === "snapshot") {
-        // A truncated replay can start partway through an escape sequence;
-        // reset first so a clipped sequence can't corrupt emulator state.
-        if (event.truncated) term.reset();
-        if (event.bytes.length) term.write(event.bytes);
-        // Drop live frames the snapshot already covers, then flush the
-        // rest — otherwise replay and live tail interleave and the screen
-        // paints twice.
-        for (const chunk of pendingRef.current) {
-          if (chunk.seq > event.seq) term.write(chunk.bytes);
-        }
-        pendingRef.current = [];
-        snapshotSeenRef.current = true;
-        return;
+      const accepted = applyTerminalEvent(renderStateRef.current, event, {
+        write: (bytes) => term.write(bytes),
+        reset: () => term.reset(),
+      });
+      // Output remains entirely outside React. Only low-frequency lifecycle
+      // changes update component state to render or clear the status banner.
+      if (accepted && event.kind !== "output") {
+        setLifecycleView({
+          lifecycle: renderStateRef.current.lifecycle,
+          status: renderStateRef.current.status,
+        });
       }
-      if (event.kind === "exited") {
-        setExitStatus(event.status ?? "process ended");
-        return;
-      }
-      if (!snapshotSeenRef.current) {
-        pendingRef.current.push({ bytes: event.bytes, seq: event.seq });
-        return;
-      }
-      term.write(event.bytes);
     });
 
     const onData = term.onData((data) => sendTerminalInput(paneId, data));
@@ -313,14 +311,18 @@ export function TerminalPane({ paneId }: { paneId: number }) {
   // scrollback is what restores the screen.
   useEffect(() => {
     if (!connected) return;
-    snapshotSeenRef.current = false;
-    pendingRef.current = [];
-    setExitStatus(null);
+    renderStateRef.current.snapshotSeen = false;
+    renderStateRef.current.pending = [];
     attachTerminal(paneId);
     // Re-send the size: the CLI may have restarted with a default pty.
     lastSizeRef.current = { cols: 0, rows: 0 };
     applyFit();
   }, [connected, paneId, attachTerminal, applyFit]);
+
+  const lifecycleBanner = terminalLifecycleBanner(
+    lifecycleView.lifecycle,
+    lifecycleView.status,
+  );
 
   return (
     // The wrapper must track the xterm theme, or a light terminal sits inside
@@ -328,9 +330,9 @@ export function TerminalPane({ paneId }: { paneId: number }) {
     // runs in `media` mode here, so it follows the same signal the palette
     // above does and the two cannot disagree.
     <div className="relative flex h-full w-full flex-col bg-white dark:bg-[#0a0a0a]">
-      {exitStatus && (
+      {lifecycleBanner && (
         <div className="border-b border-neutral-300 bg-neutral-100 px-3 py-1.5 text-xs text-amber-700 dark:border-neutral-700 dark:bg-neutral-900 dark:text-amber-400">
-          Process ended ({exitStatus}). Reboot the pane to start a new one.
+          {lifecycleBanner}
         </div>
       )}
       <div ref={containerRef} className="min-h-0 flex-1 overflow-hidden p-1" />

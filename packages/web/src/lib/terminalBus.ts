@@ -8,6 +8,8 @@
  * that pane is woken — React never sees the bytes at all.
  */
 
+export type TerminalLifecycle = "unknown" | "running" | "disconnected" | "exited";
+
 export type TerminalEvent =
   | {
       /** Replayed scrollback from the server ring buffer on attach. */
@@ -16,9 +18,18 @@ export type TerminalEvent =
       seq: number;
       /** Older bytes were evicted, so this may start mid-escape-sequence. */
       truncated: boolean;
+      instanceId?: string;
+      lifecycle: TerminalLifecycle;
+      status?: string;
     }
-  | { kind: "output"; bytes: Uint8Array; seq: number }
-  | { kind: "exited"; status?: string };
+  | { kind: "output"; bytes: Uint8Array; seq: number; instanceId?: string }
+  | { kind: "exited"; instanceId?: string; status?: string }
+  | {
+      kind: "state";
+      instanceId?: string;
+      lifecycle: TerminalLifecycle;
+      status?: string;
+    };
 
 type Listener = (event: TerminalEvent) => void;
 

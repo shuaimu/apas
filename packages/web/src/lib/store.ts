@@ -1,5 +1,10 @@
 import { create } from "zustand";
-import { decodeBase64, emitTerminal, encodeBase64 } from "./terminalBus";
+import {
+  decodeBase64,
+  emitTerminal,
+  encodeBase64,
+  type TerminalLifecycle,
+} from "./terminalBus";
 import {
   deleteSnapshot as deleteSnapshotIdb,
   loadAllSnapshots as loadAllSnapshotsIdb,
@@ -3271,6 +3276,15 @@ function requestCatchupIfNeeded(get: () => AppState, sessionId: string) {
 
 /** Exported for tests: lets a spec drive a single server frame through
  *  the dispatch without standing up a WebSocket. */
+function decodeTerminalLifecycle(value: unknown): TerminalLifecycle {
+  return value === "running" ||
+    value === "disconnected" ||
+    value === "exited" ||
+    value === "unknown"
+    ? value
+    : "unknown";
+}
+
 export function handleServerMessage(
   data: Record<string, unknown>,
   set: (partial: Partial<AppState> | ((state: AppState) => Partial<AppState>)) => void,
@@ -3621,6 +3635,7 @@ export function handleServerMessage(
           kind: "output",
           bytes: decodeBase64(b64),
           seq: (data.seq as number) ?? 0,
+          instanceId: typeof data.instance_id === "string" ? data.instance_id : undefined,
         });
       }
       break;
@@ -3635,6 +3650,9 @@ export function handleServerMessage(
           bytes: decodeBase64(b64),
           seq: (data.seq as number) ?? 0,
           truncated: Boolean(data.truncated),
+          instanceId: typeof data.instance_id === "string" ? data.instance_id : undefined,
+          lifecycle: decodeTerminalLifecycle(data.lifecycle),
+          status: typeof data.status === "string" ? data.status : undefined,
         });
       }
       break;
@@ -3645,7 +3663,21 @@ export function handleServerMessage(
       if (typeof paneId === "number") {
         emitTerminal(paneId, {
           kind: "exited",
-          status: data.status as string | undefined,
+          instanceId: typeof data.instance_id === "string" ? data.instance_id : undefined,
+          status: typeof data.status === "string" ? data.status : undefined,
+        });
+      }
+      break;
+    }
+
+    case "terminal_state": {
+      const paneId = data.pane_id as number | undefined;
+      if (typeof paneId === "number") {
+        emitTerminal(paneId, {
+          kind: "state",
+          instanceId: typeof data.instance_id === "string" ? data.instance_id : undefined,
+          lifecycle: decodeTerminalLifecycle(data.lifecycle),
+          status: typeof data.status === "string" ? data.status : undefined,
         });
       }
       break;

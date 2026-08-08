@@ -43,14 +43,14 @@ describe("terminal server frames", () => {
     );
 
     expect(seen).toEqual([
-      { kind: "output", bytes: new Uint8Array([0x68, 0x69]), seq: 4 },
+      { kind: "output", bytes: new Uint8Array([0x68, 0x69]), seq: 4, instanceId: undefined },
     ]);
     // The store must be untouched — a pty repaints many times a second and
     // storing frames would re-render every subscriber on each one.
     expect(useStore.getState()).toBe(before);
   });
 
-  it("routes terminal_snapshot with its truncated flag", () => {
+  it("routes terminal_snapshot with instance and lifecycle metadata", () => {
     const seen: TerminalEvent[] = [];
     subscribeTerminal(PANE, (e) => seen.push(e));
 
@@ -62,12 +62,22 @@ describe("terminal server frames", () => {
         data_b64: "aGk=",
         seq: 9,
         truncated: true,
+        instance_id: "pty-a",
+        lifecycle: "disconnected",
+        status: "network unavailable",
       },
       useStore.setState,
       useStore.getState,
     );
 
-    expect(seen[0]).toMatchObject({ kind: "snapshot", seq: 9, truncated: true });
+    expect(seen[0]).toMatchObject({
+      kind: "snapshot",
+      seq: 9,
+      truncated: true,
+      instanceId: "pty-a",
+      lifecycle: "disconnected",
+      status: "network unavailable",
+    });
   });
 
   it("defaults snapshot truncated to false when the server omits it", () => {
@@ -80,7 +90,12 @@ describe("terminal server frames", () => {
       useStore.getState,
     );
 
-    expect(seen[0]).toMatchObject({ kind: "snapshot", truncated: false });
+    expect(seen[0]).toMatchObject({
+      kind: "snapshot",
+      truncated: false,
+      lifecycle: "unknown",
+      instanceId: undefined,
+    });
   });
 
   it("routes terminal_exited with its status", () => {
@@ -93,7 +108,38 @@ describe("terminal server frames", () => {
       useStore.getState,
     );
 
-    expect(seen[0]).toEqual({ kind: "exited", status: "exited with status 0" });
+    expect(seen[0]).toEqual({
+      kind: "exited",
+      instanceId: undefined,
+      status: "exited with status 0",
+    });
+  });
+
+  it("routes lifecycle-only state events and defaults invalid state to unknown", () => {
+    const seen: TerminalEvent[] = [];
+    subscribeTerminal(PANE, (e) => seen.push(e));
+
+    handleServerMessage(
+      {
+        type: "terminal_state",
+        session_id: SID,
+        pane_id: PANE,
+        instance_id: "pty-a",
+        lifecycle: "running",
+      },
+      useStore.setState,
+      useStore.getState,
+    );
+    handleServerMessage(
+      { type: "terminal_state", session_id: SID, pane_id: PANE, lifecycle: "future_state" },
+      useStore.setState,
+      useStore.getState,
+    );
+
+    expect(seen).toEqual([
+      { kind: "state", instanceId: "pty-a", lifecycle: "running", status: undefined },
+      { kind: "state", instanceId: undefined, lifecycle: "unknown", status: undefined },
+    ]);
   });
 
   it("ignores frames missing pane_id rather than throwing", () => {

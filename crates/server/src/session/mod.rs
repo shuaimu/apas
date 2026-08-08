@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use shared::{
     CliClientInfo, CliClientStatus, DeepseekBackendInfo, GlmBackendInfo, MachineInfo,
     MachineProjectInfo, MachineWithProjects, MiniMaxBackendInfo, PaneConfig, PaneType, Provider,
-    ServerToCli, ServerToDaemon, ServerToWeb, UsageLimits,
+    ServerToCli, ServerToDaemon, ServerToWeb, TerminalLifecycle, UsageLimits,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -163,27 +163,65 @@ pub struct SessionManager {
     /// retry + reconnect replay), and without this each retransmit was
     /// stored and displayed as a fresh message. Bounded ring per session.
     recent_input_ids: DashMap<Uuid, VecDeque<(String, String)>>,
-    /// Raw pty scrollback per (session, pane) for `PaneKind::Terminal`
-    /// panes. In memory only and deliberately never persisted: these are
-    /// ANSI byte streams, not chat records, and writing them to
-    /// `messages.jsonl` would corrupt the message store.
-    terminal_scrollback: DashMap<(Uuid, u32), TerminalScrollback>,
+    /// Raw pty presentation and lifecycle per (session, pane) for
+    /// `PaneKind::Terminal` panes. In memory only and deliberately never
+    /// persisted: these are ANSI byte streams, not chat records, and writing
+    /// them to `messages.jsonl` would corrupt the message store.
+    terminal_states: DashMap<(Uuid, u32), TerminalStateEntry>,
 }
 
-/// Bounded rolling window of a terminal pane's output.
+/// Bounded rolling window and last authoritative lifecycle for a terminal.
 ///
 /// Replayed verbatim when a web client attaches, which is why it stores
 /// raw bytes rather than decoded text — re-encoding would have to
 /// interpret escape sequences, and interpreting them correctly is the
 /// emulator's job, not the broker's.
 #[derive(Debug, Default)]
-pub struct TerminalScrollback {
+pub struct TerminalStateEntry {
     buf: VecDeque<u8>,
     /// Sequence of the newest chunk in `buf`.
     seq: u64,
+    has_output: bool,
     /// True once the cap has forced us to drop bytes off the front, which
     /// means a replay can start mid-escape-sequence.
     truncated: bool,
+    instance_id: Option<Uuid>,
+    lifecycle: TerminalLifecycle,
+    status: Option<String>,
+}
+
+/// Immutable terminal state returned to attach handlers and lifecycle fans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalSnapshotState {
+    pub bytes: Vec<u8>,
+    pub seq: u64,
+    pub truncated: bool,
+    pub instance_id: Option<Uuid>,
+    pub lifecycle: TerminalLifecycle,
+    pub status: Option<String>,
+}
+
+impl TerminalStateEntry {
+    fn snapshot(&self) -> TerminalSnapshotState {
+        TerminalSnapshotState {
+            bytes: self.buf.iter().copied().collect(),
+            seq: self.seq,
+            truncated: self.truncated,
+            instance_id: self.instance_id,
+            lifecycle: self.lifecycle,
+            status: self.status.clone(),
+        }
+    }
+
+    fn replace_instance(&mut self, instance_id: Uuid) {
+        self.buf.clear();
+        self.seq = 0;
+        self.has_output = false;
+        self.truncated = false;
+        self.instance_id = Some(instance_id);
+        self.lifecycle = TerminalLifecycle::Unknown;
+        self.status = None;
+    }
 }
 
 /// Scrollback retained per terminal pane. A full-screen TUI repaint is a
@@ -232,47 +270,149 @@ impl SessionManager {
             machine_projects: DashMap::new(),
             shared_project_refs: DashMap::new(),
             recent_input_ids: DashMap::new(),
-            terminal_scrollback: DashMap::new(),
+            terminal_states: DashMap::new(),
         }
     }
 
     /// Append a terminal chunk to the pane's scrollback ring, evicting
-    /// from the front once the cap is reached.
-    pub fn append_terminal_output(&self, session_id: &Uuid, pane_id: u32, bytes: &[u8], seq: u64) {
+    /// from the front once the cap is reached. Returns false for an event
+    /// belonging to a replaced terminal generation.
+    pub fn append_terminal_output(
+        &self,
+        session_id: &Uuid,
+        pane_id: u32,
+        instance_id: Option<Uuid>,
+        bytes: &[u8],
+        seq: u64,
+    ) -> bool {
         let mut entry = self
-            .terminal_scrollback
+            .terminal_states
             .entry((*session_id, pane_id))
             .or_default();
+
+        match (entry.instance_id, instance_id) {
+            (Some(current), Some(incoming)) if current != incoming => return false,
+            (None, Some(incoming)) => entry.instance_id = Some(incoming),
+            _ => {}
+        }
+
+        // Identified streams have a per-instance monotonic counter. Rejecting
+        // duplicates here prevents delayed frames from being appended twice
+        // after a reconnect. Legacy streams are accepted even if their
+        // counters restart because they cannot prove process identity.
+        if instance_id.is_some() && entry.has_output && seq <= entry.seq {
+            return false;
+        }
+
         entry.buf.extend(bytes.iter().copied());
         entry.seq = seq;
+        entry.has_output = true;
         if entry.buf.len() > TERMINAL_SCROLLBACK_MAX_BYTES {
             let overflow = entry.buf.len() - TERMINAL_SCROLLBACK_MAX_BYTES;
             entry.buf.drain(..overflow);
             entry.truncated = true;
         }
+        true
     }
 
-    /// Current scrollback for a terminal pane: `(bytes, newest_seq,
-    /// truncated)`. `None` when the pane has produced no output yet.
-    pub fn terminal_snapshot(&self, session_id: &Uuid, pane_id: u32) -> Option<(Vec<u8>, u64, bool)> {
-        self.terminal_scrollback
+    /// Apply an authoritative CLI state report. A running report for a new
+    /// instance replaces the old presentation. Non-running reports for a
+    /// different instance are stale by definition and are ignored.
+    pub fn reconcile_terminal_state(
+        &self,
+        session_id: &Uuid,
+        pane_id: u32,
+        instance_id: Option<Uuid>,
+        lifecycle: TerminalLifecycle,
+        status: Option<String>,
+    ) -> Option<TerminalSnapshotState> {
+        let mut entry = self
+            .terminal_states
+            .entry((*session_id, pane_id))
+            .or_default();
+
+        match (entry.instance_id, instance_id) {
+            (Some(current), Some(incoming)) if current != incoming => {
+                if lifecycle != TerminalLifecycle::Running {
+                    return None;
+                }
+                entry.replace_instance(incoming);
+            }
+            (None, Some(incoming)) => entry.replace_instance(incoming),
+            _ => {}
+        }
+
+        // Exited is terminal for one process instance. An idempotent exit is
+        // accepted, but a delayed running/disconnected report cannot revive it.
+        if entry.lifecycle == TerminalLifecycle::Exited
+            && lifecycle != TerminalLifecycle::Exited
+            && instance_id.is_some()
+        {
+            return None;
+        }
+
+        entry.lifecycle = lifecycle;
+        entry.status = status;
+        Some(entry.snapshot())
+    }
+
+    /// Record the legacy exit event as retained lifecycle state. Matching or
+    /// metadata-less exits are accepted; exits from replaced instances are not.
+    pub fn record_terminal_exit(
+        &self,
+        session_id: &Uuid,
+        pane_id: u32,
+        instance_id: Option<Uuid>,
+        status: Option<String>,
+    ) -> Option<TerminalSnapshotState> {
+        let mut entry = self
+            .terminal_states
+            .entry((*session_id, pane_id))
+            .or_default();
+        match (entry.instance_id, instance_id) {
+            (Some(current), Some(incoming)) if current != incoming => return None,
+            (None, Some(incoming)) => entry.instance_id = Some(incoming),
+            _ => {}
+        }
+        entry.lifecycle = TerminalLifecycle::Exited;
+        entry.status = status;
+        Some(entry.snapshot())
+    }
+
+    /// Current retained presentation and lifecycle. State-only entries are
+    /// returned even when a process has not produced any output.
+    pub fn terminal_snapshot(
+        &self,
+        session_id: &Uuid,
+        pane_id: u32,
+    ) -> Option<TerminalSnapshotState> {
+        self.terminal_states
             .get(&(*session_id, pane_id))
-            .map(|e| (e.buf.iter().copied().collect(), e.seq, e.truncated))
+            .map(|entry| entry.snapshot())
     }
 
     /// Drop a terminal pane's scrollback. Called when the pane is removed
     /// so a later pane reusing the id can't inherit stale frames.
     pub fn clear_terminal_scrollback(&self, session_id: &Uuid, pane_id: u32) {
-        self.terminal_scrollback.remove(&(*session_id, pane_id));
+        self.terminal_states.remove(&(*session_id, pane_id));
     }
 
-    /// Drop every terminal pane's scrollback for a session. Used when the
-    /// CLI disconnects: those ptys died with it, so replaying their last
-    /// frames to a reattaching browser would show a live-looking terminal
-    /// that is actually dead.
-    pub fn clear_session_terminal_scrollback(&self, session_id: &Uuid) {
-        self.terminal_scrollback
-            .retain(|(sid, _), _| sid != session_id);
+    /// Mark currently-running terminals as transport-disconnected while
+    /// retaining presentation. Unknown and exited entries are not rewritten.
+    pub fn mark_session_terminals_disconnected(
+        &self,
+        session_id: &Uuid,
+    ) -> Vec<(u32, TerminalSnapshotState)> {
+        let mut changed = Vec::new();
+        for mut item in self.terminal_states.iter_mut() {
+            let ((sid, pane_id), entry) = item.pair_mut();
+            if sid == session_id && entry.lifecycle == TerminalLifecycle::Running {
+                entry.lifecycle = TerminalLifecycle::Disconnected;
+                entry.status = None;
+                changed.push((*pane_id, entry.snapshot()));
+            }
+        }
+        changed
     }
 
     /// Returns the original `created_at` if this client_msg_id was already
@@ -1688,16 +1828,19 @@ mod tests {
     fn terminal_scrollback_accumulates_and_reports_latest_seq() {
         let sessions = SessionManager::new();
         let sid = Uuid::new_v4();
+        let instance = Uuid::new_v4();
 
         assert!(sessions.terminal_snapshot(&sid, 7).is_none());
 
-        sessions.append_terminal_output(&sid, 7, b"hello ", 0);
-        sessions.append_terminal_output(&sid, 7, b"world", 1);
+        assert!(sessions.append_terminal_output(&sid, 7, Some(instance), b"hello ", 0));
+        assert!(sessions.append_terminal_output(&sid, 7, Some(instance), b"world", 1));
 
-        let (bytes, seq, truncated) = sessions.terminal_snapshot(&sid, 7).expect("snapshot");
-        assert_eq!(bytes, b"hello world");
-        assert_eq!(seq, 1);
-        assert!(!truncated);
+        let snapshot = sessions.terminal_snapshot(&sid, 7).expect("snapshot");
+        assert_eq!(snapshot.bytes, b"hello world");
+        assert_eq!(snapshot.seq, 1);
+        assert!(!snapshot.truncated);
+        assert_eq!(snapshot.instance_id, Some(instance));
+        assert_eq!(snapshot.lifecycle, TerminalLifecycle::Unknown);
     }
 
     #[test]
@@ -1709,15 +1852,15 @@ mod tests {
         // terminal's useful state is its latest frame, so dropping from
         // the front is the only correct eviction direction.
         let filler = vec![b'a'; TERMINAL_SCROLLBACK_MAX_BYTES];
-        sessions.append_terminal_output(&sid, 1, &filler, 0);
-        sessions.append_terminal_output(&sid, 1, b"TAIL", 1);
+        sessions.append_terminal_output(&sid, 1, None, &filler, 0);
+        sessions.append_terminal_output(&sid, 1, None, b"TAIL", 1);
 
-        let (bytes, seq, truncated) = sessions.terminal_snapshot(&sid, 1).expect("snapshot");
-        assert_eq!(bytes.len(), TERMINAL_SCROLLBACK_MAX_BYTES);
-        assert!(bytes.ends_with(b"TAIL"));
-        assert_eq!(seq, 1);
+        let snapshot = sessions.terminal_snapshot(&sid, 1).expect("snapshot");
+        assert_eq!(snapshot.bytes.len(), TERMINAL_SCROLLBACK_MAX_BYTES);
+        assert!(snapshot.bytes.ends_with(b"TAIL"));
+        assert_eq!(snapshot.seq, 1);
         assert!(
-            truncated,
+            snapshot.truncated,
             "client must be told the replay may start mid-escape-sequence"
         );
     }
@@ -1728,38 +1871,151 @@ mod tests {
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
 
-        sessions.append_terminal_output(&a, 1, b"pane-a1", 0);
-        sessions.append_terminal_output(&a, 2, b"pane-a2", 0);
-        sessions.append_terminal_output(&b, 1, b"pane-b1", 0);
+        sessions.append_terminal_output(&a, 1, None, b"pane-a1", 0);
+        sessions.append_terminal_output(&a, 2, None, b"pane-a2", 0);
+        sessions.append_terminal_output(&b, 1, None, b"pane-b1", 0);
 
-        assert_eq!(sessions.terminal_snapshot(&a, 1).unwrap().0, b"pane-a1");
-        assert_eq!(sessions.terminal_snapshot(&a, 2).unwrap().0, b"pane-a2");
-        assert_eq!(sessions.terminal_snapshot(&b, 1).unwrap().0, b"pane-b1");
+        assert_eq!(sessions.terminal_snapshot(&a, 1).unwrap().bytes, b"pane-a1");
+        assert_eq!(sessions.terminal_snapshot(&a, 2).unwrap().bytes, b"pane-a2");
+        assert_eq!(sessions.terminal_snapshot(&b, 1).unwrap().bytes, b"pane-b1");
 
         // Removing one pane must not disturb the other panes or sessions —
         // a pane_id is only unique within a session.
         sessions.clear_terminal_scrollback(&a, 1);
         assert!(sessions.terminal_snapshot(&a, 1).is_none());
-        assert_eq!(sessions.terminal_snapshot(&a, 2).unwrap().0, b"pane-a2");
-        assert_eq!(sessions.terminal_snapshot(&b, 1).unwrap().0, b"pane-b1");
+        assert_eq!(sessions.terminal_snapshot(&a, 2).unwrap().bytes, b"pane-a2");
+        assert_eq!(sessions.terminal_snapshot(&b, 1).unwrap().bytes, b"pane-b1");
     }
 
     #[test]
-    fn cli_disconnect_clears_only_that_sessions_terminals() {
+    fn cli_disconnect_retains_bytes_and_preserves_exited_state() {
         let sessions = SessionManager::new();
         let dead = Uuid::new_v4();
         let alive = Uuid::new_v4();
+        let running_instance = Uuid::new_v4();
+        let exited_instance = Uuid::new_v4();
 
-        sessions.append_terminal_output(&dead, 1, b"x", 0);
-        sessions.append_terminal_output(&dead, 2, b"y", 0);
-        sessions.append_terminal_output(&alive, 1, b"z", 0);
+        sessions.reconcile_terminal_state(
+            &dead,
+            1,
+            Some(running_instance),
+            TerminalLifecycle::Running,
+            None,
+        );
+        sessions.append_terminal_output(&dead, 1, Some(running_instance), b"x", 0);
+        sessions.reconcile_terminal_state(
+            &dead,
+            2,
+            Some(exited_instance),
+            TerminalLifecycle::Exited,
+            Some("status 7".into()),
+        );
+        sessions.append_terminal_output(&dead, 2, Some(exited_instance), b"y", 0);
+        sessions.append_terminal_output(&alive, 1, None, b"z", 0);
 
-        // The dead CLI's ptys are gone; replaying their last frame would
-        // render as a live terminal in a reattaching browser.
-        sessions.clear_session_terminal_scrollback(&dead);
+        let changed = sessions.mark_session_terminals_disconnected(&dead);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].0, 1);
 
-        assert!(sessions.terminal_snapshot(&dead, 1).is_none());
-        assert!(sessions.terminal_snapshot(&dead, 2).is_none());
-        assert_eq!(sessions.terminal_snapshot(&alive, 1).unwrap().0, b"z");
+        let running = sessions.terminal_snapshot(&dead, 1).unwrap();
+        assert_eq!(running.bytes, b"x");
+        assert_eq!(running.lifecycle, TerminalLifecycle::Disconnected);
+        let exited = sessions.terminal_snapshot(&dead, 2).unwrap();
+        assert_eq!(exited.bytes, b"y");
+        assert_eq!(exited.lifecycle, TerminalLifecycle::Exited);
+        assert_eq!(exited.status.as_deref(), Some("status 7"));
+        assert_eq!(sessions.terminal_snapshot(&alive, 1).unwrap().bytes, b"z");
+    }
+
+    #[test]
+    fn same_instance_reconnect_preserves_presentation() {
+        let sessions = SessionManager::new();
+        let sid = Uuid::new_v4();
+        let instance = Uuid::new_v4();
+        sessions.reconcile_terminal_state(
+            &sid,
+            2,
+            Some(instance),
+            TerminalLifecycle::Running,
+            None,
+        );
+        sessions.append_terminal_output(&sid, 2, Some(instance), b"before", 0);
+        sessions.mark_session_terminals_disconnected(&sid);
+
+        let reconciled = sessions
+            .reconcile_terminal_state(&sid, 2, Some(instance), TerminalLifecycle::Running, None)
+            .expect("same instance accepted");
+        assert_eq!(reconciled.bytes, b"before");
+        assert_eq!(reconciled.lifecycle, TerminalLifecycle::Running);
+        assert!(sessions.append_terminal_output(&sid, 2, Some(instance), b" after", 1));
+        assert_eq!(
+            sessions.terminal_snapshot(&sid, 2).unwrap().bytes,
+            b"before after"
+        );
+    }
+
+    #[test]
+    fn replacement_instance_resets_and_stale_events_are_ignored() {
+        let sessions = SessionManager::new();
+        let sid = Uuid::new_v4();
+        let old = Uuid::new_v4();
+        let new = Uuid::new_v4();
+        sessions.reconcile_terminal_state(&sid, 3, Some(old), TerminalLifecycle::Running, None);
+        sessions.append_terminal_output(&sid, 3, Some(old), b"old", 4);
+
+        let replacement = sessions
+            .reconcile_terminal_state(&sid, 3, Some(new), TerminalLifecycle::Running, None)
+            .expect("new running instance replaces old state");
+        assert!(replacement.bytes.is_empty());
+        assert_eq!(replacement.seq, 0);
+        assert_eq!(replacement.instance_id, Some(new));
+
+        assert!(sessions.append_terminal_output(&sid, 3, Some(new), b"new", 0));
+        assert!(!sessions.append_terminal_output(&sid, 3, Some(old), b" stale", 5));
+        assert!(sessions
+            .record_terminal_exit(&sid, 3, Some(old), Some("old exit".into()))
+            .is_none());
+        assert!(sessions
+            .reconcile_terminal_state(
+                &sid,
+                3,
+                Some(old),
+                TerminalLifecycle::Exited,
+                Some("old state".into()),
+            )
+            .is_none());
+        let current = sessions.terminal_snapshot(&sid, 3).unwrap();
+        assert_eq!(current.bytes, b"new");
+        assert_eq!(current.lifecycle, TerminalLifecycle::Running);
+        assert_eq!(current.instance_id, Some(new));
+    }
+
+    #[test]
+    fn exit_without_output_is_retained_for_later_attach() {
+        let sessions = SessionManager::new();
+        let sid = Uuid::new_v4();
+        let instance = Uuid::new_v4();
+        let snapshot = sessions
+            .record_terminal_exit(&sid, 9, Some(instance), Some("status 1".into()))
+            .expect("exit accepted");
+        assert!(snapshot.bytes.is_empty());
+        assert_eq!(snapshot.lifecycle, TerminalLifecycle::Exited);
+        assert_eq!(snapshot.status.as_deref(), Some("status 1"));
+        assert_eq!(sessions.mark_session_terminals_disconnected(&sid).len(), 0);
+        assert_eq!(
+            sessions.terminal_snapshot(&sid, 9).unwrap().lifecycle,
+            TerminalLifecycle::Exited
+        );
+    }
+
+    #[test]
+    fn legacy_output_is_accepted_but_does_not_confirm_running() {
+        let sessions = SessionManager::new();
+        let sid = Uuid::new_v4();
+        assert!(sessions.append_terminal_output(&sid, 4, None, b"legacy", 0));
+        let snapshot = sessions.terminal_snapshot(&sid, 4).unwrap();
+        assert_eq!(snapshot.bytes, b"legacy");
+        assert_eq!(snapshot.instance_id, None);
+        assert_eq!(snapshot.lifecycle, TerminalLifecycle::Unknown);
     }
 }

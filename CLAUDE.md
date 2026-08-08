@@ -731,21 +731,51 @@ ANSI would both bloat the store and break the message renderer. They ride
 dedicated `Terminal*` messages, base64-encoded because a pty read splits
 both UTF-8 sequences and escape sequences:
 
-- `CliToServer::TerminalOutput` / `TerminalExited`
-- `ServerToWeb::TerminalOutput` / `TerminalSnapshot` / `TerminalExited`
+- `CliToServer::TerminalOutput` / `TerminalExited` / `TerminalState`
+- `ServerToWeb::TerminalOutput` / `TerminalSnapshot` / `TerminalExited` /
+  `TerminalState`
 - `WebToServer::TerminalInput` / `TerminalResize` / `TerminalAttach`
 - `ServerToCli::TerminalInput` / `TerminalResize`
 
-The server keeps a bounded in-memory scrollback ring per `(session, pane)`
-(`TERMINAL_SCROLLBACK_MAX_BYTES`, never written to disk) and answers
-`TerminalAttach` from it, so reattach paints instantly and works while the
-CLI is mid-reconnect. The ring is dropped when the pane is removed and when
-the CLI disconnects — those ptys died with it, and replaying their last
-frame would look like a live terminal.
+The server keeps a bounded in-memory state entry per `(session, pane)` with
+scrollback bytes, the newest sequence, truncation, PTY instance UUID,
+lifecycle (`unknown`, `running`, `disconnected`, or `exited`), and optional
+exit status. `TerminalAttach` is answered from that entry, including when it
+has lifecycle but no bytes, so reattach paints immediately and a process that
+exited before producing output still gets an accurate banner.
+
+**PTY lifetime is not WebSocket lifetime.** A transport-only CLI disconnect
+changes confirmed-running terminal entries to `disconnected` but retains their
+bounded presentation. When the same APAS process reconnects, it reports every
+configured terminal before draining queued output. Each spawned PTY has a UUID:
+a running report for the same UUID restores `running` without clearing bytes,
+while a different UUID replaces the entry and starts with fresh presentation.
+Output and exit events from an older UUID are ignored. An already-`exited`
+entry and its status stay exited across later transport cleanup. Explicit pane
+removal still deletes the entry.
+
+Retention is deliberately non-durable. Terminal bytes and lifecycle remain in
+the session manager only, obey `TERMINAL_SCROLLBACK_MAX_BYTES`, and are never
+written to SQLite or `messages.jsonl`; a server restart loses them and state is
+`unknown` until the CLI reconciles again.
 
 On the web side, frames bypass zustand entirely (`lib/terminalBus.ts`): a
 full-screen TUI repaints many times a second, and storing chunks in state
-would re-render every subscriber per frame.
+would re-render every subscriber per frame. `TerminalPane` tracks the current
+PTY UUID and last rendered sequence locally. Same-instance snapshots at an
+already-rendered sequence update lifecycle without duplicating output;
+cumulative snapshots that cover missed frames and replacement UUIDs reset
+xterm before replay. Snapshot/live lifecycle is authoritative for the
+disconnected, unknown, and exited banners, including empty snapshots.
+
+**Rolling deployment.** Deploy the server first, then web, then CLI. New fields
+are optional/defaulted, so a new server accepts legacy output and exit frames,
+and a new web treats a legacy snapshot as `unknown`. Metadata-less output is
+still rendered but never proves that a retained process is running across a
+reconnect. During rollback, an older server may ignore the new `TerminalState`
+variant while continuing to relay the backward-compatible output/exit frames;
+continuity then degrades to unknown/disconnected rather than a false confirmed
+running state.
 
 **Lifetime.** The pty is a child of the CLI process, so a terminal pane dies
 when `apas` restarts; the restore path re-execs with the provider's own

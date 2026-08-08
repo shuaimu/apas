@@ -7,7 +7,7 @@ use axum::{
 };
 use base64::Engine as _;
 use futures::{SinkExt, StreamExt};
-use shared::{CliToServer, ServerToCli, ServerToWeb};
+use shared::{CliToServer, ServerToCli, ServerToWeb, TerminalLifecycle};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -730,26 +730,31 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     )
                                     .await;
                             }
-                            Ok(CliToServer::TerminalOutput { session_id, pane_id, data_b64, seq }) => {
+                            Ok(CliToServer::TerminalOutput { session_id, pane_id, instance_id, data_b64, seq }) => {
                                 // Buffer for reattach, then fan out live.
                                 // Decoded only to measure/store bytes — the
                                 // server never interprets the stream.
-                                match base64::engine::general_purpose::STANDARD.decode(data_b64.as_bytes()) {
+                                let accepted = match base64::engine::general_purpose::STANDARD.decode(data_b64.as_bytes()) {
                                     Ok(bytes) => {
                                         state.sessions.append_terminal_output(
                                             &session_id,
                                             pane_id,
+                                            instance_id,
                                             &bytes,
                                             seq,
-                                        );
+                                        )
                                     }
                                     Err(e) => {
                                         tracing::warn!(
                                             pane_id,
                                             error = %e,
-                                            "terminal output was not valid base64; forwarding without buffering"
+                                            "terminal output was not valid base64; dropping frame"
                                         );
+                                        false
                                     }
+                                };
+                                if !accepted {
+                                    continue;
                                 }
                                 state
                                     .sessions
@@ -758,19 +763,72 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         ServerToWeb::TerminalOutput {
                                             session_id,
                                             pane_id,
+                                            instance_id,
                                             data_b64,
                                             seq,
                                         },
                                     )
                                     .await;
                             }
-                            Ok(CliToServer::TerminalExited { session_id, pane_id, status }) => {
+                            Ok(CliToServer::TerminalState { session_id, pane_id, instance_id, lifecycle, status }) => {
+                                if let Some(current) = state.sessions.reconcile_terminal_state(
+                                    &session_id,
+                                    pane_id,
+                                    instance_id,
+                                    lifecycle,
+                                    status,
+                                ) {
+                                    state
+                                        .sessions
+                                        .route_to_web(
+                                            &session_id,
+                                            ServerToWeb::TerminalState {
+                                                session_id,
+                                                pane_id,
+                                                instance_id: current.instance_id,
+                                                lifecycle: current.lifecycle,
+                                                status: current.status,
+                                            },
+                                        )
+                                        .await;
+                                } else {
+                                    tracing::debug!(
+                                        pane_id,
+                                        ?instance_id,
+                                        ?lifecycle,
+                                        "ignored stale terminal state"
+                                    );
+                                }
+                            }
+                            Ok(CliToServer::TerminalExited { session_id, pane_id, instance_id, status }) => {
                                 tracing::info!(
                                     pane_id,
                                     ?status,
                                     "terminal pane exited for session {}",
                                     session_id
                                 );
+                                let Some(current) = state.sessions.record_terminal_exit(
+                                    &session_id,
+                                    pane_id,
+                                    instance_id,
+                                    status,
+                                ) else {
+                                    tracing::debug!(pane_id, ?instance_id, "ignored stale terminal exit");
+                                    continue;
+                                };
+                                state
+                                    .sessions
+                                    .route_to_web(
+                                        &session_id,
+                                        ServerToWeb::TerminalState {
+                                            session_id,
+                                            pane_id,
+                                            instance_id: current.instance_id,
+                                            lifecycle: TerminalLifecycle::Exited,
+                                            status: current.status.clone(),
+                                        },
+                                    )
+                                    .await;
                                 state
                                     .sessions
                                     .route_to_web(
@@ -778,7 +836,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         ServerToWeb::TerminalExited {
                                             session_id,
                                             pane_id,
-                                            status,
+                                            instance_id: current.instance_id,
+                                            status: current.status,
                                         },
                                     )
                                     .await;
@@ -1023,13 +1082,27 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 e
             );
         }
-        // The ptys were children of that CLI process, so they died with
-        // it. Discard their scrollback rather than replaying a final
-        // frame that would render as a live terminal to a reattaching
-        // browser.
-        state
+        // Transport loss does not prove that this APAS process or its PTYs
+        // ended. Retain their bounded presentation and expose the uncertainty
+        // until the reconnect state report reconciles each process instance.
+        for (pane_id, terminal) in state
             .sessions
-            .clear_session_terminal_scrollback(session_id);
+            .mark_session_terminals_disconnected(session_id)
+        {
+            state
+                .sessions
+                .route_to_web(
+                    session_id,
+                    ServerToWeb::TerminalState {
+                        session_id: *session_id,
+                        pane_id,
+                        instance_id: terminal.instance_id,
+                        lifecycle: terminal.lifecycle,
+                        status: terminal.status,
+                    },
+                )
+                .await;
+        }
     }
 
     state.sessions.unregister_cli(&cli_id);

@@ -1140,6 +1140,49 @@ fn spawn_terminal_pane(
     Ok(())
 }
 
+/// Snapshot every configured terminal pane for reconnect reconciliation.
+///
+/// The configured roster is authoritative for which reports are owed; the
+/// handle registry says whether a provider process actually exists. Keeping
+/// this separate from `PaneList` lets rolling-upgrade servers ignore the new
+/// messages while still accepting the established roster.
+fn terminal_state_reports(
+    session_id: Uuid,
+    pane_metas: &PaneMetas,
+    terminal_panes: &TerminalPanes,
+) -> Vec<CliToServer> {
+    let mut terminal_ids = pane_metas
+        .lock()
+        .map(|metas| {
+            metas
+                .iter()
+                .filter_map(|(pane_id, meta)| meta.kind.is_terminal().then_some(*pane_id))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    terminal_ids.sort_unstable();
+
+    terminal_ids
+        .into_iter()
+        .map(|pane_id| {
+            let handle = terminal_panes
+                .lock()
+                .ok()
+                .and_then(|panes| panes.get(&pane_id).cloned());
+            match handle {
+                Some(handle) => handle.state_message(session_id),
+                None => CliToServer::TerminalState {
+                    session_id,
+                    pane_id,
+                    instance_id: None,
+                    lifecycle: shared::TerminalLifecycle::Exited,
+                    status: Some("terminal process unavailable".to_string()),
+                },
+            }
+        })
+        .collect()
+}
+
 /// Per-pane pause flags (for deadloop panes).
 type PanePauses = Arc<Mutex<HashMap<u32, Arc<AtomicBool>>>>;
 
@@ -4907,7 +4950,8 @@ mod tests {
         resolve_pane_binary_path, route_web_input_to_pane, refresh_stale_managed_builtin_prompts,
         restored_pane_mode_and_pause, run_deadloop_session_inner, save_pane_configs,
         should_recover_deadloop_stale_session, start_bot_preserved_fields,
-        truncate_str_at_char_boundary, update_project_flags, DeadloopWatchdogDecision,
+        terminal_state_reports, truncate_str_at_char_boundary, update_project_flags,
+        DeadloopWatchdogDecision,
         DeadloopWatchdogState, ASK_USER_QUESTION_AUTO_CANCEL_STATUS, InputChannels,
         PaneInputRouteResult, PaneMeta, PaneMetas, PanePauses, PaneStopRequests,
         PendingAskQuestion, DEEPSEEK_DEFAULT_MODEL, MANAGED_PANE_CREATE_PR_ERROR,
@@ -5775,6 +5819,36 @@ mod tests {
                 assert_eq!(pane_id, 9);
             }
             _ => panic!("expected AddTabWithConfig event"),
+        }
+    }
+
+    #[test]
+    fn reconnect_reports_configured_terminal_without_handle_as_exited() {
+        let session_id = Uuid::new_v4();
+        let effort_arc = Arc::new(Mutex::new(None));
+        let mut terminal = test_pane_meta(Provider::Codex, false, None, effort_arc);
+        terminal.kind = shared::PaneKind::Terminal;
+        terminal.mode = shared::PaneMode::Interactive;
+        let panes: PaneMetas = Arc::new(Mutex::new(HashMap::from([(888, terminal)])));
+        let handles = crate::terminal_pane::TerminalPanes::default();
+
+        let reports = terminal_state_reports(session_id, &panes, &handles);
+        assert_eq!(reports.len(), 1);
+        match &reports[0] {
+            CliToServer::TerminalState {
+                session_id: got_session,
+                pane_id,
+                instance_id,
+                lifecycle,
+                status,
+            } => {
+                assert_eq!(*got_session, session_id);
+                assert_eq!(*pane_id, 888);
+                assert!(instance_id.is_none());
+                assert_eq!(*lifecycle, shared::TerminalLifecycle::Exited);
+                assert_eq!(status.as_deref(), Some("terminal process unavailable"));
+            }
+            other => panic!("unexpected report: {other:?}"),
         }
     }
 
@@ -11013,6 +11087,30 @@ async fn run_server_connection(
                 };
                 let msg_text = serde_json::to_string(&pane_list_msg).unwrap_or_default();
                 let _ = ws_sender.send(Message::Text(msg_text.into())).await;
+
+                // Reconcile pty generations before draining output queued
+                // during the outage. Same-instance reports preserve the
+                // server snapshot; a replacement clears it before seq 0.
+                let mut terminal_states_sent = true;
+                for state in terminal_state_reports(session_id, &pane_metas, &terminal_panes) {
+                    let Ok(text) = serde_json::to_string(&state) else {
+                        tracing::warn!("Failed to serialize terminal state report");
+                        continue;
+                    };
+                    if ws_sender.send(Message::Text(text.into())).await.is_err() {
+                        terminal_states_sent = false;
+                        break;
+                    }
+                }
+                if !terminal_states_sent {
+                    let _ = status_tx.send(PaneOutput {
+                        text: "[Server: Connection lost during terminal reconciliation]"
+                            .to_string(),
+                        pane_id: shared::PANE_ID_DEADLOOP,
+                    });
+                    tokio::time::sleep(reconnect_delay).await;
+                    continue;
+                }
 
                 let mut heartbeat_interval =
                     tokio::time::interval(std::time::Duration::from_secs(25));

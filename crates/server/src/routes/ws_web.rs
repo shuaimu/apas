@@ -8,7 +8,8 @@ use axum::{
 use base64::Engine as _;
 use futures::{SinkExt, StreamExt};
 use shared::{
-    MessageInfo, ServerToCli, ServerToDaemon, ServerToWeb, SessionInfo, SessionStatus, WebToServer,
+    MessageInfo, ServerToCli, ServerToDaemon, ServerToWeb, SessionInfo, SessionStatus,
+    TerminalLifecycle, WebToServer,
 };
 use std::collections::HashSet;
 use tokio::sync::mpsc;
@@ -2470,17 +2471,28 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     // Answered straight from the server's ring buffer — no
                     // CLI round-trip, so reattach paints instantly and works
                     // even while the CLI is mid-reconnect.
-                    let (data_b64, seq, truncated) =
+                    let (data_b64, seq, truncated, instance_id, lifecycle, status) =
                         match state.sessions.terminal_snapshot(&sid, pane_id) {
-                            Some((bytes, seq, truncated)) => (
-                                base64::engine::general_purpose::STANDARD.encode(&bytes),
-                                seq,
-                                truncated,
+                            Some(snapshot) => (
+                                base64::engine::general_purpose::STANDARD.encode(&snapshot.bytes),
+                                snapshot.seq,
+                                snapshot.truncated,
+                                snapshot.instance_id,
+                                snapshot.lifecycle,
+                                snapshot.status,
                             ),
                             // No output yet (pane just spawned). Reply with an
                             // empty snapshot rather than staying silent so the
-                            // client can leave its "connecting" state.
-                            None => (String::new(), 0, false),
+                            // client can leave its "connecting" state. With no
+                            // retained report, process lifecycle is unknown.
+                            None => (
+                                String::new(),
+                                0,
+                                false,
+                                None,
+                                TerminalLifecycle::Unknown,
+                                None,
+                            ),
                         };
                     state
                         .sessions
@@ -2489,9 +2501,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             ServerToWeb::TerminalSnapshot {
                                 session_id: sid,
                                 pane_id,
+                                instance_id,
                                 data_b64,
                                 seq,
                                 truncated,
+                                lifecycle,
+                                status,
                             },
                         )
                         .await;
