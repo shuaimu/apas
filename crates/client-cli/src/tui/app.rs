@@ -167,6 +167,10 @@ pub struct App {
     /// Cumulative output-line counter, just for the header so the
     /// user can confirm activity is flowing.
     output_lines_total: u64,
+    /// Absolute working directory this session operates on. Shown in the
+    /// header so a user running several `apas` sessions at once can tell
+    /// which project each one is driving.
+    project_dir: String,
 }
 
 impl App {
@@ -196,11 +200,19 @@ impl App {
             shutdown: None,
             started_at: Instant::now(),
             output_lines_total: 0,
+            project_dir: String::new(),
         }
     }
 
     pub fn with_shutdown(mut self, shutdown: Arc<AtomicBool>) -> Self {
         self.shutdown = Some(shutdown);
+        self
+    }
+
+    /// Set the working directory shown in the header. Called from the
+    /// dual_pane setup where the resolved `working_dir` is in scope.
+    pub fn with_project_dir(mut self, dir: impl Into<String>) -> Self {
+        self.project_dir = dir.into();
         self
     }
 
@@ -309,7 +321,7 @@ impl App {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3), // header
+                Constraint::Length(4), // header (title, dir, counts)
                 Constraint::Min(1),    // pane table
                 Constraint::Length(4), // footer
             ])
@@ -329,6 +341,17 @@ impl App {
                 Span::styled(
                     format!("uptime {}", uptime),
                     Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("dir: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    if self.project_dir.is_empty() {
+                        "(unknown)".to_string()
+                    } else {
+                        self.project_dir.clone()
+                    },
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(vec![

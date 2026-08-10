@@ -2850,7 +2850,8 @@ async fn run_inner(
     } else {
         // Run TUI in main thread.
         let mut app = App::new(tui_input_tx, output_rx, event_tx, command_rx, initial_tabs)
-            .with_shutdown(shutdown.clone());
+            .with_shutdown(shutdown.clone())
+            .with_project_dir(working_dir_str.clone());
         if let Err(e) = app.run() {
             tracing::error!("TUI error: {}", e);
         }
