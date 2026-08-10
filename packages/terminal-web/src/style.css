@@ -1,0 +1,3 @@
+html, body, #terminal { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #08080b; }
+#terminal { box-sizing: border-box; padding: 6px; }
+.xterm { height: 100%; }

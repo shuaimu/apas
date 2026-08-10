@@ -1,0 +1,8 @@
+{
+  "type": "pane_diff",
+  "session_id": "20000000-0000-4000-8000-000000000001",
+  "pane_id": 7,
+  "branch": "apas/mobile",
+  "base": "main",
+  "diff": "@@ -1 +1 @@\n-old\n+new"
+}

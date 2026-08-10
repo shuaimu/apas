@@ -72,14 +72,14 @@ describe("PaneGrid empty states", () => {
     });
   });
 
-  it("points the empty managed-team copy at Start team and side-chat promotion", () => {
+  it("points the empty managed-team copy at Start team and worker creation", () => {
     seedPaneGrid([]);
 
     renderPaneGrid("managed");
 
     const emptyState = screen.getByText(/No team members yet/);
     expect(emptyState.textContent).toContain("Start team");
-    expect(emptyState.textContent).toContain("promote an existing side chat");
+    expect(emptyState.textContent).toContain("add a worker");
     expect(emptyState.textContent).not.toContain("+ Add Worker");
   });
 });

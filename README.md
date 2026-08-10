@@ -46,7 +46,7 @@ Navigate to your project directory and run:
 
 ```bash
 # setup ws service or your service
-apas config set server ws://apas.mpaxos.com:8080
+apas config set server wss://apas.mpaxos.com
 
 # start apas
 apas

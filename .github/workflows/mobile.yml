@@ -1,0 +1,27 @@
+name: Mobile
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: packages/mobile/package-lock.json
+      - run: npm ci
+        working-directory: packages/mobile
+      - run: npm run lint
+        working-directory: packages/mobile
+      - run: npm run typecheck
+        working-directory: packages/mobile
+      - run: npm test
+        working-directory: packages/mobile
+      - run: npm run smoke:android
+        working-directory: packages/mobile

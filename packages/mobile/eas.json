@@ -1,0 +1,36 @@
+{
+  "cli": {
+    "version": ">= 16.0.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "channel": "development",
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://apas.mpaxos.com",
+        "EXPO_PUBLIC_WS_URL": "wss://apas.mpaxos.com"
+      }
+    },
+    "preview": {
+      "distribution": "internal",
+      "channel": "preview",
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://apas.mpaxos.com",
+        "EXPO_PUBLIC_WS_URL": "wss://apas.mpaxos.com"
+      }
+    },
+    "production": {
+      "autoIncrement": true,
+      "channel": "production",
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://apas.mpaxos.com",
+        "EXPO_PUBLIC_WS_URL": "wss://apas.mpaxos.com"
+      }
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}

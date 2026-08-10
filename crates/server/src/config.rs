@@ -9,6 +9,69 @@ pub struct Config {
     pub auth: AuthConfig,
     #[serde(default)]
     pub smtp: SmtpConfig,
+    #[serde(default)]
+    pub mobile: MobileConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MobileConfig {
+    #[serde(default)]
+    pub features: shared::MobileFeatureFlags,
+    #[serde(default)]
+    pub allow_insecure_localhost: bool,
+    #[serde(default)]
+    pub push: MobilePushConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MobilePushConfig {
+    #[serde(default = "default_expo_push_url")]
+    pub expo_push_url: String,
+    #[serde(default = "default_expo_receipts_url")]
+    pub expo_receipts_url: String,
+    #[serde(default)]
+    pub access_token: Option<String>,
+    #[serde(default = "default_push_batch_size")]
+    pub batch_size: usize,
+}
+
+fn default_expo_push_url() -> String {
+    "https://exp.host/--/api/v2/push/send".to_string()
+}
+
+fn default_expo_receipts_url() -> String {
+    "https://exp.host/--/api/v2/push/getReceipts".to_string()
+}
+
+fn default_push_batch_size() -> usize {
+    100
+}
+
+impl Default for MobilePushConfig {
+    fn default() -> Self {
+        Self {
+            expo_push_url: default_expo_push_url(),
+            expo_receipts_url: default_expo_receipts_url(),
+            access_token: None,
+            batch_size: default_push_batch_size(),
+        }
+    }
+}
+
+impl Default for MobileConfig {
+    fn default() -> Self {
+        Self {
+            features: shared::MobileFeatureFlags {
+                bootstrap: false,
+                coding_mutations: false,
+                terminal: false,
+                notifications: false,
+                deep_links: false,
+            },
+            allow_insecure_localhost: false,
+            push: MobilePushConfig::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,10 +93,22 @@ pub struct AuthConfig {
     /// database has no active cluster administrator.
     #[serde(default = "default_bootstrap_admin_email")]
     pub bootstrap_admin_email: String,
+    #[serde(default = "default_mobile_access_expiry_minutes")]
+    pub mobile_access_expiry_minutes: u64,
+    #[serde(default = "default_mobile_refresh_expiry_days")]
+    pub mobile_refresh_expiry_days: u64,
 }
 
 fn default_bootstrap_admin_email() -> String {
     "shuai@cs.stonybrook.edu".to_string()
+}
+
+fn default_mobile_access_expiry_minutes() -> u64 {
+    15
+}
+
+fn default_mobile_refresh_expiry_days() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,8 +169,11 @@ impl Default for Config {
                 jwt_secret: "change-me-in-production".to_string(),
                 token_expiry_hours: 876000, // ~100 years (never expire)
                 bootstrap_admin_email: default_bootstrap_admin_email(),
+                mobile_access_expiry_minutes: default_mobile_access_expiry_minutes(),
+                mobile_refresh_expiry_days: default_mobile_refresh_expiry_days(),
             },
             smtp: SmtpConfig::default(),
+            mobile: MobileConfig::default(),
         }
     }
 }

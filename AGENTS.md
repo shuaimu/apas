@@ -35,7 +35,7 @@ rsync -av --delete --exclude 'node_modules' --exclude '.next' packages/web/ root
 month_start="$(date +%Y-%m-01) 00:00:00"
 web_version="$(date +%y.%m).$(git rev-list --count --since="$month_start" HEAD)"
 ssh root@apas.mpaxos.com "cd /opt/apas/web && npm ci && NEXT_PUBLIC_WEB_UI_VERSION=${web_version} npm run build && systemctl restart apas-web"
-for path in / /login /machines /share /admin /health; do curl -fsSL "http://apas.mpaxos.com${path}" >/dev/null; done
+for path in / /login /machines /share /admin /health; do curl -fsSL "https://apas.mpaxos.com${path}" >/dev/null; done
 ssh root@apas.mpaxos.com "systemctl is-active apas-web apas-server && journalctl -u apas-web --since '5 minutes ago' -p err --no-pager -q"
 ```
 
@@ -46,7 +46,7 @@ restores the vulnerable dependency graph and requires a corrected redeployment.
 
 ## Web UI
 
-- **URL:** http://apas.mpaxos.com
+- **URL:** https://apas.mpaxos.com
 
 ## Versioning Rule
 

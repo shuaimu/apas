@@ -1,0 +1,1882 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WebToServer",
+  "description": "Messages sent from web client to server",
+  "oneOf": [
+    {
+      "description": "Authenticate with JWT token",
+      "type": "object",
+      "properties": {
+        "app_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "capabilities": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "client_kind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClientKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "protocol_version": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "token": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "authenticate"
+        }
+      },
+      "required": [
+        "type",
+        "token"
+      ]
+    },
+    {
+      "description": "List available CLI clients",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "list_cli_clients"
+        }
+      },
+      "required": [
+        "type"
+      ]
+    },
+    {
+      "description": "List daemon-reported machines and projects for this user",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "list_machines"
+        }
+      },
+      "required": [
+        "type"
+      ]
+    },
+    {
+      "description": "Start a new session (optionally specify CLI client)",
+      "type": "object",
+      "properties": {
+        "cli_client_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "start_session"
+        }
+      },
+      "required": [
+        "type"
+      ]
+    },
+    {
+      "description": "Resume an existing session",
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "resume_session"
+        }
+      },
+      "required": [
+        "type",
+        "session_id"
+      ]
+    },
+    {
+      "description": "Attach to observe an existing CLI session (hybrid mode)",
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "attach_session"
+        }
+      },
+      "required": [
+        "type",
+        "session_id"
+      ]
+    },
+    {
+      "description": "User input to send to Claude.\nWhen `session_id` is set, the server routes to that exact session\n(after verifying this web connection is attached to it). This is the\nonly safe option for clients that multi-attach: the connection's\nlast-attached session is non-deterministic when several attaches\nrace. Omitted = legacy single-attach behaviour.",
+      "type": "object",
+      "properties": {
+        "client_msg_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "pane_type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PaneType"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "text": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "input"
+        }
+      },
+      "required": [
+        "type",
+        "text"
+      ]
+    },
+    {
+      "description": "A deliberate chat-style message for a terminal-hosted agent. Unlike\n[`WebToServer::TerminalInput`], this is safe to persist and display in\nconversation history because the user submitted it through the\nconversation composer rather than typing arbitrary terminal bytes.\nThe server converts it to terminal input and appends Enter.",
+      "type": "object",
+      "properties": {
+        "client_msg_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "text": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "terminal_conversation_input"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id",
+        "text"
+      ]
+    },
+    {
+      "description": "Approve a tool call. See `Input::session_id` for the multi-attach rationale.",
+      "type": "object",
+      "properties": {
+        "pane_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "tool_call_id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "approve"
+        }
+      },
+      "required": [
+        "type",
+        "tool_call_id"
+      ]
+    },
+    {
+      "description": "Reject a tool call. See `Input::session_id`.",
+      "type": "object",
+      "properties": {
+        "pane_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "tool_call_id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "reject"
+        }
+      },
+      "required": [
+        "type",
+        "tool_call_id"
+      ]
+    },
+    {
+      "description": "Send signal (e.g., cancel/interrupt). See `Input::session_id`.",
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "signal": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "signal"
+        }
+      },
+      "required": [
+        "type",
+        "signal"
+      ]
+    },
+    {
+      "description": "List all sessions (persisted)",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "list_sessions"
+        }
+      },
+      "required": [
+        "type"
+      ]
+    },
+    {
+      "description": "Get messages for a specific session (with optional pagination)",
+      "type": "object",
+      "properties": {
+        "after_created_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "before_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "default": null,
+          "minimum": 0
+        },
+        "pane_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "pane_type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PaneType"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "pane_watermarks": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "get_session_messages"
+        }
+      },
+      "required": [
+        "type",
+        "session_id"
+      ]
+    },
+    {
+      "description": "Pause the deadloop session (legacy - use PausePane for new code)",
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "pause_deadloop"
+        }
+      },
+      "required": [
+        "type"
+      ]
+    },
+    {
+      "description": "Resume the deadloop session (legacy - use ResumePane for new code)",
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "resume_deadloop"
+        }
+      },
+      "required": [
+        "type"
+      ]
+    },
+    {
+      "description": "Pause a specific pane. See `Input::session_id`.",
+      "type": "object",
+      "properties": {
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "pause_pane"
+        }
+      },
+      "required": [
+        "type",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "Resume a specific pane. See `Input::session_id`.",
+      "type": "object",
+      "properties": {
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "resume_pane"
+        }
+      },
+      "required": [
+        "type",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "Soft-restart a single pane's agent on its existing session when\npossible (see `ServerToCli::RebootPane`).",
+      "type": "object",
+      "properties": {
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "reboot_pane"
+        }
+      },
+      "required": [
+        "type",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "Add a new pane",
+      "type": "object",
+      "properties": {
+        "backstory": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "goal": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "isolated_worktree": {
+          "description": "When true, the CLI creates an isolated git worktree under\n`<project>/.apas-worktrees/pane-<id>` (branch `apas-pane-<id>`)\nbefore spawning, and persists the resulting absolute path on\nPaneConfig.worktree_path. Phase 1.1e.",
+          "type": "boolean",
+          "default": false
+        },
+        "kind": {
+          "description": "Agent (default) vs Terminal. A Terminal pane ignores `prompt`,\n`role`, `goal`, `backstory` and `plan_review_mode` — there is\nno system prompt to inject into a pty-hosted TUI.",
+          "$ref": "#/$defs/PaneKind",
+          "default": "agent"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "managed": {
+          "description": "v3.5 — true when this pane is being added as part of the\nproject team, false for ordinary user-created terminal work. See\nPaneConfig::managed.",
+          "type": "boolean",
+          "default": false
+        },
+        "mode": {
+          "$ref": "#/$defs/PaneMode"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plan_review_mode": {
+          "$ref": "#/$defs/PlanReviewMode",
+          "default": "never"
+        },
+        "prompt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "$ref": "#/$defs/Provider"
+        },
+        "role": {
+          "description": "Initial role/goal/backstory/plan_review_mode applied to the new\npane BEFORE the first spawn — so a templated worker (Add Worker\nmodal on Overview) uses the right system prompt immediately\ninstead of needing a close+reopen. All optional; missing fields\nkeep the legacy \"set via Role modal later\" path.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "add_pane"
+        }
+      },
+      "required": [
+        "type",
+        "provider",
+        "mode"
+      ]
+    },
+    {
+      "description": "Remove a pane. When the pane has an isolated worktree assigned\n(`PaneConfig.worktree_path` set), `cleanup_action` says what to do\nwith that worktree and its branch. None = leave the on-disk worktree\nand branch alone (legacy behaviour — just unlink the pane from .apas).",
+      "type": "object",
+      "properties": {
+        "cleanup_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PaneCleanupAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "remove_pane"
+        }
+      },
+      "required": [
+        "type",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "Update a pane's custom label",
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "update_pane_label"
+        }
+      },
+      "required": [
+        "type",
+        "pane_id",
+        "label"
+      ]
+    },
+    {
+      "description": "Update a pane's Claude thinking-effort override. Persisted in the\nproject .apas so switching tabs doesn't reset it to default.\n`session_id` is optional (see `InterruptPane`): when present the server\nvalidates/auto-attaches this connection to that session, so the change\nisn't misrouted to the connection's drifting last-attached session\n(which breaks the mobile fan-out); absent = legacy connection-session.",
+      "type": "object",
+      "properties": {
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid",
+          "default": null
+        },
+        "type": {
+          "type": "string",
+          "const": "update_pane_effort"
+        }
+      },
+      "required": [
+        "type",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "Switch a pane's agent backend (provider + model). The CLI kills\nthe current agent child and respawns with a fresh session id —\nthe new agent starts with no prior chat context. See\n`ServerToCli::UpdatePaneModel` for the full semantics.\n`session_id` is optional (see `InterruptPane`): when present the server\nvalidates/auto-attaches this connection to that session, so the switch\nisn't misrouted to the connection's drifting last-attached session\n(which broke the model selector on mobile); absent = legacy behavior.",
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Provider"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid",
+          "default": null
+        },
+        "type": {
+          "type": "string",
+          "const": "update_pane_model"
+        }
+      },
+      "required": [
+        "type",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "Interrupt the agent process running for a pane (e.g. claude wedged on\na long-running Bash tool call). The CLI signals SIGINT to its\nsubprocess so the current turn aborts and queued input can flow.\n`session_id` is optional for backward compat: when present the server\nvalidates/auto-attaches the connection to that session (so \"Stop team\"\ninterrupts survive a just-reconnected connection); when absent it falls\nback to the connection's currently-attached session.",
+      "type": "object",
+      "properties": {
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid",
+          "default": null
+        },
+        "type": {
+          "type": "string",
+          "const": "interrupt_pane"
+        }
+      },
+      "required": [
+        "type",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "Reorder panes (array of pane_ids in desired order)",
+      "type": "object",
+      "properties": {
+        "pane_ids": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          }
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "reorder_panes"
+        }
+      },
+      "required": [
+        "type",
+        "pane_ids"
+      ]
+    },
+    {
+      "description": "Start bot (deadloop) on a pane — converts interactive pane to deadloop",
+      "type": "object",
+      "properties": {
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "min_iteration_interval_minutes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "prompt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "start_bot"
+        }
+      },
+      "required": [
+        "type",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "Stop bot on a pane — converts deadloop pane back to interactive",
+      "type": "object",
+      "properties": {
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "stop_bot"
+        }
+      },
+      "required": [
+        "type",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "Reboot the CLI process",
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "reboot_cli"
+        }
+      },
+      "required": [
+        "type"
+      ]
+    },
+    {
+      "description": "Start APAS CLI for a daemon project",
+      "type": "object",
+      "properties": {
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "start_machine_project_cli"
+        }
+      },
+      "required": [
+        "type",
+        "machine_id",
+        "project_id"
+      ]
+    },
+    {
+      "description": "Stop APAS CLI for a daemon project",
+      "type": "object",
+      "properties": {
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "stop_machine_project_cli"
+        }
+      },
+      "required": [
+        "type",
+        "machine_id",
+        "project_id"
+      ]
+    },
+    {
+      "description": "Create a brand-new project instance under a repo on a chosen machine:\nthe daemon clones `clone_url` into `~/apas_projects/<instance_name>`\n(auto-suffixed on collision), checks out a fresh `branch`, registers a\n`.apas`, and starts it. `git_remote` is the canonical key (for the\ndaemon's sibling-URL fallback + naming); `clone_url` is the real URL.",
+      "type": "object",
+      "properties": {
+        "base_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "branch": {
+          "type": "string"
+        },
+        "clone_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "git_remote": {
+          "type": "string"
+        },
+        "instance_name": {
+          "type": "string"
+        },
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "create_project_instance"
+        }
+      },
+      "required": [
+        "type",
+        "machine_id",
+        "git_remote",
+        "instance_name",
+        "branch"
+      ]
+    },
+    {
+      "description": "Compatibility tombstone for stale web clients. Upgraded servers must\nreject this inbound mutation and must never forward its credential.",
+      "type": "object",
+      "properties": {
+        "api_base_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "api_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "clear_api_key": {
+          "type": "boolean",
+          "default": false
+        },
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "set_machine_mini_max_config"
+        }
+      },
+      "deprecated": true,
+      "required": [
+        "type",
+        "machine_id"
+      ]
+    },
+    {
+      "description": "Compatibility tombstone for stale web clients. Upgraded servers must\nreject this inbound mutation and must never forward its credential.",
+      "type": "object",
+      "properties": {
+        "api_base_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "api_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "clear_api_key": {
+          "type": "boolean",
+          "default": false
+        },
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "set_machine_glm_config"
+        }
+      },
+      "deprecated": true,
+      "required": [
+        "type",
+        "machine_id"
+      ]
+    },
+    {
+      "description": "Update machine-level DeepSeek backend API configuration",
+      "type": "object",
+      "properties": {
+        "api_base_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "api_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "clear_api_key": {
+          "type": "boolean",
+          "default": false
+        },
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "set_machine_deepseek_config"
+        }
+      },
+      "required": [
+        "type",
+        "machine_id"
+      ]
+    },
+    {
+      "description": "Download all session data",
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "download_session"
+        }
+      },
+      "required": [
+        "type",
+        "session_id"
+      ]
+    },
+    {
+      "description": "Submit answers to a pending AskUserQuestion tool call. The server\nrelays this to the CLI which writes a control_response onto claude's\nstdin so the SDK's canUseTool callback completes with these answers.",
+      "type": "object",
+      "properties": {
+        "answers": {
+          "description": "Question text → selected option label(s) joined with \", \" for\nmulti-select.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "pane_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "description": "The session the answered AskUserQuestion belongs to. Optional for\nbackward compat with older web clients. When present the server\nroutes the answer deterministically via `resolve_target_session`\ninstead of falling back to the connection's last-attached session\n— the multi-session fan-out drifts that, which misrouted answers\nto a different project and left the asking pane stuck.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "tool_use_id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "answer_question"
+        }
+      },
+      "required": [
+        "type",
+        "tool_use_id",
+        "answers"
+      ]
+    },
+    {
+      "description": "Ask the CLI for the current `git diff` between the pane's worktree\nbranch and the project's HEAD. Returns via `ServerToWeb::PaneDiff`.\nPhase 1.2a.",
+      "type": "object",
+      "properties": {
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "request_pane_diff"
+        }
+      },
+      "required": [
+        "type",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "Web → server → CLI: push the pane's branch and run\n`gh pr create --fill` in its worktree. Result rides\n`ServerToWeb::PrCreated`.",
+      "type": "object",
+      "properties": {
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "create_pr"
+        }
+      },
+      "required": [
+        "type",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "Manager v2 — overwrite the project_goal.md file at the project\nroot with `goal`. The deadloop manager re-reads this file on\nevery iteration so a goal change takes effect at the next loop\nboundary, not mid-iteration.",
+      "type": "object",
+      "properties": {
+        "goal": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "update_project_goal"
+        }
+      },
+      "required": [
+        "type",
+        "goal"
+      ]
+    },
+    {
+      "description": "Set Tech-Lead autonomy flags. CLI writes both into `.apas` and\nthen echoes `CliToServer::ProjectFlagsChanged` so peer web\nclients stay in sync.",
+      "type": "object",
+      "properties": {
+        "auto_approve_todos": {
+          "type": "boolean"
+        },
+        "auto_merge_prs": {
+          "type": "boolean"
+        },
+        "disallowed_tab_types": {
+          "description": "Tab types this project refuses to create, as `<kind>:<provider>`\nkeys (see `tab_type_key`). A *deny* list so that absent means\n\"everything allowed\" — see `tab_type_allowed`. Owner/admin only,\nsame gate as the flags above.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "team_enabled": {
+          "description": "Managed team mode on/off for this project. **Owner/admin only** --\nthe server drops the whole message from a plain `user`, because\nthese are project-level policy, not per-seat preferences\n(`auto_merge_prs` alone lets the Tech Lead merge PRs unattended).",
+          "type": "boolean",
+          "default": false
+        },
+        "type": {
+          "type": "string",
+          "const": "update_project_flags"
+        }
+      },
+      "required": [
+        "type",
+        "auto_approve_todos",
+        "auto_merge_prs"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "auto_approve_todos": {
+          "type": "boolean"
+        },
+        "auto_merge_prs": {
+          "type": "boolean"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "update_project_operations"
+        }
+      },
+      "required": [
+        "type",
+        "auto_approve_todos",
+        "auto_merge_prs"
+      ]
+    },
+    {
+      "description": "Spawn the four default team panes for any role that isn't\nalready present. Triggered by the Overview \"Start team\" button.\nCLI runs `spawn_missing_team_panes`. Idempotent. Per-role\n`*_spec` fields carry the provider/model the user picked in\nthe Team setup card.",
+      "type": "object",
+      "properties": {
+        "developer": {
+          "$ref": "#/$defs/TeamRoleSpec",
+          "default": {}
+        },
+        "manager": {
+          "$ref": "#/$defs/TeamRoleSpec",
+          "default": {}
+        },
+        "reviewer": {
+          "$ref": "#/$defs/TeamRoleSpec",
+          "default": {}
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "tech_lead": {
+          "$ref": "#/$defs/TeamRoleSpec",
+          "default": {}
+        },
+        "type": {
+          "type": "string",
+          "const": "start_team"
+        }
+      },
+      "required": [
+        "type"
+      ]
+    },
+    {
+      "description": "Update a pane's role/goal/backstory triple (Phase 2.1c). All three\nfields are optional — sending null for any of them clears that\npiece. Takes effect on the next pane spawn (close + reopen tab,\nor reboot the apas CLI) since claude reads --append-system-prompt\nonly at launch.",
+      "type": "object",
+      "properties": {
+        "backstory": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "goal": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "role": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "update_pane_role"
+        }
+      },
+      "required": [
+        "type",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "User's verdict on a held tool_use from Phase 3.2b. `approve = true`\nresumes the agent's turn; `approve = false` rejects the tool, which\nclaude will surface as a tool_result error.",
+      "type": "object",
+      "properties": {
+        "approve": {
+          "type": "boolean"
+        },
+        "pane_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "tool_use_id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "plan_review_answer"
+        }
+      },
+      "required": [
+        "type",
+        "tool_use_id",
+        "approve"
+      ]
+    },
+    {
+      "description": "Update a pane's plan_review_mode (Phase 3.2c). Effective immediately\nfor future control_requests — the CLI reads the field at decision\ntime, not at spawn.",
+      "type": "object",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/PlanReviewMode"
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "update_pane_review_mode"
+        }
+      },
+      "required": [
+        "type",
+        "pane_id",
+        "mode"
+      ]
+    },
+    {
+      "description": "v3.2: web → server → CLI: flip a worker between autonomous and\nmanual modes. CLI updates PaneMeta + PaneConfig + persists to .apas.",
+      "type": "object",
+      "properties": {
+        "manual_mode": {
+          "type": "boolean"
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "update_pane_manual_mode"
+        }
+      },
+      "required": [
+        "type",
+        "pane_id",
+        "manual_mode"
+      ]
+    },
+    {
+      "description": "Ask the server to fetch the current `team-todo.md` for this\nsession's project. Forwarded as `ServerToCli::FetchTeamTodo`;\nCLI replies with `CliToServer::TeamTodoState` which the server\nhands back to web as `ServerToWeb::TeamTodoState`.",
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "fetch_team_todo"
+        }
+      },
+      "required": [
+        "type",
+        "session_id"
+      ]
+    },
+    {
+      "description": "User approves or rejects a Tech-Lead-proposed Global TODO from\nthe web Overview tab. action: \"approve\" | \"reject\".",
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "todo_id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "todo_approval"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "todo_id",
+        "action"
+      ]
+    },
+    {
+      "description": "User adds a new Global TODO from the Overview's + Add TODO\nform. CLI assigns the next id (TODO-NNN), writes status=approved,\norigin=user, then publishes a fresh TeamTodoState.",
+      "type": "object",
+      "properties": {
+        "body": {
+          "type": "string",
+          "default": ""
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "title": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "add_todo"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "title"
+      ]
+    },
+    {
+      "description": "Web requests a fresh snapshot of `suggested-workers.md`.\nForwarded as `ServerToCli::FetchSuggestedWorkers`; CLI replies\nwith `CliToServer::SuggestedWorkersState` which the server hands\nback to web as `ServerToWeb::SuggestedWorkersState`.",
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "fetch_suggested_workers"
+        }
+      },
+      "required": [
+        "type",
+        "session_id"
+      ]
+    },
+    {
+      "description": "User dismissed a suggested worker. Forwarded as\n`ServerToCli::DismissSuggestion`; CLI removes the entry and\nrepublishes the state.",
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "suggestion_id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "dismiss_suggestion"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "suggestion_id"
+      ]
+    },
+    {
+      "description": "One-way promote: flip an unmanaged side-chat pane to a managed\nteam member. CLI sets PaneMeta.managed = true and re-broadcasts\nthe PaneList. There's no demote — keep it simple.",
+      "type": "object",
+      "properties": {
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "promote_pane_to_managed"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "Keystrokes typed into a terminal pane's xterm.js view. Server\nresolves the target session and forwards as\n`ServerToCli::TerminalInput`.",
+      "type": "object",
+      "properties": {
+        "data_b64": {
+          "type": "string"
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "terminal_input"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id",
+        "data_b64"
+      ]
+    },
+    {
+      "description": "The browser's terminal viewport was resized (or first measured).\nForwarded to the CLI so the pty — and therefore the hosted TUI —\nmatches what the user actually sees.",
+      "type": "object",
+      "properties": {
+        "cols": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "rows": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "terminal_resize"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id",
+        "cols",
+        "rows"
+      ]
+    },
+    {
+      "description": "Web opened a terminal pane and wants the current scrollback.\nServer replies `ServerToWeb::TerminalSnapshot` from its in-memory\nring buffer; no CLI round-trip, so reattach is instant and works\neven while the CLI is mid-reconnect.",
+      "type": "object",
+      "properties": {
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "terminal_attach"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "Redacted native/WebView health event. Accepted only from an\nauthenticated mobile device session.",
+      "type": "object",
+      "properties": {
+        "event": {
+          "$ref": "#/$defs/MobileTelemetryEvent"
+        },
+        "type": {
+          "type": "string",
+          "const": "mobile_telemetry"
+        }
+      },
+      "required": [
+        "type",
+        "event"
+      ]
+    },
+    {
+      "description": "Liveness probe from the browser. Server echoes\n`ServerToWeb::Heartbeat` so the client can detect silently-stale\nconnections (mobile OS throttling, NAT timeout, swallowed RST)\nwithout depending on `readyState`.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "heartbeat"
+        }
+      },
+      "required": [
+        "type"
+      ]
+    }
+  ],
+  "$defs": {
+    "ClientKind": {
+      "type": "string",
+      "enum": [
+        "web",
+        "mobile"
+      ]
+    },
+    "MobileTelemetryEvent": {
+      "description": "Strictly redacted mobile renderer health signals. These events contain no\nproject/session/pane identifiers or arbitrary strings by design.",
+      "type": "string",
+      "enum": [
+        "terminal_bridge_ready",
+        "terminal_bridge_rejected_message",
+        "terminal_bridge_crash"
+      ]
+    },
+    "PaneCleanupAction": {
+      "description": "What to do with an isolated git worktree (and its branch) when the pane\nthat owns it is closed. Selected by the web UI before sending\n`WebToServer::RemovePane` so the CLI knows which git commands to run.\nPhase 1.1d of the swarm plan.",
+      "oneOf": [
+        {
+          "description": "`git worktree remove --force <path>` + `git branch -D <branch>`.\nPermanently deletes work — pick only if the work is throwaway.",
+          "type": "string",
+          "const": "discard"
+        },
+        {
+          "description": "`git -C <project> merge --no-ff <branch>` into the current main-worktree\nbranch, then remove the worktree + delete the branch. Errors out on\nmerge conflicts (the user resolves manually with normal git tools).",
+          "type": "string",
+          "const": "merge_and_remove"
+        },
+        {
+          "description": "`git worktree remove <path>` (no --force — fails if there are\nuncommitted changes, in which case we just clear `worktree_path` and\ntell the user to clean up by hand). Branch is left alone so the user\ncan `git checkout` it for manual review.",
+          "type": "string",
+          "const": "leave_as_branch"
+        }
+      ]
+    },
+    "PaneKind": {
+      "description": "How a pane hosts its agent process. Orthogonal to [`Provider`] (which\nbinary) and [`PaneMode`] (how autonomous).\n\n* [`PaneKind::Agent`] — the legacy/managed-team path: the CLI runs the provider\n  headlessly (`claude --print --output-format stream-json`,\n  `codex exec --json`) and parses structured events into\n  `CliToServer::StreamMessage`. Everything team-mode depends on —\n  usage counters, pane status, diffs, plan review, scratchpad\n  publishing, Tech Lead delegation — is built on those events. New\n  unmanaged panes are no longer created with this kind, but existing panes\n  remain compatible and managed team panes continue to use it.\n* [`PaneKind::Terminal`] — the pane instead hosts the provider's real\n  interactive TUI on a pty. Raw bytes flow over the dedicated\n  `Terminal*` messages and are rendered by xterm.js in the browser.\n  Nothing is parsed, so a terminal pane has none of the structured\n  integrations above and is never a delegation target. This is the normal\n  kind for new user-created Claude and Codex panes.\n\n`#[serde(default)]` on `PaneConfig::kind` keeps `.apas` files written\nbefore this existed deserializing as `Agent`.",
+      "type": "string",
+      "enum": [
+        "agent",
+        "terminal"
+      ]
+    },
+    "PaneMode": {
+      "description": "Mode for a pane",
+      "type": "string",
+      "enum": [
+        "deadloop",
+        "interactive"
+      ]
+    },
+    "PaneType": {
+      "description": "Pane type for dual-pane mode (legacy - kept for backward compatibility)",
+      "oneOf": [
+        {
+          "description": "Autonomous deadloop worker (left pane)",
+          "type": "string",
+          "const": "deadloop"
+        },
+        {
+          "description": "Interactive user session (right pane)",
+          "type": "string",
+          "const": "interactive"
+        }
+      ]
+    },
+    "PlanReviewMode": {
+      "description": "Phase 3.2a: per-pane policy for the \"editable plan checkpoint\"\nfeature. The streaming worker reads this at every turn to decide\nwhether to gate the first tool_use behind a user-approval card.",
+      "oneOf": [
+        {
+          "description": "Hold every turn's first tool_use until the user approves.",
+          "type": "string",
+          "const": "always"
+        },
+        {
+          "description": "Hold only when the turn's first tool_use is in a \"risky\" set\n(Write/Edit/Bash). Read-only tools run through.",
+          "type": "string",
+          "const": "risky_only"
+        },
+        {
+          "description": "Today's behaviour: no gating.",
+          "type": "string",
+          "const": "never"
+        }
+      ]
+    },
+    "Provider": {
+      "description": "Provider for a pane",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "codex",
+            "deepseek",
+            "opencode",
+            "cursor-agent"
+          ]
+        },
+        {
+          "description": "`claude-old` / `claude_old` aliases keep panes serialized before the\nstreaming-only switchover deserializing as the (now-only) Claude\nvariant. The legacy per-turn `--print` worker has been removed; all\n`Provider::Claude` panes use the long-lived stream-json worker.",
+          "type": "string",
+          "const": "claude"
+        },
+        {
+          "description": "Decode-only compatibility tombstone. MiniMax is not launchable.",
+          "type": "string",
+          "const": "minimax",
+          "deprecated": true
+        },
+        {
+          "description": "Decode-only compatibility tombstone. GLM is not launchable.",
+          "type": "string",
+          "const": "glm",
+          "deprecated": true
+        }
+      ]
+    },
+    "TeamRoleSpec": {
+      "description": "Per-role provider/model pair the user picks in the \"Team setup\"\ncard before clicking Start team. Empty fields fall back to the\nCLI's defaults (Claude / unset model).",
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Provider"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

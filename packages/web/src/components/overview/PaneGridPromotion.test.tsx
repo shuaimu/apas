@@ -21,6 +21,7 @@ function pane(
     backstory: overrides.backstory,
     managed: overrides.managed,
     model: overrides.model,
+    kind: overrides.kind,
   };
 }
 
@@ -94,6 +95,22 @@ describe("PaneGrid side-chat promotion", () => {
         pane_id: 20,
       }),
     );
+  });
+
+  it("does not offer terminal panes as managed-team workers", () => {
+    const send = seedPaneGrid([
+      pane({
+        pane_id: 21,
+        label: "Claude terminal",
+        managed: false,
+        kind: "terminal",
+      }),
+    ]);
+
+    renderPaneGrid("unmanaged");
+
+    expect(within(card("Claude terminal")).queryByText("+ Add to team")).toBeNull();
+    expect(send).not.toHaveBeenCalled();
   });
 
   it("does not render Add to team for managed cards", () => {

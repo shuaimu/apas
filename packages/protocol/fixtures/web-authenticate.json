@@ -1,0 +1,8 @@
+{
+  "type": "authenticate",
+  "token": "fixture-token",
+  "capabilities": ["mobile_bootstrap_v1", "mobile_terminal_v1"],
+  "client_kind": "mobile",
+  "app_version": "0.1.0",
+  "protocol_version": 1
+}

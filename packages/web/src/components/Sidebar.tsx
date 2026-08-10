@@ -49,7 +49,7 @@ interface SidebarProps {
   width?: number;
 }
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://apas.mpaxos.com";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://apas.mpaxos.com";
 type ProjectRole = "owner" | "user";
 
 // Group key + localStorage key for collapsed repo groups in the sidebar.

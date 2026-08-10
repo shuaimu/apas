@@ -85,6 +85,29 @@ describe("sendMessageToPane carries client_msg_id", () => {
   });
 });
 
+describe("terminal conversation messages", () => {
+  it("renders optimistically and sends a dedicated persisted conversation operation", () => {
+    const { ws, sent } = makeFakeWs();
+    useStore.setState({ ws, sessionId: SID_A, isAttached: true, isDualPane: true });
+
+    const result = useStore.getState().sendTerminalConversationMessage(PANE_ID, "hello terminal agent");
+    expect(result.success).toBe(true);
+
+    const input = parseSent(sent).find((message) => message.type === "terminal_conversation_input");
+    expect(input).toMatchObject({
+      session_id: SID_A,
+      pane_id: PANE_ID,
+      text: "hello terminal agent",
+    });
+    expect(input?.client_msg_id).toBeTruthy();
+    expect(paneBucket()).toMatchObject([{
+      role: "user",
+      content: "hello terminal agent",
+      id: `optimistic-${input?.client_msg_id as string}`,
+    }]);
+  });
+});
+
 describe("user_input echo dedup by client_msg_id", () => {
   function seedOptimisticSend(id: string, text: string) {
     useStore.setState({

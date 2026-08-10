@@ -15,9 +15,10 @@ import { useCallback, useEffect, useState } from "react";
  *
  * Note the two views are not equivalent and the difference is not cosmetic.
  * The terminal is live and interactive; the conversation view is a *reading*
- * of the transcript, so it lags by up to one poll interval, shows only
- * user/assistant turns, and cannot be typed into. It is for reviewing what
- * happened, not for driving the agent.
+ * of the transcript, so it lags by up to one poll interval and shows only
+ * user/assistant turns. Its companion composer writes messages into the pty,
+ * which makes it the practical mobile control surface while raw terminal stays
+ * available for menus, modifier keys, and troubleshooting.
  */
 export type TerminalViewMode = "terminal" | "conversation";
 

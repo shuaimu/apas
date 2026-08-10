@@ -240,10 +240,28 @@ describe("terminal outbound controls", () => {
     expect(sent[0]).toMatchObject({ kind: "agent", managed: true });
   });
 
+  it("rejects new unmanaged conversation-only panes", () => {
+    const { ws, sent } = fakeSocket();
+    useStore.setState({
+      ws,
+      sessionId: SID,
+      isAttached: true,
+      projectPolicies: { [SID]: permissivePolicy },
+    });
+
+    const result = useStore
+      .getState()
+      .addPane("claude", "interactive", "Legacy", undefined, undefined, undefined, undefined, false, "agent");
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/Conversation-only panes are retired/);
+    expect(sent).toHaveLength(0);
+  });
+
   it("fails closed before policy arrives and rejects disallowed profiles", () => {
     const { ws, sent } = fakeSocket();
     useStore.setState({ ws, sessionId: SID, isAttached: true, projectPolicies: {} });
-    const pending = useStore.getState().addPane("codex", "interactive");
+    const pending = useStore.getState().addPane("codex", "interactive", undefined, undefined, undefined, undefined, undefined, false, "terminal");
     expect(pending.success).toBe(false);
     expect(pending.error).toMatch(/authoritative cluster policy/);
 
@@ -251,11 +269,11 @@ describe("terminal outbound controls", () => {
       projectPolicies: {
         [SID]: {
           ...permissivePolicy,
-          allowedLaunchProfiles: ["agent:claude:official:default"],
+          allowedLaunchProfiles: ["terminal:claude:official:default"],
         },
       },
     });
-    const denied = useStore.getState().addPane("codex", "interactive");
+    const denied = useStore.getState().addPane("codex", "interactive", undefined, undefined, undefined, undefined, undefined, false, "terminal");
     expect(denied.success).toBe(false);
     expect(denied.error).toMatch(/disabled by cluster policy v1/);
     expect(sent).toHaveLength(0);

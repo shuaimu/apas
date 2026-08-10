@@ -33,9 +33,9 @@ mod usage;
 mod worktree;
 
 // Default server URL
-const DEFAULT_SERVER: &str = "ws://apas.mpaxos.com:8080";
+const DEFAULT_SERVER: &str = "wss://apas.mpaxos.com";
 // Web UI URL for users to view sessions
-const WEB_UI_URL: &str = "http://apas.mpaxos.com";
+const WEB_UI_URL: &str = "https://apas.mpaxos.com";
 const CURRENT_VERSION: &str = env!("APAS_VERSION");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

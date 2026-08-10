@@ -1,15 +1,24 @@
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Capability advertised by web, CLI, and daemon peers that understand the
 /// server-owned effective project policy protocol.
 pub const PROJECT_POLICY_CAPABILITY: &str = "project_policy_v1";
+// v2 launches the provider's terminal TUI and carries the first instruction
+// as an initial prompt. A v1 CLI would accept the pane but silently drop that
+// instruction, so the version bump makes mixed-version rollout fail closed.
+pub const MOBILE_TASK_LAUNCH_CAPABILITY: &str = "mobile_task_launch_v2";
+
+fn default_true() -> bool {
+    true
+}
 
 /// One published artifact in the team scratchpad (`.apas-team.jsonl`),
 /// mirroring the CLI's `crate::scratchpad::TeamRecord`. Separate type
 /// here so the wire shape is stable across CLI/server/web even if the
 /// CLI's internal helper grows extra columns. Phase 2.2b.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct TeamScratchpadRecord {
     pub ts: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -23,7 +32,7 @@ pub struct TeamScratchpadRecord {
 /// Per-role provider/model pair the user picks in the "Team setup"
 /// card before clicking Start team. Empty fields fall back to the
 /// CLI's defaults (Claude / unset model).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct TeamRoleSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<Provider>,
@@ -34,7 +43,7 @@ pub struct TeamRoleSpec {
 /// Phase 3.2a: per-pane policy for the "editable plan checkpoint"
 /// feature. The streaming worker reads this at every turn to decide
 /// whether to gate the first tool_use behind a user-approval card.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanReviewMode {
     /// Hold every turn's first tool_use until the user approves.
@@ -53,7 +62,7 @@ pub enum PlanReviewMode {
 /// last known to be running; it does not claim the provider process exited.
 /// `Unknown` is the rollout-safe default for peers predating lifecycle
 /// reconciliation and after a server restart before the CLI reports state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalLifecycle {
     #[default]
@@ -67,7 +76,7 @@ pub enum TerminalLifecycle {
 /// that owns it is closed. Selected by the web UI before sending
 /// `WebToServer::RemovePane` so the CLI knows which git commands to run.
 /// Phase 1.1d of the swarm plan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PaneCleanupAction {
     /// `git worktree remove --force <path>` + `git branch -D <branch>`.
@@ -89,7 +98,7 @@ pub enum PaneCleanupAction {
 // ============================================================================
 
 /// Messages sent from CLI client to server
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CliToServer {
     /// CLI registers with the server using auth token and version
@@ -372,7 +381,7 @@ pub enum CliToServer {
 }
 
 /// Messages sent from server to CLI client
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToCli {
     /// Registration successful
@@ -484,6 +493,11 @@ pub enum ServerToCli {
         /// is true — the CLI computes the path.
         #[serde(default)]
         isolated_worktree: bool,
+        /// Optional first instruction delivered atomically with pane creation.
+        /// This lets retained mobile launch retries deduplicate on pane_id
+        /// without risking a duplicate or missing follow-up Input frame.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial_input: Option<String>,
     },
 
     /// Remove a pane from the session. `cleanup_action` (when Some) is
@@ -707,7 +721,7 @@ pub enum ServerToCli {
 // ============================================================================
 
 /// Messages sent from machine daemon to server
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonToServer {
     /// Daemon registers with the server using auth token + machine info
@@ -741,7 +755,7 @@ pub enum DaemonToServer {
 }
 
 /// Messages sent from server to machine daemon
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToDaemon {
     /// Registration successful
@@ -828,8 +842,18 @@ pub enum ServerToDaemon {
 // Web <-> Server Messages
 // ============================================================================
 
+/// Strictly redacted mobile renderer health signals. These events contain no
+/// project/session/pane identifiers or arbitrary strings by design.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MobileTelemetryEvent {
+    TerminalBridgeReady,
+    TerminalBridgeRejectedMessage,
+    TerminalBridgeCrash,
+}
+
 /// Messages sent from web client to server
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WebToServer {
     /// Authenticate with JWT token
@@ -837,6 +861,12 @@ pub enum WebToServer {
         token: String,
         #[serde(default)]
         capabilities: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_kind: Option<crate::mobile::ClientKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app_version: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol_version: Option<u32>,
     },
 
     /// List available CLI clients
@@ -876,11 +906,28 @@ pub enum WebToServer {
         client_msg_id: Option<String>,
     },
 
+    /// A deliberate chat-style message for a terminal-hosted agent. Unlike
+    /// [`WebToServer::TerminalInput`], this is safe to persist and display in
+    /// conversation history because the user submitted it through the
+    /// conversation composer rather than typing arbitrary terminal bytes.
+    /// The server converts it to terminal input and appends Enter.
+    TerminalConversationInput {
+        session_id: Uuid,
+        pane_id: u32,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_msg_id: Option<String>,
+    },
+
     /// Approve a tool call. See `Input::session_id` for the multi-attach rationale.
     Approve {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<Uuid>,
         tool_call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
 
     /// Reject a tool call. See `Input::session_id`.
@@ -888,6 +935,10 @@ pub enum WebToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<Uuid>,
         tool_call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
 
     /// Send signal (e.g., cancel/interrupt). See `Input::session_id`.
@@ -1003,7 +1054,7 @@ pub enum WebToServer {
         #[serde(default)]
         plan_review_mode: PlanReviewMode,
         /// v3.5 — true when this pane is being added as part of the
-        /// project team, false when it's a TabBar `+` side chat. See
+        /// project team, false for ordinary user-created terminal work. See
         /// PaneConfig::managed.
         #[serde(default)]
         managed: bool,
@@ -1077,6 +1128,8 @@ pub enum WebToServer {
         #[serde(default)]
         session_id: Option<Uuid>,
         pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
 
     /// Reorder panes (array of pane_ids in desired order)
@@ -1196,6 +1249,10 @@ pub enum WebToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<Uuid>,
         tool_use_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
         /// Question text → selected option label(s) joined with ", " for
         /// multi-select.
         answers: std::collections::HashMap<String, String>,
@@ -1301,6 +1358,10 @@ pub enum WebToServer {
         session_id: Option<Uuid>,
         tool_use_id: String,
         approve: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
 
     /// Update a pane's plan_review_mode (Phase 3.2c). Effective immediately
@@ -1390,6 +1451,10 @@ pub enum WebToServer {
     /// even while the CLI is mid-reconnect.
     TerminalAttach { session_id: Uuid, pane_id: u32 },
 
+    /// Redacted native/WebView health event. Accepted only from an
+    /// authenticated mobile device session.
+    MobileTelemetry { event: MobileTelemetryEvent },
+
     /// Liveness probe from the browser. Server echoes
     /// `ServerToWeb::Heartbeat` so the client can detect silently-stale
     /// connections (mobile OS throttling, NAT timeout, swallowed RST)
@@ -1398,7 +1463,7 @@ pub enum WebToServer {
 }
 
 /// Messages sent from server to web client
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectAccessChange {
     Transferred,
@@ -1406,7 +1471,16 @@ pub enum ProjectAccessChange {
     Deleted,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationKind {
+    Approval,
+    Question,
+    PlanReview,
+    Interrupt,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToWeb {
     /// Authentication successful
@@ -1420,10 +1494,40 @@ pub enum ServerToWeb {
         cluster_role: String,
         #[serde(default)]
         account_status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol_version: Option<u32>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        negotiated_capabilities: Vec<String>,
+        #[serde(default = "default_true")]
+        mutations_allowed: bool,
+    },
+
+    /// The peer authenticated, but its protocol cannot safely mutate state.
+    /// A mobile client may retain read-only cached/live access while guiding
+    /// the user to install a compatible build.
+    ProtocolIncompatible {
+        minimum_version: u32,
+        maximum_version: u32,
+        read_only: bool,
+        message: String,
     },
 
     /// Authentication failed
     AuthenticationFailed { reason: String },
+
+    /// Correlated acceptance or rejection for a time-sensitive coding
+    /// mutation. `accepted` means the current authorized CLI accepted the
+    /// operation for processing; clients never infer success from send().
+    MutationAck {
+        request_id: String,
+        session_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u32>,
+        mutation: MutationKind,
+        accepted: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 
     /// Session started
     SessionStarted {
@@ -1445,6 +1549,8 @@ pub enum ServerToWeb {
 
     /// Output from Claude
     Output {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
         content: String,
         #[serde(default)]
         output_type: OutputType,
@@ -1753,7 +1859,7 @@ pub enum ServerToWeb {
 /// `team_todo::TeamTodo` but with status fields kept as strings so we
 /// don't have to ship the enum definitions across crate / language
 /// boundaries. The web parses these into UI state.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct TeamTodoStateMsg {
     pub globals: Vec<TeamTodoGlobalMsg>,
     pub workers: Vec<TeamTodoWorkerMsg>,
@@ -1766,7 +1872,7 @@ pub struct TeamTodoStateMsg {
     pub reviewer_cursor: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct TeamTodoGlobalMsg {
     pub id: String,
     pub title: String,
@@ -1781,7 +1887,7 @@ pub struct TeamTodoGlobalMsg {
     pub body: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct PaneTodoPrMsg {
     pub pane_id: u32,
     pub url: String,
@@ -1792,7 +1898,7 @@ pub struct PaneTodoPrMsg {
 /// One row in the suggested-workers queue. The Manager pane appends
 /// these as `## SUG-NNN — label` sections to `suggested-workers.md`;
 /// the Overview renders each as a card with Accept / Dismiss buttons.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct SuggestedWorkerMsg {
     pub id: String,
     pub label: String,
@@ -1803,7 +1909,7 @@ pub struct SuggestedWorkerMsg {
     pub needs_worktree: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct TeamTodoWorkerMsg {
     pub pane_id: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1811,7 +1917,7 @@ pub struct TeamTodoWorkerMsg {
     pub subtasks: Vec<TeamTodoSubtaskMsg>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct TeamTodoSubtaskMsg {
     pub id: String,
     pub title: String,
@@ -1822,7 +1928,7 @@ pub struct TeamTodoSubtaskMsg {
 }
 
 /// Information about a persisted session
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SessionInfo {
     pub id: Uuid,
     /// Stable project identity from `.apas`. Web UI groups by this.
@@ -1861,7 +1967,7 @@ pub struct SessionInfo {
 /// All token counts come from the per-turn Claude/Codex stream `result`
 /// usage; `prompts` counts user/loop inputs and `responses` counts completed
 /// turns. Fields are snake_case so the wire keys match the web store verbatim.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct UsageCounters {
     #[serde(default)]
     pub prompts: u64,
@@ -1882,7 +1988,7 @@ pub struct UsageCounters {
 
 /// Per-pane usage broken down by time window (cumulative lifetime plus the
 /// rolling 7-day and today windows derived from day-bucketed rows).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct PaneUsageStats {
     pub pane_id: u32,
     #[serde(default)]
@@ -1898,7 +2004,7 @@ pub struct PaneUsageStats {
 
 /// Project-level usage: the per-pane breakdown plus the project totals
 /// (sum over all panes of every session that shares this project_id).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ProjectUsageStats {
     #[serde(default)]
     pub panes: Vec<PaneUsageStats>,
@@ -1913,7 +2019,7 @@ pub struct ProjectUsageStats {
 }
 
 /// Information about a persisted message
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MessageInfo {
     pub id: String,
     pub role: String,
@@ -1931,7 +2037,7 @@ pub struct MessageInfo {
 // ============================================================================
 
 /// Machine-level DeepSeek backend status safe to expose to web UI.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DeepseekBackendInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_base_url: Option<String>,
@@ -1942,7 +2048,7 @@ pub struct DeepseekBackendInfo {
 }
 
 /// Information about a machine reported by a daemon
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MachineInfo {
     pub machine_id: Uuid,
     pub hostname: String,
@@ -1957,7 +2063,7 @@ pub struct MachineInfo {
 }
 
 /// APAS project discovered on a machine
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MachineProjectInfo {
     pub project_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1977,14 +2083,14 @@ pub struct MachineProjectInfo {
 }
 
 /// Machine with its project list
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MachineWithProjects {
     pub machine: MachineInfo,
     pub projects: Vec<MachineProjectInfo>,
 }
 
 /// Pane type for dual-pane mode (legacy - kept for backward compatibility)
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PaneType {
     /// Autonomous deadloop worker (left pane)
@@ -1995,7 +2101,7 @@ pub enum PaneType {
 }
 
 /// Provider for a pane
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
     /// `claude-old` / `claude_old` aliases keep panes serialized before the
@@ -2019,7 +2125,7 @@ pub enum Provider {
 }
 
 /// Mode for a pane
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PaneMode {
     Deadloop,
@@ -2029,22 +2135,24 @@ pub enum PaneMode {
 /// How a pane hosts its agent process. Orthogonal to [`Provider`] (which
 /// binary) and [`PaneMode`] (how autonomous).
 ///
-/// * [`PaneKind::Agent`] — the original path: the CLI runs the provider
+/// * [`PaneKind::Agent`] — the legacy/managed-team path: the CLI runs the provider
 ///   headlessly (`claude --print --output-format stream-json`,
 ///   `codex exec --json`) and parses structured events into
 ///   `CliToServer::StreamMessage`. Everything team-mode depends on —
 ///   usage counters, pane status, diffs, plan review, scratchpad
-///   publishing, Tech Lead delegation — is built on those events.
+///   publishing, Tech Lead delegation — is built on those events. New
+///   unmanaged panes are no longer created with this kind, but existing panes
+///   remain compatible and managed team panes continue to use it.
 /// * [`PaneKind::Terminal`] — the pane instead hosts the provider's real
 ///   interactive TUI on a pty. Raw bytes flow over the dedicated
 ///   `Terminal*` messages and are rendered by xterm.js in the browser.
 ///   Nothing is parsed, so a terminal pane has none of the structured
-///   integrations above and is never a delegation target; it is a side
-///   chat with a genuine terminal.
+///   integrations above and is never a delegation target. This is the normal
+///   kind for new user-created Claude and Codex panes.
 ///
 /// `#[serde(default)]` on `PaneConfig::kind` keeps `.apas` files written
 /// before this existed deserializing as `Agent`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PaneKind {
     #[default]
@@ -2092,10 +2200,6 @@ pub fn tab_type_key(kind: PaneKind, provider: Provider) -> String {
 /// `terminal_pane::terminal_binary_for`, which this must stay in step with.
 pub fn all_tab_types() -> Vec<String> {
     vec![
-        tab_type_key(PaneKind::Agent, Provider::Claude),
-        tab_type_key(PaneKind::Agent, Provider::Codex),
-        tab_type_key(PaneKind::Agent, Provider::Opencode),
-        tab_type_key(PaneKind::Agent, Provider::CursorAgent),
         tab_type_key(PaneKind::Terminal, Provider::Claude),
         tab_type_key(PaneKind::Terminal, Provider::Codex),
     ]
@@ -2121,7 +2225,7 @@ pub fn tab_type_allowed(disallowed: &[String], kind: PaneKind, provider: Provide
 /// key, this identifies the frontend/backend/model combination as well as the
 /// pane kind, so administrators can allow Claude Official without also
 /// allowing every Anthropic-compatible backend.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct LaunchProfile {
     pub key: String,
     pub label: String,
@@ -2307,7 +2411,7 @@ pub fn launch_profile_key(kind: PaneKind, provider: Provider, model: Option<&str
     format!("{kind_name}:{provider_name}:{backend}:{normalized}")
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct EffectiveProjectPolicy {
     pub team_available: bool,
     pub allowed_launch_profiles: Vec<String>,
@@ -2341,7 +2445,7 @@ impl EffectiveProjectPolicy {
 }
 
 /// Configuration for a single pane
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PaneConfig {
     pub pane_id: u32,
     pub provider: Provider,
@@ -2407,9 +2511,9 @@ pub struct PaneConfig {
     /// project team, usually created by the Overview Start team role
     /// slots or by accepted worker suggestions / manual managed-worker
     /// flows. Such panes show up on the Overview Pane Grid and the Tech
-    /// Lead may consider them for delegation. `false` (default for
-    /// backward compat + the TabBar `+` button) = side chat / experiment;
-    /// not part of the team queue and never a Tech Lead delegation target.
+    /// Lead may consider them for delegation. `false` (the compatibility
+    /// default and the value for user-created terminal panes) = not part of
+    /// the team queue and never a Tech Lead delegation target.
     #[serde(default)]
     pub managed: bool,
 }
@@ -2463,7 +2567,7 @@ impl PaneConfig {
 }
 
 /// Type of output content
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputType {
     #[default]
@@ -2489,7 +2593,7 @@ pub enum OutputType {
 }
 
 /// Session status
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
     /// Waiting for CLI client to connect
@@ -2503,7 +2607,7 @@ pub enum SessionStatus {
 }
 
 /// Information about a CLI client
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CliClientInfo {
     pub id: Uuid,
     pub name: Option<String>,
@@ -2516,7 +2620,7 @@ pub struct CliClientInfo {
 }
 
 /// CLI client status
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CliClientStatus {
     Online,
@@ -2525,7 +2629,7 @@ pub enum CliClientStatus {
 }
 
 /// Usage limit information for a time window (5-hour or 7-day)
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct UsageLimitWindow {
     /// Utilization as a fraction (0.0 to 1.0+)
     pub utilization: f64,
@@ -2541,7 +2645,7 @@ pub struct UsageLimitWindow {
 }
 
 /// Usage limits from the provider API/logs
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct UsageLimits {
     /// 5-hour rolling window usage
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "fiveHour")]
@@ -2560,7 +2664,7 @@ pub struct UsageLimits {
 // ============================================================================
 
 /// Top-level message from Claude CLI stream-json output
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClaudeStreamMessage {
     /// System initialization message
@@ -2610,7 +2714,7 @@ pub enum ClaudeStreamMessage {
 }
 
 /// Claude assistant message structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ClaudeAssistantMessage {
     pub content: Vec<ClaudeContentBlock>,
     #[serde(default)]
@@ -2620,7 +2724,7 @@ pub struct ClaudeAssistantMessage {
 }
 
 /// Claude user message structure (for tool results)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ClaudeUserMessage {
     pub content: Vec<ClaudeContentBlock>,
     #[serde(default)]
@@ -2628,7 +2732,7 @@ pub struct ClaudeUserMessage {
 }
 
 /// Content block types in Claude messages
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClaudeContentBlock {
     /// Text content from Claude
@@ -2684,7 +2788,7 @@ where
 // ============================================================================
 
 /// Top-level message from Codex CLI JSONL output
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type")]
 pub enum CodexStreamMessage {
     /// Thread started — contains the session/thread ID
@@ -2714,7 +2818,7 @@ pub enum CodexStreamMessage {
 }
 
 /// A completed item from Codex
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CodexItem {
     pub id: String,
     /// Item type: "reasoning", "agent_message", "tool_use", "tool_result", etc.
@@ -2735,7 +2839,7 @@ pub struct CodexItem {
 }
 
 /// Usage information from Codex
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CodexUsage {
     #[serde(default)]
     pub input_tokens: u64,
@@ -2746,7 +2850,7 @@ pub struct CodexUsage {
 }
 
 /// Error info from Codex turn.failed
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CodexErrorInfo {
     #[serde(default)]
     pub message: Option<String>,
@@ -2947,6 +3051,7 @@ impl CliToServer {
 impl ServerToWeb {
     pub fn output(content: impl Into<String>) -> Self {
         Self::Output {
+            session_id: None,
             content: content.into(),
             output_type: OutputType::Text,
             pane_type: None,
@@ -3213,6 +3318,20 @@ mod tests {
         assert!(!serde_json::to_string(&no_id)
             .unwrap()
             .contains("client_msg_id"));
+
+        let terminal_conversation = WebToServer::TerminalConversationInput {
+            session_id: Uuid::new_v4(),
+            pane_id: 9,
+            text: "hello terminal agent".to_string(),
+            client_msg_id: Some("terminal-send-1".to_string()),
+        };
+        let json = serde_json::to_string(&terminal_conversation).unwrap();
+        assert!(json.contains("\"type\":\"terminal_conversation_input\""));
+        assert!(json.contains("\"client_msg_id\":\"terminal-send-1\""));
+        assert!(matches!(
+            serde_json::from_str::<WebToServer>(&json).unwrap(),
+            WebToServer::TerminalConversationInput { pane_id: 9, .. }
+        ));
     }
 
     #[test]
@@ -3278,9 +3397,29 @@ mod tests {
         let msg = WebToServer::Authenticate {
             token: "jwt-token".to_string(),
             capabilities: Vec::new(),
+            client_kind: None,
+            app_version: None,
+            protocol_version: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"authenticate\""));
+
+        let legacy: WebToServer =
+            serde_json::from_str(r#"{"type":"authenticate","token":"legacy","capabilities":[]}"#)
+                .unwrap();
+        match legacy {
+            WebToServer::Authenticate {
+                client_kind,
+                app_version,
+                protocol_version,
+                ..
+            } => {
+                assert_eq!(client_kind, None);
+                assert_eq!(app_version, None);
+                assert_eq!(protocol_version, None);
+            }
+            _ => panic!("expected authenticate"),
+        }
 
         let msg = WebToServer::ListCliClients;
         let json = serde_json::to_string(&msg).unwrap();
@@ -3848,15 +3987,12 @@ mod tests {
     }
 
     #[test]
-    fn the_catalog_omits_retired_providers_and_deepseek_provider_alias() {
+    fn user_creatable_catalog_contains_only_supported_terminals() {
         let catalog = all_tab_types();
-        for absent in ["agent:minimax", "agent:glm", "agent:deepseek"] {
-            assert!(
-                !catalog.contains(&absent.to_string()),
-                "{absent} is not separately creatable"
-            );
-        }
-        assert_eq!(catalog.len(), 6, "catalog: {catalog:?}");
+        assert_eq!(
+            catalog,
+            vec!["terminal:claude".to_string(), "terminal:codex".to_string()]
+        );
     }
 
     #[test]

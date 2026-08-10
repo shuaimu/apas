@@ -72,7 +72,7 @@ describe("SharePage", () => {
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
-    expect(fetchMock).toHaveBeenCalledWith("http://apas.mpaxos.com/share/redeem", {
+    expect(fetchMock).toHaveBeenCalledWith("https://apas.mpaxos.com/share/redeem", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -133,7 +133,7 @@ describe("SharePage", () => {
 
     await screen.findByText("Invitation expired");
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://apas.mpaxos.com/share/redeem",
+      "https://apas.mpaxos.com/share/redeem",
       expect.objectContaining({
         body: JSON.stringify({ code: "ERROR123" }),
       }),

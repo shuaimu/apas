@@ -17,6 +17,8 @@ describe('useStore', () => {
       projectGoals: {},
       projectFlags: {},
       projectPolicies: {},
+      toasts: [],
+      showToast: useStore.getInitialState().showToast,
       teamRecords: [],
       teamRecordsBySession: new Map(),
     });
@@ -56,6 +58,28 @@ describe('useStore', () => {
       expect(state.ws).toBeNull();
       expect(state.cliClients).toEqual([]);
       expect(state.messages).toEqual([]);
+    });
+  });
+
+  describe('session attachment confirmations', () => {
+    it('does not let a background session disable the current project', () => {
+      useStore.setState({ sessionId: 'current-session', isAttached: true });
+
+      handleServerMessage({
+        type: 'session_attached',
+        session_id: 'cached-background-session',
+        has_active_cli: false,
+      }, useStore.setState, useStore.getState);
+
+      expect(useStore.getState().isAttached).toBe(true);
+
+      handleServerMessage({
+        type: 'session_attached',
+        session_id: 'current-session',
+        has_active_cli: false,
+      }, useStore.setState, useStore.getState);
+
+      expect(useStore.getState().isAttached).toBe(false);
     });
   });
 
@@ -266,6 +290,41 @@ describe('useStore', () => {
       useStore.getState().attachSession('test-session-id');
 
       expect(useStore.getState().messages).toHaveLength(0);
+    });
+  });
+
+  describe('loadSessionActivity', () => {
+    it('requests a bounded all-pane timeline without resetting the attachment', () => {
+      const send = vi.fn();
+      const ws = {
+        readyState: WebSocket.OPEN,
+        send,
+        close: vi.fn(),
+      } as unknown as WebSocket;
+      const existingMessage: Message = {
+        id: 'existing-message',
+        role: 'assistant',
+        content: 'Already loaded',
+        timestamp: new Date(),
+      };
+
+      useStore.setState({
+        ws,
+        sessionId: 'session-a',
+        isAttached: true,
+        messages: [existingMessage],
+      });
+
+      useStore.getState().loadSessionActivity('session-a');
+
+      expect(send).toHaveBeenCalledWith(JSON.stringify({
+        type: 'get_session_messages',
+        session_id: 'session-a',
+        limit: 30,
+      }));
+      expect(useStore.getState().sessionId).toBe('session-a');
+      expect(useStore.getState().isAttached).toBe(true);
+      expect(useStore.getState().messages).toEqual([existingMessage]);
     });
   });
 
@@ -541,11 +600,51 @@ describe('useStore', () => {
 
     it('rebootCli does not send when the websocket is closed', () => {
       const ws = makeWs(WebSocket.CLOSED);
-      useStore.setState({ sessionId: 'session-cli-reboot', ws });
+      const showToast = vi.fn();
+      useStore.setState({
+        sessionId: 'session-cli-reboot',
+        ws,
+        paneConfigs: [],
+        projectPolicies: {
+          'session-cli-reboot': {
+            teamAvailable: true,
+            allowedLaunchProfiles: [],
+            version: 1,
+            projectSuspended: false,
+            noncompliantPaneIds: [],
+          },
+        },
+        showToast,
+      });
 
       useStore.getState().rebootCli();
 
       expect(ws.send).not.toHaveBeenCalled();
+      expect(showToast).toHaveBeenCalledWith(
+        'Not connected — reboot the CLI manually on the project host',
+        'error',
+      );
+    });
+  });
+
+  describe('server error visibility', () => {
+    it('shows server errors as a toast even when the per-pane view hides global messages', () => {
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      handleServerMessage({
+        type: 'error',
+        message: 'This project CLI is too old to reboot from the web. Reboot the CLI manually.',
+      }, useStore.setState, useStore.getState);
+
+      expect(useStore.getState().toasts.at(-1)).toMatchObject({
+        kind: 'error',
+        message: 'This project CLI is too old to reboot from the web. Reboot the CLI manually.',
+      });
+      expect(useStore.getState().messages.at(-1)).toMatchObject({
+        role: 'system',
+        content: 'This project CLI is too old to reboot from the web. Reboot the CLI manually.',
+      });
+      consoleSpy.mockRestore();
     });
   });
 

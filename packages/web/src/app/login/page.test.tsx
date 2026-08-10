@@ -118,7 +118,7 @@ describe("LoginPage", () => {
     await waitFor(() => {
       expect(store.login).toHaveBeenCalledWith("token-123", "user-1", "user@example.com");
     });
-    expect(fetchMock).toHaveBeenCalledWith("http://apas.mpaxos.com/auth/login", {
+    expect(fetchMock).toHaveBeenCalledWith("https://apas.mpaxos.com/auth/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email: "user@example.com", password: "secret-pass" }),
@@ -175,7 +175,7 @@ describe("LoginPage", () => {
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
     expect(fetchMock).toHaveBeenLastCalledWith(
-      "http://apas.mpaxos.com/auth/device-complete",
+      "https://apas.mpaxos.com/auth/device-complete",
       {
         method: "POST",
         headers: {

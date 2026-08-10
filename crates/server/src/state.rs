@@ -1,9 +1,12 @@
-use crate::{config::Config, db::Database, session::SessionManager, storage::FileStorage};
+use crate::{
+    config::Config, db::Database, mobile_metrics::MobileMetrics, session::SessionManager,
+    storage::FileStorage,
+};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+use tokio::sync::{Mutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use uuid::Uuid;
 
 /// State for device code authentication (CLI login flow)
@@ -28,6 +31,9 @@ pub struct AppState {
     pub storage: FileStorage,
     pub device_codes: Arc<DashMap<String, DeviceCodeState>>,
     pub password_reset_tokens: Arc<DashMap<String, PasswordResetState>>,
+    pub mobile_auth_attempts: Arc<DashMap<String, Vec<DateTime<Utc>>>>,
+    pub mobile_metrics: Arc<MobileMetrics>,
+    mobile_task_launch_gates: Arc<DashMap<Uuid, Arc<Mutex<()>>>>,
     project_mutation_gates: Arc<DashMap<String, Arc<RwLock<()>>>>,
 }
 
@@ -47,8 +53,20 @@ impl AppState {
             storage: FileStorage::new(storage_path),
             device_codes: Arc::new(DashMap::new()),
             password_reset_tokens: Arc::new(DashMap::new()),
+            mobile_auth_attempts: Arc::new(DashMap::new()),
+            mobile_metrics: Arc::new(MobileMetrics::default()),
+            mobile_task_launch_gates: Arc::new(DashMap::new()),
             project_mutation_gates: Arc::new(DashMap::new()),
         }
+    }
+
+    pub async fn mobile_task_launch_guard(&self, request_id: Uuid) -> OwnedMutexGuard<()> {
+        self.mobile_task_launch_gates
+            .entry(request_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+            .lock_owned()
+            .await
     }
 
     fn project_mutation_gate(&self, project_id: &str) -> Arc<RwLock<()>> {

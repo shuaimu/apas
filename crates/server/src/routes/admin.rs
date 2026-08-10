@@ -17,7 +17,7 @@ use crate::{
     state::AppState,
 };
 
-const WEB_UI_URL: &str = "http://apas.mpaxos.com";
+const WEB_UI_URL: &str = "https://apas.mpaxos.com";
 
 #[derive(Debug, Serialize)]
 pub struct SystemStats {
@@ -42,6 +42,12 @@ pub struct UserSummary {
 pub struct DailyStats {
     pub date: String,
     pub count: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MobileOperationalStats {
+    pub process: crate::mobile_metrics::MobileMetricsSnapshot,
+    pub persistent: crate::db::MobilePersistenceMetrics,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -96,6 +102,17 @@ pub async fn get_stats(
         total_shares,
         recent_users,
         sessions_per_day,
+    }))
+}
+
+pub async fn get_mobile_metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<MobileOperationalStats>, AppError> {
+    require_cluster_admin(&headers, &state).await?;
+    Ok(Json(MobileOperationalStats {
+        process: state.mobile_metrics.snapshot(),
+        persistent: state.db.mobile_persistence_metrics().await?,
     }))
 }
 

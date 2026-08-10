@@ -7,7 +7,7 @@ use axum::{
 };
 use base64::Engine as _;
 use futures::{SinkExt, StreamExt};
-use shared::{CliToServer, ServerToCli, ServerToWeb, TerminalLifecycle};
+use shared::{CliToServer, PaneConfig, PaneType, ServerToCli, ServerToWeb, TerminalLifecycle};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -45,6 +45,58 @@ fn is_version_supported(client_version: &str) -> bool {
         (Some(m), Some(c)) => c >= m,
         _ => true, // Allow if we can't parse (be permissive)
     }
+}
+
+fn is_terminal_pane(panes: &[PaneConfig], pane_id: u32) -> bool {
+    panes
+        .iter()
+        .any(|pane| pane.pane_id == pane_id && pane.kind.is_terminal())
+}
+
+/// Whether this assistant message is an actual terminal-pane completion.
+///
+/// Updated CLIs include an explicit false marker on intermediate assistant
+/// text (for example, before a tool call). Messages from older CLIs have no
+/// marker, so retain the legacy behavior for those clients during rollout.
+fn terminal_assistant_completes_work(
+    message: &shared::ClaudeStreamMessage,
+    panes: &[PaneConfig],
+    pane_id: Option<u32>,
+) -> bool {
+    if !pane_id.is_some_and(|pane_id| is_terminal_pane(panes, pane_id)) {
+        return false;
+    }
+    match message {
+        shared::ClaudeStreamMessage::Assistant { extra, .. } => extra
+            .get("terminal_turn_complete")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        _ => false,
+    }
+}
+
+pub(crate) async fn set_and_broadcast_pane_status(
+    state: &AppState,
+    session_id: Uuid,
+    pane_type: PaneType,
+    pane_id: u32,
+    status: Option<String>,
+) {
+    state
+        .sessions
+        .set_pane_status(&session_id, pane_type, pane_id, status.clone());
+    state
+        .sessions
+        .route_to_web(
+            &session_id,
+            ServerToWeb::PaneStatus {
+                session_id,
+                pane_type,
+                pane_id: Some(pane_id),
+                status,
+            },
+        )
+        .await;
 }
 
 pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
@@ -555,12 +607,29 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 pane_type,
                                 pane_id,
                             }) => {
-                                let Ok((_project_id, _operation_guard)) = state
+                                let Ok((project_id, _operation_guard)) = state
                                     .active_session_operation(&session_id.to_string())
                                     .await
                                 else {
                                     continue;
                                 };
+                                let approval = match &output_type {
+                                    shared::OutputType::ApprovalRequest { tool_call_id, .. } => {
+                                        Some((
+                                            tool_call_id.clone(),
+                                            format!("approval:{session_id}:{tool_call_id}"),
+                                        ))
+                                    }
+                                    _ => None,
+                                };
+                                if let Some((tool_call_id, _)) = &approval {
+                                    state.sessions.register_pending_decision(
+                                        session_id,
+                                        tool_call_id.clone(),
+                                        pane_id,
+                                        shared::MutationKind::Approval,
+                                    );
+                                }
                                 // Char-boundary-safe slice: plain byte index can panic
                                 // mid-codepoint on multibyte content (e.g. `…`).
                                 let preview_end = {
@@ -575,6 +644,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     .route_to_web(
                                         &session_id,
                                         ServerToWeb::Output {
+                                            session_id: Some(session_id),
                                             content: data,
                                             output_type,
                                             pane_type,
@@ -583,9 +653,25 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     )
                                     .await;
                                 tracing::info!("Output routed to web: {}", routed);
+                                if let Some((_, dedupe_key)) = approval {
+                                    let routing_id = Uuid::new_v4().to_string();
+                                    if let Err(error) = crate::notifications::enqueue_project_event(
+                                        &state,
+                                        &project_id,
+                                        Some(&session_id.to_string()),
+                                        pane_id,
+                                        "decision",
+                                        &routing_id,
+                                        &dedupe_key,
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(%error, %session_id, "failed to enqueue approval notification");
+                                    }
+                                }
                             }
                             Ok(CliToServer::StreamMessage { session_id, message, pane_type, pane_id }) => {
-                                let Ok((_project_id, _operation_guard)) = state
+                                let Ok((project_id, _operation_guard)) = state
                                     .active_session_operation(&session_id.to_string())
                                     .await
                                 else {
@@ -593,8 +679,60 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 };
                                 tracing::info!("Received StreamMessage for session {} with pane_id {:?}", session_id, pane_id);
 
+                                let pending_question = match &message {
+                                    shared::ClaudeStreamMessage::Assistant { message, .. } => message
+                                        .content
+                                        .iter()
+                                        .find_map(|block| match block {
+                                            shared::ClaudeContentBlock::ToolUse { id, name, .. }
+                                                if name.eq_ignore_ascii_case("AskUserQuestion") =>
+                                            {
+                                                Some(id.clone())
+                                            }
+                                            _ => None,
+                                        }),
+                                    _ => None,
+                                };
+                                let notification = match &message {
+                                    shared::ClaudeStreamMessage::Result {
+                                        subtype,
+                                        session_id: provider_session_id,
+                                        duration_ms,
+                                        is_error,
+                                        ..
+                                    } => Some((
+                                        if *is_error || subtype != "success" { "failure" } else { "completion" },
+                                        format!("result:{session_id}:{provider_session_id}:{subtype}:{duration_ms}"),
+                                    )),
+                                    shared::ClaudeStreamMessage::Assistant { message, .. } => message
+                                        .content
+                                        .iter()
+                                        .find_map(|block| match block {
+                                            shared::ClaudeContentBlock::ToolUse { id, name, .. }
+                                                if name.eq_ignore_ascii_case("AskUserQuestion") =>
+                                            {
+                                                Some(("decision", format!("question:{session_id}:{id}")))
+                                            }
+                                            _ => None,
+                                        }),
+                                    _ => None,
+                                };
+
                                 // Use pane_id for storage, falling back to pane_type for backward compat
                                 let effective_pane_id = pane_id.or_else(|| pane_type.map(|p| shared::PaneConfig::pane_id_from_legacy(&p)));
+                                let terminal_assistant_reply = terminal_assistant_completes_work(
+                                    &message,
+                                    &state.sessions.get_session_panes(&session_id),
+                                    effective_pane_id,
+                                );
+                                if let Some(tool_use_id) = pending_question {
+                                    state.sessions.register_pending_decision(
+                                        session_id,
+                                        tool_use_id,
+                                        effective_pane_id,
+                                        shared::MutationKind::Question,
+                                    );
+                                }
 
                                 // A `result` stream event ends a turn and carries the turn's
                                 // token usage (in `extra.usage`) + cost. Capture it as a usage
@@ -655,6 +793,40 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     .await;
                                 tracing::info!("StreamMessage routed to web: {}", routed);
 
+                                if terminal_assistant_reply {
+                                    if let Some(pane_id) = effective_pane_id {
+                                        // Updated terminal clients only mark the
+                                        // provider's real completion boundary. Older
+                                        // clients retain their previous behavior
+                                        // during the rolling upgrade.
+                                        set_and_broadcast_pane_status(
+                                            &state,
+                                            session_id,
+                                            PaneType::Interactive,
+                                            pane_id,
+                                            None,
+                                        )
+                                        .await;
+                                    }
+                                }
+
+                                if let Some((category, dedupe_key)) = notification {
+                                    let routing_id = Uuid::new_v4().to_string();
+                                    if let Err(error) = crate::notifications::enqueue_project_event(
+                                        &state,
+                                        &project_id,
+                                        Some(&session_id.to_string()),
+                                        effective_pane_id,
+                                        category,
+                                        &routing_id,
+                                        &dedupe_key,
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(%error, %session_id, "failed to enqueue mobile coding notification");
+                                    }
+                                }
+
                                 // Record the turn's usage and push refreshed project
                                 // stats to the Overview. `result` arrives once per turn,
                                 // so this is not chatty.
@@ -674,6 +846,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 let effective_pane_id = pane_id.or_else(|| pane_type.map(|p| shared::PaneConfig::pane_id_from_legacy(&p)));
                                 // Save user input to file storage
                                 let created_at = chrono::Utc::now().to_rfc3339();
+                                if let Err(error) = state
+                                    .db
+                                    .record_session_user_input(&session_id.to_string(), &created_at)
+                                    .await
+                                {
+                                    tracing::warn!(%error, %session_id, "failed to record session user activity");
+                                }
                                 let stored_message = crate::storage::StoredMessage {
                                     id: Uuid::new_v4().to_string(),
                                     role: "user".to_string(),
@@ -694,6 +873,26 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         ServerToWeb::UserInput { session_id, text, pane_type, pane_id, created_at: Some(created_at), client_msg_id: None },
                                     )
                                     .await;
+
+                                if let Some(pane_id) = effective_pane_id.filter(|id| {
+                                    is_terminal_pane(
+                                        &state.sessions.get_session_panes(&session_id),
+                                        *id,
+                                    )
+                                }) {
+                                    // Terminal TUI turns are harvested from the
+                                    // provider transcript. The user boundary starts
+                                    // the same coarse working state that structured
+                                    // panes publish directly.
+                                    set_and_broadcast_pane_status(
+                                        &state,
+                                        session_id,
+                                        PaneType::Interactive,
+                                        pane_id,
+                                        Some("Working...".to_string()),
+                                    )
+                                    .await;
+                                }
 
                                 // Count this input as a prompt for the pane and refresh
                                 // the Overview usage stats.
@@ -835,7 +1034,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 state.sessions.update_usage_limits(cli_id, provider, limits);
                             }
                             Ok(CliToServer::PlanReviewRequest { session_id, pane_id, tool_use_id, tool_name, input }) => {
-                                let Ok((_project_id, _operation_guard)) = state
+                                let Ok((project_id, _operation_guard)) = state
                                     .active_session_operation(&session_id.to_string())
                                     .await
                                 else {
@@ -844,6 +1043,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 tracing::info!(
                                     "Plan review requested for session {} pane {} tool {} (id={})",
                                     session_id, pane_id, tool_name, tool_use_id,
+                                );
+                                let notification_dedupe = format!("plan:{session_id}:{tool_use_id}");
+                                state.sessions.register_pending_decision(
+                                    session_id,
+                                    tool_use_id.clone(),
+                                    Some(pane_id),
+                                    shared::MutationKind::PlanReview,
                                 );
                                 state
                                     .sessions
@@ -858,6 +1064,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         },
                                     )
                                     .await;
+                                let routing_id = Uuid::new_v4().to_string();
+                                if let Err(error) = crate::notifications::enqueue_project_event(
+                                    &state,
+                                    &project_id,
+                                    Some(&session_id.to_string()),
+                                    Some(pane_id),
+                                    "decision",
+                                    &routing_id,
+                                    &notification_dedupe,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(%error, %session_id, pane_id, "failed to enqueue plan notification");
+                                }
                             }
                             Ok(CliToServer::TerminalOutput { session_id, pane_id, instance_id, data_b64, seq }) => {
                                 let Ok((_project_id, _operation_guard)) = state
@@ -932,6 +1152,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                             },
                                         )
                                         .await;
+                                    if current.lifecycle == TerminalLifecycle::Exited {
+                                        set_and_broadcast_pane_status(
+                                            &state,
+                                            session_id,
+                                            PaneType::Interactive,
+                                            pane_id,
+                                            None,
+                                        )
+                                        .await;
+                                    }
                                 } else {
                                     tracing::debug!(
                                         pane_id,
@@ -976,6 +1206,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         },
                                     )
                                     .await;
+                                set_and_broadcast_pane_status(
+                                    &state,
+                                    session_id,
+                                    PaneType::Interactive,
+                                    pane_id,
+                                    None,
+                                )
+                                .await;
                                 state
                                     .sessions
                                     .route_to_web(
@@ -1141,7 +1379,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     .await;
                             }
                             Ok(CliToServer::PrCreated { session_id, pane_id, url, error }) => {
-                                let Ok((_project_id, _operation_guard)) = state
+                                let Ok((project_id, _operation_guard)) = state
                                     .active_session_operation(&session_id.to_string())
                                     .await
                                 else {
@@ -1150,6 +1388,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 tracing::info!(
                                     "PR created for pane {} in session {}: url={:?} error={:?}",
                                     pane_id, session_id, url, error,
+                                );
+                                let category = if error.is_some() { "failure" } else { "pull_request" };
+                                let notification_dedupe = format!(
+                                    "pull_request:{session_id}:{pane_id}:{}",
+                                    url.as_deref().unwrap_or("error")
                                 );
                                 state
                                     .sessions
@@ -1163,6 +1406,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         },
                                     )
                                     .await;
+                                let routing_id = Uuid::new_v4().to_string();
+                                if let Err(notification_error) = crate::notifications::enqueue_project_event(
+                                    &state,
+                                    &project_id,
+                                    Some(&session_id.to_string()),
+                                    Some(pane_id),
+                                    category,
+                                    &routing_id,
+                                    &notification_dedupe,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(%notification_error, %session_id, pane_id, "failed to enqueue pull-request notification");
+                                }
                             }
                             Ok(CliToServer::PaneList { session_id, mut panes }) => {
                                 let Ok((_project_id, _operation_guard)) = state
@@ -1565,4 +1822,64 @@ fn stream_message_to_stored(
     }
 
     messages
+}
+
+#[cfg(test)]
+mod pane_status_tests {
+    use super::{is_terminal_pane, terminal_assistant_completes_work};
+    use shared::{
+        ClaudeAssistantMessage, ClaudeContentBlock, ClaudeStreamMessage, PaneConfig, PaneKind,
+    };
+
+    fn assistant(extra: serde_json::Value) -> ClaudeStreamMessage {
+        ClaudeStreamMessage::Assistant {
+            message: ClaudeAssistantMessage {
+                content: vec![ClaudeContentBlock::Text {
+                    text: "still working".to_string(),
+                }],
+                model: String::new(),
+                extra: serde_json::Value::Null,
+            },
+            session_id: "provider-session".to_string(),
+            extra,
+        }
+    }
+
+    #[test]
+    fn working_status_inference_is_limited_to_terminal_panes() {
+        let mut panes = PaneConfig::defaults();
+        panes[0].pane_id = 7;
+        assert!(!is_terminal_pane(&panes, 7));
+
+        panes[0].kind = PaneKind::Terminal;
+        assert!(is_terminal_pane(&panes, 7));
+        assert!(!is_terminal_pane(&panes, 8));
+    }
+
+    #[test]
+    fn terminal_working_status_only_clears_on_confirmed_completion() {
+        let mut panes = PaneConfig::defaults();
+        panes[0].pane_id = 7;
+        panes[0].kind = PaneKind::Terminal;
+
+        assert!(!terminal_assistant_completes_work(
+            &assistant(serde_json::json!({"terminal_turn_complete": false})),
+            &panes,
+            Some(7),
+        ));
+        assert!(terminal_assistant_completes_work(
+            &assistant(serde_json::json!({"terminal_turn_complete": true})),
+            &panes,
+            Some(7),
+        ));
+        assert!(
+            terminal_assistant_completes_work(&assistant(serde_json::Value::Null), &panes, Some(7),),
+            "unmarked messages keep the legacy behavior during CLI rollout"
+        );
+        assert!(!terminal_assistant_completes_work(
+            &assistant(serde_json::json!({"terminal_turn_complete": true})),
+            &panes,
+            Some(8),
+        ));
+    }
 }

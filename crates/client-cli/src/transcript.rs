@@ -69,20 +69,42 @@ fn claude_text(content: &Value) -> String {
 /// `mode`, `permission-mode`, `ai-title` and similar bookkeeping that is not
 /// conversation and would be noise in the pane's history.
 pub fn parse_claude(raw: &str) -> Vec<TurnRecord> {
-    let mut out = Vec::new();
+    let mut out: Vec<TurnRecord> = Vec::new();
     for line in raw.lines().filter(|l| !l.trim().is_empty()) {
         let Ok(d) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        let role = match d.get("type").and_then(Value::as_str) {
+        let record_type = d.get("type").and_then(Value::as_str);
+        if record_type == Some("system")
+            && d.get("subtype").and_then(Value::as_str) == Some("turn_duration")
+        {
+            // Claude writes this after the final assistant record. It is also
+            // a useful completion edge if the preceding message was observed
+            // before its stop_reason had reached disk.
+            if let Some(turn) = out.iter_mut().rev().find(|turn| turn.is_assistant()) {
+                turn.completes_work = true;
+            }
+            continue;
+        }
+        let role = match record_type {
             Some(r @ ("user" | "assistant")) => r,
             _ => continue,
         };
         let msg = d.get("message").unwrap_or(&Value::Null);
         let text = claude_text(msg.get("content").unwrap_or(&Value::Null));
+        let completes_work = role == "assistant"
+            && msg
+                .get("stop_reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| reason != "tool_use");
         if text.trim().is_empty() {
             // Tool-use-only turns carry no text. Skipping keeps the history
             // readable; the tool calls themselves are not conversation.
+            if completes_work {
+                if let Some(turn) = out.iter_mut().rev().find(|turn| turn.is_assistant()) {
+                    turn.completes_work = true;
+                }
+            }
             continue;
         }
         let usage = msg.get("usage");
@@ -100,6 +122,7 @@ pub fn parse_claude(raw: &str) -> Vec<TurnRecord> {
             model: msg.get("model").and_then(Value::as_str).map(str::to_string),
             input_tokens: tok("input_tokens"),
             output_tokens: tok("output_tokens"),
+            completes_work,
         });
     }
     out
@@ -112,11 +135,25 @@ pub fn parse_claude(raw: &str) -> Vec<TurnRecord> {
 /// harness's own injected context (permissions, plugin lists), and `reasoning`
 /// / `custom_tool_call` items are not turns.
 pub fn parse_codex(raw: &str) -> Vec<TurnRecord> {
-    let mut out = Vec::new();
+    let mut out: Vec<TurnRecord> = Vec::new();
     for line in raw.lines().filter(|l| !l.trim().is_empty()) {
         let Ok(d) = serde_json::from_str::<Value>(line) else {
             continue;
         };
+        if d.get("type").and_then(Value::as_str) == Some("event_msg")
+            && d.get("payload")
+                .and_then(|payload| payload.get("type"))
+                .and_then(Value::as_str)
+                == Some("task_complete")
+        {
+            // Codex emits task_complete just after its final assistant item.
+            // A poll can land between those two records, so completion must
+            // be tracked independently from the turn-count cursor.
+            if let Some(turn) = out.iter_mut().rev().find(|turn| turn.is_assistant()) {
+                turn.completes_work = true;
+            }
+            continue;
+        }
         if d.get("type").and_then(Value::as_str) != Some("response_item") {
             continue;
         }
@@ -157,6 +194,7 @@ pub fn parse_codex(raw: &str) -> Vec<TurnRecord> {
             model: None,
             input_tokens: None,
             output_tokens: None,
+            completes_work: false,
         });
     }
     out
@@ -241,7 +279,9 @@ mod tests {
         );
         assert_eq!(
             p,
-            Path::new("/home/u/.claude/projects/-home-users-shuai-apas/11111111-2222-4333-8444-555555555555.jsonl")
+            Path::new(
+                "/home/u/.claude/projects/-home-users-shuai-apas/11111111-2222-4333-8444-555555555555.jsonl"
+            )
         );
     }
 
@@ -249,7 +289,7 @@ mod tests {
     fn claude_turns_carry_text_and_usage() {
         let raw = r#"
 {"type":"user","timestamp":"2026-08-04T00:00:01Z","message":{"content":"what is 6x7?"}}
-{"type":"assistant","timestamp":"2026-08-04T00:00:02Z","message":{"model":"claude-opus-5","content":[{"type":"text","text":"42"}],"usage":{"input_tokens":2,"output_tokens":3}}}
+{"type":"assistant","timestamp":"2026-08-04T00:00:02Z","message":{"model":"claude-opus-5","content":[{"type":"text","text":"42"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}}
 "#;
         let turns = parse_claude(raw);
         assert_eq!(turns.len(), 2);
@@ -260,6 +300,30 @@ mod tests {
         // Usage the agent would otherwise have had to volunteer.
         assert_eq!(turns[1].input_tokens, Some(2));
         assert_eq!(turns[1].output_tokens, Some(3));
+        assert!(turns[1].completes_work);
+    }
+
+    #[test]
+    fn claude_tool_preambles_do_not_complete_work() {
+        let raw = r#"
+{"type":"assistant","timestamp":"t1","message":{"content":[{"type":"text","text":"I will inspect that."}],"stop_reason":"tool_use"}}
+{"type":"assistant","timestamp":"t2","message":{"content":[{"type":"text","text":"All done."}],"stop_reason":"end_turn"}}
+"#;
+        let turns = parse_claude(raw);
+        assert_eq!(turns.len(), 2);
+        assert!(!turns[0].completes_work);
+        assert!(turns[1].completes_work);
+    }
+
+    #[test]
+    fn claude_turn_duration_marks_a_previously_seen_reply_complete() {
+        let before = r#"{"type":"assistant","timestamp":"t","message":{"content":"done"}}"#;
+        assert!(!parse_claude(before)[0].completes_work);
+
+        let after = format!(
+            "{before}\n{{\"type\":\"system\",\"subtype\":\"turn_duration\",\"duration_ms\":10}}"
+        );
+        assert!(parse_claude(&after)[0].completes_work);
     }
 
     #[test]
@@ -291,6 +355,7 @@ mod tests {
 {"type":"response_item","timestamp":"t3","payload":{"type":"reasoning","summary":[]}}
 {"type":"response_item","timestamp":"t4","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}
 {"type":"response_item","timestamp":"t5","payload":{"type":"custom_tool_call","name":"shell"}}
+{"type":"event_msg","timestamp":"t6","payload":{"type":"task_complete"}}
 "#;
         let turns = parse_codex(raw);
         assert_eq!(
@@ -302,6 +367,18 @@ mod tests {
         assert_eq!(turns[0].text, "do it");
         assert_eq!(turns[1].role, "assistant");
         assert_eq!(turns[1].text, "done");
+        assert!(turns[1].completes_work);
+    }
+
+    #[test]
+    fn codex_task_complete_can_arrive_after_the_assistant_turn() {
+        let before = r#"{"type":"response_item","timestamp":"t","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}"#;
+        assert!(!parse_codex(before)[0].completes_work);
+
+        let after = format!(
+            "{before}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\"}}}}"
+        );
+        assert!(parse_codex(&after)[0].completes_work);
     }
 
     #[test]

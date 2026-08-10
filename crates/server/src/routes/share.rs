@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{db::InvitationCode, error::AppError, routes::auth::verify_token, state::AppState};
 
-const WEB_UI_URL: &str = "http://apas.mpaxos.com";
+const WEB_UI_URL: &str = "https://apas.mpaxos.com";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProjectRole {

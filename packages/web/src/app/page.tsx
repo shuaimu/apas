@@ -6,6 +6,8 @@ import { createPortal } from "react-dom";
 import { TabbedView } from "@/components/tabs/TabbedView";
 import { Sidebar } from "@/components/Sidebar";
 import { ResizeHandle } from "@/components/ResizeHandle";
+import { MobileCodeHome } from "@/components/mobile/MobileCodeHome";
+import { MobileSessionActivity } from "@/components/mobile/MobileSessionActivity";
 import { useStore } from "@/lib/store";
 import { reloadWindow } from "@/lib/browserActions";
 import { clearAllSnapshots } from "@/lib/sessionCacheDb";
@@ -15,7 +17,7 @@ const MIN_SIDEBAR_WIDTH = 180;
 const MAX_SIDEBAR_WIDTH = 400;
 const DEFAULT_SIDEBAR_WIDTH = 256;
 const REPO_URL = "https://github.com/shuaimu/apas";
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://apas.mpaxos.com";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://apas.mpaxos.com";
 const WEB_UI_VERSION = process.env.NEXT_PUBLIC_WEB_UI_VERSION || "00.00.0";
 
 // Helper to get/set per-project layout preferences
@@ -40,14 +42,36 @@ function setProjectLayout(cliClientId: string | null | undefined, key: string, v
   localStorage.setItem(getProjectLayoutKey(cliClientId, key), value);
 }
 
+function useMobileViewport(): boolean {
+  const [mobile, setMobile] = useState(false);
+
+  useEffect(() => {
+    const query = typeof window.matchMedia === "function"
+      ? window.matchMedia("(max-width: 767px)")
+      : null;
+    const update = () => setMobile(query ? query.matches : window.innerWidth < 768);
+    update();
+    if (query && typeof query.addEventListener === "function") {
+      query.addEventListener("change", update);
+      return () => query.removeEventListener("change", update);
+    }
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, []);
+
+  return mobile;
+}
+
 export default function Home() {
   const router = useRouter();
-  const { connected, connect, disconnect, sessionId, isAuthenticated, logout, token, userId, userEmail, clusterRole, serverVersion, cliClientId, cliClients, setUserEmail, setClusterIdentity } = useStore();
+  const { connected, connect, disconnect, sessionId, isAuthenticated, logout, token, userId, userEmail, clusterRole, serverVersion, cliClientId, cliClients, sessions, attachSession, listSessions, setUserEmail, setClusterIdentity } = useStore();
+  const isMobileViewport = useMobileViewport();
   const [isCheckingAuth, setIsCheckingAuth] = useState(true);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [isReconnecting, setIsReconnecting] = useState(false);
   const [clearCacheState, setClearCacheState] = useState<"idle" | "confirm" | "clearing">("idle");
+  const [mobileScreen, setMobileScreen] = useState<"home" | "session">("home");
   const reconnectConnectAttemptedRef = useRef(false);
 
   // Sidebar width state - per-project
@@ -198,6 +222,37 @@ export default function Home() {
 
   return (
     <div className="app-container flex overflow-hidden bg-background">
+      {isMobileViewport && (
+        <div className="flex h-full min-h-0 w-full flex-col md:hidden">
+          {mobileScreen === "home" ? (
+            <MobileCodeHome
+              active
+              connected={connected}
+              legacySessions={sessions}
+              token={token}
+              onAccount={() => setSettingsOpen(true)}
+              onManageMachines={() => router.push("/machines")}
+              onOpenSession={(targetSessionId) => {
+                attachSession(targetSessionId);
+                setMobileScreen("session");
+              }}
+            />
+          ) : (
+            <MobileSessionActivity
+              connected={connected}
+              onAccount={() => setSettingsOpen(true)}
+              onBack={() => {
+                setMobileScreen("home");
+                listSessions();
+              }}
+              onReconnect={handleReconnect}
+            />
+          )}
+        </div>
+      )}
+
+      {!isMobileViewport && (
+      <div className="hidden min-w-0 flex-1 overflow-hidden md:flex">
       {/* Mobile sidebar overlay */}
       {sidebarOpen && (
         <div
@@ -381,6 +436,8 @@ export default function Home() {
           />
         </main>
       </div>
+      </div>
+      )}
 
       {/* Settings Modal */}
       {settingsOpen && typeof document !== 'undefined' && createPortal(
@@ -434,7 +491,7 @@ export default function Home() {
                   </p>
                   <p className="text-sm">
                     <span className="text-gray-500 dark:text-gray-400">Server: </span>
-                    <span className="font-mono text-xs">{process.env.NEXT_PUBLIC_WS_URL || 'ws://apas.mpaxos.com'}</span>
+                    <span className="font-mono text-xs">{process.env.NEXT_PUBLIC_WS_URL || 'wss://apas.mpaxos.com'}</span>
                   </p>
                 </div>
               </div>

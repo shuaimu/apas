@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import { ALL_TAB_TYPES, isTabTypeAllowed, tabTypeKey } from "./tabTypes";
-import { PROVIDER_MODEL_GROUPS } from "./providerOptions";
 
 describe("tab type keys", () => {
   it("are kind:provider, matching shared::tab_type_key", () => {
@@ -26,22 +25,10 @@ describe("tab type keys", () => {
     expect(isTabTypeAllowed(["  Agent:Claude "], "agent", "claude")).toBe(false);
   });
 
-  it("covers every provider the add-tab menu can actually send", () => {
-    // The menu's agent providers are exactly the group providers. If a group
-    // is added without a matching tab type, its tabs become unrestrictable —
-    // an admin would untick everything and that provider would still appear.
-    const menuProviders = new Set(
-      PROVIDER_MODEL_GROUPS.flatMap((g) => g.options.map((o) => o.provider)),
-    );
-    const covered = new Set(
-      ALL_TAB_TYPES.filter((t) => t.kind === "agent").map((t) => t.provider),
-    );
-    for (const p of menuProviders) {
-      expect(covered.has(p), `no tab type covers menu provider "${p}"`).toBe(true);
-    }
-    // And nothing extra, which would be a checkbox with no menu entry behind it.
-    for (const p of covered) {
-      expect(menuProviders.has(p), `tab type "agent:${p}" has no menu entry`).toBe(true);
-    }
+  it("offers only the supported terminal hosts for new user panes", () => {
+    expect(ALL_TAB_TYPES.map((type) => type.key)).toEqual([
+      "terminal:claude",
+      "terminal:codex",
+    ]);
   });
 });

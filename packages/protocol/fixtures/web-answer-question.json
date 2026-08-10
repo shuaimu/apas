@@ -1,0 +1,6 @@
+{
+  "type": "answer_question",
+  "session_id": "20000000-0000-4000-8000-000000000001",
+  "tool_use_id": "tool-1",
+  "answers": { "Deploy now?": "Yes" }
+}

@@ -12,13 +12,45 @@ use shared::{
     TerminalLifecycle, WebToServer,
 };
 use std::collections::HashSet;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::mobile_metrics::MobileMetric;
 use crate::routes::auth::verify_token;
 use crate::state::AppState;
 
 const SERVER_VERSION: &str = env!("APAS_SERVER_VERSION");
+
+fn is_read_only_message(message: &WebToServer) -> bool {
+    matches!(
+        message,
+        WebToServer::Authenticate { .. }
+            | WebToServer::ListCliClients
+            | WebToServer::ListMachines
+            | WebToServer::AttachSession { .. }
+            | WebToServer::ListSessions
+            | WebToServer::GetSessionMessages { .. }
+            | WebToServer::DownloadSession { .. }
+            | WebToServer::RequestPaneDiff { .. }
+            | WebToServer::FetchTeamTodo { .. }
+            | WebToServer::FetchSuggestedWorkers { .. }
+            | WebToServer::TerminalAttach { .. }
+            | WebToServer::MobileTelemetry { .. }
+            | WebToServer::Heartbeat
+    )
+}
+
+fn protocol_mutations_allowed(
+    client_kind: Option<shared::ClientKind>,
+    protocol_version: Option<u32>,
+) -> bool {
+    !matches!(client_kind, Some(shared::ClientKind::Mobile))
+        || protocol_version.is_some_and(|version| {
+            (shared::MOBILE_PROTOCOL_MIN_VERSION..=shared::MOBILE_PROTOCOL_MAX_VERSION)
+                .contains(&version)
+        })
+}
 
 pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(|socket| handle_socket(socket, state))
@@ -340,7 +372,7 @@ async fn get_shared_project_access_refs(
     (host_path_refs, wildcard_paths)
 }
 
-async fn list_accessible_machines_for_user(
+pub(crate) async fn list_accessible_machines_for_user(
     state: &AppState,
     user_id: &Uuid,
 ) -> Vec<shared::MachineWithProjects> {
@@ -775,6 +807,91 @@ async fn send_policy_error(state: &AppState, connection_id: &Uuid, message: impl
         .await;
 }
 
+async fn send_mutation_ack(
+    state: &AppState,
+    connection_id: &Uuid,
+    request_id: Option<&str>,
+    session_id: Uuid,
+    pane_id: Option<u32>,
+    mutation: shared::MutationKind,
+    result: Result<(), impl Into<String>>,
+) {
+    let Some(request_id) = request_id else {
+        if let Err(error) = result {
+            state
+                .sessions
+                .send_to_web(
+                    connection_id,
+                    ServerToWeb::Error {
+                        message: error.into(),
+                    },
+                )
+                .await;
+        }
+        return;
+    };
+    let (accepted, error) = match result {
+        Ok(()) => (true, None),
+        Err(error) => (false, Some(error.into())),
+    };
+    state.mobile_metrics.increment(if accepted {
+        MobileMetric::MutationAccepted
+    } else {
+        MobileMetric::MutationRejected
+    });
+    tracing::info!(
+        mutation = ?mutation,
+        accepted,
+        has_pane = pane_id.is_some(),
+        "mobile-capable mutation acknowledged"
+    );
+    let acknowledgement = ServerToWeb::MutationAck {
+        request_id: request_id.to_string(),
+        session_id,
+        pane_id,
+        mutation,
+        accepted,
+        error,
+    };
+    if let Some(user_id) = state.sessions.get_web_user(connection_id) {
+        state.sessions.complete_mutation_request(
+            user_id,
+            request_id.to_string(),
+            acknowledgement.clone(),
+        );
+    }
+    state
+        .sessions
+        .send_to_web(connection_id, acknowledgement)
+        .await;
+}
+
+/// Returns true when the request is already in flight or its retained result
+/// was replayed, so the caller must not route the mutation again.
+async fn replay_or_claim_mutation_request(
+    state: &AppState,
+    connection_id: &Uuid,
+    request_id: Option<&str>,
+) -> bool {
+    let Some(request_id) = request_id else {
+        return false;
+    };
+    let Some(user_id) = state.sessions.get_web_user(connection_id) else {
+        return true;
+    };
+    match state.sessions.claim_mutation_request(user_id, request_id) {
+        crate::session::MutationRequestClaim::New => false,
+        crate::session::MutationRequestClaim::InFlight => true,
+        crate::session::MutationRequestClaim::Replay(acknowledgement) => {
+            state
+                .sessions
+                .send_to_web(connection_id, acknowledgement)
+                .await;
+            true
+        }
+    }
+}
+
 /// Load the latest effective policy for a launch-like mutation. Both ends of
 /// the data-plane must understand server-owned policy before a launch is
 /// routed; otherwise an older peer could silently apply local `.apas` state.
@@ -842,6 +959,33 @@ async fn effective_policy_for_launch(
     }
 }
 
+/// Reboot is also the upgrade escape hatch for CLIs that predate server-owned
+/// project policy. Keep the normal policy gate, but explain this bootstrap
+/// case directly instead of returning the generic "cannot launch panes"
+/// error, which left users with no actionable way forward.
+async fn effective_policy_for_cli_reboot(
+    state: &AppState,
+    connection_id: &Uuid,
+    session_id: &Uuid,
+) -> Option<shared::EffectiveProjectPolicy> {
+    if state
+        .sessions
+        .web_supports_capability(connection_id, shared::PROJECT_POLICY_CAPABILITY)
+        && !state
+            .sessions
+            .session_supports_capability(session_id, shared::PROJECT_POLICY_CAPABILITY)
+    {
+        send_policy_error(
+            state,
+            connection_id,
+            "This project CLI is too old to reboot from the web. Reboot the CLI manually on the project host to upgrade it, then try again.",
+        )
+        .await;
+        return None;
+    }
+    effective_policy_for_launch(state, connection_id, session_id).await
+}
+
 async fn authorize_profile_launch(
     state: &AppState,
     connection_id: &Uuid,
@@ -889,6 +1033,40 @@ async fn authorize_profile_launch(
     )
     .await;
     false
+}
+
+/// Authorize creation of a brand-new pane. Structured agent panes remain
+/// available to managed team roles and existing legacy panes can still be
+/// resumed/rebooted through `authorize_profile_launch`, but ordinary new work
+/// must use the terminal path.
+async fn authorize_new_pane_launch(
+    state: &AppState,
+    connection_id: &Uuid,
+    session_id: &Uuid,
+    kind: shared::PaneKind,
+    provider: shared::Provider,
+    model: Option<&str>,
+    managed: bool,
+) -> bool {
+    if !managed && kind == shared::PaneKind::Agent {
+        send_policy_error(
+            state,
+            connection_id,
+            "Conversation-only panes are retired. Create a Claude or Codex terminal pane instead.",
+        )
+        .await;
+        return false;
+    }
+    authorize_profile_launch(
+        state,
+        connection_id,
+        session_id,
+        kind,
+        provider,
+        model,
+        managed,
+    )
+    .await
 }
 
 async fn authorize_existing_pane_launch(
@@ -986,6 +1164,7 @@ mod retired_launch_authorization_tests {
         Uuid,
         mpsc::Receiver<ServerToWeb>,
         mpsc::Receiver<ServerToCli>,
+        Uuid,
     ) {
         let dir = std::env::temp_dir().join(format!("apas-retired-auth-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("temp db dir");
@@ -1041,12 +1220,13 @@ mod retired_launch_authorization_tests {
         state
             .sessions
             .set_cli_capabilities(cli_id, vec![shared::PROJECT_POLICY_CAPABILITY.to_string()]);
-        (state, connection_id, session_id, web_rx, cli_rx)
+        (state, connection_id, session_id, web_rx, cli_rx, cli_id)
     }
 
     #[tokio::test]
     async fn retired_profile_is_rejected_before_routing() {
-        let (state, connection_id, session_id, mut web_rx, mut cli_rx) = policy_state().await;
+        let (state, connection_id, session_id, mut web_rx, mut cli_rx, _cli_id) =
+            policy_state().await;
 
         assert!(
             !authorize_profile_launch(
@@ -1073,7 +1253,8 @@ mod retired_launch_authorization_tests {
 
     #[tokio::test]
     async fn retired_team_role_is_classified_before_policy_lookup() {
-        let (state, connection_id, _session_id, mut web_rx, mut cli_rx) = policy_state().await;
+        let (state, connection_id, _session_id, mut web_rx, mut cli_rx, _cli_id) =
+            policy_state().await;
         let role = shared::TeamRoleSpec {
             provider: Some(shared::Provider::Claude),
             model: Some("glm-5.1".to_string()),
@@ -1094,7 +1275,7 @@ mod retired_launch_authorization_tests {
 
     #[tokio::test]
     async fn retained_profile_remains_authorized() {
-        let (state, connection_id, session_id, mut web_rx, _cli_rx) = policy_state().await;
+        let (state, connection_id, session_id, mut web_rx, _cli_rx, _cli_id) = policy_state().await;
 
         assert!(
             authorize_profile_launch(
@@ -1110,6 +1291,73 @@ mod retired_launch_authorization_tests {
         );
         assert!(web_rx.try_recv().is_err());
     }
+
+    #[tokio::test]
+    async fn new_unmanaged_conversation_only_pane_is_rejected() {
+        let (state, connection_id, session_id, mut web_rx, mut cli_rx, _cli_id) =
+            policy_state().await;
+
+        assert!(
+            !authorize_new_pane_launch(
+                &state,
+                &connection_id,
+                &session_id,
+                shared::PaneKind::Agent,
+                shared::Provider::Claude,
+                None,
+                false,
+            )
+            .await
+        );
+
+        let ServerToWeb::Error { message } = web_rx.try_recv().expect("explicit web error") else {
+            panic!("expected retirement error")
+        };
+        assert!(message.contains("Conversation-only panes are retired"));
+        assert!(cli_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn new_terminal_pane_remains_authorized() {
+        let (state, connection_id, session_id, mut web_rx, _cli_rx, _cli_id) = policy_state().await;
+
+        assert!(
+            authorize_new_pane_launch(
+                &state,
+                &connection_id,
+                &session_id,
+                shared::PaneKind::Terminal,
+                shared::Provider::Codex,
+                None,
+                false,
+            )
+            .await
+        );
+        assert!(web_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_cli_reboot_returns_an_actionable_manual_reboot_error() {
+        let (state, connection_id, session_id, mut web_rx, mut cli_rx, cli_id) =
+            policy_state().await;
+        state.sessions.set_cli_capabilities(cli_id, Vec::new());
+
+        assert!(
+            effective_policy_for_cli_reboot(&state, &connection_id, &session_id)
+                .await
+                .is_none()
+        );
+
+        let ServerToWeb::Error { message } = web_rx.try_recv().expect("explicit web error") else {
+            panic!("expected manual reboot error")
+        };
+        assert!(message.contains("too old to reboot from the web"));
+        assert!(message.contains("Reboot the CLI manually"));
+        assert!(
+            cli_rx.try_recv().is_err(),
+            "an incompatible CLI must not receive the reboot command"
+        );
+    }
 }
 
 async fn resolve_target_session(
@@ -1123,6 +1371,26 @@ async fn resolve_target_session(
             .sessions
             .is_web_attached_to_session(&sid, connection_id)
         {
+            let still_authorized = match state.sessions.get_web_user(connection_id) {
+                Some(user_id) => state
+                    .db
+                    .check_session_access(&sid.to_string(), &user_id.to_string())
+                    .await
+                    .unwrap_or(false),
+                None => false,
+            };
+            if !still_authorized {
+                state
+                    .sessions
+                    .send_to_web(
+                        connection_id,
+                        ServerToWeb::Error {
+                            message: "Access denied".to_string(),
+                        },
+                    )
+                    .await;
+                return None;
+            }
             if state
                 .active_session_operation(&sid.to_string())
                 .await
@@ -1197,6 +1465,26 @@ async fn resolve_target_session(
         return None;
     }
     if let Some(sid) = fallback {
+        let still_authorized = match state.sessions.get_web_user(connection_id) {
+            Some(user_id) => state
+                .db
+                .check_session_access(&sid.to_string(), &user_id.to_string())
+                .await
+                .unwrap_or(false),
+            None => false,
+        };
+        if !still_authorized {
+            state
+                .sessions
+                .send_to_web(
+                    connection_id,
+                    ServerToWeb::Error {
+                        message: "Access denied".to_string(),
+                    },
+                )
+                .await;
+            return None;
+        }
         if state
             .active_session_operation(&sid.to_string())
             .await
@@ -1308,6 +1596,13 @@ async fn handle_web_input(
         let effective_pane_id =
             pane_id.or_else(|| pane_type.map(|p| shared::PaneConfig::pane_id_from_legacy(&p)));
         let created_at = chrono::Utc::now().to_rfc3339();
+        if let Err(error) = state
+            .db
+            .record_session_user_input(&sid.to_string(), &created_at)
+            .await
+        {
+            tracing::warn!(%error, session_id = %sid, "failed to record session user activity");
+        }
         let stored_message = crate::storage::StoredMessage {
             id: uuid::Uuid::new_v4().to_string(),
             role: "user".to_string(),
@@ -1371,6 +1666,187 @@ async fn handle_web_input(
     }
 }
 
+const TERMINAL_CONVERSATION_SUBMIT_DELAY: Duration = Duration::from_millis(100);
+
+fn terminal_conversation_frame(text: &str) -> String {
+    if text.contains('\n') {
+        format!("\u{1b}[200~{text}\u{1b}[201~")
+    } else {
+        text.to_string()
+    }
+}
+
+async fn handle_terminal_conversation_input(
+    state: &AppState,
+    connection_id: &Uuid,
+    fallback_session_id: Option<Uuid>,
+    msg_sid: Uuid,
+    pane_id: u32,
+    text: String,
+    client_msg_id: Option<String>,
+) {
+    let Some(sid) =
+        resolve_target_session(state, connection_id, Some(msg_sid), fallback_session_id).await
+    else {
+        return;
+    };
+    let Ok((_project_id, _project_guard)) = state.active_session_operation(&sid.to_string()).await
+    else {
+        return;
+    };
+
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        state
+            .sessions
+            .send_to_web(
+                connection_id,
+                ServerToWeb::Error {
+                    message: "Conversation messages cannot be empty".to_string(),
+                },
+            )
+            .await;
+        return;
+    }
+
+    // A mobile client retries an unacknowledged mutation. Re-ack the
+    // original persisted message without typing it into the TUI again.
+    if let Some(ref cmid) = client_msg_id {
+        if let Some(orig_created_at) = state.sessions.seen_input_id(&sid, cmid) {
+            state
+                .sessions
+                .send_to_web(
+                    connection_id,
+                    ServerToWeb::UserInput {
+                        session_id: sid,
+                        text,
+                        pane_type: None,
+                        pane_id: Some(pane_id),
+                        created_at: Some(orig_created_at),
+                        client_msg_id: client_msg_id.clone(),
+                    },
+                )
+                .await;
+            return;
+        }
+    }
+
+    let input_frame = terminal_conversation_frame(&text);
+    let input_b64 = base64::engine::general_purpose::STANDARD.encode(input_frame.as_bytes());
+    let input_sent = state
+        .sessions
+        .route_to_cli(
+            &sid,
+            ServerToCli::TerminalInput {
+                session_id: sid,
+                pane_id,
+                data_b64: input_b64,
+            },
+        )
+        .await;
+    if !input_sent {
+        state
+            .sessions
+            .send_to_web(
+                connection_id,
+                ServerToWeb::Error {
+                    message: "CLI client not connected".to_string(),
+                },
+            )
+            .await;
+        return;
+    }
+
+    // Full-screen TUIs can classify back-to-back bytes as a paste burst.
+    // Deliver Enter separately after the text has landed.
+    tokio::time::sleep(TERMINAL_CONVERSATION_SUBMIT_DELAY).await;
+    let submit_sent = state
+        .sessions
+        .route_to_cli(
+            &sid,
+            ServerToCli::TerminalInput {
+                session_id: sid,
+                pane_id,
+                data_b64: base64::engine::general_purpose::STANDARD.encode(b"\r"),
+            },
+        )
+        .await;
+    if !submit_sent {
+        state
+            .sessions
+            .send_to_web(
+                connection_id,
+                ServerToWeb::Error {
+                    message: "The text reached the terminal, but Enter could not be sent"
+                        .to_string(),
+                },
+            )
+            .await;
+        return;
+    }
+
+    let created_at = chrono::Utc::now().to_rfc3339();
+    if let Err(error) = state
+        .db
+        .record_session_user_input(&sid.to_string(), &created_at)
+        .await
+    {
+        tracing::warn!(%error, session_id = %sid, "failed to record terminal conversation activity");
+    }
+    let stored_message = crate::storage::StoredMessage {
+        id: Uuid::new_v4().to_string(),
+        role: "user".to_string(),
+        content: text.clone(),
+        message_type: "text".to_string(),
+        created_at: created_at.clone(),
+        pane_type: Some(pane_id.to_string()),
+    };
+    if let Err(error) = state.storage.append_message(&sid, &stored_message).await {
+        tracing::error!("Failed to save terminal conversation input: {error}");
+    }
+    if let Some(cmid) = client_msg_id.clone() {
+        state
+            .sessions
+            .record_input_id(sid, cmid, created_at.clone());
+    }
+    state
+        .sessions
+        .route_to_web(
+            &sid,
+            ServerToWeb::UserInput {
+                session_id: sid,
+                text,
+                pane_type: None,
+                pane_id: Some(pane_id),
+                created_at: Some(created_at),
+                client_msg_id,
+            },
+        )
+        .await;
+    // Terminal panes are opaque PTYs, so unlike structured agent panes they
+    // cannot announce inference start themselves. Mark the accepted turn as
+    // working immediately; the CLI transcript observer clears this when the
+    // assistant response is recorded (and terminal exit also clears it).
+    crate::routes::ws_cli::set_and_broadcast_pane_status(
+        state,
+        sid,
+        shared::PaneType::Interactive,
+        pane_id,
+        Some("Working...".to_string()),
+    )
+    .await;
+    crate::routes::ws_cli::record_and_broadcast_usage(
+        state,
+        sid,
+        Some(pane_id),
+        crate::db::UsageDelta {
+            prompt_count: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
 #[cfg(test)]
 mod reboot_route_tests {
     use super::*;
@@ -1399,6 +1875,11 @@ mod reboot_route_tests {
                 cluster_role: "user".to_string(),
                 account_status: "active".to_string(),
             })
+            .await
+            .unwrap();
+        state
+            .db
+            .authorize_project_registration(&session_id.to_string(), &user_id.to_string())
             .await
             .unwrap();
         state
@@ -1432,6 +1913,7 @@ mod reboot_route_tests {
 
         let (web_tx, _web_rx) = mpsc::channel(4);
         state.sessions.register_web(web_connection_id, web_tx);
+        state.sessions.set_web_user(web_connection_id, user_id);
         state
             .sessions
             .create_session(session_id, user_id, web_connection_id);
@@ -1476,6 +1958,7 @@ mod reboot_route_tests {
 
         let (web_tx, _web_rx) = mpsc::channel(4);
         state.sessions.register_web(web_connection_id, web_tx);
+        state.sessions.set_web_user(web_connection_id, user_id);
         state
             .sessions
             .create_session(session_id, user_id, web_connection_id);
@@ -1543,6 +2026,11 @@ mod web_input_route_tests {
             .unwrap();
         state
             .db
+            .authorize_project_registration(&session_id.to_string(), &user_id.to_string())
+            .await
+            .unwrap();
+        state
+            .db
             .create_session(&crate::db::Session {
                 id: session_id.to_string(),
                 user_id: user_id.to_string(),
@@ -1573,6 +2061,24 @@ mod web_input_route_tests {
                 assert_eq!(got_pane_id, pane_id);
             }
             other => panic!("expected Input message, got {other:?}"),
+        }
+    }
+
+    fn assert_terminal_input(msg: ServerToCli, session_id: Uuid, pane_id: u32, expected: &str) {
+        match msg {
+            ServerToCli::TerminalInput {
+                session_id: got_session_id,
+                pane_id: got_pane_id,
+                data_b64,
+            } => {
+                assert_eq!(got_session_id, session_id);
+                assert_eq!(got_pane_id, pane_id);
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data_b64)
+                    .expect("valid terminal input base64");
+                assert_eq!(String::from_utf8(bytes).unwrap(), expected);
+            }
+            other => panic!("expected TerminalInput message, got {other:?}"),
         }
     }
 
@@ -1609,6 +2115,16 @@ mod web_input_route_tests {
         panic!("no UserInput response found");
     }
 
+    fn next_pane_status(rx: &mut mpsc::Receiver<ServerToWeb>) -> ServerToWeb {
+        for _ in 0..8 {
+            let message = rx.try_recv().expect("web response");
+            if matches!(message, ServerToWeb::PaneStatus { .. }) {
+                return message;
+            }
+        }
+        panic!("no PaneStatus response found");
+    }
+
     async fn setup_connected_session() -> (
         AppState,
         Uuid,
@@ -1625,6 +2141,7 @@ mod web_input_route_tests {
 
         let (web_tx, web_rx) = mpsc::channel(8);
         state.sessions.register_web(web_connection_id, web_tx);
+        state.sessions.set_web_user(web_connection_id, user_id);
         state
             .sessions
             .create_session(session_id, user_id, web_connection_id);
@@ -1669,6 +2186,15 @@ mod web_input_route_tests {
             state
                 .sessions
                 .seen_input_id(&session_id, "client-1")
+                .as_deref(),
+            Some(created_at.as_str())
+        );
+        assert_eq!(
+            state
+                .db
+                .get_session_last_user_input_at(&session_id.to_string())
+                .await
+                .unwrap()
                 .as_deref(),
             Some(created_at.as_str())
         );
@@ -1749,6 +2275,97 @@ mod web_input_route_tests {
         assert_eq!(messages[1].content, "legacy two");
         assert_eq!(state.sessions.seen_input_id(&session_id, "legacy"), None);
     }
+
+    #[tokio::test]
+    async fn terminal_conversation_input_types_submits_persists_echoes_and_deduplicates() {
+        let (state, web_connection_id, session_id, mut cli_rx, mut web_rx) =
+            setup_connected_session().await;
+
+        handle_terminal_conversation_input(
+            &state,
+            &web_connection_id,
+            Some(session_id),
+            session_id,
+            9,
+            "  line one\nline two  ".to_string(),
+            Some("terminal-client-1".to_string()),
+        )
+        .await;
+
+        assert_terminal_input(
+            cli_rx.try_recv().expect("conversation text routed"),
+            session_id,
+            9,
+            "\u{1b}[200~line one\nline two\u{1b}[201~",
+        );
+        assert_terminal_input(
+            cli_rx.try_recv().expect("conversation submit routed"),
+            session_id,
+            9,
+            "\r",
+        );
+        let created_at = assert_user_input_echo(
+            next_user_input(&mut web_rx),
+            session_id,
+            "line one\nline two",
+            Some("terminal-client-1"),
+        );
+        assert!(matches!(
+            next_pane_status(&mut web_rx),
+            ServerToWeb::PaneStatus {
+                session_id: got_session_id,
+                pane_id: Some(9),
+                status: Some(ref status),
+                ..
+            } if got_session_id == session_id && status == "Working..."
+        ));
+        assert_eq!(
+            state.sessions.get_pane_statuses(&session_id),
+            vec![(shared::PaneType::Interactive, 9, "Working...".to_string())],
+        );
+        assert_eq!(
+            state
+                .sessions
+                .seen_input_id(&session_id, "terminal-client-1")
+                .as_deref(),
+            Some(created_at.as_str())
+        );
+
+        let stored = state
+            .storage
+            .get_messages(&session_id)
+            .await
+            .expect("stored terminal conversation message");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].role, "user");
+        assert_eq!(stored[0].content, "line one\nline two");
+        assert_eq!(stored[0].pane_type.as_deref(), Some("9"));
+
+        handle_terminal_conversation_input(
+            &state,
+            &web_connection_id,
+            Some(session_id),
+            session_id,
+            9,
+            "line one\nline two".to_string(),
+            Some("terminal-client-1".to_string()),
+        )
+        .await;
+        assert!(matches!(
+            cli_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_user_input_echo(
+            next_user_input(&mut web_rx),
+            session_id,
+            "line one\nline two",
+            Some("terminal-client-1"),
+        );
+        assert_eq!(
+            state.storage.get_messages(&session_id).await.unwrap().len(),
+            1
+        );
+    }
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
@@ -1777,6 +2394,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // User must authenticate before accessing other features
     let mut user_id: Option<Uuid> = None;
     let mut session_id: Option<Uuid> = None;
+    let mut mutations_allowed = true;
+    let mut mobile_device_session_id: Option<String> = None;
+    let mut is_mobile_client = false;
 
     tracing::info!("Web client connected: {}", connection_id);
 
@@ -1787,16 +2407,83 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 break;
             }
             let parsed: Result<WebToServer, _> = serde_json::from_str(&text);
+            if let (Some(uid), Some(device_session_id)) =
+                (user_id, mobile_device_session_id.as_deref())
+            {
+                let still_active = state
+                    .db
+                    .is_mobile_device_session_active(device_session_id, &uid.to_string())
+                    .await
+                    .unwrap_or(false);
+                if !still_active {
+                    state
+                        .sessions
+                        .send_to_web(
+                            &connection_id,
+                            ServerToWeb::AuthenticationFailed {
+                                reason: "Mobile device session is expired or revoked".to_string(),
+                            },
+                        )
+                        .await;
+                    break;
+                }
+            }
+            if user_id.is_some()
+                && !mutations_allowed
+                && parsed
+                    .as_ref()
+                    .is_ok_and(|message| !is_read_only_message(message))
+            {
+                state
+                    .sessions
+                    .send_to_web(
+                        &connection_id,
+                        ServerToWeb::Error {
+                            message: "This mobile build is read-only because its protocol version is incompatible. Update the app to make changes.".to_string(),
+                        },
+                    )
+                    .await;
+                continue;
+            }
             match parsed {
                 Ok(WebToServer::Authenticate {
                     token,
                     capabilities,
+                    client_kind,
+                    app_version,
+                    protocol_version,
                 }) => {
                     // Validate JWT token
                     match verify_token(&token, &state.config.auth.jwt_secret) {
                         Ok(claims) => {
                             match Uuid::parse_str(&claims.sub) {
                                 Ok(uid) => {
+                                    if let Some(device_session_id) =
+                                        claims.device_session_id.as_deref()
+                                    {
+                                        let active = claims.token_kind.as_deref()
+                                            == Some("mobile_access")
+                                            && state
+                                                .db
+                                                .is_mobile_device_session_active(
+                                                    device_session_id,
+                                                    &uid.to_string(),
+                                                )
+                                                .await
+                                                .unwrap_or(false);
+                                        if !active {
+                                            state
+                                                .sessions
+                                                .send_to_web(
+                                                    &connection_id,
+                                                    ServerToWeb::AuthenticationFailed {
+                                                        reason: "Mobile device session is expired or revoked".to_string(),
+                                                    },
+                                                )
+                                                .await;
+                                            continue;
+                                        }
+                                    }
                                     let cluster_user =
                                         match state.db.get_user_by_id(&uid.to_string()).await {
                                             Ok(Some(user)) if user.is_active() => user,
@@ -1846,13 +2533,49 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                                 continue;
                                             }
                                         };
+                                    mobile_device_session_id = claims.device_session_id.clone();
+                                    is_mobile_client =
+                                        matches!(client_kind, Some(shared::ClientKind::Mobile))
+                                            && mobile_device_session_id.is_some();
+                                    let mobile_protocol_compatible =
+                                        protocol_mutations_allowed(client_kind, protocol_version);
+                                    mutations_allowed = mobile_protocol_compatible;
+                                    let negotiated_capabilities = capabilities
+                                        .iter()
+                                        .filter(|capability| {
+                                            matches!(
+                                                capability.as_str(),
+                                                shared::PROJECT_POLICY_CAPABILITY
+                                                    | "mobile_bootstrap_v1"
+                                                    | "mobile_coding_mutations_v1"
+                                                    | "mobile_terminal_v1"
+                                                    | "mobile_notifications_v1"
+                                                    | "mobile_deep_links_v1"
+                                            )
+                                        })
+                                        .cloned()
+                                        .collect::<Vec<_>>();
                                     user_id = Some(uid);
                                     tracing::info!(
-                                        "Web client {} authenticated as user {}",
-                                        connection_id,
-                                        uid
+                                        connection_id = %connection_id,
+                                        user_id = %uid,
+                                        client_kind = ?client_kind,
+                                        app_version = app_version.as_deref().unwrap_or("unknown"),
+                                        protocol_version = ?protocol_version,
+                                        mutations_allowed,
+                                        "Web-compatible client authenticated"
                                     );
                                     state.sessions.set_web_user(connection_id, uid);
+                                    if is_mobile_client {
+                                        state
+                                            .mobile_metrics
+                                            .increment(MobileMetric::SocketAuthenticated);
+                                        if !mobile_protocol_compatible {
+                                            state
+                                                .mobile_metrics
+                                                .increment(MobileMetric::ProtocolIncompatible);
+                                        }
+                                    }
                                     state
                                         .sessions
                                         .set_web_capabilities(connection_id, capabilities);
@@ -1866,9 +2589,34 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                                 server_version: Some(SERVER_VERSION.to_string()),
                                                 cluster_role: cluster_user.cluster_role,
                                                 account_status: cluster_user.account_status,
+                                                protocol_version: protocol_version.filter(|_| {
+                                                    matches!(
+                                                        client_kind,
+                                                        Some(shared::ClientKind::Mobile)
+                                                    )
+                                                }),
+                                                negotiated_capabilities,
+                                                mutations_allowed,
                                             },
                                         )
                                         .await;
+
+                                    if !mobile_protocol_compatible {
+                                        state
+                                            .sessions
+                                            .send_to_web(
+                                                &connection_id,
+                                                ServerToWeb::ProtocolIncompatible {
+                                                    minimum_version:
+                                                        shared::MOBILE_PROTOCOL_MIN_VERSION,
+                                                    maximum_version:
+                                                        shared::MOBILE_PROTOCOL_MAX_VERSION,
+                                                    read_only: true,
+                                                    message: "Update APAS Mobile to restore coding actions. Read-only session access remains available.".to_string(),
+                                                },
+                                            )
+                                            .await;
+                                    }
 
                                     // Send cached usage limits for all CLI clients
                                     for (cli_id, provider, limits) in
@@ -2088,45 +2836,151 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 }
                 Ok(WebToServer::Approve {
                     session_id: msg_sid,
-                    tool_call_id: _,
+                    tool_call_id,
+                    pane_id,
+                    request_id,
                 }) => {
                     let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     else {
                         continue;
                     };
-                    state
+                    if replay_or_claim_mutation_request(
+                        &state,
+                        &connection_id,
+                        request_id.as_deref(),
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    let claimed = state.sessions.claim_pending_decision(
+                        sid,
+                        &tool_call_id,
+                        pane_id,
+                        shared::MutationKind::Approval,
+                    );
+                    if claimed.is_none() && request_id.is_some() {
+                        send_mutation_ack(
+                            &state,
+                            &connection_id,
+                            request_id.as_deref(),
+                            sid,
+                            pane_id,
+                            shared::MutationKind::Approval,
+                            Err("This approval was already resolved or is no longer current"),
+                        )
+                        .await;
+                        continue;
+                    }
+                    let target_pane = claimed
+                        .as_ref()
+                        .and_then(|decision| decision.pane_id)
+                        .or(pane_id);
+                    let routed = state
                         .sessions
                         .route_to_cli(
                             &sid,
                             ServerToCli::Input {
                                 session_id: sid,
                                 data: "y".to_string(),
-                                pane_id: None,
+                                pane_id: target_pane,
                             },
                         )
                         .await;
+                    if !routed {
+                        if let Some(decision) = claimed {
+                            state
+                                .sessions
+                                .restore_pending_decision(sid, tool_call_id, decision);
+                        }
+                    }
+                    send_mutation_ack(
+                        &state,
+                        &connection_id,
+                        request_id.as_deref(),
+                        sid,
+                        target_pane,
+                        shared::MutationKind::Approval,
+                        routed
+                            .then_some(())
+                            .ok_or("The project runtime is unavailable"),
+                    )
+                    .await;
                 }
                 Ok(WebToServer::Reject {
                     session_id: msg_sid,
-                    tool_call_id: _,
+                    tool_call_id,
+                    pane_id,
+                    request_id,
                 }) => {
                     let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     else {
                         continue;
                     };
-                    state
+                    if replay_or_claim_mutation_request(
+                        &state,
+                        &connection_id,
+                        request_id.as_deref(),
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    let claimed = state.sessions.claim_pending_decision(
+                        sid,
+                        &tool_call_id,
+                        pane_id,
+                        shared::MutationKind::Approval,
+                    );
+                    if claimed.is_none() && request_id.is_some() {
+                        send_mutation_ack(
+                            &state,
+                            &connection_id,
+                            request_id.as_deref(),
+                            sid,
+                            pane_id,
+                            shared::MutationKind::Approval,
+                            Err("This approval was already resolved or is no longer current"),
+                        )
+                        .await;
+                        continue;
+                    }
+                    let target_pane = claimed
+                        .as_ref()
+                        .and_then(|decision| decision.pane_id)
+                        .or(pane_id);
+                    let routed = state
                         .sessions
                         .route_to_cli(
                             &sid,
                             ServerToCli::Input {
                                 session_id: sid,
                                 data: "n".to_string(),
-                                pane_id: None,
+                                pane_id: target_pane,
                             },
                         )
                         .await;
+                    if !routed {
+                        if let Some(decision) = claimed {
+                            state
+                                .sessions
+                                .restore_pending_decision(sid, tool_call_id, decision);
+                        }
+                    }
+                    send_mutation_ack(
+                        &state,
+                        &connection_id,
+                        request_id.as_deref(),
+                        sid,
+                        target_pane,
+                        shared::MutationKind::Approval,
+                        routed
+                            .then_some(())
+                            .ok_or("The project runtime is unavailable"),
+                    )
+                    .await;
                 }
                 Ok(WebToServer::PauseDeadloop {
                     session_id: msg_sid,
@@ -2178,7 +3032,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
                         let Some(policy) =
-                            effective_policy_for_launch(&state, &connection_id, &sid).await
+                            effective_policy_for_cli_reboot(&state, &connection_id, &sid).await
                         else {
                             continue;
                         };
@@ -2223,10 +3077,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             continue;
                         }
                         tracing::info!("Rebooting CLI for session {}", sid);
-                        state
+                        let routed = state
                             .sessions
                             .route_to_cli(&sid, reboot_cli_message(sid))
                             .await;
+                        if !routed {
+                            send_policy_error(
+                                &state,
+                                &connection_id,
+                                "The CLI reboot request could not be delivered. Reboot the CLI manually on the project host, then try again.",
+                            )
+                            .await;
+                        }
                     }
                 }
                 Ok(WebToServer::StartMachineProjectCli {
@@ -2679,7 +3541,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
-                        if !authorize_profile_launch(
+                        if !authorize_new_pane_launch(
                             &state,
                             &connection_id,
                             &sid,
@@ -2729,6 +3591,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     session_id: sid,
                                     pane_config: pane_config.clone(),
                                     isolated_worktree,
+                                    initial_input: None,
                                 },
                             )
                             .await;
@@ -2822,14 +3685,43 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 Ok(WebToServer::InterruptPane {
                     session_id: msg_sid,
                     pane_id,
+                    request_id,
                 }) => {
                     let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     else {
                         continue;
                     };
+                    if replay_or_claim_mutation_request(
+                        &state,
+                        &connection_id,
+                        request_id.as_deref(),
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    if request_id.is_some()
+                        && !state
+                            .sessions
+                            .get_session_panes(&sid)
+                            .iter()
+                            .any(|pane| pane.pane_id == pane_id)
+                    {
+                        send_mutation_ack(
+                            &state,
+                            &connection_id,
+                            request_id.as_deref(),
+                            sid,
+                            Some(pane_id),
+                            shared::MutationKind::Interrupt,
+                            Err("This pane no longer exists or is not interruptible"),
+                        )
+                        .await;
+                        continue;
+                    }
                     tracing::info!("Interrupting pane {} in session {}", pane_id, sid);
-                    state
+                    let routed = state
                         .sessions
                         .route_to_cli(
                             &sid,
@@ -2839,32 +3731,95 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             },
                         )
                         .await;
+                    send_mutation_ack(
+                        &state,
+                        &connection_id,
+                        request_id.as_deref(),
+                        sid,
+                        Some(pane_id),
+                        shared::MutationKind::Interrupt,
+                        routed
+                            .then_some(())
+                            .ok_or("The project runtime is unavailable"),
+                    )
+                    .await;
                 }
                 Ok(WebToServer::PlanReviewAnswer {
                     session_id: msg_sid,
                     tool_use_id,
                     approve,
+                    pane_id,
+                    request_id,
                 }) => {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
+                        if replay_or_claim_mutation_request(
+                            &state,
+                            &connection_id,
+                            request_id.as_deref(),
+                        )
+                        .await
+                        {
+                            continue;
+                        }
+                        let claimed = state.sessions.claim_pending_decision(
+                            sid,
+                            &tool_use_id,
+                            pane_id,
+                            shared::MutationKind::PlanReview,
+                        );
+                        if claimed.is_none() && request_id.is_some() {
+                            send_mutation_ack(
+                                &state,
+                                &connection_id,
+                                request_id.as_deref(),
+                                sid,
+                                pane_id,
+                                shared::MutationKind::PlanReview,
+                                Err(
+                                    "This plan review was already resolved or is no longer current",
+                                ),
+                            )
+                            .await;
+                            continue;
+                        }
                         tracing::info!(
                             "Plan review answer for session {}: {} → {}",
                             sid,
                             tool_use_id,
                             approve,
                         );
-                        state
+                        let routed = state
                             .sessions
                             .route_to_cli(
                                 &sid,
                                 ServerToCli::PlanReviewAnswer {
                                     session_id: sid,
-                                    tool_use_id,
+                                    tool_use_id: tool_use_id.clone(),
                                     approve,
                                 },
                             )
                             .await;
+                        if !routed {
+                            if let Some(decision) = claimed {
+                                state
+                                    .sessions
+                                    .restore_pending_decision(sid, tool_use_id, decision);
+                            }
+                        }
+                        send_mutation_ack(
+                            &state,
+                            &connection_id,
+                            request_id.as_deref(),
+                            sid,
+                            pane_id,
+                            shared::MutationKind::PlanReview,
+                            routed
+                                .then_some(())
+                                .ok_or("The project runtime is unavailable"),
+                        )
+                        .await;
                     }
                 }
                 Ok(WebToServer::UpdatePaneReviewMode {
@@ -3052,6 +4007,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         )
                         .await;
                 }
+                Ok(WebToServer::TerminalConversationInput {
+                    session_id: msg_sid,
+                    pane_id,
+                    text,
+                    client_msg_id,
+                }) => {
+                    handle_terminal_conversation_input(
+                        &state,
+                        &connection_id,
+                        session_id,
+                        msg_sid,
+                        pane_id,
+                        text,
+                        client_msg_id,
+                    )
+                    .await;
+                }
                 Ok(WebToServer::TerminalResize {
                     session_id: msg_sid,
                     pane_id,
@@ -3087,11 +4059,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     else {
                         continue;
                     };
+                    if is_mobile_client {
+                        state.mobile_metrics.increment(MobileMetric::TerminalAttach);
+                    }
                     // Answered straight from the server's ring buffer — no
                     // CLI round-trip, so reattach paints instantly and works
                     // even while the CLI is mid-reconnect.
+                    let retained_snapshot = state.sessions.terminal_snapshot(&sid, pane_id);
+                    if is_mobile_client && retained_snapshot.is_none() {
+                        state
+                            .mobile_metrics
+                            .increment(MobileMetric::TerminalAttachEmpty);
+                    }
                     let (data_b64, seq, truncated, instance_id, lifecycle, status) =
-                        match state.sessions.terminal_snapshot(&sid, pane_id) {
+                        match retained_snapshot {
                             Some(snapshot) => (
                                 base64::engine::general_purpose::STANDARD.encode(&snapshot.bytes),
                                 snapshot.seq,
@@ -3130,6 +4111,24 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         )
                         .await;
                 }
+                Ok(WebToServer::MobileTelemetry { event }) => {
+                    if !is_mobile_client {
+                        continue;
+                    }
+                    let metric = match event {
+                        shared::MobileTelemetryEvent::TerminalBridgeReady => {
+                            MobileMetric::TerminalBridgeReady
+                        }
+                        shared::MobileTelemetryEvent::TerminalBridgeRejectedMessage => {
+                            MobileMetric::TerminalBridgeRejectedMessage
+                        }
+                        shared::MobileTelemetryEvent::TerminalBridgeCrash => {
+                            MobileMetric::TerminalBridgeCrash
+                        }
+                    };
+                    state.mobile_metrics.increment(metric);
+                    tracing::info!(event = ?event, "mobile terminal bridge health event");
+                }
                 Ok(WebToServer::PromotePaneToManaged {
                     session_id: msg_sid,
                     pane_id,
@@ -3140,6 +4139,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     else {
                         continue;
                     };
+                    let pane = state
+                        .sessions
+                        .get_session_panes(&sid)
+                        .into_iter()
+                        .find(|pane| pane.pane_id == pane_id);
+                    if pane.is_some_and(|pane| pane.kind == shared::PaneKind::Terminal) {
+                        send_policy_error(
+                            &state,
+                            &connection_id,
+                            "Terminal panes cannot join a managed team",
+                        )
+                        .await;
+                        continue;
+                    }
                     tracing::info!("Promote pane {} → managed for session {}", pane_id, sid);
                     state
                         .sessions
@@ -3336,6 +4349,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 Ok(WebToServer::AnswerQuestion {
                     session_id: msg_sid,
                     tool_use_id,
+                    pane_id,
+                    request_id,
                     answers,
                 }) => {
                     // Relay the user's AskUserQuestion answers down to the CLI
@@ -3352,23 +4367,70 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
+                        if replay_or_claim_mutation_request(
+                            &state,
+                            &connection_id,
+                            request_id.as_deref(),
+                        )
+                        .await
+                        {
+                            continue;
+                        }
+                        let claimed = state.sessions.claim_pending_decision(
+                            sid,
+                            &tool_use_id,
+                            pane_id,
+                            shared::MutationKind::Question,
+                        );
+                        if claimed.is_none() && request_id.is_some() {
+                            send_mutation_ack(
+                                &state,
+                                &connection_id,
+                                request_id.as_deref(),
+                                sid,
+                                pane_id,
+                                shared::MutationKind::Question,
+                                Err("This question was already answered or is no longer current"),
+                            )
+                            .await;
+                            continue;
+                        }
                         tracing::info!(
                             tool_use_id = tool_use_id.as_str(),
                             answer_count = answers.len(),
                             "Forwarding AskUserQuestion answers to CLI for session {}",
                             sid
                         );
-                        state
+                        let routed = state
                             .sessions
                             .route_to_cli(
                                 &sid,
                                 ServerToCli::AnswerQuestion {
                                     session_id: sid,
-                                    tool_use_id,
+                                    tool_use_id: tool_use_id.clone(),
                                     answers,
                                 },
                             )
                             .await;
+                        if !routed {
+                            if let Some(decision) = claimed {
+                                state
+                                    .sessions
+                                    .restore_pending_decision(sid, tool_use_id, decision);
+                            }
+                        }
+                        send_mutation_ack(
+                            &state,
+                            &connection_id,
+                            request_id.as_deref(),
+                            sid,
+                            pane_id,
+                            shared::MutationKind::Question,
+                            routed
+                                .then_some(())
+                                .ok_or("The project runtime is unavailable"),
+                        )
+                        .await;
                     }
                 }
                 Ok(WebToServer::UpdatePaneEffort {
@@ -4129,6 +5191,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     // dropped messages for slow panes when fast panes had advanced
                     // the watermark past their tails. Both flag `catchup: true`.
                     let is_catchup = after_created_at.is_some() || pane_watermarks.is_some();
+                    if is_mobile_client && is_catchup {
+                        state.mobile_metrics.increment(MobileMetric::CatchupRequest);
+                        tracing::info!(
+                            per_pane = pane_watermarks.is_some(),
+                            "mobile timeline catch-up requested"
+                        );
+                    }
                     let is_initial_load =
                         !is_catchup && before_id.is_none() && effective_pane_filter.is_none();
                     let fetch_result = if let Some(watermarks) = pane_watermarks.as_ref() {
@@ -4287,12 +5356,77 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     }
 
-    // Cleanup: abort send_task first so the channel receiver is dropped,
-    // preventing deadlock if a sender is awaiting on a full channel
-    // while unregister_web tries to acquire a write lock on the same DashMap shard.
-    send_task.abort();
+    // Remove the registry-held sender first so the outbound task can drain any
+    // final authentication/access failure already queued for this client. All
+    // routing helpers clone and release their DashMap reference before await,
+    // so unregistering cannot deadlock with a full channel. Bound the drain in
+    // case another transient sender clone or a stalled transport remains.
     state.sessions.unregister_web(&connection_id);
+    let mut send_task = send_task;
+    if tokio::time::timeout(std::time::Duration::from_millis(250), &mut send_task)
+        .await
+        .is_err()
+    {
+        send_task.abort();
+    }
     tracing::info!("Web client disconnected: {}", connection_id);
+}
+
+#[cfg(test)]
+mod mobile_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_and_current_web_clients_keep_mutation_access() {
+        assert!(protocol_mutations_allowed(None, None));
+        assert!(protocol_mutations_allowed(
+            Some(shared::ClientKind::Web),
+            Some(999)
+        ));
+    }
+
+    #[test]
+    fn incompatible_mobile_clients_are_read_only() {
+        assert!(!protocol_mutations_allowed(
+            Some(shared::ClientKind::Mobile),
+            None
+        ));
+        assert!(!protocol_mutations_allowed(
+            Some(shared::ClientKind::Mobile),
+            Some(shared::MOBILE_PROTOCOL_MAX_VERSION + 1)
+        ));
+        assert!(protocol_mutations_allowed(
+            Some(shared::ClientKind::Mobile),
+            Some(shared::MOBILE_PROTOCOL_MIN_VERSION)
+        ));
+    }
+
+    #[test]
+    fn read_only_allowlist_excludes_mutations() {
+        assert!(is_read_only_message(&WebToServer::ListSessions));
+        assert!(is_read_only_message(&WebToServer::TerminalAttach {
+            session_id: Uuid::nil(),
+            pane_id: 1,
+        }));
+        assert!(is_read_only_message(&WebToServer::MobileTelemetry {
+            event: shared::MobileTelemetryEvent::TerminalBridgeReady,
+        }));
+        assert!(!is_read_only_message(&WebToServer::Input {
+            session_id: Some(Uuid::nil()),
+            text: "change it".to_string(),
+            pane_type: None,
+            pane_id: Some(1),
+            client_msg_id: Some("request-1".to_string()),
+        }));
+        assert!(!is_read_only_message(
+            &WebToServer::TerminalConversationInput {
+                session_id: Uuid::nil(),
+                pane_id: 1,
+                text: "change it".to_string(),
+                client_msg_id: Some("request-2".to_string()),
+            }
+        ));
+    }
 }
 
 /// Who may change project-level settings.

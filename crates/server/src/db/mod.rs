@@ -24,6 +24,29 @@ enum OwnershipTransferPolicy {
     CurrentOwner,
 }
 
+const LEGACY_PROJECT_ACCESS_MIGRATION: &str = "legacy_project_access_v1";
+
+fn admin_project_name(working_dir: Option<&str>, git_remote: Option<&str>) -> Option<String> {
+    working_dir
+        .and_then(|path| {
+            path.trim()
+                .trim_end_matches(['/', '\\'])
+                .rsplit(['/', '\\'])
+                .find(|segment| !segment.is_empty())
+        })
+        .or_else(|| {
+            git_remote.and_then(|remote| {
+                remote
+                    .trim()
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .find(|segment| !segment.is_empty())
+            })
+        })
+        .map(|name| name.strip_suffix(".git").unwrap_or(name).to_string())
+        .filter(|name| !name.is_empty())
+}
+
 impl Database {
     pub async fn new(path: &str) -> Result<Self> {
         // Ensure the directory exists
@@ -61,6 +84,17 @@ impl Database {
     }
 
     pub async fn run_migrations(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                name TEXT PRIMARY KEY,
+                applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS users (
@@ -119,6 +153,73 @@ impl Database {
 
         sqlx::query(
             r#"
+            CREATE TABLE IF NOT EXISTS mobile_installations (
+                installation_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                platform TEXT NOT NULL CHECK (platform IN ('ios', 'android')),
+                device_name TEXT,
+                app_version TEXT NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_mobile_installations_user ON mobile_installations(user_id, updated_at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS mobile_device_sessions (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                installation_id TEXT NOT NULL REFERENCES mobile_installations(installation_id) ON DELETE CASCADE,
+                refresh_token_hash TEXT NOT NULL UNIQUE,
+                app_version TEXT NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                expires_at DATETIME NOT NULL,
+                revoked_at DATETIME,
+                revocation_reason TEXT
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_mobile_device_sessions_user_active ON mobile_device_sessions(user_id, revoked_at, expires_at)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_mobile_device_sessions_installation ON mobile_device_sessions(installation_id, created_at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS mobile_refresh_token_history (
+                token_hash TEXT PRIMARY KEY,
+                device_session_id TEXT NOT NULL REFERENCES mobile_device_sessions(id) ON DELETE CASCADE,
+                consumed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_mobile_refresh_history_session ON mobile_refresh_token_history(device_session_id, consumed_at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
             CREATE TABLE IF NOT EXISTS cli_clients (
                 id TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL REFERENCES users(id),
@@ -170,6 +271,12 @@ impl Database {
             .await;
         // Raw cloneable origin URL (for the create-instance feature).
         let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN git_remote_url TEXT")
+            .execute(&self.pool)
+            .await;
+        // User-driven recency is tracked separately from lifecycle updates so
+        // reconnects, pauses, and agent output cannot displace the session the
+        // user most recently messaged in mobile session lists.
+        let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN last_user_input_at TEXT")
             .execute(&self.pool)
             .await;
         // Backfill project_id for rows that pre-date the column. Until now,
@@ -438,6 +545,143 @@ impl Database {
             .execute(&self.pool)
             .await?;
 
+        // Mobile notification state is installation-scoped. Device-session
+        // revocation removes push reachability immediately through the trigger
+        // below, regardless of which credential-revocation path fired.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS mobile_push_tokens (
+                id TEXT PRIMARY KEY,
+                installation_id TEXT NOT NULL REFERENCES mobile_installations(installation_id) ON DELETE CASCADE,
+                device_session_id TEXT NOT NULL REFERENCES mobile_device_sessions(id) ON DELETE CASCADE,
+                platform TEXT NOT NULL CHECK (platform IN ('ios', 'android')),
+                token TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                retired_at DATETIME,
+                retirement_reason TEXT
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_mobile_push_installation_active ON mobile_push_tokens(installation_id, retired_at)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_mobile_push_session ON mobile_push_tokens(device_session_id)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS mobile_notification_preferences (
+                installation_id TEXT PRIMARY KEY REFERENCES mobile_installations(installation_id) ON DELETE CASCADE,
+                decisions INTEGER NOT NULL DEFAULT 1,
+                failures INTEGER NOT NULL DEFAULT 1,
+                pull_requests INTEGER NOT NULL DEFAULT 1,
+                completions INTEGER NOT NULL DEFAULT 0,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS mobile_notification_events (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+                session_id TEXT,
+                pane_id INTEGER,
+                category TEXT NOT NULL CHECK (category IN ('decision', 'failure', 'pull_request', 'completion')),
+                routing_id TEXT NOT NULL,
+                dedupe_key TEXT NOT NULL UNIQUE,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_mobile_notification_events_user_created ON mobile_notification_events(user_id, created_at)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS mobile_notification_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL REFERENCES mobile_notification_events(id) ON DELETE CASCADE,
+                push_token_id TEXT NOT NULL REFERENCES mobile_push_tokens(id) ON DELETE CASCADE,
+                status TEXT NOT NULL DEFAULT 'queued',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                provider_ticket_id TEXT,
+                provider_error TEXT,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(event_id, push_token_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_mobile_notification_delivery_retry ON mobile_notification_deliveries(status, next_attempt_at, id)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            r#"
+            CREATE TRIGGER IF NOT EXISTS mobile_device_session_push_cleanup
+            AFTER UPDATE OF revoked_at ON mobile_device_sessions
+            WHEN NEW.revoked_at IS NOT NULL
+            BEGIN
+                DELETE FROM mobile_push_tokens WHERE device_session_id = NEW.id;
+            END
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE TRIGGER IF NOT EXISTS mobile_notification_session_cleanup
+            AFTER DELETE ON sessions
+            BEGIN
+                DELETE FROM mobile_notification_events WHERE session_id = OLD.id;
+            END
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Mobile task launch results are retained independently of an HTTP
+        // connection. The instruction is deliberately not stored: the keyed
+        // request fingerprint is enough to reject request-id reuse without
+        // adding prompt content to the control-plane database.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS mobile_task_launches (
+                request_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                device_session_id TEXT NOT NULL REFERENCES mobile_device_sessions(id) ON DELETE CASCADE,
+                request_fingerprint TEXT NOT NULL,
+                machine_id TEXT NOT NULL,
+                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed', 'failed')),
+                session_id TEXT,
+                pane_id INTEGER,
+                error_message TEXT,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_mobile_task_launch_user_created ON mobile_task_launches(user_id, created_at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Canonicalize all historical runtime sessions into durable projects.
         // The earliest session owns the project; other historical owners keep
         // access as ordinary members and are surfaced in the audit log.
@@ -459,21 +703,9 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        sqlx::query(
-            r#"
-            INSERT OR IGNORE INTO project_members (project_id, user_id, invited_by, created_at)
-            SELECT DISTINCT COALESCE(s.project_id, s.id), s.user_id, p.owner_user_id, s.created_at
-            FROM sessions s
-            JOIN projects p ON p.id = COALESCE(s.project_id, s.id)
-            WHERE s.user_id != p.owner_user_id
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // Preserve every historical owner as a member, but make the
-        // deterministic earliest-session choice visible to administrators.
-        // The NOT EXISTS guard makes rerunning the additive migration safe.
+        // Make conflicting historical owners visible to administrators. The
+        // access import itself is versioned below so runtime history cannot
+        // keep acting as an authorization source after the initial upgrade.
         sqlx::query(
             r#"
             INSERT INTO admin_audit_events
@@ -494,19 +726,6 @@ impl Database {
                      AND a.target_type = 'project'
                      AND a.target_id = p.id
                )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            INSERT OR IGNORE INTO project_members (project_id, user_id, invited_by, created_at)
-            SELECT DISTINCT COALESCE(s.project_id, s.id), ss.user_id, ss.invited_by, ss.created_at
-            FROM session_shares ss
-            JOIN sessions s ON s.id = ss.session_id
-            JOIN projects p ON p.id = COALESCE(s.project_id, s.id)
-            WHERE ss.user_id != p.owner_user_id
             "#,
         )
         .execute(&self.pool)
@@ -578,8 +797,126 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        self.migrate_legacy_project_access_once().await?;
+
         tracing::info!("Database migrations completed");
         Ok(())
+    }
+
+    /// Import access from the pre-project session tables exactly once.
+    ///
+    /// Historical sessions are evidence for the initial migration, not an
+    /// ongoing authorization source. Rerunning these inserts after a user
+    /// leaves or is removed would silently restore their project membership.
+    /// The marker and the data changes share one transaction, so a failed
+    /// migration can be retried without leaving a false completion record.
+    async fn migrate_legacy_project_access_once(&self) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let should_run = sqlx::query("INSERT OR IGNORE INTO schema_migrations (name) VALUES (?)")
+            .bind(LEGACY_PROJECT_ACCESS_MIGRATION)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+            > 0;
+
+        if !should_run {
+            tx.commit().await?;
+            return Ok(false);
+        }
+
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO project_members (project_id, user_id, invited_by, created_at)
+            SELECT DISTINCT COALESCE(s.project_id, s.id), s.user_id, p.owner_user_id, s.created_at
+            FROM sessions s
+            JOIN projects p ON p.id = COALESCE(s.project_id, s.id)
+            WHERE s.user_id != p.owner_user_id
+            "#,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO project_members (project_id, user_id, invited_by, created_at)
+            SELECT DISTINCT COALESCE(s.project_id, s.id), ss.user_id, ss.invited_by, ss.created_at
+            FROM session_shares ss
+            JOIN sessions s ON s.id = ss.session_id
+            JOIN projects p ON p.id = COALESCE(s.project_id, s.id)
+            WHERE ss.user_id != p.owner_user_id
+            "#,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        // Installations that already ran the formerly-unbounded backfill may
+        // contain resurrected rows. The audit log is authoritative for these
+        // rows: remove a membership only when its latest access-changing event
+        // is a departure/removal. A later invitation, explicit add, or owner
+        // transfer therefore remains intact.
+        let repaired = sqlx::query(
+            r#"
+            DELETE FROM project_members
+            WHERE EXISTS (
+                SELECT 1
+                FROM admin_audit_events departure
+                WHERE departure.project_id = project_members.project_id
+                  AND departure.target_id = project_members.user_id
+                  AND departure.action IN ('project.member_left', 'project.member_removed')
+                  AND departure.id = (
+                      SELECT MAX(event.id)
+                      FROM admin_audit_events event
+                      WHERE event.project_id = project_members.project_id
+                        AND (
+                            (
+                                event.action IN (
+                                    'project.member_added',
+                                    'project.member_left',
+                                    'project.member_removed'
+                                )
+                                AND (
+                                    event.target_id = project_members.user_id
+                                    OR (
+                                        event.action = 'project.member_added'
+                                        AND json_extract(
+                                            CASE WHEN json_valid(event.details)
+                                                 THEN event.details ELSE '{}' END,
+                                            '$.user_id'
+                                        ) = project_members.user_id
+                                    )
+                                )
+                            )
+                            OR (
+                                event.action = 'project.owner_transferred'
+                                AND (
+                                    json_extract(
+                                        CASE WHEN json_valid(event.details)
+                                             THEN event.details ELSE '{}' END,
+                                        '$.from'
+                                    ) = project_members.user_id
+                                    OR json_extract(
+                                        CASE WHEN json_valid(event.details)
+                                             THEN event.details ELSE '{}' END,
+                                        '$.to'
+                                    ) = project_members.user_id
+                                )
+                            )
+                        )
+                  )
+            )
+            "#,
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        tx.commit().await?;
+        tracing::info!(
+            migration = LEGACY_PROJECT_ACCESS_MIGRATION,
+            repaired_memberships = repaired,
+            "completed one-time legacy project access migration"
+        );
+        Ok(true)
     }
 
     /// Remove decode-only provider profiles from persisted policy without
@@ -696,12 +1033,888 @@ impl Database {
     }
 
     pub async fn update_user_password(&self, email: &str, password_hash: &str) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let user_id = sqlx::query_scalar::<_, String>("SELECT id FROM users WHERE email = ?")
+            .bind(email)
+            .fetch_optional(&mut *tx)
+            .await?;
         let result = sqlx::query("UPDATE users SET password_hash = ? WHERE email = ?")
             .bind(password_hash)
             .bind(email)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        if let Some(user_id) = user_id {
+            sqlx::query(
+                "UPDATE mobile_device_sessions SET revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP), revocation_reason = COALESCE(revocation_reason, 'password_reset') WHERE user_id = ? AND revoked_at IS NULL",
+            )
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_mobile_device_session(
+        &self,
+        id: &str,
+        user_id: &str,
+        installation_id: &str,
+        platform: &str,
+        device_name: Option<&str>,
+        app_version: &str,
+        refresh_token_hash: &str,
+        expires_at: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let existing_user = sqlx::query_scalar::<_, String>(
+            "SELECT user_id FROM mobile_installations WHERE installation_id = ?",
+        )
+        .bind(installation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        anyhow::ensure!(
+            existing_user.as_deref().is_none() || existing_user.as_deref() == Some(user_id),
+            "installation is already registered to another user"
+        );
+        sqlx::query(
+            r#"
+            INSERT INTO mobile_installations
+                (installation_id, user_id, platform, device_name, app_version)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(installation_id) DO UPDATE SET
+                platform = excluded.platform,
+                device_name = excluded.device_name,
+                app_version = excluded.app_version,
+                updated_at = CURRENT_TIMESTAMP
+            "#,
+        )
+        .bind(installation_id)
+        .bind(user_id)
+        .bind(platform)
+        .bind(device_name)
+        .bind(app_version)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE mobile_device_sessions SET revoked_at = CURRENT_TIMESTAMP, revocation_reason = 'superseded_login' WHERE installation_id = ? AND revoked_at IS NULL",
+        )
+        .bind(installation_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO mobile_device_sessions
+                (id, user_id, installation_id, refresh_token_hash, app_version, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(installation_id)
+        .bind(refresh_token_hash)
+        .bind(app_version)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn get_mobile_device_session(
+        &self,
+        id: &str,
+    ) -> Result<Option<MobileDeviceSessionRecord>> {
+        Ok(sqlx::query_as::<_, MobileDeviceSessionRecord>(
+            r#"
+            SELECT s.id, s.user_id, s.installation_id, i.platform, i.device_name,
+                   s.app_version, s.created_at, s.last_used_at, s.expires_at,
+                   s.revoked_at, s.revocation_reason
+            FROM mobile_device_sessions s
+            JOIN mobile_installations i ON i.installation_id = s.installation_id
+            WHERE s.id = ?
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn list_mobile_device_sessions(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<MobileDeviceSessionRecord>> {
+        Ok(sqlx::query_as::<_, MobileDeviceSessionRecord>(
+            r#"
+            SELECT s.id, s.user_id, s.installation_id, i.platform, i.device_name,
+                   s.app_version, s.created_at, s.last_used_at, s.expires_at,
+                   s.revoked_at, s.revocation_reason
+            FROM mobile_device_sessions s
+            JOIN mobile_installations i ON i.installation_id = s.installation_id
+            WHERE s.user_id = ?
+            ORDER BY s.created_at DESC
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn is_mobile_device_session_active(&self, id: &str, user_id: &str) -> Result<bool> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM mobile_device_sessions WHERE id = ? AND user_id = ? AND revoked_at IS NULL AND datetime(expires_at) > datetime('now')",
+        )
+        .bind(id)
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count == 1)
+    }
+
+    pub async fn mobile_refresh_token_matches(
+        &self,
+        session_id: &str,
+        refresh_token_hash: &str,
+    ) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM mobile_device_sessions WHERE id = ? AND refresh_token_hash = ? AND revoked_at IS NULL AND datetime(expires_at) > datetime('now')",
+        )
+        .bind(session_id)
+        .bind(refresh_token_hash)
+        .fetch_one(&self.pool)
+        .await?
+            == 1)
+    }
+
+    pub async fn rotate_mobile_refresh_token(
+        &self,
+        current_hash: &str,
+        installation_id: &str,
+        new_hash: &str,
+    ) -> Result<Result<MobileDeviceSessionRecord, MobileRefreshFailure>> {
+        let mut tx = self.pool.begin().await?;
+        // Make the compare-and-swap the transaction's first statement. Two
+        // deferred SQLite transactions that both read before writing can form
+        // snapshots that cannot be upgraded, yielding SQLITE_BUSY immediately
+        // despite busy_timeout. Beginning with the write serializes refresh
+        // races and lets the loser inspect the winner's committed history.
+        let updated = sqlx::query(
+            r#"UPDATE mobile_device_sessions
+               SET refresh_token_hash = ?, last_used_at = CURRENT_TIMESTAMP
+               WHERE refresh_token_hash = ?
+                 AND installation_id = ?
+                 AND revoked_at IS NULL
+                 AND datetime(expires_at) > datetime('now')"#,
+        )
+        .bind(new_hash)
+        .bind(current_hash)
+        .bind(installation_id)
+        .execute(&mut *tx)
+        .await?;
+
+        if updated.rows_affected() == 1 {
+            let session_id = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM mobile_device_sessions WHERE refresh_token_hash = ?",
+            )
+            .bind(new_hash)
+            .fetch_one(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO mobile_refresh_token_history (token_hash, device_session_id) VALUES (?, ?)",
+            )
+            .bind(current_hash)
+            .bind(&session_id)
+            .execute(&mut *tx)
+            .await?;
+            let record = sqlx::query_as::<_, MobileDeviceSessionRecord>(
+                r#"
+                SELECT s.id, s.user_id, s.installation_id, i.platform, i.device_name,
+                       s.app_version, s.created_at, s.last_used_at, s.expires_at,
+                       s.revoked_at, s.revocation_reason
+                FROM mobile_device_sessions s
+                JOIN mobile_installations i ON i.installation_id = s.installation_id
+                WHERE s.id = ?
+                "#,
+            )
+            .bind(&session_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(Ok(record));
+        }
+
+        let row: Option<(String, String, Option<String>, String)> = sqlx::query_as(
+            "SELECT id, installation_id, revoked_at, expires_at FROM mobile_device_sessions WHERE refresh_token_hash = ?",
+        )
+        .bind(current_hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((session_id, bound_installation, revoked_at, expires_at)) = row {
+            if bound_installation != installation_id {
+                sqlx::query(
+                    "UPDATE mobile_device_sessions SET revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP), revocation_reason = 'installation_mismatch' WHERE id = ?",
+                )
+                .bind(&session_id)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                return Ok(Err(MobileRefreshFailure::InstallationMismatch));
+            }
+            if revoked_at.is_some() {
+                tx.commit().await?;
+                return Ok(Err(MobileRefreshFailure::Revoked));
+            }
+            let expires = chrono::DateTime::parse_from_rfc3339(&expires_at)
+                .map(|value| value.with_timezone(&chrono::Utc))
+                .ok();
+            if expires.is_none_or(|value| value <= chrono::Utc::now()) {
+                sqlx::query(
+                    "UPDATE mobile_device_sessions SET revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP), revocation_reason = 'expired' WHERE id = ?",
+                )
+                .bind(&session_id)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                return Ok(Err(MobileRefreshFailure::Expired));
+            }
+
+            // A matching active row that lost the compare-and-swap is a
+            // concurrent-use signal. Revoke it rather than guessing which
+            // caller should retain the credential.
+            sqlx::query(
+                "UPDATE mobile_device_sessions SET revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP), revocation_reason = 'concurrent_refresh_reuse' WHERE id = ?",
+            )
+            .bind(&session_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(Err(MobileRefreshFailure::Reused));
+        }
+
+        let reused_session = sqlx::query_scalar::<_, String>(
+            "SELECT device_session_id FROM mobile_refresh_token_history WHERE token_hash = ?",
+        )
+        .bind(current_hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let failure = if let Some(session_id) = reused_session {
+            sqlx::query(
+                "UPDATE mobile_device_sessions SET revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP), revocation_reason = 'refresh_token_reuse' WHERE id = ?",
+            )
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+            MobileRefreshFailure::Reused
+        } else {
+            MobileRefreshFailure::Invalid
+        };
+        tx.commit().await?;
+        Ok(Err(failure))
+    }
+
+    pub async fn revoke_mobile_device_session(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+        allow_any_user: bool,
+        reason: &str,
+    ) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let owner = sqlx::query_scalar::<_, String>(
+            "SELECT user_id FROM mobile_device_sessions WHERE id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(owner) = owner else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+        anyhow::ensure!(
+            allow_any_user || owner == actor_user_id,
+            "device session access denied"
+        );
+        let changed = sqlx::query(
+            "UPDATE mobile_device_sessions SET revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP), revocation_reason = COALESCE(revocation_reason, ?) WHERE id = ?",
+        )
+        .bind(reason)
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        if changed {
+            Self::insert_audit_tx(
+                &mut tx,
+                actor_user_id,
+                "mobile.device_session_revoked",
+                "mobile_device_session",
+                session_id,
+                Some(serde_json::json!({ "reason": reason, "owner_user_id": owner })),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(changed)
+    }
+
+    pub async fn revoke_mobile_device_sessions_for_user(
+        &self,
+        user_id: &str,
+        reason: &str,
+    ) -> Result<u64> {
+        Ok(sqlx::query(
+            "UPDATE mobile_device_sessions SET revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP), revocation_reason = COALESCE(revocation_reason, ?) WHERE user_id = ? AND revoked_at IS NULL",
+        )
+        .bind(reason)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
+    }
+
+    pub async fn register_mobile_push_token(
+        &self,
+        token_id: &str,
+        user_id: &str,
+        device_session_id: &str,
+        installation_id: &str,
+        platform: &str,
+        token: &str,
+        token_hash: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let allowed = sqlx::query_scalar::<_, i64>(
+            r#"SELECT COUNT(*) FROM mobile_device_sessions
+               WHERE id = ? AND user_id = ? AND installation_id = ?
+                 AND revoked_at IS NULL AND datetime(expires_at) > datetime('now')"#,
+        )
+        .bind(device_session_id)
+        .bind(user_id)
+        .bind(installation_id)
+        .fetch_one(&mut *tx)
+        .await?
+            > 0;
+        anyhow::ensure!(
+            allowed,
+            "mobile device session does not own this installation"
+        );
+        sqlx::query(
+            "UPDATE mobile_push_tokens SET retired_at = COALESCE(retired_at, CURRENT_TIMESTAMP), retirement_reason = COALESCE(retirement_reason, 'rotated') WHERE installation_id = ? AND token_hash != ? AND retired_at IS NULL",
+        )
+        .bind(installation_id)
+        .bind(token_hash)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO mobile_push_tokens
+                 (id, installation_id, device_session_id, platform, token, token_hash)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(token_hash) DO UPDATE SET
+                 installation_id = excluded.installation_id,
+                 device_session_id = excluded.device_session_id,
+                 platform = excluded.platform,
+                 token = excluded.token,
+                 retired_at = NULL,
+                 retirement_reason = NULL,
+                 updated_at = CURRENT_TIMESTAMP"#,
+        )
+        .bind(token_id)
+        .bind(installation_id)
+        .bind(device_session_id)
+        .bind(platform)
+        .bind(token)
+        .bind(token_hash)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO mobile_notification_preferences(installation_id) VALUES (?)",
+        )
+        .bind(installation_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn claim_mobile_task_launch(
+        &self,
+        request_id: &str,
+        user_id: &str,
+        device_session_id: &str,
+        request_fingerprint: &str,
+        machine_id: &str,
+        project_id: &str,
+    ) -> Result<MobileTaskLaunchRecord> {
+        let mut tx = self.pool.begin().await?;
+        let authorized_device = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM mobile_device_sessions WHERE id = ? AND user_id = ? AND revoked_at IS NULL AND datetime(expires_at) > datetime('now')",
+        )
+        .bind(device_session_id)
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await?
+            == 1;
+        anyhow::ensure!(authorized_device, "mobile device session is unavailable");
+        sqlx::query(
+            r#"INSERT OR IGNORE INTO mobile_task_launches
+                 (request_id, user_id, device_session_id, request_fingerprint, machine_id, project_id)
+               VALUES (?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(request_id)
+        .bind(user_id)
+        .bind(device_session_id)
+        .bind(request_fingerprint)
+        .bind(machine_id)
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+        let record = sqlx::query_as::<_, MobileTaskLaunchRecord>(
+            r#"SELECT request_id, user_id, device_session_id, request_fingerprint,
+                      machine_id, project_id, status, session_id, pane_id, error_message
+               FROM mobile_task_launches WHERE request_id = ?"#,
+        )
+        .bind(request_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(record)
+    }
+
+    pub async fn complete_mobile_task_launch(
+        &self,
+        request_id: &str,
+        user_id: &str,
+        session_id: &str,
+        pane_id: u32,
+    ) -> Result<bool> {
+        Ok(sqlx::query(
+            r#"UPDATE mobile_task_launches
+               SET status = 'completed', session_id = ?, pane_id = ?, error_message = NULL,
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE request_id = ? AND user_id = ? AND status = 'pending'"#,
+        )
+        .bind(session_id)
+        .bind(i64::from(pane_id))
+        .bind(request_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            == 1)
+    }
+
+    pub async fn fail_mobile_task_launch(
+        &self,
+        request_id: &str,
+        user_id: &str,
+        error_message: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE mobile_task_launches
+               SET status = 'failed', error_message = ?, updated_at = CURRENT_TIMESTAMP
+               WHERE request_id = ? AND user_id = ? AND status = 'pending'"#,
+        )
+        .bind(error_message)
+        .bind(request_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mobile_notification_preferences(
+        &self,
+        user_id: &str,
+        device_session_id: &str,
+    ) -> Result<Option<shared::MobileNotificationPreferences>> {
+        let row = sqlx::query(
+            r#"SELECT p.decisions, p.failures, p.pull_requests, p.completions
+               FROM mobile_notification_preferences p
+               JOIN mobile_device_sessions s ON s.installation_id = p.installation_id
+               WHERE s.id = ? AND s.user_id = ? AND s.revoked_at IS NULL"#,
+        )
+        .bind(device_session_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| shared::MobileNotificationPreferences {
+            decisions: row.get::<i64, _>("decisions") != 0,
+            failures: row.get::<i64, _>("failures") != 0,
+            pull_requests: row.get::<i64, _>("pull_requests") != 0,
+            completions: row.get::<i64, _>("completions") != 0,
+        }))
+    }
+
+    pub async fn update_mobile_notification_preferences(
+        &self,
+        user_id: &str,
+        device_session_id: &str,
+        preferences: &shared::MobileNotificationPreferences,
+    ) -> Result<bool> {
+        let installation_id = sqlx::query_scalar::<_, String>(
+            "SELECT installation_id FROM mobile_device_sessions WHERE id = ? AND user_id = ? AND revoked_at IS NULL",
+        )
+        .bind(device_session_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(installation_id) = installation_id else {
+            return Ok(false);
+        };
+        sqlx::query(
+            r#"INSERT INTO mobile_notification_preferences
+                 (installation_id, decisions, failures, pull_requests, completions)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(installation_id) DO UPDATE SET
+                 decisions = excluded.decisions,
+                 failures = excluded.failures,
+                 pull_requests = excluded.pull_requests,
+                 completions = excluded.completions,
+                 updated_at = CURRENT_TIMESTAMP"#,
+        )
+        .bind(&installation_id)
+        .bind(preferences.decisions)
+        .bind(preferences.failures)
+        .bind(preferences.pull_requests)
+        .bind(preferences.completions)
+        .execute(&self.pool)
+        .await?;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_mobile_notification_event(
+        &self,
+        event_id: &str,
+        user_id: &str,
+        project_id: &str,
+        session_id: Option<&str>,
+        pane_id: Option<u32>,
+        category: &str,
+        routing_id: &str,
+        dedupe_key: &str,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            matches!(
+                category,
+                "decision" | "failure" | "pull_request" | "completion"
+            ),
+            "invalid notification category"
+        );
+        anyhow::ensure!(
+            !routing_id.is_empty() && routing_id.len() <= 200,
+            "invalid notification routing identifier"
+        );
+        let mut tx = self.pool.begin().await?;
+        let authorized = sqlx::query_scalar::<_, i64>(
+            r#"SELECT COUNT(*)
+               FROM users u
+               JOIN projects p ON p.id = ?
+               LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = u.id
+               WHERE u.id = ? AND u.account_status = 'active' AND p.lifecycle_status = 'active'
+                 AND (p.owner_user_id = u.id OR pm.user_id IS NOT NULL)
+                 AND (? IS NULL OR EXISTS (
+                   SELECT 1 FROM sessions s
+                   WHERE s.id = ? AND COALESCE(s.project_id, s.id) = p.id
+                 ))"#,
+        )
+        .bind(project_id)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(session_id)
+        .fetch_one(&mut *tx)
+        .await?
+            > 0;
+        if !authorized {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        let inserted = sqlx::query(
+            r#"INSERT OR IGNORE INTO mobile_notification_events
+                 (id, user_id, project_id, session_id, pane_id, category, routing_id, dedupe_key)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(event_id)
+        .bind(user_id)
+        .bind(project_id)
+        .bind(session_id)
+        .bind(pane_id.map(i64::from))
+        .bind(category)
+        .bind(routing_id)
+        .bind(dedupe_key)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        if !inserted {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            r#"INSERT OR IGNORE INTO mobile_notification_deliveries(event_id, push_token_id)
+               SELECT ?, t.id
+               FROM mobile_push_tokens t
+               JOIN mobile_installations i ON i.installation_id = t.installation_id
+               JOIN mobile_device_sessions s ON s.id = t.device_session_id
+               JOIN mobile_notification_preferences p ON p.installation_id = i.installation_id
+               WHERE i.user_id = ? AND t.retired_at IS NULL AND s.revoked_at IS NULL
+                 AND datetime(s.expires_at) > datetime('now')
+                 AND CASE ?
+                   WHEN 'decision' THEN p.decisions
+                   WHEN 'failure' THEN p.failures
+                   WHEN 'pull_request' THEN p.pull_requests
+                   WHEN 'completion' THEN p.completions
+                   ELSE 0
+                 END = 1"#,
+        )
+        .bind(event_id)
+        .bind(user_id)
+        .bind(category)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn claim_mobile_notification_deliveries(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<MobileNotificationDeliveryRecord>> {
+        let mut tx = self.pool.begin().await?;
+        // Authorization may change after enqueue and before the provider
+        // worker claims a delivery. Erase stale logical events first so
+        // suspended accounts, lost project membership, and deleted sessions
+        // can never receive a delayed notification or leave a queued backlog.
+        sqlx::query(
+            r#"DELETE FROM mobile_notification_events
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM users u
+                   WHERE u.id = mobile_notification_events.user_id
+                     AND u.account_status = 'active'
+               )
+               OR (
+                   project_id IS NOT NULL AND NOT EXISTS (
+                       SELECT 1 FROM projects p
+                       WHERE p.id = mobile_notification_events.project_id
+                         AND p.lifecycle_status = 'active'
+                         AND (
+                             p.owner_user_id = mobile_notification_events.user_id
+                             OR EXISTS (
+                                 SELECT 1 FROM project_members pm
+                                 WHERE pm.project_id = p.id
+                                   AND pm.user_id = mobile_notification_events.user_id
+                             )
+                         )
+                   )
+               )
+               OR (
+                   session_id IS NOT NULL AND NOT EXISTS (
+                       SELECT 1 FROM sessions s
+                       WHERE s.id = mobile_notification_events.session_id
+                         AND (
+                             mobile_notification_events.project_id IS NULL
+                             OR COALESCE(s.project_id, s.id) = mobile_notification_events.project_id
+                         )
+                   )
+               )"#,
+        )
+        .execute(&mut *tx)
+        .await?;
+        let rows = sqlx::query_as::<_, MobileNotificationDeliveryRecord>(
+            r#"SELECT d.id, d.event_id, d.push_token_id, t.token, e.category,
+                      e.routing_id, e.session_id, d.attempt_count, d.provider_ticket_id
+               FROM mobile_notification_deliveries d
+               JOIN mobile_notification_events e ON e.id = d.event_id
+               JOIN mobile_push_tokens t ON t.id = d.push_token_id
+               JOIN users u ON u.id = e.user_id
+               LEFT JOIN projects p ON p.id = e.project_id
+               WHERE d.status IN ('queued', 'retry')
+                 AND datetime(d.next_attempt_at) <= datetime('now')
+                 AND t.retired_at IS NULL AND u.account_status = 'active'
+                 AND (e.project_id IS NULL OR p.lifecycle_status = 'active')
+               ORDER BY d.id LIMIT ?"#,
+        )
+        .bind(limit.min(100) as i64)
+        .fetch_all(&mut *tx)
+        .await?;
+        for row in &rows {
+            sqlx::query(
+                "UPDATE mobile_notification_deliveries SET status = 'sending', attempt_count = attempt_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            )
+            .bind(row.id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(rows)
+    }
+
+    pub async fn pending_mobile_notification_receipts(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<MobileNotificationDeliveryRecord>> {
+        Ok(sqlx::query_as::<_, MobileNotificationDeliveryRecord>(
+            r#"SELECT d.id, d.event_id, d.push_token_id, t.token, e.category,
+                      e.routing_id, e.session_id, d.attempt_count, d.provider_ticket_id
+               FROM mobile_notification_deliveries d
+               JOIN mobile_notification_events e ON e.id = d.event_id
+               JOIN mobile_push_tokens t ON t.id = d.push_token_id
+               WHERE d.status = 'ticketed' AND d.provider_ticket_id IS NOT NULL
+                 AND datetime(d.updated_at) <= datetime('now', '-15 seconds')
+               ORDER BY d.id LIMIT ?"#,
+        )
+        .bind(limit.min(100) as i64)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn mark_mobile_delivery_ticketed(&self, id: i64, ticket_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE mobile_notification_deliveries SET status = 'ticketed', provider_ticket_id = ?, provider_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(ticket_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_mobile_delivery_delivered(&self, id: i64) -> Result<()> {
+        sqlx::query(
+            "UPDATE mobile_notification_deliveries SET status = 'delivered', provider_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn retry_mobile_delivery(
+        &self,
+        id: i64,
+        error: &str,
+        delay_seconds: u64,
+    ) -> Result<()> {
+        let modifier = format!("+{} seconds", delay_seconds.min(3600));
+        sqlx::query(
+            "UPDATE mobile_notification_deliveries SET status = 'retry', provider_error = ?, provider_ticket_id = NULL, next_attempt_at = datetime('now', ?), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(error)
+        .bind(modifier)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn retire_mobile_push_token(
+        &self,
+        token_id: &str,
+        delivery_id: i64,
+        reason: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE mobile_push_tokens SET retired_at = COALESCE(retired_at, CURRENT_TIMESTAMP), retirement_reason = COALESCE(retirement_reason, ?) WHERE id = ?",
+        )
+        .bind(reason)
+        .bind(token_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE mobile_notification_deliveries SET status = 'permanent_failure', provider_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(reason)
+        .bind(delivery_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn recover_mobile_notification_outbox(&self) -> Result<u64> {
+        Ok(sqlx::query(
+            "UPDATE mobile_notification_deliveries SET status = 'retry', next_attempt_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE status = 'sending'",
+        )
+        .execute(&self.pool)
+        .await?
+            .rows_affected())
+    }
+
+    /// Persistent gauges for the admin-only mobile operational view. The
+    /// result intentionally contains counts and app versions only—never raw
+    /// credentials, installation identifiers, push tokens, or project data.
+    pub async fn mobile_persistence_metrics(&self) -> Result<MobilePersistenceMetrics> {
+        let active_device_sessions = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM mobile_device_sessions WHERE revoked_at IS NULL AND datetime(expires_at) > datetime('now')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let active_push_tokens = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM mobile_push_tokens WHERE retired_at IS NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let pending_task_launches = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM mobile_task_launches WHERE status = 'pending'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let outbox = sqlx::query_as::<_, (String, i64)>(
+            "SELECT status, COUNT(*) FROM mobile_notification_deliveries GROUP BY status",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+        let app_versions = sqlx::query_as::<_, (String, i64)>(
+            r#"SELECT app_version, COUNT(*)
+               FROM mobile_device_sessions
+               WHERE revoked_at IS NULL AND datetime(expires_at) > datetime('now')
+               GROUP BY app_version ORDER BY COUNT(*) DESC, app_version"#,
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(
+            |(app_version, active_device_sessions)| MobileAppVersionCount {
+                app_version,
+                active_device_sessions,
+            },
+        )
+        .collect();
+        Ok(MobilePersistenceMetrics {
+            active_device_sessions,
+            active_push_tokens,
+            pending_task_launches,
+            outbox_queued: *outbox.get("queued").unwrap_or(&0),
+            outbox_sending: *outbox.get("sending").unwrap_or(&0),
+            outbox_ticketed: *outbox.get("ticketed").unwrap_or(&0),
+            outbox_retry: *outbox.get("retry").unwrap_or(&0),
+            outbox_permanent_failure: *outbox.get("permanent_failure").unwrap_or(&0),
+            app_versions,
+        })
+    }
+
+    pub async fn active_project_user_ids(&self, project_id: &str) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            r#"SELECT u.id
+               FROM users u
+               WHERE u.account_status = 'active' AND u.id IN (
+                   SELECT owner_user_id FROM projects
+                   WHERE id = ? AND lifecycle_status = 'active'
+                   UNION
+                   SELECT user_id FROM project_members WHERE project_id = ?
+               )
+               ORDER BY u.id"#,
+        )
+        .bind(project_id)
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     pub async fn bootstrap_cluster_admin(&self, email: &str) -> Result<bool> {
@@ -848,6 +2061,14 @@ impl Database {
             .await?
             .rows_affected()
             > 0;
+        if changed && status == AccountStatus::Suspended {
+            sqlx::query(
+                "UPDATE mobile_device_sessions SET revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP), revocation_reason = COALESCE(revocation_reason, 'account_suspended') WHERE user_id = ? AND revoked_at IS NULL",
+            )
+            .bind(target_user_id)
+            .execute(&mut *tx)
+            .await?;
+        }
         if changed {
             Self::insert_audit_tx(
                 &mut tx,
@@ -1770,16 +2991,33 @@ impl Database {
         offset: i64,
     ) -> Result<Vec<AdminProjectSummary>> {
         let pattern = format!("%{}%", search.unwrap_or_default().trim());
-        Ok(sqlx::query_as::<_, AdminProjectSummary>(
+        let rows = sqlx::query(
             r#"
+            WITH ranked_sessions AS (
+                SELECT COALESCE(project_id, id) AS canonical_project_id,
+                       working_dir, hostname, git_remote,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY COALESCE(project_id, id)
+                           ORDER BY CASE WHEN status = 'active' THEN 0 ELSE 1 END,
+                                    COALESCE(updated_at, created_at) DESC,
+                                    id DESC
+                       ) AS session_rank
+                FROM sessions
+            )
             SELECT p.id, p.owner_user_id, u.email AS owner_email, p.lifecycle_status,
                    (SELECT COUNT(*) FROM project_members pm WHERE pm.project_id = p.id) AS member_count,
                    (SELECT COUNT(*) FROM sessions s WHERE COALESCE(s.project_id, s.id) = p.id AND s.status = 'active') AS active_session_count,
                    (SELECT MAX(s.updated_at) FROM sessions s WHERE COALESCE(s.project_id, s.id) = p.id) AS last_activity,
-                   p.created_at
+                   p.created_at, rs.working_dir, rs.hostname, rs.git_remote
             FROM projects p
             JOIN users u ON u.id = p.owner_user_id
-            WHERE (? = '%%' OR lower(p.id) LIKE lower(?) OR lower(u.email) LIKE lower(?))
+            LEFT JOIN ranked_sessions rs
+              ON rs.canonical_project_id = p.id AND rs.session_rank = 1
+            WHERE (? = '%%'
+                   OR lower(p.id) LIKE lower(?)
+                   OR lower(u.email) LIKE lower(?)
+                   OR lower(COALESCE(rs.working_dir, '')) LIKE lower(?)
+                   OR lower(COALESCE(rs.hostname, '')) LIKE lower(?))
             ORDER BY COALESCE(last_activity, p.created_at) DESC
             LIMIT ? OFFSET ?
             "#,
@@ -1787,10 +3025,32 @@ impl Database {
         .bind(&pattern)
         .bind(&pattern)
         .bind(&pattern)
+        .bind(&pattern)
+        .bind(&pattern)
         .bind(limit.clamp(1, 200))
         .bind(offset.max(0))
         .fetch_all(&self.pool)
-        .await?)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let working_dir = row.get::<Option<String>, _>("working_dir");
+                let git_remote = row.get::<Option<String>, _>("git_remote");
+                AdminProjectSummary {
+                    id: row.get("id"),
+                    project_name: admin_project_name(working_dir.as_deref(), git_remote.as_deref()),
+                    hostname: row.get("hostname"),
+                    owner_user_id: row.get("owner_user_id"),
+                    owner_email: row.get("owner_email"),
+                    lifecycle_status: row.get("lifecycle_status"),
+                    member_count: row.get("member_count"),
+                    active_session_count: row.get("active_session_count"),
+                    last_activity: row.get("last_activity"),
+                    created_at: row.get("created_at"),
+                }
+            })
+            .collect())
     }
 
     pub async fn list_project_ids(&self) -> Result<Vec<String>> {
@@ -2135,6 +3395,36 @@ impl Database {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    pub async fn record_session_user_input(&self, id: &str, created_at: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE sessions
+            SET last_user_input_at = CASE
+                    WHEN last_user_input_at IS NULL OR last_user_input_at < ? THEN ?
+                    ELSE last_user_input_at
+                END,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            "#,
+        )
+        .bind(created_at)
+        .bind(created_at)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_session_last_user_input_at(&self, id: &str) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT last_user_input_at FROM sessions WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten())
     }
 
     /// Mark session as inactive and clear cli_client_id (CLI disconnected)
@@ -2905,6 +4195,466 @@ fn accumulate(c: &mut shared::UsageCounters, r: &PaneUsageDayRow) {
 }
 
 #[cfg(test)]
+mod mobile_notification_tests {
+    use super::*;
+
+    async fn database() -> Database {
+        let dir = std::env::temp_dir().join(format!(
+            "apas-mobile-notifications-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Database::new(&dir.join("apas.db").to_string_lossy())
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        db.create_user(&User {
+            id: "mobile-user".to_string(),
+            email: "mobile-notifications@example.test".to_string(),
+            password_hash: "hash".to_string(),
+            created_at: None,
+            cluster_role: "user".to_string(),
+            account_status: "active".to_string(),
+        })
+        .await
+        .unwrap();
+        db.create_mobile_device_session(
+            "device-session",
+            "mobile-user",
+            "installation",
+            "ios",
+            Some("Phone"),
+            "0.1.0",
+            "refresh-hash",
+            &(chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339(),
+        )
+        .await
+        .unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn registration_rotation_preferences_and_revocation_cleanup_are_atomic() {
+        let db = database().await;
+        db.register_mobile_push_token(
+            "push-1",
+            "mobile-user",
+            "device-session",
+            "installation",
+            "ios",
+            "ExponentPushToken[first]",
+            "token-hash-1",
+        )
+        .await
+        .unwrap();
+        db.register_mobile_push_token(
+            "push-2",
+            "mobile-user",
+            "device-session",
+            "installation",
+            "ios",
+            "ExponentPushToken[second]",
+            "token-hash-2",
+        )
+        .await
+        .unwrap();
+        db.create_mobile_device_session(
+            "device-session-2",
+            "mobile-user",
+            "installation-2",
+            "android",
+            Some("Tablet"),
+            "0.1.0",
+            "refresh-hash-2",
+            &(chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339(),
+        )
+        .await
+        .unwrap();
+        db.register_mobile_push_token(
+            "push-3",
+            "mobile-user",
+            "device-session-2",
+            "installation-2",
+            "android",
+            "ExponentPushToken[third]",
+            "token-hash-3",
+        )
+        .await
+        .unwrap();
+        let active = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM mobile_push_tokens WHERE retired_at IS NULL",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(active, 2);
+
+        let preferences = shared::MobileNotificationPreferences {
+            decisions: false,
+            failures: true,
+            pull_requests: false,
+            completions: true,
+        };
+        assert!(db
+            .update_mobile_notification_preferences("mobile-user", "device-session", &preferences,)
+            .await
+            .unwrap());
+        assert!(
+            db.update_mobile_notification_preferences(
+                "mobile-user",
+                "device-session-2",
+                &preferences,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            db.mobile_notification_preferences("mobile-user", "device-session")
+                .await
+                .unwrap()
+                .unwrap()
+                .completions,
+            true
+        );
+
+        db.authorize_project_registration("mobile-project", "mobile-user")
+            .await
+            .unwrap();
+        db.create_session(&Session {
+            id: "mobile-session".to_string(),
+            user_id: "mobile-user".to_string(),
+            cli_client_id: None,
+            working_dir: None,
+            hostname: None,
+            status: "active".to_string(),
+            created_at: None,
+            updated_at: None,
+            is_paused: false,
+            project_id: Some("mobile-project".to_string()),
+            git_remote: None,
+            git_remote_url: None,
+        })
+        .await
+        .unwrap();
+        assert!(db
+            .enqueue_mobile_notification_event(
+                "event-1",
+                "mobile-user",
+                "mobile-project",
+                Some("mobile-session"),
+                Some(1),
+                "completion",
+                "opaque-route",
+                "dedupe-1",
+            )
+            .await
+            .unwrap());
+        assert!(!db
+            .enqueue_mobile_notification_event(
+                "event-2",
+                "mobile-user",
+                "mobile-project",
+                Some("mobile-session"),
+                Some(1),
+                "completion",
+                "opaque-route",
+                "dedupe-1",
+            )
+            .await
+            .unwrap());
+        let deliveries = db.claim_mobile_notification_deliveries(100).await.unwrap();
+        assert_eq!(deliveries.len(), 2);
+        assert_eq!(db.recover_mobile_notification_outbox().await.unwrap(), 2);
+
+        let deliveries = db.claim_mobile_notification_deliveries(100).await.unwrap();
+        assert_eq!(deliveries.len(), 2);
+        db.mark_mobile_delivery_ticketed(deliveries[0].id, "ticket-1")
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE mobile_notification_deliveries SET updated_at = datetime('now', '-20 seconds') WHERE id = ?",
+        )
+        .bind(deliveries[0].id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let receipts = db.pending_mobile_notification_receipts(100).await.unwrap();
+        assert_eq!(receipts.len(), 1);
+        db.mark_mobile_delivery_delivered(receipts[0].id)
+            .await
+            .unwrap();
+
+        db.retry_mobile_delivery(deliveries[1].id, "transient", 0)
+            .await
+            .unwrap();
+        let retry = db.claim_mobile_notification_deliveries(100).await.unwrap();
+        assert_eq!(retry.len(), 1);
+        assert!(retry[0].attempt_count >= 2);
+        db.retire_mobile_push_token(&retry[0].push_token_id, retry[0].id, "DeviceNotRegistered")
+            .await
+            .unwrap();
+        let invalid_status = sqlx::query_scalar::<_, String>(
+            "SELECT status FROM mobile_notification_deliveries WHERE id = ?",
+        )
+        .bind(retry[0].id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(invalid_status, "permanent_failure");
+
+        sqlx::query("DELETE FROM sessions WHERE id = 'mobile-session'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let session_events =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mobile_notification_events")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        let session_deliveries =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mobile_notification_deliveries")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!((session_events, session_deliveries), (0, 0));
+
+        sqlx::query("DELETE FROM projects WHERE id = 'mobile-project'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let events =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mobile_notification_events")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        let deliveries =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mobile_notification_deliveries")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!((events, deliveries), (0, 0));
+
+        db.revoke_mobile_device_session("mobile-user", "device-session", false, "test_revocation")
+            .await
+            .unwrap();
+        // Revoking one device session deletes exactly that session's push
+        // tokens, via the mobile_device_session_push_cleanup trigger. Scope the
+        // check to the revoked session: a bare global count cannot tell
+        // "this device went dark" apart from "every device this user owns went
+        // dark", and the latter would be a bug, not a pass.
+        let revoked_session_tokens = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM mobile_push_tokens WHERE device_session_id = 'device-session'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(revoked_session_tokens, 0);
+        // Deliberately not a global "active tokens" count. One token was already
+        // retired above as DeviceNotRegistered, and which one that is depends on
+        // the order claim_mobile_notification_deliveries hands back the two
+        // deliveries — so a global count is legitimately 0 or 1 and asserting
+        // either makes the test order-dependent. Scoping to the sibling session
+        // states the property that actually matters and holds every run.
+        let sibling_tokens = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM mobile_push_tokens WHERE device_session_id = 'device-session-2'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            sibling_tokens, 1,
+            "revoking one device session must not touch another's push tokens"
+        );
+        db.revoke_mobile_device_session("mobile-user", "device-session-2", false, "test_logout")
+            .await
+            .unwrap();
+        let remaining = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mobile_push_tokens")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn queued_notifications_are_erased_after_membership_loss() {
+        let db = database().await;
+        db.create_user(&User {
+            id: "project-owner".to_string(),
+            email: "notification-owner@example.test".to_string(),
+            password_hash: "hash".to_string(),
+            created_at: None,
+            cluster_role: "user".to_string(),
+            account_status: "active".to_string(),
+        })
+        .await
+        .unwrap();
+        db.authorize_project_registration("shared-project", "project-owner")
+            .await
+            .unwrap();
+        db.add_project_member("project-owner", "shared-project", "mobile-user")
+            .await
+            .unwrap();
+        db.create_session(&Session {
+            id: "shared-session".to_string(),
+            user_id: "project-owner".to_string(),
+            cli_client_id: None,
+            working_dir: None,
+            hostname: None,
+            status: "active".to_string(),
+            created_at: None,
+            updated_at: None,
+            is_paused: false,
+            project_id: Some("shared-project".to_string()),
+            git_remote: None,
+            git_remote_url: None,
+        })
+        .await
+        .unwrap();
+        db.register_mobile_push_token(
+            "member-push",
+            "mobile-user",
+            "device-session",
+            "installation",
+            "ios",
+            "ExponentPushToken[member]",
+            "member-token-hash",
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .enqueue_mobile_notification_event(
+                "membership-event",
+                "mobile-user",
+                "shared-project",
+                Some("shared-session"),
+                Some(1),
+                "decision",
+                "opaque-membership-route",
+                "membership-dedupe",
+            )
+            .await
+            .unwrap());
+
+        db.remove_project_member("project-owner", "shared-project", "mobile-user")
+            .await
+            .unwrap();
+        assert!(db
+            .claim_mobile_notification_deliveries(100)
+            .await
+            .unwrap()
+            .is_empty());
+        let events =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mobile_notification_events")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        let deliveries =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mobile_notification_deliveries")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!((events, deliveries), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn notification_outbox_recovers_and_drains_a_bounded_load_after_reopen() {
+        const EVENTS: usize = 1_000;
+        let dir =
+            std::env::temp_dir().join(format!("apas-mobile-outbox-load-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("apas.db").to_string_lossy().into_owned();
+        let db = Database::new(&path).await.unwrap();
+        db.run_migrations().await.unwrap();
+        db.create_user(&User {
+            id: "outbox-user".to_string(),
+            email: "mobile-outbox@example.test".to_string(),
+            password_hash: "hash".to_string(),
+            created_at: None,
+            cluster_role: "user".to_string(),
+            account_status: "active".to_string(),
+        })
+        .await
+        .unwrap();
+        db.create_mobile_device_session(
+            "outbox-device",
+            "outbox-user",
+            "outbox-installation",
+            "android",
+            None,
+            "load-test",
+            "refresh-hash",
+            &(chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339(),
+        )
+        .await
+        .unwrap();
+        db.register_mobile_push_token(
+            "outbox-push",
+            "outbox-user",
+            "outbox-device",
+            "outbox-installation",
+            "android",
+            "ExponentPushToken[outbox-load]",
+            "outbox-token-hash",
+        )
+        .await
+        .unwrap();
+        db.authorize_project_registration("outbox-project", "outbox-user")
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        for index in 0..EVENTS {
+            assert!(db
+                .enqueue_mobile_notification_event(
+                    &format!("load-event-{index}"),
+                    "outbox-user",
+                    "outbox-project",
+                    None,
+                    None,
+                    "failure",
+                    &format!("route-{index}"),
+                    &format!("dedupe-{index}"),
+                )
+                .await
+                .unwrap());
+        }
+        let stranded = db.claim_mobile_notification_deliveries(100).await.unwrap();
+        assert_eq!(stranded.len(), 100);
+        drop(db);
+
+        let reopened = Database::new(&path).await.unwrap();
+        reopened.run_migrations().await.unwrap();
+        assert_eq!(
+            reopened.recover_mobile_notification_outbox().await.unwrap(),
+            100
+        );
+        let mut drained = 0;
+        loop {
+            let deliveries = reopened
+                .claim_mobile_notification_deliveries(100)
+                .await
+                .unwrap();
+            if deliveries.is_empty() {
+                break;
+            }
+            assert!(deliveries.len() <= 100);
+            drained += deliveries.len();
+            for delivery in deliveries {
+                reopened
+                    .mark_mobile_delivery_delivered(delivery.id)
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(drained, EVENTS);
+        eprintln!(
+            "recovered and drained {EVENTS} notification deliveries in {:?}",
+            started.elapsed()
+        );
+    }
+}
+
+#[cfg(test)]
 mod usage_stats_tests {
     use super::*;
 
@@ -3187,6 +4937,78 @@ mod cluster_administration_tests {
             .unwrap();
         assert!(imported.team_available);
         assert!(!imported.allows(shared::PaneKind::Terminal, shared::Provider::Codex, None,));
+    }
+
+    #[tokio::test]
+    async fn legacy_access_upgrade_repairs_a_membership_resurrected_after_leave() {
+        let db = database("legacy-access-repair").await;
+        db.run_migrations().await.unwrap();
+        db.create_user(&user("original-owner", "original@test", "user"))
+            .await
+            .unwrap();
+        db.create_user(&user("new-owner", "new@test", "user"))
+            .await
+            .unwrap();
+        db.authorize_project_registration("project-a", "original-owner")
+            .await
+            .unwrap();
+        db.add_project_member("original-owner", "project-a", "new-owner")
+            .await
+            .unwrap();
+        db.create_session(&Session {
+            id: "historical-session".to_string(),
+            user_id: "original-owner".to_string(),
+            cli_client_id: None,
+            working_dir: None,
+            hostname: None,
+            status: "active".to_string(),
+            created_at: None,
+            updated_at: None,
+            is_paused: false,
+            project_id: Some("project-a".to_string()),
+            git_remote: None,
+            git_remote_url: None,
+        })
+        .await
+        .unwrap();
+        assert!(db
+            .transfer_project_ownership_by_owner("original-owner", "project-a", "new-owner")
+            .await
+            .unwrap());
+        assert!(db
+            .leave_project("original-owner", "project-a")
+            .await
+            .unwrap());
+
+        // Simulate an installation upgrading from the old unbounded
+        // backfill: the stale membership has already been recreated, while
+        // the new migration marker does not exist yet.
+        sqlx::query(
+            "INSERT INTO project_members (project_id, user_id, invited_by) VALUES ('project-a', 'original-owner', 'new-owner')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE name = ?")
+            .bind(LEGACY_PROJECT_ACCESS_MIGRATION)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        db.run_migrations().await.unwrap();
+        assert!(db
+            .get_project_role_for_user("project-a", "original-owner")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM schema_migrations WHERE name = ?",)
+                .bind(LEGACY_PROJECT_ACCESS_MIGRATION)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -3478,6 +5300,69 @@ mod cluster_administration_tests {
             .unwrap_err()
             .to_string()
             .contains("suspended"));
+    }
+
+    #[tokio::test]
+    async fn admin_project_inventory_includes_session_name_and_host() {
+        let db = database("admin-project-metadata").await;
+        db.run_migrations().await.unwrap();
+        db.create_user(&user("owner", "owner@test", "admin"))
+            .await
+            .unwrap();
+        db.authorize_project_registration("project-a", "owner")
+            .await
+            .unwrap();
+
+        for (id, working_dir, hostname, status) in [
+            (
+                "current-session",
+                "/home/users/shuai/mako-soumojit/",
+                "zoo-002",
+                "active",
+            ),
+            (
+                "newer-archived-session",
+                "/tmp/archived-name",
+                "old-host",
+                "completed",
+            ),
+        ] {
+            db.create_session(&Session {
+                id: id.to_string(),
+                user_id: "owner".to_string(),
+                cli_client_id: None,
+                working_dir: Some(working_dir.to_string()),
+                hostname: Some(hostname.to_string()),
+                status: status.to_string(),
+                created_at: None,
+                updated_at: None,
+                is_paused: false,
+                project_id: Some("project-a".to_string()),
+                git_remote: Some("github.com/example/fallback-name".to_string()),
+                git_remote_url: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let projects = db.list_admin_projects(None, 50, 0).await.unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].project_name.as_deref(), Some("mako-soumojit"));
+        assert_eq!(projects[0].hostname.as_deref(), Some("zoo-002"));
+        assert_eq!(
+            db.list_admin_projects(Some("mako-soumojit"), 50, 0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.list_admin_projects(Some("zoo-002"), 50, 0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -3891,6 +5776,24 @@ mod cluster_administration_tests {
             0
         );
 
+        // A server restart reruns schema setup, but historical session
+        // ownership must never recreate an intentionally removed membership.
+        db.run_migrations().await.unwrap();
+        assert!(db
+            .get_project_role_for_user("project-a", "owner")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM session_shares WHERE user_id = 'owner'",
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+            0
+        );
+
         // Administrator policy remains broader than owner policy.
         assert!(db
             .transfer_project_ownership("admin", "project-a", "outsider")
@@ -3942,5 +5845,117 @@ mod cluster_administration_tests {
             owner_membership, 0,
             "the sole owner is never duplicated as a user"
         );
+    }
+}
+
+#[cfg(test)]
+mod mobile_task_launch_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn launch_claims_retain_one_result_and_cascade_without_prompt_storage() {
+        let dir =
+            std::env::temp_dir().join(format!("apas-mobile-task-launch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Database::new(&dir.join("apas.db").to_string_lossy())
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        let user_id = uuid::Uuid::new_v4().to_string();
+        db.create_user(&User {
+            id: user_id.clone(),
+            email: "mobile-launch@test".to_string(),
+            password_hash: "hash".to_string(),
+            created_at: None,
+            cluster_role: "user".to_string(),
+            account_status: "active".to_string(),
+        })
+        .await
+        .unwrap();
+        db.authorize_project_registration("project-a", &user_id)
+            .await
+            .unwrap();
+        let device_session_id = uuid::Uuid::new_v4().to_string();
+        db.create_mobile_device_session(
+            &device_session_id,
+            &user_id,
+            "installation-a",
+            "ios",
+            Some("phone"),
+            "1.0.0",
+            "refresh-hash",
+            &(chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339(),
+        )
+        .await
+        .unwrap();
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let first = db
+            .claim_mobile_task_launch(
+                &request_id,
+                &user_id,
+                &device_session_id,
+                "keyed-fingerprint",
+                &uuid::Uuid::new_v4().to_string(),
+                "project-a",
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status, "pending");
+        assert!(db
+            .complete_mobile_task_launch(
+                &request_id,
+                &user_id,
+                &uuid::Uuid::new_v4().to_string(),
+                42
+            )
+            .await
+            .unwrap());
+        assert!(!db
+            .complete_mobile_task_launch(
+                &request_id,
+                &user_id,
+                &uuid::Uuid::new_v4().to_string(),
+                99
+            )
+            .await
+            .unwrap());
+        let retained = db
+            .claim_mobile_task_launch(
+                &request_id,
+                &user_id,
+                &device_session_id,
+                "different-fingerprint",
+                &uuid::Uuid::new_v4().to_string(),
+                "project-a",
+            )
+            .await
+            .unwrap();
+        assert_eq!(retained.status, "completed");
+        assert_eq!(retained.request_fingerprint, "keyed-fingerprint");
+        assert_eq!(retained.pane_id, Some(42));
+
+        let columns = sqlx::query("PRAGMA table_info(mobile_task_launches)")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<Vec<_>>();
+        assert!(!columns
+            .iter()
+            .any(|name| name.contains("instruction") || name.contains("prompt")));
+
+        sqlx::query("DELETE FROM projects WHERE id = 'project-a'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let remaining = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM mobile_task_launches WHERE request_id = ?",
+        )
+        .bind(&request_id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0);
     }
 }

@@ -1,17 +1,17 @@
 //! Pty-hosted terminal panes (`shared::PaneKind::Terminal`).
 //!
-//! The default pane kind runs a provider headlessly
+//! The legacy/managed-team pane kind runs a provider headlessly
 //! (`claude --print --output-format stream-json`) and parses structured
-//! events. A terminal pane does the opposite: it allocates a pty, execs
+//! events. The normal user-created terminal pane instead allocates a pty, execs
 //! the provider's **real interactive TUI**, and ships the raw bytes to the
 //! browser where xterm.js renders them. Nothing is parsed, so nothing
 //! needs to be kept in sync with a provider's output
 //! format — the point of the feature is to reuse the CLI as it ships.
 //!
-//! The only flags passed are the provider's continue flag (on restore) and
-//! its permission-bypass flag: a pane driven from a browser has nobody at the
-//! keyboard to answer an approval prompt, and agent panes already launch with
-//! the same bypass. See [`permission_bypass_flag_for`].
+//! The only flags passed are the provider's exact resume arguments (on
+//! restore) and its permission-bypass flag: a pane driven from a browser has
+//! nobody at the keyboard to answer an approval prompt, and agent panes
+//! already launch with the same bypass. See [`permission_bypass_flag_for`].
 //!
 //! The cost is that a terminal pane has none of the structured
 //! integrations: no usage counters, no pane status, no diffs, no plan
@@ -19,9 +19,10 @@
 //! delegation target. See the `PaneKind` docs in `shared`.
 //!
 //! Lifetime: the pty is a child of the CLI process, so a terminal pane
-//! dies when `apas` restarts. There is no `--resume` equivalent to
-//! reattach a TUI, which is why [`TerminalHandle::spawn`] takes a
-//! `resume` flag that maps to the provider's own continue flag instead.
+//! dies when `apas` restarts. [`TerminalHandle::spawn`] therefore re-execs the
+//! provider and asks it to resume the pane's conversation. Claude can resume
+//! the exact pinned session id; codex currently exposes only its own resume
+//! picker/subcommand here.
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -73,14 +74,18 @@ pub fn terminal_binary_for(provider: &Provider) -> Option<&'static str> {
     }
 }
 
-/// The provider's own "pick up where we left off" flag. A pty-hosted TUI
-/// has no apas-visible session id to resume, so this is the closest we
-/// get to surviving an `apas` restart.
-fn resume_flag_for(provider: &Provider) -> Option<&'static str> {
+/// The provider's own "pick up where we left off" arguments.
+///
+/// Claude must receive the pane's exact pinned id. `--continue` is not an
+/// equivalent: it selects the most recent conversation for the cwd, which can
+/// belong to another pane while APAS continues watching this pane's pinned
+/// transcript. Codex's `resume` remains a subcommand and therefore must be
+/// appended before its permission flag.
+fn resume_args_for(provider: &Provider, conversation_id: Uuid) -> Vec<String> {
     match provider {
-        Provider::Claude => Some("--continue"),
-        Provider::Codex => Some("resume"),
-        _ => None,
+        Provider::Claude => vec!["--resume".to_string(), conversation_id.to_string()],
+        Provider::Codex => vec!["resume".to_string()],
+        _ => Vec::new(),
     }
 }
 
@@ -148,6 +153,7 @@ impl TerminalHandle {
         cwd: &str,
         env: &[(String, String)],
         resume: bool,
+        initial_prompt: Option<&str>,
         server_tx: tokio_mpsc::Sender<CliToServer>,
     ) -> Result<Self> {
         let pty = native_pty_system();
@@ -166,8 +172,8 @@ impl TerminalHandle {
         // both plain top-level flags, so it is order-insensitive. Appending
         // resume first satisfies both.
         if resume {
-            if let Some(flag) = resume_flag_for(provider) {
-                cmd.arg(flag);
+            for arg in resume_args_for(provider, claude_session_id) {
+                cmd.arg(arg);
             }
         }
         if let Some(flag) = permission_bypass_flag_for(provider) {
@@ -179,12 +185,21 @@ impl TerminalHandle {
         // history without guessing which file is whose. Codex has no
         // equivalent flag; see `transcript::find_codex_rollout`.
         //
-        // Deliberately skipped when resuming: `--continue` picks up an existing
-        // conversation that already owns an id, and forcing a different one
-        // would either be rejected or split the history in two.
+        // Deliberately skipped when resuming: claude receives this same id via
+        // `--resume <id>` above, while codex has no equivalent pinning flag.
         if !resume && matches!(provider, Provider::Claude) {
             cmd.arg("--session-id");
             cmd.arg(claude_session_id.to_string());
+        }
+        // Both supported interactive CLIs accept a positional first prompt.
+        // Supplying it at process creation is atomic and avoids racing raw
+        // keystrokes against a full-screen TUI that has not initialized yet.
+        // A restored pane uses the provider's resume flow instead and must not
+        // replay an old instruction.
+        if !resume {
+            if let Some(prompt) = initial_prompt.map(str::trim).filter(|p| !p.is_empty()) {
+                cmd.arg(prompt);
+            }
         }
         cmd.cwd(cwd);
         // A TUI keys its capabilities off TERM. Without this it inherits
@@ -491,23 +506,30 @@ mod tests {
             Provider::CursorAgent,
         ] {
             assert_eq!(permission_bypass_flag_for(&p), None, "{p:?}");
-            assert_eq!(resume_flag_for(&p), None, "{p:?}");
+            assert!(resume_args_for(&p, Uuid::nil()).is_empty(), "{p:?}");
         }
     }
 
     #[test]
-    fn codex_bypass_flag_follows_its_resume_subcommand() {
+    fn restore_uses_provider_resume_arguments_without_losing_claude_identity() {
         // `resume` is a subcommand for codex, not a flag, so the bypass flag
         // has to come after it -- `codex resume --dangerously-...`, never
         // `codex --dangerously-... resume`. Claude's are both top-level flags
         // and order-insensitive. Pinning the relative order here because the
         // spawn builds them in sequence and a swap only fails at runtime.
-        assert_eq!(resume_flag_for(&Provider::Codex), Some("resume"));
+        let conversation_id = Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap();
+        assert_eq!(
+            resume_args_for(&Provider::Codex, conversation_id),
+            vec!["resume".to_string()]
+        );
         assert_eq!(
             permission_bypass_flag_for(&Provider::Codex),
             Some("--dangerously-bypass-approvals-and-sandbox")
         );
-        assert_eq!(resume_flag_for(&Provider::Claude), Some("--continue"));
+        assert_eq!(
+            resume_args_for(&Provider::Claude, conversation_id),
+            vec!["--resume".to_string(), conversation_id.to_string()]
+        );
         assert_eq!(
             permission_bypass_flag_for(&Provider::Claude),
             Some("--dangerously-skip-permissions")
@@ -533,6 +555,7 @@ mod tests {
                 "/tmp",
                 &[],
                 false,
+                Some("diagnose the failing test"),
                 tx,
             )
             .expect("spawn pty");
@@ -613,7 +636,9 @@ mod tests {
             // pane's transcript can be located exactly rather than guessed.
             assert_eq!(
                 String::from_utf8_lossy(&collected).trim_end(),
-                format!("--dangerously-skip-permissions --session-id {conv_id}"),
+                format!(
+                    "--dangerously-skip-permissions --session-id {conv_id} diagnose the failing test"
+                ),
             );
             handle.shutdown();
         });
@@ -637,6 +662,7 @@ mod tests {
                 "/tmp",
                 &[],
                 false,
+                None,
                 tx.clone(),
             )
             .expect("spawn first pty");
@@ -649,6 +675,7 @@ mod tests {
                 "/tmp",
                 &[],
                 false,
+                None,
                 tx,
             )
             .expect("spawn replacement pty");
@@ -678,6 +705,7 @@ mod tests {
                 "/tmp",
                 &[],
                 false,
+                None,
                 tx,
             )
             .expect("spawn pty");

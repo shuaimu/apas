@@ -697,6 +697,9 @@ interface AppState {
   ) => void;
   listSessions: () => void;
   loadSessionMessages: (sessionId: string) => void;
+  /** Fetch a bounded newest slice across every pane without resetting the
+   *  current attachment. Used by the mobile activity timeline. */
+  loadSessionActivity: (sessionId: string) => void;
   loadMoreMessages: (pane?: PaneType | number) => void;
   /** Lazy-load mode: fetch this pane's messages on first tab activation
    *  if we haven't already. Server's attach reply doesn't ship every
@@ -830,6 +833,9 @@ interface AppState {
    *  terminalBus, not through store state — see that module for why. */
   attachTerminal: (paneId: number) => void;
   sendTerminalInput: (paneId: number, data: string) => void;
+  /** Submit a loggable chat message to a terminal-hosted agent. Raw terminal
+   *  keystrokes stay on sendTerminalInput and are never added to history. */
+  sendTerminalConversationMessage: (paneId: number, text: string) => { success: boolean; error?: string };
   sendTerminalResize: (paneId: number, cols: number, rows: number) => void;
 
   /** Ask the server (which asks the CLI) for the current team-todo.md.
@@ -886,7 +892,7 @@ export interface PlanReviewPendingItem {
   arrivedAt: number;
 }
 
-const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://apas.mpaxos.com";
+const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "wss://apas.mpaxos.com";
 const DEEPSEEK_API_BASE_URL = "https://api.deepseek.com/anthropic";
 
 export const useStore = create<AppState>((set, get) => ({
@@ -1097,6 +1103,9 @@ export const useStore = create<AppState>((set, get) => ({
         type: "authenticate",
         token,
         capabilities: ["project_policy_v1"],
+        client_kind: "web",
+        app_version: process.env.NEXT_PUBLIC_WEB_UI_VERSION || "development",
+        protocol_version: 1,
       }));
     };
 
@@ -1629,6 +1638,16 @@ export const useStore = create<AppState>((set, get) => ({
     ws.send(JSON.stringify({ type: "get_session_messages", session_id: sessionId, limit: 30 }));
   },
 
+  loadSessionActivity: (sessionId: string) => {
+    const { ws } = get();
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({
+      type: "get_session_messages",
+      session_id: sessionId,
+      limit: 30,
+    }));
+  },
+
   sendMessage: (text: string) => {
     const { ws, sessionId } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -2157,6 +2176,12 @@ export const useStore = create<AppState>((set, get) => ({
     if (managed && !policy.teamAvailable) {
       return { success: false, error: `Team launch is disabled by cluster policy v${policy.version}.` };
     }
+    if (!managed && kind === "agent") {
+      return {
+        success: false,
+        error: "Conversation-only panes are retired. Create a Claude or Codex terminal pane instead.",
+      };
+    }
     if (!policyAllowsLaunch(policy, kind, typedProvider, model)) {
       return {
         success: false,
@@ -2472,6 +2497,35 @@ export const useStore = create<AppState>((set, get) => ({
     }));
   },
 
+  sendTerminalConversationMessage: (paneId: number, text: string) => {
+    const { ws, sessionId, isAttached } = get();
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return { success: false, error: "Not connected to server" };
+    }
+    if (!sessionId || !isAttached) {
+      return { success: false, error: "Session is not active. Start the CLI to send messages." };
+    }
+    const body = text.trim();
+    if (!body) return { success: false, error: "Message cannot be empty" };
+
+    const sendId = generateId();
+    get().addMessageToPane({
+      id: `optimistic-${sendId}`,
+      role: "user",
+      content: body,
+      timestamp: new Date(),
+      outputType: { type: "text" },
+    }, paneId);
+    ws.send(JSON.stringify({
+      type: "terminal_conversation_input",
+      session_id: sessionId,
+      pane_id: paneId,
+      text: body,
+      client_msg_id: sendId,
+    }));
+    return { success: true };
+  },
+
   /** Tell the pty the viewport size so the hosted TUI re-lays-out. */
   sendTerminalResize: (paneId: number, cols: number, rows: number) => {
     const { ws, sessionId } = get();
@@ -2486,8 +2540,12 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   promotePaneToManaged: (paneId: number) => {
-    const { ws, sessionId, showToast } = get();
+    const { ws, sessionId, showToast, paneConfigs } = get();
     if (!sessionId) return;
+    if (paneConfigs.find((pane) => pane.pane_id === paneId)?.kind === "terminal") {
+      showToast("Terminal panes cannot join a managed team", "error");
+      return;
+    }
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
         type: "promote_pane_to_managed",
@@ -2664,8 +2722,14 @@ export const useStore = create<AppState>((set, get) => ({
       showToast("CLI reboot refused because one or more panes are outside cluster policy", "error");
       return;
     }
-    if (ws && ws.readyState === WebSocket.OPEN) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      showToast("Not connected — reboot the CLI manually on the project host", "error");
+      return;
+    }
+    try {
       ws.send(JSON.stringify({ type: "reboot_cli", session_id: get().sessionId }));
+    } catch {
+      showToast("The reboot request could not be sent — reboot the CLI manually on the project host", "error");
     }
   },
 
@@ -3684,8 +3748,17 @@ export function handleServerMessage(
 
     case "session_attached": {
       const hasActiveCli = data.has_active_cli as boolean;
-      storeDebugLog("Session attached, has active CLI:", hasActiveCli);
-      set({ isAttached: hasActiveCli });
+      const attachedSessionId = data.session_id as string | undefined;
+      const currentSessionId = get().sessionId;
+      storeDebugLog("Session attached, has active CLI:", hasActiveCli, attachedSessionId);
+      // Reconnect subscribes this socket to cached background sessions too.
+      // Their confirmations can arrive after the current project's reply, so
+      // never let a background (often inactive) session disable the current
+      // project's composer. Older servers omitted session_id, hence the
+      // compatibility fallback.
+      if (!attachedSessionId || attachedSessionId === currentSessionId) {
+        set({ isAttached: hasActiveCli });
+      }
       break;
     }
 
@@ -4048,17 +4121,24 @@ export function handleServerMessage(
       break;
     }
 
-    case "error":
-      console.error("Server error:", data.message);
+    case "error": {
+      const message = typeof data.message === "string" ? data.message : "Unknown server error";
+      console.error("Server error:", message);
+      // Per-pane views do not render the legacy global message list, which
+      // made policy and delivery failures look like buttons that did nothing.
+      // Keep the system message for history compatibility and also surface an
+      // immediate, view-independent alert.
+      get().showToast(message, "error");
       const errorMessage: Message = {
         id: generateId(),
         role: "system",
-        content: data.message as string,
+        content: message,
         timestamp: new Date(),
         outputType: { type: "error" },
       };
       set((state) => ({ messages: [...state.messages, errorMessage] }));
       break;
+    }
 
     case "project_access_changed": {
       const projectId = data.project_id as string | undefined;

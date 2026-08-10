@@ -109,6 +109,85 @@ impl User {
     }
 }
 
+#[derive(Debug, Clone, FromRow)]
+pub struct MobileDeviceSessionRecord {
+    pub id: String,
+    pub user_id: String,
+    pub installation_id: String,
+    pub platform: String,
+    pub device_name: Option<String>,
+    pub app_version: String,
+    pub created_at: String,
+    pub last_used_at: String,
+    pub expires_at: String,
+    pub revoked_at: Option<String>,
+    pub revocation_reason: Option<String>,
+}
+
+impl MobileDeviceSessionRecord {
+    pub fn is_active(&self) -> bool {
+        self.revoked_at.is_none()
+            && chrono::DateTime::parse_from_rfc3339(&self.expires_at)
+                .map(|expires| expires.with_timezone(&chrono::Utc) > chrono::Utc::now())
+                .unwrap_or(false)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobileRefreshFailure {
+    Invalid,
+    Expired,
+    Revoked,
+    Reused,
+    InstallationMismatch,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct MobileNotificationDeliveryRecord {
+    pub id: i64,
+    pub event_id: String,
+    pub push_token_id: String,
+    pub token: String,
+    pub category: String,
+    pub routing_id: String,
+    pub session_id: Option<String>,
+    pub attempt_count: i64,
+    pub provider_ticket_id: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct MobileTaskLaunchRecord {
+    pub request_id: String,
+    pub user_id: String,
+    pub device_session_id: String,
+    pub request_fingerprint: String,
+    pub machine_id: String,
+    pub project_id: String,
+    pub status: String,
+    pub session_id: Option<String>,
+    pub pane_id: Option<i64>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MobileAppVersionCount {
+    pub app_version: String,
+    pub active_device_sessions: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MobilePersistenceMetrics {
+    pub active_device_sessions: i64,
+    pub active_push_tokens: i64,
+    pub pending_task_launches: i64,
+    pub outbox_queued: i64,
+    pub outbox_sending: i64,
+    pub outbox_ticketed: i64,
+    pub outbox_retry: i64,
+    pub outbox_permanent_failure: i64,
+    pub app_versions: Vec<MobileAppVersionCount>,
+}
+
 #[derive(Debug, Clone, FromRow, Serialize)]
 pub struct Project {
     pub id: String,
@@ -178,9 +257,11 @@ pub struct ProjectMemberInfo {
     pub created_at: Option<String>,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AdminProjectSummary {
     pub id: String,
+    pub project_name: Option<String>,
+    pub hostname: Option<String>,
     pub owner_user_id: String,
     pub owner_email: String,
     pub lifecycle_status: String,

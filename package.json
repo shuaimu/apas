@@ -1,0 +1,13 @@
+{
+  "name": "apas-workspace",
+  "private": true,
+  "scripts": {
+    "mobile:install": "npm --prefix packages/protocol ci && npm --prefix packages/terminal-web ci && npm --prefix packages/mobile ci",
+    "mobile:lint": "npm --prefix packages/mobile run lint",
+    "mobile:typecheck": "npm --prefix packages/protocol run typecheck && npm --prefix packages/terminal-web run typecheck && npm --prefix packages/mobile run typecheck",
+    "mobile:test": "npm --prefix packages/protocol test && npm --prefix packages/terminal-web test && npm --prefix packages/mobile test",
+    "mobile:smoke:android": "npm --prefix packages/mobile run smoke:android",
+    "protocol:generate": "npm --prefix packages/protocol run generate",
+    "protocol:check": "npm --prefix packages/protocol run check:generated"
+  }
+}

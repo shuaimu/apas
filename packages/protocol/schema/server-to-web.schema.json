@@ -1,0 +1,2611 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ServerToWeb",
+  "oneOf": [
+    {
+      "description": "Authentication successful",
+      "type": "object",
+      "properties": {
+        "account_status": {
+          "type": "string",
+          "default": ""
+        },
+        "cluster_role": {
+          "type": "string",
+          "default": ""
+        },
+        "mutations_allowed": {
+          "type": "boolean",
+          "default": true
+        },
+        "negotiated_capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "protocol_version": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "server_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "authenticated"
+        },
+        "user_email": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "user_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "type",
+        "user_id"
+      ]
+    },
+    {
+      "description": "The peer authenticated, but its protocol cannot safely mutate state.\nA mobile client may retain read-only cached/live access while guiding\nthe user to install a compatible build.",
+      "type": "object",
+      "properties": {
+        "maximum_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "message": {
+          "type": "string"
+        },
+        "minimum_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "read_only": {
+          "type": "boolean"
+        },
+        "type": {
+          "type": "string",
+          "const": "protocol_incompatible"
+        }
+      },
+      "required": [
+        "type",
+        "minimum_version",
+        "maximum_version",
+        "read_only",
+        "message"
+      ]
+    },
+    {
+      "description": "Authentication failed",
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "authentication_failed"
+        }
+      },
+      "required": [
+        "type",
+        "reason"
+      ]
+    },
+    {
+      "description": "Correlated acceptance or rejection for a time-sensitive coding\nmutation. `accepted` means the current authorized CLI accepted the\noperation for processing; clients never infer success from send().",
+      "type": "object",
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mutation": {
+          "$ref": "#/$defs/MutationKind"
+        },
+        "pane_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "mutation_ack"
+        }
+      },
+      "required": [
+        "type",
+        "request_id",
+        "session_id",
+        "mutation",
+        "accepted"
+      ]
+    },
+    {
+      "description": "Session started",
+      "type": "object",
+      "properties": {
+        "pane_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "pane_type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PaneType"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "session_started"
+        }
+      },
+      "required": [
+        "type",
+        "session_id"
+      ]
+    },
+    {
+      "description": "Session status update",
+      "type": "object",
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/SessionStatus"
+        },
+        "type": {
+          "type": "string",
+          "const": "session_status"
+        }
+      },
+      "required": [
+        "type",
+        "status"
+      ]
+    },
+    {
+      "description": "Session attached confirmation (includes whether CLI is active)",
+      "type": "object",
+      "properties": {
+        "has_active_cli": {
+          "type": "boolean"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "session_attached"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "has_active_cli"
+      ]
+    },
+    {
+      "description": "Output from Claude",
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "output_type": {
+          "$ref": "#/$defs/OutputType",
+          "default": "text"
+        },
+        "pane_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "pane_type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PaneType"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "output"
+        }
+      },
+      "required": [
+        "type",
+        "content"
+      ]
+    },
+    {
+      "description": "Error message",
+      "type": "object",
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "error"
+        }
+      },
+      "required": [
+        "type",
+        "message"
+      ]
+    },
+    {
+      "description": "List of available CLI clients",
+      "type": "object",
+      "properties": {
+        "clients": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CliClientInfo"
+          }
+        },
+        "type": {
+          "type": "string",
+          "const": "cli_clients"
+        }
+      },
+      "required": [
+        "type",
+        "clients"
+      ]
+    },
+    {
+      "description": "List of daemon-reported machines and projects",
+      "type": "object",
+      "properties": {
+        "machines": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MachineWithProjects"
+          }
+        },
+        "type": {
+          "type": "string",
+          "const": "machines"
+        }
+      },
+      "required": [
+        "type",
+        "machines"
+      ]
+    },
+    {
+      "description": "Structured message from Claude CLI stream-json output",
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "$ref": "#/$defs/ClaudeStreamMessage"
+        },
+        "pane_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "pane_type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PaneType"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "stream_message"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "message"
+      ]
+    },
+    {
+      "description": "List of persisted sessions",
+      "type": "object",
+      "properties": {
+        "sessions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SessionInfo"
+          }
+        },
+        "type": {
+          "type": "string",
+          "const": "sessions"
+        }
+      },
+      "required": [
+        "type",
+        "sessions"
+      ]
+    },
+    {
+      "description": "Project-wide authorization changed outside this socket. Clients use\nthis as a refresh hint; the server remains the authorization boundary.",
+      "type": "object",
+      "properties": {
+        "change": {
+          "$ref": "#/$defs/ProjectAccessChange"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "role": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "project_access_changed"
+        }
+      },
+      "required": [
+        "type",
+        "project_id",
+        "change"
+      ]
+    },
+    {
+      "description": "Messages for a session",
+      "type": "object",
+      "properties": {
+        "catchup": {
+          "type": "boolean",
+          "default": false
+        },
+        "has_more": {
+          "type": "boolean",
+          "default": false
+        },
+        "messages": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MessageInfo"
+          }
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "session_messages"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "messages"
+      ]
+    },
+    {
+      "description": "User input/prompt from CLI (displayed in web UI)",
+      "type": "object",
+      "properties": {
+        "client_msg_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "pane_type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PaneType"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "text": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "user_input"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "text"
+      ]
+    },
+    {
+      "description": "Deadloop pause status update (legacy - use PanePaused for new code)",
+      "type": "object",
+      "properties": {
+        "is_paused": {
+          "type": "boolean"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "deadloop_status"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "is_paused"
+      ]
+    },
+    {
+      "description": "Pane pause status update",
+      "type": "object",
+      "properties": {
+        "is_paused": {
+          "type": "boolean"
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "pane_paused"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id",
+        "is_paused"
+      ]
+    },
+    {
+      "description": "Pane status update (e.g., \"thinking\") for status bar display.\n`session_id` lets the web client drop statuses for sessions it is\nnot currently viewing — the web is multi-attached to keep background\ntabs live, but only the foreground tab should drive the status pill.",
+      "type": "object",
+      "properties": {
+        "pane_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "pane_type": {
+          "$ref": "#/$defs/PaneType",
+          "default": "deadloop"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "pane_status"
+        }
+      },
+      "required": [
+        "type",
+        "session_id"
+      ]
+    },
+    {
+      "description": "List of pane configurations for a session",
+      "type": "object",
+      "properties": {
+        "panes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PaneConfig"
+          }
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "pane_list"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "panes"
+      ]
+    },
+    {
+      "description": "Usage limits update from a CLI client",
+      "type": "object",
+      "properties": {
+        "cli_client_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "limits": {
+          "$ref": "#/$defs/UsageLimits"
+        },
+        "provider": {
+          "$ref": "#/$defs/Provider",
+          "default": "claude"
+        },
+        "type": {
+          "type": "string",
+          "const": "usage_limits"
+        }
+      },
+      "required": [
+        "type",
+        "cli_client_id",
+        "limits"
+      ]
+    },
+    {
+      "description": "Full session data for download",
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hostname": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "messages": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MessageInfo"
+          }
+        },
+        "project_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "session_download"
+        },
+        "working_dir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "messages"
+      ]
+    },
+    {
+      "description": "One team scratchpad record forwarded from the CLI. Phase 2.2b.",
+      "type": "object",
+      "properties": {
+        "record": {
+          "$ref": "#/$defs/TeamScratchpadRecord"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "team_record"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "record"
+      ]
+    },
+    {
+      "description": "Plan-review request forwarded from CLI. Phase 3.2b2.",
+      "type": "object",
+      "properties": {
+        "input": true,
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "tool_name": {
+          "type": "string"
+        },
+        "tool_use_id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "plan_review_request"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id",
+        "tool_use_id",
+        "tool_name",
+        "input"
+      ]
+    },
+    {
+      "description": "On-demand diff for a pane's isolated worktree branch. Phase 1.2a.",
+      "type": "object",
+      "properties": {
+        "base": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "diff": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "pane_diff"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "Forwarded from `CliToServer::PrCreated` after the CLI ran\n`gh pr create --fill`. The web shows a toast with the URL or\nthe error.",
+      "type": "object",
+      "properties": {
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "pr_created"
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "Forwarded from `CliToServer::ProjectGoalChanged`. The web caches\nthis per-session and refreshes the Project goal textbox when the\nuser isn't actively editing.",
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "project_goal_changed"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "content"
+      ]
+    },
+    {
+      "description": "Per-project and per-pane usage stats (prompt/token/cost counts) for\nthe Overview. Pushed after each turn is recorded and replayed on\nattach; the server aggregates from the day-bucketed stats table.",
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "stats": {
+          "$ref": "#/$defs/ProjectUsageStats"
+        },
+        "type": {
+          "type": "string",
+          "const": "project_usage_stats"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "stats"
+      ]
+    },
+    {
+      "description": "Result of a web-initiated `CreateProjectInstance`, relayed from the\ndaemon's ack to the requesting user's web clients as a toast. Distinct\nfrom the generic `Error` variant (which renders in the chat log).",
+      "type": "object",
+      "properties": {
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "project_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "project_instance_created"
+        }
+      },
+      "required": [
+        "type",
+        "machine_id"
+      ]
+    },
+    {
+      "description": "Forwarded from `CliToServer::ProjectFlagsChanged`. Web mirrors\nthe latest Tech-Lead autonomy flags per session for the Overview\ntoggles.",
+      "type": "object",
+      "properties": {
+        "auto_approve_todos": {
+          "type": "boolean"
+        },
+        "auto_merge_prs": {
+          "type": "boolean"
+        },
+        "disallowed_tab_types": {
+          "description": "Tab types this project refuses to create, as `<kind>:<provider>`\nkeys (see `tab_type_key`). A *deny* list so that absent means\n\"everything allowed\" — see `tab_type_allowed`. Owner/admin only,\nsame gate as the flags above.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "team_enabled": {
+          "description": "Drives whether the web shows any team surface at all. The CLI\nre-broadcasts this every 5s from `.apas`, so a web client that\nattaches mid-session hydrates without asking.",
+          "type": "boolean",
+          "default": false
+        },
+        "type": {
+          "type": "string",
+          "const": "project_flags_changed"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "auto_approve_todos",
+        "auto_merge_prs"
+      ]
+    },
+    {
+      "description": "Effective cluster-governed policy for the attached project.",
+      "type": "object",
+      "properties": {
+        "noncompliant_pane_ids": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          }
+        },
+        "policy": {
+          "$ref": "#/$defs/EffectiveProjectPolicy"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "project_policy_changed"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "policy"
+      ]
+    },
+    {
+      "description": "Snapshot of the project's team-todo.md state. Sent in reply to\n`WebToServer::FetchTeamTodo` and after every CLI-side mutation\ntriggered by `WebToServer::TodoApproval`. See\n`docs/todo-driven-workflow.md`.",
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "state": {
+          "$ref": "#/$defs/TeamTodoStateMsg"
+        },
+        "type": {
+          "type": "string",
+          "const": "team_todo_state"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "state"
+      ]
+    },
+    {
+      "description": "Snapshot of the project's suggested-workers.md state. Sent in\nreply to `WebToServer::FetchSuggestedWorkers` and after every\nCLI-side mutation triggered by `WebToServer::DismissSuggestion`.",
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "suggestions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SuggestedWorkerMsg"
+          }
+        },
+        "type": {
+          "type": "string",
+          "const": "suggested_workers_state"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "suggestions"
+      ]
+    },
+    {
+      "description": "Live pty bytes for a terminal pane, fanned out to every web\nclient attached to the session.",
+      "type": "object",
+      "properties": {
+        "data_b64": {
+          "type": "string"
+        },
+        "instance_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "terminal_output"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id",
+        "data_b64",
+        "seq"
+      ]
+    },
+    {
+      "description": "Replayed scrollback in answer to `WebToServer::TerminalAttach`.\n\n`seq` is the sequence of the newest chunk included, so the client\ncan drop any live `TerminalOutput` it already buffered at or below\nit instead of double-rendering. `truncated` is true when the ring\nbuffer dropped older bytes, which means the replay may begin\npartway through an escape sequence — the client writes a reset\nfirst so a clipped sequence can't corrupt the emulator state.",
+      "type": "object",
+      "properties": {
+        "data_b64": {
+          "type": "string"
+        },
+        "instance_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "lifecycle": {
+          "$ref": "#/$defs/TerminalLifecycle",
+          "default": "unknown"
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "truncated": {
+          "type": "boolean",
+          "default": false
+        },
+        "type": {
+          "type": "string",
+          "const": "terminal_snapshot"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id",
+        "data_b64",
+        "seq"
+      ]
+    },
+    {
+      "description": "A terminal pane's child process ended.",
+      "type": "object",
+      "properties": {
+        "instance_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "terminal_exited"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "Live terminal lifecycle change. Snapshot carries the same fields for\nclients that attach after this event was emitted.",
+      "type": "object",
+      "properties": {
+        "instance_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "lifecycle": {
+          "$ref": "#/$defs/TerminalLifecycle",
+          "default": "unknown"
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "terminal_state"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "Echo of `WebToServer::Heartbeat`. The browser's liveness loop\nuses any inbound frame (including this one) as proof the WS is\nhealthy; a missing echo within `livenessMs` triggers reconnect.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "heartbeat"
+        }
+      },
+      "required": [
+        "type"
+      ]
+    }
+  ],
+  "$defs": {
+    "ClaudeAssistantMessage": {
+      "description": "Claude assistant message structure",
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ClaudeContentBlock"
+          }
+        },
+        "model": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "content"
+      ]
+    },
+    "ClaudeContentBlock": {
+      "description": "Content block types in Claude messages",
+      "oneOf": [
+        {
+          "description": "Text content from Claude",
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "text"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ]
+        },
+        {
+          "description": "Tool use request from Claude",
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "input": true,
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "tool_use"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "name",
+            "input"
+          ]
+        },
+        {
+          "description": "Tool result (in user messages)\nNote: Claude CLI can send `content` as either a string or an array of\ncontent parts. We use a custom deserializer to handle both.",
+          "type": "object",
+          "properties": {
+            "content": {
+              "type": "string"
+            },
+            "is_error": {
+              "type": "boolean",
+              "default": false
+            },
+            "tool_use_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "tool_result"
+            }
+          },
+          "required": [
+            "type",
+            "tool_use_id",
+            "content"
+          ]
+        }
+      ]
+    },
+    "ClaudeStreamMessage": {
+      "description": "Top-level message from Claude CLI stream-json output",
+      "oneOf": [
+        {
+          "description": "System initialization message",
+          "type": "object",
+          "properties": {
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "model": {
+              "type": "string",
+              "default": ""
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "subtype": {
+              "type": "string"
+            },
+            "tools": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "system"
+            }
+          },
+          "additionalProperties": true,
+          "required": [
+            "type",
+            "subtype",
+            "session_id"
+          ]
+        },
+        {
+          "description": "Assistant (Claude) message with content blocks",
+          "type": "object",
+          "properties": {
+            "message": {
+              "$ref": "#/$defs/ClaudeAssistantMessage"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "assistant"
+            }
+          },
+          "additionalProperties": true,
+          "required": [
+            "type",
+            "message",
+            "session_id"
+          ]
+        },
+        {
+          "description": "User message (typically tool results)",
+          "type": "object",
+          "properties": {
+            "message": {
+              "$ref": "#/$defs/ClaudeUserMessage"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "tool_use_result": {
+              "default": null
+            },
+            "type": {
+              "type": "string",
+              "const": "user"
+            }
+          },
+          "additionalProperties": true,
+          "required": [
+            "type",
+            "message",
+            "session_id"
+          ]
+        },
+        {
+          "description": "Final result message",
+          "type": "object",
+          "properties": {
+            "duration_ms": {
+              "type": "integer",
+              "format": "uint64",
+              "default": 0,
+              "minimum": 0
+            },
+            "is_error": {
+              "type": "boolean",
+              "default": false
+            },
+            "result": {
+              "type": "string",
+              "default": ""
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "subtype": {
+              "type": "string"
+            },
+            "total_cost_usd": {
+              "type": "number",
+              "format": "double",
+              "default": 0.0
+            },
+            "type": {
+              "type": "string",
+              "const": "result"
+            }
+          },
+          "additionalProperties": true,
+          "required": [
+            "type",
+            "subtype",
+            "session_id"
+          ]
+        }
+      ]
+    },
+    "ClaudeUserMessage": {
+      "description": "Claude user message structure (for tool results)",
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ClaudeContentBlock"
+          }
+        },
+        "role": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "required": [
+        "content"
+      ]
+    },
+    "CliClientInfo": {
+      "description": "Information about a CLI client",
+      "type": "object",
+      "properties": {
+        "active_session": {
+          "description": "Active session ID if the CLI has a local session running",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "last_seen": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/CliClientStatus"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "status"
+      ]
+    },
+    "CliClientStatus": {
+      "description": "CLI client status",
+      "type": "string",
+      "enum": [
+        "online",
+        "offline",
+        "busy"
+      ]
+    },
+    "DeepseekBackendInfo": {
+      "description": "Machine-level DeepSeek backend status safe to expose to web UI.",
+      "type": "object",
+      "properties": {
+        "api_base_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "api_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "api_key_configured": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "EffectiveProjectPolicy": {
+      "type": "object",
+      "properties": {
+        "allowed_launch_profiles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "project_suspended": {
+          "type": "boolean",
+          "default": false
+        },
+        "team_available": {
+          "type": "boolean"
+        },
+        "version": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "team_available",
+        "allowed_launch_profiles",
+        "version"
+      ]
+    },
+    "MachineInfo": {
+      "description": "Information about a machine reported by a daemon",
+      "type": "object",
+      "properties": {
+        "arch": {
+          "type": "string"
+        },
+        "daemon_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "deepseek_backend": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeepseekBackendInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "last_seen": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "os": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "machine_id",
+        "hostname",
+        "os",
+        "arch"
+      ]
+    },
+    "MachineProjectInfo": {
+      "description": "APAS project discovered on a machine",
+      "type": "object",
+      "properties": {
+        "is_running": {
+          "type": "boolean",
+          "default": false
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "memory_kb": {
+          "description": "Resident set size of the headless CLI process, in KiB. Reported by the\ndaemon from /proc/<pid>/status so the UI can spot runaway memory usage\nbefore the kernel does.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "pid": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "path"
+      ]
+    },
+    "MachineWithProjects": {
+      "description": "Machine with its project list",
+      "type": "object",
+      "properties": {
+        "machine": {
+          "$ref": "#/$defs/MachineInfo"
+        },
+        "projects": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MachineProjectInfo"
+          }
+        }
+      },
+      "required": [
+        "machine",
+        "projects"
+      ]
+    },
+    "MessageInfo": {
+      "description": "Information about a persisted message",
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "message_type": {
+          "type": "string"
+        },
+        "pane_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "pane_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "role",
+        "content",
+        "message_type"
+      ]
+    },
+    "MutationKind": {
+      "type": "string",
+      "enum": [
+        "approval",
+        "question",
+        "plan_review",
+        "interrupt"
+      ]
+    },
+    "OutputType": {
+      "description": "Type of output content",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "text",
+            "system",
+            "error"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "object",
+              "properties": {
+                "language": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "code"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "tool_use": {
+              "type": "object",
+              "properties": {
+                "input": true,
+                "tool": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "tool",
+                "input"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "tool_use"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "tool_result": {
+              "type": "object",
+              "properties": {
+                "success": {
+                  "type": "boolean"
+                },
+                "tool": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "tool",
+                "success"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "tool_result"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "approval_request": {
+              "type": "object",
+              "properties": {
+                "description": {
+                  "type": "string"
+                },
+                "tool": {
+                  "type": "string"
+                },
+                "tool_call_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "tool_call_id",
+                "tool",
+                "description"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "approval_request"
+          ]
+        }
+      ]
+    },
+    "PaneConfig": {
+      "description": "Configuration for a single pane",
+      "type": "object",
+      "properties": {
+        "backstory": {
+          "description": "Free-form additional context appended to the system prompt\n(project conventions, constraints, prior decisions). Long-ish\nis fine — claude's context window is large.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "goal": {
+          "description": "One-line objective the pane is currently working toward, e.g.\n\"make the auth tests green\". Surfaced in the system prompt and\n(later) on the pane header.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "is_paused": {
+          "type": "boolean",
+          "default": false
+        },
+        "kind": {
+          "description": "Agent (headless stream-json, the default) vs Terminal (pty-hosted\ninteractive TUI). See [`PaneKind`].",
+          "$ref": "#/$defs/PaneKind",
+          "default": "agent"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "managed": {
+          "description": "v3.5 — managed vs. unmanaged. `true` = this pane is part of the\nproject team, usually created by the Overview Start team role\nslots or by accepted worker suggestions / manual managed-worker\nflows. Such panes show up on the Overview Pane Grid and the Tech\nLead may consider them for delegation. `false` (the compatibility\ndefault and the value for user-created terminal panes) = not part of\nthe team queue and never a Tech Lead delegation target.",
+          "type": "boolean",
+          "default": false
+        },
+        "manual_mode": {
+          "description": "v3.2 — worker mode. `false` (default) = **autonomous**: the Tech\nLead may delegate to this pane via `.apas-team.jsonl`. `true` =\n**manual**: the worker only takes user chat; the Tech Lead should\nskip it when picking a delegation target. Persisted to `.apas`.",
+          "type": "boolean",
+          "default": false
+        },
+        "min_iteration_interval_minutes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "mode": {
+          "$ref": "#/$defs/PaneMode"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "plan_review_mode": {
+          "description": "Phase 3.2a: per-pane policy for the editable plan checkpoint.\nDefault is `Never` (today's behaviour) so existing panes keep\nrunning without prompts.",
+          "$ref": "#/$defs/PlanReviewMode",
+          "default": "never"
+        },
+        "prompt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "provider": {
+          "$ref": "#/$defs/Provider"
+        },
+        "role": {
+          "description": "Short role label for the agent in this pane, e.g. \"backend\nimplementer\" or \"reviewer\". When set, gets prepended to claude's\nsystem prompt at spawn so the agent self-identifies. Phase 2.1.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "stop_requested": {
+          "type": "boolean",
+          "default": false
+        },
+        "worktree_path": {
+          "description": "Absolute path to an isolated git worktree this pane should run in.\nWhen `None`, the pane runs in the project's main working_dir as before\n(legacy behaviour, all panes share one tree → potential conflicts).\nPhase 1.1 of the swarm plan adds an opt-in path that puts each pane\non its own branch+worktree so parallel work doesn't race; this field\nis the persistence hook for that. The worktree itself is created\nout-of-band (CLI subcommand / web action) — apas does not touch git\njust because the field is set.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "pane_id",
+        "provider",
+        "mode",
+        "session_id"
+      ]
+    },
+    "PaneKind": {
+      "description": "How a pane hosts its agent process. Orthogonal to [`Provider`] (which\nbinary) and [`PaneMode`] (how autonomous).\n\n* [`PaneKind::Agent`] — the legacy/managed-team path: the CLI runs the provider\n  headlessly (`claude --print --output-format stream-json`,\n  `codex exec --json`) and parses structured events into\n  `CliToServer::StreamMessage`. Everything team-mode depends on —\n  usage counters, pane status, diffs, plan review, scratchpad\n  publishing, Tech Lead delegation — is built on those events. New\n  unmanaged panes are no longer created with this kind, but existing panes\n  remain compatible and managed team panes continue to use it.\n* [`PaneKind::Terminal`] — the pane instead hosts the provider's real\n  interactive TUI on a pty. Raw bytes flow over the dedicated\n  `Terminal*` messages and are rendered by xterm.js in the browser.\n  Nothing is parsed, so a terminal pane has none of the structured\n  integrations above and is never a delegation target. This is the normal\n  kind for new user-created Claude and Codex panes.\n\n`#[serde(default)]` on `PaneConfig::kind` keeps `.apas` files written\nbefore this existed deserializing as `Agent`.",
+      "type": "string",
+      "enum": [
+        "agent",
+        "terminal"
+      ]
+    },
+    "PaneMode": {
+      "description": "Mode for a pane",
+      "type": "string",
+      "enum": [
+        "deadloop",
+        "interactive"
+      ]
+    },
+    "PaneTodoPrMsg": {
+      "type": "object",
+      "properties": {
+        "annotation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "pane_id",
+        "url"
+      ]
+    },
+    "PaneType": {
+      "description": "Pane type for dual-pane mode (legacy - kept for backward compatibility)",
+      "oneOf": [
+        {
+          "description": "Autonomous deadloop worker (left pane)",
+          "type": "string",
+          "const": "deadloop"
+        },
+        {
+          "description": "Interactive user session (right pane)",
+          "type": "string",
+          "const": "interactive"
+        }
+      ]
+    },
+    "PaneUsageStats": {
+      "description": "Per-pane usage broken down by time window (cumulative lifetime plus the\nrolling 7-day and today windows derived from day-bucketed rows).",
+      "type": "object",
+      "properties": {
+        "last_7d": {
+          "$ref": "#/$defs/UsageCounters",
+          "default": {
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 0,
+            "cost_usd": 0.0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "prompts": 0,
+            "responses": 0
+          }
+        },
+        "last_active": {
+          "description": "Most recent activity timestamp (ISO 8601), max over the pane's buckets.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lifetime": {
+          "$ref": "#/$defs/UsageCounters",
+          "default": {
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 0,
+            "cost_usd": 0.0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "prompts": 0,
+            "responses": 0
+          }
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "today": {
+          "$ref": "#/$defs/UsageCounters",
+          "default": {
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 0,
+            "cost_usd": 0.0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "prompts": 0,
+            "responses": 0
+          }
+        }
+      },
+      "required": [
+        "pane_id"
+      ]
+    },
+    "PlanReviewMode": {
+      "description": "Phase 3.2a: per-pane policy for the \"editable plan checkpoint\"\nfeature. The streaming worker reads this at every turn to decide\nwhether to gate the first tool_use behind a user-approval card.",
+      "oneOf": [
+        {
+          "description": "Hold every turn's first tool_use until the user approves.",
+          "type": "string",
+          "const": "always"
+        },
+        {
+          "description": "Hold only when the turn's first tool_use is in a \"risky\" set\n(Write/Edit/Bash). Read-only tools run through.",
+          "type": "string",
+          "const": "risky_only"
+        },
+        {
+          "description": "Today's behaviour: no gating.",
+          "type": "string",
+          "const": "never"
+        }
+      ]
+    },
+    "ProjectAccessChange": {
+      "description": "Messages sent from server to web client",
+      "type": "string",
+      "enum": [
+        "transferred",
+        "revoked",
+        "deleted"
+      ]
+    },
+    "ProjectUsageStats": {
+      "description": "Project-level usage: the per-pane breakdown plus the project totals\n(sum over all panes of every session that shares this project_id).",
+      "type": "object",
+      "properties": {
+        "last_7d": {
+          "$ref": "#/$defs/UsageCounters",
+          "default": {
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 0,
+            "cost_usd": 0.0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "prompts": 0,
+            "responses": 0
+          }
+        },
+        "last_active": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lifetime": {
+          "$ref": "#/$defs/UsageCounters",
+          "default": {
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 0,
+            "cost_usd": 0.0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "prompts": 0,
+            "responses": 0
+          }
+        },
+        "panes": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/PaneUsageStats"
+          }
+        },
+        "today": {
+          "$ref": "#/$defs/UsageCounters",
+          "default": {
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 0,
+            "cost_usd": 0.0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "prompts": 0,
+            "responses": 0
+          }
+        }
+      }
+    },
+    "Provider": {
+      "description": "Provider for a pane",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "codex",
+            "deepseek",
+            "opencode",
+            "cursor-agent"
+          ]
+        },
+        {
+          "description": "`claude-old` / `claude_old` aliases keep panes serialized before the\nstreaming-only switchover deserializing as the (now-only) Claude\nvariant. The legacy per-turn `--print` worker has been removed; all\n`Provider::Claude` panes use the long-lived stream-json worker.",
+          "type": "string",
+          "const": "claude"
+        },
+        {
+          "description": "Decode-only compatibility tombstone. MiniMax is not launchable.",
+          "type": "string",
+          "const": "minimax",
+          "deprecated": true
+        },
+        {
+          "description": "Decode-only compatibility tombstone. GLM is not launchable.",
+          "type": "string",
+          "const": "glm",
+          "deprecated": true
+        }
+      ]
+    },
+    "SessionInfo": {
+      "description": "Information about a persisted session",
+      "type": "object",
+      "properties": {
+        "cli_client_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "created_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "git_remote": {
+          "description": "Canonical `host/owner/repo` of the project's git `origin` remote. The\nweb sidebar groups projects with the same value under one repo header.\n`None`/absent means \"no remote\" (its own sidebar group).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "git_remote_url": {
+          "description": "Raw `origin` URL for this project's repo (the cloneable URL). Surfaced\nso the web can prefill the clone URL when creating a new instance.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hostname": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "is_active": {
+          "description": "True if this session has an active CLI client connected",
+          "type": "boolean",
+          "default": false
+        },
+        "is_shared": {
+          "description": "True if this session is shared with the user (not owned)",
+          "type": "boolean",
+          "default": false
+        },
+        "owner_email": {
+          "description": "Email of the session owner (only set if is_shared is true)",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "project_id": {
+          "description": "Stable project identity from `.apas`. Web UI groups by this.\nFalls back to `id` for legacy rows that pre-date the column.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "share_role": {
+          "description": "Share role for this user on the session (\"owner\", \"admin\", or \"user\")",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": "string"
+        },
+        "working_dir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "status"
+      ]
+    },
+    "SessionStatus": {
+      "description": "Session status",
+      "oneOf": [
+        {
+          "description": "Waiting for CLI client to connect",
+          "type": "string",
+          "const": "pending"
+        },
+        {
+          "description": "CLI client connected, session active",
+          "type": "string",
+          "const": "connected"
+        },
+        {
+          "description": "CLI client disconnected",
+          "type": "string",
+          "const": "disconnected"
+        },
+        {
+          "description": "Session ended",
+          "type": "string",
+          "const": "ended"
+        }
+      ]
+    },
+    "SuggestedWorkerMsg": {
+      "description": "One row in the suggested-workers queue. The Manager pane appends\nthese as `## SUG-NNN — label` sections to `suggested-workers.md`;\nthe Overview renders each as a card with Accept / Dismiss buttons.",
+      "type": "object",
+      "properties": {
+        "backstory": {
+          "type": "string"
+        },
+        "goal": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "needs_worktree": {
+          "type": "boolean",
+          "default": false
+        },
+        "role": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "role",
+        "goal",
+        "backstory"
+      ]
+    },
+    "TeamScratchpadRecord": {
+      "description": "One published artifact in the team scratchpad (`.apas-team.jsonl`),\nmirroring the CLI's `crate::scratchpad::TeamRecord`. Separate type\nhere so the wire shape is stable across CLI/server/web even if the\nCLI's internal helper grows extra columns. Phase 2.2b.",
+      "type": "object",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "pane_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "tags": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "ts": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ts",
+        "kind",
+        "body"
+      ]
+    },
+    "TeamTodoGlobalMsg": {
+      "type": "object",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "origin": {
+          "description": "user | tech-lead",
+          "type": "string"
+        },
+        "prs": {
+          "description": "One PR per contributing worker. Empty until any worker's branch\nhas been pushed and PR'd.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/PaneTodoPrMsg"
+          }
+        },
+        "status": {
+          "description": "proposed | approved | in_progress | under_review | pr_open | done | rejected",
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "status",
+        "origin",
+        "body"
+      ]
+    },
+    "TeamTodoStateMsg": {
+      "description": "Wire format for a snapshot of `team-todo.md`. Mirrors the CLI's\n`team_todo::TeamTodo` but with status fields kept as strings so we\ndon't have to ship the enum definitions across crate / language\nboundaries. The web parses these into UI state.",
+      "type": "object",
+      "properties": {
+        "globals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TeamTodoGlobalMsg"
+          }
+        },
+        "reviewer_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tech_lead_cursor": {
+          "description": "Per-agent scratchpad cursor (RFC3339 timestamp of the last\nrecord acted on). `None` means the cursor file is missing —\neither the agent hasn't iterated yet, or it was wiped.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TeamTodoWorkerMsg"
+          }
+        }
+      },
+      "required": [
+        "globals",
+        "workers"
+      ]
+    },
+    "TeamTodoSubtaskMsg": {
+      "type": "object",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "parent": {
+          "type": "string"
+        },
+        "status": {
+          "description": "pending | in_progress | done | reviewing | revising | approved",
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "status",
+        "parent",
+        "body"
+      ]
+    },
+    "TeamTodoWorkerMsg": {
+      "type": "object",
+      "properties": {
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "role_hint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "subtasks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TeamTodoSubtaskMsg"
+          }
+        }
+      },
+      "required": [
+        "pane_id",
+        "subtasks"
+      ]
+    },
+    "TerminalLifecycle": {
+      "description": "Last server-observable state of a pty-hosted terminal pane.\n\n`Disconnected` means the CLI transport went away while the terminal was\nlast known to be running; it does not claim the provider process exited.\n`Unknown` is the rollout-safe default for peers predating lifecycle\nreconciliation and after a server restart before the CLI reports state.",
+      "type": "string",
+      "enum": [
+        "unknown",
+        "running",
+        "disconnected",
+        "exited"
+      ]
+    },
+    "UsageCounters": {
+      "description": "Aggregated usage counters for a pane or project over one time window.\nAll token counts come from the per-turn Claude/Codex stream `result`\nusage; `prompts` counts user/loop inputs and `responses` counts completed\nturns. Fields are snake_case so the wire keys match the web store verbatim.",
+      "type": "object",
+      "properties": {
+        "cache_creation_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "cache_read_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "cost_usd": {
+          "description": "Real cost in USD (only Claude transport reports it; 0 otherwise).",
+          "type": "number",
+          "format": "double",
+          "default": 0.0
+        },
+        "input_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "prompts": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "responses": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        }
+      }
+    },
+    "UsageLimitWindow": {
+      "description": "Usage limit information for a time window (5-hour or 7-day)",
+      "type": "object",
+      "properties": {
+        "resets_at": {
+          "description": "When the limit resets (ISO 8601 timestamp)",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "utilization": {
+          "description": "Utilization as a fraction (0.0 to 1.0+)",
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "required": [
+        "utilization"
+      ]
+    },
+    "UsageLimits": {
+      "description": "Usage limits from the provider API/logs",
+      "type": "object",
+      "properties": {
+        "fetched_at": {
+          "description": "When the usage was last fetched (ISO 8601 timestamp)",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "five_hour": {
+          "description": "5-hour rolling window usage",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsageLimitWindow"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "seven_day": {
+          "description": "7-day (weekly) rolling window usage",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsageLimitWindow"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

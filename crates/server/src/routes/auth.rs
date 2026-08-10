@@ -58,6 +58,10 @@ pub struct MeResponse {
 pub struct Claims {
     pub sub: String, // user_id
     pub exp: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_kind: Option<String>,
 }
 
 pub async fn register(
@@ -196,16 +200,7 @@ pub async fn me(
         })?;
 
     let claims = verify_token(auth_header, &state.config.auth.jwt_secret)?;
-    let user = state
-        .db
-        .get_user_by_id(&claims.sub)
-        .await?
-        .ok_or_else(|| AppError::AuthError("User not found".to_string()))?;
-    if !user.is_active() {
-        return Err(AppError::AuthError(
-            "Cluster account is suspended".to_string(),
-        ));
-    }
+    let user = require_active_claims(&state, &claims).await?;
 
     Ok(Json(MeResponse {
         user_id: user.id,
@@ -229,6 +224,8 @@ fn generate_token(
     let claims = Claims {
         sub: user_id.to_string(),
         exp: expiration,
+        device_session_id: None,
+        token_kind: None,
     };
 
     encode(
@@ -237,6 +234,57 @@ fn generate_token(
         &EncodingKey::from_secret(auth_config.jwt_secret.as_bytes()),
     )
     .map_err(|e| AppError::Internal(e.to_string()))
+}
+
+pub fn generate_mobile_access_token(
+    user_id: &str,
+    device_session_id: &str,
+    auth_config: &crate::config::AuthConfig,
+) -> Result<(String, chrono::DateTime<Utc>), AppError> {
+    let expires_at = Utc::now()
+        .checked_add_signed(Duration::minutes(
+            auth_config.mobile_access_expiry_minutes as i64,
+        ))
+        .ok_or_else(|| AppError::Internal("Failed to calculate expiration".to_string()))?;
+    let claims = Claims {
+        sub: user_id.to_string(),
+        exp: expires_at.timestamp() as usize,
+        device_session_id: Some(device_session_id.to_string()),
+        token_kind: Some("mobile_access".to_string()),
+    };
+    let token = encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(auth_config.jwt_secret.as_bytes()),
+    )
+    .map_err(|error| AppError::Internal(error.to_string()))?;
+    Ok((token, expires_at))
+}
+
+pub async fn require_active_claims(state: &AppState, claims: &Claims) -> Result<User, AppError> {
+    let user = state
+        .db
+        .get_user_by_id(&claims.sub)
+        .await?
+        .ok_or_else(|| AppError::AuthError("Cluster account not found".to_string()))?;
+    if !user.is_active() {
+        return Err(AppError::AuthError(
+            "Cluster account is suspended".to_string(),
+        ));
+    }
+    if let Some(device_session_id) = claims.device_session_id.as_deref() {
+        if claims.token_kind.as_deref() != Some("mobile_access")
+            || !state
+                .db
+                .is_mobile_device_session_active(device_session_id, &claims.sub)
+                .await?
+        {
+            return Err(AppError::AuthError(
+                "Mobile device session is expired or revoked".to_string(),
+            ));
+        }
+    }
+    Ok(user)
 }
 
 pub fn verify_token(token: &str, secret: &str) -> Result<Claims, AppError> {
@@ -253,7 +301,7 @@ pub fn verify_token(token: &str, secret: &str) -> Result<Claims, AppError> {
 // Device Code Flow (for CLI login)
 // ============================================================================
 
-const WEB_UI_URL: &str = "http://apas.mpaxos.com";
+const WEB_UI_URL: &str = "https://apas.mpaxos.com";
 
 #[derive(Debug, Serialize)]
 pub struct DeviceCodeResponse {

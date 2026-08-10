@@ -1,0 +1,18 @@
+{
+  "type": "sessions",
+  "sessions": [
+    {
+      "id": "20000000-0000-4000-8000-000000000001",
+      "project_id": "30000000-0000-4000-8000-000000000001",
+      "cli_client_id": null,
+      "working_dir": "/workspace/project",
+      "hostname": "builder-1",
+      "git_remote": "example/project",
+      "git_remote_url": "https://example.com/project.git",
+      "status": "active",
+      "created_at": "2026-08-08T12:00:00Z",
+      "is_shared": false,
+      "is_active": true
+    }
+  ]
+}

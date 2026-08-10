@@ -1,0 +1,4 @@
+{
+  "type": "mobile_telemetry",
+  "event": "terminal_bridge_ready"
+}

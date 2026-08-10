@@ -31,8 +31,8 @@ interface PaneGridProps {
   onPausePane: (paneId: number) => void;
   onResumePane: (paneId: number) => void;
   onRemovePane: (paneId: number) => void;
-  /** "managed" shows team members; "unmanaged" shows TabBar `+` side
-   *  chats with a one-way "Add to team" button per card. */
+  /** "managed" shows team members; "unmanaged" shows ordinary terminal
+   *  panes plus any historical side chats. */
   kind: "managed" | "unmanaged";
 }
 
@@ -64,13 +64,13 @@ export function PaneGrid({
       return (
         <div className="rounded border border-dashed border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30 p-4 text-sm italic text-gray-500 dark:text-gray-400">
           No team members yet. Use the Start team card above to launch the default
-          roles, or promote an existing side chat below.
+          roles, or add a worker.
         </div>
       );
     }
     return (
       <div className="rounded border border-dashed border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30 p-3 text-xs italic text-gray-500 dark:text-gray-400">
-        No side chats. Click <strong>+</strong> in the tab bar to start one.
+        No terminal panes. Click <strong>+</strong> in the tab bar to start one.
       </div>
     );
   }
@@ -99,7 +99,7 @@ export function PaneGrid({
             onResume={() => onResumePane(pane.pane_id)}
             onRemove={() => onRemovePane(pane.pane_id)}
             onPromote={
-              kind === "unmanaged"
+              kind === "unmanaged" && pane.kind !== "terminal"
                 ? () => promotePaneToManaged(pane.pane_id)
                 : undefined
             }
@@ -143,6 +143,7 @@ function PaneCard({
   onPromote,
 }: PaneCardProps) {
   const isBot = pane.mode === "deadloop";
+  const isTerminal = pane.kind === "terminal";
   const isUnsupported = isRetiredProviderModel(pane.provider, pane.model);
   const isThinking = !!status && !isPaused;
   const modeIndicator = isUnsupported
@@ -228,7 +229,7 @@ function PaneCard({
             panes and for Manager/Tech-Lead panes (those have their own
             semantics — Manager is always user-facing, Tech Lead is the
             orchestrator itself, not a delegation target). */}
-        {!isUnsupported && pane.pane_id !== PANE_ID_INTERACTIVE &&
+        {!isUnsupported && !isTerminal && pane.pane_id !== PANE_ID_INTERACTIVE &&
           pane.pane_id !== PANE_ID_DEADLOOP &&
           !isManagerOrTechLead(pane.role) && (
             <WorkerModeToggle
@@ -239,6 +240,10 @@ function PaneCard({
         {isUnsupported ? (
           <span className="ml-auto rounded bg-red-100 px-2 py-0.5 text-[10px] font-medium text-red-700 dark:bg-red-900/40 dark:text-red-300">
             Unsupported provider
+          </span>
+        ) : isTerminal ? (
+          <span className="ml-auto rounded bg-gray-100 px-2 py-0.5 text-[10px] font-medium text-gray-600 dark:bg-gray-700 dark:text-gray-300">
+            Terminal
           </span>
         ) : <span className="ml-auto flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
           <select
@@ -329,7 +334,7 @@ function PaneCard({
               Diff
             </span>
           )}
-          {!isUnsupported && (
+          {!isUnsupported && !isTerminal && (
             <span
               className="rounded border border-purple-400 dark:border-purple-700 bg-purple-50 dark:bg-purple-900/30 px-1.5 py-0.5 text-purple-700 dark:text-purple-300 hover:bg-purple-100 dark:hover:bg-purple-900/50"
               role="button"

@@ -1,0 +1,29 @@
+name: Mobile protocol
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: packages/protocol/package-lock.json
+      - run: npm ci
+        working-directory: packages/protocol
+      - run: npm run generate
+        working-directory: packages/protocol
+      - name: Generated contract is clean
+        run: git diff --exit-code -- crates/shared packages/protocol/schema packages/protocol/src/generated.ts
+      - run: cargo test -p shared
+      - run: npm run typecheck
+        working-directory: packages/protocol
+      - run: npm test
+        working-directory: packages/protocol

@@ -195,7 +195,7 @@ export function OverviewView({
           <SuggestedWorkersPanel />
         </OverviewSection>
 
-        <OverviewSection title="Side chats (unmanaged)">
+        <OverviewSection title="Terminal work (unmanaged)">
           <PaneGrid
             kind="unmanaged"
             onOpenPane={onOpenPane}

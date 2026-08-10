@@ -5,7 +5,6 @@ import { Bot } from "lucide-react";
 import { PaneConfig, PaneKind, paneKey } from "@/lib/store";
 import { useIsLaunchProfileAllowed } from "@/lib/tabTypes";
 import {
-  PROVIDER_MODEL_GROUPS,
   isDeepseekModel,
   isRetiredProviderModel,
 } from "@/lib/providerOptions";
@@ -30,6 +29,9 @@ interface TabBarProps {
   onRebootCli?: () => void;
   showBootButton?: boolean;
   showRebootButton?: boolean;
+  /** The Overview pseudo-tab is a team-mode surface. Hide it when the
+   * project's effective cluster policy disables team mode. */
+  showOverview?: boolean;
   paneStatuses: Record<string, string | null>;
   pausedPanes: number[];
   /** Mobile-only controls merged into the tab-bar row so the top header can
@@ -113,6 +115,7 @@ export function TabBar({
   onRebootCli,
   showBootButton = false,
   showRebootButton = false,
+  showOverview = true,
   paneStatuses,
   pausedPanes,
   leading,
@@ -255,22 +258,24 @@ export function TabBar({
         className="flex-1 flex flex-nowrap items-end overflow-x-auto overflow-y-hidden no-scrollbar"
         style={{ scrollbarWidth: "none", msOverflowStyle: "none" }}
       >
-        <button
-          type="button"
-          onClick={() => onSelectTab(OVERVIEW_PANE_ID)}
-          className={`flex items-center gap-1.5 px-2 sm:px-3 py-1.5 text-xs font-medium border-r border-gray-200 dark:border-gray-700 transition-colors flex-shrink-0 ${
-            isOverviewActive
-              ? "bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 border-t-2 border-t-indigo-500"
-              : "text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700/50 border-t-2 border-t-transparent"
-          }`}
-          title="Team overview — status of every pane in this project"
-        >
-          <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 10h16M4 14h16M4 18h10" />
-          </svg>
-          {/* Label shows on desktop, or when overview is the active view on mobile. */}
-          <span className={isOverviewActive ? "inline" : "hidden sm:inline"}>Overview</span>
-        </button>
+        {showOverview && (
+          <button
+            type="button"
+            onClick={() => onSelectTab(OVERVIEW_PANE_ID)}
+            className={`flex items-center gap-1.5 px-2 sm:px-3 py-1.5 text-xs font-medium border-r border-gray-200 dark:border-gray-700 transition-colors flex-shrink-0 ${
+              isOverviewActive
+                ? "bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 border-t-2 border-t-indigo-500"
+                : "text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700/50 border-t-2 border-t-transparent"
+            }`}
+            title="Team overview — status of every pane in this project"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 10h16M4 14h16M4 18h10" />
+            </svg>
+            {/* Label shows on desktop, or when overview is the active view on mobile. */}
+            <span className={isOverviewActive ? "inline" : "hidden sm:inline"}>Overview</span>
+          </button>
+        )}
         {tabs.map((tab, index) => {
           const isActive = tab.pane_id === activeTabId;
           const isBot = tab.mode === "deadloop";
@@ -462,7 +467,6 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
   const isAllowed = useIsLaunchProfileAllowed();
   const [showMenu, setShowMenu] = useState(false);
   const [isolatedWorktree, setIsolatedWorktree] = useState(false);
-  const [expandedGroup, setExpandedGroup] = useState<string | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -470,7 +474,6 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
     const handleClick = (e: MouseEvent) => {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
         setShowMenu(false);
-        setExpandedGroup(null);
       }
     };
     document.addEventListener("mousedown", handleClick);
@@ -480,25 +483,11 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
   // isolatedWorktree stays toggled while the menu is open so the user's
   // choice persists across submenu navigation, but resets after each
   // tab creation so a second tab doesn't silently get a new worktree.
-  const handlePick = (provider: string, model?: string, kind: PaneKind = "agent") => {
-    onAddTab(provider, model, isolatedWorktree || undefined, kind);
+  const handlePick = (provider: string) => {
+    onAddTab(provider, undefined, isolatedWorktree || undefined, "terminal");
     setIsolatedWorktree(false);
     setShowMenu(false);
-    setExpandedGroup(null);
   };
-
-  // Visual disclosure caret next to grouped entries; rotates 90° when
-  // its group is expanded.
-  const Caret = ({ open }: { open: boolean }) => (
-    <svg
-      className={`w-3 h-3 ml-auto text-gray-400 transition-transform ${open ? "rotate-90" : ""}`}
-      fill="none"
-      stroke="currentColor"
-      viewBox="0 0 24 24"
-    >
-      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-    </svg>
-  );
 
   return (
     <div className="relative flex-shrink-0" ref={menuRef}>
@@ -527,25 +516,24 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
             Isolated git worktree
           </label>
 
-          {/* Terminal tabs host the provider's real TUI on a pty. Only
-              claude and codex are offered. Mirrors
-              `terminal_binary_for` in the CLI. */}
-          <div className="border-b border-gray-100 dark:border-gray-700 pb-0.5">
+          {/* New panes host the provider's real TUI on a pty. Structured
+              agent panes are reserved for managed team roles. */}
+          <div className="pb-0.5">
             <div
               className="px-3 pt-1.5 pb-1 text-[10px] font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500"
-              title="Runs the real interactive CLI in a terminal. No usage stats, diffs, or Tech Lead delegation — it's a side chat with a genuine TUI."
+              title="Runs the provider's real interactive CLI in a terminal."
             >
-              Terminal
+              New terminal
             </div>
             {[
-              { provider: "claude", label: "Claude terminal" },
-              { provider: "codex", label: "Codex terminal" },
+              { provider: "claude", label: "Claude" },
+              { provider: "codex", label: "Codex" },
             ]
               .filter((entry) => isAllowed("terminal", entry.provider))
               .map((entry) => (
               <button
                 key={entry.provider}
-                onClick={() => handlePick(entry.provider, undefined, "terminal")}
+                onClick={() => handlePick(entry.provider)}
                 className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
               >
                 <span className="flex-shrink-0 text-gray-500 dark:text-gray-400">
@@ -555,78 +543,6 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
               </button>
             ))}
           </div>
-
-          {PROVIDER_MODEL_GROUPS.filter((group) =>
-            // Every option in a group shares one provider. DeepSeek is a
-            // Claude model, not a provider, so the group is
-            // allowed exactly when its provider is.
-            group.options.some((o) => isAllowed("agent", o.provider, o.model)),
-          ).map((group, i) => (
-            <div key={group.id}>
-              {i > 0 && (
-                <div className="border-t border-gray-100 dark:border-gray-700 my-0.5" />
-              )}
-              {group.options.length === 1 ? (
-                <button
-                  onClick={() => {
-                    const option = group.options[0];
-                    handlePick(option.provider, option.model);
-                  }}
-                  className={`w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 items-center gap-2 ${isAllowed("agent", group.options[0].provider, group.options[0].model) ? "flex" : "hidden"}`}
-                >
-                  <span className={`${group.toneClass} flex-shrink-0`}>
-                    <ProviderIcon
-                      provider={group.iconProvider}
-                      model={group.iconModel}
-                      className="w-4 h-4"
-                    />
-                  </span>
-                  {group.label}
-                </button>
-              ) : (
-                <>
-                  <button
-                    onClick={() =>
-                      setExpandedGroup((g) => (g === group.id ? null : group.id))
-                    }
-                    className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
-                  >
-                    <span className={`${group.toneClass} flex-shrink-0`}>
-                      <ProviderIcon
-                        provider={group.iconProvider}
-                        model={group.iconModel}
-                        className="w-4 h-4"
-                      />
-                    </span>
-                    {group.label}
-                    <Caret open={expandedGroup === group.id} />
-                  </button>
-                  {expandedGroup === group.id && (
-                    <div className="bg-gray-50 dark:bg-gray-900/40">
-                      {group.options.filter((option) =>
-                        isAllowed("agent", option.provider, option.model)
-                      ).map((option) => (
-                        <button
-                          key={option.value}
-                          onClick={() => handlePick(option.provider, option.model)}
-                          className="w-full text-left pl-8 pr-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
-                        >
-                          <span className={`${group.toneClass} flex-shrink-0`}>
-                            <ProviderIcon
-                              provider={option.provider}
-                              model={option.model}
-                              className="w-4 h-4"
-                            />
-                          </span>
-                          {option.label}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </>
-              )}
-            </div>
-          ))}
         </div>
       )}
     </div>

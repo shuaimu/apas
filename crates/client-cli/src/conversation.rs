@@ -42,6 +42,11 @@ pub struct TurnRecord {
     pub input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
+    /// True only when the provider transcript confirms that this response is
+    /// finished. Assistant text can arrive before tool calls, so the presence
+    /// of an assistant turn alone is not an idle boundary.
+    #[serde(default)]
+    pub completes_work: bool,
 }
 
 impl TurnRecord {
@@ -68,6 +73,7 @@ mod tests {
             model: None,
             input_tokens: None,
             output_tokens: None,
+            completes_work: false,
         }
     }
 

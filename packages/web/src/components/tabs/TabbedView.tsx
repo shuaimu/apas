@@ -189,18 +189,21 @@ export function deriveInitialActiveTabId(args: {
   activeTabId: number | null;
   clientChanged: boolean;
   managerTabId: number | null;
+  overviewAvailable: boolean;
   paneConfigsLength: number;
   savedActiveTab: string;
   tabIds: number[];
 }): number | null {
   // A selected project with no real panes is a valid workspace state. Keep
-  // its navigation anchored on the Overview pseudo-tab so the tab bar can
-  // expose the first-pane action instead of inheriting a stale pane id from
-  // the previously selected project.
-  if (args.tabIds.length === 0) return OVERVIEW_PANE_ID;
+  // its navigation anchored on Overview when team mode is available. When
+  // cluster policy disables team mode there is no Overview surface, so leave
+  // the selection empty while the tab bar still exposes the first-pane action.
+  if (args.tabIds.length === 0) {
+    return args.overviewAvailable ? OVERVIEW_PANE_ID : null;
+  }
 
   const isValidTab = (paneId: number) =>
-    paneId === OVERVIEW_PANE_ID || args.tabIds.includes(paneId);
+    (args.overviewAvailable && paneId === OVERVIEW_PANE_ID) || args.tabIds.includes(paneId);
 
   // Same project, current pick is still valid -> no change.
   if (
@@ -226,9 +229,10 @@ export function deriveInitialActiveTabId(args: {
   }
 
   // Persisted pref is gone or no longer matches a real pane. Prefer the
-  // Manager pane (chat-first landing); otherwise land on the Overview
-  // pseudo-tab where Start Manager and the project-goal input live.
-  return args.managerTabId ?? OVERVIEW_PANE_ID;
+  // Manager pane (chat-first landing). With team mode enabled, Overview is
+  // the secondary landing surface; otherwise use the first real pane.
+  return args.managerTabId
+    ?? (args.overviewAvailable ? OVERVIEW_PANE_ID : args.tabIds[0] ?? null);
 }
 
 export function lazyPaneMessageLoadTargets(args: {
@@ -410,6 +414,7 @@ export function TabbedView({
   mobileTrailing?: React.ReactNode;
 } = {}) {
   const sessionId = useStore((s) => s.sessionId);
+  const projectPolicies = useStore((s) => s.projectPolicies);
   const messages = useStore((s) => s.messages);
   const paneConfigs = useStore((s) => s.paneConfigs);
   const paneMessages = useStore((s) => s.paneMessages);
@@ -426,6 +431,8 @@ export function TabbedView({
   const sessions = useStore((s) => s.sessions);
   const machines = useStore((s) => s.machines);
   const isLaunchProfileAllowed = useIsLaunchProfileAllowed();
+  const showOverview = sessionId == null
+    || projectPolicies[sessionId]?.teamAvailable !== false;
 
   const sendMessageToPane = useStore((s) => s.sendMessageToPane);
   const loadMoreMessages = useStore((s) => s.loadMoreMessages);
@@ -582,14 +589,15 @@ export function TabbedView({
       activeTabId,
       clientChanged,
       managerTabId,
+      overviewAvailable: showOverview,
       paneConfigsLength: paneConfigs.length,
       savedActiveTab: saved,
       tabIds: ids,
     });
-    if (nextActiveTabId != null && activeTabId !== nextActiveTabId) {
+    if (activeTabId !== nextActiveTabId) {
       setActiveTabId(nextActiveTabId);
     }
-  }, [activeTabId, cliClientId, managerTabId, paneConfigs.length, tabIds]);
+  }, [activeTabId, cliClientId, managerTabId, paneConfigs.length, showOverview, tabIds]);
 
   // Lazy-load: when activeTabId changes (initial pick or user click),
   // fetch that pane's messages if we haven't already. Server's attach
@@ -691,7 +699,7 @@ export function TabbedView({
     [cleanupDialog, removePane, activeTabId, effectiveTabs, handleSelectTab],
   );
 
-  const handleAddTab = useCallback((provider: string = "claude", model?: string, isolatedWorktree?: boolean, kind: PaneKind = "agent") => {
+  const handleAddTab = useCallback((provider: string = "claude", model?: string, isolatedWorktree?: boolean, kind: PaneKind = "terminal") => {
     const isDeepseek = provider === "deepseek" || (provider === "claude" && isDeepseekModel(model));
     const basePrefix = provider === "codex"
       ? "Codex"
@@ -700,10 +708,7 @@ export function TabbedView({
         : provider === "opencode"
           ? "OpenCode"
           : isDeepseek ? "DeepSeek" : "Claude";
-    // Terminal tabs sit next to agent tabs in the same bar, so the label
-    // has to say which is which — they behave very differently.
-    const prefix = kind === "terminal" ? `${basePrefix} TTY` : basePrefix;
-    const label = `${prefix} ${effectiveTabs.length + 1}`;
+    const label = `${basePrefix} ${effectiveTabs.length + 1}`;
     const result = addPane(provider, "interactive", label, undefined, model, isolatedWorktree, undefined, false, kind);
     if (result.success) {
       setAddTabError(null);
@@ -1069,6 +1074,7 @@ export function TabbedView({
         onRebootCli={rebootCli}
         showBootButton={canBootCurrentProject}
         showRebootButton={isAttached}
+        showOverview={showOverview}
         paneStatuses={paneStatuses}
         pausedPanes={pausedPanes}
         leading={mobileLeading}
@@ -1283,7 +1289,7 @@ export function TabbedView({
           remount+paint cycle. Avoids the 100-500ms delay that used to
           look like a server fetch. Keyed by sessionId+paneId so a
           project switch still resets state cleanly. */}
-      {activeTabId === OVERVIEW_PANE_ID ? (
+      {showOverview && activeTabId === OVERVIEW_PANE_ID ? (
         <OverviewView
           key="overview"
           onOpenPane={handleSelectTab}

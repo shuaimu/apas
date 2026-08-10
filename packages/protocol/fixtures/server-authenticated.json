@@ -1,0 +1,11 @@
+{
+  "type": "authenticated",
+  "user_id": "10000000-0000-4000-8000-000000000001",
+  "user_email": "mobile@example.com",
+  "server_version": "26.08.1",
+  "cluster_role": "user",
+  "account_status": "active",
+  "protocol_version": 1,
+  "negotiated_capabilities": ["mobile_bootstrap_v1"],
+  "mutations_allowed": true
+}

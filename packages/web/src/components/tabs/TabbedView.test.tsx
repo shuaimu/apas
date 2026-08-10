@@ -82,7 +82,8 @@ function seedDownloadTabbedView({
 }
 
 function seedZeroPaneTabbedView(
-  allowedLaunchProfiles = ["agent:claude:official:default"],
+  allowedLaunchProfiles = ["terminal:claude:official:default"],
+  teamAvailable = true,
 ) {
   const addPane = vi.fn(() => ({ success: true }));
 
@@ -120,7 +121,7 @@ function seedZeroPaneTabbedView(
       },
       projectPolicies: {
         [ZERO_PANE_SESSION_ID]: {
-          teamAvailable: false,
+          teamAvailable,
           allowedLaunchProfiles,
           version: 1,
           projectSuspended: false,
@@ -145,6 +146,7 @@ describe("deriveInitialActiveTabId", () => {
     activeTabId: null,
     clientChanged: true,
     managerTabId: null,
+    overviewAvailable: true,
     paneConfigsLength: 2,
     savedActiveTab: "",
     tabIds: [10, 20],
@@ -219,6 +221,29 @@ describe("deriveInitialActiveTabId", () => {
         tabIds: [],
       }),
     ).toBe(OVERVIEW_PANE_ID);
+  });
+
+  it("falls back to a real pane when cluster policy disables Overview", () => {
+    expect(
+      deriveInitialActiveTabId({
+        ...base,
+        activeTabId: OVERVIEW_PANE_ID,
+        clientChanged: false,
+        overviewAvailable: false,
+        savedActiveTab: String(OVERVIEW_PANE_ID),
+      }),
+    ).toBe(10);
+  });
+
+  it("leaves a zero-pane project unselected when cluster policy disables Overview", () => {
+    expect(
+      deriveInitialActiveTabId({
+        ...base,
+        overviewAvailable: false,
+        paneConfigsLength: 0,
+        tabIds: [],
+      }),
+    ).toBeNull();
   });
 });
 
@@ -323,7 +348,6 @@ describe("TabbedView zero-pane projects", () => {
 
     fireEvent.click(screen.getByTitle("New tab"));
     fireEvent.click(screen.getByText("Claude"));
-    fireEvent.click(screen.getByText("Official"));
 
     expect(addPane).toHaveBeenCalledWith(
       "claude",
@@ -334,12 +358,12 @@ describe("TabbedView zero-pane projects", () => {
       undefined,
       undefined,
       false,
-      "agent",
+      "terminal",
     );
   });
 
   it("does not offer a disallowed launch profile for the first pane", async () => {
-    const { addPane } = seedZeroPaneTabbedView(["agent:codex:official:default"]);
+    const { addPane } = seedZeroPaneTabbedView(["terminal:codex:official:default"]);
 
     render(<TabbedView />);
     await screen.findByText("Team Overview");
@@ -348,6 +372,17 @@ describe("TabbedView zero-pane projects", () => {
     expect(screen.queryByText("Claude")).toBeNull();
     expect(screen.getByText("Codex")).toBeTruthy();
     expect(addPane).not.toHaveBeenCalled();
+  });
+
+  it("hides Overview but keeps the first-pane control when cluster policy disables team mode", () => {
+    seedZeroPaneTabbedView(["terminal:claude:official:default"], false);
+
+    render(<TabbedView />);
+
+    expect(screen.queryByRole("button", { name: "Overview" })).toBeNull();
+    expect(screen.queryByText("Team Overview")).toBeNull();
+    expect(screen.getByTitle("New tab")).toBeTruthy();
+    expect(screen.queryByText("Waiting for activity...")).toBeNull();
   });
 
   it("keeps the fallback and hides project controls when no session is selected", () => {

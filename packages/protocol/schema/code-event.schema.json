@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CodeEvent",
+  "type": "object",
+  "properties": {
+    "created_at": {
+      "type": "string"
+    },
+    "detail": true,
+    "id": {
+      "type": "string"
+    },
+    "kind": {
+      "$ref": "#/$defs/CodeEventKind"
+    },
+    "ordering_key": {
+      "type": "string"
+    },
+    "pane_id": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    },
+    "requires_attention": {
+      "type": "boolean",
+      "default": false
+    },
+    "session_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "summary": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "session_id",
+    "ordering_key",
+    "created_at",
+    "kind",
+    "summary"
+  ],
+  "$defs": {
+    "CodeEventKind": {
+      "type": "string",
+      "enum": [
+        "instruction",
+        "agent_status",
+        "tool",
+        "question",
+        "approval",
+        "plan",
+        "todo",
+        "test",
+        "diff",
+        "pull_request",
+        "terminal",
+        "completed",
+        "interrupted",
+        "error"
+      ]
+    }
+  }
+}

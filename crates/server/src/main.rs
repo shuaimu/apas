@@ -4,6 +4,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod config;
 mod db;
 mod error;
+mod mobile_metrics;
+mod notifications;
 mod project_lifecycle;
 mod routes;
 mod session;
@@ -57,6 +59,13 @@ async fn async_main() -> Result<()> {
     // Create app state
     let state = AppState::new(db, config.clone());
     project_lifecycle::recover_interrupted_deletions(&state).await?;
+    if state.config.mobile.features.notifications {
+        let transport = notifications::ExpoPushTransport::new(state.config.mobile.push.clone())?;
+        tokio::spawn(notifications::run_worker(
+            state.clone(),
+            std::sync::Arc::new(transport),
+        ));
+    }
 
     // Spawn the message GC task. Runs once at boot to catch the backlog,
     // then every 24h. Pure delete — drops messages with created_at older

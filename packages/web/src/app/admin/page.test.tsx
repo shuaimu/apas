@@ -49,7 +49,7 @@ function installApiFixtures() {
     }
     if (url.endsWith("/admin/policy/default")) return response(policy);
     if (url.includes("/admin/users/invitations")) {
-      return response({ registration_url: "http://apas.mpaxos.com/register?invitation=invite-1" });
+      return response({ registration_url: "https://apas.mpaxos.com/register?invitation=invite-1" });
     }
     if (url.match(/\/admin\/users\/user-1$/) && init?.method === "PATCH") {
       return response({ id: "user-1", email: "member@example.com", cluster_role: "admin", account_status: "active" });
@@ -65,6 +65,8 @@ function installApiFixtures() {
       return response({
         items: [{
           id: "project-a",
+          project_name: "mako-soumojit",
+          hostname: "zoo-002",
           owner_user_id: "owner-1",
           owner_email: "owner@example.com",
           lifecycle_status: "active",
@@ -81,6 +83,8 @@ function installApiFixtures() {
       return response({
         project: {
           id: "project-a",
+          project_name: "mako-soumojit",
+          hostname: "zoo-002",
           owner_user_id: "owner-1",
           owner_email: "owner@example.com",
           lifecycle_status: "active",
@@ -148,7 +152,7 @@ describe("AdminPage", () => {
     expect(screen.getByText("Codex / Official")).toBeTruthy();
     expect(screen.queryByText("Legacy GLM")).toBeNull();
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://apas.mpaxos.com/admin/stats",
+      "https://apas.mpaxos.com/admin/stats",
       expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer admin-token" }) }),
     );
   });
@@ -167,7 +171,7 @@ describe("AdminPage", () => {
 
     fireEvent.change(screen.getByLabelText("Role for member@example.com"), { target: { value: "admin" } });
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
-      "http://apas.mpaxos.com/admin/users/user-1",
+      "https://apas.mpaxos.com/admin/users/user-1",
       expect.objectContaining({ method: "PATCH", body: JSON.stringify({ cluster_role: "admin" }) }),
     ));
   });
@@ -178,13 +182,15 @@ describe("AdminPage", () => {
     render(<AdminPage />);
     await screen.findByText("Cluster Administration");
     fireEvent.click(screen.getByRole("button", { name: "projects" }));
+    expect(await screen.findByText("mako-soumojit")).toBeTruthy();
+    expect(screen.getByText(/Host zoo-002/)).toBeTruthy();
     fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
 
     expect(await screen.findByText("Project control")).toBeTruthy();
     expect(screen.getByText("member@example.com")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Use cluster defaults" }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
-      "http://apas.mpaxos.com/admin/projects/project-a/policy",
+      "https://apas.mpaxos.com/admin/projects/project-a/policy",
       expect.objectContaining({
         method: "PATCH",
         body: JSON.stringify({ team_available: null, allowed_launch_profiles: null }),

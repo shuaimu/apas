@@ -104,12 +104,12 @@ function expectOverviewSurfaces() {
   expect(screen.getByText("Team TODO")).toBeTruthy();
   expect(screen.getByText("Team (managed)")).toBeTruthy();
   expect(screen.getByText("Suggested workers")).toBeTruthy();
-  expect(screen.getByText("Side chats (unmanaged)")).toBeTruthy();
+  expect(screen.getByText("Terminal work (unmanaged)")).toBeTruthy();
   expect(screen.getByText("Team scratchpad")).toBeTruthy();
   expect(screen.getByText("Delegation board")).toBeTruthy();
   expect(screen.getByText("Resource use")).toBeTruthy();
   expect(screen.getByText(/No suggestions yet/)).toBeTruthy();
-  expect(screen.getByText(/No side chats/)).toBeTruthy();
+  expect(screen.getByText(/No terminal panes/)).toBeTruthy();
   expect(screen.getByText(/No scratchpad records yet/)).toBeTruthy();
   expect(screen.getByText(/No delegations seen yet/)).toBeTruthy();
   expect(screen.getByText(/No usage telemetry yet/)).toBeTruthy();

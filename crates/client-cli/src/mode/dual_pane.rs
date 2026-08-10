@@ -374,7 +374,13 @@ fn conversation_turn_to_stream_messages(
                     extra: serde_json::Value::Null,
                 },
                 session_id: sid.clone(),
-                extra: serde_json::Value::Null,
+                // The server used to clear the terminal pane's working state
+                // on every assistant fragment. Preserve a positive marker as
+                // well as a negative one so updated clients can distinguish a
+                // tool-use preamble from a provider-confirmed completion.
+                extra: serde_json::json!({
+                    "terminal_turn_complete": turn.completes_work,
+                }),
             },
             pane_type: None,
             pane_id: Some(turn.pane_id),
@@ -417,6 +423,25 @@ fn conversation_turn_to_stream_messages(
     }
 
     out
+}
+
+/// The transcript belongs to the directory in which the provider process is
+/// actually running, not necessarily the project's primary checkout.
+fn terminal_transcript_cwd(project_dir: &Path, worktree_path: Option<&str>) -> std::path::PathBuf {
+    worktree_path
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| project_dir.to_path_buf())
+}
+
+/// Existing history is suppressed only for panes present when the watcher was
+/// installed. A pane created afterwards must be captured from its first turn,
+/// including when that turn completes before the first polling tick.
+fn initial_terminal_transcript_cursor(restored_at_watcher_start: bool, turn_count: usize) -> usize {
+    if restored_at_watcher_start {
+        turn_count
+    } else {
+        0
+    }
 }
 
 /// Spawn whichever team panes (Manager, Tech Lead, Reviewer, Developer)
@@ -1059,6 +1084,7 @@ fn spawn_terminal_pane(
     worktree_path: Option<&str>,
     server_tx: &tokio_mpsc::Sender<CliToServer>,
     resume: bool,
+    initial_input: Option<&str>,
 ) -> Result<(), String> {
     let binary = terminal_binary_for(provider).ok_or_else(|| {
         format!(
@@ -1079,6 +1105,7 @@ fn spawn_terminal_pane(
         cwd,
         &env,
         resume,
+        initial_input,
         server_tx.clone(),
     )
     .map_err(|e| format!("[Error starting terminal pane: {e:#}]"))?;
@@ -1486,8 +1513,7 @@ type PaneMetas = Arc<Mutex<HashMap<u32, PaneMeta>>>;
 
 const ASK_USER_QUESTION_AUTO_CANCEL_STATUS: &str =
     "[Pending question auto-cancelled: new message replaces it]";
-const MANAGED_PANE_CREATE_PR_ERROR: &str =
-    "Managed team panes open PRs through the Reviewer-approved Team TODO flow; manual PR creation is disabled for this pane.";
+const MANAGED_PANE_CREATE_PR_ERROR: &str = "Managed team panes open PRs through the Reviewer-approved Team TODO flow; manual PR creation is disabled for this pane.";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CancelledAskUserQuestion {
@@ -2040,8 +2066,8 @@ async fn run_inner(
 
     // Restore pty-hosted terminal panes. `resume: true` because these are
     // panes that already existed in `.apas` — the pty itself did not
-    // survive the restart, so this is the closest we get to reattaching
-    // (claude `--continue` / codex `resume`).
+    // survive the restart, so re-exec the provider and resume its conversation
+    // (claude `--resume <pane session id>` / codex `resume`).
     for (pane_id, provider, pane_session_id, worktree) in &terminal_startups {
         if let Err(err) = spawn_terminal_pane(
             &terminal_panes,
@@ -2053,6 +2079,7 @@ async fn run_inner(
             worktree.as_deref(),
             &server_tx,
             true,
+            None,
         ) {
             tracing::error!(pane_id, %err, "failed to restore terminal pane");
         }
@@ -2607,20 +2634,35 @@ async fn run_inner(
         let project_for_turns = std::path::PathBuf::from(working_dir_str.clone());
         let metas_for_turns = pane_metas.clone();
         let sessions_for_turns = pane_sessions.clone();
+        // Only panes restored above should suppress their existing history.
+        // A pane created after this snapshot must capture from turn zero even
+        // if it manages to finish its first turn before the watcher's first
+        // three-second poll.
+        let startup_terminal_panes: HashSet<u32> = pane_metas
+            .lock()
+            .map(|metas| {
+                metas
+                    .iter()
+                    .filter_map(|(pane_id, meta)| meta.kind.is_terminal().then_some(*pane_id))
+                    .collect()
+            })
+            .unwrap_or_default();
         thread::spawn(move || {
             let Some(home) = dirs::home_dir() else {
                 tracing::warn!("no home dir; terminal pane history is unavailable");
                 return;
             };
-            // Per-pane cursor, seeded on first sight rather than 0 so a CLI
-            // restart does not replay a pane's whole history as if it were new.
-            let mut seen: HashMap<u32, usize> = HashMap::new();
-            let mut warmed: bool = false;
+            // Per-pane cursor and selected transcript. Tracking the path as
+            // part of the identity prevents a provider/session/worktree
+            // change from applying an old file's cursor to a new transcript.
+            let mut seen: HashMap<u32, (std::path::PathBuf, usize)> = HashMap::new();
+            let mut seen_completions: HashMap<u32, usize> = HashMap::new();
             while !shutdown_for_turns.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_secs(3));
 
-                // Snapshot terminal panes: (pane_id, provider, conversation id).
-                let panes: Vec<(u32, Provider, Uuid)> = {
+                // Snapshot terminal panes: (pane_id, provider, conversation
+                // id, actual terminal cwd override).
+                let panes: Vec<(u32, Provider, Uuid, Option<String>)> = {
                     let Ok(metas) = metas_for_turns.lock() else {
                         continue;
                     };
@@ -2630,23 +2672,25 @@ async fn run_inner(
                         .filter(|(_, m)| m.kind.is_terminal())
                         .filter_map(|(id, m)| {
                             let sid = sessions.as_ref()?.get(id).copied()?;
-                            Some((*id, m.provider.clone(), sid))
+                            Some((*id, m.provider.clone(), sid, m.worktree_path.clone()))
                         })
                         .collect()
                 };
 
-                for (pane_id, provider, conv_id) in panes {
+                for (pane_id, provider, conv_id, worktree_path) in panes {
                     let is_codex = matches!(provider, Provider::Codex);
+                    let transcript_cwd =
+                        terminal_transcript_cwd(&project_for_turns, worktree_path.as_deref());
                     let path = if is_codex {
                         // No flag pins a codex session id, so match on cwd.
-                        match crate::transcript::find_codex_rollout(&home, &project_for_turns) {
+                        match crate::transcript::find_codex_rollout(&home, &transcript_cwd) {
                             Some(p) => p,
                             None => continue,
                         }
                     } else {
                         crate::transcript::claude_transcript_path(
                             &home,
-                            &project_for_turns,
+                            &transcript_cwd,
                             &conv_id.to_string(),
                         )
                     };
@@ -2654,24 +2698,53 @@ async fn run_inner(
                     let Ok(turns) = crate::transcript::read_turns(&path, pane_id, is_codex) else {
                         continue;
                     };
-                    let cursor = seen.entry(pane_id).or_insert(0);
-                    if !warmed {
-                        // First pass only establishes where each transcript
-                        // already was.
-                        *cursor = turns.len();
-                        continue;
-                    }
-                    if turns.len() <= *cursor {
-                        continue;
-                    }
-                    for turn in &turns[*cursor..] {
-                        for msg in conversation_turn_to_stream_messages(turn, session_id, conv_id) {
-                            let _ = server_tx_for_turns.blocking_send(msg);
+                    let completion_count = turns.iter().filter(|turn| turn.completes_work).count();
+                    let restored_at_start = startup_terminal_panes.contains(&pane_id);
+                    let (tracked_path, cursor) = seen.entry(pane_id).or_insert_with(|| {
+                        let baseline =
+                            initial_terminal_transcript_cursor(restored_at_start, turns.len());
+                        (path.clone(), baseline)
+                    });
+                    let completed = seen_completions.entry(pane_id).or_insert_with(|| {
+                        if restored_at_start {
+                            completion_count
+                        } else {
+                            0
                         }
+                    });
+                    if *tracked_path != path {
+                        *tracked_path = path.clone();
+                        *cursor = 0;
+                        *completed = 0;
                     }
-                    *cursor = turns.len();
+                    let previous_cursor = *cursor;
+                    if turns.len() > previous_cursor {
+                        for turn in &turns[previous_cursor..] {
+                            for msg in
+                                conversation_turn_to_stream_messages(turn, session_id, conv_id)
+                            {
+                                let _ = server_tx_for_turns.blocking_send(msg);
+                            }
+                        }
+                        *cursor = turns.len();
+                    }
+                    // Codex writes task_complete after its assistant message.
+                    // If the prior poll already advanced the turn cursor, no
+                    // new StreamMessage exists to carry the completion marker,
+                    // so send the status transition explicitly.
+                    let completion_was_on_new_turn = turns
+                        .get(previous_cursor..)
+                        .is_some_and(|new_turns| new_turns.iter().any(|turn| turn.completes_work));
+                    if completion_count > *completed && !completion_was_on_new_turn {
+                        let _ = server_tx_for_turns.blocking_send(CliToServer::PaneStatus {
+                            session_id,
+                            pane_type: PaneType::Interactive,
+                            pane_id: Some(pane_id),
+                            status: None,
+                        });
+                    }
+                    *completed = completion_count;
                 }
-                warmed = true;
             }
         });
     }
@@ -3000,165 +3073,32 @@ fn handle_tui_events(
     while !shutdown.load(Ordering::SeqCst) {
         match event_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(TuiEvent::AddTab) => {
-                // Generate a new pane_id (TUI always creates Claude interactive tabs)
+                // The local "+" path follows the same retirement rule as the
+                // web: ordinary new work opens Claude's real terminal TUI.
+                // Queue the canonical configured event so policy enforcement,
+                // pty registration, announcements, and persistence stay in
+                // one implementation.
                 let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
-                let claude_session_id = Uuid::new_v4();
-                let label = format!("Tab {}", pane_id);
-                let mode = shared::PaneMode::Interactive;
-                let provider = Provider::Claude;
-
-                // Create input channel — TUI and web input both flow through this
-                let (input_tx, input_rx) = mpsc::channel::<PaneInput>();
-                {
-                    let mut channels = input_channels.lock().unwrap();
-                    channels.insert(pane_id, input_tx);
-                }
-
-                // Track claude session and metadata for this pane
-                {
-                    let mut ps = pane_sessions.lock().unwrap();
-                    ps.insert(pane_id, claude_session_id);
-                }
-                let child_proc: Arc<Mutex<Option<std::process::Child>>> =
-                    Arc::new(Mutex::new(None));
-                {
-                    let mut metas = pane_metas.lock().unwrap();
-                    metas.insert(
-                        pane_id,
-                        PaneMeta {
-                            kind: shared::PaneKind::Agent,
-                            mode: mode.clone(),
-                            provider: provider.clone(),
-                            label: label.clone(),
-                            prompt: None,
-                            model: None,
-                            effort: None,
-                            min_iteration_interval_minutes: None,
-                            child_process: child_proc.clone(),
-                            streaming_interrupt_tx: Arc::new(Mutex::new(None)),
-                            control_response_tx: Arc::new(Mutex::new(None)),
-                            pending_questions: Arc::new(Mutex::new(HashMap::new())),
-                            effort_arc: Arc::new(Mutex::new(None)),
-                            worktree_path: None,
-                            role: None,
-                            goal: None,
-                            backstory: None,
-                            plan_review_mode: shared::PlanReviewMode::default(),
-                            plan_review_mode_arc: Arc::new(Mutex::new(
-                                shared::PlanReviewMode::default(),
-                            )),
-                            pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
-                            manual_mode: false,
-                            managed: false,
-                        },
-                    );
-                }
-
-                // Notify TUI to add the tab visually
-                let _ = command_tx.send(TuiCommand::AddTab {
+                let _ = event_tx.send(TuiEvent::AddTabWithConfig {
                     pane_id,
-                    label: label.clone(),
-                    mode: mode.clone(),
+                    label: format!("Claude {}", pane_id),
+                    claude_session_id: Uuid::new_v4(),
+                    mode: shared::PaneMode::Interactive,
+                    provider: Provider::Claude,
+                    prompt: None,
+                    min_iteration_interval_minutes: None,
+                    model: None,
+                    effort: None,
+                    worktree_path: None,
+                    initial_input: None,
+                    role: None,
+                    goal: None,
+                    backstory: None,
+                    plan_review_mode: shared::PlanReviewMode::default(),
+                    managed: false,
+                    try_resume_first: false,
+                    kind: shared::PaneKind::Terminal,
                 });
-
-                let _ = output_tx.send(PaneOutput {
-                    text: format!("[New tab created: {}]", label),
-                    pane_id,
-                });
-
-                // Spawn interactive session thread
-                {
-                    let output_tx = output_tx.clone();
-                    let server_tx = server_tx.clone();
-                    let shutdown = shutdown.clone();
-                    let binary_path = resolve_pane_binary_path(
-                        Provider::Claude,
-                        None,
-                        claude_path,
-                        codex_path,
-                        opencode_path,
-                        cursor_agent_path,
-                    );
-                    let working_dir = working_dir.to_string();
-                    let (
-                        interrupt_slot,
-                        control_resp_slot,
-                        pending_qs,
-                        effort_arc,
-                        worktree_path,
-                        system_prompt,
-                        pr_mode_arc,
-                        pr_pending,
-                    ) = pane_metas
-                        .lock()
-                        .unwrap()
-                        .get(&pane_id)
-                        .map(|m| {
-                            (
-                                m.streaming_interrupt_tx.clone(),
-                                m.control_response_tx.clone(),
-                                m.pending_questions.clone(),
-                                m.effort_arc.clone(),
-                                m.worktree_path.clone(),
-                                crate::role::compose_system_prompt(
-                                    m.role.as_deref(),
-                                    m.goal.as_deref(),
-                                    m.backstory.as_deref(),
-                                ),
-                                m.plan_review_mode_arc.clone(),
-                                m.pending_plan_reviews.clone(),
-                            )
-                        })
-                        .unwrap_or_else(|| {
-                            (
-                                Arc::new(Mutex::new(None)),
-                                Arc::new(Mutex::new(None)),
-                                Arc::new(Mutex::new(HashMap::new())),
-                                Arc::new(Mutex::new(None)),
-                                None,
-                                None,
-                                Arc::new(Mutex::new(shared::PlanReviewMode::default())),
-                                Arc::new(Mutex::new(HashMap::new())),
-                            )
-                        });
-                    thread::spawn(move || {
-                        run_pane_session(
-                            &binary_path,
-                            &working_dir,
-                            worktree_path,
-                            system_prompt,
-                            pr_mode_arc,
-                            pr_pending,
-                            session_id,
-                            claude_session_id,
-                            pane_id,
-                            &Provider::Claude,
-                            None,
-                            None,
-                            input_rx,
-                            output_tx,
-                            server_tx,
-                            shutdown,
-                            child_proc,
-                            interrupt_slot,
-                            control_resp_slot,
-                            pending_qs,
-                            effort_arc,
-                            true,
-                        )
-                    });
-                }
-
-                announce_and_persist_panes(
-                    &server_tx,
-                    session_id,
-                    working_dir,
-                    &pane_metas,
-                    &input_channels,
-                    &pane_sessions,
-                    &pane_pauses,
-                    &pane_stop_requests,
-                );
             }
             Ok(TuiEvent::AddTabWithConfig {
                 pane_id,
@@ -3304,6 +3244,7 @@ fn handle_tui_events(
                         worktree_path.as_deref(),
                         &server_tx,
                         try_resume_first,
+                        initial_input.as_deref(),
                     ) {
                         tracing::error!(pane_id, %err, "failed to start terminal pane");
                         let _ = output_tx.send(PaneOutput { text: err, pane_id });
@@ -4488,7 +4429,7 @@ fn build_pane_list(
 fn promote_pane_to_managed(pane_metas: &PaneMetas, promote_id: u32) -> bool {
     let mut metas = pane_metas.lock().unwrap();
     match metas.get_mut(&promote_id) {
-        Some(m) if !m.managed => {
+        Some(m) if !m.managed && m.kind == shared::PaneKind::Agent => {
             m.managed = true;
             // Bring promoted Claude panes up to the team's baseline (max
             // effort). effort_arc is read by the streaming worker before
@@ -5118,6 +5059,7 @@ mod tests {
     use crate::tui::{PaneOutput, TuiEvent};
     use shared::{CliToServer, Provider};
     use std::collections::{HashMap, HashSet};
+    use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
     use std::thread;
@@ -6416,8 +6358,7 @@ mod tests {
 
     #[test]
     fn refresh_stale_managed_builtin_prompts_updates_only_known_stale_defaults() {
-        const STALE_TECH_LEAD_PROMPT: &str =
-            "You are this project's Tech Lead, running as an autonomous deadloop.\n\n\
+        const STALE_TECH_LEAD_PROMPT: &str = "You are this project's Tech Lead, running as an autonomous deadloop.\n\n\
 Every iteration, in order:\n\n\
 1. Read `project_goal.md` and `team-todo.md` UNCONDITIONALLY every iteration.\n\
 2. Walk the Global TODOs and act on each.\n\
@@ -7116,6 +7057,18 @@ Use a project-specific custom dispatch loop.";
     }
 
     #[test]
+    fn promote_pane_to_managed_rejects_terminal_panes() {
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+        let effort_arc = Arc::new(Mutex::new(None));
+        let mut terminal = test_pane_meta(Provider::Claude, false, None, effort_arc);
+        terminal.kind = shared::PaneKind::Terminal;
+        pane_metas.lock().unwrap().insert(8, terminal);
+
+        assert!(!promote_pane_to_managed(&pane_metas, 8));
+        assert!(!pane_metas.lock().unwrap().get(&8).unwrap().managed);
+    }
+
+    #[test]
     fn auto_cancel_pending_questions_drains_only_target_pane_with_denials() {
         let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
         let (target_tx, target_rx) = mpsc::channel::<String>();
@@ -7457,6 +7410,26 @@ Use a project-specific custom dispatch loop.";
 
     // --- self-reported terminal-pane history ------------------------------
 
+    #[test]
+    fn terminal_history_uses_the_provider_process_working_directory() {
+        let project = Path::new("/srv/project");
+        assert_eq!(
+            super::terminal_transcript_cwd(project, Some("/srv/worktrees/claude-7")),
+            Path::new("/srv/worktrees/claude-7")
+        );
+        assert_eq!(super::terminal_transcript_cwd(project, None), project);
+    }
+
+    #[test]
+    fn only_restored_terminal_history_is_suppressed_on_first_poll() {
+        assert_eq!(super::initial_terminal_transcript_cursor(true, 8), 8);
+        assert_eq!(
+            super::initial_terminal_transcript_cursor(false, 8),
+            0,
+            "a newly-created pane's fast first turn must not be skipped"
+        );
+    }
+
     fn recorded_turn(role: &str, text: &str) -> crate::conversation::TurnRecord {
         crate::conversation::TurnRecord {
             ts: "2026-08-04T00:00:00Z".to_string(),
@@ -7466,6 +7439,7 @@ Use a project-specific custom dispatch loop.";
             model: Some("claude-opus-5".to_string()),
             input_tokens: None,
             output_tokens: None,
+            completes_work: false,
         }
     }
 
@@ -7485,13 +7459,14 @@ Use a project-specific custom dispatch loop.";
         match &msgs[0] {
             CliToServer::StreamMessage {
                 session_id,
-                message: shared::ClaudeStreamMessage::Assistant { message, .. },
+                message: shared::ClaudeStreamMessage::Assistant { message, extra, .. },
                 pane_id,
                 ..
             } => {
                 assert_eq!(*session_id, sid);
                 assert_eq!(*pane_id, Some(42));
                 assert_eq!(message.model, "claude-opus-5");
+                assert_eq!(extra["terminal_turn_complete"], false);
                 match &message.content[0] {
                     shared::ClaudeContentBlock::Text { text } => {
                         assert_eq!(text, "here is the answer")
@@ -7500,6 +7475,24 @@ Use a project-specific custom dispatch loop.";
                 }
             }
             other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_completed_terminal_turn_carries_the_idle_boundary() {
+        let mut turn = recorded_turn("assistant", "done");
+        turn.completes_work = true;
+        let msgs =
+            super::conversation_turn_to_stream_messages(&turn, Uuid::new_v4(), Uuid::new_v4());
+        let wire = serde_json::to_string(&msgs[0]).expect("completion marker serializes");
+        let round_trip: CliToServer =
+            serde_json::from_str(&wire).expect("completion marker deserializes");
+        match &round_trip {
+            CliToServer::StreamMessage {
+                message: shared::ClaudeStreamMessage::Assistant { extra, .. },
+                ..
+            } => assert_eq!(extra["terminal_turn_complete"], true),
+            other => panic!("expected assistant message, got {other:?}"),
         }
     }
 
@@ -10790,7 +10783,10 @@ fn run_pane_session(
                     };
                     let error_text = if first_message && using_resume {
                         try_resume_first = false;
-                        format!("[Session resume failed ({}), will create new session on next message...]", exit_msg)
+                        format!(
+                            "[Session resume failed ({}), will create new session on next message...]",
+                            exit_msg
+                        )
                     } else {
                         format!(
                             "[{} process failed: {}]",
@@ -11009,7 +11005,10 @@ async fn run_server_connection(
                 let register_msg = CliToServer::Register {
                     token: token.to_string(),
                     version: Some(env!("APAS_VERSION").to_string()),
-                    capabilities: vec![shared::PROJECT_POLICY_CAPABILITY.to_string()],
+                    capabilities: vec![
+                        shared::PROJECT_POLICY_CAPABILITY.to_string(),
+                        shared::MOBILE_TASK_LAUNCH_CAPABILITY.to_string(),
+                    ],
                 };
                 let msg_text = match serde_json::to_string(&register_msg) {
                     Ok(t) => t,
@@ -11047,10 +11046,10 @@ async fn run_server_connection(
                                     };
                                     match response {
                                         ServerToCli::Registered { cli_id } => {
-                                            return Some(Ok(cli_id))
+                                            return Some(Ok(cli_id));
                                         }
                                         ServerToCli::RegistrationFailed { reason } => {
-                                            return Some(Err(reason))
+                                            return Some(Err(reason));
                                         }
                                         ServerToCli::VersionUnsupported {
                                             client_version,
@@ -11747,7 +11746,7 @@ async fn run_server_connection(
                                                     });
                                                 }
                                             }
-                                            ServerToCli::AddPane { session_id: _, pane_config, isolated_worktree } => {
+                                            ServerToCli::AddPane { session_id: _, pane_config, isolated_worktree, initial_input } => {
                                                 if shared::is_retired_launch(
                                                     pane_config.provider,
                                                     pane_config.model.as_deref(),
@@ -11760,6 +11759,29 @@ async fn run_server_connection(
                                                         "[New pane refused — unsupported provider has been retired]",
                                                     )
                                                     .await;
+                                                    continue;
+                                                }
+                                                if !pane_config.managed
+                                                    && pane_config.kind == shared::PaneKind::Agent
+                                                {
+                                                    report_retired_launch_rejection(
+                                                        &status_tx,
+                                                        &mut ws_sender,
+                                                        session_id,
+                                                        pane_config.pane_id,
+                                                        "[New pane refused — conversation-only panes are retired; use a Claude or Codex terminal pane]",
+                                                    )
+                                                    .await;
+                                                    continue;
+                                                }
+                                                if pane_metas
+                                                    .lock()
+                                                    .is_ok_and(|metas| metas.contains_key(&pane_config.pane_id))
+                                                {
+                                                    tracing::info!(
+                                                        pane_id = pane_config.pane_id,
+                                                        "Ignoring idempotent duplicate AddPane",
+                                                    );
                                                     continue;
                                                 }
                                                 let label = pane_config.label.clone().unwrap_or_else(|| format!("Tab {}", pane_config.pane_id));
@@ -11827,13 +11849,16 @@ async fn run_server_connection(
                                                     model: pane_config.model,
                                                     effort: pane_config.effort,
                                                     worktree_path,
-                                                    initial_input: None,
+                                                    initial_input,
                                                     role: pane_config.role,
                                                     goal: pane_config.goal,
                                                     backstory: pane_config.backstory,
                                                     plan_review_mode: pane_config.plan_review_mode,
                                                     managed: pane_config.managed,
-                                                    try_resume_first: true,
+                                                    // AddPane always names a brand-new pane/session.
+                                                    // Restores and reboots have separate paths and
+                                                    // explicitly opt into provider resume.
+                                                    try_resume_first: false,
                                                     kind: pane_config.kind,
                                                 });
                                             }

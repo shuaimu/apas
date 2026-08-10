@@ -4,7 +4,7 @@ import { useState, useEffect, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://apas.mpaxos.com";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://apas.mpaxos.com";
 
 function ResetPasswordForm() {
   const router = useRouter();

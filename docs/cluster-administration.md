@@ -1,7 +1,7 @@
 # Cluster administration rollout
 
 The cluster control plane is available to persisted `admin` accounts at
-`http://apas.mpaxos.com/admin`. Cluster administration does not grant access
+`https://apas.mpaxos.com/admin`. Cluster administration does not grant access
 to project messages, files, diffs, or terminals; an administrator needs an
 explicit project owner/user relationship for data-plane access.
 

@@ -12,7 +12,7 @@ import {
   Shield,
 } from "lucide-react";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://apas.mpaxos.com";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://apas.mpaxos.com";
 type Tab = "overview" | "users" | "projects" | "audit";
 
 interface Page<T> { items: T[]; limit: number; offset: number }
@@ -41,6 +41,8 @@ interface Policy {
 interface LaunchProfile { key: string; label: string }
 interface ProjectSummary {
   id: string;
+  project_name?: string | null;
+  hostname?: string | null;
   owner_user_id: string;
   owner_email: string;
   lifecycle_status: "active" | "suspended";
@@ -268,7 +270,11 @@ export default function AdminPage() {
             <div className="overflow-hidden rounded-xl border border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-900">
               {projects.map((project) => <button key={project.id} onClick={() => void loadProject(project.id)} className="flex w-full items-center gap-3 border-b border-gray-100 p-4 text-left hover:bg-gray-50 dark:border-gray-800 dark:hover:bg-gray-800">
                 <FolderOpen className="h-5 w-5 text-blue-500" />
-                <div className="min-w-0 flex-1"><div className="truncate font-mono text-sm">{project.id}</div><div className="text-xs text-gray-500">Owner {project.owner_email} · {project.member_count} members · {project.active_session_count} active</div></div>
+                <div className="min-w-0 flex-1">
+                  <div className="truncate font-medium">{project.project_name || "Unnamed project"}</div>
+                  <div className="truncate text-xs text-gray-500">Host {project.hostname || "Unknown"} · Owner {project.owner_email} · {project.member_count} members · {project.active_session_count} active</div>
+                  <div className="truncate font-mono text-[11px] text-gray-400">{project.id}</div>
+                </div>
                 <span className={`h-2 w-2 rounded-full ${project.connected ? "bg-green-500" : "bg-gray-400"}`} title={project.connected ? "Connected" : "Offline"} />
                 <span className="text-xs capitalize">{project.lifecycle_status}</span>
               </button>)}

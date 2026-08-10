@@ -18,10 +18,13 @@ const storeMock = vi.hoisted(() => {
     connect: vi.fn(),
     connected: false,
     disconnect: vi.fn(),
+    attachSession: vi.fn(),
     isAuthenticated: false,
+    listSessions: vi.fn(),
     logout: vi.fn(),
     serverVersion: null,
     sessionId: null,
+    sessions: [],
     setUserEmail: vi.fn(),
     token: null,
     userEmail: null,
@@ -78,6 +81,22 @@ vi.mock("@/components/tabs/TabbedView", () => ({
   TabbedView: () => <div data-testid="tabbed-view" />,
 }));
 
+vi.mock("@/components/mobile/MobileCodeHome", () => ({
+  MobileCodeHome: ({ onOpenSession }: { onOpenSession: (sessionId: string, projectName: string) => void }) => (
+    <div data-testid="mobile-code-home">
+      <button onClick={() => onOpenSession("mobile-session", "mobile-project")}>Open mobile session</button>
+    </div>
+  ),
+}));
+
+vi.mock("@/components/mobile/MobileSessionActivity", () => ({
+  MobileSessionActivity: ({ onBack }: { onBack: () => void }) => (
+    <div data-testid="mobile-session-activity">
+      <button onClick={onBack}>Back to mobile home</button>
+    </div>
+  ),
+}));
+
 vi.mock("@/lib/sessionCacheDb", () => ({
   clearAllSnapshots: clearAllSnapshotsMock,
   deleteSnapshot: vi.fn(),
@@ -116,6 +135,10 @@ function setDesktopWidth(width = 1024) {
     configurable: true,
     value: width,
   });
+}
+
+function setMobileWidth() {
+  setDesktopWidth(390);
 }
 
 function seedAuthenticatedState(cliClientId: string | null = "project-a", overrides: Record<string, unknown> = {}) {
@@ -242,7 +265,7 @@ describe("Home auth bootstrap", () => {
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
-        "http://apas.mpaxos.com/auth/me",
+        "https://apas.mpaxos.com/auth/me",
         expect.objectContaining({
           headers: { Authorization: "Bearer stored-token" },
         }),
@@ -293,6 +316,36 @@ describe("Home auth bootstrap", () => {
 
     expect(logout).toHaveBeenCalledTimes(1);
     expect(router.push).toHaveBeenCalledWith("/login");
+  });
+});
+
+describe("Home responsive shell", () => {
+  it("uses the native-style session home on a phone and keeps the desktop shell offscreen", async () => {
+    const attachSession = vi.fn();
+    setMobileWidth();
+    seedAuthenticatedState("project-a", { attachSession });
+
+    render(<Home />);
+
+    expect(await screen.findByTestId("mobile-code-home")).toBeTruthy();
+    expect(screen.queryByTestId("sidebar")).toBeNull();
+    expect(screen.queryByTestId("tabbed-view")).toBeNull();
+
+    fireEvent.click(screen.getByText("Open mobile session"));
+    expect(attachSession).toHaveBeenCalledWith("mobile-session");
+    expect(await screen.findByTestId("mobile-session-activity")).toBeTruthy();
+    expect(screen.queryByTestId("tabbed-view")).toBeNull();
+
+    fireEvent.click(screen.getByText("Back to mobile home"));
+    expect(await screen.findByTestId("mobile-code-home")).toBeTruthy();
+  });
+
+  it("preserves the existing sidebar and pane view on desktop", async () => {
+    renderAuthenticatedHome();
+
+    expect(await screen.findByTestId("sidebar")).toBeTruthy();
+    expect(screen.getByTestId("tabbed-view")).toBeTruthy();
+    expect(screen.queryByTestId("mobile-code-home")).toBeNull();
   });
 });
 

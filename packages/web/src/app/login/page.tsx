@@ -6,7 +6,7 @@ import Link from "next/link";
 import { safeRedirect, redirectParam } from "@/lib/safeRedirect";
 import { useStore } from "@/lib/store";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://apas.mpaxos.com";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://apas.mpaxos.com";
 
 function LoginForm() {
   const router = useRouter();

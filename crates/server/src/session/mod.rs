@@ -110,11 +110,39 @@ pub struct SessionManager {
     /// retry + reconnect replay), and without this each retransmit was
     /// stored and displayed as a fresh message. Bounded ring per session.
     recent_input_ids: DashMap<Uuid, VecDeque<(String, String)>>,
+    /// Server-authoritative unresolved decisions keyed by the CLI tool id.
+    /// Removal is the atomic first-response claim shared by web and mobile.
+    pending_decisions: DashMap<(Uuid, String), PendingDecision>,
+    /// Per-user mobile mutation request state. A retry with the same opaque
+    /// request id either observes the retained acknowledgement or waits for
+    /// the original in-flight operation; it never applies the action twice.
+    mutation_requests: DashMap<(Uuid, String), MutationRequestState>,
+    /// Bounded completion order used to evict old acknowledgement results.
+    mutation_request_order: DashMap<Uuid, VecDeque<String>>,
     /// Raw pty presentation and lifecycle per (session, pane) for
     /// `PaneKind::Terminal` panes. In memory only and deliberately never
     /// persisted: these are ANSI byte streams, not chat records, and writing
     /// them to `messages.jsonl` would corrupt the message store.
     terminal_states: DashMap<(Uuid, u32), TerminalStateEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingDecision {
+    pub pane_id: Option<u32>,
+    pub kind: shared::MutationKind,
+}
+
+#[derive(Debug, Clone)]
+enum MutationRequestState {
+    Pending,
+    Complete(ServerToWeb),
+}
+
+#[derive(Debug, Clone)]
+pub enum MutationRequestClaim {
+    New,
+    InFlight,
+    Replay(ServerToWeb),
 }
 
 /// Bounded rolling window and last authoritative lifecycle for a terminal.
@@ -221,6 +249,9 @@ impl SessionManager {
             machine_projects: DashMap::new(),
             shared_project_refs: DashMap::new(),
             recent_input_ids: DashMap::new(),
+            pending_decisions: DashMap::new(),
+            mutation_requests: DashMap::new(),
+            mutation_request_order: DashMap::new(),
             terminal_states: DashMap::new(),
         }
     }
@@ -386,6 +417,87 @@ impl SessionManager {
         }
     }
 
+    pub fn register_pending_decision(
+        &self,
+        session_id: Uuid,
+        decision_id: String,
+        pane_id: Option<u32>,
+        kind: shared::MutationKind,
+    ) {
+        self.pending_decisions
+            .insert((session_id, decision_id), PendingDecision { pane_id, kind });
+    }
+
+    pub fn claim_pending_decision(
+        &self,
+        session_id: Uuid,
+        decision_id: &str,
+        pane_id: Option<u32>,
+        kind: shared::MutationKind,
+    ) -> Option<PendingDecision> {
+        let key = (session_id, decision_id.to_string());
+        let current = self.pending_decisions.get(&key)?;
+        let matches = current.kind == kind
+            && pane_id.is_none_or(|requested| current.pane_id == Some(requested));
+        drop(current);
+        matches
+            .then(|| self.pending_decisions.remove(&key).map(|(_, value)| value))
+            .flatten()
+    }
+
+    pub fn restore_pending_decision(
+        &self,
+        session_id: Uuid,
+        decision_id: String,
+        decision: PendingDecision,
+    ) {
+        self.pending_decisions
+            .entry((session_id, decision_id))
+            .or_insert(decision);
+    }
+
+    /// Atomically reserve an opaque request id before routing a mutation.
+    pub fn claim_mutation_request(&self, user_id: Uuid, request_id: &str) -> MutationRequestClaim {
+        use dashmap::mapref::entry::Entry;
+
+        match self
+            .mutation_requests
+            .entry((user_id, request_id.to_string()))
+        {
+            Entry::Vacant(entry) => {
+                entry.insert(MutationRequestState::Pending);
+                MutationRequestClaim::New
+            }
+            Entry::Occupied(entry) => match entry.get() {
+                MutationRequestState::Pending => MutationRequestClaim::InFlight,
+                MutationRequestState::Complete(ack) => MutationRequestClaim::Replay(ack.clone()),
+            },
+        }
+    }
+
+    /// Retain a bounded acknowledgement window so lost WebSocket frames can
+    /// be retried safely with the same request id.
+    pub fn complete_mutation_request(
+        &self,
+        user_id: Uuid,
+        request_id: String,
+        acknowledgement: ServerToWeb,
+    ) {
+        const MAX_TRACKED: usize = 128;
+
+        self.mutation_requests.insert(
+            (user_id, request_id.clone()),
+            MutationRequestState::Complete(acknowledgement),
+        );
+        let mut order = self.mutation_request_order.entry(user_id).or_default();
+        order.push_back(request_id);
+        while order.len() > MAX_TRACKED {
+            if let Some(expired) = order.pop_front() {
+                self.mutation_requests.remove(&(user_id, expired));
+            }
+        }
+    }
+
     pub fn set_shared_project_refs_for_user(
         &self,
         user_id: Uuid,
@@ -517,6 +629,14 @@ impl SessionManager {
         self.session_projects.iter().any(|entry| {
             entry.value().as_str() == project_id && self.is_session_active(entry.key())
         })
+    }
+
+    pub fn active_session_for_project(&self, project_id: &str) -> Option<Uuid> {
+        self.session_projects
+            .iter()
+            .filter(|entry| entry.value().as_str() == project_id)
+            .map(|entry| *entry.key())
+            .find(|session_id| self.is_session_active(session_id))
     }
 
     /// Best-effort immediate revocation after account suspension. Persistent
@@ -2430,5 +2550,126 @@ mod tests {
         assert_eq!(snapshot.bytes, b"legacy");
         assert_eq!(snapshot.instance_id, None);
         assert_eq!(snapshot.lifecycle, TerminalLifecycle::Unknown);
+    }
+
+    #[test]
+    fn pending_decisions_accept_only_the_first_exact_response() {
+        let sessions = SessionManager::new();
+        let session_id = Uuid::new_v4();
+        sessions.register_pending_decision(
+            session_id,
+            "tool-1".to_string(),
+            Some(7),
+            shared::MutationKind::Question,
+        );
+        assert!(sessions
+            .claim_pending_decision(
+                session_id,
+                "tool-1",
+                Some(8),
+                shared::MutationKind::Question,
+            )
+            .is_none());
+        assert!(sessions
+            .claim_pending_decision(
+                session_id,
+                "tool-1",
+                Some(7),
+                shared::MutationKind::PlanReview,
+            )
+            .is_none());
+        let claimed = sessions
+            .claim_pending_decision(
+                session_id,
+                "tool-1",
+                Some(7),
+                shared::MutationKind::Question,
+            )
+            .expect("first exact response claims the decision");
+        assert_eq!(claimed.pane_id, Some(7));
+        assert!(sessions
+            .claim_pending_decision(
+                session_id,
+                "tool-1",
+                Some(7),
+                shared::MutationKind::Question,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn mutation_request_retry_replays_original_ack_without_reclaiming() {
+        let sessions = SessionManager::new();
+        let user_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        assert!(matches!(
+            sessions.claim_mutation_request(user_id, "request-1"),
+            MutationRequestClaim::New
+        ));
+        assert!(matches!(
+            sessions.claim_mutation_request(user_id, "request-1"),
+            MutationRequestClaim::InFlight
+        ));
+
+        sessions.complete_mutation_request(
+            user_id,
+            "request-1".to_string(),
+            ServerToWeb::MutationAck {
+                request_id: "request-1".to_string(),
+                session_id,
+                pane_id: Some(4),
+                mutation: shared::MutationKind::Interrupt,
+                accepted: true,
+                error: None,
+            },
+        );
+
+        let MutationRequestClaim::Replay(ServerToWeb::MutationAck {
+            request_id,
+            session_id: replayed_session,
+            accepted,
+            ..
+        }) = sessions.claim_mutation_request(user_id, "request-1")
+        else {
+            panic!("completed request should replay its acknowledgement");
+        };
+        assert_eq!(request_id, "request-1");
+        assert_eq!(replayed_session, session_id);
+        assert!(accepted);
+    }
+
+    #[test]
+    fn mutation_request_acknowledgements_are_scoped_and_bounded_per_user() {
+        let sessions = SessionManager::new();
+        let first_user = Uuid::new_v4();
+        let second_user = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        for index in 0..129 {
+            let request_id = format!("request-{index}");
+            assert!(matches!(
+                sessions.claim_mutation_request(first_user, &request_id),
+                MutationRequestClaim::New
+            ));
+            sessions.complete_mutation_request(
+                first_user,
+                request_id.clone(),
+                ServerToWeb::MutationAck {
+                    request_id,
+                    session_id,
+                    pane_id: None,
+                    mutation: shared::MutationKind::Question,
+                    accepted: false,
+                    error: Some("stale".to_string()),
+                },
+            );
+        }
+        assert!(matches!(
+            sessions.claim_mutation_request(first_user, "request-0"),
+            MutationRequestClaim::New
+        ));
+        assert!(matches!(
+            sessions.claim_mutation_request(second_user, "request-128"),
+            MutationRequestClaim::New
+        ));
     }
 }

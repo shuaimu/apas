@@ -1,0 +1,26 @@
+{
+  "name": "@apas/protocol",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "generate:schema": "cargo run --manifest-path ../../Cargo.toml -p shared --example export_mobile_schema -- schema",
+    "generate:types": "node scripts/generate.mjs",
+    "generate": "npm run generate:schema && npm run generate:types",
+    "check:generated": "npm run generate && git diff --exit-code -- schema src/generated.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@babel/runtime": "7.29.7",
+    "ajv": "8.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "25.0.8",
+    "json-schema-to-typescript": "15.0.4",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  }
+}

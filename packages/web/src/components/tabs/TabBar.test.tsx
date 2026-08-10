@@ -2,10 +2,6 @@ import { createEvent, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TabBar } from "./TabBar";
 import type { PaneConfig } from "@/lib/store";
-import {
-  DEEPSEEK_DEFAULT_MODEL,
-  PROVIDER_MODEL_GROUPS,
-} from "@/lib/providerOptions";
 
 function pane(overrides: Partial<PaneConfig> & Pick<PaneConfig, "pane_id" | "label" | "role">): PaneConfig {
   return {
@@ -30,6 +26,7 @@ function renderTabBar(
     onRenameTab?: ReturnType<typeof vi.fn>;
     onReorderTabs?: ReturnType<typeof vi.fn>;
     showRebootButton?: boolean;
+    showOverview?: boolean;
     tabs?: PaneConfig[];
   } = {},
 ) {
@@ -56,6 +53,7 @@ function renderTabBar(
       onReorderTabs={onReorderTabs as Parameters<typeof TabBar>[0]["onReorderTabs"]}
       onRebootCli={overrides.onRebootCli as Parameters<typeof TabBar>[0]["onRebootCli"]}
       showRebootButton={overrides.showRebootButton}
+      showOverview={overrides.showOverview}
       paneStatuses={{}}
       pausedPanes={[]}
     />,
@@ -152,32 +150,20 @@ describe("TabBar coordinator close controls", () => {
     expect(onCloseTab).toHaveBeenCalledWith(13);
   });
 
-  it("renders the add-tab provider menu from shared provider/model groups", () => {
+  it("offers only Claude and Codex terminal panes for new tabs", () => {
     const onAddTab = vi.fn();
     renderTabBar({ onAddTab });
 
     fireEvent.click(screen.getByTitle("New tab"));
 
-    for (const group of PROVIDER_MODEL_GROUPS) {
-      expect(screen.getByText(group.label)).toBeTruthy();
-    }
+    expect(screen.getByText("Claude")).toBeTruthy();
+    expect(screen.getByText("Codex")).toBeTruthy();
+    expect(screen.queryByText("OpenCode")).toBeNull();
+    expect(screen.queryByText("Cursor")).toBeNull();
+    expect(screen.queryByText("DeepSeek")).toBeNull();
 
-    const claudeGroup = PROVIDER_MODEL_GROUPS.find((group) => group.id === "claude");
-    expect(claudeGroup).toBeTruthy();
     fireEvent.click(screen.getByText("Claude"));
-
-    for (const option of claudeGroup?.options ?? []) {
-      expect(screen.getByText(option.label)).toBeTruthy();
-    }
-
-    fireEvent.click(screen.getByText("DeepSeek"));
-
-    expect(onAddTab).toHaveBeenCalledWith(
-      "claude",
-      DEEPSEEK_DEFAULT_MODEL,
-      undefined,
-      "agent",
-    );
+    expect(onAddTab).toHaveBeenCalledWith("claude", undefined, undefined, "terminal");
   });
 
   it("keeps full-process reboot behind the explicit Reboot CLI control", () => {
@@ -212,6 +198,23 @@ describe("TabBar coordinator close controls", () => {
     expect(confirmSpy).toHaveBeenCalledWith("Are you sure you want to reboot the CLI?");
     expect(onRebootCli).not.toHaveBeenCalled();
     confirmSpy.mockRestore();
+  });
+});
+
+describe("TabBar Overview visibility", () => {
+  beforeEach(() => {
+    Element.prototype.scrollIntoView = vi.fn();
+  });
+
+  it("omits Overview while preserving real pane tabs when team mode is unavailable", () => {
+    const { container } = renderTabBar({
+      showOverview: false,
+      tabs: basicTabs(),
+      activeTabId: 1,
+    });
+
+    expect(screen.queryByRole("button", { name: "Overview" })).toBeNull();
+    expect(tabButton(container, 1).textContent).toContain("Alpha");
   });
 });
 
@@ -311,9 +314,8 @@ describe("TabBar add-tab worktree controls", () => {
 
     openNewTabMenu();
     fireEvent.click(screen.getByText("Claude"));
-    fireEvent.click(screen.getByText("Official"));
 
-    expect(onAddTab).toHaveBeenCalledWith("claude", undefined, undefined, "agent");
+    expect(onAddTab).toHaveBeenCalledWith("claude", undefined, undefined, "terminal");
   });
 
   it("passes true when isolated worktree is checked and resets it after picking", () => {
@@ -323,15 +325,14 @@ describe("TabBar add-tab worktree controls", () => {
     openNewTabMenu();
     fireEvent.click(isolatedWorktreeCheckbox());
     fireEvent.click(screen.getByText("Claude"));
-    fireEvent.click(screen.getByText("Official"));
 
-    expect(onAddTab).toHaveBeenCalledWith("claude", undefined, true, "agent");
+    expect(onAddTab).toHaveBeenCalledWith("claude", undefined, true, "terminal");
 
     openNewTabMenu();
     expect(isolatedWorktreeCheckbox().checked).toBe(false);
     fireEvent.click(screen.getByText("Codex"));
 
-    expect(onAddTab).toHaveBeenLastCalledWith("codex", undefined, undefined, "agent");
+    expect(onAddTab).toHaveBeenLastCalledWith("codex", undefined, undefined, "terminal");
   });
 
   it("offers claude and codex terminal tabs and passes kind=terminal", () => {
@@ -339,7 +340,7 @@ describe("TabBar add-tab worktree controls", () => {
     renderTabBar({ onAddTab });
 
     openNewTabMenu();
-    fireEvent.click(screen.getByText("Codex terminal"));
+    fireEvent.click(screen.getByText("Codex"));
 
     expect(onAddTab).toHaveBeenCalledWith("codex", undefined, undefined, "terminal");
   });
@@ -350,9 +351,9 @@ describe("TabBar add-tab worktree controls", () => {
     renderTabBar();
     openNewTabMenu();
 
-    expect(screen.getByText("Claude terminal")).toBeTruthy();
-    expect(screen.getByText("Codex terminal")).toBeTruthy();
-    for (const label of ["MiniMax terminal", "GLM terminal", "DeepSeek terminal", "OpenCode terminal"]) {
+    expect(screen.getByText("Claude")).toBeTruthy();
+    expect(screen.getByText("Codex")).toBeTruthy();
+    for (const label of ["MiniMax", "GLM", "DeepSeek", "OpenCode", "Cursor"]) {
       expect(screen.queryByText(label)).toBeNull();
     }
   });
@@ -374,18 +375,14 @@ describe("TabBar add-tab worktree controls", () => {
     expect(tab.textContent).toContain("!");
   });
 
-  it("closes the menu from an outside click and collapses expanded provider submenus", () => {
+  it("closes the menu from an outside click", () => {
     renderTabBar();
 
     openNewTabMenu();
-    fireEvent.click(screen.getByText("Claude"));
-    expect(screen.getByText("Official")).toBeTruthy();
+    expect(screen.getByText("Claude")).toBeTruthy();
 
     fireEvent.mouseDown(document.body);
 
-    expect(screen.queryByText("Official")).toBeNull();
-
-    openNewTabMenu();
-    expect(screen.queryByText("Official")).toBeNull();
+    expect(screen.queryByText("Claude")).toBeNull();
   });
 });

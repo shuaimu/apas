@@ -346,7 +346,7 @@ describe("Sidebar project list", () => {
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
     expect(fetchMock.mock.calls[2][0]).toBe(
-      "http://apas.mpaxos.com/projects/canonical-project/owner",
+      "https://apas.mpaxos.com/projects/canonical-project/owner",
     );
     expect(fetchMock.mock.calls[2][1]).toMatchObject({
       method: "PATCH",

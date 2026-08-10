@@ -172,7 +172,7 @@ to a glibc build so an update can never brick the binary.
 Located at `~/.config/apas/config.toml`:
 ```toml
 [remote]
-server = "ws://apas.mpaxos.com:8080"
+server = "wss://apas.mpaxos.com"
 token = "your-token"
 
 [local]
@@ -243,10 +243,10 @@ distinguishes a pre-`panes` file from a new project.
 `disallowed_tab_types` are project-level policy flags. `team_enabled` gates
 managed team mode entirely (see "Team mode is opt-in" below);
 `disallowed_tab_types` restricts which tab types users may create (see "Tab-type
-policy"); the other two are read by the Tech Lead loop. All are owner/admin-only. Managed pane entries are restored as team roles; unmanaged
-interactive panes can coexist with the team. `kind` defaults to `"agent"` when
-absent, so `.apas` files written before terminal panes existed keep loading
-unchanged — see "Terminal panes" under Key Concepts.
+policy"); the other two are read by the Tech Lead loop. All are owner/admin-only. Managed pane entries are restored as team roles; new unmanaged
+work is created as a terminal pane. `kind` defaults to `"agent"` when absent
+solely for compatibility, so `.apas` files written before terminal panes
+existed keep loading unchanged — see "Terminal panes" under Key Concepts.
 
 ## Message Types
 
@@ -330,7 +330,7 @@ cargo run -p apas
 
 ### Environment Variables
 - `RUST_LOG`: Logging level (e.g., `info`, `debug`)
-- `NEXT_PUBLIC_WS_URL`: WebSocket URL for web frontend (default: `ws://apas.mpaxos.com:8080`)
+- `NEXT_PUBLIC_WS_URL`: WebSocket URL for web frontend (default: `wss://apas.mpaxos.com`)
 
 ## Deployment
 
@@ -346,7 +346,7 @@ The APAS server and web UI are deployed on an LXC container:
   then `systemctl reload nginx`. `/ws/ /auth/ /admin/ /share/ /health` →
   `apas-server` (`127.0.0.1:8080`); everything else → the Next.js app
   (`127.0.0.1:3000`). This exists so the web's WebSocket + HTTP API ride the
-  standard port 80 (`ws://apas.mpaxos.com/ws/web`) instead of the non-standard
+  standard port 80 (`wss://apas.mpaxos.com/ws/web`) instead of the non-standard
   `:8080`, which mobile carriers/Wi-Fi block — that broke mobile entirely.
 
   **A proxied `location /X/` shadows the page at `/X`.** nginx answers a
@@ -367,11 +367,11 @@ The APAS server and web UI are deployed on an LXC container:
   `curl -sL -o /dev/null -w '%{http_code} %{num_redirects}' <url>` — a page
   answering `200 1` instead of `200 0` is this bug.
 - **apas-server**: `127.0.0.1:8080` — still also bound publicly on `:8080` for
-  the **CLI/daemon** (`ws://apas.mpaxos.com:8080/ws/cli`); do not firewall 8080.
+  the **CLI/daemon** (`wss://apas.mpaxos.com/ws/cli`); do not firewall 8080.
 - **Next.js web (apas-web)**: `127.0.0.1:3000` (moved off 80 via a systemd
   drop-in `apas-web.service.d/port.conf` → `Environment=PORT=3000`).
-- The web's default WS/API URLs are now **port-less** (`ws://apas.mpaxos.com`,
-  `http://apas.mpaxos.com`); `NEXT_PUBLIC_WS_URL`/`NEXT_PUBLIC_API_URL` no
+- The web's default WS/API URLs are now **port-less** (`wss://apas.mpaxos.com`,
+  `https://apas.mpaxos.com`); `NEXT_PUBLIC_WS_URL`/`NEXT_PUBLIC_API_URL` no
   longer need to be set at build time.
 
 #### Directory Structure on Server
@@ -452,7 +452,7 @@ ssh root@apas.mpaxos.com "cd /opt/apas/web && npm ci && NEXT_PUBLIC_WEB_UI_VERSI
 
 # Verify service state, public pages, API health, referenced /_next/static assets,
 # WebSocket/terminal attachment from the UI, and recent service errors.
-for path in / /login /machines /share /admin /health; do curl -fsSL "http://apas.mpaxos.com${path}" >/dev/null; done
+for path in / /login /machines /share /admin /health; do curl -fsSL "https://apas.mpaxos.com${path}" >/dev/null; done
 ssh root@apas.mpaxos.com "systemctl is-active apas-web apas-server && journalctl -u apas-web --since '5 minutes ago' -p err --no-pager -q && journalctl -u apas-server --since '5 minutes ago' -p err --no-pager -q"
 ```
 
@@ -630,12 +630,13 @@ otherwise have had to volunteer.
 
 **Locating the file differs by provider, and so does the confidence:**
 
-- **claude** — spawned with `--session-id <pane's session_id>`, which APAS
-  already mints per pane. The path is then exact:
+- **claude** — initially spawned with `--session-id <pane's session_id>`, which
+  APAS already mints per pane, and restored with `--resume <pane's session_id>`
+  so it keeps writing that same transcript. The path is exact:
   `~/.claude/projects/<cwd with / replaced by ->/<session-id>.jsonl`. Verified
-  against a live run, not assumed. Skipped when resuming: `--continue` picks up
-  a conversation that already owns an id, and forcing a different one would
-  split the history.
+  against a live run, not assumed. Never substitute `--continue` here: it can
+  select another pane's most recent cwd conversation and silently disconnect
+  terminal output from APAS's transcript watcher.
 - **codex** — has no equivalent flag. Its rollout files record `cwd` and a
   start timestamp in `session_meta`, so a pane is matched to the newest rollout
   in its own directory. That is a heuristic; two codex panes in the same
@@ -720,9 +721,11 @@ whole cycle; it releases on fd close, so a killed pane cannot wedge the project.
 
 ## Terminal panes (`kind: "terminal"`)
 
-Most panes are `kind: "agent"` (the default, and what every pane written
-before this field existed deserializes as): the CLI runs the provider
-headlessly and parses stream-json into structured events.
+New user-created Claude and Codex work uses `kind: "terminal"`. The structured
+`kind: "agent"` path is retained for managed team roles and historical panes:
+the CLI runs the provider headlessly and parses stream-json into structured
+events. Missing `kind` still deserializes as `agent` so old `.apas` files remain
+readable; that compatibility default is not a creation default.
 
 A **terminal pane** instead allocates a pty (`portable-pty`), execs the
 provider's *real interactive TUI*, and streams the raw bytes
@@ -732,6 +735,13 @@ ships.
 
 Only `claude` and `codex` can host one (`terminal_pane::terminal_binary_for`);
 DeepSeek, OpenCode, and Cursor Agent have unverified pty behaviour.
+
+The desktop tab bar, mobile browser pane picker, native mobile task launcher,
+server authorization, and CLI local add-tab path all enforce this boundary.
+Existing unmanaged agent panes can still run, receive messages, switch models,
+and reboot; creating another one is rejected. Managed team panes continue to
+use `agent` because delegation, diffs, plan review, and status depend on its
+structured stream.
 
 **What terminal panes deliberately do not get.** Every other team-mode
 integration is built on stream-json events, so a terminal pane still has no
@@ -793,7 +803,13 @@ variant while continuing to relay the backward-compatible output/exit frames;
 continuity then degrades to unknown/disconnected rather than a false confirmed
 running state.
 
+Native mobile launch advertises `mobile_task_launch_v2`. The version bump is
+intentional: v2 creates a terminal pane and passes the first instruction as a
+positional CLI prompt; a v1 CLI would otherwise accept the pane and drop that
+instruction. The server therefore asks the user to update/reconnect the CLI
+instead of pretending an older launch succeeded.
+
 **Lifetime.** The pty is a child of the CLI process, so a terminal pane dies
-when `apas` restarts; the restore path re-execs with the provider's own
-continue flag (`claude --continue`, `codex resume`) as the closest available
-substitute. There is no apas-visible session id to resume a TUI.
+when `apas` restarts; the restore path re-execs with the provider's own resume
+flow (`claude --resume <pane session id>`, `codex resume`). Claude's pane
+session id is APAS-visible and remains pinned across that restore.
