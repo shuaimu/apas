@@ -15,8 +15,17 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
 
-# WebSocket client
-tokio-tungstenite = { workspace = true }
+# WebSocket client. The rustls feature is what lets `wss://` work at all:
+# tokio-tungstenite's default features are ["connect", "handshake"] with no TLS,
+# and without one its plain `wrap_stream` answers a wss:// URL with
+# `TlsFeatureNotEnabled`. That happens *after* the TCP connect, so the socket is
+# opened and torn down within a millisecond — the CLI looks like it is silently
+# refusing to contact the server, and the only visible trace is one connect per
+# reconnect backoff. DEFAULT_SERVER is wss://, so a bare `apas` cannot reach the
+# server without this. webpki-roots (bundled Mozilla roots) rather than
+# native-roots, matching reqwest below, so the static musl binary carries its own
+# trust store instead of depending on whatever the host has.
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 
 # Serialization
 serde = { workspace = true }
