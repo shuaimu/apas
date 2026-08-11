@@ -1024,7 +1024,8 @@ async fn handle_config_command(action: ConfigAction) -> Result<()> {
                 && config.summaries.adapter == config::SummaryAdapterKind::Codex
             {
                 eprintln!(
-                    "WARNING: the Codex summary adapter retains a read-only command tool. +                     Prompt and sandbox controls reduce but do not eliminate host-file read risk."
+                    "WARNING: the Codex summary adapter retains a read-only command tool. \
+                     Prompt and sandbox controls reduce but do not eliminate host-file read risk."
                 );
             }
         }
