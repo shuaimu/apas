@@ -378,6 +378,11 @@ pub enum CliToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
+
+    /// Result from the CLI's isolated no-tools summary runner.
+    PaneWorkSummaryResult {
+        result: crate::PaneWorkSummaryGenerationResult,
+    },
 }
 
 /// Messages sent from server to CLI client
@@ -713,6 +718,11 @@ pub enum ServerToCli {
         pane_id: u32,
         cols: u16,
         rows: u16,
+    },
+
+    /// Run one bounded stage using the CLI's isolated no-tools summarizer.
+    GeneratePaneWorkSummary {
+        job: crate::PaneWorkSummaryGenerationJob,
     },
 }
 
@@ -1451,6 +1461,22 @@ pub enum WebToServer {
     /// even while the CLI is mid-reconnect.
     TerminalAttach { session_id: Uuid, pane_id: u32 },
 
+    /// Fetch cached summaries and reconcile retained source for one pane.
+    ListPaneWorkSummaries {
+        session_id: Uuid,
+        pane_id: u32,
+        #[serde(default)]
+        include_current: bool,
+    },
+
+    /// Retry a failed/stale window, or refresh the current window when omitted.
+    RefreshPaneWorkSummary {
+        session_id: Uuid,
+        pane_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window_start: Option<chrono::DateTime<chrono::Utc>>,
+    },
+
     /// Redacted native/WebView health event. Accepted only from an
     /// authenticated mobile device session.
     MobileTelemetry { event: MobileTelemetryEvent },
@@ -1847,6 +1873,25 @@ pub enum ServerToWeb {
         lifecycle: TerminalLifecycle,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<String>,
+    },
+
+    /// Complete pane-scoped snapshot returned on list/open.
+    PaneWorkSummaries {
+        session_id: Uuid,
+        pane_id: u32,
+        #[serde(default)]
+        summaries: Vec<crate::PaneWorkSummary>,
+        #[serde(default)]
+        availability: crate::PaneWorkSummaryAvailability,
+    },
+
+    /// Incremental generation/cache state for a single pane window.
+    PaneWorkSummaryUpdated {
+        session_id: Uuid,
+        pane_id: u32,
+        summary: crate::PaneWorkSummary,
+        #[serde(default)]
+        availability: crate::PaneWorkSummaryAvailability,
     },
 
     /// Echo of `WebToServer::Heartbeat`. The browser's liveness loop
@@ -3120,6 +3165,58 @@ mod tests {
             CliToServer::Register { token, .. } => assert_eq!(token, "test-token"),
             _ => panic!("Expected Register variant"),
         }
+    }
+
+    #[test]
+    fn pane_work_summary_message_paths_round_trip() {
+        let session_id = Uuid::new_v4();
+        let job = crate::PaneWorkSummaryGenerationJob {
+            protocol_version: crate::PANE_WORK_SUMMARY_PROTOCOL_VERSION,
+            job_id: Uuid::new_v4(),
+            session_id,
+            pane_id: 9,
+            pane_provider: Provider::Claude,
+            window_start: "2026-08-11T03:00:00Z".parse().unwrap(),
+            window_end: "2026-08-11T06:00:00Z".parse().unwrap(),
+            source_digest: "digest".to_string(),
+            stage: crate::PaneWorkSummaryStage::Final,
+            chunk_index: None,
+            chunk_count: None,
+            content: "notes".to_string(),
+            correction_attempt: false,
+        };
+
+        let cli_job = ServerToCli::GeneratePaneWorkSummary { job: job.clone() };
+        let decoded: ServerToCli =
+            serde_json::from_str(&serde_json::to_string(&cli_job).unwrap()).unwrap();
+        assert!(
+            matches!(decoded, ServerToCli::GeneratePaneWorkSummary { job: decoded } if decoded == job)
+        );
+
+        let web_request = WebToServer::ListPaneWorkSummaries {
+            session_id,
+            pane_id: 9,
+            include_current: true,
+        };
+        let decoded: WebToServer =
+            serde_json::from_str(&serde_json::to_string(&web_request).unwrap()).unwrap();
+        assert!(
+            matches!(decoded, WebToServer::ListPaneWorkSummaries { session_id: sid, pane_id: 9, include_current: true } if sid == session_id)
+        );
+
+        let legacy_request: WebToServer = serde_json::from_value(serde_json::json!({
+            "type": "list_pane_work_summaries",
+            "session_id": session_id,
+            "pane_id": 9
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy_request,
+            WebToServer::ListPaneWorkSummaries {
+                include_current: false,
+                ..
+            }
+        ));
     }
 
     #[test]

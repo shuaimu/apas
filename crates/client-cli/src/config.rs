@@ -11,6 +11,56 @@ pub struct Config {
     pub local: LocalConfig,
     #[serde(default)]
     pub daemon: DaemonConfig,
+    #[serde(default)]
+    pub summaries: SummaryConfig,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryAdapterKind {
+    #[default]
+    Disabled,
+    Claude,
+    /// Explicit opt-in: uses ephemeral, read-only headless execution but
+    /// retains Codex's command tool and therefore has residual host-read risk.
+    Codex,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SummaryConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub adapter: SummaryAdapterKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default = "default_summary_timeout_seconds")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_summary_input_bytes")]
+    pub max_input_bytes: usize,
+    #[serde(default)]
+    pub allow_cross_provider: bool,
+}
+
+fn default_summary_timeout_seconds() -> u64 {
+    120
+}
+
+fn default_summary_input_bytes() -> usize {
+    64 * 1024
+}
+
+impl Default for SummaryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            adapter: SummaryAdapterKind::Disabled,
+            model: None,
+            timeout_seconds: default_summary_timeout_seconds(),
+            max_input_bytes: default_summary_input_bytes(),
+            allow_cross_provider: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

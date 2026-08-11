@@ -1487,6 +1487,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             Ok(CliToServer::Register { .. }) => {
                                 // Already registered, ignore
                             }
+                            Ok(CliToServer::PaneWorkSummaryResult { result }) => {
+                                let _ = state
+                                    .pane_work_summaries
+                                    .accept_result(cli_id, result)
+                                    .await;
+                            }
                             Ok(CliToServer::ProjectPolicySnapshot {
                                 session_id,
                                 team_enabled,

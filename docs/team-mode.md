@@ -232,8 +232,8 @@ because it reads diffs and source files.
 
 - The role addendum only kicks in on the **next spawn** — close + reopen
   the tab (or reboot the CLI) after editing the role.
-- The Team modal scrolls; the Overview tab's scratchpad ticker is for
-  faster scanning. Use either.
+- The Overview tab's scratchpad ticker shows the most recent team records;
+  inspect `.apas-team.jsonl` when older records are needed.
 - If a pane is stuck or looping, the activity sparkline on its Overview
   card is the fastest diagnostic — a flat line for the last few minutes
   means it's wedged.

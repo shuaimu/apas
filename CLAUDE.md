@@ -691,7 +691,7 @@ exposes the same protocol as typed MCP tools.
 **The scratchpad file is still the source of truth.** Every tool writes through
 `scratchpad` / `team_todo` / `manager` and lands on disk in the shape it always
 had — so the CLI's watcher still *observes* writes rather than trusting agents
-to self-report, delegations stay visible in the web Team modal, and team state
+to self-report, delegations stay visible in the Overview scratchpad, and team state
 survives a machine loss (after the 2026-08-02 NFS crash the scratchpad was the
 only durable artifact of it — the server persists none of this).
 

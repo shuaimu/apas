@@ -333,6 +333,7 @@ describe("mobile code screens", () => {
     expect(view.getByText("Raw terminal")).toBeTruthy();
     expect(view.queryByText("Review")).toBeNull();
     expect(view.queryByText("Interrupt")).toBeNull();
+    expect(view.queryByText("Summary")).toBeNull();
     expect(view.queryByText(/Conversation mode/)).toBeNull();
     fireEvent.changeText(view.getByPlaceholderText("Message this terminal conversation"), "Please summarize the current state.");
     fireEvent.press(view.getByText("Send message"));
@@ -345,6 +346,9 @@ describe("mobile code screens", () => {
       client_msg_id: "04cbf715-81d0-42ca-86c5-87913e77c2c9",
     }, "04cbf715-81d0-42ca-86c5-87913e77c2c9"));
     expect(mockSend.mock.calls.map(([message]) => message).filter((message) => message.type === "terminal_input")).toEqual([]);
+    expect(mockSend.mock.calls.map(([message]) => message).filter(
+      (message) => message.type === "list_pane_work_summaries" || message.type === "refresh_pane_work_summary",
+    )).toEqual([]);
     expect(view.getByPlaceholderText("Message this terminal conversation").props.value).toBe("");
   });
 

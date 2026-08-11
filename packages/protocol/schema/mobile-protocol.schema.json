@@ -1535,6 +1535,168 @@
         "pane_id"
       ]
     },
+    "PaneWorkSummary": {
+      "description": "One cached summary record. Source text and intermediate notes are never\npersisted in this record.",
+      "type": "object",
+      "properties": {
+        "attempts": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "generated_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "protocol_version": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 1,
+          "minimum": 0
+        },
+        "provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "source_digest": {
+          "type": "string",
+          "default": ""
+        },
+        "source_message_count": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "source_through": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "source_through_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/PaneWorkSummaryStatus",
+          "default": "queued"
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updated_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "window_end": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "window_kind": {
+          "$ref": "#/$defs/PaneWorkSummaryWindowKind",
+          "default": "completed"
+        },
+        "window_start": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "session_id",
+        "pane_id",
+        "window_start",
+        "window_end"
+      ]
+    },
+    "PaneWorkSummaryAvailability": {
+      "description": "Generation support reported alongside cached records.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "available"
+          ]
+        },
+        {
+          "description": "The selected session is owned by a CLI predating this capability.",
+          "type": "string",
+          "const": "cli_update_required"
+        },
+        {
+          "description": "The CLI supports the protocol but its isolated adapter is disabled.",
+          "type": "string",
+          "const": "summarizer_disabled"
+        },
+        {
+          "description": "The configured adapter is temporarily unable to accept generation.",
+          "type": "string",
+          "const": "summarizer_unavailable"
+        },
+        {
+          "description": "A legacy or partially upgraded peer did not report availability.",
+          "type": "string",
+          "const": "unknown"
+        }
+      ]
+    },
+    "PaneWorkSummaryStatus": {
+      "description": "Durable generation state for one pane/window/source digest.",
+      "type": "string",
+      "enum": [
+        "queued",
+        "generating",
+        "complete",
+        "partial",
+        "stale",
+        "failed",
+        "source_expired"
+      ]
+    },
+    "PaneWorkSummaryWindowKind": {
+      "description": "Whether the cached record covers a closed window or the still-open window.",
+      "type": "string",
+      "enum": [
+        "completed",
+        "current"
+      ]
+    },
     "PlanReviewMode": {
       "description": "Phase 3.2a: per-pane policy for the \"editable plan checkpoint\"\nfeature. The streaming worker reads this at every turn to decide\nwhether to gate the first tool_use behind a user-approval card.",
       "oneOf": [
@@ -2858,6 +3020,73 @@
             "type",
             "session_id",
             "pane_id"
+          ]
+        },
+        {
+          "description": "Complete pane-scoped snapshot returned on list/open.",
+          "type": "object",
+          "properties": {
+            "availability": {
+              "$ref": "#/$defs/PaneWorkSummaryAvailability",
+              "default": "unknown"
+            },
+            "pane_id": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "session_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "summaries": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/PaneWorkSummary"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "pane_work_summaries"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "pane_id"
+          ]
+        },
+        {
+          "description": "Incremental generation/cache state for a single pane window.",
+          "type": "object",
+          "properties": {
+            "availability": {
+              "$ref": "#/$defs/PaneWorkSummaryAvailability",
+              "default": "unknown"
+            },
+            "pane_id": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "session_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "summary": {
+              "$ref": "#/$defs/PaneWorkSummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "pane_work_summary_updated"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "pane_id",
+            "summary"
           ]
         },
         {
@@ -5015,6 +5244,65 @@
             "type": {
               "type": "string",
               "const": "terminal_attach"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "pane_id"
+          ]
+        },
+        {
+          "description": "Fetch cached summaries and reconcile retained source for one pane.",
+          "type": "object",
+          "properties": {
+            "include_current": {
+              "type": "boolean",
+              "default": false
+            },
+            "pane_id": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "session_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "type": {
+              "type": "string",
+              "const": "list_pane_work_summaries"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "pane_id"
+          ]
+        },
+        {
+          "description": "Retry a failed/stale window, or refresh the current window when omitted.",
+          "type": "object",
+          "properties": {
+            "pane_id": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "session_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "type": {
+              "type": "string",
+              "const": "refresh_pane_work_summary"
+            },
+            "window_start": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
             }
           },
           "required": [

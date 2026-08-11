@@ -1,0 +1,1630 @@
+use crate::{
+    config::SummaryConfig,
+    db::Database,
+    session::SessionManager,
+    storage::{FileStorage, PaneWorkSummaryDocument, StoredMessage},
+};
+use chrono::{DateTime, Duration, TimeZone, Utc};
+use dashmap::DashMap;
+use regex::Regex;
+use sha2::{Digest, Sha256};
+use shared::{
+    PaneWorkSummary, PaneWorkSummaryAvailability, PaneWorkSummaryGenerationJob,
+    PaneWorkSummaryGenerationResult, PaneWorkSummaryResultKind, PaneWorkSummaryStage,
+    PaneWorkSummaryStatus, PaneWorkSummaryWindowKind, Provider, ServerToCli, ServerToWeb,
+    PANE_WORK_SUMMARY_CAPABILITY, PANE_WORK_SUMMARY_PROTOCOL_VERSION,
+};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
+use std::sync::OnceLock;
+use tokio::sync::Mutex;
+use uuid::Uuid;
+
+pub const SUMMARY_WINDOW_HOURS: i64 = 3;
+const MAX_FIELD_BYTES: usize = 2 * 1024;
+const MAX_TOOL_RESULT_BYTES: usize = 512;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalRecord {
+    pub timestamp: DateTime<Utc>,
+    pub id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceWindow {
+    pub session_id: Uuid,
+    pub pane_id: u32,
+    pub window_start: DateTime<Utc>,
+    pub window_end: DateTime<Utc>,
+    pub records: Vec<CanonicalRecord>,
+    pub source_digest: String,
+    pub source_through: DateTime<Utc>,
+    pub source_through_id: String,
+}
+
+impl SourceWindow {
+    pub fn canonical_source(&self) -> String {
+        self.records
+            .iter()
+            .map(|record| {
+                format!(
+                    "[{} id={}] {}",
+                    record.timestamp.to_rfc3339(),
+                    record.id,
+                    record.text
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkManifest {
+    pub chunks: Vec<String>,
+    /// True means dispatch must fail explicitly; chunks retain the newest
+    /// accepted material only to make diagnostics deterministic.
+    pub overflowed: bool,
+    pub total_chunks: usize,
+}
+
+pub fn window_bounds(timestamp: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
+    let seconds = SUMMARY_WINDOW_HOURS * 60 * 60;
+    let start_seconds = timestamp.timestamp().div_euclid(seconds) * seconds;
+    let start = Utc
+        .timestamp_opt(start_seconds, 0)
+        .single()
+        .expect("valid UTC summary boundary");
+    (start, start + Duration::hours(SUMMARY_WINDOW_HOURS))
+}
+
+pub fn parse_pane_id(
+    raw_pane_type: Option<&str>,
+    single_pane_fallback: Option<u32>,
+) -> Option<u32> {
+    let raw = match raw_pane_type
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(raw) => raw,
+        None => return single_pane_fallback,
+    };
+    if raw.eq_ignore_ascii_case("deadloop") {
+        return Some(shared::PANE_ID_DEADLOOP);
+    }
+    if raw.eq_ignore_ascii_case("interactive") {
+        return Some(shared::PANE_ID_INTERACTIVE);
+    }
+    if let Ok(id) = raw.parse::<u32>() {
+        return Some(id);
+    }
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("deadloop") {
+        return Some(shared::PANE_ID_DEADLOOP);
+    }
+    if lower.contains("interactive") {
+        return Some(shared::PANE_ID_INTERACTIVE);
+    }
+    let digits = lower
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    digits.parse().ok().or(single_pane_fallback)
+}
+
+pub fn build_source_windows(
+    session_id: Uuid,
+    messages: &[StoredMessage],
+    single_pane_fallback: Option<u32>,
+) -> Vec<SourceWindow> {
+    let mut grouped: BTreeMap<(u32, DateTime<Utc>), Vec<CanonicalRecord>> = BTreeMap::new();
+
+    for message in messages {
+        let Some(pane_id) = parse_pane_id(message.pane_type.as_deref(), single_pane_fallback)
+        else {
+            continue;
+        };
+        let Ok(timestamp) = DateTime::parse_from_rfc3339(&message.created_at) else {
+            continue;
+        };
+        let timestamp = timestamp.with_timezone(&Utc);
+        let Some(text) = normalize_message(message) else {
+            continue;
+        };
+        let (window_start, _) = window_bounds(timestamp);
+        grouped
+            .entry((pane_id, window_start))
+            .or_default()
+            .push(CanonicalRecord {
+                timestamp,
+                id: clip_utf8(&message.id, 256),
+                text,
+            });
+    }
+
+    grouped
+        .into_iter()
+        .map(|((pane_id, window_start), mut records)| {
+            records.sort_by(|left, right| {
+                left.timestamp
+                    .cmp(&right.timestamp)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            let last = records.last().expect("group contains a record");
+            let source_through = last.timestamp;
+            let source_through_id = last.id.clone();
+            let window_end = window_start + Duration::hours(SUMMARY_WINDOW_HOURS);
+            let source_digest =
+                digest_records(session_id, pane_id, window_start, window_end, &records);
+            SourceWindow {
+                session_id,
+                pane_id,
+                window_start,
+                window_end,
+                records,
+                source_digest,
+                source_through,
+                source_through_id,
+            }
+        })
+        .collect()
+}
+
+fn normalize_message(message: &StoredMessage) -> Option<String> {
+    let kind = message.message_type.trim().to_ascii_lowercase();
+    let role = message.role.trim().to_ascii_lowercase();
+    let prefix = match role.as_str() {
+        "user" => "USER",
+        "assistant" => "ASSISTANT",
+        _ => "EVENT",
+    };
+
+    match kind.as_str() {
+        "text" | "result" | "error" | "status" => {
+            let content = redact_secrets(&clip_utf8(message.content.trim(), MAX_FIELD_BYTES));
+            (!content.is_empty()).then(|| format!("{prefix}: {content}"))
+        }
+        "tool_use" => {
+            let value: serde_json::Value = serde_json::from_str(&message.content).ok()?;
+            let name = value.get("name")?.as_str()?.trim();
+            (!name.is_empty()).then(|| format!("TOOL: {}", clip_utf8(name, 128)))
+        }
+        "tool_result" => {
+            let value: serde_json::Value = serde_json::from_str(&message.content).ok()?;
+            let failed = value
+                .get("is_error")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let content = value
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let concise = redact_secrets(&clip_utf8(content.trim(), MAX_TOOL_RESULT_BYTES));
+            Some(if concise.is_empty() {
+                format!(
+                    "TOOL RESULT: {}",
+                    if failed { "failed" } else { "succeeded" }
+                )
+            } else {
+                format!(
+                    "TOOL RESULT {}: {concise}",
+                    if failed { "FAILED" } else { "SUCCEEDED" }
+                )
+            })
+        }
+        // PTY output, transport state, heartbeats, and usage-only envelopes
+        // are deliberately excluded from the summary source.
+        _ => None,
+    }
+}
+
+fn digest_records(
+    session_id: Uuid,
+    pane_id: u32,
+    window_start: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+    records: &[CanonicalRecord],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"pane-work-summary-v1\0");
+    hasher.update(session_id.as_bytes());
+    hasher.update(pane_id.to_be_bytes());
+    hasher.update(window_start.timestamp().to_be_bytes());
+    hasher.update(window_end.timestamp().to_be_bytes());
+    for record in records {
+        hasher.update(record.timestamp.timestamp_micros().to_be_bytes());
+        hasher.update((record.id.len() as u64).to_be_bytes());
+        hasher.update(record.id.as_bytes());
+        hasher.update((record.text.len() as u64).to_be_bytes());
+        hasher.update(record.text.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn chunk_window(
+    window: &SourceWindow,
+    max_chunk_bytes: usize,
+    max_chunks: usize,
+) -> ChunkManifest {
+    let max_chunk_bytes = max_chunk_bytes.max(1);
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for record in &window.records {
+        let line = format!(
+            "[{} id={}] {}",
+            record.timestamp.to_rfc3339(),
+            record.id,
+            record.text
+        );
+        let line = clip_utf8(&line, max_chunk_bytes);
+        let extra = line.len() + usize::from(!current.is_empty());
+        if !current.is_empty() && current.len() + extra > max_chunk_bytes {
+            chunks.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push('\n');
+        }
+        current.push_str(&line);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    let total_chunks = chunks.len();
+    let overflowed = total_chunks > max_chunks;
+    if overflowed {
+        chunks = chunks.split_off(total_chunks - max_chunks.max(1));
+    }
+    ChunkManifest {
+        chunks,
+        overflowed,
+        total_chunks,
+    }
+}
+
+pub fn cached_digest_is_stale(cached_digest: &str, window: &SourceWindow) -> bool {
+    !cached_digest.is_empty() && cached_digest != window.source_digest
+}
+
+fn secret_regex() -> &'static Regex {
+    static SECRET: OnceLock<Regex> = OnceLock::new();
+    SECRET.get_or_init(|| {
+        Regex::new(
+            r"(?ix)(?:bearer\s+)[a-z0-9._~+/=-]{8,}|(?:sk|ghp|github_pat)_[a-z0-9_-]{8,}|\bAKIA[A-Z0-9]{12,}\b|(?:api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]{6,}",
+        )
+        .expect("valid secret redaction regex")
+    })
+}
+
+pub fn redact_secrets(value: &str) -> String {
+    secret_regex().replace_all(value, "[REDACTED]").into_owned()
+}
+
+fn clip_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    format!("{}…[clipped]", &value[..boundary])
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LogicalJobKey {
+    session_id: Uuid,
+    pane_id: u32,
+    window_start: DateTime<Utc>,
+    source_digest: String,
+    stage: PaneWorkSummaryStage,
+    chunk_index: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct GenerationTask {
+    job: PaneWorkSummaryGenerationJob,
+    window_kind: PaneWorkSummaryWindowKind,
+    source_message_count: u32,
+    source_through: DateTime<Utc>,
+    source_through_id: String,
+    attempt: u32,
+}
+
+impl GenerationTask {
+    fn logical_key(&self) -> LogicalJobKey {
+        LogicalJobKey {
+            session_id: self.job.session_id,
+            pane_id: self.job.pane_id,
+            window_start: self.job.window_start,
+            source_digest: self.job.source_digest.clone(),
+            stage: self.job.stage,
+            chunk_index: self.job.chunk_index,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct InFlightJob {
+    task: GenerationTask,
+    cli_id: Uuid,
+    started_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct ReductionState {
+    base: GenerationTask,
+    notes: Vec<Option<String>>,
+}
+
+#[derive(Default)]
+struct SummaryRuntime {
+    queued: VecDeque<GenerationTask>,
+    logical_jobs: HashSet<LogicalJobKey>,
+    in_flight: HashMap<Uuid, InFlightJob>,
+    busy_clis: HashSet<Uuid>,
+    reductions: HashMap<(Uuid, u32, DateTime<Utc>, String), ReductionState>,
+}
+
+#[derive(Debug, Default)]
+pub struct SummaryMetrics {
+    scans: std::sync::atomic::AtomicU64,
+    scanned_bytes: std::sync::atomic::AtomicU64,
+    dispatched: std::sync::atomic::AtomicU64,
+    retries: std::sync::atomic::AtomicU64,
+    failures: std::sync::atomic::AtomicU64,
+    unavailable: std::sync::atomic::AtomicU64,
+}
+
+/// Server-owned summary orchestration. The CLI is only an isolated generation
+/// worker; scope, source, authorization, cache writes, and result correlation
+/// remain here.
+pub struct PaneWorkSummaryService {
+    db: Database,
+    sessions: Arc<SessionManager>,
+    storage: FileStorage,
+    config: SummaryConfig,
+    runtime: Mutex<SummaryRuntime>,
+    availability: DashMap<Uuid, PaneWorkSummaryAvailability>,
+    refreshes: DashMap<(Uuid, u32), DateTime<Utc>>,
+    recovered_sessions: DashMap<Uuid, ()>,
+    pub metrics: SummaryMetrics,
+}
+
+impl PaneWorkSummaryService {
+    pub fn new(
+        db: Database,
+        sessions: Arc<SessionManager>,
+        storage: FileStorage,
+        config: SummaryConfig,
+    ) -> Self {
+        Self {
+            db,
+            sessions,
+            storage,
+            config,
+            runtime: Mutex::new(SummaryRuntime::default()),
+            availability: DashMap::new(),
+            refreshes: DashMap::new(),
+            recovered_sessions: DashMap::new(),
+            metrics: SummaryMetrics::default(),
+        }
+    }
+
+    pub async fn reconcile_all(self: &Arc<Self>) {
+        if !self.config.enabled {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let sessions = match self.storage.list_sessions_with_messages().await {
+            Ok(mut sessions) => {
+                sessions.sort_unstable();
+                sessions.truncate(self.config.max_sessions_per_scan);
+                sessions
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Pane summary session scan failed");
+                return;
+            }
+        };
+        let mut scanned_bytes = 0_u64;
+        for session_id in sessions {
+            match self.reconcile_session(session_id, None, false, false).await {
+                Ok(bytes) => scanned_bytes = scanned_bytes.saturating_add(bytes as u64),
+                Err(error) => {
+                    tracing::warn!(%session_id, %error, "Pane summary reconciliation failed")
+                }
+            }
+        }
+        use std::sync::atomic::Ordering;
+        self.metrics.scans.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .scanned_bytes
+            .fetch_add(scanned_bytes, Ordering::Relaxed);
+        let runtime = self.runtime.lock().await;
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            scanned_bytes,
+            queue_depth = runtime.queued.len(),
+            in_flight = runtime.in_flight.len(),
+            "Pane summary reconciliation complete"
+        );
+        drop(runtime);
+        self.kick_dispatch().await;
+    }
+
+    pub async fn list_for_pane(
+        self: &Arc<Self>,
+        session_id: Uuid,
+        pane_id: u32,
+        include_current: bool,
+    ) -> anyhow::Result<(Vec<PaneWorkSummary>, PaneWorkSummaryAvailability)> {
+        self.reconcile_session(session_id, Some(pane_id), include_current, false)
+            .await?;
+        self.kick_dispatch().await;
+        let document = self.storage.load_pane_work_summaries(&session_id).await?;
+        let mut summaries = document
+            .summaries
+            .into_iter()
+            .filter(|summary| summary.pane_id == pane_id)
+            .collect::<Vec<_>>();
+        summaries.sort_by(|left, right| right.window_start.cmp(&left.window_start));
+        Ok((summaries, self.availability_for(session_id)))
+    }
+
+    pub async fn refresh(
+        self: &Arc<Self>,
+        session_id: Uuid,
+        pane_id: u32,
+        window_start: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<(Vec<PaneWorkSummary>, PaneWorkSummaryAvailability)> {
+        let now = Utc::now();
+        if let Some(last) = self.refreshes.get(&(session_id, pane_id)) {
+            if now.signed_duration_since(*last)
+                < Duration::seconds(self.config.refresh_throttle_seconds as i64)
+            {
+                return self.list_cached(session_id, pane_id).await;
+            }
+        }
+        self.refreshes.insert((session_id, pane_id), now);
+        if let Some(window_start) = window_start {
+            self.storage
+                .update_pane_work_summaries(&session_id, |document| {
+                    if let Some(summary) = document.summaries.iter_mut().find(|summary| {
+                        summary.pane_id == pane_id && summary.window_start == window_start
+                    }) {
+                        summary.status = PaneWorkSummaryStatus::Stale;
+                        summary.error = None;
+                        summary.updated_at = Some(Utc::now());
+                    }
+                    Ok(())
+                })
+                .await?;
+        }
+        self.reconcile_session(session_id, Some(pane_id), true, true)
+            .await?;
+        self.kick_dispatch().await;
+        self.list_cached(session_id, pane_id).await
+    }
+
+    async fn list_cached(
+        &self,
+        session_id: Uuid,
+        pane_id: u32,
+    ) -> anyhow::Result<(Vec<PaneWorkSummary>, PaneWorkSummaryAvailability)> {
+        let mut summaries = self
+            .storage
+            .load_pane_work_summaries(&session_id)
+            .await?
+            .summaries
+            .into_iter()
+            .filter(|summary| summary.pane_id == pane_id)
+            .collect::<Vec<_>>();
+        summaries.sort_by(|left, right| right.window_start.cmp(&left.window_start));
+        Ok((summaries, self.availability_for(session_id)))
+    }
+
+    fn availability_for(&self, session_id: Uuid) -> PaneWorkSummaryAvailability {
+        if !self.config.enabled {
+            return PaneWorkSummaryAvailability::SummarizerDisabled;
+        }
+        if !self
+            .sessions
+            .session_supports_capability(&session_id, PANE_WORK_SUMMARY_CAPABILITY)
+        {
+            return PaneWorkSummaryAvailability::CliUpdateRequired;
+        }
+        self.availability
+            .get(&session_id)
+            .map(|entry| *entry)
+            .unwrap_or(PaneWorkSummaryAvailability::Available)
+    }
+
+    async fn reconcile_session(
+        self: &Arc<Self>,
+        session_id: Uuid,
+        pane_filter: Option<u32>,
+        include_current: bool,
+        force: bool,
+    ) -> anyhow::Result<usize> {
+        let messages = self.storage.get_messages(&session_id).await?;
+        let scanned_bytes = messages.iter().map(|message| message.content.len()).sum();
+        let panes = {
+            let active = self.sessions.get_session_panes(&session_id);
+            if active.is_empty() {
+                self.storage.load_pane_list(&session_id).await?
+            } else {
+                active
+            }
+        };
+        let fallback = (panes.len() == 1).then(|| panes[0].pane_id);
+        let providers = panes
+            .iter()
+            .map(|pane| (pane.pane_id, pane.provider))
+            .collect::<HashMap<_, _>>();
+        let now = Utc::now();
+        let mut windows = build_source_windows(session_id, &messages, fallback)
+            .into_iter()
+            .filter(|window| pane_filter.is_none_or(|pane| window.pane_id == pane))
+            .filter(|window| window.window_end <= now || include_current)
+            .collect::<Vec<_>>();
+        windows.sort_by(|left, right| right.window_start.cmp(&left.window_start));
+
+        let first_recovery = self.recovered_sessions.insert(session_id, ()).is_none();
+        let document_result = if first_recovery {
+            self.storage.recover_pane_work_summaries(&session_id).await
+        } else {
+            self.storage.load_pane_work_summaries(&session_id).await
+        };
+        let mut document = match document_result {
+            Ok(document) => document,
+            Err(error) => {
+                tracing::warn!(%session_id, %error, "Pane summary cache is unreadable");
+                return Err(error);
+            }
+        };
+        let retained_window_keys = windows
+            .iter()
+            .map(|window| (window.pane_id, window.window_start))
+            .collect::<HashSet<_>>();
+        for summary in &mut document.summaries {
+            if pane_filter.is_none_or(|pane| summary.pane_id == pane)
+                && !retained_window_keys.contains(&(summary.pane_id, summary.window_start))
+                && summary.window_end < now - Duration::days(7)
+                && matches!(
+                    summary.status,
+                    PaneWorkSummaryStatus::Queued
+                        | PaneWorkSummaryStatus::Generating
+                        | PaneWorkSummaryStatus::Stale
+                        | PaneWorkSummaryStatus::Failed
+                )
+            {
+                summary.status = PaneWorkSummaryStatus::SourceExpired;
+                summary.error = Some(
+                    "The retained conversation source expired before generation completed"
+                        .to_string(),
+                );
+                summary.updated_at = Some(now);
+            }
+        }
+        let mut tasks = Vec::new();
+        for window in windows {
+            let kind = if window.window_end <= now {
+                PaneWorkSummaryWindowKind::Completed
+            } else {
+                PaneWorkSummaryWindowKind::Current
+            };
+            let existing_index = document.summaries.iter().position(|summary| {
+                summary.pane_id == window.pane_id && summary.window_start == window.window_start
+            });
+            let should_queue;
+            if let Some(index) = existing_index {
+                let existing = &mut document.summaries[index];
+                if existing.source_digest != window.source_digest {
+                    existing.status = PaneWorkSummaryStatus::Stale;
+                    existing.source_digest = window.source_digest.clone();
+                    existing.source_message_count = window.records.len() as u32;
+                    existing.source_through = Some(window.source_through);
+                    existing.source_through_id = Some(window.source_through_id.clone());
+                    existing.updated_at = Some(now);
+                    should_queue = true;
+                } else if needs_completed_replacement(existing, kind) {
+                    existing.window_kind = PaneWorkSummaryWindowKind::Completed;
+                    existing.status = PaneWorkSummaryStatus::Queued;
+                    existing.updated_at = Some(now);
+                    should_queue = true;
+                } else if matches!(
+                    existing.status,
+                    PaneWorkSummaryStatus::Complete
+                        | PaneWorkSummaryStatus::Partial
+                        | PaneWorkSummaryStatus::Queued
+                        | PaneWorkSummaryStatus::Generating
+                ) && !force
+                {
+                    continue;
+                } else if matches!(
+                    existing.status,
+                    PaneWorkSummaryStatus::Failed | PaneWorkSummaryStatus::SourceExpired
+                ) && !force
+                {
+                    continue;
+                } else {
+                    should_queue = true;
+                }
+            } else {
+                document.summaries.push(PaneWorkSummary {
+                    protocol_version: PANE_WORK_SUMMARY_PROTOCOL_VERSION,
+                    session_id,
+                    pane_id: window.pane_id,
+                    window_start: window.window_start,
+                    window_end: window.window_end,
+                    window_kind: kind,
+                    status: PaneWorkSummaryStatus::Queued,
+                    summary: None,
+                    source_digest: window.source_digest.clone(),
+                    source_message_count: window.records.len() as u32,
+                    source_through: Some(window.source_through),
+                    source_through_id: Some(window.source_through_id.clone()),
+                    generated_at: None,
+                    updated_at: Some(now),
+                    provider: None,
+                    model: None,
+                    attempts: 0,
+                    error: None,
+                });
+                should_queue = true;
+            }
+            if !should_queue {
+                continue;
+            }
+
+            let source_bytes = window.canonical_source().len();
+            let manifest =
+                chunk_window(&window, self.config.max_chunk_bytes, self.config.max_chunks);
+            if source_bytes > self.config.max_source_bytes || manifest.overflowed {
+                if let Some(summary) = document.summaries.iter_mut().find(|summary| {
+                    summary.pane_id == window.pane_id && summary.window_start == window.window_start
+                }) {
+                    summary.status = PaneWorkSummaryStatus::Failed;
+                    summary.error = Some(format!(
+                        "Summary source exceeds configured bounds ({} bytes, {} chunks)",
+                        source_bytes, manifest.total_chunks
+                    ));
+                    summary.updated_at = Some(now);
+                }
+                continue;
+            }
+
+            let chunk_count = manifest.chunks.len() as u32;
+            let reduction_key = (
+                session_id,
+                window.pane_id,
+                window.window_start,
+                window.source_digest.clone(),
+            );
+            let mut chunk_tasks = manifest
+                .chunks
+                .into_iter()
+                .enumerate()
+                .map(|(index, content)| GenerationTask {
+                    job: PaneWorkSummaryGenerationJob {
+                        protocol_version: PANE_WORK_SUMMARY_PROTOCOL_VERSION,
+                        job_id: Uuid::new_v4(),
+                        session_id,
+                        pane_id: window.pane_id,
+                        pane_provider: providers
+                            .get(&window.pane_id)
+                            .copied()
+                            .unwrap_or(Provider::Claude),
+                        window_start: window.window_start,
+                        window_end: window.window_end,
+                        source_digest: window.source_digest.clone(),
+                        stage: PaneWorkSummaryStage::Notes,
+                        chunk_index: Some(index as u32),
+                        chunk_count: Some(chunk_count),
+                        content,
+                        correction_attempt: false,
+                    },
+                    window_kind: kind,
+                    source_message_count: window.records.len() as u32,
+                    source_through: window.source_through,
+                    source_through_id: window.source_through_id.clone(),
+                    attempt: 1,
+                })
+                .collect::<Vec<_>>();
+            if let Some(base) = chunk_tasks.first().cloned() {
+                let mut runtime = self.runtime.lock().await;
+                runtime.reductions.insert(
+                    reduction_key,
+                    ReductionState {
+                        base,
+                        notes: vec![None; chunk_count as usize],
+                    },
+                );
+            }
+            tasks.append(&mut chunk_tasks);
+            if let Some(summary) = document.summaries.iter_mut().find(|summary| {
+                summary.pane_id == window.pane_id && summary.window_start == window.window_start
+            }) {
+                summary.status = PaneWorkSummaryStatus::Queued;
+                summary.error = None;
+                summary.updated_at = Some(now);
+            }
+        }
+        self.storage
+            .save_pane_work_summaries(&session_id, &document)
+            .await?;
+        tracing::debug!(
+            %session_id,
+            summary_records = document.summaries.len(),
+            queued_stages = tasks.len(),
+            scanned_bytes,
+            "Pane summary cache reconciled"
+        );
+        for task in tasks {
+            self.enqueue(task).await;
+        }
+        Ok(scanned_bytes)
+    }
+
+    async fn enqueue(&self, task: GenerationTask) {
+        let key = task.logical_key();
+        let mut runtime = self.runtime.lock().await;
+        if runtime.logical_jobs.insert(key) {
+            runtime.queued.push_back(task);
+        }
+    }
+
+    async fn kick_dispatch(self: &Arc<Self>) {
+        loop {
+            let reserved = {
+                let mut runtime = self.runtime.lock().await;
+                if runtime.in_flight.len() >= self.config.global_concurrency.max(1) {
+                    None
+                } else {
+                    let queue_len = runtime.queued.len();
+                    let mut selected = None;
+                    for _ in 0..queue_len {
+                        let Some(task) = runtime.queued.pop_front() else {
+                            break;
+                        };
+                        let session = self.sessions.get_session(&task.job.session_id);
+                        let cli_id = session.and_then(|session| session.cli_client_id);
+                        let Some(cli_id) = cli_id else {
+                            runtime.queued.push_back(task);
+                            continue;
+                        };
+                        if runtime.busy_clis.contains(&cli_id)
+                            || !self.sessions.session_supports_capability(
+                                &task.job.session_id,
+                                PANE_WORK_SUMMARY_CAPABILITY,
+                            )
+                        {
+                            runtime.queued.push_back(task);
+                            continue;
+                        }
+                        let in_flight = InFlightJob {
+                            task: task.clone(),
+                            cli_id,
+                            started_at: Utc::now(),
+                        };
+                        runtime.busy_clis.insert(cli_id);
+                        runtime.in_flight.insert(task.job.job_id, in_flight.clone());
+                        selected = Some(in_flight);
+                        break;
+                    }
+                    selected
+                }
+            };
+            let Some(in_flight) = reserved else {
+                return;
+            };
+            let sent = self
+                .sessions
+                .send_to_cli(
+                    &in_flight.cli_id,
+                    ServerToCli::GeneratePaneWorkSummary {
+                        job: in_flight.task.job.clone(),
+                    },
+                )
+                .await;
+            if !sent {
+                self.release_and_retry(in_flight.task.job.job_id, "CLI disconnected")
+                    .await;
+                continue;
+            }
+            use std::sync::atomic::Ordering;
+            self.metrics.dispatched.fetch_add(1, Ordering::Relaxed);
+            let _ = self
+                .set_record_status(&in_flight.task, PaneWorkSummaryStatus::Generating, None)
+                .await;
+        }
+    }
+
+    pub async fn accept_result(
+        self: &Arc<Self>,
+        cli_id: Uuid,
+        result: PaneWorkSummaryGenerationResult,
+    ) -> bool {
+        let in_flight = {
+            let mut runtime = self.runtime.lock().await;
+            let Some(in_flight) = runtime.in_flight.get(&result.job_id).cloned() else {
+                tracing::warn!(job_id = %result.job_id, "Ignoring unknown pane summary result");
+                return false;
+            };
+            let job = &in_flight.task.job;
+            let matches = in_flight.cli_id == cli_id
+                && result.protocol_version == PANE_WORK_SUMMARY_PROTOCOL_VERSION
+                && result.session_id == job.session_id
+                && result.pane_id == job.pane_id
+                && result.window_start == job.window_start
+                && result.source_digest == job.source_digest
+                && result.stage == job.stage
+                && result.chunk_index == job.chunk_index;
+            if !matches {
+                tracing::warn!(job_id = %result.job_id, %cli_id, "Rejecting mismatched pane summary result");
+                return false;
+            }
+            runtime.in_flight.remove(&result.job_id);
+            runtime.busy_clis.remove(&cli_id);
+            runtime.logical_jobs.remove(&in_flight.task.logical_key());
+            in_flight
+        };
+        tracing::info!(
+            job_id = %result.job_id,
+            session_id = %result.session_id,
+            pane_id = result.pane_id,
+            stage = ?result.stage,
+            latency_ms = Utc::now().signed_duration_since(in_flight.started_at).num_milliseconds(),
+            provider = result.provider.as_deref().unwrap_or("unknown"),
+            model = result.model.as_deref().unwrap_or("unknown"),
+            "Pane summary result received"
+        );
+        match result.kind {
+            PaneWorkSummaryResultKind::Success => {
+                if self
+                    .accept_success(in_flight.task.clone(), result)
+                    .await
+                    .is_err()
+                {
+                    self.mark_terminal_failure(&in_flight.task, "Invalid summary provider output")
+                        .await;
+                }
+            }
+            PaneWorkSummaryResultKind::Unavailable => {
+                self.availability.insert(
+                    result.session_id,
+                    PaneWorkSummaryAvailability::SummarizerUnavailable,
+                );
+                use std::sync::atomic::Ordering;
+                self.metrics.unavailable.fetch_add(1, Ordering::Relaxed);
+                self.mark_terminal_failure(
+                    &in_flight.task,
+                    result.error.as_deref().unwrap_or("Summarizer unavailable"),
+                )
+                .await;
+            }
+            PaneWorkSummaryResultKind::RetryableFailure => {
+                self.retry_or_fail(
+                    in_flight.task,
+                    result
+                        .error
+                        .as_deref()
+                        .unwrap_or("Transient provider failure"),
+                )
+                .await;
+            }
+            PaneWorkSummaryResultKind::PermanentFailure => {
+                self.mark_terminal_failure(
+                    &in_flight.task,
+                    result
+                        .error
+                        .as_deref()
+                        .unwrap_or("Provider rejected summary job"),
+                )
+                .await;
+            }
+        }
+        self.kick_dispatch().await;
+        true
+    }
+
+    async fn accept_success(
+        self: &Arc<Self>,
+        task: GenerationTask,
+        result: PaneWorkSummaryGenerationResult,
+    ) -> anyhow::Result<()> {
+        let output = result
+            .output
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("missing output"))?;
+        match task.job.stage {
+            PaneWorkSummaryStage::Notes => {
+                anyhow::ensure!(output.len() <= 4 * 1024, "notes output too large");
+                anyhow::ensure!(!output.chars().any(forbidden_control), "control character");
+                let key = (
+                    task.job.session_id,
+                    task.job.pane_id,
+                    task.job.window_start,
+                    task.job.source_digest.clone(),
+                );
+                let maybe_final = {
+                    let mut runtime = self.runtime.lock().await;
+                    let reduction = runtime
+                        .reductions
+                        .get_mut(&key)
+                        .ok_or_else(|| anyhow::anyhow!("missing reduction state"))?;
+                    let index = task.job.chunk_index.unwrap_or_default() as usize;
+                    anyhow::ensure!(index < reduction.notes.len(), "bad chunk index");
+                    reduction.notes[index] = Some(normalize_whitespace(output));
+                    if reduction.notes.iter().all(Option::is_some) {
+                        let notes = reduction
+                            .notes
+                            .iter()
+                            .enumerate()
+                            .map(|(index, note)| {
+                                format!("CHUNK {}: {}", index + 1, note.as_deref().unwrap())
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let mut final_task = reduction.base.clone();
+                        final_task.job.job_id = Uuid::new_v4();
+                        final_task.job.stage = PaneWorkSummaryStage::Final;
+                        final_task.job.chunk_index = None;
+                        final_task.job.content = notes;
+                        final_task.attempt = 1;
+                        runtime.reductions.remove(&key);
+                        Some(final_task)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(final_task) = maybe_final {
+                    self.enqueue(final_task).await;
+                }
+            }
+            PaneWorkSummaryStage::Final => {
+                match validate_final_output(output, task.source_message_count) {
+                    Ok(summary_text) => {
+                        self.complete_record(&task, summary_text, &result).await?;
+                    }
+                    Err(error) if !task.job.correction_attempt => {
+                        let mut correction = task.clone();
+                        correction.job.job_id = Uuid::new_v4();
+                        correction.job.correction_attempt = true;
+                        correction.job.content = format!(
+                            "The prior response was invalid ({error}). Return only the required JSON object.\n\n{}",
+                            correction.job.content
+                        );
+                        self.enqueue(correction).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn complete_record(
+        &self,
+        task: &GenerationTask,
+        summary_text: String,
+        result: &PaneWorkSummaryGenerationResult,
+    ) -> anyhow::Result<()> {
+        let now = Utc::now();
+        let status = if task.window_kind == PaneWorkSummaryWindowKind::Current {
+            PaneWorkSummaryStatus::Partial
+        } else {
+            PaneWorkSummaryStatus::Complete
+        };
+        let document = self
+            .storage
+            .update_pane_work_summaries(&task.job.session_id, |document| {
+                let record = matching_record_mut(document, task)?;
+                record.status = status;
+                record.window_kind = task.window_kind;
+                record.summary = Some(summary_text);
+                record.source_through = Some(task.source_through);
+                record.source_through_id = Some(task.source_through_id.clone());
+                record.generated_at = Some(now);
+                record.updated_at = Some(now);
+                record.provider = result.provider.clone();
+                record.model = result.model.clone();
+                record.attempts = task.attempt;
+                record.error = None;
+                Ok(())
+            })
+            .await?;
+        self.broadcast_record(&document, task).await;
+        Ok(())
+    }
+
+    async fn set_record_status(
+        &self,
+        task: &GenerationTask,
+        status: PaneWorkSummaryStatus,
+        error: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let document = self
+            .storage
+            .update_pane_work_summaries(&task.job.session_id, |document| {
+                let record = matching_record_mut(document, task)?;
+                record.status = status;
+                record.attempts = task.attempt;
+                record.error = error.map(|error| clip_utf8(error, 512));
+                record.updated_at = Some(Utc::now());
+                Ok(())
+            })
+            .await?;
+        self.broadcast_record(&document, task).await;
+        Ok(())
+    }
+
+    async fn broadcast_record(&self, document: &PaneWorkSummaryDocument, task: &GenerationTask) {
+        let Some(summary) = document
+            .summaries
+            .iter()
+            .find(|summary| {
+                summary.pane_id == task.job.pane_id && summary.window_start == task.job.window_start
+            })
+            .cloned()
+        else {
+            return;
+        };
+        let web_ids = self
+            .sessions
+            .get_session(&task.job.session_id)
+            .map(|session| session.web_connection_ids)
+            .unwrap_or_default();
+        for web_id in web_ids {
+            let Some(user_id) = self.sessions.get_web_user(&web_id) else {
+                continue;
+            };
+            if self
+                .db
+                .check_session_access(&task.job.session_id.to_string(), &user_id.to_string())
+                .await
+                .unwrap_or(false)
+            {
+                let _ = self
+                    .sessions
+                    .send_to_web(
+                        &web_id,
+                        ServerToWeb::PaneWorkSummaryUpdated {
+                            session_id: task.job.session_id,
+                            pane_id: task.job.pane_id,
+                            summary: summary.clone(),
+                            availability: self.availability_for(task.job.session_id),
+                        },
+                    )
+                    .await;
+            }
+        }
+    }
+
+    pub async fn sweep_timeouts(self: &Arc<Self>) {
+        let cutoff = Utc::now() - Duration::seconds(self.config.job_timeout_seconds.max(1) as i64);
+        let expired = {
+            let runtime = self.runtime.lock().await;
+            runtime
+                .in_flight
+                .iter()
+                .filter(|(_, job)| job.started_at <= cutoff)
+                .map(|(job_id, _)| *job_id)
+                .collect::<Vec<_>>()
+        };
+        for job_id in expired {
+            self.release_and_retry(job_id, "Summary generation timed out")
+                .await;
+        }
+        self.kick_dispatch().await;
+    }
+
+    async fn release_and_retry(&self, job_id: Uuid, error: &str) {
+        let task = {
+            let mut runtime = self.runtime.lock().await;
+            let Some(in_flight) = runtime.in_flight.remove(&job_id) else {
+                return;
+            };
+            runtime.busy_clis.remove(&in_flight.cli_id);
+            runtime.logical_jobs.remove(&in_flight.task.logical_key());
+            in_flight.task
+        };
+        self.retry_or_fail(task, error).await;
+    }
+
+    async fn retry_or_fail(&self, mut task: GenerationTask, error: &str) {
+        if task.attempt < self.config.max_attempts.max(1) {
+            task.attempt += 1;
+            task.job.job_id = Uuid::new_v4();
+            use std::sync::atomic::Ordering;
+            self.metrics.retries.fetch_add(1, Ordering::Relaxed);
+            let delay = 1_u64 << (task.attempt - 2).min(5);
+            let _ = self
+                .set_record_status(&task, PaneWorkSummaryStatus::Queued, Some(error))
+                .await;
+            let mut runtime = self.runtime.lock().await;
+            let key = task.logical_key();
+            if runtime.logical_jobs.insert(key) {
+                runtime.queued.push_back(task);
+            }
+            drop(runtime);
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+        } else {
+            self.mark_terminal_failure(&task, error).await;
+        }
+    }
+
+    async fn mark_terminal_failure(&self, task: &GenerationTask, error: &str) {
+        use std::sync::atomic::Ordering;
+        self.metrics.failures.fetch_add(1, Ordering::Relaxed);
+        let _ = self
+            .set_record_status(task, PaneWorkSummaryStatus::Failed, Some(error))
+            .await;
+    }
+}
+
+fn matching_record_mut<'a>(
+    document: &'a mut PaneWorkSummaryDocument,
+    task: &GenerationTask,
+) -> anyhow::Result<&'a mut PaneWorkSummary> {
+    let record = document
+        .summaries
+        .iter_mut()
+        .find(|summary| {
+            summary.pane_id == task.job.pane_id && summary.window_start == task.job.window_start
+        })
+        .ok_or_else(|| anyhow::anyhow!("summary cache record missing"))?;
+    anyhow::ensure!(
+        record.source_digest == task.job.source_digest,
+        "summary source digest changed"
+    );
+    Ok(record)
+}
+
+fn forbidden_control(character: char) -> bool {
+    character.is_control() && !character.is_whitespace()
+}
+
+fn normalize_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn validate_final_output(output: &str, source_message_count: u32) -> anyhow::Result<String> {
+    anyhow::ensure!(output.len() <= 2 * 1024, "final output too large");
+    anyhow::ensure!(!output.chars().any(forbidden_control), "control character");
+    let value: serde_json::Value = serde_json::from_str(output)?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("output is not an object"))?;
+    anyhow::ensure!(object.len() == 1, "unexpected output fields");
+    let summary = object
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("missing summary string"))?;
+    let summary = normalize_whitespace(summary);
+    anyhow::ensure!(!summary.is_empty(), "empty summary");
+    anyhow::ensure!(
+        !summary.contains('<') && !summary.contains('>'),
+        "markup is not permitted"
+    );
+    let words = summary.split_whitespace().count();
+    anyhow::ensure!(words <= 100, "summary exceeds 100 words");
+    if source_message_count >= 4 {
+        anyhow::ensure!(words >= 50, "summary shorter than 50 words");
+    }
+    Ok(summary)
+}
+
+fn needs_completed_replacement(
+    existing: &PaneWorkSummary,
+    next_kind: PaneWorkSummaryWindowKind,
+) -> bool {
+    next_kind == PaneWorkSummaryWindowKind::Completed
+        && (existing.window_kind == PaneWorkSummaryWindowKind::Current
+            || existing.status == PaneWorkSummaryStatus::Partial)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(id: &str, pane: Option<&str>, timestamp: &str, content: &str) -> StoredMessage {
+        StoredMessage {
+            id: id.to_string(),
+            role: "assistant".to_string(),
+            content: content.to_string(),
+            message_type: "text".to_string(),
+            created_at: timestamp.to_string(),
+            pane_type: pane.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn utc_windows_are_fixed_and_non_overlapping() {
+        let timestamp = "2026-08-11T05:59:59Z".parse().unwrap();
+        let (start, end) = window_bounds(timestamp);
+        assert_eq!(start.to_rfc3339(), "2026-08-11T03:00:00+00:00");
+        assert_eq!(end.to_rfc3339(), "2026-08-11T06:00:00+00:00");
+        assert_eq!(window_bounds(end).0, end);
+    }
+
+    #[test]
+    fn pane_normalization_and_windows_never_mix_siblings() {
+        let session_id = Uuid::new_v4();
+        let messages = vec![
+            message("b", Some("pane-8"), "2026-08-11T04:10:00Z", "pane eight"),
+            message("a", Some("7"), "2026-08-11T04:00:00Z", "pane seven"),
+            message("legacy", None, "2026-08-11T04:20:00Z", "fallback"),
+        ];
+        let windows = build_source_windows(session_id, &messages, Some(7));
+        assert_eq!(windows.len(), 2);
+        let seven = windows.iter().find(|window| window.pane_id == 7).unwrap();
+        assert_eq!(seven.records.len(), 2);
+        assert!(!seven.canonical_source().contains("pane eight"));
+        let eight = windows.iter().find(|window| window.pane_id == 8).unwrap();
+        assert_eq!(eight.records.len(), 1);
+    }
+
+    #[test]
+    fn canonical_source_redacts_secrets_and_excludes_pty() {
+        let session_id = Uuid::new_v4();
+        let mut secret = message(
+            "secret",
+            Some("2"),
+            "2026-08-11T04:00:00Z",
+            "Authorization: Bearer abcdefghijklmnop and token=supersecret",
+        );
+        let mut pty = message("pty", Some("2"), "2026-08-11T04:01:00Z", "raw terminal");
+        pty.message_type = "terminal_output".to_string();
+        let windows = build_source_windows(session_id, &[secret.clone(), pty], None);
+        let source = windows[0].canonical_source();
+        assert!(!source.contains("abcdefghijklmnop"));
+        assert!(!source.contains("supersecret"));
+        assert!(!source.contains("raw terminal"));
+        secret.content = "safe".to_string();
+        let changed = build_source_windows(session_id, &[secret], None);
+        assert!(cached_digest_is_stale(
+            &windows[0].source_digest,
+            &changed[0]
+        ));
+    }
+
+    #[test]
+    fn chunking_respects_message_boundaries_and_reports_overflow() {
+        let session_id = Uuid::new_v4();
+        let messages = (0..8)
+            .map(|index| {
+                message(
+                    &format!("m{index}"),
+                    Some("2"),
+                    &format!("2026-08-11T04:{index:02}:00Z"),
+                    &"x".repeat(100),
+                )
+            })
+            .collect::<Vec<_>>();
+        let window = build_source_windows(session_id, &messages, None).remove(0);
+        let manifest = chunk_window(&window, 180, 2);
+        assert!(manifest.overflowed);
+        assert_eq!(manifest.chunks.len(), 2);
+        assert!(manifest.chunks.last().unwrap().contains("m7"));
+    }
+
+    #[test]
+    fn canonical_digest_is_stable_across_input_order() {
+        let session_id = Uuid::nil();
+        let a = message("a", Some("2"), "2026-08-11T04:00:00Z", "first");
+        let b = message("b", Some("2"), "2026-08-11T04:01:00Z", "second");
+        let first = build_source_windows(session_id, &[a.clone(), b.clone()], None);
+        let second = build_source_windows(session_id, &[b, a], None);
+        assert_eq!(first[0].source_digest, second[0].source_digest);
+    }
+
+    #[test]
+    fn a_partial_current_record_is_replaced_when_its_window_closes() {
+        let session_id = Uuid::new_v4();
+        let start = Utc::now() - Duration::hours(3);
+        let record = PaneWorkSummary {
+            protocol_version: PANE_WORK_SUMMARY_PROTOCOL_VERSION,
+            session_id,
+            pane_id: 2,
+            window_start: start,
+            window_end: start + Duration::hours(3),
+            window_kind: PaneWorkSummaryWindowKind::Current,
+            status: PaneWorkSummaryStatus::Partial,
+            summary: Some("partial".to_string()),
+            source_digest: "digest".to_string(),
+            source_message_count: 1,
+            source_through: Some(start),
+            source_through_id: Some("m1".to_string()),
+            generated_at: Some(start),
+            updated_at: Some(start),
+            provider: Some("claude".to_string()),
+            model: None,
+            attempts: 1,
+            error: None,
+        };
+        assert!(needs_completed_replacement(
+            &record,
+            PaneWorkSummaryWindowKind::Completed
+        ));
+    }
+}
+
+#[cfg(test)]
+mod service_tests {
+    use super::*;
+    use crate::db::{Session, User};
+    use tokio::sync::mpsc;
+
+    async fn test_service() -> (
+        Arc<PaneWorkSummaryService>,
+        Database,
+        FileStorage,
+        Arc<SessionManager>,
+    ) {
+        let root = std::env::temp_dir().join(format!("apas-summary-service-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("apas.db").to_string_lossy().to_string();
+        let db = Database::new(&db_path).await.unwrap();
+        db.run_migrations().await.unwrap();
+        let storage = FileStorage::new(&root);
+        let sessions = Arc::new(SessionManager::new());
+        let service = Arc::new(PaneWorkSummaryService::new(
+            db.clone(),
+            sessions.clone(),
+            storage.clone(),
+            SummaryConfig::default(),
+        ));
+        (service, db, storage, sessions)
+    }
+
+    async fn add_user_and_session(db: &Database, user_id: Uuid, session_id: Uuid) {
+        db.create_user(&User {
+            id: user_id.to_string(),
+            email: format!("{user_id}@example.test"),
+            password_hash: "hash".to_string(),
+            created_at: None,
+            cluster_role: "user".to_string(),
+            account_status: "active".to_string(),
+        })
+        .await
+        .unwrap();
+        db.create_session(&Session {
+            id: session_id.to_string(),
+            user_id: user_id.to_string(),
+            cli_client_id: None,
+            working_dir: Some("/tmp/project".to_string()),
+            hostname: Some("test-host".to_string()),
+            status: "connected".to_string(),
+            created_at: None,
+            updated_at: None,
+            is_paused: false,
+            project_id: Some(session_id.to_string()),
+            git_remote: None,
+            git_remote_url: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    fn result_for(
+        job: &PaneWorkSummaryGenerationJob,
+        output: &str,
+    ) -> PaneWorkSummaryGenerationResult {
+        PaneWorkSummaryGenerationResult {
+            protocol_version: PANE_WORK_SUMMARY_PROTOCOL_VERSION,
+            job_id: job.job_id,
+            session_id: job.session_id,
+            pane_id: job.pane_id,
+            window_start: job.window_start,
+            source_digest: job.source_digest.clone(),
+            stage: job.stage,
+            chunk_index: job.chunk_index,
+            kind: PaneWorkSummaryResultKind::Success,
+            output: Some(output.to_string()),
+            error: None,
+            provider: Some("claude".to_string()),
+            model: Some("test-model".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_capable_cli_runs_stages_persists_and_broadcasts_only_to_authorized_user() {
+        let (service, db, storage, sessions) = test_service().await;
+        let owner = Uuid::new_v4();
+        let outsider = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        add_user_and_session(&db, owner, session_id).await;
+        db.create_user(&User {
+            id: outsider.to_string(),
+            email: format!("{outsider}@example.test"),
+            password_hash: "hash".to_string(),
+            created_at: None,
+            cluster_role: "user".to_string(),
+            account_status: "active".to_string(),
+        })
+        .await
+        .unwrap();
+
+        let cli_id = Uuid::new_v4();
+        let (cli_tx, mut cli_rx) = mpsc::channel(8);
+        sessions.register_cli(cli_id, owner, cli_tx, Some("test".to_string()));
+        sessions.set_cli_capabilities(cli_id, vec![PANE_WORK_SUMMARY_CAPABILITY.to_string()]);
+        sessions.create_cli_session(
+            session_id,
+            cli_id,
+            Some("/tmp/project".to_string()),
+            Some("test-host".to_string()),
+        );
+
+        let owner_web = Uuid::new_v4();
+        let outsider_web = Uuid::new_v4();
+        let (owner_tx, mut owner_rx) = mpsc::channel(16);
+        let (outsider_tx, mut outsider_rx) = mpsc::channel(16);
+        sessions.register_web(owner_web, owner_tx);
+        sessions.set_web_user(owner_web, owner);
+        sessions.register_web(outsider_web, outsider_tx);
+        sessions.set_web_user(outsider_web, outsider);
+        assert!(sessions.attach_web_to_session(&session_id, owner_web, Some(cli_id)));
+        assert!(sessions.attach_web_to_session(&session_id, outsider_web, Some(cli_id)));
+
+        let source_time = Utc::now() - Duration::hours(4);
+        storage
+            .append_message(
+                &session_id,
+                &StoredMessage {
+                    id: "source-1".to_string(),
+                    role: "assistant".to_string(),
+                    content:
+                        "Implemented the requested storage behavior and ran its focused tests."
+                            .to_string(),
+                    message_type: "text".to_string(),
+                    created_at: source_time.to_rfc3339(),
+                    pane_type: Some("7".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let (_, availability) = service.list_for_pane(session_id, 7, false).await.unwrap();
+        assert_eq!(availability, PaneWorkSummaryAvailability::Available);
+        let ServerToCli::GeneratePaneWorkSummary { job: notes_job } = cli_rx.recv().await.unwrap()
+        else {
+            panic!("expected notes job")
+        };
+        assert_eq!(notes_job.stage, PaneWorkSummaryStage::Notes);
+
+        let mut mismatched = result_for(&notes_job, "grounded facts");
+        mismatched.source_digest = "wrong".to_string();
+        assert!(!service.accept_result(cli_id, mismatched).await);
+        assert!(
+            service
+                .accept_result(cli_id, result_for(&notes_job, "grounded facts"))
+                .await
+        );
+
+        let ServerToCli::GeneratePaneWorkSummary { job: final_job } = cli_rx.recv().await.unwrap()
+        else {
+            panic!("expected final job")
+        };
+        assert_eq!(final_job.stage, PaneWorkSummaryStage::Final);
+        assert!(service
+            .accept_result(
+                cli_id,
+                result_for(
+                    &final_job,
+                    r#"{"summary":"Implemented the requested behavior and verified it with focused tests."}"#,
+                ),
+            )
+            .await);
+
+        let document = storage.load_pane_work_summaries(&session_id).await.unwrap();
+        assert_eq!(document.summaries.len(), 1);
+        assert_eq!(
+            document.summaries[0].status,
+            PaneWorkSummaryStatus::Complete
+        );
+        assert_eq!(document.summaries[0].provider.as_deref(), Some("claude"));
+
+        let mut saw_complete = false;
+        while let Ok(message) = owner_rx.try_recv() {
+            if matches!(
+                message,
+                ServerToWeb::PaneWorkSummaryUpdated {
+                    summary: PaneWorkSummary {
+                        status: PaneWorkSummaryStatus::Complete,
+                        ..
+                    },
+                    ..
+                }
+            ) {
+                saw_complete = true;
+            }
+        }
+        assert!(saw_complete);
+        assert!(outsider_rx.try_recv().is_err());
+
+        storage
+            .append_message(
+                &session_id,
+                &StoredMessage {
+                    id: "source-late".to_string(),
+                    role: "assistant".to_string(),
+                    content: "A late retained result changed the completed window.".to_string(),
+                    message_type: "text".to_string(),
+                    created_at: (source_time + Duration::minutes(1)).to_rfc3339(),
+                    pane_type: Some("7".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        service.list_for_pane(session_id, 7, false).await.unwrap();
+        let ServerToCli::GeneratePaneWorkSummary { job: refreshed_job } =
+            cli_rx.recv().await.unwrap()
+        else {
+            panic!("expected regeneration job")
+        };
+        assert_ne!(refreshed_job.source_digest, notes_job.source_digest);
+        let refreshed = storage.load_pane_work_summaries(&session_id).await.unwrap();
+        assert_eq!(
+            refreshed.summaries[0].status,
+            PaneWorkSummaryStatus::Generating
+        );
+    }
+
+    #[tokio::test]
+    async fn old_cli_keeps_cached_summaries_readable_without_receiving_jobs() {
+        let (service, db, storage, sessions) = test_service().await;
+        let owner = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        add_user_and_session(&db, owner, session_id).await;
+        let cli_id = Uuid::new_v4();
+        let (cli_tx, mut cli_rx) = mpsc::channel(2);
+        sessions.register_cli(cli_id, owner, cli_tx, Some("old".to_string()));
+        sessions.set_cli_capabilities(cli_id, Vec::new());
+        sessions.create_cli_session(session_id, cli_id, None, None);
+        let start = Utc::now() - Duration::hours(6);
+        storage
+            .save_pane_work_summaries(
+                &session_id,
+                &PaneWorkSummaryDocument {
+                    version: 1,
+                    summaries: vec![PaneWorkSummary {
+                        protocol_version: PANE_WORK_SUMMARY_PROTOCOL_VERSION,
+                        session_id,
+                        pane_id: 2,
+                        window_start: start,
+                        window_end: start + Duration::hours(3),
+                        window_kind: PaneWorkSummaryWindowKind::Completed,
+                        status: PaneWorkSummaryStatus::Complete,
+                        summary: Some("Previously cached summary".to_string()),
+                        source_digest: "cached".to_string(),
+                        source_message_count: 1,
+                        source_through: Some(start),
+                        source_through_id: Some("old".to_string()),
+                        generated_at: Some(start),
+                        updated_at: Some(start),
+                        provider: Some("claude".to_string()),
+                        model: None,
+                        attempts: 1,
+                        error: None,
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+
+        let (summaries, availability) = service.list_for_pane(session_id, 2, false).await.unwrap();
+        assert_eq!(
+            summaries[0].summary.as_deref(),
+            Some("Previously cached summary")
+        );
+        assert_eq!(availability, PaneWorkSummaryAvailability::CliUpdateRequired);
+        assert!(cli_rx.try_recv().is_err());
+    }
+}

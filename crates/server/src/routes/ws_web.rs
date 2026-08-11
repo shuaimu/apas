@@ -2546,6 +2546,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                             matches!(
                                                 capability.as_str(),
                                                 shared::PROJECT_POLICY_CAPABILITY
+                                                    | shared::PANE_WORK_SUMMARY_CAPABILITY
                                                     | "mobile_bootstrap_v1"
                                                     | "mobile_coding_mutations_v1"
                                                     | "mobile_terminal_v1"
@@ -5298,6 +5299,135 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 )
                                 .await;
                         }
+                    }
+                }
+                Ok(WebToServer::ListPaneWorkSummaries {
+                    session_id: sid,
+                    pane_id,
+                    include_current,
+                }) => {
+                    let Some(uid) = user_id else {
+                        continue;
+                    };
+                    if !state.sessions.web_supports_capability(
+                        &connection_id,
+                        shared::PANE_WORK_SUMMARY_CAPABILITY,
+                    ) {
+                        continue;
+                    }
+                    if !state
+                        .db
+                        .check_session_access(&sid.to_string(), &uid.to_string())
+                        .await
+                        .unwrap_or(false)
+                    {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Access denied".to_string(),
+                                },
+                            )
+                            .await;
+                        continue;
+                    }
+                    let Ok((_project_id, _project_guard)) =
+                        state.active_session_operation(&sid.to_string()).await
+                    else {
+                        continue;
+                    };
+                    match state
+                        .pane_work_summaries
+                        .list_for_pane(sid, pane_id, include_current)
+                        .await
+                    {
+                        Ok((summaries, availability)) => {
+                            state
+                                .sessions
+                                .send_to_web(
+                                    &connection_id,
+                                    ServerToWeb::PaneWorkSummaries {
+                                        session_id: sid,
+                                        pane_id,
+                                        summaries,
+                                        availability,
+                                    },
+                                )
+                                .await;
+                        }
+                        Err(error) => {
+                            tracing::warn!(%sid, pane_id, %error, "Failed to list pane summaries");
+                            state
+                                .sessions
+                                .send_to_web(
+                                    &connection_id,
+                                    ServerToWeb::Error {
+                                        message: "Failed to load pane summaries".to_string(),
+                                    },
+                                )
+                                .await;
+                        }
+                    }
+                }
+                Ok(WebToServer::RefreshPaneWorkSummary {
+                    session_id: sid,
+                    pane_id,
+                    window_start,
+                }) => {
+                    let Some(uid) = user_id else {
+                        continue;
+                    };
+                    if !state.sessions.web_supports_capability(
+                        &connection_id,
+                        shared::PANE_WORK_SUMMARY_CAPABILITY,
+                    ) || !state
+                        .db
+                        .check_session_access(&sid.to_string(), &uid.to_string())
+                        .await
+                        .unwrap_or(false)
+                    {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Access denied".to_string(),
+                                },
+                            )
+                            .await;
+                        continue;
+                    }
+                    let Ok((_project_id, _project_guard)) =
+                        state.active_session_operation(&sid.to_string()).await
+                    else {
+                        continue;
+                    };
+                    match state
+                        .pane_work_summaries
+                        .refresh(sid, pane_id, window_start)
+                        .await
+                    {
+                        Ok((summaries, availability)) => {
+                            state
+                                .sessions
+                                .send_to_web(
+                                    &connection_id,
+                                    ServerToWeb::PaneWorkSummaries {
+                                        session_id: sid,
+                                        pane_id,
+                                        summaries,
+                                        availability,
+                                    },
+                                )
+                                .await;
+                        }
+                        Err(error) => tracing::warn!(
+                            %sid,
+                            pane_id,
+                            %error,
+                            "Failed to refresh pane summary"
+                        ),
                     }
                 }
                 Ok(WebToServer::DownloadSession { session_id: sid }) => {

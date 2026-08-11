@@ -368,6 +368,54 @@ export interface PaneConfig {
   managed?: boolean;
 }
 
+export type PaneWorkSummaryStatus =
+  | "queued"
+  | "generating"
+  | "complete"
+  | "partial"
+  | "stale"
+  | "failed"
+  | "source_expired";
+
+export type PaneWorkSummaryAvailability =
+  | "available"
+  | "cli_update_required"
+  | "summarizer_disabled"
+  | "summarizer_unavailable"
+  | "unknown";
+
+export interface PaneWorkSummary {
+  protocolVersion: number;
+  sessionId: string;
+  paneId: number;
+  windowStart: string;
+  windowEnd: string;
+  windowKind: "completed" | "current";
+  status: PaneWorkSummaryStatus;
+  summary?: string;
+  sourceDigest: string;
+  sourceMessageCount: number;
+  sourceThrough?: string;
+  generatedAt?: string;
+  updatedAt?: string;
+  provider?: string;
+  model?: string;
+  attempts: number;
+  error?: string;
+}
+
+export interface PaneWorkSummaryCache {
+  summaries: PaneWorkSummary[];
+  availability: PaneWorkSummaryAvailability;
+  loading: boolean;
+  requestedAt?: number;
+  error?: string;
+}
+
+export function paneWorkSummaryKey(sessionId: string, paneId: number): string {
+  return `${sessionId}/${paneId}`;
+}
+
 export type PaneCleanupAction = "discard" | "merge_and_remove" | "leave_as_branch";
 
 // Legacy pane_id constants (must match shared::PANE_ID_DEADLOOP / PANE_ID_INTERACTIVE)
@@ -508,6 +556,7 @@ interface AppState {
   clusterRole: "admin" | "user" | null;
   accountStatus: "active" | "suspended" | null;
   serverVersion: string | null;
+  negotiatedCapabilities: Set<string>;
   isAuthenticated: boolean;
 
   // Connection state
@@ -539,6 +588,7 @@ interface AppState {
   paneHasMore: Record<string, boolean>;
   paneStatuses: Record<string, string | null>;
   paneModes: Record<string, PaneType>;
+  paneWorkSummaries: Record<string, PaneWorkSummaryCache>;
   pausedPanes: number[]; // pane_ids that are paused
   loadingMorePane: number | null;
 
@@ -711,6 +761,16 @@ interface AppState {
    *  sliding window (overwrites the recent range, keeps older history) so a
    *  reconnect/reload heals any hole left below the catchup watermark. */
   refreshPaneWindow: (paneId: number, limit?: number) => void;
+  listPaneWorkSummaries: (
+    sessionId: string,
+    paneId: number,
+    includeCurrent?: boolean,
+  ) => boolean;
+  refreshPaneWorkSummary: (
+    sessionId: string,
+    paneId: number,
+    windowStart?: string,
+  ) => boolean;
   prependMessages: (messages: Message[], hasMore: boolean) => void;
   sendMessageToPane: (text: string, pane: PaneType | number) => { success: boolean; error?: string };
   addMessageToPane: (message: Message, pane: PaneType | number) => void;
@@ -907,6 +967,7 @@ export const useStore = create<AppState>((set, get) => ({
     ? (localStorage.getItem("apas_account_status") as "active" | "suspended" | null)
     : null,
   serverVersion: null,
+  negotiatedCapabilities: new Set(),
   isAuthenticated: false,
 
   connected: false,
@@ -931,6 +992,7 @@ export const useStore = create<AppState>((set, get) => ({
   paneHasMore: {},
   paneStatuses: {},
   paneModes: {},
+  paneWorkSummaries: {},
   pausedPanes: [],
   paneDiffs: {},
   projectGoals: {},
@@ -1022,10 +1084,12 @@ export const useStore = create<AppState>((set, get) => ({
       teamRecordsBySession: new Map(),
       teamRecords: [],
       serverVersion: null,
+      negotiatedCapabilities: new Set(),
       cliClients: [],
       sessions: [],
       machines: [],
       paneModes: {},
+      paneWorkSummaries: {},
       projectPolicies: {},
       reconnectAttempts: 0,
       reconnectTimeout: null,
@@ -1102,7 +1166,7 @@ export const useStore = create<AppState>((set, get) => ({
       ws.send(JSON.stringify({
         type: "authenticate",
         token,
-        capabilities: ["project_policy_v1"],
+        capabilities: ["project_policy_v1", "pane_work_summary_v1"],
         client_kind: "web",
         app_version: process.env.NEXT_PUBLIC_WEB_UI_VERSION || "development",
         protocol_version: 1,
@@ -1361,6 +1425,7 @@ export const useStore = create<AppState>((set, get) => ({
           interactiveStatus: null,
           deadloopStatus: null,
           paneLoadingInitial: new Set(),
+          paneWorkSummaries: {},
           sessionCache,
           unreadSessions,
         });
@@ -1384,6 +1449,7 @@ export const useStore = create<AppState>((set, get) => ({
           isDeadloopPaused: false,
           interactiveStatus: null,
           deadloopStatus: null,
+          paneWorkSummaries: {},
           sessionCache,
           unreadSessions,
         });
@@ -1422,6 +1488,11 @@ export const useStore = create<AppState>((set, get) => ({
       const teamRecordsBySession = new Map(state.teamRecordsBySession);
       const teamTodoStates = new Map(state.teamTodoStates);
       const suggestedWorkersBySession = new Map(state.suggestedWorkersBySession);
+      const paneWorkSummaries = Object.fromEntries(
+        Object.entries(state.paneWorkSummaries).filter(
+          ([key]) => ![...removedSessionIds].some((id) => key.startsWith(`${id}/`)),
+        ),
+      );
       for (const id of removedSessionIds) {
         sessionCache.delete(id);
         teamRecordsBySession.delete(id);
@@ -1444,6 +1515,7 @@ export const useStore = create<AppState>((set, get) => ({
         teamRecordsBySession,
         teamTodoStates,
         suggestedWorkersBySession,
+        paneWorkSummaries,
         ...(activeRemoved
           ? {
               sessionId: null,
@@ -1823,6 +1895,61 @@ export const useStore = create<AppState>((set, get) => ({
         limit,
       }),
     );
+  },
+
+  listPaneWorkSummaries: (summarySessionId, paneId, includeCurrent = true) => {
+    const { ws, negotiatedCapabilities, paneWorkSummaries } = get();
+    if (!negotiatedCapabilities.has("pane_work_summary_v1")) return false;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    const key = paneWorkSummaryKey(summarySessionId, paneId);
+    const existing = paneWorkSummaries[key];
+    if (existing?.loading) return false;
+    if (existing?.requestedAt && Date.now() - existing.requestedAt < 1_000) return false;
+    set((state) => ({
+      paneWorkSummaries: {
+        ...state.paneWorkSummaries,
+        [key]: {
+          summaries: existing?.summaries ?? [],
+          availability: existing?.availability ?? "unknown",
+          loading: true,
+          requestedAt: Date.now(),
+        },
+      },
+    }));
+    ws.send(JSON.stringify({
+      type: "list_pane_work_summaries",
+      session_id: summarySessionId,
+      pane_id: paneId,
+      include_current: includeCurrent,
+    }));
+    return true;
+  },
+
+  refreshPaneWorkSummary: (summarySessionId, paneId, windowStart) => {
+    const { ws, negotiatedCapabilities } = get();
+    if (!negotiatedCapabilities.has("pane_work_summary_v1")) return false;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    const key = paneWorkSummaryKey(summarySessionId, paneId);
+    const existing = get().paneWorkSummaries[key];
+    if (existing?.loading) return false;
+    set((state) => ({
+      paneWorkSummaries: {
+        ...state.paneWorkSummaries,
+        [key]: {
+          summaries: existing?.summaries ?? [],
+          availability: existing?.availability ?? "unknown",
+          loading: true,
+          requestedAt: Date.now(),
+        },
+      },
+    }));
+    ws.send(JSON.stringify({
+      type: "refresh_pane_work_summary",
+      session_id: summarySessionId,
+      pane_id: paneId,
+      ...(windowStart ? { window_start: windowStart } : {}),
+    }));
+    return true;
   },
 
   loadMoreMessages: (pane?: PaneType | number) => {
@@ -3484,6 +3611,39 @@ function decodeTerminalLifecycle(value: unknown): TerminalLifecycle {
     : "unknown";
 }
 
+function decodePaneWorkSummary(value: unknown): PaneWorkSummary | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.session_id !== "string" ||
+    typeof record.pane_id !== "number" ||
+    typeof record.window_start !== "string" ||
+    typeof record.window_end !== "string" ||
+    typeof record.status !== "string"
+  ) {
+    return null;
+  }
+  return {
+    protocolVersion: typeof record.protocol_version === "number" ? record.protocol_version : 1,
+    sessionId: record.session_id,
+    paneId: record.pane_id,
+    windowStart: record.window_start,
+    windowEnd: record.window_end,
+    windowKind: record.window_kind === "current" ? "current" : "completed",
+    status: record.status as PaneWorkSummaryStatus,
+    summary: typeof record.summary === "string" ? record.summary : undefined,
+    sourceDigest: typeof record.source_digest === "string" ? record.source_digest : "",
+    sourceMessageCount: typeof record.source_message_count === "number" ? record.source_message_count : 0,
+    sourceThrough: typeof record.source_through === "string" ? record.source_through : undefined,
+    generatedAt: typeof record.generated_at === "string" ? record.generated_at : undefined,
+    updatedAt: typeof record.updated_at === "string" ? record.updated_at : undefined,
+    provider: typeof record.provider === "string" ? record.provider : undefined,
+    model: typeof record.model === "string" ? record.model : undefined,
+    attempts: typeof record.attempts === "number" ? record.attempts : 0,
+    error: typeof record.error === "string" ? record.error : undefined,
+  };
+}
+
 export function handleServerMessage(
   data: Record<string, unknown>,
   set: (partial: Partial<AppState> | ((state: AppState) => Partial<AppState>)) => void,
@@ -3500,6 +3660,11 @@ export function handleServerMessage(
         accountStatus:
           (data.account_status as "active" | "suspended" | undefined) ?? null,
         serverVersion: (data.server_version as string | undefined) ?? null,
+        negotiatedCapabilities: new Set(
+          Array.isArray(data.negotiated_capabilities)
+            ? (data.negotiated_capabilities as string[])
+            : [],
+        ),
       });
       if (data.user_email) {
         localStorage.setItem("apas_user_email", data.user_email as string);
@@ -3853,6 +4018,63 @@ export function handleServerMessage(
           instanceId: typeof data.instance_id === "string" ? data.instance_id : undefined,
           lifecycle: decodeTerminalLifecycle(data.lifecycle),
           status: typeof data.status === "string" ? data.status : undefined,
+        });
+      }
+      break;
+    }
+
+    case "pane_work_summaries": {
+      const sessionId = data.session_id as string | undefined;
+      const paneId = data.pane_id as number | undefined;
+      if (sessionId && typeof paneId === "number") {
+        const key = paneWorkSummaryKey(sessionId, paneId);
+        const summaries = Array.isArray(data.summaries)
+          ? data.summaries.map(decodePaneWorkSummary).filter((item): item is PaneWorkSummary => item !== null)
+          : [];
+        summaries.sort((left, right) => right.windowStart.localeCompare(left.windowStart));
+        set((state) => ({
+          paneWorkSummaries: {
+            ...state.paneWorkSummaries,
+            [key]: {
+              summaries,
+              availability: (data.availability as PaneWorkSummaryAvailability | undefined) ?? "unknown",
+              loading: false,
+              requestedAt: state.paneWorkSummaries[key]?.requestedAt,
+            },
+          },
+        }));
+      }
+      break;
+    }
+
+    case "pane_work_summary_updated": {
+      const sessionId = data.session_id as string | undefined;
+      const paneId = data.pane_id as number | undefined;
+      const summary = decodePaneWorkSummary(data.summary);
+      if (sessionId && typeof paneId === "number" && summary) {
+        const key = paneWorkSummaryKey(sessionId, paneId);
+        set((state) => {
+          const existing = state.paneWorkSummaries[key];
+          const summaries = [...(existing?.summaries ?? [])];
+          const index = summaries.findIndex(
+            (item) => item.windowStart === summary.windowStart,
+          );
+          if (index >= 0) summaries[index] = summary;
+          else summaries.push(summary);
+          summaries.sort((left, right) => right.windowStart.localeCompare(left.windowStart));
+          return {
+            paneWorkSummaries: {
+              ...state.paneWorkSummaries,
+              [key]: {
+                summaries,
+                availability: (data.availability as PaneWorkSummaryAvailability | undefined)
+                  ?? existing?.availability
+                  ?? "unknown",
+                loading: false,
+                requestedAt: existing?.requestedAt,
+              },
+            },
+          };
         });
       }
       break;

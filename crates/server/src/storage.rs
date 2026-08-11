@@ -13,6 +13,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 static SESSION_GC_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+const PANE_WORK_SUMMARY_SIDECAR_VERSION: u32 = 1;
 
 /// Truncate `content` to roughly `max_bytes`, preserving JSON validity for
 /// `tool_result` envelopes. The web client parses these envelopes
@@ -125,6 +126,27 @@ pub struct StoredMessage {
     pub pane_type: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaneWorkSummaryDocument {
+    #[serde(default = "pane_work_summary_sidecar_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub summaries: Vec<shared::PaneWorkSummary>,
+}
+
+impl Default for PaneWorkSummaryDocument {
+    fn default() -> Self {
+        Self {
+            version: PANE_WORK_SUMMARY_SIDECAR_VERSION,
+            summaries: Vec::new(),
+        }
+    }
+}
+
+const fn pane_work_summary_sidecar_version() -> u32 {
+    PANE_WORK_SUMMARY_SIDECAR_VERSION
+}
+
 #[derive(Clone)]
 pub struct FileStorage {
     base_path: PathBuf,
@@ -173,6 +195,11 @@ impl FileStorage {
     /// Get the pane list metadata file path for a session
     fn panes_file(&self, session_id: &Uuid) -> PathBuf {
         self.session_dir(session_id).join("panes.json")
+    }
+
+    fn pane_work_summaries_file(&self, session_id: &Uuid) -> PathBuf {
+        self.session_dir(session_id)
+            .join("pane-work-summaries.json")
     }
 
     /// Ensure the session directory exists
@@ -229,6 +256,124 @@ impl FileStorage {
         let data = fs::read(file_path).await?;
         let panes = serde_json::from_slice::<Vec<shared::PaneConfig>>(&data)?;
         Ok(panes)
+    }
+
+    /// Read the durable summary cache. A malformed document fails closed so
+    /// the caller cannot overwrite potentially recoverable cache data while
+    /// rebuilding derived state.
+    pub async fn load_pane_work_summaries(
+        &self,
+        session_id: &Uuid,
+    ) -> Result<PaneWorkSummaryDocument> {
+        let lock = self.session_lock(session_id);
+        let _guard = lock.lock().await;
+        self.load_pane_work_summaries_unlocked(session_id).await
+    }
+
+    async fn load_pane_work_summaries_unlocked(
+        &self,
+        session_id: &Uuid,
+    ) -> Result<PaneWorkSummaryDocument> {
+        let path = self.pane_work_summaries_file(session_id);
+        if !path.exists() {
+            return Ok(PaneWorkSummaryDocument::default());
+        }
+        let bytes = fs::read(&path).await?;
+        let document: PaneWorkSummaryDocument = serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(
+            document.version == PANE_WORK_SUMMARY_SIDECAR_VERSION,
+            "unsupported pane summary sidecar version {}",
+            document.version
+        );
+        Ok(document)
+    }
+
+    /// Atomically replace the versioned summary cache under the same
+    /// per-session lock used by message GC and project deletion.
+    pub async fn save_pane_work_summaries(
+        &self,
+        session_id: &Uuid,
+        document: &PaneWorkSummaryDocument,
+    ) -> Result<()> {
+        let lock = self.session_lock(session_id);
+        let _guard = lock.lock().await;
+        self.save_pane_work_summaries_unlocked(session_id, document)
+            .await
+    }
+
+    async fn save_pane_work_summaries_unlocked(
+        &self,
+        session_id: &Uuid,
+        document: &PaneWorkSummaryDocument,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            document.version == PANE_WORK_SUMMARY_SIDECAR_VERSION,
+            "refusing to write unsupported pane summary sidecar version {}",
+            document.version
+        );
+        self.ensure_session_dir(session_id).await?;
+        let path = self.pane_work_summaries_file(session_id);
+        let tmp_path = session_gc_temp_path(&path);
+        let bytes = serde_json::to_vec_pretty(document)?;
+        let write_result: Result<()> = async {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&tmp_path)
+                .await?;
+            file.write_all(&bytes).await?;
+            file.flush().await?;
+            file.sync_all().await?;
+            drop(file);
+            fs::rename(&tmp_path, &path).await?;
+            Ok(())
+        }
+        .await;
+        if write_result.is_err() {
+            let _ = fs::remove_file(&tmp_path).await;
+        }
+        write_result
+    }
+
+    /// Serialize read-modify-write updates so simultaneous stage results
+    /// cannot lose one another.
+    pub async fn update_pane_work_summaries<F>(
+        &self,
+        session_id: &Uuid,
+        update: F,
+    ) -> Result<PaneWorkSummaryDocument>
+    where
+        F: FnOnce(&mut PaneWorkSummaryDocument) -> Result<()>,
+    {
+        let lock = self.session_lock(session_id);
+        let _guard = lock.lock().await;
+        let mut document = self.load_pane_work_summaries_unlocked(session_id).await?;
+        update(&mut document)?;
+        self.save_pane_work_summaries_unlocked(session_id, &document)
+            .await?;
+        Ok(document)
+    }
+
+    /// Queued/generating jobs are process-local. Requeue them on restart so
+    /// the scheduler can reconstruct source chunks from retained messages.
+    pub async fn recover_pane_work_summaries(
+        &self,
+        session_id: &Uuid,
+    ) -> Result<PaneWorkSummaryDocument> {
+        self.update_pane_work_summaries(session_id, |document| {
+            for summary in &mut document.summaries {
+                if matches!(
+                    summary.status,
+                    shared::PaneWorkSummaryStatus::Queued
+                        | shared::PaneWorkSummaryStatus::Generating
+                ) {
+                    summary.status = shared::PaneWorkSummaryStatus::Queued;
+                    summary.error = None;
+                }
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Permanently remove all file-backed artifacts for the supplied sessions.
@@ -1814,6 +1959,164 @@ mod gc_tests {
             .lock()
             .expect("session_locks poisoned")
             .contains_key(&sid));
+    }
+}
+
+#[cfg(test)]
+mod pane_work_summary_storage_tests {
+    use super::{FileStorage, PaneWorkSummaryDocument, StoredMessage};
+    use chrono::{Duration, Utc};
+    use shared::{
+        PaneWorkSummary, PaneWorkSummaryStatus, PaneWorkSummaryWindowKind,
+        PANE_WORK_SUMMARY_PROTOCOL_VERSION,
+    };
+    use uuid::Uuid;
+
+    fn fresh_storage() -> FileStorage {
+        FileStorage::new(
+            std::env::temp_dir().join(format!("apas-summary-storage-{}", Uuid::new_v4())),
+        )
+    }
+
+    fn summary(session_id: Uuid, pane_id: u32) -> PaneWorkSummary {
+        let start = Utc::now() - Duration::hours(3);
+        PaneWorkSummary {
+            protocol_version: PANE_WORK_SUMMARY_PROTOCOL_VERSION,
+            session_id,
+            pane_id,
+            window_start: start,
+            window_end: start + Duration::hours(3),
+            window_kind: PaneWorkSummaryWindowKind::Completed,
+            status: PaneWorkSummaryStatus::Complete,
+            summary: Some(format!("summary for pane {pane_id}")),
+            source_digest: format!("digest-{pane_id}"),
+            source_message_count: 2,
+            source_through: Some(start + Duration::minutes(2)),
+            source_through_id: Some("m2".to_string()),
+            generated_at: Some(Utc::now()),
+            updated_at: Some(Utc::now()),
+            provider: Some("claude".to_string()),
+            model: None,
+            attempts: 1,
+            error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn sidecar_is_atomic_and_survives_message_gc_and_pane_closure() {
+        let storage = fresh_storage();
+        let session_id = Uuid::new_v4();
+        let document = PaneWorkSummaryDocument {
+            version: 1,
+            summaries: vec![summary(session_id, 4)],
+        };
+        storage
+            .save_pane_work_summaries(&session_id, &document)
+            .await
+            .unwrap();
+        storage
+            .append_message(
+                &session_id,
+                &StoredMessage {
+                    id: "old".to_string(),
+                    role: "assistant".to_string(),
+                    content: "source".to_string(),
+                    message_type: "text".to_string(),
+                    created_at: (Utc::now() - Duration::days(9)).to_rfc3339(),
+                    pane_type: Some("4".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        storage
+            .gc_session_before(&session_id, Utc::now() - Duration::days(7))
+            .await
+            .unwrap();
+        storage.save_pane_list(&session_id, &[]).await.unwrap();
+
+        assert_eq!(
+            storage.load_pane_work_summaries(&session_id).await.unwrap(),
+            document
+        );
+        let raw = tokio::fs::read_to_string(storage.pane_work_summaries_file(&session_id))
+            .await
+            .unwrap();
+        assert!(raw.contains("summary for pane 4"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_updates_do_not_lose_records() {
+        let storage = fresh_storage();
+        let session_id = Uuid::new_v4();
+        let mut tasks = Vec::new();
+        for pane_id in 1..=8 {
+            let storage = storage.clone();
+            tasks.push(tokio::spawn(async move {
+                storage
+                    .update_pane_work_summaries(&session_id, |document| {
+                        document.summaries.push(summary(session_id, pane_id));
+                        Ok(())
+                    })
+                    .await
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        let document = storage.load_pane_work_summaries(&session_id).await.unwrap();
+        assert_eq!(document.summaries.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn corruption_is_reported_without_touching_messages_and_deletion_removes_sidecar() {
+        let storage = fresh_storage();
+        let session_id = Uuid::new_v4();
+        storage.ensure_session_dir(&session_id).await.unwrap();
+        tokio::fs::write(storage.pane_work_summaries_file(&session_id), b"not json")
+            .await
+            .unwrap();
+        storage
+            .append_message(
+                &session_id,
+                &StoredMessage {
+                    id: "keep".to_string(),
+                    role: "user".to_string(),
+                    content: "keep me".to_string(),
+                    message_type: "text".to_string(),
+                    created_at: Utc::now().to_rfc3339(),
+                    pane_type: Some("2".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(storage.load_pane_work_summaries(&session_id).await.is_err());
+        assert_eq!(storage.get_messages(&session_id).await.unwrap().len(), 1);
+        storage.delete_session_dirs(&[session_id]).await.unwrap();
+        assert!(!storage.session_dir(&session_id).exists());
+    }
+
+    #[tokio::test]
+    async fn restart_requeues_in_progress_records() {
+        let storage = fresh_storage();
+        let session_id = Uuid::new_v4();
+        let mut record = summary(session_id, 2);
+        record.status = PaneWorkSummaryStatus::Generating;
+        storage
+            .save_pane_work_summaries(
+                &session_id,
+                &PaneWorkSummaryDocument {
+                    version: 1,
+                    summaries: vec![record],
+                },
+            )
+            .await
+            .unwrap();
+        let recovered = storage
+            .recover_pane_work_summaries(&session_id)
+            .await
+            .unwrap();
+        assert_eq!(recovered.summaries[0].status, PaneWorkSummaryStatus::Queued);
     }
 }
 

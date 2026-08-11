@@ -10982,6 +10982,19 @@ async fn run_server_connection(
     // reconnects, so we avoid re-shelling out to git on every loop iteration.
     let git_remote = crate::worktree::normalized_git_remote(std::path::Path::new(working_dir));
     let git_remote_url = crate::worktree::raw_git_remote(std::path::Path::new(working_dir));
+    let summary_runner = match crate::summary_runner::SummaryRunner::from_config(
+        &crate::config::Config::load().unwrap_or_default(),
+    )
+    .await
+    {
+        Ok(runner) => runner,
+        Err(error) => {
+            tracing::warn!(%error, "Pane summary adapter disabled after validation failure");
+            None
+        }
+    };
+    let (summary_result_tx, mut summary_result_rx) =
+        tokio_mpsc::channel::<shared::PaneWorkSummaryGenerationResult>(1);
 
     while !shutdown.load(Ordering::SeqCst) {
         let ws_url = format!("{}/ws/cli", server_url);
@@ -11003,13 +11016,17 @@ async fn run_server_connection(
                 let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
                 // Register
+                let mut capabilities = vec![
+                    shared::PROJECT_POLICY_CAPABILITY.to_string(),
+                    shared::MOBILE_TASK_LAUNCH_CAPABILITY.to_string(),
+                ];
+                if summary_runner.is_some() {
+                    capabilities.push(shared::PANE_WORK_SUMMARY_CAPABILITY.to_string());
+                }
                 let register_msg = CliToServer::Register {
                     token: token.to_string(),
                     version: Some(env!("APAS_VERSION").to_string()),
-                    capabilities: vec![
-                        shared::PROJECT_POLICY_CAPABILITY.to_string(),
-                        shared::MOBILE_TASK_LAUNCH_CAPABILITY.to_string(),
-                    ],
+                    capabilities,
                 };
                 let msg_text = match serde_json::to_string(&register_msg) {
                     Ok(t) => t,
@@ -11226,11 +11243,66 @@ async fn run_server_connection(
                                 break;
                             }
                         }
+                        Some(result) = summary_result_rx.recv() => {
+                            let message = CliToServer::PaneWorkSummaryResult { result };
+                            let Ok(text) = serde_json::to_string(&message) else {
+                                tracing::warn!("Failed to serialize pane summary result");
+                                continue;
+                            };
+                            if ws_sender.send(Message::Text(text.into())).await.is_err() {
+                                break;
+                            }
+                        }
                         msg = ws_receiver.next() => {
                             match msg {
                                 Some(Ok(Message::Text(text))) => {
                                     if let Ok(server_msg) = serde_json::from_str::<ServerToCli>(&text) {
                                         match server_msg {
+                                            ServerToCli::GeneratePaneWorkSummary { job } => {
+                                                if job.session_id != session_id {
+                                                    let result = shared::PaneWorkSummaryGenerationResult {
+                                                        protocol_version: shared::PANE_WORK_SUMMARY_PROTOCOL_VERSION,
+                                                        job_id: job.job_id,
+                                                        session_id: job.session_id,
+                                                        pane_id: job.pane_id,
+                                                        window_start: job.window_start,
+                                                        source_digest: job.source_digest,
+                                                        stage: job.stage,
+                                                        chunk_index: job.chunk_index,
+                                                        kind: shared::PaneWorkSummaryResultKind::PermanentFailure,
+                                                        output: None,
+                                                        error: Some("Summary job targets a different session".to_string()),
+                                                        provider: None,
+                                                        model: None,
+                                                    };
+                                                    let _ = summary_result_tx.try_send(result);
+                                                    continue;
+                                                }
+                                                if let Some(runner) = summary_runner.clone() {
+                                                    let result_tx = summary_result_tx.clone();
+                                                    tokio::spawn(async move {
+                                                        let result = runner.run(job).await;
+                                                        let _ = result_tx.send(result).await;
+                                                    });
+                                                } else {
+                                                    let result = shared::PaneWorkSummaryGenerationResult {
+                                                        protocol_version: shared::PANE_WORK_SUMMARY_PROTOCOL_VERSION,
+                                                        job_id: job.job_id,
+                                                        session_id: job.session_id,
+                                                        pane_id: job.pane_id,
+                                                        window_start: job.window_start,
+                                                        source_digest: job.source_digest,
+                                                        stage: job.stage,
+                                                        chunk_index: job.chunk_index,
+                                                        kind: shared::PaneWorkSummaryResultKind::Unavailable,
+                                                        output: None,
+                                                        error: Some("No validated summary adapter is enabled".to_string()),
+                                                        provider: None,
+                                                        model: None,
+                                                    };
+                                                    let _ = summary_result_tx.try_send(result);
+                                                }
+                                            }
                                             ServerToCli::ProjectPolicy {
                                                 session_id: policy_session_id,
                                                 policy,

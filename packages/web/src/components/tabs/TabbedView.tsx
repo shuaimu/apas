@@ -2,7 +2,7 @@
 
 import React, { useRef, useCallback, useEffect, useState, useMemo, memo } from "react";
 import dynamic from "next/dynamic";
-import { useStore, Message, PaneConfig, PaneCleanupAction, PaneKind, PlanReviewMode, TeamRecord, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, paneKey, selectActiveTeamRecords, type SupportedProvider } from "@/lib/store";
+import { useStore, Message, PaneConfig, PaneCleanupAction, PaneKind, PlanReviewMode, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, paneKey, type SupportedProvider } from "@/lib/store";
 import { ROLE_TEMPLATES, TEMPLATE_COLOR_CLASSES } from "@/lib/roleTemplates";
 import { useTerminalViewModes, type TerminalViewMode } from "@/lib/terminalViewMode";
 import { OverviewView } from "../overview/OverviewView";
@@ -21,6 +21,26 @@ import { isRetiredProviderModel } from "@/lib/providerOptions";
 // the initial payload for the (common) case of no terminal panes.
 import { TerminalViewToggle } from "./TerminalViewToggle";
 import { TerminalChatInput } from "./TerminalChatInput";
+import { PaneWorkSummaryDrawer } from "./PaneWorkSummaryDrawer";
+
+function useDesktopViewport(): boolean {
+  const [desktop, setDesktop] = useState(() =>
+    typeof window !== "undefined" ? window.innerWidth >= 768 : false,
+  );
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") {
+      const updateFromWidth = () => setDesktop(window.innerWidth >= 768);
+      window.addEventListener("resize", updateFromWidth);
+      return () => window.removeEventListener("resize", updateFromWidth);
+    }
+    const query = window.matchMedia("(min-width: 768px)");
+    const update = () => setDesktop(query.matches);
+    update();
+    query.addEventListener?.("change", update);
+    return () => query.removeEventListener?.("change", update);
+  }, []);
+  return desktop;
+}
 
 /**
  * A terminal pane with its two controlled views. The active mode lives in
@@ -415,6 +435,7 @@ export function TabbedView({
 } = {}) {
   const sessionId = useStore((s) => s.sessionId);
   const projectPolicies = useStore((s) => s.projectPolicies);
+  const negotiatedCapabilities = useStore((s) => s.negotiatedCapabilities);
   const messages = useStore((s) => s.messages);
   const paneConfigs = useStore((s) => s.paneConfigs);
   const paneMessages = useStore((s) => s.paneMessages);
@@ -452,12 +473,10 @@ export function TabbedView({
   const startMachineProjectCli = useStore((s) => s.startMachineProjectCli);
   const rebootCli = useStore((s) => s.rebootCli);
   const rebootPane = useStore((s) => s.rebootPane);
-  const downloadSession = useStore((s) => s.downloadSession);
   const requestPaneDiff = useStore((s) => s.requestPaneDiff);
   const createPanePr = useStore((s) => s.createPanePr);
   const paneDiffs = useStore((s) => s.paneDiffs);
   const updatePaneRole = useStore((s) => s.updatePaneRole);
-  const teamRecords = useStore(selectActiveTeamRecords);
   const planReviewPending = useStore((s) => s.planReviewPending);
   const answerPlanReview = useStore((s) => s.answerPlanReview);
   const updatePaneReviewMode = useStore((s) => s.updatePaneReviewMode);
@@ -491,9 +510,8 @@ export function TabbedView({
   const [diffModalPaneId, setDiffModalPaneId] = useState<number | null>(null);
   // Role drawer modal (Phase 2.1c). When set, edits role/goal/backstory.
   const [roleModalPaneId, setRoleModalPaneId] = useState<number | null>(null);
-  // Team scratchpad modal (Phase 2.2b). Just a boolean — content lives in store.
-  const [teamModalOpen, setTeamModalOpen] = useState(false);
-
+  const [summaryDrawerOpen, setSummaryDrawerOpen] = useState(false);
+  const isDesktopViewport = useDesktopViewport();
   // Determine effective tabs: use paneConfigs from server, or synthesize from observed messages
   const effectiveTabs = useMemo(() => {
     // PaneList (paneConfigs) is authoritative for pane mode. Mode hints
@@ -768,6 +786,19 @@ export function TabbedView({
   );
 
   const activeConfig = effectiveTabs.find((t) => t.pane_id === activeTabId);
+  const canShowSummary = Boolean(
+    isDesktopViewport
+      && connected
+      && negotiatedCapabilities.has("pane_work_summary_v1")
+      && activeConfig
+      && activeTabId != null
+      && activeTabId !== OVERVIEW_PANE_ID
+      && activeTabId !== PANE_ID_MAIN,
+  );
+
+  useEffect(() => {
+    if (!canShowSummary) setSummaryDrawerOpen(false);
+  }, [canShowSummary]);
   const visibleProviderOptions = PROVIDER_OPTIONS.filter(
     (option) =>
       option.value === activeConfig?.provider
@@ -1250,22 +1281,21 @@ export function TabbedView({
         <div className="flex-1" />
 
         {/* Actions */}
-        {!activeIsUnsupported && (
+        {canShowSummary && (
           <button
-            onClick={() => setTeamModalOpen(true)}
-            className="inline-flex items-center px-2.5 py-1 text-xs font-medium rounded transition-colors bg-amber-600 hover:bg-amber-700 text-white"
-            title="Team scratchpad — append-only timeline of artifacts (diffs, reviews, decisions) shared across panes via .apas-team.jsonl"
+            type="button"
+            onClick={() => setSummaryDrawerOpen((open) => !open)}
+            className={`inline-flex items-center rounded px-2.5 py-1 text-xs font-medium transition-colors ${
+              summaryDrawerOpen
+                ? "bg-blue-700 text-white hover:bg-blue-800"
+                : "border border-gray-300 bg-white text-gray-700 hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
+            }`}
+            aria-expanded={summaryDrawerOpen}
+            aria-controls="pane-work-summary-drawer"
           >
-            Team{teamRecords.length > 0 ? ` (${teamRecords.length})` : ""}
+            Summary
           </button>
         )}
-        <button
-          onClick={downloadSession}
-          className="hidden md:inline-flex items-center px-2.5 py-1 text-xs font-medium rounded transition-colors bg-blue-500 hover:bg-blue-600 text-white"
-          title="Download session data"
-        >
-          Download
-        </button>
         {!activeIsUnsupported && shouldShowPaneRebootButton(activeTabId) && (
           <button
             onClick={() => {
@@ -1283,6 +1313,8 @@ export function TabbedView({
         )}
       </div>
 
+      <div className="flex flex-1 min-h-0">
+        <div className="flex flex-1 flex-col min-w-0 min-h-0">
       {/* Pane bodies: Overview is rendered alone; otherwise every pane's
           body is mounted once and visibility-toggled via `hidden`, so
           switching tabs is a CSS class flip instead of an unmount+
@@ -1415,6 +1447,18 @@ export function TabbedView({
           )}
         </div>
       )}
+        </div>
+        {summaryDrawerOpen && canShowSummary && sessionId && activeTabId != null && activeConfig && (
+          <div id="pane-work-summary-drawer" className="h-full">
+            <PaneWorkSummaryDrawer
+              sessionId={sessionId}
+              paneId={activeTabId}
+              paneLabel={activeConfig.label || `Pane ${activeTabId}`}
+              onClose={() => setSummaryDrawerOpen(false)}
+            />
+          </div>
+        )}
+      </div>
 
       <StartBotPromptModal
         open={startBotModalOpen}
@@ -1486,12 +1530,6 @@ export function TabbedView({
         }}
       />
 
-      <TeamModal
-        open={teamModalOpen}
-        records={teamRecords}
-        onClose={() => setTeamModalOpen(false)}
-      />
-
       {planReviewPending.length > 0 && (
         <div className="fixed inset-x-0 bottom-0 z-40 flex justify-center p-3 pointer-events-none">
           <div className="pointer-events-auto flex w-full max-w-3xl flex-col gap-2">
@@ -1536,82 +1574,6 @@ export function TabbedView({
           </div>
         </div>
       )}
-    </div>
-  );
-}
-
-interface TeamModalProps {
-  open: boolean;
-  records: TeamRecord[];
-  onClose: () => void;
-}
-
-function TeamModal({ open, records, onClose }: TeamModalProps) {
-  if (!open) return null;
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
-      onClick={onClose}
-    >
-      <div
-        className="flex w-full max-w-3xl flex-col rounded-lg border border-zinc-700 bg-zinc-900 p-5 text-zinc-100 shadow-xl"
-        style={{ maxHeight: "85vh" }}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="mb-3 flex items-center justify-between gap-3">
-          <h3 className="text-lg font-semibold">
-            Team scratchpad ({records.length} record{records.length === 1 ? "" : "s"})
-          </h3>
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded border border-zinc-600 bg-zinc-800 px-3 py-1 text-xs hover:bg-zinc-700"
-          >
-            Close
-          </button>
-        </div>
-        <p className="mb-3 text-xs text-zinc-400">
-          Append-only timeline of artifacts published by panes, stored at <code>.apas-team.jsonl</code> in the project root. Agents append via Bash/Write tools; this view tails the file.
-        </p>
-        <div className="flex-1 overflow-auto rounded border border-zinc-800 bg-black/30 p-3">
-          {records.length === 0 ? (
-            <p className="text-sm italic text-zinc-400">
-              No records yet. Agents can append by writing JSON lines to <code>.apas-team.jsonl</code>.
-            </p>
-          ) : (
-            <ul className="flex flex-col gap-3">
-              {records.map((r, i) => (
-                <li key={i} className="rounded border border-zinc-800 bg-zinc-900/60 p-3">
-                  <div className="mb-1 flex flex-wrap items-center gap-2 text-xs text-zinc-400">
-                    <span className="font-mono text-zinc-300">{r.kind}</span>
-                    <span>·</span>
-                    <span>{r.ts}</span>
-                    {r.pane_id !== undefined && (
-                      <>
-                        <span>·</span>
-                        <span>pane {r.pane_id}</span>
-                      </>
-                    )}
-                    {r.tags.length > 0 && (
-                      <>
-                        <span>·</span>
-                        {r.tags.map((t) => (
-                          <span key={t} className="rounded bg-zinc-800 px-1.5 py-0.5 font-mono text-[10px] text-zinc-300">
-                            {t}
-                          </span>
-                        ))}
-                      </>
-                    )}
-                  </div>
-                  <pre className="whitespace-pre-wrap break-words text-xs text-zinc-100 font-mono">
-                    {r.body}
-                  </pre>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-      </div>
     </div>
   );
 }

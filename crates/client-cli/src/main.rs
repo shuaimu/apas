@@ -24,6 +24,7 @@ mod project;
 mod role;
 mod scratchpad;
 mod suggested_workers;
+mod summary_runner;
 mod team_todo;
 mod terminal_pane;
 mod transcript;
@@ -707,7 +708,7 @@ fn is_apas_daemon_process(pid: u32) -> bool {
     has_apas_binary && has_daemon_arg
 }
 
-const CONFIG_KEYS: &str = "server, token, claude_path, codex_path, opencode_path, cursor_agent_path, deepseek_api_base_url, deepseek_api_key, daemon_machine_id, daemon_roots";
+const CONFIG_KEYS: &str = "server, token, claude_path, codex_path, opencode_path, cursor_agent_path, deepseek_api_base_url, deepseek_api_key, daemon_machine_id, daemon_roots, summary_enabled, summary_adapter, summary_model, summary_timeout_seconds, summary_max_input_bytes, summary_allow_cross_provider";
 
 fn set_config_value(config: &mut config::Config, key: &str, value: String) -> Result<()> {
     match key {
@@ -739,9 +740,32 @@ fn set_config_value(config: &mut config::Config, key: &str, value: String) -> Re
                 .filter(|v| !v.is_empty())
                 .collect();
         }
+        "summary_enabled" => config.summaries.enabled = parse_bool_config(&key, &value)?,
+        "summary_adapter" => {
+            config.summaries.adapter = match value.trim().to_ascii_lowercase().as_str() {
+                "disabled" | "off" | "none" => config::SummaryAdapterKind::Disabled,
+                "claude" => config::SummaryAdapterKind::Claude,
+                "codex" => config::SummaryAdapterKind::Codex,
+                _ => anyhow::bail!("summary_adapter must be disabled, claude, or codex"),
+            }
+        }
+        "summary_model" => config.summaries.model = (!value.trim().is_empty()).then_some(value),
+        "summary_timeout_seconds" => config.summaries.timeout_seconds = value.parse()?,
+        "summary_max_input_bytes" => config.summaries.max_input_bytes = value.parse()?,
+        "summary_allow_cross_provider" => {
+            config.summaries.allow_cross_provider = parse_bool_config(&key, &value)?
+        }
         _ => anyhow::bail!("Unknown config key: {}. Valid keys: {}", key, CONFIG_KEYS),
     }
     Ok(())
+}
+
+fn parse_bool_config(key: &str, value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => anyhow::bail!("{} must be true or false", key),
+    }
 }
 
 #[cfg(test)]
@@ -978,6 +1002,12 @@ fn get_config_value(config: &config::Config, key: &str) -> Result<String> {
             .unwrap_or_default(),
         "daemon_machine_id" => config.daemon.machine_id.clone().unwrap_or_default(),
         "daemon_roots" => config.daemon.project_roots.join(","),
+        "summary_enabled" => config.summaries.enabled.to_string(),
+        "summary_adapter" => format!("{:?}", config.summaries.adapter).to_ascii_lowercase(),
+        "summary_model" => config.summaries.model.clone().unwrap_or_default(),
+        "summary_timeout_seconds" => config.summaries.timeout_seconds.to_string(),
+        "summary_max_input_bytes" => config.summaries.max_input_bytes.to_string(),
+        "summary_allow_cross_provider" => config.summaries.allow_cross_provider.to_string(),
         _ => anyhow::bail!("Unknown config key: {}. Valid keys: {}", key, CONFIG_KEYS),
     };
     Ok(value)
@@ -990,6 +1020,13 @@ async fn handle_config_command(action: ConfigAction) -> Result<()> {
             set_config_value(&mut config, &key, value)?;
             config.save()?;
             println!("Configuration saved");
+            if key == "summary_adapter"
+                && config.summaries.adapter == config::SummaryAdapterKind::Codex
+            {
+                eprintln!(
+                    "WARNING: the Codex summary adapter retains a read-only command tool. +                     Prompt and sandbox controls reduce but do not eliminate host-file read risk."
+                );
+            }
         }
         ConfigAction::Get { key } => {
             let config = config::Config::load()?;
@@ -1025,6 +1062,24 @@ async fn handle_config_command(action: ConfigAction) -> Result<()> {
                 config.daemon.machine_id.unwrap_or_default()
             );
             println!("daemon_roots: {}", config.daemon.project_roots.join(","));
+            println!("summary_enabled: {}", config.summaries.enabled);
+            println!("summary_adapter: {:?}", config.summaries.adapter);
+            println!(
+                "summary_model: {}",
+                config.summaries.model.unwrap_or_default()
+            );
+            println!(
+                "summary_timeout_seconds: {}",
+                config.summaries.timeout_seconds
+            );
+            println!(
+                "summary_max_input_bytes: {}",
+                config.summaries.max_input_bytes
+            );
+            println!(
+                "summary_allow_cross_provider: {}",
+                config.summaries.allow_cross_provider
+            );
         }
         ConfigAction::Path => {
             let path = config::Config::config_path()?;

@@ -11,6 +11,7 @@ mod routes;
 mod session;
 mod state;
 mod storage;
+mod work_summary;
 
 use state::AppState;
 
@@ -93,6 +94,27 @@ async fn async_main() -> Result<()> {
                 Err(e) => tracing::warn!("Message GC sweep failed: {}", e),
             }
             tokio::time::sleep(interval).await;
+        }
+    });
+    let summary_timeouts = state.pane_work_summaries.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            summary_timeouts.sweep_timeouts().await;
+        }
+    });
+
+    // Reconcile completed summary windows at boot and every configured
+    // interval. Generation is capability-gated and never blocks appends.
+    let summary_service = state.pane_work_summaries.clone();
+    let summary_interval_minutes = state.config.summaries.reconcile_interval_minutes.max(1);
+    tokio::spawn(async move {
+        loop {
+            summary_service.reconcile_all().await;
+            tokio::time::sleep(std::time::Duration::from_secs(
+                summary_interval_minutes * 60,
+            ))
+            .await;
         }
     });
 

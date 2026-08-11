@@ -14,25 +14,23 @@ import {
   TabbedView,
 } from "./TabbedView";
 
-type StoreState = ReturnType<typeof useStore.getState>;
-
 const initialStore = useStore.getInitialState();
-const DOWNLOAD_SESSION_ID = "session-tabbed-download";
-const DOWNLOAD_CLI_CLIENT_ID = "cli-tabbed-download";
-const DOWNLOAD_PANE_ID = 42;
+const TOOLBAR_SESSION_ID = "session-tabbed-toolbar";
+const TOOLBAR_CLI_CLIENT_ID = "cli-tabbed-toolbar";
+const TOOLBAR_PANE_ID = 42;
 const ZERO_PANE_SESSION_ID = "session-zero-pane";
 const ZERO_PANE_CLI_CLIENT_ID = "cli-zero-pane";
 
 function activeTabKey(): string {
-  return `apas_layout_${DOWNLOAD_CLI_CLIENT_ID}_active_tab`;
+  return `apas_layout_${TOOLBAR_CLI_CLIENT_ID}_active_tab`;
 }
 
-function downloadPane(overrides: Partial<PaneConfig> & Pick<PaneConfig, "pane_id" | "label">): PaneConfig {
+function toolbarPane(overrides: Partial<PaneConfig> & Pick<PaneConfig, "pane_id" | "label">): PaneConfig {
   return {
     pane_id: overrides.pane_id,
     provider: overrides.provider ?? "claude",
     mode: overrides.mode ?? "interactive",
-    session_id: overrides.session_id ?? `${DOWNLOAD_SESSION_ID}-pane-${overrides.pane_id}`,
+    session_id: overrides.session_id ?? `${TOOLBAR_SESSION_ID}-pane-${overrides.pane_id}`,
     is_paused: overrides.is_paused ?? false,
     label: overrides.label,
     role: overrides.role,
@@ -40,25 +38,17 @@ function downloadPane(overrides: Partial<PaneConfig> & Pick<PaneConfig, "pane_id
   };
 }
 
-function seedDownloadTabbedView({
-  downloadSession = vi.fn(),
-  rebootPane = vi.fn(),
-  requestPaneDiff = vi.fn(),
-}: {
-  downloadSession?: StoreState["downloadSession"];
-  rebootPane?: StoreState["rebootPane"];
-  requestPaneDiff?: StoreState["requestPaneDiff"];
-} = {}) {
-  const panes = [downloadPane({ pane_id: DOWNLOAD_PANE_ID, label: "Worker" })];
-  localStorage.setItem(activeTabKey(), String(DOWNLOAD_PANE_ID));
+function seedToolbarTabbedView() {
+  const panes = [toolbarPane({ pane_id: TOOLBAR_PANE_ID, label: "Worker" })];
+  localStorage.setItem(activeTabKey(), String(TOOLBAR_PANE_ID));
 
   act(() => {
     useStore.setState({
       connected: true,
       isAttached: true,
       isDualPane: true,
-      sessionId: DOWNLOAD_SESSION_ID,
-      cliClientId: DOWNLOAD_CLI_CLIENT_ID,
+      sessionId: TOOLBAR_SESSION_ID,
+      cliClientId: TOOLBAR_CLI_CLIENT_ID,
       messages: [],
       paneConfigs: panes,
       paneMessages: Object.fromEntries(panes.map((item) => [paneKey(item.pane_id), []])),
@@ -72,13 +62,8 @@ function seedDownloadTabbedView({
       teamRecords: [],
       loadPaneMessagesIfNeeded: vi.fn(),
       loadMoreMessages: vi.fn(),
-      downloadSession,
-      rebootPane,
-      requestPaneDiff,
     });
   });
-
-  return { downloadSession, rebootPane, requestPaneDiff };
 }
 
 function seedZeroPaneTabbedView(
@@ -279,7 +264,7 @@ describe("lazyPaneMessageLoadTargets", () => {
   });
 });
 
-describe("TabbedView session download actions", () => {
+describe("TabbedView pane toolbar actions", () => {
   beforeEach(() => {
     Element.prototype.scrollIntoView = vi.fn();
   });
@@ -292,22 +277,51 @@ describe("TabbedView session download actions", () => {
     });
   });
 
-  it("calls downloadSession from the toolbar without opening Team or active-tab actions", () => {
-    const downloadSession = vi.fn();
-    const rebootPane = vi.fn();
-    const requestPaneDiff = vi.fn();
-    seedDownloadTabbedView({ downloadSession, rebootPane, requestPaneDiff });
+  it("does not render the retired Team and Download actions", () => {
+    seedToolbarTabbedView();
 
     render(<TabbedView />);
 
-    expect(screen.getByRole("button", { name: "Team" })).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Download" }));
+    expect(screen.queryByRole("button", { name: "Team" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Download" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Reboot" })).toBeTruthy();
+    expect(localStorage.getItem(activeTabKey())).toBe(String(TOOLBAR_PANE_ID));
+  });
 
-    expect(downloadSession).toHaveBeenCalledOnce();
-    expect(screen.queryByText(/Team scratchpad/)).toBeNull();
-    expect(rebootPane).not.toHaveBeenCalled();
-    expect(requestPaneDiff).not.toHaveBeenCalled();
-    expect(localStorage.getItem(activeTabKey())).toBe(String(DOWNLOAD_PANE_ID));
+  it("shows the negotiated Summary action on desktop and opens the pane drawer", async () => {
+    const listPaneWorkSummaries = vi.fn(() => true);
+    seedToolbarTabbedView();
+    act(() => useStore.setState({
+      negotiatedCapabilities: new Set(["pane_work_summary_v1"]),
+      listPaneWorkSummaries,
+    }));
+
+    render(<TabbedView />);
+    fireEvent.click(screen.getByRole("button", { name: "Summary" }));
+
+    expect(await screen.findByLabelText("Work summaries for Worker")).toBeTruthy();
+    expect(listPaneWorkSummaries).toHaveBeenCalledWith(
+      TOOLBAR_SESSION_ID,
+      TOOLBAR_PANE_ID,
+      true,
+    );
+  });
+
+  it("renders no Summary action and sends no request in the responsive mobile view", () => {
+    const priorWidth = window.innerWidth;
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 390 });
+    const listPaneWorkSummaries = vi.fn(() => true);
+    seedToolbarTabbedView();
+    act(() => useStore.setState({
+      negotiatedCapabilities: new Set(["pane_work_summary_v1"]),
+      listPaneWorkSummaries,
+    }));
+
+    render(<TabbedView />);
+
+    expect(screen.queryByRole("button", { name: "Summary" })).toBeNull();
+    expect(listPaneWorkSummaries).not.toHaveBeenCalled();
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: priorWidth });
   });
 });
 

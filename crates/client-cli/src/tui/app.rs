@@ -351,7 +351,9 @@ impl App {
                     } else {
                         self.project_dir.clone()
                     },
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(vec![

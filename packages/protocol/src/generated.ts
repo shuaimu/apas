@@ -393,6 +393,28 @@ export type ServerToWeb =
       [k: string]: unknown;
     }
   | {
+      /**
+       * Generation support reported alongside cached records.
+       */
+      availability?: "available" | "cli_update_required" | "summarizer_disabled" | "summarizer_unavailable" | "unknown";
+      pane_id: number;
+      session_id: string;
+      summaries?: PaneWorkSummary[];
+      type: "pane_work_summaries";
+      [k: string]: unknown;
+    }
+  | {
+      /**
+       * Generation support reported alongside cached records.
+       */
+      availability?: "available" | "cli_update_required" | "summarizer_disabled" | "summarizer_unavailable" | "unknown";
+      pane_id: number;
+      session_id: string;
+      summary: PaneWorkSummary;
+      type: "pane_work_summary_updated";
+      [k: string]: unknown;
+    }
+  | {
       type: "heartbeat";
       [k: string]: unknown;
     };
@@ -935,6 +957,20 @@ export type WebToServer =
       pane_id: number;
       session_id: string;
       type: "terminal_attach";
+      [k: string]: unknown;
+    }
+  | {
+      include_current?: boolean;
+      pane_id: number;
+      session_id: string;
+      type: "list_pane_work_summaries";
+      [k: string]: unknown;
+    }
+  | {
+      pane_id: number;
+      session_id: string;
+      type: "refresh_pane_work_summary";
+      window_start?: string | null;
       [k: string]: unknown;
     }
   | {
@@ -1632,6 +1668,37 @@ export interface SuggestedWorkerMsg {
   label: string;
   needs_worktree?: boolean;
   role: string;
+  [k: string]: unknown;
+}
+/**
+ * One cached summary record. Source text and intermediate notes are never
+ * persisted in this record.
+ */
+export interface PaneWorkSummary {
+  attempts?: number;
+  error?: string | null;
+  generated_at?: string | null;
+  model?: string | null;
+  pane_id: number;
+  protocol_version?: number;
+  provider?: string | null;
+  session_id: string;
+  source_digest?: string;
+  source_message_count?: number;
+  source_through?: string | null;
+  source_through_id?: string | null;
+  /**
+   * Durable generation state for one pane/window/source digest.
+   */
+  status?: "queued" | "generating" | "complete" | "partial" | "stale" | "failed" | "source_expired";
+  summary?: string | null;
+  updated_at?: string | null;
+  window_end: string;
+  /**
+   * Whether the cached record covers a closed window or the still-open window.
+   */
+  window_kind?: "completed" | "current";
+  window_start: string;
   [k: string]: unknown;
 }
 export interface MobileTaskLaunchRequest {

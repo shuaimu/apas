@@ -1707,6 +1707,65 @@
       ]
     },
     {
+      "description": "Fetch cached summaries and reconcile retained source for one pane.",
+      "type": "object",
+      "properties": {
+        "include_current": {
+          "type": "boolean",
+          "default": false
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "list_pane_work_summaries"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "Retry a failed/stale window, or refresh the current window when omitted.",
+      "type": "object",
+      "properties": {
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "refresh_pane_work_summary"
+        },
+        "window_start": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id"
+      ]
+    },
+    {
       "description": "Redacted native/WebView health event. Accepted only from an\nauthenticated mobile device session.",
       "type": "object",
       "properties": {

@@ -562,6 +562,12 @@ async fn run_connection(
                             "ignoring terminal message: remote mode has no terminal panes"
                         );
                     }
+                    Ok(ServerToCli::GeneratePaneWorkSummary { job }) => {
+                        tracing::warn!(
+                            job_id = %job.job_id,
+                            "ignoring summary job: remote mode never advertises summary capability"
+                        );
+                    }
                     Err(e) => {
                         tracing::warn!("Failed to parse server message: {}", e);
                     }

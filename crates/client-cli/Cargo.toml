@@ -77,6 +77,7 @@ portable-pty = "0.9"
 # Pty bytes are base64'd onto the wire: a read can split both UTF-8
 # sequences and ANSI escapes, so the frames can't be typed as JSON strings.
 base64 = "0.22"
+tempfile = "3"
 
 # MCP server (`apas mcp-server`) — the typed front door panes use instead of
 # hand-assembling `.apas-team.jsonl` tags in bash. Official Rust SDK; verified
@@ -90,4 +91,3 @@ schemars = "1"
 libc = "0.2"
 
 [dev-dependencies]
-tempfile = "3"

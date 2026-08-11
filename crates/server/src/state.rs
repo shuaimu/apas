@@ -1,6 +1,6 @@
 use crate::{
     config::Config, db::Database, mobile_metrics::MobileMetrics, session::SessionManager,
-    storage::FileStorage,
+    storage::FileStorage, work_summary::PaneWorkSummaryService,
 };
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -33,6 +33,7 @@ pub struct AppState {
     pub password_reset_tokens: Arc<DashMap<String, PasswordResetState>>,
     pub mobile_auth_attempts: Arc<DashMap<String, Vec<DateTime<Utc>>>>,
     pub mobile_metrics: Arc<MobileMetrics>,
+    pub pane_work_summaries: Arc<PaneWorkSummaryService>,
     mobile_task_launch_gates: Arc<DashMap<Uuid, Arc<Mutex<()>>>>,
     project_mutation_gates: Arc<DashMap<String, Arc<RwLock<()>>>>,
 }
@@ -46,15 +47,25 @@ impl AppState {
             .unwrap_or(Path::new("./data"))
             .to_path_buf();
 
+        let sessions = Arc::new(SessionManager::new());
+        let storage = FileStorage::new(storage_path);
+        let pane_work_summaries = Arc::new(PaneWorkSummaryService::new(
+            db.clone(),
+            sessions.clone(),
+            storage.clone(),
+            config.summaries.clone(),
+        ));
+
         Self {
             db,
             config,
-            sessions: Arc::new(SessionManager::new()),
-            storage: FileStorage::new(storage_path),
+            sessions,
+            storage,
             device_codes: Arc::new(DashMap::new()),
             password_reset_tokens: Arc::new(DashMap::new()),
             mobile_auth_attempts: Arc::new(DashMap::new()),
             mobile_metrics: Arc::new(MobileMetrics::default()),
+            pane_work_summaries,
             mobile_task_launch_gates: Arc::new(DashMap::new()),
             project_mutation_gates: Arc::new(DashMap::new()),
         }

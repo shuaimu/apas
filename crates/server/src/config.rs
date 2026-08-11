@@ -11,6 +11,77 @@ pub struct Config {
     pub smtp: SmtpConfig,
     #[serde(default)]
     pub mobile: MobileConfig,
+    #[serde(default)]
+    pub summaries: SummaryConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SummaryConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_summary_reconcile_minutes")]
+    pub reconcile_interval_minutes: u64,
+    #[serde(default = "default_summary_global_concurrency")]
+    pub global_concurrency: usize,
+    #[serde(default = "default_summary_sessions_per_scan")]
+    pub max_sessions_per_scan: usize,
+    #[serde(default = "default_summary_source_bytes")]
+    pub max_source_bytes: usize,
+    #[serde(default = "default_summary_chunk_bytes")]
+    pub max_chunk_bytes: usize,
+    #[serde(default = "default_summary_chunks")]
+    pub max_chunks: usize,
+    #[serde(default = "default_summary_timeout_seconds")]
+    pub job_timeout_seconds: u64,
+    #[serde(default = "default_summary_refresh_throttle_seconds")]
+    pub refresh_throttle_seconds: u64,
+    #[serde(default = "default_summary_attempts")]
+    pub max_attempts: u32,
+}
+
+fn default_summary_reconcile_minutes() -> u64 {
+    15
+}
+fn default_summary_global_concurrency() -> usize {
+    2
+}
+fn default_summary_sessions_per_scan() -> usize {
+    100
+}
+fn default_summary_source_bytes() -> usize {
+    64 * 1024
+}
+fn default_summary_chunk_bytes() -> usize {
+    12 * 1024
+}
+fn default_summary_chunks() -> usize {
+    16
+}
+fn default_summary_timeout_seconds() -> u64 {
+    120
+}
+fn default_summary_refresh_throttle_seconds() -> u64 {
+    60
+}
+fn default_summary_attempts() -> u32 {
+    3
+}
+
+impl Default for SummaryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            reconcile_interval_minutes: default_summary_reconcile_minutes(),
+            global_concurrency: default_summary_global_concurrency(),
+            max_sessions_per_scan: default_summary_sessions_per_scan(),
+            max_source_bytes: default_summary_source_bytes(),
+            max_chunk_bytes: default_summary_chunk_bytes(),
+            max_chunks: default_summary_chunks(),
+            job_timeout_seconds: default_summary_timeout_seconds(),
+            refresh_throttle_seconds: default_summary_refresh_throttle_seconds(),
+            max_attempts: default_summary_attempts(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +245,7 @@ impl Default for Config {
             },
             smtp: SmtpConfig::default(),
             mobile: MobileConfig::default(),
+            summaries: SummaryConfig::default(),
         }
     }
 }

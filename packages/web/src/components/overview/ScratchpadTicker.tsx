@@ -4,7 +4,7 @@
  * Phase 5.1c — inline view of the last ~20 records from .apas-team.jsonl,
  * filterable by `kind`. Reuses the store's `teamRecords` array (already
  * populated by the CLI watcher + ServerToWeb::TeamRecord). Stays
- * compact: same row shape as the full Team modal but smaller padding.
+ * compact so it fits alongside the rest of the Overview.
  */
 import { useMemo, useState } from "react";
 import { selectActiveTeamRecords, useStore, TeamRecord } from "@/lib/store";
@@ -103,7 +103,7 @@ export function ScratchpadTicker() {
       </ul>
       {teamRecords.length > MAX_ROWS && (
         <p className="mt-2 text-[11px] text-gray-500 dark:text-gray-400 italic">
-          Showing newest {MAX_ROWS} of {teamRecords.length}. Open the Team modal in the header for the full timeline.
+          Showing newest {MAX_ROWS} of {teamRecords.length}.
         </p>
       )}
     </div>
