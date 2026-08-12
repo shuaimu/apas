@@ -295,6 +295,35 @@ describe("MobileSessionActivity", () => {
     expect(screen.queryByText("Instruction sent")).toBeNull();
   });
 
+  it("expands agent detail to a full-width panel outside the toggle button", () => {
+    seedStore({
+      paneMessages: {
+        "3": [message({
+          id: "tool-message",
+          content: "Running a focused command",
+          outputType: {
+            type: "tool_use",
+            tool: "Bash",
+            input: { command: "npm test -- MobileSessionActivity" },
+          },
+        })],
+      },
+    });
+    renderActivity();
+
+    const toggle = screen.getByRole("button", { name: /Using Bash/ });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(toggle);
+
+    const detail = screen.getByText(/npm test -- MobileSessionActivity/);
+    expect(detail.tagName).toBe("PRE");
+    expect(detail.className).toContain("w-full");
+    expect(detail.className).toContain("min-w-0");
+    expect(detail.className).toContain("max-w-full");
+    expect(toggle.contains(detail)).toBe(false);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+  });
+
   it("keeps approval decisions actionable in the activity timeline", () => {
     const approval = message({
       id: "approval",

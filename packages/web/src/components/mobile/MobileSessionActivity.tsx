@@ -220,7 +220,12 @@ function MobileEventCard({
 
   return (
     <article data-message-role={message.role} className={`rounded-2xl border p-3.5 ${eventSurface(message)} ${eventTone(message, answeredQuestions)}`}>
-      <button type="button" onClick={() => expandable && setExpanded((value) => !value)} className="w-full text-left">
+      <button
+        type="button"
+        aria-expanded={expandable ? expanded : undefined}
+        onClick={() => expandable && setExpanded((value) => !value)}
+        className="w-full min-w-0 text-left"
+      >
         {label && (
           <div className="mb-2.5 flex items-center">
             <span className="shrink-0 rounded-full bg-[#efeff5] px-2.5 py-1 text-[0.68rem] font-extrabold uppercase tracking-wide text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]">
@@ -237,10 +242,11 @@ function MobileEventCard({
           </p>
           {expandable && (expanded ? <ChevronUp className="mt-0.5 h-4 w-4 shrink-0 text-[#686873]" /> : <ChevronDown className="mt-0.5 h-4 w-4 shrink-0 text-[#686873]" />)}
         </div>
-        {expanded && message.role !== "user" && output?.type !== "approval_request" && !(output?.type === "tool_use" && output.tool === "AskUserQuestion") && (
-          <pre className="mt-3 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-xl bg-[#efeff5] p-3 text-xs font-normal leading-5 text-[#45454f] dark:bg-[#111115] dark:text-[#c7c7d1]">{detail}</pre>
-        )}
       </button>
+
+      {expanded && message.role !== "user" && output?.type !== "approval_request" && !(output?.type === "tool_use" && output.tool === "AskUserQuestion") && (
+        <pre className="mt-3 box-border w-full min-w-0 max-w-full overflow-auto whitespace-pre-wrap break-words rounded-xl bg-[#efeff5] p-3 text-xs font-normal leading-5 text-[#45454f] dark:bg-[#111115] dark:text-[#c7c7d1]">{detail}</pre>
+      )}
 
       {output?.type === "approval_request" && (
         <div className="mt-3 border-t border-amber-200 pt-3 dark:border-amber-900">
