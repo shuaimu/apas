@@ -15,8 +15,10 @@ describe("PaneWorkSummaryDrawer", () => {
 
   it("requests only its pane and renders cached status", () => {
     const listPaneWorkSummaries = vi.fn(() => true);
+    const refreshPaneWorkSummary = vi.fn(() => true);
     act(() => useStore.setState({
       listPaneWorkSummaries,
+      refreshPaneWorkSummary,
       paneWorkSummaries: {
         [paneWorkSummaryKey(SID, 4)]: {
           availability: "available",
@@ -41,6 +43,8 @@ describe("PaneWorkSummaryDrawer", () => {
     expect(listPaneWorkSummaries).toHaveBeenCalledWith(SID, 4, true);
     expect(screen.getByText(/Implemented the desktop drawer/)).toBeTruthy();
     expect(screen.getByText("Complete")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(refreshPaneWorkSummary).toHaveBeenCalledWith(SID, 4);
   });
 
   it("formats shared UTC boundaries in an explicit local time zone", () => {

@@ -390,7 +390,7 @@ pub struct PaneWorkSummaryService {
     config: SummaryConfig,
     runtime: Mutex<SummaryRuntime>,
     availability: DashMap<Uuid, PaneWorkSummaryAvailability>,
-    refreshes: DashMap<(Uuid, u32), DateTime<Utc>>,
+    refreshes: DashMap<(Uuid, u32, DateTime<Utc>), DateTime<Utc>>,
     recovered_sessions: DashMap<Uuid, ()>,
     pub metrics: SummaryMetrics,
 }
@@ -433,7 +433,7 @@ impl PaneWorkSummaryService {
         };
         let mut scanned_bytes = 0_u64;
         for session_id in sessions {
-            match self.reconcile_session(session_id, None, false, false).await {
+            match self.reconcile_session(session_id, None, false, None).await {
                 Ok(bytes) => scanned_bytes = scanned_bytes.saturating_add(bytes as u64),
                 Err(error) => {
                     tracing::warn!(%session_id, %error, "Pane summary reconciliation failed")
@@ -463,7 +463,7 @@ impl PaneWorkSummaryService {
         pane_id: u32,
         include_current: bool,
     ) -> anyhow::Result<(Vec<PaneWorkSummary>, PaneWorkSummaryAvailability)> {
-        self.reconcile_session(session_id, Some(pane_id), include_current, false)
+        self.reconcile_session(session_id, Some(pane_id), include_current, None)
             .await?;
         self.kick_dispatch().await;
         let document = self.storage.load_pane_work_summaries(&session_id).await?;
@@ -483,29 +483,29 @@ impl PaneWorkSummaryService {
         window_start: Option<DateTime<Utc>>,
     ) -> anyhow::Result<(Vec<PaneWorkSummary>, PaneWorkSummaryAvailability)> {
         let now = Utc::now();
-        if let Some(last) = self.refreshes.get(&(session_id, pane_id)) {
+        let target_window = window_start.unwrap_or_else(|| window_bounds(now).0);
+        let refresh_key = (session_id, pane_id, target_window);
+        if let Some(last) = self.refreshes.get(&refresh_key) {
             if now.signed_duration_since(*last)
                 < Duration::seconds(self.config.refresh_throttle_seconds as i64)
             {
                 return self.list_cached(session_id, pane_id).await;
             }
         }
-        self.refreshes.insert((session_id, pane_id), now);
-        if let Some(window_start) = window_start {
-            self.storage
-                .update_pane_work_summaries(&session_id, |document| {
-                    if let Some(summary) = document.summaries.iter_mut().find(|summary| {
-                        summary.pane_id == pane_id && summary.window_start == window_start
-                    }) {
-                        summary.status = PaneWorkSummaryStatus::Stale;
-                        summary.error = None;
-                        summary.updated_at = Some(Utc::now());
-                    }
-                    Ok(())
-                })
-                .await?;
-        }
-        self.reconcile_session(session_id, Some(pane_id), true, true)
+        self.refreshes.insert(refresh_key, now);
+        self.storage
+            .update_pane_work_summaries(&session_id, |document| {
+                if let Some(summary) = document.summaries.iter_mut().find(|summary| {
+                    summary.pane_id == pane_id && summary.window_start == target_window
+                }) {
+                    summary.status = PaneWorkSummaryStatus::Stale;
+                    summary.error = None;
+                    summary.updated_at = Some(Utc::now());
+                }
+                Ok(())
+            })
+            .await?;
+        self.reconcile_session(session_id, Some(pane_id), true, Some(target_window))
             .await?;
         self.kick_dispatch().await;
         self.list_cached(session_id, pane_id).await
@@ -549,7 +549,7 @@ impl PaneWorkSummaryService {
         session_id: Uuid,
         pane_filter: Option<u32>,
         include_current: bool,
-        force: bool,
+        force_window: Option<DateTime<Utc>>,
     ) -> anyhow::Result<usize> {
         let messages = self.storage.get_messages(&session_id).await?;
         let scanned_bytes = messages.iter().map(|message| message.content.len()).sum();
@@ -613,6 +613,7 @@ impl PaneWorkSummaryService {
         }
         let mut tasks = Vec::new();
         for window in windows {
+            let force = force_window == Some(window.window_start);
             let kind = if window.window_end <= now {
                 PaneWorkSummaryWindowKind::Completed
             } else {
@@ -624,6 +625,12 @@ impl PaneWorkSummaryService {
             let should_queue;
             if let Some(index) = existing_index {
                 let existing = &mut document.summaries[index];
+                // The persisted queue survives a server restart, but the process-local
+                // task queue does not. Rebuild queued work during the first reconciliation
+                // for the session (recovery also converts interrupted Generating records
+                // back to Queued).
+                let rebuild_recovered_task =
+                    first_recovery && existing.status == PaneWorkSummaryStatus::Queued;
                 if existing.source_digest != window.source_digest {
                     existing.status = PaneWorkSummaryStatus::Stale;
                     existing.source_digest = window.source_digest.clone();
@@ -644,6 +651,7 @@ impl PaneWorkSummaryService {
                         | PaneWorkSummaryStatus::Queued
                         | PaneWorkSummaryStatus::Generating
                 ) && !force
+                    && !rebuild_recovered_task
                 {
                     continue;
                 } else if matches!(
@@ -776,6 +784,14 @@ impl PaneWorkSummaryService {
         let mut runtime = self.runtime.lock().await;
         if runtime.logical_jobs.insert(key) {
             runtime.queued.push_back(task);
+        }
+    }
+
+    async fn enqueue_front(&self, task: GenerationTask) {
+        let key = task.logical_key();
+        let mut runtime = self.runtime.lock().await;
+        if runtime.logical_jobs.insert(key) {
+            runtime.queued.push_front(task);
         }
     }
 
@@ -984,7 +1000,11 @@ impl PaneWorkSummaryService {
                     }
                 };
                 if let Some(final_task) = maybe_final {
-                    self.enqueue(final_task).await;
+                    // Finish the newest window before spending quota on older
+                    // intermediate chunks. Otherwise every window can appear
+                    // to be generating while all final reductions sit at the
+                    // back of a long backfill queue.
+                    self.enqueue_front(final_task).await;
                 }
             }
             PaneWorkSummaryStage::Final => {
@@ -1000,7 +1020,7 @@ impl PaneWorkSummaryService {
                             "The prior response was invalid ({error}). Return only the required JSON object.\n\n{}",
                             correction.job.content
                         );
-                        self.enqueue(correction).await;
+                        self.enqueue_front(correction).await;
                     }
                     Err(error) => return Err(error),
                 }
@@ -1361,6 +1381,22 @@ mod service_tests {
     use crate::db::{Session, User};
     use tokio::sync::mpsc;
 
+    fn service_message(
+        id: &str,
+        pane: Option<&str>,
+        timestamp: &str,
+        content: &str,
+    ) -> StoredMessage {
+        StoredMessage {
+            id: id.to_string(),
+            role: "assistant".to_string(),
+            content: content.to_string(),
+            message_type: "text".to_string(),
+            created_at: timestamp.to_string(),
+            pane_type: pane.map(str::to_string),
+        }
+    }
+
     async fn test_service() -> (
         Arc<PaneWorkSummaryService>,
         Database,
@@ -1431,6 +1467,306 @@ mod service_tests {
             provider: Some("claude".to_string()),
             model: Some("test-model".to_string()),
         }
+    }
+
+    fn cached_summary(
+        window: &SourceWindow,
+        window_kind: PaneWorkSummaryWindowKind,
+        status: PaneWorkSummaryStatus,
+        summary: Option<&str>,
+    ) -> PaneWorkSummary {
+        PaneWorkSummary {
+            protocol_version: PANE_WORK_SUMMARY_PROTOCOL_VERSION,
+            session_id: window.session_id,
+            pane_id: window.pane_id,
+            window_start: window.window_start,
+            window_end: window.window_end,
+            window_kind,
+            status,
+            summary: summary.map(str::to_string),
+            source_digest: window.source_digest.clone(),
+            source_message_count: window.records.len() as u32,
+            source_through: Some(window.source_through),
+            source_through_id: Some(window.source_through_id.clone()),
+            generated_at: summary.map(|_| Utc::now()),
+            updated_at: Some(Utc::now()),
+            provider: summary.map(|_| "codex".to_string()),
+            model: None,
+            attempts: u32::from(summary.is_some()),
+            error: (status == PaneWorkSummaryStatus::Failed)
+                .then(|| "Previous generation failed".to_string()),
+        }
+    }
+
+    fn register_capable_cli(
+        sessions: &SessionManager,
+        owner: Uuid,
+        session_id: Uuid,
+    ) -> (Uuid, mpsc::Receiver<ServerToCli>) {
+        let cli_id = Uuid::new_v4();
+        let (cli_tx, cli_rx) = mpsc::channel(16);
+        sessions.register_cli(cli_id, owner, cli_tx, Some("test".to_string()));
+        sessions.set_cli_capabilities(cli_id, vec![PANE_WORK_SUMMARY_CAPABILITY.to_string()]);
+        sessions.create_cli_session(
+            session_id,
+            cli_id,
+            Some("/tmp/project".to_string()),
+            Some("test-host".to_string()),
+        );
+        (cli_id, cli_rx)
+    }
+
+    #[tokio::test]
+    async fn first_reconcile_rebuilds_the_process_local_queue_after_restart() {
+        let (service, db, storage, sessions) = test_service().await;
+        let owner = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        add_user_and_session(&db, owner, session_id).await;
+        let (_cli_id, mut cli_rx) = register_capable_cli(&sessions, owner, session_id);
+
+        let window_start = window_bounds(Utc::now()).0 - Duration::hours(SUMMARY_WINDOW_HOURS);
+        let message = service_message(
+            "interrupted",
+            Some("7"),
+            &(window_start + Duration::minutes(1)).to_rfc3339(),
+            "This summary was interrupted by a server restart.",
+        );
+        storage.append_message(&session_id, &message).await.unwrap();
+        let windows = build_source_windows(session_id, &[message], None);
+        storage
+            .save_pane_work_summaries(
+                &session_id,
+                &PaneWorkSummaryDocument {
+                    version: 1,
+                    summaries: vec![cached_summary(
+                        &windows[0],
+                        PaneWorkSummaryWindowKind::Completed,
+                        PaneWorkSummaryStatus::Generating,
+                        None,
+                    )],
+                },
+            )
+            .await
+            .unwrap();
+
+        service.list_for_pane(session_id, 7, false).await.unwrap();
+        let ServerToCli::GeneratePaneWorkSummary { job } = cli_rx.recv().await.unwrap() else {
+            panic!("expected recovered notes job")
+        };
+        assert_eq!(job.window_start, window_start);
+        assert_eq!(job.stage, PaneWorkSummaryStage::Notes);
+    }
+
+    #[tokio::test]
+    async fn toolbar_refresh_requeues_only_the_current_window() {
+        let (service, db, storage, sessions) = test_service().await;
+        let owner = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        add_user_and_session(&db, owner, session_id).await;
+        let (_cli_id, mut cli_rx) = register_capable_cli(&sessions, owner, session_id);
+
+        let current_time = Utc::now();
+        let current_start = window_bounds(current_time).0;
+        let completed_start = current_start - Duration::hours(SUMMARY_WINDOW_HOURS);
+        let messages = vec![
+            service_message(
+                "completed",
+                Some("7"),
+                &(completed_start + Duration::minutes(1)).to_rfc3339(),
+                "Completed and verified the previous window's work.",
+            ),
+            service_message(
+                "current",
+                Some("7"),
+                &current_time.to_rfc3339(),
+                "Continued implementation in the current window.",
+            ),
+        ];
+        for source in &messages {
+            storage.append_message(&session_id, source).await.unwrap();
+        }
+        let windows = build_source_windows(session_id, &messages, None);
+        let completed = windows
+            .iter()
+            .find(|window| window.window_start == completed_start)
+            .unwrap();
+        let current = windows
+            .iter()
+            .find(|window| window.window_start == current_start)
+            .unwrap();
+        storage
+            .save_pane_work_summaries(
+                &session_id,
+                &PaneWorkSummaryDocument {
+                    version: 1,
+                    summaries: vec![
+                        cached_summary(
+                            completed,
+                            PaneWorkSummaryWindowKind::Completed,
+                            PaneWorkSummaryStatus::Complete,
+                            Some("Keep this completed summary."),
+                        ),
+                        cached_summary(
+                            current,
+                            PaneWorkSummaryWindowKind::Current,
+                            PaneWorkSummaryStatus::Partial,
+                            Some("Refresh only this partial summary."),
+                        ),
+                    ],
+                },
+            )
+            .await
+            .unwrap();
+
+        service.refresh(session_id, 7, None).await.unwrap();
+        let ServerToCli::GeneratePaneWorkSummary { job } = cli_rx.recv().await.unwrap() else {
+            panic!("expected current-window notes job")
+        };
+        assert_eq!(job.window_start, current_start);
+        assert!(cli_rx.try_recv().is_err());
+
+        let document = storage.load_pane_work_summaries(&session_id).await.unwrap();
+        let preserved = document
+            .summaries
+            .iter()
+            .find(|summary| summary.window_start == completed_start)
+            .unwrap();
+        assert_eq!(preserved.status, PaneWorkSummaryStatus::Complete);
+        assert_eq!(
+            preserved.summary.as_deref(),
+            Some("Keep this completed summary.")
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_requeues_only_the_selected_failed_window() {
+        let (service, db, storage, sessions) = test_service().await;
+        let owner = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        add_user_and_session(&db, owner, session_id).await;
+        let (_cli_id, mut cli_rx) = register_capable_cli(&sessions, owner, session_id);
+
+        let newest_start = window_bounds(Utc::now()).0 - Duration::hours(SUMMARY_WINDOW_HOURS);
+        let failed_start = newest_start - Duration::hours(SUMMARY_WINDOW_HOURS);
+        let messages = vec![
+            service_message(
+                "failed",
+                Some("7"),
+                &(failed_start + Duration::minutes(1)).to_rfc3339(),
+                "The older summary generation failed.",
+            ),
+            service_message(
+                "complete",
+                Some("7"),
+                &(newest_start + Duration::minutes(1)).to_rfc3339(),
+                "The newer window already has a valid summary.",
+            ),
+        ];
+        for source in &messages {
+            storage.append_message(&session_id, source).await.unwrap();
+        }
+        let windows = build_source_windows(session_id, &messages, None);
+        let failed = windows
+            .iter()
+            .find(|window| window.window_start == failed_start)
+            .unwrap();
+        let complete = windows
+            .iter()
+            .find(|window| window.window_start == newest_start)
+            .unwrap();
+        storage
+            .save_pane_work_summaries(
+                &session_id,
+                &PaneWorkSummaryDocument {
+                    version: 1,
+                    summaries: vec![
+                        cached_summary(
+                            failed,
+                            PaneWorkSummaryWindowKind::Completed,
+                            PaneWorkSummaryStatus::Failed,
+                            None,
+                        ),
+                        cached_summary(
+                            complete,
+                            PaneWorkSummaryWindowKind::Completed,
+                            PaneWorkSummaryStatus::Complete,
+                            Some("Preserve the newer completed summary."),
+                        ),
+                    ],
+                },
+            )
+            .await
+            .unwrap();
+
+        service
+            .refresh(session_id, 7, Some(failed_start))
+            .await
+            .unwrap();
+        let ServerToCli::GeneratePaneWorkSummary { job } = cli_rx.recv().await.unwrap() else {
+            panic!("expected selected-window retry job")
+        };
+        assert_eq!(job.window_start, failed_start);
+        assert!(cli_rx.try_recv().is_err());
+
+        let document = storage.load_pane_work_summaries(&session_id).await.unwrap();
+        let preserved = document
+            .summaries
+            .iter()
+            .find(|summary| summary.window_start == newest_start)
+            .unwrap();
+        assert_eq!(preserved.status, PaneWorkSummaryStatus::Complete);
+        assert_eq!(
+            preserved.summary.as_deref(),
+            Some("Preserve the newer completed summary.")
+        );
+    }
+
+    #[tokio::test]
+    async fn final_reduction_is_dispatched_before_older_window_notes() {
+        let (service, db, storage, sessions) = test_service().await;
+        let owner = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        add_user_and_session(&db, owner, session_id).await;
+        let (cli_id, mut cli_rx) = register_capable_cli(&sessions, owner, session_id);
+
+        let newest_start = window_bounds(Utc::now()).0 - Duration::hours(SUMMARY_WINDOW_HOURS);
+        let older_start = newest_start - Duration::hours(SUMMARY_WINDOW_HOURS);
+        for source in [
+            service_message(
+                "older",
+                Some("7"),
+                &(older_start + Duration::minutes(1)).to_rfc3339(),
+                "Worked on an older task.",
+            ),
+            service_message(
+                "newest",
+                Some("7"),
+                &(newest_start + Duration::minutes(1)).to_rfc3339(),
+                "Worked on the newest task.",
+            ),
+        ] {
+            storage.append_message(&session_id, &source).await.unwrap();
+        }
+
+        service.list_for_pane(session_id, 7, false).await.unwrap();
+        let ServerToCli::GeneratePaneWorkSummary { job: notes_job } = cli_rx.recv().await.unwrap()
+        else {
+            panic!("expected newest notes job")
+        };
+        assert_eq!(notes_job.window_start, newest_start);
+        assert_eq!(notes_job.stage, PaneWorkSummaryStage::Notes);
+        assert!(
+            service
+                .accept_result(cli_id, result_for(&notes_job, "Newest grounded facts"))
+                .await
+        );
+
+        let ServerToCli::GeneratePaneWorkSummary { job: next_job } = cli_rx.recv().await.unwrap()
+        else {
+            panic!("expected newest final job")
+        };
+        assert_eq!(next_job.window_start, newest_start);
+        assert_eq!(next_job.stage, PaneWorkSummaryStage::Final);
     }
 
     #[tokio::test]
