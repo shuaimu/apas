@@ -4,9 +4,29 @@ import type { MobileSessionSummary } from "@apas/protocol";
 import { StatusBadge } from "@/components/ui";
 import { useTheme } from "@/design/tokens";
 
-export function SessionCard({ session, onPress }: { session: MobileSessionSummary; onPress: () => void }) {
+export type MobileSessionActivityStatus = "working" | "idle" | "offline";
+
+export function sessionActivityStatus(
+  session: MobileSessionSummary,
+  paneStatuses?: Record<string, string>,
+): MobileSessionActivityStatus {
+  if (!session.is_active) return "offline";
+  if (Object.values(paneStatuses ?? {}).some(Boolean) || session.is_working) return "working";
+  return "idle";
+}
+
+export function SessionCard({
+  session,
+  paneStatuses,
+  onPress,
+}: {
+  session: MobileSessionSummary;
+  paneStatuses?: Record<string, string>;
+  onPress: () => void;
+}) {
   const theme = useTheme();
-  const active = Boolean(session.is_active);
+  const activity = sessionActivityStatus(session, paneStatuses);
+  const tone = activity === "working" ? "success" : activity === "idle" ? "neutral" : "danger";
   return (
     <Pressable
       accessibilityRole="button"
@@ -16,7 +36,7 @@ export function SessionCard({ session, onPress }: { session: MobileSessionSummar
     >
       <View style={styles.row}>
         <Text numberOfLines={1} style={[styles.title, { color: theme.text }]}>{session.project_name ?? "Coding session"}</Text>
-        <StatusBadge label={active ? "Active" : session.status} tone={active ? "success" : "neutral"} />
+        <StatusBadge label={activity[0].toUpperCase() + activity.slice(1)} tone={tone} />
       </View>
       <Text numberOfLines={1} style={{ color: theme.textMuted }}>{session.hostname ?? session.working_dir ?? "Unknown target"}</Text>
       {session.latest_summary ? <Text numberOfLines={2} style={[styles.summary, { color: theme.text }]}>{session.latest_summary}</Text> : null}

@@ -29,6 +29,7 @@ fn session_info(
     owner_email: Option<String>,
 ) -> SessionInfo {
     let session_id = Uuid::parse_str(&session.id).unwrap_or_default();
+    let is_active = state.sessions.is_session_active(&session_id);
     SessionInfo {
         id: session_id,
         project_id: session
@@ -48,7 +49,8 @@ fn session_info(
         is_shared: shared,
         owner_email,
         share_role: Some(if shared { "user" } else { "owner" }.to_string()),
-        is_active: state.sessions.is_session_active(&session_id),
+        is_active,
+        is_working: is_active && !state.sessions.get_pane_statuses(&session_id).is_empty(),
     }
 }
 
@@ -597,6 +599,21 @@ mod tests {
         config.database.path = dir.join("apas.db").to_string_lossy().to_string();
         config.mobile.features.bootstrap = true;
         let state = AppState::new(db, config);
+        let cli_id = Uuid::new_v4();
+        let session_id = Uuid::parse_str(&recent_owner_session_id).unwrap();
+        let (cli_tx, _cli_rx) = tokio::sync::mpsc::channel(1);
+        state
+            .sessions
+            .register_cli(cli_id, Uuid::parse_str(&owner_id).unwrap(), cli_tx, None);
+        state
+            .sessions
+            .create_cli_session(session_id, cli_id, None, None);
+        state.sessions.set_pane_status(
+            &session_id,
+            shared::PaneType::Interactive,
+            3,
+            Some("Working…".to_string()),
+        );
         let Json(response) = bootstrap(State(state.clone()), headers(&state, &owner_id))
             .await
             .unwrap();
@@ -610,5 +627,9 @@ mod tests {
             response.sessions[0].last_user_input_at.as_deref(),
             Some("2026-08-09T12:00:00Z")
         );
+        assert!(response.sessions[0].session.is_active);
+        assert!(response.sessions[0].session.is_working);
+        assert!(!response.sessions[1].session.is_active);
+        assert!(!response.sessions[1].session.is_working);
     }
 }

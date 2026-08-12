@@ -43,6 +43,9 @@ export function startConnectionRuntime(): ConnectionSupervisor {
     },
     onMessage: (message) => {
       if (handlePaneWorkSummaryMessage(message)) return;
+      if (message.type === "session_attached") {
+        useMobileStore.getState().setSessionActive(message.session_id, message.has_active_cli);
+      }
       if (message.type === "pane_list") {
         useMobileStore.getState().setPanes(message.session_id, message.panes);
       }

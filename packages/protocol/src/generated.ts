@@ -1146,6 +1146,11 @@ export interface MobileSessionSummary {
    * True if this session is shared with the user (not owned)
    */
   is_shared?: boolean;
+  /**
+   * True when at least one pane is currently reporting work. This is
+   * meaningful only while `is_active` is true.
+   */
+  is_working?: boolean;
   last_user_input_at?: string | null;
   latest_summary?: string | null;
   latest_update_at?: string | null;
@@ -1280,6 +1285,11 @@ export interface SessionInfo {
    * True if this session is shared with the user (not owned)
    */
   is_shared?: boolean;
+  /**
+   * True when at least one pane is currently reporting work. This is
+   * meaningful only while `is_active` is true.
+   */
+  is_working?: boolean;
   /**
    * Email of the session owner (only set if is_shared is true)
    */

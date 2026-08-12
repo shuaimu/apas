@@ -201,6 +201,26 @@ describe("mobile code screens", () => {
     expect(sessionList?.props.data.map((item: MobileSessionSummary) => item.id)).toEqual([newer.id, older.id]);
   });
 
+  it("uses only working, idle, and offline session badges", () => {
+    useMobileStore.setState({
+      sessions: [
+        { ...session, id: "working", project_name: "working", is_working: true },
+        { ...session, id: "idle", project_name: "idle", is_working: false },
+        { ...session, id: "offline", project_name: "offline", is_active: false, is_working: false },
+      ],
+      paneStatusesBySession: {},
+    });
+    const view = render(<CodeHomeScreen />);
+
+    expect(view.getByText("Working")).toBeTruthy();
+    expect(view.getByText("Idle")).toBeTruthy();
+    fireEvent.press(view.getByText("Recent"));
+    expect(view.getByText("Offline")).toBeTruthy();
+    for (const name of ["working", "idle", "offline"]) {
+      expect(view.getByLabelText(`Open ${name}`).findAllByProps({ children: "Active" })).toHaveLength(0);
+    }
+  });
+
   it("updates user-message recency from the acknowledged instruction event", () => {
     const other = {
       ...session,

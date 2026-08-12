@@ -1043,6 +1043,11 @@
           "type": "boolean",
           "default": false
         },
+        "is_working": {
+          "description": "True when at least one pane is currently reporting work. This is\nmeaningful only while `is_active` is true.",
+          "type": "boolean",
+          "default": false
+        },
         "last_user_input_at": {
           "type": [
             "string",
@@ -3152,6 +3157,11 @@
         },
         "is_shared": {
           "description": "True if this session is shared with the user (not owned)",
+          "type": "boolean",
+          "default": false
+        },
+        "is_working": {
+          "description": "True when at least one pane is currently reporting work. This is\nmeaningful only while `is_active` is true.",
           "type": "boolean",
           "default": false
         },

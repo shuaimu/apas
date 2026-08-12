@@ -12,6 +12,8 @@ describe('useStore', () => {
       sessionId: null,
       ws: null,
       cliClients: [],
+      sessions: [],
+      workingPanesBySession: new Map(),
       messages: [],
       machines: [],
       projectGoals: {},
@@ -80,6 +82,45 @@ describe('useStore', () => {
       }, useStore.setState, useStore.getState);
 
       expect(useStore.getState().isAttached).toBe(false);
+    });
+
+    it('tracks working, idle, and offline independently for every session', () => {
+      useStore.setState({
+        sessionId: 'current-session',
+        sessions: [
+          { id: 'current-session', status: 'connected', isActive: true, isWorking: false },
+          { id: 'background-session', status: 'connected', isActive: true, isWorking: false },
+        ],
+      });
+
+      handleServerMessage({
+        type: 'pane_status',
+        session_id: 'background-session',
+        pane_id: 7,
+        pane_type: 'interactive',
+        status: 'Working…',
+      }, useStore.setState, useStore.getState);
+      expect(useStore.getState().sessions.find((session) => session.id === 'background-session')?.isWorking).toBe(true);
+      expect(useStore.getState().paneStatuses['7']).toBeUndefined();
+
+      handleServerMessage({
+        type: 'pane_status',
+        session_id: 'background-session',
+        pane_id: 7,
+        pane_type: 'interactive',
+        status: null,
+      }, useStore.setState, useStore.getState);
+      expect(useStore.getState().sessions.find((session) => session.id === 'background-session')?.isWorking).toBe(false);
+
+      handleServerMessage({
+        type: 'session_attached',
+        session_id: 'background-session',
+        has_active_cli: false,
+      }, useStore.setState, useStore.getState);
+      expect(useStore.getState().sessions.find((session) => session.id === 'background-session')).toMatchObject({
+        isActive: false,
+        isWorking: false,
+      });
     });
   });
 

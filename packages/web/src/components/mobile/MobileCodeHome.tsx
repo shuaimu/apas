@@ -16,6 +16,7 @@ interface MobileSessionSummary {
   working_dir?: string | null;
   status: string;
   is_active?: boolean;
+  is_working?: boolean;
   latest_update_at?: string | null;
   last_user_input_at?: string | null;
   latest_summary?: string | null;
@@ -50,6 +51,7 @@ function adaptSession(session: SessionInfo): MobileSessionSummary {
     working_dir: session.workingDir,
     status: session.status,
     is_active: session.isActive,
+    is_working: session.isWorking,
     latest_update_at: session.createdAt,
     attention_count: 0,
     is_shared: session.isShared,
@@ -81,8 +83,8 @@ function compareSessionRecency(left: MobileSessionSummary, right: MobileSessionS
 }
 
 function statusLabel(session: MobileSessionSummary): string {
-  if (session.is_active) return "Active";
-  return session.status || "Inactive";
+  if (!session.is_active) return "Offline";
+  return session.is_working ? "Working" : "Idle";
 }
 
 function sessionTarget(session: MobileSessionSummary): string {
@@ -153,6 +155,7 @@ export function MobileCodeHome({
         ...session,
         status: live.status || session.status,
         is_active: live.isActive ?? session.is_active,
+        is_working: live.isWorking ?? session.is_working,
         hostname: live.hostname ?? session.hostname,
         working_dir: live.workingDir ?? session.working_dir,
       };
@@ -276,9 +279,11 @@ export function MobileCodeHome({
                   <div className="flex items-center justify-between gap-2.5">
                     <span className="min-w-0 flex-1 truncate text-base font-bold">{name}</span>
                     <span className={`shrink-0 rounded-full px-2.5 py-1 text-[0.7rem] font-bold ${
-                      session.is_active
+                      session.is_working
                         ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300"
-                        : "bg-[#efeff5] text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]"
+                        : session.is_active
+                          ? "bg-[#efeff5] text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]"
+                          : "bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300"
                     }`}>
                       {statusLabel(session)}
                     </span>

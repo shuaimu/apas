@@ -5089,6 +5089,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         .map(|s| {
                             let session_id = Uuid::parse_str(&s.id).unwrap_or_default();
                             let is_active = state.sessions.is_session_active(&session_id);
+                            let is_working = is_active
+                                && !state.sessions.get_pane_statuses(&session_id).is_empty();
                             let project_id = s
                                 .project_id
                                 .as_deref()
@@ -5110,6 +5112,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 owner_email: None,
                                 share_role: Some("owner".to_string()),
                                 is_active,
+                                is_working,
                             }
                         })
                         .collect();
@@ -5118,6 +5121,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     for (s, owner_email, share_role) in shared_sessions {
                         let session_id = Uuid::parse_str(&s.id).unwrap_or_default();
                         let is_active = state.sessions.is_session_active(&session_id);
+                        let is_working =
+                            is_active && !state.sessions.get_pane_statuses(&session_id).is_empty();
                         let project_id = s
                             .project_id
                             .as_deref()
@@ -5137,6 +5142,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             owner_email: Some(owner_email),
                             share_role: Some(share_role),
                             is_active,
+                            is_working,
                         });
                     }
 

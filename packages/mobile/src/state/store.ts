@@ -62,6 +62,7 @@ interface MobileState {
   setEvents: (sessionId: string, events: CodeEvent[]) => void;
   setPanes: (sessionId: string, panes: PaneConfig[]) => void;
   setPaneStatus: (sessionId: string, paneId: number, status: string | null | undefined) => void;
+  setSessionActive: (sessionId: string, active: boolean) => void;
   beginPaneWorkSummaryRequest: (sessionId: string, paneId: number) => void;
   setPaneWorkSummaryError: (sessionId: string, paneId: number, error: string | null) => void;
   replacePaneWorkSummaries: (
@@ -187,10 +188,24 @@ export const useMobileStore = create<MobileState>((set) => ({
       if (status) sessionStatuses[String(paneId)] = status;
       else delete sessionStatuses[String(paneId)];
       return {
+        sessions: state.sessions.map((session) => session.id === sessionId
+          ? { ...session, is_working: Object.values(sessionStatuses).some(Boolean) }
+          : session),
         paneStatusesBySession: {
           ...state.paneStatusesBySession,
           [sessionId]: sessionStatuses,
         },
+      };
+    }),
+  setSessionActive: (sessionId, active) =>
+    set((state) => {
+      const paneStatusesBySession = { ...state.paneStatusesBySession };
+      if (!active) delete paneStatusesBySession[sessionId];
+      return {
+        sessions: state.sessions.map((session) => session.id === sessionId
+          ? { ...session, is_active: active, is_working: active && Boolean(session.is_working) }
+          : session),
+        paneStatusesBySession,
       };
     }),
   beginPaneWorkSummaryRequest: (sessionId, paneId) =>

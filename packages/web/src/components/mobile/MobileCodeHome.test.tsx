@@ -51,6 +51,24 @@ describe("MobileCodeHome", () => {
     expect(screen.queryByRole("button", { name: "Open alpha" })).toBeNull();
   });
 
+  it("uses only working, idle, and offline session badges", () => {
+    renderHome({
+      legacySessions: [
+        session({ id: "working", workingDir: "/workspace/working", isWorking: true }),
+        session({ id: "idle", workingDir: "/workspace/idle", isWorking: false }),
+        session({ id: "offline", workingDir: "/workspace/offline", isActive: false, isWorking: false }),
+      ],
+    });
+
+    expect(screen.getByText("Working")).toBeTruthy();
+    expect(screen.getByText("Idle")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Recent" }));
+    expect(screen.getByText("Offline")).toBeTruthy();
+    for (const name of ["working", "idle", "offline"]) {
+      expect(within(screen.getByRole("button", { name: `Open ${name}` })).queryByText("Active")).toBeNull();
+    }
+  });
+
   it("keeps project selection compact and combines it with status filters", () => {
     renderHome();
     fireEvent.click(screen.getByRole("button", { name: "Recent" }));

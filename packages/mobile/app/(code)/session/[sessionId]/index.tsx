@@ -7,6 +7,7 @@ import type { CodeEvent, PaneConfig } from "@apas/protocol";
 import { DecisionActions, type DecisionResponse } from "@/components/DecisionActions";
 import { EventCard } from "@/components/EventCard";
 import { PaneWorkSummarySheet } from "@/components/PaneWorkSummarySheet";
+import { sessionActivityStatus } from "@/components/SessionCard";
 import { EmptyState, ErrorNotice, FormField, OfflineBanner, PrimaryButton, Screen, SecondaryButton, StatusBadge } from "@/components/ui";
 import { connectionSupervisor } from "@/connection/runtime";
 import { useTheme } from "@/design/tokens";
@@ -82,6 +83,7 @@ export default function SessionActivityScreen() {
   const selectedPane = panes.find((pane) => pane.id === activePaneId);
   const selectedIsTerminal = selectedPane?.kind === "terminal";
   const selectedStatus = activePaneId === null ? null : paneStatuses?.[String(activePaneId)] ?? null;
+  const sessionActivity = session ? sessionActivityStatus(session, paneStatuses) : "offline";
   const conversationEvents = useMemo(
     () => activePaneId === null ? [] : events.filter((event) => event.pane_id === activePaneId),
     [activePaneId, events],
@@ -299,7 +301,7 @@ export default function SessionActivityScreen() {
       <OfflineBanner />
       {actionError ? <View style={styles.error}><ErrorNotice message={actionError} /></View> : null}
       <View style={[styles.summary, { borderColor: theme.border }]}> 
-        <View style={styles.row}><View style={{ flex: 1 }}><Text style={[styles.title, { color: theme.text }]}>{session.project_name ?? "Coding session"}</Text><Text style={{ color: theme.textMuted }}>{session.hostname ?? session.working_dir}</Text></View><StatusBadge label={session.is_active ? "Active" : session.status} tone={session.is_active ? "success" : "neutral"} /></View>
+        <View style={styles.row}><View style={{ flex: 1 }}><Text style={[styles.title, { color: theme.text }]}>{session.project_name ?? "Coding session"}</Text><Text style={{ color: theme.textMuted }}>{session.hostname ?? session.working_dir}</Text></View><StatusBadge label={sessionActivity[0].toUpperCase() + sessionActivity.slice(1)} tone={sessionActivity === "working" ? "success" : sessionActivity === "offline" ? "danger" : "neutral"} /></View>
         <View style={styles.actions}>
           {summarySupported ? <SecondaryButton disabled={activePaneId === null} onPress={() => setSummaryOpen(true)}>Summary</SecondaryButton> : null}
           <SecondaryButton disabled={!selectedIsTerminal || !terminalEnabled} onPress={() => { if (!selectedIsTerminal || activePaneId === null) return; persistTimelinePosition(); router.push({ pathname: "/(code)/session/[sessionId]/terminal", params: { sessionId, paneId: String(activePaneId) } }); }}>Raw terminal</SecondaryButton>

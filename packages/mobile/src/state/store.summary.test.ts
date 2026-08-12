@@ -73,4 +73,24 @@ describe("native pane work summary state", () => {
     expect(useMobileStore.getState().paneWorkSummaries).toEqual({});
     expect(useMobileStore.getState().visibleSummaryPane).toBeNull();
   });
+
+  it("moves sessions between working, idle, and offline from live status messages", () => {
+    useMobileStore.setState({
+      sessions: [{
+        id: sessionId,
+        status: "connected",
+        is_active: true,
+        is_working: false,
+      }],
+    });
+    useMobileStore.getState().setPaneStatus(sessionId, 3, "Working…");
+    expect(useMobileStore.getState().sessions[0]).toMatchObject({ is_active: true, is_working: true });
+
+    useMobileStore.getState().setPaneStatus(sessionId, 3, null);
+    expect(useMobileStore.getState().sessions[0]).toMatchObject({ is_active: true, is_working: false });
+
+    useMobileStore.getState().setSessionActive(sessionId, false);
+    expect(useMobileStore.getState().sessions[0]).toMatchObject({ is_active: false, is_working: false });
+    expect(useMobileStore.getState().paneStatusesBySession[sessionId]).toBeUndefined();
+  });
 });

@@ -64,6 +64,7 @@ export interface SessionInfo {
   ownerEmail?: string;
   shareRole?: "owner" | "user";
   isActive?: boolean;
+  isWorking?: boolean;
 }
 
 /** A `create_project_instance` still in flight. */
@@ -587,6 +588,7 @@ interface AppState {
   paneMessages: Record<string, Message[]>;
   paneHasMore: Record<string, boolean>;
   paneStatuses: Record<string, string | null>;
+  workingPanesBySession: Map<string, Set<number>>;
   paneModes: Record<string, PaneType>;
   paneWorkSummaries: Record<string, PaneWorkSummaryCache>;
   pausedPanes: number[]; // pane_ids that are paused
@@ -991,6 +993,7 @@ export const useStore = create<AppState>((set, get) => ({
   paneMessages: {},
   paneHasMore: {},
   paneStatuses: {},
+  workingPanesBySession: new Map(),
   paneModes: {},
   paneWorkSummaries: {},
   pausedPanes: [],
@@ -1087,6 +1090,7 @@ export const useStore = create<AppState>((set, get) => ({
       negotiatedCapabilities: new Set(),
       cliClients: [],
       sessions: [],
+      workingPanesBySession: new Map(),
       machines: [],
       paneModes: {},
       paneWorkSummaries: {},
@@ -3921,9 +3925,21 @@ export function handleServerMessage(
       // never let a background (often inactive) session disable the current
       // project's composer. Older servers omitted session_id, hence the
       // compatibility fallback.
-      if (!attachedSessionId || attachedSessionId === currentSessionId) {
-        set({ isAttached: hasActiveCli });
-      }
+      set((state) => {
+        const workingPanesBySession = new Map(state.workingPanesBySession);
+        if (attachedSessionId && !hasActiveCli) workingPanesBySession.delete(attachedSessionId);
+        return {
+          ...(attachedSessionId && {
+            sessions: state.sessions.map((session) => session.id === attachedSessionId
+              ? { ...session, isActive: hasActiveCli, isWorking: hasActiveCli && Boolean(session.isWorking) }
+              : session),
+          }),
+          ...(!attachedSessionId || attachedSessionId === currentSessionId
+            ? { isAttached: hasActiveCli }
+            : {}),
+          workingPanesBySession,
+        };
+      });
       break;
     }
 
@@ -4248,22 +4264,33 @@ export function handleServerMessage(
     }
 
     case "pane_status": {
-      // The web is multi-attached to several sessions (background tabs stay
-      // live). Statuses from non-foreground sessions would otherwise
-      // overwrite paneStatuses[paneId] for the tab the user is actually
-      // viewing — that's how a "Pane worker unavailable" status from one
-      // project's CLI ended up on another project's tab pill.
+      // Track every attached session for the mobile session cards, but only
+      // apply a pane pill to the foreground session below.
       const msgSessionId = data.session_id as string | undefined;
       const curSessionId = get().sessionId;
-      if (msgSessionId && curSessionId && msgSessionId !== curSessionId) {
-        break;
-      }
       const paneType = data.pane_type as string | undefined;
       const paneId = normalizePaneId(paneType, data.pane_id as number | undefined);
       const status = data.status as string | null;
       const modeHint = normalizePaneModeHint(paneType);
 
       if (paneId) {
+        if (msgSessionId) {
+          set((state) => {
+            const workingPanesBySession = new Map(state.workingPanesBySession);
+            const workingPanes = new Set(workingPanesBySession.get(msgSessionId) ?? []);
+            if (status) workingPanes.add(paneId);
+            else workingPanes.delete(paneId);
+            if (workingPanes.size > 0) workingPanesBySession.set(msgSessionId, workingPanes);
+            else workingPanesBySession.delete(msgSessionId);
+            return {
+              workingPanesBySession,
+              sessions: state.sessions.map((session) => session.id === msgSessionId
+                ? { ...session, isWorking: workingPanes.size > 0 }
+                : session),
+            };
+          });
+        }
+        if (msgSessionId && curSessionId && msgSessionId !== curSessionId) break;
         set((state) => ({
           paneStatuses: { ...state.paneStatuses, [paneId]: status },
           paneModes: modeHint
@@ -4402,10 +4429,19 @@ export function handleServerMessage(
         ownerEmail: s.owner_email as string | undefined,
         shareRole: s.share_role === "owner" ? "owner" : s.share_role ? "user" : undefined,
         isActive: s.is_active as boolean | undefined,
+        isWorking: s.is_working as boolean | undefined,
       }));
 
       set((state) => {
-        const next: Partial<AppState> = { sessions: parsedSessions };
+        const workingPanesBySession = new Map(state.workingPanesBySession);
+        for (const session of parsedSessions) {
+          if (!session.isWorking) workingPanesBySession.delete(session.id);
+        }
+        const allowedSessionIds = new Set(parsedSessions.map((session) => session.id));
+        for (const sessionId of workingPanesBySession.keys()) {
+          if (!allowedSessionIds.has(sessionId)) workingPanesBySession.delete(sessionId);
+        }
+        const next: Partial<AppState> = { sessions: parsedSessions, workingPanesBySession };
         if (state.sessionId) {
           const activeClient = state.cliClients.find((c) => c.activeSession === state.sessionId);
           const currentSession = parsedSessions.find((s) => s.id === state.sessionId);

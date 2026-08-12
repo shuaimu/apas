@@ -557,6 +557,7 @@ impl SessionManager {
         for key in keys_to_remove {
             self.cli_usage_limits.remove(&key);
         }
+        let mut disconnected_sessions = Vec::new();
         if let Some((_, session_ids)) = self.cli_sessions.remove(cli_id) {
             for session_id in session_ids {
                 if let Some(mut session) = self.sessions.get_mut(&session_id) {
@@ -567,9 +568,13 @@ impl SessionManager {
                         // Drop any cached "thinking"/status — the producer is gone,
                         // otherwise the next web attach would replay a stale indicator.
                         session.pane_statuses.clear();
+                        disconnected_sessions.push(session_id);
                     }
                 }
             }
+        }
+        for session_id in disconnected_sessions {
+            self.broadcast_session_presence(&session_id, false);
         }
         tracing::info!("CLI client unregistered: {}", cli_id);
         // Broadcast updated client list to all web clients
@@ -1454,8 +1459,26 @@ impl SessionManager {
         if let Some(user_id) = self.cli_users.get(&cli_id).map(|e| *e) {
             self.broadcast_machines_update_for_user(&user_id);
         }
+        self.broadcast_session_presence(&session_id, true);
         // Broadcast updated client list to all web clients (shows active session)
         self.broadcast_cli_clients_update();
+    }
+
+    fn broadcast_session_presence(&self, session_id: &Uuid, has_active_cli: bool) {
+        let web_ids = self
+            .sessions
+            .get(session_id)
+            .map(|session| session.web_connection_ids.clone())
+            .unwrap_or_default();
+        let message = ServerToWeb::SessionAttached {
+            session_id: *session_id,
+            has_active_cli,
+        };
+        for web_id in web_ids {
+            if let Some(sender) = self.web_senders.get(&web_id) {
+                let _ = sender.try_send(message.clone());
+            }
+        }
     }
 
     /// Attach a web client to an existing session (to observe CLI output)
@@ -2062,6 +2085,43 @@ mod tests {
             vec![(PaneType::Interactive, 22, "Waiting for input".to_string())],
             "None status clears only the matching pane entry"
         );
+    }
+
+    #[tokio::test]
+    async fn attached_web_peers_receive_cli_presence_transitions() {
+        let mgr = SessionManager::new();
+        let user_id = Uuid::new_v4();
+        let first_cli_id = Uuid::new_v4();
+        let replacement_cli_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let web_id = Uuid::new_v4();
+        let (first_cli_tx, _first_cli_rx) = mpsc::channel(1);
+        let (replacement_cli_tx, _replacement_cli_rx) = mpsc::channel(1);
+        let (web_tx, mut web_rx) = mpsc::channel(4);
+
+        mgr.register_cli(first_cli_id, user_id, first_cli_tx, None);
+        mgr.create_cli_session(session_id, first_cli_id, None, None);
+        mgr.register_web(web_id, web_tx);
+        assert!(mgr.attach_web_to_session(&session_id, web_id, Some(first_cli_id),));
+
+        mgr.register_cli(replacement_cli_id, user_id, replacement_cli_tx, None);
+        mgr.create_cli_session(session_id, replacement_cli_id, None, None);
+        assert!(matches!(
+            web_rx.recv().await,
+            Some(ServerToWeb::SessionAttached {
+                session_id: received_session_id,
+                has_active_cli: true,
+            }) if received_session_id == session_id
+        ));
+
+        mgr.unregister_cli(&replacement_cli_id);
+        assert!(matches!(
+            web_rx.recv().await,
+            Some(ServerToWeb::SessionAttached {
+                session_id: received_session_id,
+                has_active_cli: false,
+            }) if received_session_id == session_id
+        ));
     }
 
     #[test]

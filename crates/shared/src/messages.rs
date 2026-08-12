@@ -2006,6 +2006,10 @@ pub struct SessionInfo {
     /// True if this session has an active CLI client connected
     #[serde(default)]
     pub is_active: bool,
+    /// True when at least one pane is currently reporting work. This is
+    /// meaningful only while `is_active` is true.
+    #[serde(default)]
+    pub is_working: bool,
 }
 
 /// Aggregated usage counters for a pane or project over one time window.

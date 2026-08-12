@@ -2467,6 +2467,11 @@
           "type": "boolean",
           "default": false
         },
+        "is_working": {
+          "description": "True when at least one pane is currently reporting work. This is\nmeaningful only while `is_active` is true.",
+          "type": "boolean",
+          "default": false
+        },
         "owner_email": {
           "description": "Email of the session owner (only set if is_shared is true)",
           "type": [
