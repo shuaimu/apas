@@ -5,7 +5,7 @@ use shared::{
     ServerToDaemon, ServerToWeb, TerminalLifecycle, UsageLimits,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -110,6 +110,13 @@ pub struct SessionManager {
     /// retry + reconnect replay), and without this each retransmit was
     /// stored and displayed as a fresh message. Bounded ring per session.
     recent_input_ids: DashMap<Uuid, VecDeque<(String, String)>>,
+    /// User turns accepted through `terminal_conversation_input` are echoed
+    /// immediately, then observed a second time when the CLI tails the
+    /// provider transcript. Keep a short, one-shot correlation queue so the
+    /// transcript copy can be consumed without hiding genuine input typed
+    /// directly into the terminal.
+    pending_terminal_transcript_echoes:
+        DashMap<(Uuid, u32), VecDeque<PendingTerminalTranscriptEcho>>,
     /// Server-authoritative unresolved decisions keyed by the CLI tool id.
     /// Removal is the atomic first-response claim shared by web and mobile.
     pending_decisions: DashMap<(Uuid, String), PendingDecision>,
@@ -131,6 +138,15 @@ pub struct PendingDecision {
     pub pane_id: Option<u32>,
     pub kind: shared::MutationKind,
 }
+
+#[derive(Debug, Clone)]
+struct PendingTerminalTranscriptEcho {
+    text: String,
+    registered_at: Instant,
+}
+
+const TERMINAL_TRANSCRIPT_ECHO_TTL: Duration = Duration::from_secs(120);
+const MAX_PENDING_TERMINAL_TRANSCRIPT_ECHOES: usize = 64;
 
 #[derive(Debug, Clone)]
 enum MutationRequestState {
@@ -249,6 +265,7 @@ impl SessionManager {
             machine_projects: DashMap::new(),
             shared_project_refs: DashMap::new(),
             recent_input_ids: DashMap::new(),
+            pending_terminal_transcript_echoes: DashMap::new(),
             pending_decisions: DashMap::new(),
             mutation_requests: DashMap::new(),
             mutation_request_order: DashMap::new(),
@@ -415,6 +432,72 @@ impl SessionManager {
         while ids.len() > MAX_TRACKED {
             ids.pop_front();
         }
+    }
+
+    /// Expect one provider-transcript copy of a terminal conversation input.
+    /// Correlation is deliberately scoped by session and pane and consumed
+    /// once, so two intentional identical prompts remain two prompts.
+    pub fn expect_terminal_transcript_echo(&self, session_id: Uuid, pane_id: u32, text: String) {
+        let now = Instant::now();
+        let mut pending = self
+            .pending_terminal_transcript_echoes
+            .entry((session_id, pane_id))
+            .or_default();
+        pending
+            .retain(|item| now.duration_since(item.registered_at) <= TERMINAL_TRANSCRIPT_ECHO_TTL);
+        pending.push_back(PendingTerminalTranscriptEcho {
+            text,
+            registered_at: now,
+        });
+        while pending.len() > MAX_PENDING_TERMINAL_TRANSCRIPT_ECHOES {
+            pending.pop_front();
+        }
+    }
+
+    /// Consume a matching provider-transcript user turn exactly once.
+    /// Returns false for raw-terminal/TUI input because those turns have no
+    /// server-originated expectation and must still be stored and broadcast.
+    pub fn consume_terminal_transcript_echo(
+        &self,
+        session_id: &Uuid,
+        pane_id: u32,
+        text: &str,
+    ) -> bool {
+        let Some(mut pending) = self
+            .pending_terminal_transcript_echoes
+            .get_mut(&(*session_id, pane_id))
+        else {
+            return false;
+        };
+        let now = Instant::now();
+        pending
+            .retain(|item| now.duration_since(item.registered_at) <= TERMINAL_TRANSCRIPT_ECHO_TTL);
+        let Some(index) = pending.iter().position(|item| item.text == text) else {
+            return false;
+        };
+        pending.remove(index);
+        true
+    }
+
+    /// Cancel an expectation when the server cannot finish submitting or
+    /// persisting the terminal conversation input.
+    pub fn cancel_terminal_transcript_echo(
+        &self,
+        session_id: &Uuid,
+        pane_id: u32,
+        text: &str,
+    ) -> bool {
+        let Some(mut pending) = self
+            .pending_terminal_transcript_echoes
+            .get_mut(&(*session_id, pane_id))
+        else {
+            return false;
+        };
+        let Some(index) = pending.iter().rposition(|item| item.text == text) else {
+            return false;
+        };
+        pending.remove(index);
+        true
     }
 
     pub fn register_pending_decision(
@@ -1064,6 +1147,8 @@ impl SessionManager {
             self.session_projects.remove(session_id);
             self.recent_input_ids.remove(session_id);
         }
+        self.pending_terminal_transcript_echoes
+            .retain(|(session_id, _), _| !session_set.contains(session_id));
         let terminal_keys = self
             .terminal_states
             .iter()
@@ -2034,6 +2119,30 @@ mod tests {
     }
 
     #[test]
+    fn terminal_transcript_echo_correlation_is_scoped_and_one_shot() {
+        let mgr = SessionManager::new();
+        let sid = Uuid::new_v4();
+        let other_sid = Uuid::new_v4();
+
+        mgr.expect_terminal_transcript_echo(sid, 9, "repeat me".to_string());
+        mgr.expect_terminal_transcript_echo(sid, 9, "repeat me".to_string());
+
+        assert!(!mgr.consume_terminal_transcript_echo(&other_sid, 9, "repeat me"));
+        assert!(!mgr.consume_terminal_transcript_echo(&sid, 10, "repeat me"));
+        assert!(!mgr.consume_terminal_transcript_echo(&sid, 9, "different"));
+        assert!(mgr.consume_terminal_transcript_echo(&sid, 9, "repeat me"));
+        assert!(
+            mgr.consume_terminal_transcript_echo(&sid, 9, "repeat me"),
+            "two accepted identical messages each own one correlation slot"
+        );
+        assert!(!mgr.consume_terminal_transcript_echo(&sid, 9, "repeat me"));
+
+        mgr.expect_terminal_transcript_echo(sid, 9, "cancelled".to_string());
+        assert!(mgr.cancel_terminal_transcript_echo(&sid, 9, "cancelled"));
+        assert!(!mgr.consume_terminal_transcript_echo(&sid, 9, "cancelled"));
+    }
+
+    #[test]
     fn pane_status_cache_replays_latest_statuses_and_clears_idle_panes() {
         let mgr = SessionManager::new();
         let sid = Uuid::new_v4();
@@ -2348,6 +2457,7 @@ mod tests {
 
         mgr.append_terminal_output(&owner_session, 9, None, b"secret", 1);
         mgr.record_input_id(owner_session, "input".to_string(), "time".to_string());
+        mgr.expect_terminal_transcript_echo(owner_session, 9, "secret prompt".to_string());
         mgr.purge_project_state("project-a", &[owner_user, member_user])
             .await;
         assert!(!mgr.is_cli_connected(&owner_cli));
@@ -2357,6 +2467,7 @@ mod tests {
         assert!(!mgr.sessions.contains_key(&member_session));
         assert!(mgr.terminal_snapshot(&owner_session, 9).is_none());
         assert!(mgr.seen_input_id(&owner_session, "input").is_none());
+        assert!(!mgr.consume_terminal_transcript_echo(&owner_session, 9, "secret prompt"));
     }
 
     #[test]

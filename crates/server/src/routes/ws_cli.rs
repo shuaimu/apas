@@ -99,6 +99,107 @@ pub(crate) async fn set_and_broadcast_pane_status(
         .await;
 }
 
+pub(crate) async fn handle_cli_user_input(
+    state: &AppState,
+    session_id: Uuid,
+    text: String,
+    pane_type: Option<PaneType>,
+    pane_id: Option<u32>,
+) {
+    let Ok((_project_id, _operation_guard)) = state
+        .active_session_operation(&session_id.to_string())
+        .await
+    else {
+        return;
+    };
+
+    // Terminal conversation input is stored and echoed by the web route as
+    // soon as the text and Enter reach the pty. The transcript watcher later
+    // reports that same user turn through CliToServer::UserInput. Consume its
+    // one-shot correlation before storage, broadcast, status, and accounting;
+    // raw terminal/TUI input has no expectation and continues normally.
+    let effective_pane_id =
+        pane_id.or_else(|| pane_type.map(|pane| PaneConfig::pane_id_from_legacy(&pane)));
+    if effective_pane_id.is_some_and(|pane_id| {
+        state
+            .sessions
+            .consume_terminal_transcript_echo(&session_id, pane_id, &text)
+    }) {
+        tracing::debug!(
+            %session_id,
+            pane_id = effective_pane_id,
+            "Consumed duplicate terminal transcript user turn"
+        );
+        return;
+    }
+
+    tracing::info!("Received UserInput for session {}: {}", session_id, text);
+    let created_at = chrono::Utc::now().to_rfc3339();
+    if let Err(error) = state
+        .db
+        .record_session_user_input(&session_id.to_string(), &created_at)
+        .await
+    {
+        tracing::warn!(%error, %session_id, "failed to record session user activity");
+    }
+    let stored_message = crate::storage::StoredMessage {
+        id: Uuid::new_v4().to_string(),
+        role: "user".to_string(),
+        content: text.clone(),
+        message_type: "text".to_string(),
+        created_at: created_at.clone(),
+        pane_type: effective_pane_id.map(|id| id.to_string()),
+    };
+    if let Err(error) = state
+        .storage
+        .append_message(&session_id, &stored_message)
+        .await
+    {
+        tracing::error!("Failed to save user input to file: {error}");
+    }
+
+    state
+        .sessions
+        .route_to_web(
+            &session_id,
+            ServerToWeb::UserInput {
+                session_id,
+                text,
+                pane_type,
+                pane_id,
+                created_at: Some(created_at),
+                client_msg_id: None,
+            },
+        )
+        .await;
+
+    if let Some(pane_id) = effective_pane_id
+        .filter(|id| is_terminal_pane(&state.sessions.get_session_panes(&session_id), *id))
+    {
+        // User turns harvested from a raw terminal still start the coarse
+        // working state. Web-originated turns already did this in ws_web.
+        set_and_broadcast_pane_status(
+            state,
+            session_id,
+            PaneType::Interactive,
+            pane_id,
+            Some("Working...".to_string()),
+        )
+        .await;
+    }
+
+    record_and_broadcast_usage(
+        state,
+        session_id,
+        effective_pane_id,
+        crate::db::UsageDelta {
+            prompt_count: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
 pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
@@ -835,74 +936,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 }
                             }
                             Ok(CliToServer::UserInput { session_id, text, pane_type, pane_id }) => {
-                                let Ok((_project_id, _operation_guard)) = state
-                                    .active_session_operation(&session_id.to_string())
-                                    .await
-                                else {
-                                    continue;
-                                };
-                                tracing::info!("Received UserInput for session {}: {}", session_id, text);
-                                // Use pane_id for storage, falling back to pane_type
-                                let effective_pane_id = pane_id.or_else(|| pane_type.map(|p| shared::PaneConfig::pane_id_from_legacy(&p)));
-                                // Save user input to file storage
-                                let created_at = chrono::Utc::now().to_rfc3339();
-                                if let Err(error) = state
-                                    .db
-                                    .record_session_user_input(&session_id.to_string(), &created_at)
-                                    .await
-                                {
-                                    tracing::warn!(%error, %session_id, "failed to record session user activity");
-                                }
-                                let stored_message = crate::storage::StoredMessage {
-                                    id: Uuid::new_v4().to_string(),
-                                    role: "user".to_string(),
-                                    content: text.clone(),
-                                    message_type: "text".to_string(),
-                                    created_at: created_at.clone(),
-                                    pane_type: effective_pane_id.map(|id| id.to_string()),
-                                };
-                                if let Err(e) = state.storage.append_message(&session_id, &stored_message).await {
-                                    tracing::error!("Failed to save user input to file: {}", e);
-                                }
-
-                                // Forward user input to web client
-                                state
-                                    .sessions
-                                    .route_to_web(
-                                        &session_id,
-                                        ServerToWeb::UserInput { session_id, text, pane_type, pane_id, created_at: Some(created_at), client_msg_id: None },
-                                    )
-                                    .await;
-
-                                if let Some(pane_id) = effective_pane_id.filter(|id| {
-                                    is_terminal_pane(
-                                        &state.sessions.get_session_panes(&session_id),
-                                        *id,
-                                    )
-                                }) {
-                                    // Terminal TUI turns are harvested from the
-                                    // provider transcript. The user boundary starts
-                                    // the same coarse working state that structured
-                                    // panes publish directly.
-                                    set_and_broadcast_pane_status(
-                                        &state,
-                                        session_id,
-                                        PaneType::Interactive,
-                                        pane_id,
-                                        Some("Working...".to_string()),
-                                    )
-                                    .await;
-                                }
-
-                                // Count this input as a prompt for the pane and refresh
-                                // the Overview usage stats.
-                                record_and_broadcast_usage(
-                                    &state,
-                                    session_id,
-                                    effective_pane_id,
-                                    crate::db::UsageDelta { prompt_count: 1, ..Default::default() },
-                                )
-                                .await;
+                                handle_cli_user_input(&state, session_id, text, pane_type, pane_id).await;
                             }
                             Ok(CliToServer::SessionEnd { session_id, reason }) => {
                                 let Ok((_project_id, _operation_guard)) = state

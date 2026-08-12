@@ -1758,6 +1758,13 @@ async fn handle_terminal_conversation_input(
         return;
     }
 
+    // The provider transcript will later contain this same user turn. Arm a
+    // one-shot correlation before sending Enter so the fast transcript path
+    // cannot race ahead and persist/broadcast the message a second time.
+    state
+        .sessions
+        .expect_terminal_transcript_echo(sid, pane_id, text.clone());
+
     // Full-screen TUIs can classify back-to-back bytes as a paste burst.
     // Deliver Enter separately after the text has landed.
     tokio::time::sleep(TERMINAL_CONVERSATION_SUBMIT_DELAY).await;
@@ -1773,6 +1780,9 @@ async fn handle_terminal_conversation_input(
         )
         .await;
     if !submit_sent {
+        state
+            .sessions
+            .cancel_terminal_transcript_echo(&sid, pane_id, &text);
         state
             .sessions
             .send_to_web(
@@ -1803,6 +1813,11 @@ async fn handle_terminal_conversation_input(
         pane_type: Some(pane_id.to_string()),
     };
     if let Err(error) = state.storage.append_message(&sid, &stored_message).await {
+        // Let the transcript observer provide the durable copy when this
+        // first persistence attempt fails.
+        state
+            .sessions
+            .cancel_terminal_transcript_echo(&sid, pane_id, &text);
         tracing::error!("Failed to save terminal conversation input: {error}");
     }
     if let Some(cmid) = client_msg_id.clone() {
@@ -2342,6 +2357,28 @@ mod web_input_route_tests {
         assert_eq!(stored[0].content, "line one\nline two");
         assert_eq!(stored[0].pane_type.as_deref(), Some("9"));
 
+        // The terminal transcript watcher observes the same user turn a few
+        // seconds later. It must consume the correlation instead of storing
+        // and broadcasting a second copy.
+        while web_rx.try_recv().is_ok() {}
+        crate::routes::ws_cli::handle_cli_user_input(
+            &state,
+            session_id,
+            "line one\nline two".to_string(),
+            None,
+            Some(9),
+        )
+        .await;
+        assert!(matches!(
+            web_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            state.storage.get_messages(&session_id).await.unwrap().len(),
+            1,
+            "provider transcript echo must not persist a duplicate"
+        );
+
         handle_terminal_conversation_input(
             &state,
             &web_connection_id,
@@ -2365,6 +2402,28 @@ mod web_input_route_tests {
         assert_eq!(
             state.storage.get_messages(&session_id).await.unwrap().len(),
             1
+        );
+
+        // Once the expected transcript echo is consumed, an identical turn
+        // typed directly into the raw terminal is genuine and must survive.
+        while web_rx.try_recv().is_ok() {}
+        crate::routes::ws_cli::handle_cli_user_input(
+            &state,
+            session_id,
+            "line one\nline two".to_string(),
+            None,
+            Some(9),
+        )
+        .await;
+        assert_user_input_echo(
+            next_user_input(&mut web_rx),
+            session_id,
+            "line one\nline two",
+            None,
+        );
+        assert_eq!(
+            state.storage.get_messages(&session_id).await.unwrap().len(),
+            2
         );
     }
 }
