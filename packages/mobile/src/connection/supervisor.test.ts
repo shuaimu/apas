@@ -36,6 +36,8 @@ describe("ConnectionSupervisor", () => {
   it("connects, authenticates, synchronizes, and becomes ready", async () => {
     const sockets: FakeSocket[] = [];
     const phases: string[] = [];
+    const setNegotiatedCapabilities = jest.fn();
+    const onSynchronized = jest.fn();
     const supervisor = new ConnectionSupervisor({
       createSocket: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; },
       accessToken: async () => "access",
@@ -43,7 +45,9 @@ describe("ConnectionSupervisor", () => {
       persistBootstrap: async () => undefined,
       setPhase: (phase) => phases.push(phase),
       setMutationsAllowed: jest.fn(),
+      setNegotiatedCapabilities,
       applyBootstrap: jest.fn(),
+      onSynchronized,
       random: () => 0.5,
     });
     supervisor.start();
@@ -54,10 +58,13 @@ describe("ConnectionSupervisor", () => {
       type: "authenticated",
       user_id: emptyBootstrap.user_id,
       mutations_allowed: true,
+      negotiated_capabilities: ["terminal", "pane_work_summary_v1"],
     });
     await Promise.resolve();
     await Promise.resolve();
     expect(phases).toEqual(expect.arrayContaining(["connecting", "authenticating", "synchronizing", "ready"]));
+    expect(setNegotiatedCapabilities).toHaveBeenCalledWith(["terminal", "pane_work_summary_v1"]);
+    expect(onSynchronized).toHaveBeenCalledTimes(1);
   });
 
   it("makes the socket unusable immediately in the background", () => {
@@ -289,6 +296,7 @@ describe("ConnectionSupervisor", () => {
   it("keeps a protocol downgrade read-only after synchronization", async () => {
     const socket = new FakeSocket();
     const mutations = jest.fn();
+    const setNegotiatedCapabilities = jest.fn();
     const supervisor = new ConnectionSupervisor({
       createSocket: () => socket,
       accessToken: async () => "access",
@@ -296,6 +304,7 @@ describe("ConnectionSupervisor", () => {
       persistBootstrap: async () => undefined,
       setPhase: jest.fn(),
       setMutationsAllowed: mutations,
+      setNegotiatedCapabilities,
       applyBootstrap: jest.fn(),
     });
     supervisor.start();
@@ -305,6 +314,7 @@ describe("ConnectionSupervisor", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(mutations).toHaveBeenLastCalledWith(false);
+    expect(setNegotiatedCapabilities).toHaveBeenLastCalledWith([]);
   });
 
   it("wipes authentication state when refresh proves the device is revoked", async () => {

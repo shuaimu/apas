@@ -36,6 +36,7 @@ fn is_read_only_message(message: &WebToServer) -> bool {
             | WebToServer::FetchTeamTodo { .. }
             | WebToServer::FetchSuggestedWorkers { .. }
             | WebToServer::TerminalAttach { .. }
+            | WebToServer::ListPaneWorkSummaries { .. }
             | WebToServer::MobileTelemetry { .. }
             | WebToServer::Heartbeat
     )
@@ -5538,9 +5539,21 @@ mod mobile_protocol_tests {
             session_id: Uuid::nil(),
             pane_id: 1,
         }));
+        assert!(is_read_only_message(&WebToServer::ListPaneWorkSummaries {
+            session_id: Uuid::nil(),
+            pane_id: 1,
+            include_current: true,
+        }));
         assert!(is_read_only_message(&WebToServer::MobileTelemetry {
             event: shared::MobileTelemetryEvent::TerminalBridgeReady,
         }));
+        assert!(!is_read_only_message(
+            &WebToServer::RefreshPaneWorkSummary {
+                session_id: Uuid::nil(),
+                pane_id: 1,
+                window_start: None,
+            }
+        ));
         assert!(!is_read_only_message(&WebToServer::Input {
             session_id: Some(Uuid::nil()),
             text: "change it".to_string(),

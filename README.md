@@ -109,7 +109,8 @@ apas --offline           # Run in offline mode (no server)
 apas -d /path/to/dir     # Specify working directory
 ```
 
-Desktop pane work summaries are an opt-in, isolated CLI feature. See
+Pane work summaries are available on desktop, responsive mobile web, and the
+native app when the isolated CLI feature is enabled. See
 [docs/pane-work-summaries.md](docs/pane-work-summaries.md) for scope, privacy,
 retention, enablement, and rollback guidance.
 

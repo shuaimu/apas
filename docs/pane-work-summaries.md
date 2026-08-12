@@ -1,9 +1,10 @@
-# Desktop pane work summaries
+# Pane work summaries
 
 APAS can cache a short summary of each agent pane's conversation activity in
-fixed, non-overlapping three-hour UTC windows. The desktop web workspace shows
-these windows in a docked `Summary` drawer and formats their range in the
-browser's local time. Summaries are navigation aids, not an audit log or proof
+fixed, non-overlapping three-hour UTC windows. Desktop uses a docked `Summary`
+drawer; responsive browsers and the native iOS/Android app use a compact
+summary sheet for the selected pane. Each client formats window ranges in the
+device's local time. Summaries are navigation aids, not an audit log or proof
 that repository work completed.
 
 ## Scope and retention
@@ -23,6 +24,32 @@ that repository work completed.
   partial through its latest source time. When the window closes, it is
   replaced by a final summary. Late retained messages make a cached result
   stale and queue regeneration.
+
+## Mobile access and continuity
+
+Open `Summary` from an attached session to view only the currently selected
+pane. The sheet can switch panes without replacing the conversation screen or
+its remembered scroll position. `Refresh current window` reconciles the open
+three-hour window; `Retry` targets only the selected failed window. Queued,
+generating, partial, stale, failed, source-expired, CLI-update-required,
+disabled, and temporarily unavailable states remain explicit. Provider/model
+labels describe which isolated adapter produced a result when that metadata is
+available.
+
+The native app stores at most the newest 56 windows for each accessible
+session/pane in its existing encrypted SQLite cache. Cached records remain
+readable offline with a last-updated label, while refresh and retry are
+disabled. Logout, authentication loss, account suspension, project-access
+loss, and full cache wipe remove those records through the same protected-state
+cleanup paths as session activity. The responsive browser does not add durable
+offline summary storage.
+
+Both mobile clients require negotiated `pane_work_summary_v1` support. If the
+server, project CLI, or installed client cannot safely support generation, the
+summary action or its network controls are unavailable while ordinary
+conversation and terminal use continues. An open native sheet requests an
+authoritative pane snapshot again after reconnect and merges later updates by
+window without duplicating cards.
 
 ## CLI isolation and provider privacy
 
@@ -101,7 +128,7 @@ Structured server logs report scan duration/bytes, queue and in-flight depth,
 dispatch/result latency, retry/failure/unavailable counts, provider/model, and
 per-session cache size. They do not log normalized source or summary prompts.
 
-For a rolling release, deploy server, then web, then CLI. Old CLIs continue
+For a rolling release, deploy server, then web/mobile, then CLI. Old CLIs continue
 normal pane work, receive no unknown generation messages, and leave cached
 summaries readable with an update-required notice. To roll back, disable the
 CLI adapter, then roll back web/server in either order. Sidecars remain inert

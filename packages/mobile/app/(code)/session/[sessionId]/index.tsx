@@ -6,6 +6,7 @@ import type { CodeEvent, PaneConfig } from "@apas/protocol";
 
 import { DecisionActions, type DecisionResponse } from "@/components/DecisionActions";
 import { EventCard } from "@/components/EventCard";
+import { PaneWorkSummarySheet } from "@/components/PaneWorkSummarySheet";
 import { EmptyState, ErrorNotice, FormField, OfflineBanner, PrimaryButton, Screen, SecondaryButton, StatusBadge } from "@/components/ui";
 import { connectionSupervisor } from "@/connection/runtime";
 import { useTheme } from "@/design/tokens";
@@ -25,10 +26,12 @@ export default function SessionActivityScreen() {
   const setEvents = useMobileStore((state) => state.setEvents);
   const connection = useMobileStore((state) => state.connection);
   const terminalEnabled = useMobileStore((state) => Boolean(state.features.terminal));
+  const summarySupported = useMobileStore((state) => state.negotiatedCapabilities.includes("pane_work_summary_v1"));
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [followUp, setFollowUp] = useState("");
   const [followUpRequestId, setFollowUpRequestId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [summaryOpen, setSummaryOpen] = useState(false);
   const [savedPositionResult, setSavedPositionResult] = useState<{
     sessionId: string;
     paneId: number;
@@ -297,7 +300,10 @@ export default function SessionActivityScreen() {
       {actionError ? <View style={styles.error}><ErrorNotice message={actionError} /></View> : null}
       <View style={[styles.summary, { borderColor: theme.border }]}> 
         <View style={styles.row}><View style={{ flex: 1 }}><Text style={[styles.title, { color: theme.text }]}>{session.project_name ?? "Coding session"}</Text><Text style={{ color: theme.textMuted }}>{session.hostname ?? session.working_dir}</Text></View><StatusBadge label={session.is_active ? "Active" : session.status} tone={session.is_active ? "success" : "neutral"} /></View>
-        <View style={styles.actions}><SecondaryButton disabled={!selectedIsTerminal || !terminalEnabled} onPress={() => { if (!selectedIsTerminal || activePaneId === null) return; persistTimelinePosition(); router.push({ pathname: "/(code)/session/[sessionId]/terminal", params: { sessionId, paneId: String(activePaneId) } }); }}>Raw terminal</SecondaryButton></View>
+        <View style={styles.actions}>
+          {summarySupported ? <SecondaryButton disabled={activePaneId === null} onPress={() => setSummaryOpen(true)}>Summary</SecondaryButton> : null}
+          <SecondaryButton disabled={!selectedIsTerminal || !terminalEnabled} onPress={() => { if (!selectedIsTerminal || activePaneId === null) return; persistTimelinePosition(); router.push({ pathname: "/(code)/session/[sessionId]/terminal", params: { sessionId, paneId: String(activePaneId) } }); }}>Raw terminal</SecondaryButton>
+        </View>
       </View>
       {panes.length > 0 ? <View style={styles.panes}><Text style={{ color: theme.textMuted }}>Conversation:</Text>{panes.map((pane) => <SecondaryButton key={pane.id} onPress={() => selectConversationPane(pane.id)}>{`${activePaneId === pane.id ? "✓ " : ""}${pane.label}${paneStatuses?.[String(pane.id)] ? " · working" : ""}`}</SecondaryButton>)}</View> : null}
       <FlatList
@@ -327,6 +333,15 @@ export default function SessionActivityScreen() {
         <FormField label="Message" value={followUp} onChangeText={(value) => { setFollowUp(value); setFollowUpRequestId(null); }} placeholder={selectedIsTerminal ? "Message this terminal conversation" : "Steer this exact session and pane"} multiline />
         <PrimaryButton disabled={!mutationsAllowed() || activePaneId === null || !followUp.trim() || (selectedIsTerminal && !terminalEnabled)} onPress={() => void steer()}>{followUpRequestId ? "Retry message safely" : "Send message"}</PrimaryButton>
       </View>
+      <PaneWorkSummarySheet
+        visible={summaryOpen}
+        sessionId={sessionId}
+        paneId={activePaneId}
+        paneLabel={selectedPane?.label ?? null}
+        panes={panes.map((pane) => ({ id: pane.id, label: pane.label }))}
+        onSelectPane={selectConversationPane}
+        onClose={() => setSummaryOpen(false)}
+      />
     </Screen>
   );
 }

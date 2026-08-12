@@ -21,7 +21,9 @@ export interface ConnectionDependencies {
   persistBootstrap: (value: MobileBootstrapResponse) => Promise<void>;
   setPhase: (phase: ConnectionPhase) => void;
   setMutationsAllowed: (allowed: boolean) => void;
+  setNegotiatedCapabilities?: (capabilities: string[]) => void;
   applyBootstrap: (value: MobileBootstrapResponse) => void;
+  onSynchronized?: () => void;
   onMessage?: (message: ServerToWeb) => void;
   isAuthenticationLoss?: (error: unknown) => boolean;
   onAuthenticationLost?: () => void;
@@ -193,11 +195,13 @@ export class ConnectionSupervisor {
 
     if (message.type === "authenticated") {
       this.dependencies.setMutationsAllowed(message.mutations_allowed !== false);
+      this.dependencies.setNegotiatedCapabilities?.(message.negotiated_capabilities ?? []);
       await this.synchronize(generation, socket);
       return;
     }
     if (message.type === "protocol_incompatible") {
       this.dependencies.setMutationsAllowed(false);
+      this.dependencies.setNegotiatedCapabilities?.([]);
       await this.synchronize(generation, socket);
       return;
     }
@@ -262,6 +266,7 @@ export class ConnectionSupervisor {
       }
       this.attempts = 0;
       this.dependencies.setPhase("ready");
+      this.dependencies.onSynchronized?.();
     } catch (error) {
       if (this.dependencies.isAuthenticationLoss?.(error)) {
         this.dependencies.onAuthenticationLost?.();

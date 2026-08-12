@@ -1,7 +1,13 @@
 import * as SQLite from "expo-sqlite";
-import type { CodeEvent, MobileSessionSummary } from "@apas/protocol";
+import {
+  validateServerMessage,
+  type CodeEvent,
+  type MobileSessionSummary,
+  type PaneWorkSummary,
+} from "@apas/protocol";
 
 import { getOrCreateCacheKey } from "@/security/credentials";
+import type { PaneWorkSummaryAvailability } from "@/state/store";
 
 const DATABASE_NAME = "apas-code.db";
 let databasePromise: Promise<SQLite.SQLiteDatabase> | null = null;
@@ -12,6 +18,21 @@ interface SessionRow {
 
 interface EventRow {
   payload: string;
+}
+
+interface PaneWorkSummaryRow {
+  payload: string;
+  updated_at: string;
+}
+
+export const MAX_PANE_WORK_SUMMARY_WINDOWS = 56;
+
+export interface CachedPaneWorkSummarySnapshot {
+  sessionId: string;
+  paneId: number;
+  summaries: PaneWorkSummary[];
+  availability: PaneWorkSummaryAvailability;
+  updatedAt: string;
 }
 
 export interface CachedSnapshot {
@@ -83,7 +104,14 @@ export async function openCache(): Promise<SQLite.SQLiteDatabase> {
         pane_id INTEGER NOT NULL,
         updated_at TEXT NOT NULL
       );
-      PRAGMA user_version = 3;
+      CREATE TABLE IF NOT EXISTS pane_work_summary_snapshots (
+        session_id TEXT NOT NULL,
+        pane_id INTEGER NOT NULL,
+        payload TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(session_id, pane_id)
+      );
+      PRAGMA user_version = 4;
     `);
     return db;
   })();
@@ -170,8 +198,11 @@ export async function readCachedSnapshot(sessionId?: string): Promise<CachedSnap
 export async function removeInaccessibleSessions(allowedSessionIds: Set<string>): Promise<void> {
   const db = await openCache();
   const rows = await db.getAllAsync<{ session_id: string }>("SELECT session_id FROM session_summaries");
+  const summaryRows = await db.getAllAsync<{ session_id: string }>(
+    "SELECT DISTINCT session_id FROM pane_work_summary_snapshots",
+  );
   await db.withTransactionAsync(async () => {
-    for (const { session_id: sessionId } of rows) {
+    for (const sessionId of new Set([...rows, ...summaryRows].map((row) => row.session_id))) {
       if (allowedSessionIds.has(sessionId)) continue;
       await db.runAsync("DELETE FROM session_summaries WHERE session_id = ?", sessionId);
       await db.runAsync("DELETE FROM code_events WHERE session_id = ?", sessionId);
@@ -179,8 +210,79 @@ export async function removeInaccessibleSessions(allowedSessionIds: Set<string>)
       await db.runAsync("DELETE FROM conversation_positions WHERE session_id = ?", sessionId);
       await db.runAsync("DELETE FROM conversation_pane_positions WHERE session_id = ?", sessionId);
       await db.runAsync("DELETE FROM selected_conversation_panes WHERE session_id = ?", sessionId);
+      await db.runAsync("DELETE FROM pane_work_summary_snapshots WHERE session_id = ?", sessionId);
     }
   });
+}
+
+export async function writePaneWorkSummarySnapshot(
+  sessionId: string,
+  paneId: number,
+  summaries: PaneWorkSummary[],
+  availability: PaneWorkSummaryAvailability,
+  updatedAt = new Date().toISOString(),
+): Promise<void> {
+  const bounded = boundPaneWorkSummaries(sessionId, paneId, summaries);
+  const db = await openCache();
+  await db.runAsync(
+    `INSERT INTO pane_work_summary_snapshots(session_id, pane_id, payload, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(session_id, pane_id) DO UPDATE SET
+       payload = excluded.payload,
+       updated_at = excluded.updated_at`,
+    sessionId,
+    paneId,
+    JSON.stringify({ summaries: bounded, availability }),
+    updatedAt,
+  );
+}
+
+export async function readPaneWorkSummarySnapshot(
+  sessionId: string,
+  paneId: number,
+): Promise<CachedPaneWorkSummarySnapshot | null> {
+  const db = await openCache();
+  const row = await db.getFirstAsync<PaneWorkSummaryRow>(
+    "SELECT payload, updated_at FROM pane_work_summary_snapshots WHERE session_id = ? AND pane_id = ?",
+    sessionId,
+    paneId,
+  );
+  if (!row) return null;
+  try {
+    const payload = JSON.parse(row.payload) as { summaries?: unknown; availability?: unknown };
+    const message = {
+      type: "pane_work_summaries",
+      session_id: sessionId,
+      pane_id: paneId,
+      summaries: payload.summaries,
+      availability: payload.availability,
+    };
+    if (!validateServerMessage(message).valid || !Array.isArray(payload.summaries)) return null;
+    return {
+      sessionId,
+      paneId,
+      summaries: boundPaneWorkSummaries(sessionId, paneId, payload.summaries as PaneWorkSummary[]),
+      availability: (payload.availability ?? "unknown") as PaneWorkSummaryAvailability,
+      updatedAt: row.updated_at,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function boundPaneWorkSummaries(
+  sessionId: string,
+  paneId: number,
+  summaries: PaneWorkSummary[],
+): PaneWorkSummary[] {
+  const byWindow = new Map<string, PaneWorkSummary>();
+  for (const summary of summaries) {
+    if (summary.session_id !== sessionId || summary.pane_id !== paneId) continue;
+    byWindow.set(summary.window_start, summary);
+  }
+  return [...byWindow.values()]
+    .sort((left, right) => right.window_start.localeCompare(left.window_start))
+    .slice(0, MAX_PANE_WORK_SUMMARY_WINDOWS);
 }
 
 export async function saveTaskDraft(draftKey: string, value: unknown): Promise<void> {

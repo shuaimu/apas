@@ -1,6 +1,6 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useStore, type Message, type PaneConfig } from "@/lib/store";
+import { paneWorkSummaryKey, useStore, type Message, type PaneConfig, type PaneWorkSummary } from "@/lib/store";
 import { MobileSessionActivity, type MobileSessionActivityProps } from "./MobileSessionActivity";
 
 vi.mock("@/components/tabs/TerminalPane", () => ({
@@ -30,6 +30,23 @@ function message(overrides: Partial<Message> & Pick<Message, "id">): Message {
   };
 }
 
+function summary(overrides: Partial<PaneWorkSummary> = {}): PaneWorkSummary {
+  return {
+    protocolVersion: 1,
+    sessionId: "session-a",
+    paneId: 3,
+    windowStart: "2026-08-11T03:00:00Z",
+    windowEnd: "2026-08-11T06:00:00Z",
+    windowKind: "completed",
+    status: "complete",
+    summary: "Implemented the selected pane workflow and verified its focused behavior.",
+    sourceDigest: "digest-3",
+    sourceMessageCount: 5,
+    attempts: 1,
+    ...overrides,
+  };
+}
+
 function seedStore(overrides: Record<string, unknown> = {}) {
   const loadSessionActivity = vi.fn();
   const loadPaneMessagesIfNeeded = vi.fn();
@@ -43,6 +60,8 @@ function seedStore(overrides: Record<string, unknown> = {}) {
   const answerPlanReview = vi.fn();
   const requestPaneDiff = vi.fn();
   const addPane = vi.fn(() => ({ success: true }));
+  const listPaneWorkSummaries = vi.fn(() => true);
+  const refreshPaneWorkSummary = vi.fn(() => true);
 
   act(() => {
     useStore.setState({
@@ -73,6 +92,8 @@ function seedStore(overrides: Record<string, unknown> = {}) {
         },
       },
       paneDiffs: {},
+      paneWorkSummaries: {},
+      negotiatedCapabilities: new Set<string>(),
       loadSessionActivity,
       loadPaneMessagesIfNeeded,
       loadMoreMessages,
@@ -85,6 +106,8 @@ function seedStore(overrides: Record<string, unknown> = {}) {
       answerPlanReview,
       requestPaneDiff,
       addPane,
+      listPaneWorkSummaries,
+      refreshPaneWorkSummary,
       ...overrides,
     });
   });
@@ -97,8 +120,10 @@ function seedStore(overrides: Record<string, unknown> = {}) {
     loadMoreMessages,
     loadPaneMessagesIfNeeded,
     loadSessionActivity,
+    listPaneWorkSummaries,
     reject,
     requestPaneDiff,
+    refreshPaneWorkSummary,
     sendMessageToPane,
     sendTerminalConversationMessage,
     sendTerminalInput,
@@ -414,5 +439,92 @@ describe("MobileSessionActivity", () => {
     expect(props.onAccount).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByText(/tap to reconnect/));
     expect(props.onReconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens pane-scoped summaries and sends exact refresh and retry requests", async () => {
+    const failedStart = "2026-08-11T00:00:00Z";
+    const actions = seedStore({
+      negotiatedCapabilities: new Set(["pane_work_summary_v1"]),
+      paneWorkSummaries: {
+        [paneWorkSummaryKey("session-a", 3)]: {
+          availability: "available",
+          loading: false,
+          summaries: [
+            summary(),
+            summary({
+              windowStart: failedStart,
+              windowEnd: "2026-08-11T03:00:00Z",
+              status: "failed",
+              summary: undefined,
+              sourceDigest: "failed-3",
+              error: "Provider quota exceeded",
+            }),
+          ],
+        },
+      },
+    });
+    renderActivity();
+
+    fireEvent.click(screen.getByRole("button", { name: "Summary" }));
+    expect(await screen.findByRole("dialog", { name: "Work summaries for Codex 3" })).toBeTruthy();
+    expect(actions.listPaneWorkSummaries).toHaveBeenCalledWith("session-a", 3, true);
+    expect(screen.getByText(/Implemented the selected pane workflow/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(actions.refreshPaneWorkSummary).toHaveBeenCalledWith("session-a", 3);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(actions.refreshPaneWorkSummary).toHaveBeenCalledWith("session-a", 3, failedStart);
+  });
+
+  it("switches summary panes atomically without sibling content", async () => {
+    const actions = seedStore({
+      negotiatedCapabilities: new Set(["pane_work_summary_v1"]),
+      paneConfigs: [
+        pane({ pane_id: 3, label: "Codex 3" }),
+        pane({ pane_id: 4, label: "Claude 4", provider: "claude" }),
+      ],
+      paneMessages: { "3": [], "4": [] },
+      paneWorkSummaries: {
+        [paneWorkSummaryKey("session-a", 3)]: {
+          availability: "available",
+          loading: false,
+          summaries: [summary({ summary: "Only summary three" })],
+        },
+        [paneWorkSummaryKey("session-a", 4)]: {
+          availability: "available",
+          loading: false,
+          summaries: [summary({ paneId: 4, summary: "Only summary four", sourceDigest: "digest-4" })],
+        },
+      },
+    });
+    renderActivity();
+    fireEvent.click(screen.getByRole("button", { name: "Summary" }));
+    expect(await screen.findByText("Only summary three")).toBeTruthy();
+
+    fireEvent.click(within(screen.getByRole("dialog", { name: "Work summaries for Codex 3" })).getByRole("button", { name: "Claude 4" }));
+    expect(await screen.findByText("Only summary four")).toBeTruthy();
+    expect(screen.queryByText("Only summary three")).toBeNull();
+    expect(actions.listPaneWorkSummaries).toHaveBeenLastCalledWith("session-a", 4, true);
+  });
+
+  it("keeps the mounted conversation and its scroll position while summaries open", () => {
+    seedStore({ negotiatedCapabilities: new Set(["pane_work_summary_v1"]) });
+    renderActivity();
+    const conversation = screen.getByRole("log", { name: "Conversation activity" }) as HTMLDivElement;
+    conversation.scrollTop = 123;
+    fireEvent.scroll(conversation);
+
+    fireEvent.click(screen.getByRole("button", { name: "Summary" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close work summary" }));
+
+    const restored = screen.getByRole("log", { name: "Conversation activity" }) as HTMLDivElement;
+    expect(restored).toBe(conversation);
+    expect(restored.scrollTop).toBe(123);
+  });
+
+  it("does not offer summaries when the server did not negotiate support", () => {
+    seedStore({ negotiatedCapabilities: new Set() });
+    renderActivity();
+    expect(screen.queryByRole("button", { name: "Summary" })).toBeNull();
   });
 });

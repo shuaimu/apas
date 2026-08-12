@@ -2305,12 +2305,25 @@ mod tests {
         let cli_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
         let session_id = Uuid::new_v4();
+        let web_id = Uuid::new_v4();
+        let other_web_id = Uuid::new_v4();
         let (cli_tx, _cli_rx) = mpsc::channel(1);
+        let (web_tx, _web_rx) = mpsc::channel(1);
+        let (other_web_tx, _other_web_rx) = mpsc::channel(1);
         mgr.register_cli(cli_id, user_id, cli_tx, None);
         mgr.create_cli_session(session_id, cli_id, None, None);
+        mgr.register_web(web_id, web_tx);
+        mgr.register_web(other_web_id, other_web_tx);
         assert!(!mgr.session_supports_capability(&session_id, shared::PROJECT_POLICY_CAPABILITY,));
         mgr.set_cli_capabilities(cli_id, vec![shared::PROJECT_POLICY_CAPABILITY.to_string()]);
         assert!(mgr.session_supports_capability(&session_id, shared::PROJECT_POLICY_CAPABILITY,));
+        assert!(!mgr.web_supports_capability(&web_id, shared::PANE_WORK_SUMMARY_CAPABILITY));
+        mgr.set_web_capabilities(
+            web_id,
+            vec![shared::PANE_WORK_SUMMARY_CAPABILITY.to_string()],
+        );
+        assert!(mgr.web_supports_capability(&web_id, shared::PANE_WORK_SUMMARY_CAPABILITY));
+        assert!(!mgr.web_supports_capability(&other_web_id, shared::PANE_WORK_SUMMARY_CAPABILITY));
     }
 
     #[tokio::test]

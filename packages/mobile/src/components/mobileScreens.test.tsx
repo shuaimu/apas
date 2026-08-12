@@ -1,6 +1,6 @@
 import { FlatList, ScrollView, StyleSheet } from "react-native";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react-native";
-import type { CodeEvent, MobileLaunchTarget, MobileSessionSummary, PaneConfig, WebToServer } from "@apas/protocol";
+import type { CodeEvent, MobileLaunchTarget, MobileSessionSummary, PaneConfig, PaneWorkSummary, WebToServer } from "@apas/protocol";
 
 import CodeHomeScreen from "@/../app/(code)/(tabs)/index";
 import NewTaskScreen from "@/../app/(code)/new";
@@ -23,6 +23,7 @@ const mockReadConversationPosition = jest.fn();
 const mockSaveConversationPosition = jest.fn();
 const mockReadSelectedConversationPane = jest.fn();
 const mockSaveSelectedConversationPane = jest.fn();
+const mockReadPaneWorkSummarySnapshot = jest.fn();
 const mockRandomUUID = jest.fn(() => "04cbf715-81d0-42ca-86c5-87913e77c2c9");
 
 jest.mock("expo-router", () => ({
@@ -44,6 +45,7 @@ jest.mock("@/storage/cache", () => ({
   saveConversationPosition: (...args: unknown[]) => mockSaveConversationPosition(...args),
   readSelectedConversationPane: (...args: unknown[]) => mockReadSelectedConversationPane(...args),
   saveSelectedConversationPane: (...args: unknown[]) => mockSaveSelectedConversationPane(...args),
+  readPaneWorkSummarySnapshot: (...args: unknown[]) => mockReadPaneWorkSummarySnapshot(...args),
 }));
 jest.mock("@/api/client", () => ({ launchTask: (...args: unknown[]) => mockLaunchTask(...args) }));
 jest.mock("expo-crypto", () => ({ randomUUID: () => mockRandomUUID() }));
@@ -98,6 +100,19 @@ function event(index: number): CodeEvent {
   };
 }
 
+function workSummary(paneId: number, status: PaneWorkSummary["status"] = "complete"): PaneWorkSummary {
+  return {
+    session_id: session.id,
+    pane_id: paneId,
+    window_start: "2026-08-08T09:00:00Z",
+    window_end: "2026-08-08T12:00:00Z",
+    status,
+    summary: `Pane ${paneId} summarized work`,
+    source_message_count: 4,
+    provider: "codex",
+  };
+}
+
 describe("mobile code screens", () => {
   beforeEach(() => {
     cleanup();
@@ -112,6 +127,7 @@ describe("mobile code screens", () => {
     mockSaveConversationPosition.mockReset().mockResolvedValue(undefined);
     mockReadSelectedConversationPane.mockReset().mockReturnValue(new Promise(() => undefined));
     mockSaveSelectedConversationPane.mockReset().mockResolvedValue(undefined);
+    mockReadPaneWorkSummarySnapshot.mockReset().mockResolvedValue(null);
     mockRandomUUID.mockClear();
     mockReadCachedSnapshot.mockReset();
     useMobileStore.setState({
@@ -123,6 +139,9 @@ describe("mobile code screens", () => {
       eventsBySession: {},
       panesBySession: {},
       paneStatusesBySession: {},
+      negotiatedCapabilities: [],
+      paneWorkSummaries: {},
+      visibleSummaryPane: null,
       lastUpdatedAt: null,
       launchTargets: [],
       features: {},
@@ -350,6 +369,122 @@ describe("mobile code screens", () => {
       (message) => message.type === "list_pane_work_summaries" || message.type === "refresh_pane_work_summary",
     )).toEqual([]);
     expect(view.getByPlaceholderText("Message this terminal conversation").props.value).toBe("");
+  });
+
+  it("opens pane-scoped summaries without unmounting or resetting the conversation", async () => {
+    const paneThreeEvent = event(3);
+    const paneFourEvent = { ...event(4), pane_id: 4, summary: "Pane four conversation" };
+    mockParams = { sessionId: session.id, paneId: "3" };
+    mockReadCachedSnapshot.mockReturnValue(new Promise(() => undefined));
+    useMobileStore.setState({
+      sessions: [session],
+      eventsBySession: { [session.id]: [paneThreeEvent, paneFourEvent] },
+      panesBySession: {
+        [session.id]: [
+          { ...terminalPane, pane_id: 3, kind: "agent", label: "Codex 3" },
+          { ...terminalPane, pane_id: 4, kind: "agent", label: "Claude 4", provider: "claude" },
+        ],
+      },
+      negotiatedCapabilities: ["pane_work_summary_v1"],
+    });
+    const view = render(<SessionActivityScreen />);
+    const timeline = view.UNSAFE_getAllByType(FlatList).find((list) => list.props.data?.[0]?.id === paneThreeEvent.id);
+    fireEvent.scroll(timeline!, {
+      nativeEvent: {
+        contentOffset: { x: 0, y: 260 },
+        contentSize: { width: 300, height: 1200 },
+        layoutMeasurement: { width: 300, height: 500 },
+      },
+    });
+
+    fireEvent.press(view.getByText("Summary"));
+    await waitFor(() => expect(mockSend).toHaveBeenCalledWith({
+      type: "list_pane_work_summaries",
+      session_id: session.id,
+      pane_id: 3,
+      include_current: true,
+    }));
+    expect(view.getByTestId("event-message-line").props.children[0]).toBe("Event 3");
+    expect(mockSaveConversationPosition).not.toHaveBeenCalled();
+
+    act(() => useMobileStore.getState().replacePaneWorkSummaries(
+      session.id,
+      3,
+      [workSummary(3, "failed")],
+      "available",
+    ));
+    await waitFor(() => expect(view.getByText("Pane 3 summarized work")).toBeTruthy());
+    fireEvent.press(view.getByText("Refresh current window"));
+    expect(mockSend).toHaveBeenCalledWith({
+      type: "refresh_pane_work_summary",
+      session_id: session.id,
+      pane_id: 3,
+    });
+    act(() => useMobileStore.getState().replacePaneWorkSummaries(
+      session.id,
+      3,
+      [workSummary(3, "failed")],
+      "available",
+    ));
+    fireEvent.press(view.getByText("Retry"));
+    expect(mockSend).toHaveBeenCalledWith({
+      type: "refresh_pane_work_summary",
+      session_id: session.id,
+      pane_id: 3,
+      window_start: "2026-08-08T09:00:00Z",
+    });
+
+    act(() => useMobileStore.getState().replacePaneWorkSummaries(
+      session.id,
+      4,
+      [workSummary(4)],
+      "available",
+    ));
+    const claudePaneButtons = view.getAllByText("Claude 4");
+    fireEvent.press(claudePaneButtons.at(-1)!);
+    await waitFor(() => expect(mockSend).toHaveBeenCalledWith({
+      type: "list_pane_work_summaries",
+      session_id: session.id,
+      pane_id: 4,
+      include_current: true,
+    }));
+    expect(view.getByText("Pane 4 summarized work")).toBeTruthy();
+    expect(view.queryByText("Pane 3 summarized work")).toBeNull();
+    expect(view.getByTestId("event-message-line").props.children[0]).toBe("Pane four conversation");
+    expect(mockSaveConversationPosition).toHaveBeenCalledWith(session.id, 3, {
+      offset: 260,
+      followNewest: false,
+    });
+
+    fireEvent.press(view.getByText("Close"));
+    expect(view.getByTestId("event-message-line").props.children[0]).toBe("Pane four conversation");
+    expect(view.getByText("✓ Claude 4")).toBeTruthy();
+  });
+
+  it("shows a fresh, pane-isolated cached summary offline with controls disabled", async () => {
+    mockParams = { sessionId: session.id, paneId: "3" };
+    mockReadCachedSnapshot.mockReturnValue(new Promise(() => undefined));
+    mockReadPaneWorkSummarySnapshot.mockResolvedValue({
+      sessionId: session.id,
+      paneId: 3,
+      summaries: [workSummary(3)],
+      availability: "available",
+      updatedAt: "2026-08-12T12:00:00Z",
+    });
+    useMobileStore.setState({
+      connection: "offline",
+      sessions: [session],
+      panesBySession: { [session.id]: [{ ...terminalPane, pane_id: 3, kind: "agent", label: "Codex 3" }] },
+      negotiatedCapabilities: ["pane_work_summary_v1"],
+    });
+    const view = render(<SessionActivityScreen />);
+    fireEvent.press(view.getByText("Summary"));
+
+    await waitFor(() => expect(view.getByText("Pane 3 summarized work")).toBeTruthy());
+    expect(view.getByText(/Offline cached view · updated/)).toBeTruthy();
+    fireEvent.press(view.getByRole("button", { name: "Refresh current window" }));
+    expect(mockSend.mock.calls.some(([message]) => message.type === "refresh_pane_work_summary")).toBe(false);
+    expect(mockSend.mock.calls.some(([message]) => message.type === "list_pane_work_summaries")).toBe(false);
   });
 
   it("shows and clears the selected pane's live working state", async () => {

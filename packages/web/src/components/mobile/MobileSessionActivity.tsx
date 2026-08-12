@@ -7,6 +7,7 @@ import {
   ArrowLeft,
   ChevronDown,
   ChevronUp,
+  History,
   LoaderCircle,
   Plus,
   Send,
@@ -16,6 +17,7 @@ import {
   X,
 } from "lucide-react";
 import { AskUserQuestionCard } from "@/components/tools/AskUserQuestionCard";
+import { MobilePaneWorkSummarySheet } from "./MobilePaneWorkSummarySheet";
 import {
   paneKey,
   useStore,
@@ -285,6 +287,7 @@ export function MobileSessionActivity({ connected, onAccount, onBack, onReconnec
   const reject = useStore((state) => state.reject);
   const answerPlanReview = useStore((state) => state.answerPlanReview);
   const addPane = useStore((state) => state.addPane);
+  const summarySupported = useStore((state) => state.negotiatedCapabilities.has("pane_work_summary_v1"));
 
   const [selectedPaneId, setSelectedPaneId] = useState<number | null>(null);
   const [followUp, setFollowUp] = useState("");
@@ -292,6 +295,7 @@ export function MobileSessionActivity({ connected, onAccount, onBack, onReconnec
   const [activityLimit, setActivityLimit] = useState(INITIAL_ACTIVITY_LIMIT);
   const [terminalPaneId, setTerminalPaneId] = useState<number | null>(null);
   const [newPaneOpen, setNewPaneOpen] = useState(false);
+  const [summaryOpen, setSummaryOpen] = useState(false);
   const activityScrollRef = useRef<HTMLDivElement>(null);
   const restoredScrollContextRef = useRef<string | null>(null);
   const restoredScrollElementRef = useRef<HTMLDivElement | null>(null);
@@ -532,6 +536,9 @@ export function MobileSessionActivity({ connected, onAccount, onBack, onReconnec
             persistActivityScroll();
             setTerminalPaneId(selectedPaneId);
           }} className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-[#dedee7] bg-white px-3 py-2 text-xs font-bold disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"><SquareTerminal className="h-4 w-4" /> Raw terminal</button>
+          {summarySupported && (
+            <button type="button" disabled={selectedPaneId === null} onClick={() => setSummaryOpen(true)} className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-[#dedee7] bg-white px-3 py-2 text-xs font-bold disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"><History className="h-4 w-4" /> Summary</button>
+          )}
         </div>
       </div>
 
@@ -608,6 +615,17 @@ export function MobileSessionActivity({ connected, onAccount, onBack, onReconnec
             </div>
           </div>
         </div>
+      )}
+
+      {summaryOpen && selectedPaneId !== null && (
+        <MobilePaneWorkSummarySheet
+          connected={connected}
+          sessionId={sessionId}
+          paneId={selectedPaneId}
+          panes={paneConfigs}
+          onSelectPane={selectPane}
+          onClose={() => setSummaryOpen(false)}
+        />
       )}
     </section>
   );

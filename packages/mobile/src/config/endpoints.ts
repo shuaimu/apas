@@ -23,4 +23,5 @@ export const MOBILE_CAPABILITIES = [
   "code_events",
   "coding_mutations",
   "terminal",
+  "pane_work_summary_v1",
 ] as const;
