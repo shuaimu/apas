@@ -6,6 +6,14 @@ export const metadata: Metadata = {
   title: "APAS - Claude Code Remote",
   description: "Web interface for Claude Code",
   manifest: "/manifest.json",
+  icons: {
+    icon: [
+      { url: "/favicon.svg", type: "image/svg+xml" },
+      { url: "/icon-32.png", sizes: "32x32", type: "image/png" },
+    ],
+    shortcut: "/icon-32.png",
+    apple: [{ url: "/apple-touch-icon.png", sizes: "180x180", type: "image/png" }],
+  },
   appleWebApp: {
     capable: true,
     statusBarStyle: "default",

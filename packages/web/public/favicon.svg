@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="APAS terminal">
+  <rect width="512" height="512" rx="112" fill="#5b5bd6"/>
+  <rect x="72" y="88" width="368" height="336" rx="52" fill="#171729"/>
+  <circle cx="128" cy="140" r="14" fill="#ff6b6b"/>
+  <circle cx="174" cy="140" r="14" fill="#ffd166"/>
+  <circle cx="220" cy="140" r="14" fill="#66d9a4"/>
+  <path d="m148 210 72 62-72 62" fill="none" stroke="#fff" stroke-linecap="round" stroke-linejoin="round" stroke-width="34"/>
+  <path d="M254 334h104" fill="none" stroke="#b8b8ff" stroke-linecap="round" stroke-width="34"/>
+</svg>
