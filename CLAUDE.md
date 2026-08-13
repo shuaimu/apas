@@ -641,12 +641,20 @@ otherwise have had to volunteer.
   start timestamp in `session_meta`, so a pane is matched to the newest rollout
   in its own directory. That is a heuristic; two codex panes in the same
   directory could in principle be confused.
+- **opencode** — OpenCode owns its `ses_*` identifiers, so APAS asks
+  `opencode session list --format json` for the newest session whose directory
+  exactly matches the pane cwd, then reads it with `opencode export <id>`.
+  Like Codex, two panes sharing a cwd are inherently ambiguous; sessions from
+  another directory are never selected.
 
 Parsing keeps only real conversation. claude transcripts also carry `mode`,
 `ai-title`, `last-prompt` bookkeeping; codex carries `developer` messages (the
-harness's own injected context), `reasoning`, and tool calls. None of those are
-turns, and rendering them would be noise. Tool-use-only turns with no text are
-skipped rather than recorded blank.
+harness's own injected context), `reasoning`, and tool calls; OpenCode exports
+typed reasoning/tool/synthetic parts. None of those are turns, and rendering
+them would be noise. Tool-use-only turns with no text are skipped rather than
+recorded blank. In-progress OpenCode assistant messages are held until their
+completion timestamp arrives so APAS never advances its cursor over a partial
+reply.
 
 **The conversation view is writable, and that is the point on mobile.** An
 xterm TUI on a phone is close to unusable — no modifier keys, tiny hit targets,
@@ -669,7 +677,8 @@ agent pane gets — the captured turns arrive as ordinary pane messages, so
 `MessagePane` renders them with no special casing. The two are not equivalent
 and the UI says so: the terminal is live and interactive, while the
 conversation is a *reading* of the transcript that lags by up to one poll,
-shows only user/assistant turns, and cannot be typed into. The terminal stays
+shows only user/assistant turns, and sends typed messages into the same live
+pty. The terminal stays
 mounted-but-hidden behind the conversation view, because unmounting would tear
 down the xterm instance and force a re-attach, losing scroll position and focus
 on every glance at the transcript.
@@ -721,7 +730,7 @@ whole cycle; it releases on fd close, so a killed pane cannot wedge the project.
 
 ## Terminal panes (`kind: "terminal"`)
 
-New user-created Claude and Codex work uses `kind: "terminal"`. The structured
+New user-created Claude, Codex, and OpenCode work uses `kind: "terminal"`. The structured
 `kind: "agent"` path is retained for managed team roles and historical panes:
 the CLI runs the provider headlessly and parses stream-json into structured
 events. Missing `kind` still deserializes as `agent` so old `.apas` files remain
@@ -733,8 +742,17 @@ to xterm.js in the browser. Nothing is parsed, so nothing has to be kept in
 sync with a provider's output format — the point is to reuse the CLI as it
 ships.
 
-Only `claude` and `codex` can host one (`terminal_pane::terminal_binary_for`);
-DeepSeek, OpenCode, and Cursor Agent have unverified pty behaviour.
+Only `claude`, `codex`, and `opencode` can host one
+(`terminal_pane::terminal_binary_for`); DeepSeek and Cursor Agent have
+unverified pty behaviour. OpenCode launches with `--auto`; a fresh mobile task
+uses `--prompt <instruction>`, while restoration uses `--continue`.
+
+APAS does not install OpenCode, choose its model provider, or authenticate it.
+Install and authenticate OpenCode on every intended project host before enabling
+the profile. The default executable is `opencode`; override a nonstandard
+installation with `apas config set opencode_path /path/to/opencode`. Existing
+explicit cluster/project allowlists remain opt-in and must add
+`terminal:opencode:official:default` through the normal policy controls.
 
 The desktop tab bar, mobile browser pane picker, native mobile task launcher,
 server authorization, and CLI local add-tab path all enforce this boundary.
@@ -805,11 +823,20 @@ running state.
 
 Native mobile launch advertises `mobile_task_launch_v2`. The version bump is
 intentional: v2 creates a terminal pane and passes the first instruction as a
-positional CLI prompt; a v1 CLI would otherwise accept the pane and drop that
-instruction. The server therefore asks the user to update/reconnect the CLI
-instead of pretending an older launch succeeded.
+provider-native CLI prompt; a v1 CLI would otherwise accept the pane and drop
+that instruction. OpenCode additionally requires `terminal_opencode_v1`, so a
+rolling server/web deployment refuses to route it to an older v2 CLI that can
+launch Claude/Codex but not OpenCode. The server asks the user to
+update/reconnect instead of pretending an older launch succeeded.
+
+Roll out OpenCode support in this order: server first, web second, then upgrade
+and reconnect project CLIs so they advertise `terminal_opencode_v1`. Install and
+authenticate OpenCode and opt the intended policies into its profile only after
+the host CLI has reconnected.
 
 **Lifetime.** The pty is a child of the CLI process, so a terminal pane dies
 when `apas` restarts; the restore path re-execs with the provider's own resume
-flow (`claude --resume <pane session id>`, `codex resume`). Claude's pane
-session id is APAS-visible and remains pinned across that restore.
+flow (`claude --resume <pane session id>`, `codex resume`, `opencode
+--continue`). Claude's pane session id is APAS-visible and remains pinned
+across that restore; Codex and OpenCode select their newest session for the
+pane cwd.

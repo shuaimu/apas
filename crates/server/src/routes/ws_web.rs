@@ -1053,7 +1053,21 @@ async fn authorize_new_pane_launch(
         send_policy_error(
             state,
             connection_id,
-            "Conversation-only panes are retired. Create a Claude or Codex terminal pane instead.",
+            "Conversation-only panes are retired. Create a Claude, Codex, or OpenCode terminal pane instead.",
+        )
+        .await;
+        return false;
+    }
+    if kind == shared::PaneKind::Terminal
+        && provider == shared::Provider::Opencode
+        && !state
+            .sessions
+            .session_supports_capability(session_id, shared::OPENCODE_TERMINAL_CAPABILITY)
+    {
+        send_policy_error(
+            state,
+            connection_id,
+            "The project CLI must be updated and reconnected before creating an OpenCode terminal pane.",
         )
         .await;
         return false;
@@ -1329,6 +1343,57 @@ mod retired_launch_authorization_tests {
                 &session_id,
                 shared::PaneKind::Terminal,
                 shared::Provider::Codex,
+                None,
+                false,
+            )
+            .await
+        );
+        assert!(web_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn opencode_terminal_requires_a_capable_cli() {
+        let (state, connection_id, session_id, mut web_rx, mut cli_rx, _cli_id) =
+            policy_state().await;
+
+        assert!(
+            !authorize_new_pane_launch(
+                &state,
+                &connection_id,
+                &session_id,
+                shared::PaneKind::Terminal,
+                shared::Provider::Opencode,
+                None,
+                false,
+            )
+            .await
+        );
+
+        let ServerToWeb::Error { message } = web_rx.try_recv().expect("explicit web error") else {
+            panic!("expected compatibility error")
+        };
+        assert!(message.contains("updated and reconnected"));
+        assert!(cli_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn opencode_terminal_is_authorized_for_a_capable_cli() {
+        let (state, connection_id, session_id, mut web_rx, _cli_rx, cli_id) = policy_state().await;
+        state.sessions.set_cli_capabilities(
+            cli_id,
+            vec![
+                shared::PROJECT_POLICY_CAPABILITY.to_string(),
+                shared::OPENCODE_TERMINAL_CAPABILITY.to_string(),
+            ],
+        );
+
+        assert!(
+            authorize_new_pane_launch(
+                &state,
+                &connection_id,
+                &session_id,
+                shared::PaneKind::Terminal,
+                shared::Provider::Opencode,
                 None,
                 false,
             )
@@ -5398,16 +5463,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                         continue;
                     }
-                    let Ok((_project_id, _project_guard)) =
+                    let Ok((_project_id, project_guard)) =
                         state.active_session_operation(&sid.to_string()).await
                     else {
                         continue;
                     };
-                    match state
-                        .pane_work_summaries
-                        .list_for_pane(sid, pane_id, include_current)
-                        .await
-                    {
+                    match state.pane_work_summaries.list_for_pane(sid, pane_id).await {
                         Ok((summaries, availability)) => {
                             state
                                 .sessions
@@ -5421,6 +5482,24 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     },
                                 )
                                 .await;
+                            if include_current {
+                                let summaries = state.pane_work_summaries.clone();
+                                tokio::spawn(async move {
+                                    // Keep project deletion behind this cache/current-window
+                                    // reconciliation just as it was for the synchronous path.
+                                    let _project_guard = project_guard;
+                                    if let Err(error) =
+                                        summaries.reconcile_current_for_pane(sid, pane_id).await
+                                    {
+                                        tracing::warn!(
+                                            %sid,
+                                            pane_id,
+                                            %error,
+                                            "Failed to reconcile current pane summary"
+                                        );
+                                    }
+                                });
+                            }
                         }
                         Err(error) => {
                             tracing::warn!(%sid, pane_id, %error, "Failed to list pane summaries");

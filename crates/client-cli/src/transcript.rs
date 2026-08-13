@@ -12,9 +12,11 @@
 //! task recorded nothing at all. Those instructions are advisory and the
 //! clients treat them as such.
 //!
-//! Both providers already write a complete transcript to disk, so this reads
-//! that instead. It needs no cooperation, cannot be skipped, and carries token
-//! usage the agent would have had to volunteer.
+//! The providers already retain a complete transcript, so this reads that
+//! instead. Claude and Codex expose local files; OpenCode exposes the same
+//! data through its stable `session list --format json` and `export` CLI
+//! commands. It needs no agent cooperation and carries token usage the agent
+//! would otherwise have had to volunteer.
 //!
 //! **Locating the file differs by provider, and so does the confidence:**
 //!
@@ -27,10 +29,15 @@
 //!   is a heuristic: two codex panes started in the same directory within the
 //!   same second could in principle be confused. Bounded by requiring the cwd
 //!   to match exactly.
+//! * **opencode** — session IDs are generated as `ses_*`, so APAS cannot pin
+//!   its UUID at creation. The newest session whose exported `directory`
+//!   exactly matches the pane cwd is selected, then exported by ID. This has
+//!   the same shared-cwd ambiguity as Codex but never crosses directories.
 
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::conversation::TurnRecord;
 
@@ -198,6 +205,174 @@ pub fn parse_codex(raw: &str) -> Vec<TurnRecord> {
         });
     }
     out
+}
+
+fn millis_timestamp(value: Option<i64>) -> String {
+    value
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|timestamp| timestamp.to_rfc3339())
+        .unwrap_or_default()
+}
+
+/// Turns from `opencode export <session-id>`, oldest first.
+///
+/// OpenCode persists one message info object plus typed parts. Only completed
+/// assistant messages are emitted: exporting while text is streaming can
+/// otherwise advance APAS's turn cursor with a partial reply that will never
+/// be corrected. Synthetic/ignored text, reasoning, tools, and attachments are
+/// intentionally excluded from the human conversation.
+pub fn parse_opencode(raw: &str) -> Vec<TurnRecord> {
+    let Ok(export) = serde_json::from_str::<Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(messages) = export.get("messages").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut turns = Vec::new();
+    for entry in messages {
+        let info = entry.get("info").unwrap_or(&Value::Null);
+        let Some(role @ ("user" | "assistant")) = info.get("role").and_then(Value::as_str) else {
+            continue;
+        };
+        if role == "assistant"
+            && info
+                .get("time")
+                .and_then(|time| time.get("completed"))
+                .and_then(Value::as_i64)
+                .is_none()
+        {
+            continue;
+        }
+        let text = entry
+            .get("parts")
+            .and_then(Value::as_array)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                    .filter(|part| {
+                        !part
+                            .get("ignored")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                            && !part
+                                .get("synthetic")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false)
+                    })
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        if text.trim().is_empty() {
+            continue;
+        }
+        let finish = info.get("finish").and_then(Value::as_str);
+        let completes_work = role == "assistant"
+            && finish
+                .is_some_and(|reason| !matches!(reason, "tool-calls" | "tool_calls" | "tool_use"));
+        let tokens = info.get("tokens");
+        let token = |key: &str| {
+            tokens
+                .and_then(|value| value.get(key))
+                .and_then(Value::as_u64)
+        };
+        let model = if role == "assistant" {
+            info.get("modelID").and_then(Value::as_str)
+        } else {
+            info.get("model")
+                .and_then(|model| model.get("modelID"))
+                .and_then(Value::as_str)
+        };
+        turns.push(TurnRecord {
+            ts: millis_timestamp(
+                info.get("time")
+                    .and_then(|time| time.get("created"))
+                    .and_then(Value::as_i64),
+            ),
+            pane_id: 0,
+            role: role.to_string(),
+            text,
+            model: model.map(str::to_string),
+            input_tokens: token("input"),
+            output_tokens: token("output"),
+            completes_work,
+        });
+    }
+    turns
+}
+
+fn same_directory(left: &Path, right: &Path) -> bool {
+    let left = std::fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = std::fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    left == right
+}
+
+/// Select the newest OpenCode session scoped to this exact working directory.
+pub fn parse_opencode_session_list(raw: &str, cwd: &Path) -> Option<String> {
+    let sessions = serde_json::from_str::<Value>(raw).ok()?;
+    sessions
+        .as_array()?
+        .iter()
+        .filter_map(|session| {
+            let directory = session.get("directory").and_then(Value::as_str)?;
+            if !same_directory(Path::new(directory), cwd) {
+                return None;
+            }
+            let id = session.get("id").and_then(Value::as_str)?;
+            let updated = session
+                .get("updated")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            Some((updated, id.to_string()))
+        })
+        .max_by_key(|(updated, _)| *updated)
+        .map(|(_, id)| id)
+}
+
+/// Ask OpenCode for the newest retained session in `cwd`.
+pub fn find_opencode_session(binary: &str, cwd: &Path) -> Result<Option<String>> {
+    let output = Command::new(binary)
+        .args(["session", "list", "--format", "json", "--max-count", "100"])
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("run {binary} session list"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "{binary} session list failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(parse_opencode_session_list(
+        &String::from_utf8_lossy(&output.stdout),
+        cwd,
+    ))
+}
+
+/// Export and parse one exact OpenCode session, stamping its pane identity.
+pub fn read_opencode_turns(
+    binary: &str,
+    cwd: &Path,
+    session_id: &str,
+    pane_id: u32,
+) -> Result<Vec<TurnRecord>> {
+    let output = Command::new(binary)
+        .args(["export", session_id])
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("run {binary} export {session_id}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "{binary} export failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut turns = parse_opencode(&String::from_utf8_lossy(&output.stdout));
+    for turn in &mut turns {
+        turn.pane_id = pane_id;
+    }
+    Ok(turns)
 }
 
 /// Newest codex rollout whose `session_meta.cwd` matches `cwd`.
@@ -379,6 +554,65 @@ mod tests {
             "{before}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\"}}}}"
         );
         assert!(parse_codex(&after)[0].completes_work);
+    }
+
+    #[test]
+    fn opencode_export_keeps_only_real_completed_conversation() {
+        let raw = r#"{
+          "info":{"id":"ses_1","directory":"/work"},
+          "messages":[
+            {"info":{"role":"user","time":{"created":1786593600000},"model":{"modelID":"gpt-5"}},"parts":[
+              {"type":"text","text":"fix it"},
+              {"type":"text","text":"hidden","synthetic":true}
+            ]},
+            {"info":{"role":"assistant","time":{"created":1786593601000,"completed":1786593602000},"modelID":"gpt-5","finish":"tool-calls","tokens":{"input":12,"output":3}},"parts":[
+              {"type":"text","text":"I will inspect it."},
+              {"type":"reasoning","text":"private chain"}
+            ]},
+            {"info":{"role":"assistant","time":{"created":1786593603000},"modelID":"gpt-5"},"parts":[
+              {"type":"text","text":"partial response"}
+            ]},
+            {"info":{"role":"assistant","time":{"created":1786593603000,"completed":1786593604000},"modelID":"gpt-5","finish":"stop","tokens":{"input":20,"output":8}},"parts":[
+              {"type":"text","text":"Fixed and tested."},
+              {"type":"tool","state":{"status":"completed"}}
+            ]}
+          ]
+        }"#;
+
+        let turns = parse_opencode(raw);
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].text, "fix it");
+        assert_eq!(turns[1].text, "I will inspect it.");
+        assert!(!turns[1].completes_work, "tool-call preamble is not idle");
+        assert_eq!(turns[2].text, "Fixed and tested.");
+        assert_eq!(turns[2].model.as_deref(), Some("gpt-5"));
+        assert_eq!(turns[2].input_tokens, Some(20));
+        assert_eq!(turns[2].output_tokens, Some(8));
+        assert!(turns[2].completes_work);
+        assert!(turns.iter().all(|turn| !turn.text.contains("partial")));
+        assert!(turns.iter().all(|turn| !turn.text.contains("private")));
+    }
+
+    #[test]
+    fn opencode_session_selection_is_newest_and_cwd_scoped() {
+        let root = tempfile::tempdir().unwrap();
+        let wanted = root.path().join("wanted");
+        let other = root.path().join("other");
+        std::fs::create_dir_all(&wanted).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let raw = serde_json::json!([
+            {"id":"ses_old","directory":wanted,"updated":1},
+            {"id":"ses_other","directory":other,"updated":999},
+            {"id":"ses_new","directory":wanted,"updated":2}
+        ])
+        .to_string();
+
+        assert_eq!(
+            parse_opencode_session_list(&raw, &wanted).as_deref(),
+            Some("ses_new")
+        );
+        assert!(parse_opencode_session_list(&raw, &root.path().join("missing")).is_none());
     }
 
     #[test]

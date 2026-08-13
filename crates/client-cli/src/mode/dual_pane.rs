@@ -1080,19 +1080,20 @@ fn spawn_terminal_pane(
     // path exact instead of guessed.
     claude_session_id: Uuid,
     provider: &Provider,
+    binary_path: &str,
     working_dir: &str,
     worktree_path: Option<&str>,
     server_tx: &tokio_mpsc::Sender<CliToServer>,
     resume: bool,
     initial_input: Option<&str>,
 ) -> Result<(), String> {
-    let binary = terminal_binary_for(provider).ok_or_else(|| {
+    terminal_binary_for(provider).ok_or_else(|| {
         format!(
-            "[{} cannot host a terminal pane; only claude and codex are supported]",
+            "[{} cannot host a terminal pane; only claude, codex, and opencode are supported]",
             provider_display_name(provider, None)
         )
     })?;
-    let binary_path = resolve_binary_path(binary);
+    let binary_path = resolve_binary_path(binary_path);
     let cwd = worktree_path.unwrap_or(working_dir);
     let env = build_pane_env_overrides(provider, None)?;
 
@@ -2067,14 +2068,24 @@ async fn run_inner(
     // Restore pty-hosted terminal panes. `resume: true` because these are
     // panes that already existed in `.apas` — the pty itself did not
     // survive the restart, so re-exec the provider and resume its conversation
-    // (claude `--resume <pane session id>` / codex `resume`).
+    // (claude `--resume <pane session id>` / codex `resume` / opencode
+    // `--continue`).
     for (pane_id, provider, pane_session_id, worktree) in &terminal_startups {
+        let binary_path = resolve_pane_binary_path(
+            *provider,
+            None,
+            &claude_path,
+            &codex_path,
+            &opencode_path,
+            &cursor_agent_path,
+        );
         if let Err(err) = spawn_terminal_pane(
             &terminal_panes,
             *pane_id,
             session_id,
             *pane_session_id,
             provider,
+            &binary_path,
             &working_dir_str,
             worktree.as_deref(),
             &server_tx,
@@ -2621,9 +2632,9 @@ async fn run_inner(
     // clients see what came before. Polls mtime+size — cheap; only
     // Terminal panes have no stream-json to observe, so their history is read
     // out of the provider's own transcript. Self-reporting via an MCP tool was
-    // tried first and does not work: both claude and codex connect to the
-    // server and will call the tool when told to directly, but neither acts on
-    // the MCP `initialize` instructions, so an ordinary task recorded nothing.
+    // tried first and does not work: providers may connect to the server and
+    // call the tool when told directly, but do not reliably act on MCP
+    // `initialize` instructions, so an ordinary task recorded nothing.
     //
     // Polling rather than the file watcher: the watcher is mtime-gated for
     // deadloop wake-ups and reports only *that* something changed, while this
@@ -2634,6 +2645,7 @@ async fn run_inner(
         let project_for_turns = std::path::PathBuf::from(working_dir_str.clone());
         let metas_for_turns = pane_metas.clone();
         let sessions_for_turns = pane_sessions.clone();
+        let opencode_for_turns = opencode_path.clone();
         // Only panes restored above should suppress their existing history.
         // A pane created after this snapshot must capture from turn zero even
         // if it manages to finish its first turn before the watcher's first
@@ -2648,14 +2660,11 @@ async fn run_inner(
             })
             .unwrap_or_default();
         thread::spawn(move || {
-            let Some(home) = dirs::home_dir() else {
-                tracing::warn!("no home dir; terminal pane history is unavailable");
-                return;
-            };
-            // Per-pane cursor and selected transcript. Tracking the path as
+            let home = dirs::home_dir();
+            // Per-pane cursor and selected transcript. Tracking the source as
             // part of the identity prevents a provider/session/worktree
             // change from applying an old file's cursor to a new transcript.
-            let mut seen: HashMap<u32, (std::path::PathBuf, usize)> = HashMap::new();
+            let mut seen: HashMap<u32, (String, usize)> = HashMap::new();
             let mut seen_completions: HashMap<u32, usize> = HashMap::new();
             while !shutdown_for_turns.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_secs(3));
@@ -2678,32 +2687,68 @@ async fn run_inner(
                 };
 
                 for (pane_id, provider, conv_id, worktree_path) in panes {
-                    let is_codex = matches!(provider, Provider::Codex);
                     let transcript_cwd =
                         terminal_transcript_cwd(&project_for_turns, worktree_path.as_deref());
-                    let path = if is_codex {
-                        // No flag pins a codex session id, so match on cwd.
-                        match crate::transcript::find_codex_rollout(&home, &transcript_cwd) {
-                            Some(p) => p,
-                            None => continue,
+                    let (source, turns) = match provider {
+                        Provider::Codex => {
+                            let Some(home) = home.as_deref() else {
+                                continue;
+                            };
+                            // No flag pins a codex session id, so match on cwd.
+                            let Some(path) =
+                                crate::transcript::find_codex_rollout(home, &transcript_cwd)
+                            else {
+                                continue;
+                            };
+                            let Ok(turns) = crate::transcript::read_turns(&path, pane_id, true)
+                            else {
+                                continue;
+                            };
+                            (format!("codex:{}", path.display()), turns)
                         }
-                    } else {
-                        crate::transcript::claude_transcript_path(
-                            &home,
-                            &transcript_cwd,
-                            &conv_id.to_string(),
-                        )
+                        Provider::Opencode => {
+                            let Ok(Some(opencode_session_id)) =
+                                crate::transcript::find_opencode_session(
+                                    &opencode_for_turns,
+                                    &transcript_cwd,
+                                )
+                            else {
+                                continue;
+                            };
+                            let Ok(turns) = crate::transcript::read_opencode_turns(
+                                &opencode_for_turns,
+                                &transcript_cwd,
+                                &opencode_session_id,
+                                pane_id,
+                            ) else {
+                                continue;
+                            };
+                            (format!("opencode:{opencode_session_id}"), turns)
+                        }
+                        Provider::Claude => {
+                            let Some(home) = home.as_deref() else {
+                                continue;
+                            };
+                            let path = crate::transcript::claude_transcript_path(
+                                home,
+                                &transcript_cwd,
+                                &conv_id.to_string(),
+                            );
+                            let Ok(turns) = crate::transcript::read_turns(&path, pane_id, false)
+                            else {
+                                continue;
+                            };
+                            (format!("claude:{}", path.display()), turns)
+                        }
+                        _ => continue,
                     };
 
-                    let Ok(turns) = crate::transcript::read_turns(&path, pane_id, is_codex) else {
-                        continue;
-                    };
                     let completion_count = turns.iter().filter(|turn| turn.completes_work).count();
                     let restored_at_start = startup_terminal_panes.contains(&pane_id);
-                    let (tracked_path, cursor) = seen.entry(pane_id).or_insert_with(|| {
+                    let (tracked_source, cursor) = seen.entry(pane_id).or_insert_with(|| {
                         let baseline =
                             initial_terminal_transcript_cursor(restored_at_start, turns.len());
-                        (path.clone(), baseline)
+                        (source.clone(), baseline)
                     });
                     let completed = seen_completions.entry(pane_id).or_insert_with(|| {
                         if restored_at_start {
@@ -2712,8 +2757,8 @@ async fn run_inner(
                             0
                         }
                     });
-                    if *tracked_path != path {
-                        *tracked_path = path.clone();
+                    if *tracked_source != source {
+                        *tracked_source = source;
                         *cursor = 0;
                         *completed = 0;
                     }
@@ -3241,6 +3286,7 @@ fn handle_tui_events(
                         session_id,
                         claude_session_id,
                         &provider,
+                        &binary_path,
                         working_dir,
                         worktree_path.as_deref(),
                         &server_tx,
@@ -4690,11 +4736,16 @@ fn build_agent_args(
         #[allow(deprecated)]
         Provider::Minimax | Provider::Glm => (Vec::new(), false),
         Provider::Opencode => {
-            // OpenCode uses: opencode run --format json [-m model] [-c -s session_id] -- <prompt>
+            // OpenCode generates its own `ses_*` identifiers, so the APAS
+            // UUID cannot be passed to --session. Resume the newest session
+            // in this process cwd instead. `--auto` is the documented
+            // non-interactive permission mode and still honors explicit deny
+            // rules from the user's OpenCode configuration.
             let mut base = vec![
                 "run".to_string(),
                 "--format".to_string(),
                 "json".to_string(),
+                "--auto".to_string(),
             ];
             if let Some(model) = model {
                 let trimmed = model.trim();
@@ -4702,29 +4753,12 @@ fn build_agent_args(
                     base.extend_from_slice(&["-m".to_string(), trimmed.to_string()]);
                 }
             }
-            if first_message && try_resume {
-                base.extend_from_slice(&[
-                    "-c".to_string(),
-                    "-s".to_string(),
-                    session_id.to_string(),
-                    "--".to_string(),
-                    prompt.to_string(),
-                ]);
-                (base, true)
-            } else if first_message {
-                base.extend_from_slice(&["--".to_string(), prompt.to_string()]);
-                (base, false)
-            } else {
-                // Subsequent messages — always resume
-                base.extend_from_slice(&[
-                    "-c".to_string(),
-                    "-s".to_string(),
-                    session_id.to_string(),
-                    "--".to_string(),
-                    prompt.to_string(),
-                ]);
-                (base, true)
+            let resume = !first_message || try_resume;
+            if resume {
+                base.push("--continue".to_string());
             }
+            base.extend_from_slice(&["--".to_string(), prompt.to_string()]);
+            (base, resume)
         }
     }
 }
@@ -5008,8 +5042,116 @@ fn try_handle_control_response(
     true
 }
 
+fn convert_opencode_to_claude(line: &str, session_id_str: &str) -> Option<ClaudeStreamMessage> {
+    let event = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    match event.get("type").and_then(serde_json::Value::as_str)? {
+        "text" => {
+            let part = event.get("part")?;
+            let text = part.get("text").and_then(serde_json::Value::as_str)?;
+            if text.trim().is_empty() {
+                return None;
+            }
+            Some(ClaudeStreamMessage::Assistant {
+                message: shared::ClaudeAssistantMessage {
+                    content: vec![ClaudeContentBlock::Text {
+                        text: text.to_string(),
+                    }],
+                    model: "opencode".to_string(),
+                    extra: serde_json::Value::Null,
+                },
+                session_id: session_id_str.to_string(),
+                extra: serde_json::Value::Null,
+            })
+        }
+        "tool_use" => {
+            let part = event.get("part")?;
+            let state = part.get("state").unwrap_or(&serde_json::Value::Null);
+            Some(ClaudeStreamMessage::Assistant {
+                message: shared::ClaudeAssistantMessage {
+                    content: vec![ClaudeContentBlock::ToolUse {
+                        id: part
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("opencode-tool")
+                            .to_string(),
+                        name: part
+                            .get("tool")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("tool")
+                            .to_string(),
+                        input: state
+                            .get("input")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                    }],
+                    model: "opencode".to_string(),
+                    extra: serde_json::Value::Null,
+                },
+                session_id: session_id_str.to_string(),
+                extra: serde_json::Value::Null,
+            })
+        }
+        "step_finish" => {
+            let part = event.get("part").unwrap_or(&serde_json::Value::Null);
+            // OpenCode emits a step_finish after a tool-call step as well as
+            // after the final assistant step. Only the latter completes the
+            // APAS turn; otherwise the working indicator would clear while
+            // OpenCode is still executing tools.
+            if matches!(
+                part.get("reason").and_then(serde_json::Value::as_str),
+                Some("tool-calls" | "tool_calls" | "tool_use")
+            ) {
+                return None;
+            }
+            let tokens = part
+                .get("tokens")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let input = tokens
+                .get("input")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default();
+            let output = tokens
+                .get("output")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default();
+            Some(ClaudeStreamMessage::Result {
+                subtype: "success".to_string(),
+                result: String::new(),
+                total_cost_usd: part
+                    .get("cost")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or_default(),
+                duration_ms: 0,
+                session_id: session_id_str.to_string(),
+                is_error: false,
+                extra: serde_json::json!({
+                    "usage": {
+                        "input_tokens": input,
+                        "output_tokens": output
+                    }
+                }),
+            })
+        }
+        "error" => Some(ClaudeStreamMessage::Result {
+            subtype: "error".to_string(),
+            result: event
+                .get("error")
+                .map(serde_json::Value::to_string)
+                .unwrap_or_else(|| "OpenCode failed".to_string()),
+            total_cost_usd: 0.0,
+            duration_ms: 0,
+            session_id: session_id_str.to_string(),
+            is_error: true,
+            extra: serde_json::Value::Null,
+        }),
+        _ => None,
+    }
+}
+
 /// Parse a line of output and convert to ClaudeStreamMessage based on provider.
-/// For Codex, parses as CodexStreamMessage and converts.
+/// Codex and OpenCode use their documented JSON event formats and are adapted
+/// into the shared renderer shape.
 fn parse_agent_output(
     provider: &Provider,
     line: &str,
@@ -5023,10 +5165,7 @@ fn parse_agent_output(
             Ok(codex_msg) => shared::convert_codex_to_claude(&codex_msg, session_id_str),
             Err(_) => None,
         },
-        Provider::Opencode => {
-            // OpenCode --format json outputs JSON lines; try parsing as ClaudeStreamMessage
-            serde_json::from_str::<ClaudeStreamMessage>(line).ok()
-        }
+        Provider::Opencode => convert_opencode_to_claude(line, session_id_str),
         Provider::CursorAgent => {
             // cursor-agent --output-format stream-json emits Claude-compatible events
             serde_json::from_str::<ClaudeStreamMessage>(line).ok()
@@ -5043,22 +5182,23 @@ mod tests {
         active_usage_providers, auto_cancel_pending_questions_for_new_input,
         boot_restore_try_resume_first, build_agent_args, build_agent_switch_respawn_event,
         build_deadloop_agent_args, build_pane_env_overrides_from_keys, build_pane_list,
-        build_pane_reboot_events, build_user_envelope_line, deadloop_wait_plan,
-        evaluate_deadloop_watchdog, is_codex_stale_session_error, manual_create_pr_worktree_path,
-        normalize_codex_effort, normalize_effort_level, promote_pane_to_managed,
-        refresh_stale_managed_builtin_prompts, reset_deadloop_codex_stale_session,
-        resolve_pane_binary_path, restored_pane_mode_and_pause, retired_launch_rejection_output,
-        route_web_input_to_pane, run_deadloop_session_inner, save_pane_configs,
-        should_recover_deadloop_stale_session, start_bot_preserved_fields, stop_retired_panes,
-        terminal_state_reports, truncate_str_at_char_boundary, update_project_operations,
-        DeadloopWatchdogDecision, DeadloopWatchdogState, InputChannels, PaneInputRouteResult,
-        PaneMeta, PaneMetas, PanePauses, PaneStopRequests, PendingAskQuestion,
-        ASK_USER_QUESTION_AUTO_CANCEL_STATUS, DEEPSEEK_DEFAULT_MODEL, MANAGED_PANE_CREATE_PR_ERROR,
+        build_pane_reboot_events, build_user_envelope_line, convert_opencode_to_claude,
+        deadloop_wait_plan, evaluate_deadloop_watchdog, is_codex_stale_session_error,
+        manual_create_pr_worktree_path, normalize_codex_effort, normalize_effort_level,
+        promote_pane_to_managed, refresh_stale_managed_builtin_prompts,
+        reset_deadloop_codex_stale_session, resolve_pane_binary_path, restored_pane_mode_and_pause,
+        retired_launch_rejection_output, route_web_input_to_pane, run_deadloop_session_inner,
+        save_pane_configs, should_recover_deadloop_stale_session, start_bot_preserved_fields,
+        stop_retired_panes, terminal_state_reports, truncate_str_at_char_boundary,
+        update_project_operations, DeadloopWatchdogDecision, DeadloopWatchdogState, InputChannels,
+        PaneInputRouteResult, PaneMeta, PaneMetas, PanePauses, PaneStopRequests,
+        PendingAskQuestion, ASK_USER_QUESTION_AUTO_CANCEL_STATUS, DEEPSEEK_DEFAULT_MODEL,
+        MANAGED_PANE_CREATE_PR_ERROR,
     };
     use crate::project::{get_or_create_project, save_project};
     use crate::terminal_pane::TerminalPanes;
     use crate::tui::{PaneOutput, TuiEvent};
-    use shared::{CliToServer, Provider};
+    use shared::{ClaudeContentBlock, ClaudeStreamMessage, CliToServer, Provider};
     use std::collections::{HashMap, HashSet};
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -5746,6 +5886,90 @@ mod tests {
         );
         assert!(!args.iter().any(|a| a == "--model"));
         assert!(!args.iter().any(|a| a == "-c"));
+    }
+
+    #[test]
+    fn build_agent_args_opencode_uses_auto_and_never_passes_the_apas_uuid() {
+        let session_id = Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap();
+        let (fresh, fresh_resume) = build_agent_args(
+            &Provider::Opencode,
+            &session_id,
+            FULL_PROMPT,
+            Some("openai/gpt-5"),
+            None,
+            true,
+            false,
+        );
+        assert!(!fresh_resume);
+        assert_eq!(fresh[0], "run");
+        assert!(fresh.iter().any(|arg| arg == "--auto"));
+        assert!(fresh.windows(2).any(|args| args == ["-m", "openai/gpt-5"]));
+        assert!(!fresh.iter().any(|arg| arg == "--continue"));
+        assert!(!fresh.iter().any(|arg| arg == &session_id.to_string()));
+        assert_eq!(fresh.last().map(String::as_str), Some(FULL_PROMPT));
+
+        let (resumed, using_resume) = build_agent_args(
+            &Provider::Opencode,
+            &session_id,
+            FULL_PROMPT,
+            None,
+            None,
+            false,
+            false,
+        );
+        assert!(using_resume);
+        assert!(resumed.iter().any(|arg| arg == "--continue"));
+        assert!(!resumed.iter().any(|arg| arg == "--session" || arg == "-s"));
+        assert!(!resumed.iter().any(|arg| arg == &session_id.to_string()));
+    }
+
+    #[test]
+    fn opencode_json_events_are_adapted_to_shared_messages() {
+        let text = convert_opencode_to_claude(
+            r#"{"type":"text","part":{"type":"text","text":"done"}}"#,
+            "pane-session",
+        )
+        .expect("text event");
+        match text {
+            ClaudeStreamMessage::Assistant {
+                message,
+                session_id,
+                ..
+            } => {
+                assert_eq!(session_id, "pane-session");
+                assert!(matches!(
+                    message.content.as_slice(),
+                    [ClaudeContentBlock::Text { text }] if text == "done"
+                ));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let finish = convert_opencode_to_claude(
+            r#"{"type":"step_finish","part":{"reason":"stop","cost":0.25,"tokens":{"input":11,"output":7}}}"#,
+            "pane-session",
+        )
+        .expect("finish event");
+        match finish {
+            ClaudeStreamMessage::Result {
+                total_cost_usd,
+                extra,
+                is_error,
+                ..
+            } => {
+                assert_eq!(total_cost_usd, 0.25);
+                assert_eq!(extra["usage"]["input_tokens"], 11);
+                assert_eq!(extra["usage"]["output_tokens"], 7);
+                assert!(!is_error);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        assert!(convert_opencode_to_claude(
+            r#"{"type":"step_finish","part":{"reason":"tool-calls"}}"#,
+            "pane-session",
+        )
+        .is_none());
     }
 
     #[test]
@@ -11019,6 +11243,7 @@ async fn run_server_connection(
                 let mut capabilities = vec![
                     shared::PROJECT_POLICY_CAPABILITY.to_string(),
                     shared::MOBILE_TASK_LAUNCH_CAPABILITY.to_string(),
+                    shared::OPENCODE_TERMINAL_CAPABILITY.to_string(),
                 ];
                 if summary_runner.is_some() {
                     capabilities.push(shared::PANE_WORK_SUMMARY_CAPABILITY.to_string());
@@ -11842,7 +12067,7 @@ async fn run_server_connection(
                                                         &mut ws_sender,
                                                         session_id,
                                                         pane_config.pane_id,
-                                                        "[New pane refused — conversation-only panes are retired; use a Claude or Codex terminal pane]",
+                                                        "[New pane refused — conversation-only panes are retired; use a Claude, Codex, or OpenCode terminal pane]",
                                                     )
                                                     .await;
                                                     continue;

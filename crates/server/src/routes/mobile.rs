@@ -133,6 +133,22 @@ fn mobile_launch_profiles(policy: &shared::EffectiveProjectPolicy) -> Vec<Mobile
         .collect()
 }
 
+fn mobile_launch_capability_error(
+    provider: shared::Provider,
+    supports_mobile_launch: bool,
+    supports_opencode_terminal: bool,
+) -> Option<&'static str> {
+    if !supports_mobile_launch {
+        return Some("The project CLI must be updated and reconnected before mobile task launch");
+    }
+    if provider == shared::Provider::Opencode && !supports_opencode_terminal {
+        return Some(
+            "The project CLI must be updated and reconnected before launching an OpenCode task",
+        );
+    }
+    None
+}
+
 async fn launch_targets(
     state: &AppState,
     machines: &[shared::MachineWithProjects],
@@ -338,11 +354,17 @@ pub async fn launch_task(
             "The project runtime is still starting; retry this same submission shortly".to_string(),
         ));
     };
-    if !state
+    let supports_mobile_launch = state
         .sessions
-        .session_supports_capability(&session_id, shared::MOBILE_TASK_LAUNCH_CAPABILITY)
-    {
-        let message = "The project CLI must be updated and reconnected before mobile task launch";
+        .session_supports_capability(&session_id, shared::MOBILE_TASK_LAUNCH_CAPABILITY);
+    let supports_opencode_terminal = state
+        .sessions
+        .session_supports_capability(&session_id, shared::OPENCODE_TERMINAL_CAPABILITY);
+    if let Some(message) = mobile_launch_capability_error(
+        profile.provider,
+        supports_mobile_launch,
+        supports_opencode_terminal,
+    ) {
         state
             .db
             .fail_mobile_task_launch(&request.request_id.to_string(), &user.id, message)
@@ -522,11 +544,24 @@ mod tests {
             vec![
                 "terminal:claude:official:default",
                 "terminal:codex:official:default",
+                "terminal:opencode:official:default",
             ]
         );
         assert!(profiles
             .iter()
             .all(|profile| profile.kind == PaneKind::Terminal));
+    }
+
+    #[test]
+    fn mobile_opencode_launch_requires_its_provider_capability() {
+        let error = mobile_launch_capability_error(shared::Provider::Opencode, true, false)
+            .expect("older CLI must be rejected");
+        assert!(error.contains("OpenCode"));
+        assert!(error.contains("updated and reconnected"));
+
+        assert!(mobile_launch_capability_error(shared::Provider::Opencode, true, true).is_none());
+        assert!(mobile_launch_capability_error(shared::Provider::Claude, true, false).is_none());
+        assert!(mobile_launch_capability_error(shared::Provider::Codex, true, false).is_none());
     }
 
     #[tokio::test]

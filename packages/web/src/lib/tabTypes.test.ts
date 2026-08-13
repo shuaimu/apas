@@ -29,6 +29,7 @@ describe("tab type keys", () => {
     expect(ALL_TAB_TYPES.map((type) => type.key)).toEqual([
       "terminal:claude",
       "terminal:codex",
+      "terminal:opencode",
     ]);
   });
 });

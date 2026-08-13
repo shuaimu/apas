@@ -17,7 +17,7 @@
  *   `Terminal*` messages and are rendered by xterm.js in the browser.
  *   Nothing is parsed, so a terminal pane has none of the structured
  *   integrations above and is never a delegation target. This is the normal
- *   kind for new user-created Claude and Codex panes.
+ *   kind for new user-created Claude, Codex, and OpenCode panes.
  *
  * `#[serde(default)]` on `PaneConfig::kind` keeps `.apas` files written
  * before this existed deserializing as `Agent`.
@@ -643,7 +643,7 @@ export type WebToServer =
        *   `Terminal*` messages and are rendered by xterm.js in the browser.
        *   Nothing is parsed, so a terminal pane has none of the structured
        *   integrations above and is never a delegation target. This is the normal
-       *   kind for new user-created Claude and Codex panes.
+       *   kind for new user-created Claude, Codex, and OpenCode panes.
        *
        * `#[serde(default)]` on `PaneConfig::kind` keeps `.apas` files written
        * before this existed deserializing as `Agent`.
@@ -1355,7 +1355,7 @@ export interface PaneConfig {
    *   `Terminal*` messages and are rendered by xterm.js in the browser.
    *   Nothing is parsed, so a terminal pane has none of the structured
    *   integrations above and is never a delegation target. This is the normal
-   *   kind for new user-created Claude and Codex panes.
+   *   kind for new user-created Claude, Codex, and OpenCode panes.
    *
    * `#[serde(default)]` on `PaneConfig::kind` keeps `.apas` files written
    * before this existed deserializing as `Agent`.

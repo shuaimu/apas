@@ -76,9 +76,9 @@ Keeping the sidecar under the existing session directory makes owner project del
 
 ### 4. Completed windows are automatic; current windows are demand-driven
 
-A background scheduler runs at server startup and every 15 minutes. It scans retained session history in bounded batches, groups meaningful records, compares digests with the cache, and queues completed missing/stale windows newest-first. Drawer requests trigger the same bounded reconciliation immediately for the selected pane. The scheduler never delays message appends or the daily GC job.
+A background scheduler runs at server startup and every 15 minutes. It scans retained session history in bounded batches, groups meaningful records, compares digests with the cache, and queues completed missing/stale windows newest-first. Drawer requests return the durable sidecar cache immediately without waiting for a retained-history scan; after that response, the server reconciles only the selected pane's open window. Historical backfill and stale completed-window regeneration remain owned by the background scheduler. The scheduler never delays message appends, drawer cache reads, or the daily GC job.
 
-The open window is generated only when an authorized desktop requests it or explicitly refreshes it. A partial cache record includes `source_through`; repeated requests reuse it unless the source digest changed and a refresh throttle has elapsed. When the window closes, the completed-window path replaces the partial result.
+The open window is generated only when an authorized client requests it or explicitly refreshes it. A partial cache record includes `source_through`; repeated requests reuse it unless the source digest changed and a refresh throttle has elapsed. When the window closes, the completed-window path replaces the partial result.
 
 Each CLI may have one in-flight summary generation at a time. The server also applies a configurable global concurrency bound, per-window deduplication, a job timeout, and at most three transient attempts with exponential backoff. Permanent/invalid results remain failed and manually retryable. If a capable CLI is offline, the job stays queued while source is retained; raw retention is not extended indefinitely to wait for generation.
 

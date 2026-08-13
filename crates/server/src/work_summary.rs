@@ -370,6 +370,23 @@ struct SummaryRuntime {
     reductions: HashMap<(Uuid, u32, DateTime<Utc>, String), ReductionState>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ReconcileScope {
+    Completed,
+    Current,
+    Target(DateTime<Utc>),
+}
+
+impl ReconcileScope {
+    fn includes(self, window: &SourceWindow, now: DateTime<Utc>) -> bool {
+        match self {
+            Self::Completed => window.window_end <= now,
+            Self::Current => window.window_end > now,
+            Self::Target(window_start) => window.window_start == window_start,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SummaryMetrics {
     scans: std::sync::atomic::AtomicU64,
@@ -392,6 +409,7 @@ pub struct PaneWorkSummaryService {
     availability: DashMap<Uuid, PaneWorkSummaryAvailability>,
     refreshes: DashMap<(Uuid, u32, DateTime<Utc>), DateTime<Utc>>,
     recovered_sessions: DashMap<Uuid, ()>,
+    recovered_windows: DashMap<(Uuid, u32, DateTime<Utc>), ()>,
     pub metrics: SummaryMetrics,
 }
 
@@ -411,6 +429,7 @@ impl PaneWorkSummaryService {
             availability: DashMap::new(),
             refreshes: DashMap::new(),
             recovered_sessions: DashMap::new(),
+            recovered_windows: DashMap::new(),
             metrics: SummaryMetrics::default(),
         }
     }
@@ -433,7 +452,10 @@ impl PaneWorkSummaryService {
         };
         let mut scanned_bytes = 0_u64;
         for session_id in sessions {
-            match self.reconcile_session(session_id, None, false, None).await {
+            match self
+                .reconcile_session(session_id, None, ReconcileScope::Completed, None)
+                .await
+            {
                 Ok(bytes) => scanned_bytes = scanned_bytes.saturating_add(bytes as u64),
                 Err(error) => {
                     tracing::warn!(%session_id, %error, "Pane summary reconciliation failed")
@@ -458,22 +480,25 @@ impl PaneWorkSummaryService {
     }
 
     pub async fn list_for_pane(
+        &self,
+        session_id: Uuid,
+        pane_id: u32,
+    ) -> anyhow::Result<(Vec<PaneWorkSummary>, PaneWorkSummaryAvailability)> {
+        self.list_cached(session_id, pane_id).await
+    }
+
+    /// Reconcile only the still-open window after the persisted cache has
+    /// already been returned to the requesting client. Historical backfill is
+    /// exclusively owned by the periodic completed-window scheduler.
+    pub async fn reconcile_current_for_pane(
         self: &Arc<Self>,
         session_id: Uuid,
         pane_id: u32,
-        include_current: bool,
-    ) -> anyhow::Result<(Vec<PaneWorkSummary>, PaneWorkSummaryAvailability)> {
-        self.reconcile_session(session_id, Some(pane_id), include_current, None)
+    ) -> anyhow::Result<()> {
+        self.reconcile_session(session_id, Some(pane_id), ReconcileScope::Current, None)
             .await?;
         self.kick_dispatch().await;
-        let document = self.storage.load_pane_work_summaries(&session_id).await?;
-        let mut summaries = document
-            .summaries
-            .into_iter()
-            .filter(|summary| summary.pane_id == pane_id)
-            .collect::<Vec<_>>();
-        summaries.sort_by(|left, right| right.window_start.cmp(&left.window_start));
-        Ok((summaries, self.availability_for(session_id)))
+        self.broadcast_pane_snapshot(session_id, pane_id).await
     }
 
     pub async fn refresh(
@@ -505,8 +530,13 @@ impl PaneWorkSummaryService {
                 Ok(())
             })
             .await?;
-        self.reconcile_session(session_id, Some(pane_id), true, Some(target_window))
-            .await?;
+        self.reconcile_session(
+            session_id,
+            Some(pane_id),
+            ReconcileScope::Target(target_window),
+            Some(target_window),
+        )
+        .await?;
         self.kick_dispatch().await;
         self.list_cached(session_id, pane_id).await
     }
@@ -526,6 +556,18 @@ impl PaneWorkSummaryService {
             .collect::<Vec<_>>();
         summaries.sort_by(|left, right| right.window_start.cmp(&left.window_start));
         Ok((summaries, self.availability_for(session_id)))
+    }
+
+    #[cfg(test)]
+    async fn reconcile_completed_for_pane(
+        self: &Arc<Self>,
+        session_id: Uuid,
+        pane_id: u32,
+    ) -> anyhow::Result<()> {
+        self.reconcile_session(session_id, Some(pane_id), ReconcileScope::Completed, None)
+            .await?;
+        self.kick_dispatch().await;
+        Ok(())
     }
 
     fn availability_for(&self, session_id: Uuid) -> PaneWorkSummaryAvailability {
@@ -548,7 +590,7 @@ impl PaneWorkSummaryService {
         self: &Arc<Self>,
         session_id: Uuid,
         pane_filter: Option<u32>,
-        include_current: bool,
+        scope: ReconcileScope,
         force_window: Option<DateTime<Utc>>,
     ) -> anyhow::Result<usize> {
         let messages = self.storage.get_messages(&session_id).await?;
@@ -567,10 +609,17 @@ impl PaneWorkSummaryService {
             .map(|pane| (pane.pane_id, pane.provider))
             .collect::<HashMap<_, _>>();
         let now = Utc::now();
-        let mut windows = build_source_windows(session_id, &messages, fallback)
+        let pane_windows = build_source_windows(session_id, &messages, fallback)
             .into_iter()
             .filter(|window| pane_filter.is_none_or(|pane| window.pane_id == pane))
-            .filter(|window| window.window_end <= now || include_current)
+            .collect::<Vec<_>>();
+        let retained_window_keys = pane_windows
+            .iter()
+            .map(|window| (window.pane_id, window.window_start))
+            .collect::<HashSet<_>>();
+        let mut windows = pane_windows
+            .into_iter()
+            .filter(|window| scope.includes(window, now))
             .collect::<Vec<_>>();
         windows.sort_by(|left, right| right.window_start.cmp(&left.window_start));
 
@@ -587,10 +636,6 @@ impl PaneWorkSummaryService {
                 return Err(error);
             }
         };
-        let retained_window_keys = windows
-            .iter()
-            .map(|window| (window.pane_id, window.window_start))
-            .collect::<HashSet<_>>();
         for summary in &mut document.summaries {
             if pane_filter.is_none_or(|pane| summary.pane_id == pane)
                 && !retained_window_keys.contains(&(summary.pane_id, summary.window_start))
@@ -629,8 +674,11 @@ impl PaneWorkSummaryService {
                 // task queue does not. Rebuild queued work during the first reconciliation
                 // for the session (recovery also converts interrupted Generating records
                 // back to Queued).
-                let rebuild_recovered_task =
-                    first_recovery && existing.status == PaneWorkSummaryStatus::Queued;
+                let rebuild_recovered_task = existing.status == PaneWorkSummaryStatus::Queued
+                    && self
+                        .recovered_windows
+                        .insert((session_id, window.pane_id, window.window_start), ())
+                        .is_none();
                 if existing.source_digest != window.source_digest {
                     existing.status = PaneWorkSummaryStatus::Stale;
                     existing.source_digest = window.source_digest.clone();
@@ -689,6 +737,8 @@ impl PaneWorkSummaryService {
             if !should_queue {
                 continue;
             }
+            self.recovered_windows
+                .insert((session_id, window.pane_id, window.window_start), ());
 
             let source_bytes = window.canonical_source().len();
             let manifest =
@@ -1126,6 +1176,40 @@ impl PaneWorkSummaryService {
         }
     }
 
+    async fn broadcast_pane_snapshot(&self, session_id: Uuid, pane_id: u32) -> anyhow::Result<()> {
+        let (summaries, availability) = self.list_cached(session_id, pane_id).await?;
+        let web_ids = self
+            .sessions
+            .get_session(&session_id)
+            .map(|session| session.web_connection_ids)
+            .unwrap_or_default();
+        for web_id in web_ids {
+            let Some(user_id) = self.sessions.get_web_user(&web_id) else {
+                continue;
+            };
+            if self
+                .db
+                .check_session_access(&session_id.to_string(), &user_id.to_string())
+                .await
+                .unwrap_or(false)
+            {
+                let _ = self
+                    .sessions
+                    .send_to_web(
+                        &web_id,
+                        ServerToWeb::PaneWorkSummaries {
+                            session_id,
+                            pane_id,
+                            summaries: summaries.clone(),
+                            availability,
+                        },
+                    )
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn sweep_timeouts(self: &Arc<Self>) {
         let cutoff = Utc::now() - Duration::seconds(self.config.job_timeout_seconds.max(1) as i64);
         let expired = {
@@ -1549,12 +1633,123 @@ mod service_tests {
             .await
             .unwrap();
 
-        service.list_for_pane(session_id, 7, false).await.unwrap();
+        service
+            .reconcile_completed_for_pane(session_id, 7)
+            .await
+            .unwrap();
         let ServerToCli::GeneratePaneWorkSummary { job } = cli_rx.recv().await.unwrap() else {
             panic!("expected recovered notes job")
         };
         assert_eq!(job.window_start, window_start);
         assert_eq!(job.stage, PaneWorkSummaryStage::Notes);
+    }
+
+    #[tokio::test]
+    async fn listing_returns_the_durable_cache_without_reconciling_changed_source() {
+        let (service, db, storage, sessions) = test_service().await;
+        let owner = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        add_user_and_session(&db, owner, session_id).await;
+        let (_cli_id, mut cli_rx) = register_capable_cli(&sessions, owner, session_id);
+
+        let window_start = window_bounds(Utc::now()).0 - Duration::hours(SUMMARY_WINDOW_HOURS);
+        let first = service_message(
+            "first",
+            Some("7"),
+            &(window_start + Duration::minutes(1)).to_rfc3339(),
+            "Implemented the original behavior.",
+        );
+        storage.append_message(&session_id, &first).await.unwrap();
+        let window = build_source_windows(session_id, &[first], None)
+            .into_iter()
+            .next()
+            .unwrap();
+        storage
+            .save_pane_work_summaries(
+                &session_id,
+                &PaneWorkSummaryDocument {
+                    version: 1,
+                    summaries: vec![cached_summary(
+                        &window,
+                        PaneWorkSummaryWindowKind::Completed,
+                        PaneWorkSummaryStatus::Complete,
+                        Some("Saved completed summary."),
+                    )],
+                },
+            )
+            .await
+            .unwrap();
+        storage
+            .append_message(
+                &session_id,
+                &service_message(
+                    "late",
+                    Some("7"),
+                    &(window_start + Duration::minutes(2)).to_rfc3339(),
+                    "Late activity changed the retained source.",
+                ),
+            )
+            .await
+            .unwrap();
+
+        let (summaries, availability) = service.list_for_pane(session_id, 7).await.unwrap();
+        assert_eq!(availability, PaneWorkSummaryAvailability::Available);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].summary.as_deref(),
+            Some("Saved completed summary.")
+        );
+        assert_eq!(summaries[0].status, PaneWorkSummaryStatus::Complete);
+        assert!(cli_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn panel_open_reconciles_only_the_changed_current_window() {
+        let (service, db, storage, sessions) = test_service().await;
+        let owner = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        add_user_and_session(&db, owner, session_id).await;
+        let (_cli_id, mut cli_rx) = register_capable_cli(&sessions, owner, session_id);
+
+        let now = Utc::now();
+        let current_start = window_bounds(now).0;
+        let completed_start = current_start - Duration::hours(SUMMARY_WINDOW_HOURS);
+        for source in [
+            service_message(
+                "completed",
+                Some("7"),
+                &(completed_start + Duration::minutes(1)).to_rfc3339(),
+                "This historical window is background-owned.",
+            ),
+            service_message(
+                "current",
+                Some("7"),
+                &now.to_rfc3339(),
+                "This current window is generated on panel open.",
+            ),
+        ] {
+            storage.append_message(&session_id, &source).await.unwrap();
+        }
+
+        service
+            .reconcile_current_for_pane(session_id, 7)
+            .await
+            .unwrap();
+        let ServerToCli::GeneratePaneWorkSummary { job } = cli_rx.recv().await.unwrap() else {
+            panic!("expected current-window summary job")
+        };
+        assert_eq!(job.window_start, current_start);
+        assert!(cli_rx.try_recv().is_err());
+
+        let document = storage.load_pane_work_summaries(&session_id).await.unwrap();
+        assert_eq!(document.summaries.len(), 1);
+        assert_eq!(document.summaries[0].window_start, current_start);
+
+        service
+            .reconcile_current_for_pane(session_id, 7)
+            .await
+            .unwrap();
+        assert!(cli_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1748,7 +1943,10 @@ mod service_tests {
             storage.append_message(&session_id, &source).await.unwrap();
         }
 
-        service.list_for_pane(session_id, 7, false).await.unwrap();
+        service
+            .reconcile_completed_for_pane(session_id, 7)
+            .await
+            .unwrap();
         let ServerToCli::GeneratePaneWorkSummary { job: notes_job } = cli_rx.recv().await.unwrap()
         else {
             panic!("expected newest notes job")
@@ -1827,8 +2025,12 @@ mod service_tests {
             .await
             .unwrap();
 
-        let (_, availability) = service.list_for_pane(session_id, 7, false).await.unwrap();
+        let (_, availability) = service.list_for_pane(session_id, 7).await.unwrap();
         assert_eq!(availability, PaneWorkSummaryAvailability::Available);
+        service
+            .reconcile_completed_for_pane(session_id, 7)
+            .await
+            .unwrap();
         let ServerToCli::GeneratePaneWorkSummary { job: notes_job } = cli_rx.recv().await.unwrap()
         else {
             panic!("expected notes job")
@@ -1899,7 +2101,10 @@ mod service_tests {
             )
             .await
             .unwrap();
-        service.list_for_pane(session_id, 7, false).await.unwrap();
+        service
+            .reconcile_completed_for_pane(session_id, 7)
+            .await
+            .unwrap();
         let ServerToCli::GeneratePaneWorkSummary { job: refreshed_job } =
             cli_rx.recv().await.unwrap()
         else {
@@ -1955,7 +2160,7 @@ mod service_tests {
             .await
             .unwrap();
 
-        let (summaries, availability) = service.list_for_pane(session_id, 2, false).await.unwrap();
+        let (summaries, availability) = service.list_for_pane(session_id, 2).await.unwrap();
         assert_eq!(
             summaries[0].summary.as_deref(),
             Some("Previously cached summary")

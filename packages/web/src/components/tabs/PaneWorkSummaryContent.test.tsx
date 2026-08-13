@@ -60,4 +60,23 @@ describe("PaneWorkSummaryContent", () => {
     }
     expect(summaryAvailabilityMessage("available")).toBeNull();
   });
+
+  it("does not present an in-flight cache read as unconfirmed support", () => {
+    const view = render(
+      <PaneWorkSummaryList
+        cache={{ summaries: [], availability: "unknown", loading: true }}
+        onRetry={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Loading summaries…")).toBeTruthy();
+    expect(screen.queryByText(/support has not been confirmed/)).toBeNull();
+
+    view.rerender(
+      <PaneWorkSummaryList
+        cache={{ summaries: [], availability: "unknown", loading: false }}
+        onRetry={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(/support has not been confirmed/)).toBeTruthy();
+  });
 });

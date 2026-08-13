@@ -19,10 +19,10 @@
 - [x] 3.1 Add an `AppState` summary service with a deduplicated queue keyed by session, pane, window, digest, and stage.
 - [x] 3.2 Implement bounded in-flight dispatch, one-job-per-CLI enforcement, timeouts, transient classification, three-attempt backoff, and permanent failure state.
 - [x] 3.3 Implement startup and 15-minute reconciliation for completed windows, bounded session scanning, newest-first retained-history backfill, and source-expired reporting.
-- [x] 3.4 Implement demand-driven current-window generation, source-through timestamps, refresh throttling, and final replacement when the window closes.
+- [x] 3.4 Implement cache-first reads plus demand-driven current-window generation, source-through timestamps, refresh throttling, and final replacement when the window closes.
 - [x] 3.5 Route staged jobs only to the session-owning CLI advertising the summary capability and validate every returned job/scope/digest before updating cache.
 - [x] 3.6 Implement chunk-note collection, final reduction dispatch, summary whitespace/word-count/output validation, and one formatting-correction attempt.
-- [x] 3.7 Implement authorized list and refresh handlers using current project access and active-project operation guards, including revocation/leave/delete race tests.
+- [x] 3.7 Implement authorized cache-first list and targeted refresh handlers using current project access and active-project operation guards, including revocation/leave/delete race tests.
 - [x] 3.8 Broadcast summary snapshots and incremental queued/generating/stale/complete/partial/failed/unavailable updates only to currently authorized attached web clients.
 - [x] 3.9 Add structured logs and counters for scan duration/bytes, queue depth, generation latency, retries, failures, unavailable clients, provider/model, and cache growth without logging source content.
 

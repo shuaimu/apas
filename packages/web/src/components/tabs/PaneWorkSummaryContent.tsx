@@ -146,7 +146,12 @@ export function PaneWorkSummaryList({
   onRetry: (windowStart: string) => void;
   retryDisabled?: boolean;
 }) {
-  const message = summaryAvailabilityMessage(cache?.availability ?? "unknown");
+  // Before the first cache snapshot arrives, "unknown" only means that the
+  // request is in flight. Showing the mixed-version warning at that point made
+  // every drawer open look like summary support still needed confirmation.
+  const message = !cache || (cache.loading && cache.availability === "unknown")
+    ? null
+    : summaryAvailabilityMessage(cache.availability);
   return (
     <>
       {message && (

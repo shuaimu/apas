@@ -58,6 +58,12 @@ The system SHALL automatically queue a completed meaningful window for summariza
 - **THEN** the system may generate a partial summary through the latest included activity timestamp
 - **AND** the drawer identifies that summary as in progress rather than completed
 
+#### Scenario: User opens a pane with cached summaries
+- **WHEN** an authorized user opens summaries for a pane that has durable cached results
+- **THEN** the system returns those cached results without waiting for retained source reconciliation
+- **AND** asynchronously reconciles only the pane's current open window after the cache response
+- **AND** leaves missing or stale completed-window backfill to the background scheduler
+
 ### Requirement: Missing retained history is backfilled without blocking live work
 When summary generation is introduced or has fallen behind, the system SHALL identify unsummarized meaningful windows whose raw activity is still retained and queue them newest-first. Unavailable history that was already removed by message retention SHALL NOT be reconstructed or represented as summarized.
 

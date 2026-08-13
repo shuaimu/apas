@@ -9,6 +9,13 @@ pub const PROJECT_POLICY_CAPABILITY: &str = "project_policy_v1";
 // as an initial prompt. A v1 CLI would accept the pane but silently drop that
 // instruction, so the version bump makes mixed-version rollout fail closed.
 pub const MOBILE_TASK_LAUNCH_CAPABILITY: &str = "mobile_task_launch_v2";
+/// The connected CLI can host OpenCode's interactive TUI, pass an initial
+/// prompt with OpenCode's native flags, and mirror its transcript.
+///
+/// Kept separate from the generic mobile-launch capability so a rolling
+/// server/web deployment cannot route an OpenCode pane to an older CLI that
+/// would persist the pane but fail to launch it.
+pub const OPENCODE_TERMINAL_CAPABILITY: &str = "terminal_opencode_v1";
 
 fn default_true() -> bool {
     true
@@ -2197,7 +2204,7 @@ pub enum PaneMode {
 ///   `Terminal*` messages and are rendered by xterm.js in the browser.
 ///   Nothing is parsed, so a terminal pane has none of the structured
 ///   integrations above and is never a delegation target. This is the normal
-///   kind for new user-created Claude and Codex panes.
+///   kind for new user-created Claude, Codex, and OpenCode panes.
 ///
 /// `#[serde(default)]` on `PaneConfig::kind` keeps `.apas` files written
 /// before this existed deserializing as `Agent`.
@@ -2245,12 +2252,13 @@ pub fn tab_type_key(kind: PaneKind, provider: Provider) -> String {
 /// are never advertised, and DeepSeek is offered as a Claude model because it
 /// uses the Anthropic-compatible bridge.
 ///
-/// Terminal panes exist only for claude and codex — see
+/// Terminal panes exist only for claude, codex, and opencode — see
 /// `terminal_pane::terminal_binary_for`, which this must stay in step with.
 pub fn all_tab_types() -> Vec<String> {
     vec![
         tab_type_key(PaneKind::Terminal, Provider::Claude),
         tab_type_key(PaneKind::Terminal, Provider::Codex),
+        tab_type_key(PaneKind::Terminal, Provider::Opencode),
     ]
 }
 
@@ -2368,6 +2376,14 @@ pub fn supported_launch_profiles() -> Vec<LaunchProfile> {
             "Codex Terminal",
             PaneKind::Terminal,
             Provider::Codex,
+            "official",
+            None,
+        ),
+        launch_profile(
+            "terminal:opencode:official:default",
+            "OpenCode Terminal",
+            PaneKind::Terminal,
+            Provider::Opencode,
             "official",
             None,
         ),
@@ -4092,7 +4108,11 @@ mod tests {
         let catalog = all_tab_types();
         assert_eq!(
             catalog,
-            vec!["terminal:claude".to_string(), "terminal:codex".to_string()]
+            vec![
+                "terminal:claude".to_string(),
+                "terminal:codex".to_string(),
+                "terminal:opencode".to_string(),
+            ]
         );
     }
 
@@ -4196,6 +4216,7 @@ mod tests {
             "agent:cursor-agent:official:default",
             "terminal:claude:official:default",
             "terminal:codex:official:default",
+            "terminal:opencode:official:default",
         ] {
             assert!(policy
                 .allowed_launch_profiles

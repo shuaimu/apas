@@ -8,10 +8,11 @@
 //! needs to be kept in sync with a provider's output
 //! format — the point of the feature is to reuse the CLI as it ships.
 //!
-//! The only flags passed are the provider's exact resume arguments (on
-//! restore) and its permission-bypass flag: a pane driven from a browser has
-//! nobody at the keyboard to answer an approval prompt, and agent panes
-//! already launch with the same bypass. See [`permission_bypass_flag_for`].
+//! The only flags passed are the provider's resume arguments (on restore),
+//! its permission-bypass flag, and its provider-specific initial-prompt form:
+//! a pane driven from a browser has nobody at the keyboard to answer an
+//! approval prompt, and agent panes already launch with the same bypass. See
+//! [`permission_bypass_flag_for`].
 //!
 //! The cost is that a terminal pane has none of the structured
 //! integrations: no usage counters, no pane status, no diffs, no plan
@@ -21,8 +22,8 @@
 //! Lifetime: the pty is a child of the CLI process, so a terminal pane
 //! dies when `apas` restarts. [`TerminalHandle::spawn`] therefore re-execs the
 //! provider and asks it to resume the pane's conversation. Claude can resume
-//! the exact pinned session id; codex currently exposes only its own resume
-//! picker/subcommand here.
+//! the exact pinned session id; Codex and OpenCode expose their own resume
+//! mechanisms instead.
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -56,9 +57,9 @@ const DEFAULT_ROWS: u16 = 24;
 
 /// Which binaries a terminal pane may host.
 ///
-/// Deliberately not every [`Provider`]: only Claude and Codex have verified
-/// terminal behavior. Other providers have interaction models that we have
-/// not verified render correctly through a bare pty. Returning `None`
+/// Deliberately not every [`Provider`]: Claude, Codex, and OpenCode have
+/// documented interactive TUIs, non-interactive permission modes, and resume
+/// flows that APAS can safely drive through a bare pty. Returning `None`
 /// here makes the caller reject the pane rather than spawn something that
 /// paints garbage into xterm.js.
 pub fn terminal_binary_for(provider: &Provider) -> Option<&'static str> {
@@ -66,11 +67,8 @@ pub fn terminal_binary_for(provider: &Provider) -> Option<&'static str> {
     match provider {
         Provider::Claude => Some("claude"),
         Provider::Codex => Some("codex"),
-        Provider::Minimax
-        | Provider::Glm
-        | Provider::Deepseek
-        | Provider::Opencode
-        | Provider::CursorAgent => None,
+        Provider::Opencode => Some("opencode"),
+        Provider::Minimax | Provider::Glm | Provider::Deepseek | Provider::CursorAgent => None,
     }
 }
 
@@ -80,11 +78,13 @@ pub fn terminal_binary_for(provider: &Provider) -> Option<&'static str> {
 /// equivalent: it selects the most recent conversation for the cwd, which can
 /// belong to another pane while APAS continues watching this pane's pinned
 /// transcript. Codex's `resume` remains a subcommand and therefore must be
-/// appended before its permission flag.
+/// appended before its permission flag. OpenCode's `--continue` selects the
+/// newest session for the pane's working directory.
 fn resume_args_for(provider: &Provider, conversation_id: Uuid) -> Vec<String> {
     match provider {
         Provider::Claude => vec!["--resume".to_string(), conversation_id.to_string()],
         Provider::Codex => vec!["resume".to_string()],
+        Provider::Opencode => vec!["--continue".to_string()],
         _ => Vec::new(),
     }
 }
@@ -97,15 +97,57 @@ fn resume_args_for(provider: &Provider, conversation_id: Uuid) -> Vec<String> {
 /// `build_agent_args`), so this makes the two pane kinds behave consistently
 /// rather than introducing a new policy.
 ///
-/// Verified present on the *interactive* forms of both binaries, not just the
-/// headless ones — `claude --help` and `codex --help`. That matters because an
-/// unrecognised flag doesn't degrade, it fails the spawn outright.
+/// Verified present on the *interactive* forms of all hostable binaries, not
+/// just their headless modes. That matters because an unrecognised flag does
+/// not degrade; it fails the spawn outright.
 fn permission_bypass_flag_for(provider: &Provider) -> Option<&'static str> {
     match provider {
         Provider::Claude => Some("--dangerously-skip-permissions"),
         Provider::Codex => Some("--dangerously-bypass-approvals-and-sandbox"),
+        // Official OpenCode auto mode approves requests that are not
+        // explicitly denied by the user's own permission configuration.
+        Provider::Opencode => Some("--auto"),
         _ => None,
     }
+}
+
+/// Provider-specific interactive CLI arguments, separated from pty setup so
+/// tests can pin the exact command line without spawning a real agent.
+fn terminal_args_for(
+    provider: &Provider,
+    conversation_id: Uuid,
+    resume: bool,
+    initial_prompt: Option<&str>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    if resume {
+        args.extend(resume_args_for(provider, conversation_id));
+    }
+    if let Some(flag) = permission_bypass_flag_for(provider) {
+        args.push(flag.to_string());
+    }
+    if !resume {
+        // Pin Claude before the positional prompt. Besides preserving the
+        // long-standing command shape, this keeps the prompt last so it
+        // cannot accidentally absorb a following option-like token.
+        if matches!(provider, Provider::Claude) {
+            args.push("--session-id".to_string());
+            args.push(conversation_id.to_string());
+        }
+        if let Some(prompt) = initial_prompt
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty())
+        {
+            // OpenCode's positional argument is the project path. Its initial
+            // instruction must use --prompt; Claude and Codex accept the
+            // instruction positionally.
+            if matches!(provider, Provider::Opencode) {
+                args.push("--prompt".to_string());
+            }
+            args.push(prompt.to_string());
+        }
+    }
+    args
 }
 
 /// A running pty and the handles needed to drive it.
@@ -167,44 +209,17 @@ impl TerminalHandle {
             .context("failed to allocate pty for terminal pane")?;
 
         let mut cmd = CommandBuilder::new(binary_path);
-        // Order matters: codex's resume flag is really a *subcommand*
-        // (`codex resume`), and its bypass flag has to follow it. Claude's are
-        // both plain top-level flags, so it is order-insensitive. Appending
-        // resume first satisfies both.
-        if resume {
-            for arg in resume_args_for(provider, claude_session_id) {
-                cmd.arg(arg);
-            }
-        }
-        if let Some(flag) = permission_bypass_flag_for(provider) {
-            cmd.arg(flag);
-        }
-        // Pin claude's session id to the one APAS already minted for this pane.
-        // That makes the transcript path exact -- `~/.claude/projects/<cwd with
-        // / as ->/<id>.jsonl` -- which is what lets the CLI read this pane's
-        // history without guessing which file is whose. Codex has no
-        // equivalent flag; see `transcript::find_codex_rollout`.
-        //
-        // Deliberately skipped when resuming: claude receives this same id via
-        // `--resume <id>` above, while codex has no equivalent pinning flag.
-        if !resume && matches!(provider, Provider::Claude) {
-            cmd.arg("--session-id");
-            cmd.arg(claude_session_id.to_string());
-        }
-        // Both supported interactive CLIs accept a positional first prompt.
-        // Supplying it at process creation is atomic and avoids racing raw
-        // keystrokes against a full-screen TUI that has not initialized yet.
-        // A restored pane uses the provider's resume flow instead and must not
-        // replay an old instruction.
-        if !resume {
-            if let Some(prompt) = initial_prompt.map(str::trim).filter(|p| !p.is_empty()) {
-                cmd.arg(prompt);
-            }
+        // Order matters: codex's resume marker is a subcommand (`codex
+        // resume`) and its bypass flag follows it. The helper also prevents
+        // treating OpenCode's initial instruction as its positional project
+        // path.
+        for arg in terminal_args_for(provider, claude_session_id, resume, initial_prompt) {
+            cmd.arg(arg);
         }
         cmd.cwd(cwd);
         // A TUI keys its capabilities off TERM. Without this it inherits
         // whatever the daemon-spawned CLI had — often `dumb`, which makes
-        // claude/codex fall back to a line-mode renderer that looks broken
+        // the provider can fall back to a line-mode renderer that looks broken
         // in xterm.js. COLORTERM is what unlocks 24-bit colour.
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
@@ -457,14 +472,14 @@ mod tests {
 
     #[test]
     #[allow(deprecated)]
-    fn only_claude_and_codex_can_host_a_terminal() {
+    fn only_verified_interactive_clis_can_host_a_terminal() {
         assert_eq!(terminal_binary_for(&Provider::Claude), Some("claude"));
         assert_eq!(terminal_binary_for(&Provider::Codex), Some("codex"));
+        assert_eq!(terminal_binary_for(&Provider::Opencode), Some("opencode"));
         for p in [
             Provider::Minimax,
             Provider::Glm,
             Provider::Deepseek,
-            Provider::Opencode,
             Provider::CursorAgent,
         ] {
             assert_eq!(
@@ -481,7 +496,7 @@ mod tests {
         // A terminal pane is driven from a browser; an approval prompt there
         // just blocks until someone notices the tab. Any provider we are
         // willing to host must therefore have a bypass flag.
-        for p in [Provider::Claude, Provider::Codex] {
+        for p in [Provider::Claude, Provider::Codex, Provider::Opencode] {
             assert!(
                 terminal_binary_for(&p).is_some(),
                 "{p:?} should be hostable"
@@ -502,7 +517,6 @@ mod tests {
             Provider::Minimax,
             Provider::Glm,
             Provider::Deepseek,
-            Provider::Opencode,
             Provider::CursorAgent,
         ] {
             assert_eq!(permission_bypass_flag_for(&p), None, "{p:?}");
@@ -533,6 +547,24 @@ mod tests {
         assert_eq!(
             permission_bypass_flag_for(&Provider::Claude),
             Some("--dangerously-skip-permissions")
+        );
+        assert_eq!(
+            terminal_args_for(
+                &Provider::Opencode,
+                conversation_id,
+                false,
+                Some("fix the test")
+            ),
+            vec!["--auto", "--prompt", "fix the test"]
+        );
+        assert_eq!(
+            terminal_args_for(
+                &Provider::Opencode,
+                conversation_id,
+                true,
+                Some("must not replay")
+            ),
+            vec!["--continue", "--auto"]
         );
     }
 

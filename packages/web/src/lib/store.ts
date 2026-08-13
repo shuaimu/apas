@@ -2310,7 +2310,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (!managed && kind === "agent") {
       return {
         success: false,
-        error: "Conversation-only panes are retired. Create a Claude or Codex terminal pane instead.",
+        error: "Conversation-only panes are retired. Create a Claude, Codex, or OpenCode terminal pane instead.",
       };
     }
     if (!policyAllowsLaunch(policy, kind, typedProvider, model)) {

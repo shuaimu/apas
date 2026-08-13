@@ -24,13 +24,14 @@ export interface TabTypeOption {
  * Every tab type, in menu order. Must stay in step with `shared::all_tab_types`
  * — a Rust test reads this file and asserts the two agree.
  *
- * Terminal exists only for claude and codex, mirroring
+ * Terminal exists only for claude, codex, and opencode, mirroring
  * `terminal_pane::terminal_binary_for` in the CLI.
  */
 export const ALL_TAB_TYPES: TabTypeOption[] = (
   [
     { kind: "terminal", provider: "claude", label: "Claude" },
     { kind: "terminal", provider: "codex", label: "Codex" },
+    { kind: "terminal", provider: "opencode", label: "OpenCode" },
   ] as Omit<TabTypeOption, "key">[]
 ).map((t) => ({ ...t, key: tabTypeKey(t.kind, t.provider) }));
 

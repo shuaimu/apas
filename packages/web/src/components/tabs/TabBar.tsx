@@ -528,6 +528,7 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
             {[
               { provider: "claude", label: "Claude" },
               { provider: "codex", label: "Codex" },
+              { provider: "opencode", label: "OpenCode" },
             ]
               .filter((entry) => isAllowed("terminal", entry.provider))
               .map((entry) => (

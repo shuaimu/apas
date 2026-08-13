@@ -150,7 +150,7 @@ describe("TabBar coordinator close controls", () => {
     expect(onCloseTab).toHaveBeenCalledWith(13);
   });
 
-  it("offers only Claude and Codex terminal panes for new tabs", () => {
+  it("offers all verified terminal panes for new tabs", () => {
     const onAddTab = vi.fn();
     renderTabBar({ onAddTab });
 
@@ -158,7 +158,7 @@ describe("TabBar coordinator close controls", () => {
 
     expect(screen.getByText("Claude")).toBeTruthy();
     expect(screen.getByText("Codex")).toBeTruthy();
-    expect(screen.queryByText("OpenCode")).toBeNull();
+    expect(screen.getByText("OpenCode")).toBeTruthy();
     expect(screen.queryByText("Cursor")).toBeNull();
     expect(screen.queryByText("DeepSeek")).toBeNull();
 
@@ -335,25 +335,25 @@ describe("TabBar add-tab worktree controls", () => {
     expect(onAddTab).toHaveBeenLastCalledWith("codex", undefined, undefined, "terminal");
   });
 
-  it("offers claude and codex terminal tabs and passes kind=terminal", () => {
+  it("offers verified terminal providers and passes kind=terminal", () => {
     const onAddTab = vi.fn();
     renderTabBar({ onAddTab });
 
     openNewTabMenu();
-    fireEvent.click(screen.getByText("Codex"));
+    fireEvent.click(screen.getByText("OpenCode"));
 
-    expect(onAddTab).toHaveBeenCalledWith("codex", undefined, undefined, "terminal");
+    expect(onAddTab).toHaveBeenCalledWith("opencode", undefined, undefined, "terminal");
   });
 
   it("does not offer a terminal tab for providers a pty can't host", () => {
-    // Mirrors `terminal_binary_for` in the CLI. Only Claude and Codex have
-    // verified pty behavior.
+    // Mirrors `terminal_binary_for` in the CLI.
     renderTabBar();
     openNewTabMenu();
 
     expect(screen.getByText("Claude")).toBeTruthy();
     expect(screen.getByText("Codex")).toBeTruthy();
-    for (const label of ["MiniMax", "GLM", "DeepSeek", "OpenCode", "Cursor"]) {
+    expect(screen.getByText("OpenCode")).toBeTruthy();
+    for (const label of ["MiniMax", "GLM", "DeepSeek", "Cursor"]) {
       expect(screen.queryByText(label)).toBeNull();
     }
   });
