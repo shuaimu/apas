@@ -91,6 +91,13 @@ describe("TabbedView terminal panes", () => {
     const terminal = await screen.findByTestId("terminal-pane-7");
     const viewSwitch = screen.getByRole("group", { name: "Terminal pane view" });
     const usageLabel = screen.getByText("Codex Usage");
+    expect(screen.queryByRole("button", { name: "Bot" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Role" })).toBeNull();
+    expect(
+      screen.queryByTitle(
+        "Agent backend — switching kills the current agent child and respawns with a fresh session id",
+      ),
+    ).toBeNull();
     expect(
       viewSwitch.compareDocumentPosition(usageLabel) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).not.toBe(0);

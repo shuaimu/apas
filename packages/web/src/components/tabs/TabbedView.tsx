@@ -1174,15 +1174,17 @@ export function TabbedView({
             </>
           ) : (
             <>
-              <button
-                onClick={handleStartBot}
-                className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-green-500 hover:bg-green-600 text-white"
-                title="Start autonomous bot execution in this tab"
-              >
-                <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
-                Bot
-              </button>
-              {activeTabId != null && activeProvider && (
+              {!activeIsTerminal && (
+                <button
+                  onClick={handleStartBot}
+                  className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-green-500 hover:bg-green-600 text-white"
+                  title="Start autonomous bot execution in this tab"
+                >
+                  <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
+                  Bot
+                </button>
+              )}
+              {!activeIsTerminal && activeTabId != null && activeProvider && (
                 <select
                   value={activeProvider as ProviderOption}
                   onChange={(e) => {
@@ -1248,7 +1250,7 @@ export function TabbedView({
                   Diff
                 </button>
               )}
-              {activeTabId != null && activeConfig && (
+              {!activeIsTerminal && activeTabId != null && activeConfig && (
                 <button
                   onClick={() => setRoleModalPaneId(activeTabId)}
                   className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-purple-600 hover:bg-purple-700 text-white"
