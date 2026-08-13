@@ -63,14 +63,22 @@ fn terminal_assistant_completes_work(
     panes: &[PaneConfig],
     pane_id: Option<u32>,
 ) -> bool {
-    if !pane_id.is_some_and(|pane_id| is_terminal_pane(panes, pane_id)) {
+    let Some(pane_id) = pane_id else {
         return false;
-    }
+    };
     match message {
-        shared::ClaudeStreamMessage::Assistant { extra, .. } => extra
-            .get("terminal_turn_complete")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true),
+        shared::ClaudeStreamMessage::Assistant { extra, .. } => {
+            // The explicit marker is emitted only by the terminal transcript
+            // watcher, so it remains authoritative while pane metadata is
+            // being repopulated after a server/CLI reconnect. Requiring the
+            // pane list first stranded "Working..." when completion won that
+            // race. Unmarked messages retain the pane-kind guard for rolling
+            // compatibility with older clients.
+            extra
+                .get("terminal_turn_complete")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or_else(|| is_terminal_pane(panes, pane_id))
+        }
         _ => false,
     }
 }
@@ -1913,13 +1921,35 @@ mod pane_status_tests {
             Some(7),
         ));
         assert!(
+            terminal_assistant_completes_work(
+                &assistant(serde_json::json!({"terminal_turn_complete": true})),
+                &[],
+                Some(7),
+            ),
+            "an explicit terminal completion must win the reconnect pane-list race"
+        );
+        assert!(!terminal_assistant_completes_work(
+            &assistant(serde_json::json!({"terminal_turn_complete": false})),
+            &[],
+            Some(7),
+        ));
+        assert!(
             terminal_assistant_completes_work(&assistant(serde_json::Value::Null), &panes, Some(7),),
             "unmarked messages keep the legacy behavior during CLI rollout"
         );
+        assert!(
+            !terminal_assistant_completes_work(&assistant(serde_json::Value::Null), &[], Some(7),),
+            "unmarked structured assistant messages cannot clear arbitrary panes"
+        );
+        assert!(!terminal_assistant_completes_work(
+            &assistant(serde_json::Value::Null),
+            &panes,
+            Some(8),
+        ));
         assert!(!terminal_assistant_completes_work(
             &assistant(serde_json::json!({"terminal_turn_complete": true})),
             &panes,
-            Some(8),
+            None,
         ));
     }
 }

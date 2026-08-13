@@ -122,6 +122,44 @@ describe('useStore', () => {
         isWorking: false,
       });
     });
+
+    it('uses an explicit terminal completion as a redundant working-state clear', () => {
+      useStore.setState({
+        sessionId: 'current-session',
+        sessions: [
+          { id: 'current-session', status: 'connected', isActive: true, isWorking: true },
+        ],
+        workingPanesBySession: new Map([['current-session', new Set([7])]]),
+        paneStatuses: { '7': 'Working...' },
+      });
+
+      handleServerMessage({
+        type: 'stream_message',
+        session_id: 'current-session',
+        pane_id: 7,
+        message: {
+          type: 'assistant',
+          message: { content: [] },
+          extra: { terminal_turn_complete: false },
+        },
+      }, useStore.setState, useStore.getState);
+      expect(useStore.getState().sessions[0]?.isWorking).toBe(true);
+
+      handleServerMessage({
+        type: 'stream_message',
+        session_id: 'current-session',
+        pane_id: 7,
+        message: {
+          type: 'assistant',
+          message: { content: [] },
+          extra: { terminal_turn_complete: true },
+        },
+      }, useStore.setState, useStore.getState);
+
+      expect(useStore.getState().sessions[0]?.isWorking).toBe(false);
+      expect(useStore.getState().workingPanesBySession.has('current-session')).toBe(false);
+      expect(useStore.getState().paneStatuses['7']).toBeNull();
+    });
   });
 
   describe('cluster policy snapshots', () => {

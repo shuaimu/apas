@@ -5067,6 +5067,36 @@ export function handleServerMessage(
         bumpWatermark(set, msgSessionId, paneIdForBump, serverCreatedAt);
       }
       const msgType = msg.type as string;
+      const explicitTerminalCompletion = msgType === "assistant"
+        && Boolean(
+          msg.extra
+          && typeof msg.extra === "object"
+          && (msg.extra as Record<string, unknown>).terminal_turn_complete === true,
+        );
+      if (explicitTerminalCompletion && msgSessionId) {
+        const completedPaneId = normalizePaneId(paneType, normalizeRawPaneId(paneId));
+        if (completedPaneId != null) {
+          // The completion marker and pane_status:null describe the same
+          // boundary. Apply the marker too so a dropped clear frame cannot
+          // strand a mobile session card in Working until reconnect.
+          set((state) => {
+            const workingPanesBySession = new Map(state.workingPanesBySession);
+            const workingPanes = new Set(workingPanesBySession.get(msgSessionId) ?? []);
+            workingPanes.delete(completedPaneId);
+            if (workingPanes.size > 0) workingPanesBySession.set(msgSessionId, workingPanes);
+            else workingPanesBySession.delete(msgSessionId);
+            return {
+              workingPanesBySession,
+              sessions: state.sessions.map((session) => session.id === msgSessionId
+                ? { ...session, isWorking: workingPanes.size > 0 }
+                : session),
+              ...(isCurrentSession
+                ? { paneStatuses: { ...state.paneStatuses, [completedPaneId]: null } }
+                : {}),
+            };
+          });
+        }
+      }
       if (msgType === "assistant") {
         const message = msg.message as Record<string, unknown>;
         const content = message?.content as Array<Record<string, unknown>>;

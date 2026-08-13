@@ -36,19 +36,24 @@ afterEach(() => {
 });
 
 describe("MobileCodeHome", () => {
-  it("renders the native-style compact session home and filters in place", () => {
+  it("renders only all-project and idle-project categories", () => {
     renderHome();
 
     expect(screen.getByRole("heading", { name: "Coding sessions" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Account" })).toBeTruthy();
     expect(screen.getByRole("button", { name: /New task/ })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Active" }).getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByRole("button", { name: "All projects" }).getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByRole("button", { name: "Idle projects" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Active" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Attention" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Completed" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Recent" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Open alpha" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Open beta" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Idle projects" }));
     expect(screen.getByRole("button", { name: "Open alpha" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Open beta" })).toBeNull();
-
-    fireEvent.click(screen.getByRole("button", { name: "Completed" }));
-    expect(screen.getByRole("button", { name: "Open beta" })).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Open alpha" })).toBeNull();
   });
 
   it("uses only working, idle, and offline session badges", () => {
@@ -62,23 +67,13 @@ describe("MobileCodeHome", () => {
 
     expect(screen.getByText("Working")).toBeTruthy();
     expect(screen.getByText("Idle")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Recent" }));
     expect(screen.getByText("Offline")).toBeTruthy();
     for (const name of ["working", "idle", "offline"]) {
       expect(within(screen.getByRole("button", { name: `Open ${name}` })).queryByText("Active")).toBeNull();
     }
   });
 
-  it("keeps project selection compact and combines it with status filters", () => {
-    renderHome();
-    fireEvent.click(screen.getByRole("button", { name: "Recent" }));
-    fireEvent.click(screen.getByRole("button", { name: "beta" }));
-
-    expect(screen.getByRole("button", { name: "Open beta" })).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Open alpha" })).toBeNull();
-  });
-
-  it("uses server-authoritative attention counts for the Attention filter", async () => {
+  it("idle projects excludes working and offline sessions", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
@@ -88,26 +83,56 @@ describe("MobileCodeHome", () => {
             project_name: "alpha",
             status: "active",
             is_active: true,
-            attention_count: 2,
+            is_working: true,
           },
           {
             id: "session-b",
             project_name: "beta",
             status: "active",
             is_active: true,
-            attention_count: 0,
+            is_working: false,
+          },
+          {
+            id: "session-c",
+            project_name: "gamma",
+            status: "ended",
+            is_active: false,
+            is_working: false,
           },
         ],
       }),
     }));
     renderHome({ active: true, legacySessions: [] });
 
-    fireEvent.click(screen.getByRole("button", { name: "Attention" }));
+    fireEvent.click(screen.getByRole("button", { name: "Idle projects" }));
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: "Open alpha" })).toBeTruthy();
-      expect(screen.queryByRole("button", { name: "Open beta" })).toBeNull();
+      expect(screen.getByRole("button", { name: "Open beta" })).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Open alpha" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Open gamma" })).toBeNull();
     });
-    expect(screen.getByText("2 attention")).toBeTruthy();
+  });
+
+  it("does not preserve a stale bootstrap working flag once live inventory is present", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        sessions: [{
+          id: "session-a",
+          project_name: "alpha",
+          status: "active",
+          is_active: true,
+          is_working: true,
+        }],
+      }),
+    }));
+    renderHome({
+      active: true,
+      legacySessions: [session({ id: "session-a", workingDir: "/workspace/alpha", isWorking: undefined })],
+    });
+
+    await waitFor(() => {
+      expect(within(screen.getByRole("button", { name: "Open alpha" })).getByText("Idle")).toBeTruthy();
+    });
   });
 
   it("shows the most recently messaged session first", async () => {

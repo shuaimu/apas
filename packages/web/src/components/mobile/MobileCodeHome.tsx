@@ -6,7 +6,7 @@ import type { SessionInfo } from "@/lib/store";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://apas.mpaxos.com";
 
-type SessionFilter = "active" | "attention" | "completed" | "recent";
+type SessionFilter = "all" | "idle";
 
 interface MobileSessionSummary {
   id: string;
@@ -30,10 +30,8 @@ interface MobileBootstrapResponse {
 }
 
 const FILTERS: { key: SessionFilter; label: string }[] = [
-  { key: "active", label: "Active" },
-  { key: "attention", label: "Attention" },
-  { key: "completed", label: "Completed" },
-  { key: "recent", label: "Recent" },
+  { key: "all", label: "All projects" },
+  { key: "idle", label: "Idle projects" },
 ];
 
 function projectName(session: SessionInfo): string {
@@ -60,12 +58,7 @@ function adaptSession(session: SessionInfo): MobileSessionSummary {
 }
 
 function matches(session: MobileSessionSummary, filter: SessionFilter): boolean {
-  if (filter === "active") return Boolean(session.is_active);
-  if (filter === "attention") return (session.attention_count ?? 0) > 0;
-  if (filter === "completed") {
-    return !session.is_active && ["ended", "completed"].includes(session.status.toLowerCase());
-  }
-  return true;
+  return filter === "all" || statusLabel(session) === "Idle";
 }
 
 function timestamp(value?: string | null): number {
@@ -117,8 +110,7 @@ export function MobileCodeHome({
   onOpenSession,
 }: MobileCodeHomeProps) {
   const [remoteSessions, setRemoteSessions] = useState<MobileSessionSummary[] | null>(null);
-  const [filter, setFilter] = useState<SessionFilter>("active");
-  const [project, setProject] = useState<string | null>(null);
+  const [filter, setFilter] = useState<SessionFilter>("all");
   const [loadError, setLoadError] = useState<string | null>(null);
   const [newTaskOpen, setNewTaskOpen] = useState(false);
 
@@ -155,22 +147,21 @@ export function MobileCodeHome({
         ...session,
         status: live.status || session.status,
         is_active: live.isActive ?? session.is_active,
-        is_working: live.isWorking ?? session.is_working,
+        // Once the WebSocket inventory has this session it is the live
+        // authority. Do not preserve a stale REST `true` merely because an
+        // older/mixed-version inventory omitted isWorking.
+        is_working: Boolean(live.isWorking),
         hostname: live.hostname ?? session.hostname,
         working_dir: live.workingDir ?? session.working_dir,
       };
     });
   }, [legacySessions, remoteSessions]);
 
-  const projects = useMemo(
-    () => [...new Set(sessions.map((session) => session.project_name).filter((name): name is string => Boolean(name)))].sort(),
-    [sessions],
-  );
   const filteredSessions = useMemo(
     () => sessions
-      .filter((session) => matches(session, filter) && (!project || session.project_name === project))
+      .filter((session) => matches(session, filter))
       .sort(compareSessionRecency),
-    [filter, project, sessions],
+    [filter, sessions],
   );
   const activeSessions = useMemo(
     () => sessions.filter((session) => session.is_active).sort(compareSessionRecency),
@@ -232,30 +223,6 @@ export function MobileCodeHome({
         })}
       </div>
 
-      {projects.length > 1 && (
-        <div aria-label="Project filters" className="no-scrollbar flex shrink-0 gap-2 overflow-x-auto px-4 py-2.5">
-          {["All projects", ...projects].map((name) => {
-            const value = name === "All projects" ? null : name;
-            const selected = project === value;
-            return (
-              <button
-                key={name}
-                type="button"
-                aria-pressed={selected}
-                onClick={() => setProject(value)}
-                className={`shrink-0 rounded-full border px-3 py-1.5 text-xs font-medium ${
-                  selected
-                    ? "border-[#6d5efc] text-[#6d5efc]"
-                    : "border-[#dedee7] text-[#686873] dark:border-[#383842] dark:text-[#aaaab6]"
-                }`}
-              >
-                {name}
-              </button>
-            );
-          })}
-        </div>
-      )}
-
       {loadError && sessions.length > 0 && (
         <div className="mx-4 mt-2 flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
           <AlertTriangle className="h-4 w-4 shrink-0" /> Showing the last session list; refresh will retry automatically.
@@ -307,9 +274,9 @@ export function MobileCodeHome({
             <div className="mb-3 rounded-2xl bg-[#efeff5] p-3 dark:bg-[#25252d]">
               <AlertTriangle className="h-6 w-6 text-[#686873] dark:text-[#aaaab6]" />
             </div>
-            <h2 className="text-lg font-extrabold">{sessions.length ? `No ${filter} sessions` : "No coding sessions yet"}</h2>
+            <h2 className="text-lg font-extrabold">{sessions.length ? "No idle projects" : "No coding sessions yet"}</h2>
             <p className="mt-1.5 max-w-sm text-sm leading-5 text-[#686873] dark:text-[#aaaab6]">
-              {sessions.length ? "Try another status or project filter." : "Start APAS in a project, then follow its coding activity here."}
+              {sessions.length ? "All connected projects are currently working." : "Start APAS in a project, then follow its coding activity here."}
             </p>
             <button
               type="button"

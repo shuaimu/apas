@@ -156,26 +156,31 @@ describe("mobile code screens", () => {
     expect(view.getByText("Start a task")).toBeTruthy();
   });
 
-  it("keeps the horizontal project selector compact", () => {
+  it("offers only all-project and idle-project categories", () => {
     useMobileStore.setState({
       sessions: [
-        session,
+        { ...session, project_name: "working-project", is_working: true },
         {
           ...session,
           id: "9478d3c9-8527-437c-a7c4-93437f3a2e2f",
           project_id: "a70f916e-a160-4a82-9738-a63c76e2fc33",
-          project_name: "second-project",
+          project_name: "idle-project",
+          is_working: false,
         },
       ],
     });
     const view = render(<CodeHomeScreen />);
-    const selector = view.UNSAFE_getAllByType(FlatList).find(
-      (list) => list.props.horizontal && list.props.data?.includes("All projects"),
-    );
 
-    expect(selector).toBeTruthy();
-    expect(StyleSheet.flatten(selector?.props.style)).toMatchObject({ flexGrow: 0, flexShrink: 0 });
-    expect(StyleSheet.flatten(selector?.props.contentContainerStyle)).toMatchObject({ alignItems: "center" });
+    expect(view.getByText("All projects")).toBeTruthy();
+    expect(view.getByText("Idle projects")).toBeTruthy();
+    expect(view.queryByText("Active")).toBeNull();
+    expect(view.queryByText("Attention")).toBeNull();
+    expect(view.queryByText("Completed")).toBeNull();
+    expect(view.queryByText("Recent")).toBeNull();
+
+    fireEvent.press(view.getByText("Idle projects"));
+    expect(view.getByLabelText("Open idle-project")).toBeTruthy();
+    expect(view.queryByLabelText("Open working-project")).toBeNull();
   });
 
   it("promotes the session most recently messaged by the user", () => {
@@ -214,7 +219,6 @@ describe("mobile code screens", () => {
 
     expect(view.getByText("Working")).toBeTruthy();
     expect(view.getByText("Idle")).toBeTruthy();
-    fireEvent.press(view.getByText("Recent"));
     expect(view.getByText("Offline")).toBeTruthy();
     for (const name of ["working", "idle", "offline"]) {
       expect(view.getByLabelText(`Open ${name}`).findAllByProps({ children: "Active" })).toHaveLength(0);
@@ -252,25 +256,26 @@ describe("mobile code screens", () => {
       .toBe("2026-08-09T12:00:00Z");
   });
 
-  it("filters attention sessions in place like the other status controls", () => {
+  it("uses live pane status when filtering idle projects", () => {
     useMobileStore.setState({
       sessions: [
-        { ...session, project_name: "needs-attention", attention_count: 1 },
+        { ...session, project_name: "pane-working", is_working: false },
         {
           ...session,
           id: "dbb94295-01ce-4945-b586-e43f4c798e68",
           project_id: "a70f916e-a160-4a82-9738-a63c76e2fc33",
-          project_name: "no-attention",
-          attention_count: 0,
+          project_name: "actually-idle",
+          is_working: false,
         },
       ],
+      paneStatusesBySession: { [session.id]: { "3": "Thinking..." } },
     });
     const view = render(<CodeHomeScreen />);
 
     expect(view.getByText("Account")).toBeTruthy();
-    fireEvent.press(view.getByText("Attention"));
-    expect(view.getByLabelText("Open needs-attention")).toBeTruthy();
-    expect(view.queryByLabelText("Open no-attention")).toBeNull();
+    fireEvent.press(view.getByText("Idle projects"));
+    expect(view.getByLabelText("Open actually-idle")).toBeTruthy();
+    expect(view.queryByLabelText("Open pane-working")).toBeNull();
   });
 
   it("labels cached offline rendering and disables action assumptions", () => {
