@@ -558,10 +558,16 @@ impl HostedProcess {
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        // setsid makes the provider the leader of an isolated process group,
-        // allowing cleanup to terminate descendants rather than only the TUI.
-        let mut command = CommandBuilder::new("setsid");
-        command.arg(binary_path);
+        // Spawn the provider directly so portable_pty's pre_exec `setsid()`
+        // + `TIOCSCTTY` leave it the session leader with the pty as its
+        // controlling terminal and as the pty's foreground process group.
+        // Wrapping the binary in an extra `setsid` would fork it into a new
+        // session without a controlling terminal, so resizes (TIOCSWINSZ)
+        // never deliver SIGWINCH to it and TUIs that cache the terminal
+        // size at startup (opencode's opentui) stay stuck at the initial
+        // 80-column width. Cleanup still terminates the whole tree because
+        // the direct child is a session/process-group leader.
+        let mut command = CommandBuilder::new(binary_path);
         for arg in crate::terminal_pane::terminal_args_for(
             &provider,
             conversation_id,

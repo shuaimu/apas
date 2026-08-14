@@ -1058,6 +1058,49 @@ fn format_spawn_error(
     }
 }
 
+/// Fail before creating a persistent pane host when the configured provider
+/// binary cannot be executed. Without this preflight the host itself starts
+/// successfully and the user only sees `setsid: ... No such file`, bypassing
+/// the actionable APAS error (and leaving an unnecessary detached host).
+fn resolve_terminal_binary(provider: &Provider, binary_path: &str) -> Result<String, String> {
+    let resolved = resolve_binary_path(binary_path);
+    let path = Path::new(&resolved);
+    let metadata = std::fs::metadata(path);
+
+    let executable = metadata.as_ref().is_ok_and(|metadata| {
+        if !metadata.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    });
+
+    if executable {
+        return Ok(resolved);
+    }
+
+    let kind = match metadata {
+        Ok(_) => std::io::ErrorKind::PermissionDenied,
+        Err(error) => error.kind(),
+    };
+    let error = std::io::Error::new(
+        kind,
+        if kind == std::io::ErrorKind::PermissionDenied {
+            "configured path is not an executable file"
+        } else {
+            "executable not found"
+        },
+    );
+    Err(format_spawn_error(provider, None, binary_path, &error))
+}
+
 type PaneInput = (String, bool);
 
 /// Per-pane input channel registry.
@@ -1093,7 +1136,7 @@ fn spawn_terminal_pane(
             provider_display_name(provider, None)
         )
     })?;
-    let binary_path = resolve_binary_path(binary_path);
+    let binary_path = resolve_terminal_binary(provider, binary_path)?;
     let cwd = worktree_path.unwrap_or(working_dir);
     let env = build_pane_env_overrides(provider, None)?;
 
@@ -5302,14 +5345,14 @@ mod tests {
         deadloop_wait_plan, evaluate_deadloop_watchdog, is_codex_stale_session_error,
         manual_create_pr_worktree_path, normalize_codex_effort, normalize_effort_level,
         promote_pane_to_managed, queue_transport_reconnect, refresh_stale_managed_builtin_prompts,
-        reset_deadloop_codex_stale_session, resolve_pane_binary_path, restored_pane_mode_and_pause,
-        retired_launch_rejection_output, route_web_input_to_pane, run_deadloop_session_inner,
-        save_pane_configs, should_recover_deadloop_stale_session, start_bot_preserved_fields,
-        stop_retired_panes, terminal_state_reports, truncate_str_at_char_boundary,
-        update_project_operations, DeadloopWatchdogDecision, DeadloopWatchdogState, InputChannels,
-        PaneInputRouteResult, PaneMeta, PaneMetas, PanePauses, PaneStopRequests,
-        PendingAskQuestion, ASK_USER_QUESTION_AUTO_CANCEL_STATUS, DEEPSEEK_DEFAULT_MODEL,
-        MANAGED_PANE_CREATE_PR_ERROR,
+        reset_deadloop_codex_stale_session, resolve_pane_binary_path, resolve_terminal_binary,
+        restored_pane_mode_and_pause, retired_launch_rejection_output, route_web_input_to_pane,
+        run_deadloop_session_inner, save_pane_configs, should_recover_deadloop_stale_session,
+        start_bot_preserved_fields, stop_retired_panes, terminal_state_reports,
+        truncate_str_at_char_boundary, update_project_operations, DeadloopWatchdogDecision,
+        DeadloopWatchdogState, InputChannels, PaneInputRouteResult, PaneMeta, PaneMetas,
+        PanePauses, PaneStopRequests, PendingAskQuestion, ASK_USER_QUESTION_AUTO_CANCEL_STATUS,
+        DEEPSEEK_DEFAULT_MODEL, MANAGED_PANE_CREATE_PR_ERROR,
     };
     use crate::project::{get_or_create_project, save_project};
     use crate::terminal_pane::TerminalPanes;
@@ -7172,6 +7215,38 @@ Use a project-specific custom dispatch loop.";
             "cursor-agent",
         );
         assert_eq!(path, "claude");
+    }
+
+    #[test]
+    fn terminal_binary_preflight_returns_actionable_missing_opencode_error() {
+        let missing = "/definitely/missing/apas-test-opencode";
+        let error = resolve_terminal_binary(&Provider::Opencode, missing).unwrap_err();
+
+        assert!(error.contains("OpenCode"), "{error}");
+        assert!(error.contains(missing), "{error}");
+        assert!(error.contains("opencode_path"), "{error}");
+        assert!(error.contains("executable not found"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_binary_preflight_accepts_executable_and_rejects_non_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let binary = root.path().join("opencode-test");
+        std::fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            resolve_terminal_binary(&Provider::Opencode, binary.to_str().unwrap()).unwrap(),
+            binary.to_string_lossy()
+        );
+
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let error =
+            resolve_terminal_binary(&Provider::Opencode, binary.to_str().unwrap()).unwrap_err();
+        assert!(error.contains("not an executable file"), "{error}");
     }
 
     #[test]
