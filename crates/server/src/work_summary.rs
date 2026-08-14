@@ -570,6 +570,20 @@ impl PaneWorkSummaryService {
         Ok(())
     }
 
+    /// How much of a session's log `reconcile_session` reads, newest-first.
+    ///
+    /// Scaled off `max_source_bytes` because that is the size at which a single
+    /// window stops being summarisable: a generous multiple covers several
+    /// panes with several live windows each, and anything past it belongs to
+    /// windows that would be rejected as over-bounds regardless.
+    fn source_tail_budget(&self) -> u64 {
+        const WINDOWS_WORTH_OF_SOURCE: u64 = 64;
+        const FLOOR_BYTES: u64 = 4 * 1024 * 1024;
+        (self.config.max_source_bytes as u64)
+            .saturating_mul(WINDOWS_WORTH_OF_SOURCE)
+            .max(FLOOR_BYTES)
+    }
+
     fn availability_for(&self, session_id: Uuid) -> PaneWorkSummaryAvailability {
         if !self.config.enabled {
             return PaneWorkSummaryAvailability::SummarizerDisabled;
@@ -593,8 +607,26 @@ impl PaneWorkSummaryService {
         scope: ReconcileScope,
         force_window: Option<DateTime<Utc>>,
     ) -> anyhow::Result<usize> {
-        let messages = self.storage.get_messages(&session_id).await?;
+        // Bounded read. This runs on a timer over every session, and reading
+        // the whole log was what turned one runaway session into an
+        // out-of-memory server: 2.9 GB of JSON became roughly 15 GB of structs
+        // every sweep. Reading only the tail costs nothing real — a window
+        // whose source exceeds `max_source_bytes` is rejected below rather
+        // than summarised, so the bytes beyond that budget could never have
+        // produced a summary anyway.
+        let (messages, source_truncated) = self
+            .storage
+            .get_messages_tail(&session_id, self.source_tail_budget())
+            .await?;
         let scanned_bytes = messages.iter().map(|message| message.content.len()).sum();
+        // When the read was truncated, the oldest window we can see is missing
+        // its beginning. Summarising it would quietly describe a fragment as
+        // if it were the whole window, so it is treated as over-bounds below.
+        let partial_window_through = source_truncated
+            .then(|| messages.first())
+            .flatten()
+            .and_then(|message| DateTime::parse_from_rfc3339(&message.created_at).ok())
+            .map(|ts| window_bounds(ts.with_timezone(&Utc)).0);
         let panes = {
             let active = self.sessions.get_session_panes(&session_id);
             if active.is_empty() {
@@ -743,7 +775,12 @@ impl PaneWorkSummaryService {
             let source_bytes = window.canonical_source().len();
             let manifest =
                 chunk_window(&window, self.config.max_chunk_bytes, self.config.max_chunks);
-            if source_bytes > self.config.max_source_bytes || manifest.overflowed {
+            // A window at or before the truncation boundary is missing its
+            // oldest records, so its source is both incomplete and — since it
+            // filled the read budget — far larger than the cap allows.
+            let partial = partial_window_through
+                .is_some_and(|boundary| window.window_start <= boundary);
+            if partial || source_bytes > self.config.max_source_bytes || manifest.overflowed {
                 if let Some(summary) = document.summaries.iter_mut().find(|summary| {
                     summary.pane_id == window.pane_id && summary.window_start == window.window_start
                 }) {
@@ -1598,6 +1635,100 @@ mod service_tests {
             Some("test-host".to_string()),
         );
         (cli_id, cli_rx)
+    }
+
+    #[tokio::test]
+    async fn a_window_cut_short_by_the_bounded_read_is_never_summarised() {
+        // The reconciler reads only the tail of a session's log, so the oldest
+        // window it can see may be missing its beginning. The danger is not the
+        // huge window — that fails the size check anyway — but the *small*
+        // surviving fragment of one, which looks perfectly summarisable and
+        // would be described as if it were the whole window.
+        let (service, db, storage, sessions) = test_service().await;
+        let owner = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        add_user_and_session(&db, owner, session_id).await;
+        let (_cli_id, _cli_rx) = register_capable_cli(&sessions, owner, session_id);
+
+        let budget = service.source_tail_budget();
+        let filler = "x".repeat(4 * 1024);
+        let old_start = window_bounds(Utc::now()).0 - Duration::hours(SUMMARY_WINDOW_HOURS * 2);
+        let newer_start = window_bounds(Utc::now()).0 - Duration::hours(SUMMARY_WINDOW_HOURS);
+        // Count exactly what lands on disk — the cut position is what this
+        // fixture is really controlling, and an estimate drifts enough to move
+        // it outside the older window.
+        let append = |message: StoredMessage| {
+            let bytes = serde_json::to_string(&message).unwrap().len() as u64 + 1;
+            (message, bytes)
+        };
+
+        // The window that will be cut into. Sized so that whatever survives the
+        // cut stays under max_source_bytes — otherwise the existing size check
+        // would reject it and this test would prove nothing.
+        let mut written = 0u64;
+        for i in 0..10 {
+            let (message, bytes) = append(service_message(
+                &format!("old{i}"),
+                Some("7"),
+                &(old_start + Duration::seconds(i)).to_rfc3339(),
+                &filler,
+            ));
+            storage.append_message(&session_id, &message).await.unwrap();
+            written += bytes;
+        }
+        // Overshoot the budget by less than the older window's size, so the cut
+        // lands inside that window instead of past it.
+        let overshoot = 25 * 1024;
+        let mut i = 0i64;
+        while written < budget + overshoot {
+            let (message, bytes) = append(service_message(
+                &format!("new{i}"),
+                Some("7"),
+                &(newer_start + Duration::seconds(i % 3000)).to_rfc3339(),
+                &filler,
+            ));
+            storage.append_message(&session_id, &message).await.unwrap();
+            written += bytes;
+            i += 1;
+        }
+
+        let (tail, truncated) = storage
+            .get_messages_tail(&session_id, budget)
+            .await
+            .unwrap();
+        assert!(truncated, "fixture did not exceed the read budget");
+        assert!(
+            tail.iter().any(|m| m.id.starts_with("old")),
+            "fixture cut away the older window entirely; nothing to assert on"
+        );
+
+        service
+            .reconcile_completed_for_pane(session_id, 7)
+            .await
+            .unwrap();
+
+        let document = storage
+            .load_pane_work_summaries(&session_id)
+            .await
+            .unwrap();
+        let partial = document
+            .summaries
+            .iter()
+            .find(|summary| summary.window_start == old_start)
+            .expect("the partially-read window should be recorded");
+        assert_eq!(
+            partial.status,
+            PaneWorkSummaryStatus::Failed,
+            "a window missing its start was accepted for summarisation"
+        );
+        assert!(
+            partial
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("exceeds configured bounds")),
+            "unexpected rejection reason: {:?}",
+            partial.error
+        );
     }
 
     #[tokio::test]

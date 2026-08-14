@@ -13,6 +13,19 @@ use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 static SESSION_GC_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Ceiling on one session's `messages.jsonl`.
+///
+/// Sized to be unreachable by human conversation and firmly reachable by a
+/// runaway writer. The incident that motivated it wrote 2.9 GB into a single
+/// session; the server then died trying to read that back into memory. 256 MiB
+/// is roughly a third of a million typical messages — orders of magnitude more
+/// than any real session — while still leaving the file readable in full.
+pub const SESSION_MESSAGES_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Target size after a trim. Deliberately below the cap so an over-cap session
+/// does not rewrite its whole log on every subsequent append.
+const SESSION_MESSAGES_TRIM_TO_BYTES: u64 = 192 * 1024 * 1024;
 const PANE_WORK_SUMMARY_SIDECAR_VERSION: u32 = 1;
 
 /// Truncate `content` to roughly `max_bytes`, preserving JSON validity for
@@ -155,6 +168,11 @@ pub struct FileStorage {
     /// GC's atomic rename — the append handle would land on the orphaned
     /// pre-rename inode and the message would silently vanish.
     session_locks: Arc<StdMutex<HashMap<Uuid, Arc<AsyncMutex<()>>>>>,
+    /// Size ceiling for one session's log, and the size a trim leaves behind.
+    /// Fields rather than constants so tests can exercise the trim without
+    /// writing a quarter of a gigabyte.
+    max_session_bytes: u64,
+    trim_session_to_bytes: u64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -171,7 +189,18 @@ impl FileStorage {
         Self {
             base_path: base_path.as_ref().to_path_buf(),
             session_locks: Arc::new(StdMutex::new(HashMap::new())),
+            max_session_bytes: SESSION_MESSAGES_MAX_BYTES,
+            trim_session_to_bytes: SESSION_MESSAGES_TRIM_TO_BYTES,
         }
+    }
+
+    /// Shrink the per-session size cap. Test-only: the production ceiling is
+    /// too large to reach in a unit test.
+    #[cfg(test)]
+    fn with_session_size_cap(mut self, max_bytes: u64, trim_to_bytes: u64) -> Self {
+        self.max_session_bytes = max_bytes;
+        self.trim_session_to_bytes = trim_to_bytes;
+        self
     }
 
     fn session_lock(&self, session_id: &Uuid) -> Arc<AsyncMutex<()>> {
@@ -230,7 +259,84 @@ impl FileStorage {
         // we don't sync to disk (that's the OS's call), but we do close
         // out the in-process write before returning to the caller.
         file.flush().await?;
+        drop(file);
 
+        // Enforce the size ceiling while we still hold the session lock, so a
+        // concurrent append cannot interleave with the rewrite.
+        self.enforce_session_size_cap(session_id, &file_path).await?;
+
+        Ok(())
+    }
+
+    /// Drop the oldest messages once a session's log passes
+    /// [`SESSION_MESSAGES_MAX_BYTES`].
+    ///
+    /// The age-based GC cannot do this job. It deletes what has aged past its
+    /// retention window, which says nothing about volume: a pane republishing
+    /// its transcript in a loop wrote 2.9 GB inside a single 7-day window, and
+    /// the sweep correctly kept all of it while the server ran out of memory
+    /// reading it back. This is the bound on *how much*, and it has to be
+    /// enforced at append because that is the only point that sees every write.
+    ///
+    /// Caller must hold the session lock.
+    async fn enforce_session_size_cap(&self, session_id: &Uuid, file_path: &Path) -> Result<()> {
+        // std rather than tokio::fs: tokio's metadata can lag a write that
+        // this very call just made (see get_messages_after for the same note).
+        let size = match std::fs::metadata(file_path) {
+            Ok(meta) => meta.len(),
+            Err(_) => return Ok(()),
+        };
+        if size <= self.max_session_bytes {
+            return Ok(());
+        }
+
+        // Trim well below the ceiling rather than to it, so the next append
+        // does not immediately rewrite the file again.
+        let keep_from = size.saturating_sub(self.trim_session_to_bytes);
+        let tmp_path = session_gc_temp_path(file_path);
+
+        let copy_result: Result<u64> = async {
+            let file = fs::File::open(file_path).await?;
+            let mut reader = BufReader::new(file);
+            reader.seek(SeekFrom::Start(keep_from)).await?;
+            // The seek almost certainly landed mid-line; discard that
+            // fragment so the file never starts with half a record.
+            let mut partial = String::new();
+            reader.read_line(&mut partial).await?;
+
+            let mut tmp = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&tmp_path)
+                .await?;
+            let copied = tokio::io::copy(&mut reader, &mut tmp).await?;
+            tmp.flush().await?;
+            Ok(copied)
+        }
+        .await;
+
+        let copied = match copy_result {
+            Ok(copied) => copied,
+            Err(err) => {
+                let _ = fs::remove_file(&tmp_path).await;
+                return Err(err);
+            }
+        };
+
+        if let Err(err) = fs::rename(&tmp_path, file_path).await {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(err.into());
+        }
+
+        // Loud on purpose: this discards a user's conversation history, and
+        // reaching it at all means something upstream is writing far too much.
+        tracing::warn!(
+            %session_id,
+            previous_bytes = size,
+            retained_bytes = copied,
+            cap_bytes = self.max_session_bytes,
+            "Session message log exceeded its size cap — dropped the oldest messages"
+        );
         Ok(())
     }
 
@@ -450,6 +556,59 @@ impl FileStorage {
     }
 
     /// Read ALL messages for a session (no limit)
+    /// Read at most the newest `max_bytes` of a session's log.
+    ///
+    /// Returns the messages oldest-first, plus whether older messages were
+    /// skipped — a caller that cares about completeness has to know it is
+    /// looking at a tail rather than the whole conversation.
+    ///
+    /// This exists because [`Self::get_messages`] is unbounded, and the one
+    /// production caller that ran it on a timer parsed a 2.9 GB log into
+    /// roughly 15 GB of structs every 15 minutes until the server died. Peak
+    /// memory here is a function of `max_bytes`, never of the file.
+    pub async fn get_messages_tail(
+        &self,
+        session_id: &Uuid,
+        max_bytes: u64,
+    ) -> Result<(Vec<StoredMessage>, bool)> {
+        let file_path = self.messages_file(session_id);
+        if !file_path.exists() {
+            return Ok((Vec::new(), false));
+        }
+        // std rather than tokio: tokio's metadata can lag a very recent write
+        // by another task, and a short size would silently drop the newest
+        // messages — the ones this read most wants.
+        let size = std::fs::metadata(&file_path)?.len();
+        if size == 0 {
+            return Ok((Vec::new(), false));
+        }
+
+        let keep_from = size.saturating_sub(max_bytes);
+        let truncated = keep_from > 0;
+
+        let file = fs::File::open(&file_path).await?;
+        let mut reader = BufReader::new(file);
+        if truncated {
+            reader.seek(SeekFrom::Start(keep_from)).await?;
+            // The seek lands mid-line; drop that fragment so parsing starts on
+            // a record boundary.
+            let mut partial = String::new();
+            reader.read_line(&mut partial).await?;
+        }
+
+        let mut messages = Vec::new();
+        let mut lines = reader.lines();
+        while let Some(line) = lines.next_line().await? {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(msg) = serde_json::from_str::<StoredMessage>(&line) {
+                messages.push(msg);
+            }
+        }
+        Ok((messages, truncated))
+    }
+
     pub async fn get_messages(&self, session_id: &Uuid) -> Result<Vec<StoredMessage>> {
         let file_path = self.messages_file(session_id);
 
@@ -1452,6 +1611,119 @@ mod gc_tests {
         let file_name = first.file_name().unwrap().to_string_lossy();
         assert!(file_name.starts_with("messages.jsonl.gc."));
         assert!(file_name.ends_with(".tmp"));
+    }
+
+    #[tokio::test]
+    async fn append_trims_a_session_that_outgrows_its_size_cap() {
+        // The failure this guards: a pane republishing its transcript wrote
+        // 2.9 GB into one session inside the GC's 7-day window, so the
+        // age-based sweep correctly kept every byte and the server exhausted
+        // its memory reading the file back.
+        let storage = fresh_storage().with_session_size_cap(8 * 1024, 4 * 1024);
+        let sid = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+
+        for i in 0..400 {
+            storage
+                .append_message(&sid, &make_msg(&format!("m{i}"), &now))
+                .await
+                .unwrap();
+        }
+
+        let size = std::fs::metadata(storage.messages_file(&sid)).unwrap().len();
+        assert!(
+            size <= 8 * 1024,
+            "log stayed over its cap after appends: {size} bytes"
+        );
+
+        // The newest messages are the ones worth keeping, and every retained
+        // line must still parse — a trim that cut mid-record would corrupt the
+        // store just as surely as letting it grow.
+        let kept = storage.get_messages(&sid).await.unwrap();
+        assert!(!kept.is_empty(), "trim emptied the session");
+        assert_eq!(
+            kept.last().unwrap().id,
+            "m399",
+            "trim discarded the newest message"
+        );
+        assert!(
+            kept.iter().all(|m| m.role == "assistant"),
+            "a partial line survived the trim"
+        );
+        assert!(
+            session_tmp_files(&storage, &sid).await.is_empty(),
+            "trim left a temp file behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn tail_read_is_bounded_and_reports_that_it_skipped_older_messages() {
+        let storage = fresh_storage();
+        let sid = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+        for i in 0..500 {
+            storage
+                .append_message(&sid, &make_msg(&format!("m{i}"), &now))
+                .await
+                .unwrap();
+        }
+        let full = storage.get_messages(&sid).await.unwrap();
+        assert_eq!(full.len(), 500);
+
+        let (tail, truncated) = storage.get_messages_tail(&sid, 2 * 1024).await.unwrap();
+        assert!(truncated, "a partial read must say so");
+        assert!(tail.len() < full.len(), "tail read was not bounded");
+        assert!(!tail.is_empty());
+        // Newest-biased, and never starting mid-record.
+        assert_eq!(tail.last().unwrap().id, "m499");
+        assert!(tail.iter().all(|m| m.role == "assistant"));
+    }
+
+    #[tokio::test]
+    async fn tail_read_returns_everything_when_the_log_fits() {
+        let storage = fresh_storage();
+        let sid = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+        for i in 0..5 {
+            storage
+                .append_message(&sid, &make_msg(&format!("m{i}"), &now))
+                .await
+                .unwrap();
+        }
+
+        let (tail, truncated) = storage.get_messages_tail(&sid, 1024 * 1024).await.unwrap();
+        assert!(!truncated, "a complete read must not claim truncation");
+        assert_eq!(tail.len(), 5);
+        assert_eq!(tail[0].id, "m0");
+    }
+
+    #[tokio::test]
+    async fn tail_read_of_a_missing_session_is_empty_not_an_error() {
+        let storage = fresh_storage();
+        let (tail, truncated) = storage
+            .get_messages_tail(&Uuid::new_v4(), 1024)
+            .await
+            .unwrap();
+        assert!(tail.is_empty());
+        assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn append_leaves_a_session_under_the_cap_untouched() {
+        let storage = fresh_storage().with_session_size_cap(8 * 1024, 4 * 1024);
+        let sid = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+
+        for i in 0..5 {
+            storage
+                .append_message(&sid, &make_msg(&format!("m{i}"), &now))
+                .await
+                .unwrap();
+        }
+
+        let kept = storage.get_messages(&sid).await.unwrap();
+        assert_eq!(kept.len(), 5, "an under-cap session must not be rewritten");
+        assert_eq!(kept[0].id, "m0");
     }
 
     #[tokio::test]
