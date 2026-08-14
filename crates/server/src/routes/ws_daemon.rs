@@ -101,6 +101,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     Ok(DaemonToServer::ProjectInstanceCreated { .. }) => {
                         tracing::warn!("Daemon sent project-instance result before register");
                     }
+                    Ok(DaemonToServer::ProjectRuntimeStopped { .. }) => {
+                        tracing::warn!("Daemon sent project-runtime stop result before register");
+                    }
                     Err(err) => {
                         tracing::warn!("Failed to parse daemon registration message: {}", err);
                     }
@@ -272,6 +275,29 @@ fn apply_registered_daemon_message(
             ..
         } => {
             sessions.relay_project_instance_created(machine_id, request_id, project_id, error);
+        }
+        DaemonToServer::ProjectRuntimeStopped {
+            request_id,
+            project_id,
+            success,
+            remaining_pane_hosts,
+            error,
+        } => {
+            tracing::info!(
+                %machine_id,
+                %request_id,
+                %project_id,
+                success,
+                remaining_pane_hosts,
+                "daemon project-runtime cleanup completed"
+            );
+            sessions.complete_project_runtime_stop(
+                request_id,
+                project_id,
+                success,
+                remaining_pane_hosts,
+                error,
+            );
         }
     }
 }

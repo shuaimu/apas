@@ -535,6 +535,11 @@ async fn run_connection(
                         // AnswerQuestion is dual_pane-only — remote mode doesn't run
                         // the streaming worker that owns the pending_questions map.
                     }
+                    Ok(ServerToCli::CliLifecycleRequest { .. }) => {
+                        tracing::warn!(
+                            "ignoring lifecycle request: remote mode does not advertise lifecycle capability"
+                        );
+                    }
                     Ok(ServerToCli::RebootCli { .. }) => {
                         tracing::info!("Reboot command received, restarting...");
                         crate::update::restart_cli();

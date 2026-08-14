@@ -16,6 +16,12 @@ pub const MOBILE_TASK_LAUNCH_CAPABILITY: &str = "mobile_task_launch_v2";
 /// server/web deployment cannot route an OpenCode pane to an older CLI that
 /// would persist the pane but fail to launch it.
 pub const OPENCODE_TERMINAL_CAPABILITY: &str = "terminal_opencode_v1";
+/// The CLI understands correlated, transport-only reconnect requests.
+pub const CLI_LIFECYCLE_CAPABILITY: &str = "cli_lifecycle_v1";
+/// The CLI can keep supported terminal providers alive outside the replaceable
+/// project controller process and adopt them after a reboot.
+pub const PERSISTENT_TERMINAL_HOST_CAPABILITY: &str = "persistent_terminal_host_v1";
+pub const PANE_HOST_CLEANUP_ACK_CAPABILITY: &str = "pane_host_cleanup_ack_v1";
 
 fn default_true() -> bool {
     true
@@ -77,6 +83,81 @@ pub enum TerminalLifecycle {
     Running,
     Disconnected,
     Exited,
+}
+
+/// A project-level lifecycle operation. Reconnect is deliberately distinct
+/// from reboot so mixed-version routing can never turn transport recovery into
+/// a destructive process replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CliLifecycleOperation {
+    ReconnectTransport,
+    RebootCli,
+}
+
+/// Authoritative progress for a correlated lifecycle request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CliLifecyclePhase {
+    Accepted,
+    Preparing,
+    Reconnecting,
+    Handoff,
+    Reconciling,
+    Succeeded,
+    Failed,
+    TimedOut,
+}
+
+impl CliLifecyclePhase {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::TimedOut)
+    }
+}
+
+/// Whether one configured pane can retain its exact live process during a
+/// full CLI replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PanePreservationMode {
+    LiveAdoptable,
+    RestartRequiredOnCliReboot,
+    StructuredPaneMayResume,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PanePreservationInfo {
+    pub pane_id: u32,
+    pub mode: PanePreservationMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<Uuid>,
+}
+
+/// Current lifecycle capabilities and the per-pane reboot consequence list.
+/// Empty/default values make the message safe while CLI versions roll out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CliLifecycleInventory {
+    #[serde(default)]
+    pub reconnect_transport: bool,
+    #[serde(default)]
+    pub persistent_terminal_hosting: bool,
+    #[serde(default)]
+    pub panes: Vec<PanePreservationInfo>,
+}
+
+/// Host-owned terminal continuity metadata reported during reconciliation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TerminalRuntimeReconciliation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<Uuid>,
+    #[serde(default)]
+    pub oldest_seq: u64,
+    #[serde(default)]
+    pub current_seq: u64,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub live_adopted: bool,
 }
 
 /// What to do with an isolated git worktree (and its branch) when the pane
@@ -384,6 +465,29 @@ pub enum CliToServer {
         lifecycle: TerminalLifecycle,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime: Option<TerminalRuntimeReconciliation>,
+    },
+
+    /// Capability and preservation consequence snapshot for project lifecycle
+    /// controls. Re-sent after every registration and roster change.
+    CliLifecycleInventory {
+        session_id: Uuid,
+        #[serde(default)]
+        inventory: CliLifecycleInventory,
+    },
+
+    /// Progress/outcome for a lifecycle request. The server forwards this
+    /// only to web connections that still have access to the project.
+    CliLifecycleStatus {
+        session_id: Uuid,
+        request_id: Uuid,
+        operation: CliLifecycleOperation,
+        phase: CliLifecyclePhase,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inventory: Option<CliLifecycleInventory>,
     },
 
     /// Result from the CLI's isolated no-tools summary runner.
@@ -539,6 +643,14 @@ pub enum ServerToCli {
 
     /// Reboot the CLI process
     RebootCli { session_id: Uuid },
+
+    /// Correlated lifecycle request used by capability-aware peers. Servers
+    /// must never translate an unsupported reconnect into legacy RebootCli.
+    CliLifecycleRequest {
+        session_id: Uuid,
+        request_id: Uuid,
+        operation: CliLifecycleOperation,
+    },
 
     /// Request CLI to send its current PaneList
     RequestPaneList { session_id: Uuid },
@@ -769,6 +881,19 @@ pub enum DaemonToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+
+    /// Completion of an intentional project-runtime stop. New servers wait
+    /// for this before final project deletion so detached pane hosts cannot
+    /// outlive the project record that authorized them.
+    ProjectRuntimeStopped {
+        request_id: Uuid,
+        project_id: String,
+        success: bool,
+        #[serde(default)]
+        remaining_pane_hosts: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 /// Messages sent from server to machine daemon
@@ -792,7 +917,11 @@ pub enum ServerToDaemon {
     },
 
     /// Stop APAS CLI for a project on this machine
-    StopProjectCli { project_id: String },
+    StopProjectCli {
+        project_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<Uuid>,
+    },
 
     /// Clone a repo into a new instance directory, branch it, register a
     /// `.apas`, and start it. The daemon mints the project_id (so, unlike
@@ -1182,6 +1311,15 @@ pub enum WebToServer {
         session_id: Option<Uuid>,
     },
 
+    /// Capability-gated project lifecycle operation. `session_id` is
+    /// required so multi-attached web connections cannot accidentally target
+    /// the last session that happened to attach.
+    CliLifecycleRequest {
+        session_id: Uuid,
+        request_id: Uuid,
+        operation: CliLifecycleOperation,
+    },
+
     /// Start APAS CLI for a daemon project
     StartMachineProjectCli {
         machine_id: Uuid,
@@ -1249,9 +1387,6 @@ pub enum WebToServer {
         #[serde(default)]
         clear_api_key: bool,
     },
-
-    /// Download all session data
-    DownloadSession { session_id: Uuid },
 
     /// Submit answers to a pending AskUserQuestion tool call. The server
     /// relays this to the CLI which writes a control_response onto claude's
@@ -1562,6 +1697,26 @@ pub enum ServerToWeb {
         error: Option<String>,
     },
 
+    /// Latest connected-CLI lifecycle capabilities and per-pane reboot
+    /// preservation consequence list.
+    CliLifecycleInventory {
+        session_id: Uuid,
+        #[serde(default)]
+        inventory: CliLifecycleInventory,
+    },
+
+    /// Authoritative progress/outcome for one lifecycle request.
+    CliLifecycleStatus {
+        session_id: Uuid,
+        request_id: Uuid,
+        operation: CliLifecycleOperation,
+        phase: CliLifecyclePhase,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inventory: Option<CliLifecycleInventory>,
+    },
+
     /// Session started
     SessionStarted {
         session_id: Uuid,
@@ -1700,17 +1855,6 @@ pub enum ServerToWeb {
         #[serde(default)]
         provider: Provider,
         limits: UsageLimits,
-    },
-
-    /// Full session data for download
-    SessionDownload {
-        session_id: Uuid,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        project_id: Option<Uuid>,
-        messages: Vec<MessageInfo>,
-        working_dir: Option<String>,
-        hostname: Option<String>,
-        created_at: Option<String>,
     },
 
     /// One team scratchpad record forwarded from the CLI. Phase 2.2b.
@@ -1857,6 +2001,8 @@ pub enum ServerToWeb {
         lifecycle: TerminalLifecycle,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime: Option<TerminalRuntimeReconciliation>,
     },
 
     /// A terminal pane's child process ended.
@@ -1880,6 +2026,8 @@ pub enum ServerToWeb {
         lifecycle: TerminalLifecycle,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime: Option<TerminalRuntimeReconciliation>,
     },
 
     /// Complete pane-scoped snapshot returned on list/open.
@@ -4007,6 +4155,13 @@ mod tests {
             instance_id: Some(instance_id),
             lifecycle: TerminalLifecycle::Exited,
             status: Some("exited with status 1".to_string()),
+            runtime: Some(TerminalRuntimeReconciliation {
+                runtime_id: Some(Uuid::new_v4()),
+                oldest_seq: 3,
+                current_seq: 9,
+                truncated: true,
+                live_adopted: true,
+            }),
         };
         let json = serde_json::to_string(&cli).unwrap();
         match serde_json::from_str::<CliToServer>(&json).unwrap() {
@@ -4016,12 +4171,14 @@ mod tests {
                 instance_id: got_instance,
                 lifecycle,
                 status,
+                runtime,
             } => {
                 assert_eq!(got_session, session_id);
                 assert_eq!(pane_id, 11);
                 assert_eq!(got_instance, Some(instance_id));
                 assert_eq!(lifecycle, TerminalLifecycle::Exited);
                 assert_eq!(status.as_deref(), Some("exited with status 1"));
+                assert_eq!(runtime.expect("runtime metadata").current_seq, 9);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -4032,6 +4189,7 @@ mod tests {
             instance_id: Some(instance_id),
             lifecycle: TerminalLifecycle::Disconnected,
             status: None,
+            runtime: None,
         };
         let json = serde_json::to_string(&web).unwrap();
         match serde_json::from_str::<ServerToWeb>(&json).unwrap() {
@@ -4045,6 +4203,60 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn lifecycle_protocol_is_correlated_and_legacy_reboot_is_unchanged() {
+        let session_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let reconnect = WebToServer::CliLifecycleRequest {
+            session_id,
+            request_id,
+            operation: CliLifecycleOperation::ReconnectTransport,
+        };
+        let json = serde_json::to_string(&reconnect).unwrap();
+        assert!(json.contains("\"type\":\"cli_lifecycle_request\""));
+        assert!(json.contains("\"operation\":\"reconnect_transport\""));
+        match serde_json::from_str::<WebToServer>(&json).unwrap() {
+            WebToServer::CliLifecycleRequest {
+                request_id: got, ..
+            } => assert_eq!(got, request_id),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let legacy = format!(r#"{{"type":"reboot_cli","session_id":"{session_id}"}}"#);
+        assert!(matches!(
+            serde_json::from_str::<WebToServer>(&legacy).unwrap(),
+            WebToServer::RebootCli { .. }
+        ));
+    }
+
+    #[test]
+    fn lifecycle_inventory_defaults_for_rolling_upgrade() {
+        let json = r#"{
+            "type":"cli_lifecycle_inventory",
+            "session_id":"52443f74-5819-4502-83fe-db530fe70feb"
+        }"#;
+        match serde_json::from_str::<CliToServer>(json).unwrap() {
+            CliToServer::CliLifecycleInventory { inventory, .. } => {
+                assert!(!inventory.reconnect_transport);
+                assert!(!inventory.persistent_terminal_hosting);
+                assert!(inventory.panes.is_empty());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_daemon_project_stop_defaults_to_uncorrelated_cleanup() {
+        let legacy = r#"{"type":"stop_project_cli","project_id":"project-a"}"#;
+        assert!(matches!(
+            serde_json::from_str::<ServerToDaemon>(legacy).unwrap(),
+            ServerToDaemon::StopProjectCli {
+                project_id,
+                request_id: None,
+            } if project_id == "project-a"
+        ));
     }
 
     // --- tab-type policy -------------------------------------------------

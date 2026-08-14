@@ -25,6 +25,10 @@ pub async fn cleanup_project(state: &AppState, project_id: &str) -> Result<()> {
 
     state
         .sessions
+        .confirm_project_runtime_stopped(project_id)
+        .await?;
+    state
+        .sessions
         .purge_project_state(project_id, &affected_user_ids)
         .await;
     state.storage.delete_session_dirs(&session_ids).await?;

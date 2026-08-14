@@ -579,6 +579,12 @@ impl DaemonState {
     }
 
     fn stop_project(&mut self, project_id: &str) -> Result<()> {
+        if let Ok(project_uuid) = Uuid::parse_str(project_id) {
+            let stopped = crate::pane_host::shutdown_project_hosts(project_uuid)?;
+            if stopped > 0 {
+                tracing::info!(project_id, stopped, "stopped persistent pane hosts");
+            }
+        }
         let session_name = self
             .sessions
             .remove(project_id)
@@ -811,7 +817,10 @@ async fn run_connection(
         token: token.to_string(),
         machine: state.machine_info.clone(),
         projects: state.snapshot_projects(),
-        capabilities: vec![shared::PROJECT_POLICY_CAPABILITY.to_string()],
+        capabilities: vec![
+            shared::PROJECT_POLICY_CAPABILITY.to_string(),
+            shared::PANE_HOST_CLEANUP_ACK_CAPABILITY.to_string(),
+        ],
     };
     ws_sender
         .send(Message::Text(serde_json::to_string(&register)?.into()))
@@ -952,9 +961,28 @@ async fn run_connection(
                                 let text = serde_json::to_string(&update)?;
                                 ws_sender.send(Message::Text(text.into())).await?;
                             }
-                            ServerToDaemon::StopProjectCli { project_id } => {
-                                if let Err(err) = state.stop_project(&project_id) {
+                            ServerToDaemon::StopProjectCli { project_id, request_id } => {
+                                let stop_result = state.stop_project(&project_id);
+                                if let Err(err) = &stop_result {
                                     tracing::warn!("Failed to stop project {}: {}", project_id, err);
+                                }
+                                let remaining_pane_hosts = Uuid::parse_str(&project_id)
+                                    .ok()
+                                    .and_then(|project_uuid| crate::pane_host::list_project_descriptors(project_uuid).ok())
+                                    .map(|descriptors| descriptors.len())
+                                    .unwrap_or_default();
+                                if let Some(request_id) = request_id {
+                                    let success = stop_result.is_ok() && remaining_pane_hosts == 0;
+                                    let ack = DaemonToServer::ProjectRuntimeStopped {
+                                        request_id,
+                                        project_id: project_id.clone(),
+                                        success,
+                                        remaining_pane_hosts,
+                                        error: stop_result.err().map(|error| error.to_string()),
+                                    };
+                                    ws_sender
+                                        .send(Message::Text(serde_json::to_string(&ack)?.into()))
+                                        .await?;
                                 }
                                 let update = DaemonToServer::Heartbeat {
                                     projects: state.snapshot_projects(),

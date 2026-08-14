@@ -471,7 +471,16 @@ export function TabbedView({
   const startBot = useStore((s) => s.startBot);
   const stopBot = useStore((s) => s.stopBot);
   const startMachineProjectCli = useStore((s) => s.startMachineProjectCli);
+  const reconnectCli = useStore((s) => s.reconnectCli);
   const rebootCli = useStore((s) => s.rebootCli);
+  const lifecycleInventory = useStore((s) =>
+    s.sessionId ? s.cliLifecycleInventories[s.sessionId] : undefined,
+  );
+  const lifecycleStatus = useStore((s) => {
+    if (!s.sessionId) return undefined;
+    const requestId = s.cliLifecycleLatestBySession[s.sessionId];
+    return requestId ? s.cliLifecycleOperations[requestId] : undefined;
+  });
   const rebootPane = useStore((s) => s.rebootPane);
   const requestPaneDiff = useStore((s) => s.requestPaneDiff);
   const createPanePr = useStore((s) => s.createPanePr);
@@ -1102,7 +1111,10 @@ export function TabbedView({
         onRenameTab={handleRenameTab}
         onReorderTabs={handleReorderTabs}
         onBootCli={handleBootCli}
+        onReconnectCli={reconnectCli}
         onRebootCli={rebootCli}
+        lifecycleInventory={lifecycleInventory}
+        lifecycleStatus={lifecycleStatus}
         showBootButton={canBootCurrentProject}
         showRebootButton={isAttached}
         showOverview={showOverview}

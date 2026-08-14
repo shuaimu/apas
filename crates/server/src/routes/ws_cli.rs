@@ -15,6 +15,31 @@ use uuid::Uuid;
 use crate::routes::auth::verify_token;
 use crate::state::AppState;
 
+async fn route_lifecycle_to_authorized_web(
+    state: &AppState,
+    session_id: Uuid,
+    message: ServerToWeb,
+) {
+    let web_ids = state
+        .sessions
+        .get_session(&session_id)
+        .map(|session| session.web_connection_ids)
+        .unwrap_or_default();
+    for web_id in web_ids {
+        let authorized = match state.sessions.get_web_user(&web_id) {
+            Some(user_id) => state
+                .db
+                .check_session_access(&session_id.to_string(), &user_id.to_string())
+                .await
+                .unwrap_or(false),
+            None => false,
+        };
+        if authorized {
+            state.sessions.send_to_web(&web_id, message.clone()).await;
+        }
+    }
+}
+
 /// Minimum supported client version (YY.MM.COMMIT format)
 /// Update this when making breaking API changes
 const MIN_CLIENT_VERSION: &str = "26.01.0";
@@ -1167,7 +1192,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     )
                                     .await;
                             }
-                            Ok(CliToServer::TerminalState { session_id, pane_id, instance_id, lifecycle, status }) => {
+                            Ok(CliToServer::TerminalState { session_id, pane_id, instance_id, lifecycle, status, runtime }) => {
                                 let Ok((_project_id, _operation_guard)) = state
                                     .active_session_operation(&session_id.to_string())
                                     .await
@@ -1180,6 +1205,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     instance_id,
                                     lifecycle,
                                     status,
+                                    runtime,
                                 ) {
                                     state
                                         .sessions
@@ -1191,6 +1217,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                                 instance_id: current.instance_id,
                                                 lifecycle: current.lifecycle,
                                                 status: current.status,
+                                                runtime: current.runtime,
                                             },
                                         )
                                         .await;
@@ -1212,6 +1239,56 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         "ignored stale terminal state"
                                     );
                                 }
+                            }
+                            Ok(CliToServer::CliLifecycleInventory { session_id, inventory }) => {
+                                let Ok((_project_id, _operation_guard)) = state
+                                    .active_session_operation(&session_id.to_string())
+                                    .await
+                                else {
+                                    continue;
+                                };
+                                state.sessions.set_lifecycle_inventory(session_id, inventory.clone());
+                                route_lifecycle_to_authorized_web(
+                                    &state,
+                                    session_id,
+                                    ServerToWeb::CliLifecycleInventory { session_id, inventory },
+                                )
+                                .await;
+                            }
+                            Ok(CliToServer::CliLifecycleStatus {
+                                session_id,
+                                request_id,
+                                operation,
+                                phase,
+                                message,
+                                inventory,
+                            }) => {
+                                let Ok((_project_id, _operation_guard)) = state
+                                    .active_session_operation(&session_id.to_string())
+                                    .await
+                                else {
+                                    continue;
+                                };
+                                let Some(status) = state.sessions.update_lifecycle_request(
+                                    request_id,
+                                    session_id,
+                                    operation,
+                                    phase,
+                                    message,
+                                    inventory,
+                                ) else {
+                                    tracing::warn!(%session_id, %request_id, ?operation, ?phase, "ignored unknown or mismatched CLI lifecycle status");
+                                    continue;
+                                };
+                                tracing::info!(
+                                    %session_id,
+                                    %request_id,
+                                    ?operation,
+                                    ?phase,
+                                    duration_ms = status.created_at.elapsed().as_millis(),
+                                    "CLI lifecycle progress"
+                                );
+                                route_lifecycle_to_authorized_web(&state, session_id, status.message()).await;
                             }
                             Ok(CliToServer::TerminalExited { session_id, pane_id, instance_id, status }) => {
                                 let Ok((_project_id, _operation_guard)) = state
@@ -1245,6 +1322,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                             instance_id: current.instance_id,
                                             lifecycle: TerminalLifecycle::Exited,
                                             status: current.status.clone(),
+                                            runtime: current.runtime.clone(),
                                         },
                                     )
                                     .await;
@@ -1682,6 +1760,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         instance_id: terminal.instance_id,
                         lifecycle: terminal.lifecycle,
                         status: terminal.status,
+                        runtime: terminal.runtime,
                     },
                 )
                 .await;

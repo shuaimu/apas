@@ -896,6 +896,33 @@
       ]
     },
     {
+      "description": "Capability-gated project lifecycle operation. `session_id` is\nrequired so multi-attached web connections cannot accidentally target\nthe last session that happened to attach.",
+      "type": "object",
+      "properties": {
+        "operation": {
+          "$ref": "#/$defs/CliLifecycleOperation"
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "cli_lifecycle_request"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "request_id",
+        "operation"
+      ]
+    },
+    {
       "description": "Start APAS CLI for a daemon project",
       "type": "object",
       "properties": {
@@ -1089,24 +1116,6 @@
       "required": [
         "type",
         "machine_id"
-      ]
-    },
-    {
-      "description": "Download all session data",
-      "type": "object",
-      "properties": {
-        "session_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "type": {
-          "type": "string",
-          "const": "download_session"
-        }
-      },
-      "required": [
-        "type",
-        "session_id"
       ]
     },
     {
@@ -1797,6 +1806,14 @@
     }
   ],
   "$defs": {
+    "CliLifecycleOperation": {
+      "description": "A project-level lifecycle operation. Reconnect is deliberately distinct\nfrom reboot so mixed-version routing can never turn transport recovery into\na destructive process replacement.",
+      "type": "string",
+      "enum": [
+        "reconnect_transport",
+        "reboot_cli"
+      ]
+    },
     "ClientKind": {
       "type": "string",
       "enum": [

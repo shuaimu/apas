@@ -82,6 +82,10 @@ pub struct LocalConfig {
     pub deepseek_api_base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deepseek_api_key: Option<String>,
+    #[serde(default = "default_pane_host_adoption_grace_seconds")]
+    pub pane_host_adoption_grace_seconds: u64,
+    #[serde(default = "default_pane_host_reboot_grace_seconds")]
+    pub pane_host_reboot_grace_seconds: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -104,6 +108,14 @@ fn default_cursor_agent_path() -> String {
     "cursor-agent".to_string()
 }
 
+fn default_pane_host_adoption_grace_seconds() -> u64 {
+    10 * 60
+}
+
+fn default_pane_host_reboot_grace_seconds() -> u64 {
+    15 * 60
+}
+
 impl Default for LocalConfig {
     fn default() -> Self {
         Self {
@@ -113,6 +125,8 @@ impl Default for LocalConfig {
             cursor_agent_path: default_cursor_agent_path(),
             deepseek_api_base_url: None,
             deepseek_api_key: None,
+            pane_host_adoption_grace_seconds: default_pane_host_adoption_grace_seconds(),
+            pane_host_reboot_grace_seconds: default_pane_host_reboot_grace_seconds(),
         }
     }
 }

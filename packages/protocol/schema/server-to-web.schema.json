@@ -153,6 +153,79 @@
       ]
     },
     {
+      "description": "Latest connected-CLI lifecycle capabilities and per-pane reboot\npreservation consequence list.",
+      "type": "object",
+      "properties": {
+        "inventory": {
+          "$ref": "#/$defs/CliLifecycleInventory",
+          "default": {
+            "panes": [],
+            "persistent_terminal_hosting": false,
+            "reconnect_transport": false
+          }
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "cli_lifecycle_inventory"
+        }
+      },
+      "required": [
+        "type",
+        "session_id"
+      ]
+    },
+    {
+      "description": "Authoritative progress/outcome for one lifecycle request.",
+      "type": "object",
+      "properties": {
+        "inventory": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CliLifecycleInventory"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operation": {
+          "$ref": "#/$defs/CliLifecycleOperation"
+        },
+        "phase": {
+          "$ref": "#/$defs/CliLifecyclePhase"
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "cli_lifecycle_status"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "request_id",
+        "operation",
+        "phase"
+      ]
+    },
+    {
       "description": "Session started",
       "type": "object",
       "properties": {
@@ -650,56 +723,6 @@
       ]
     },
     {
-      "description": "Full session data for download",
-      "type": "object",
-      "properties": {
-        "created_at": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "hostname": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "messages": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/MessageInfo"
-          }
-        },
-        "project_id": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "format": "uuid"
-        },
-        "session_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "type": {
-          "type": "string",
-          "const": "session_download"
-        },
-        "working_dir": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "type",
-        "session_id",
-        "messages"
-      ]
-    },
-    {
       "description": "One team scratchpad record forwarded from the CLI. Phase 2.2b.",
       "type": "object",
       "properties": {
@@ -1100,6 +1123,16 @@
           "format": "uint32",
           "minimum": 0
         },
+        "runtime": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TerminalRuntimeReconciliation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "seq": {
           "type": "integer",
           "format": "uint64",
@@ -1188,6 +1221,16 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0
+        },
+        "runtime": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TerminalRuntimeReconciliation"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "session_id": {
           "type": "string",
@@ -1585,6 +1628,49 @@
         "online",
         "offline",
         "busy"
+      ]
+    },
+    "CliLifecycleInventory": {
+      "description": "Current lifecycle capabilities and the per-pane reboot consequence list.\nEmpty/default values make the message safe while CLI versions roll out.",
+      "type": "object",
+      "properties": {
+        "panes": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/PanePreservationInfo"
+          }
+        },
+        "persistent_terminal_hosting": {
+          "type": "boolean",
+          "default": false
+        },
+        "reconnect_transport": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "CliLifecycleOperation": {
+      "description": "A project-level lifecycle operation. Reconnect is deliberately distinct\nfrom reboot so mixed-version routing can never turn transport recovery into\na destructive process replacement.",
+      "type": "string",
+      "enum": [
+        "reconnect_transport",
+        "reboot_cli"
+      ]
+    },
+    "CliLifecyclePhase": {
+      "description": "Authoritative progress for a correlated lifecycle request.",
+      "type": "string",
+      "enum": [
+        "accepted",
+        "preparing",
+        "reconnecting",
+        "handoff",
+        "reconciling",
+        "succeeded",
+        "failed",
+        "timed_out"
       ]
     },
     "DeepseekBackendInfo": {
@@ -2042,6 +2128,39 @@
       "enum": [
         "deadloop",
         "interactive"
+      ]
+    },
+    "PanePreservationInfo": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/PanePreservationMode"
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "runtime_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "pane_id",
+        "mode"
+      ]
+    },
+    "PanePreservationMode": {
+      "description": "Whether one configured pane can retain its exact live process during a\nfull CLI replacement.",
+      "type": "string",
+      "enum": [
+        "live_adoptable",
+        "restart_required_on_cli_reboot",
+        "structured_pane_may_resume"
       ]
     },
     "PaneTodoPrMsg": {
@@ -2736,6 +2855,39 @@
         "disconnected",
         "exited"
       ]
+    },
+    "TerminalRuntimeReconciliation": {
+      "description": "Host-owned terminal continuity metadata reported during reconciliation.",
+      "type": "object",
+      "properties": {
+        "current_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "live_adopted": {
+          "type": "boolean",
+          "default": false
+        },
+        "oldest_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "runtime_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "truncated": {
+          "type": "boolean",
+          "default": false
+        }
+      }
     },
     "UsageCounters": {
       "description": "Aggregated usage counters for a pane or project over one time window.\nAll token counts come from the per-turn Claude/Codex stream `result`\nusage; `prompts` counts user/loop inputs and `responses` counts completed\nturns. Fields are snake_case so the wire keys match the web store verbatim.",

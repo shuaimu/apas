@@ -31,7 +31,6 @@ fn is_read_only_message(message: &WebToServer) -> bool {
             | WebToServer::AttachSession { .. }
             | WebToServer::ListSessions
             | WebToServer::GetSessionMessages { .. }
-            | WebToServer::DownloadSession { .. }
             | WebToServer::RequestPaneDiff { .. }
             | WebToServer::FetchTeamTodo { .. }
             | WebToServer::FetchSuggestedWorkers { .. }
@@ -125,46 +124,6 @@ fn to_message_info(message: crate::storage::StoredMessage) -> MessageInfo {
     }
 }
 
-async fn session_download_response(state: &AppState, sid: Uuid) -> ServerToWeb {
-    let (project_id, working_dir, hostname, created_at) =
-        match state.db.get_session(&sid.to_string()).await {
-            Ok(Some(session)) => {
-                let project_id = session
-                    .project_id
-                    .as_deref()
-                    .and_then(|p| Uuid::parse_str(p).ok())
-                    .or(Some(sid));
-                (
-                    project_id,
-                    session.working_dir,
-                    session.hostname,
-                    session.created_at,
-                )
-            }
-            _ => (Some(sid), None, None, None),
-        };
-
-    match state.storage.get_messages(&sid).await {
-        Ok(stored_messages) => {
-            let messages: Vec<MessageInfo> =
-                stored_messages.into_iter().map(to_message_info).collect();
-            ServerToWeb::SessionDownload {
-                session_id: sid,
-                project_id,
-                messages,
-                working_dir,
-                hostname,
-                created_at,
-            }
-        }
-        Err(e) => {
-            tracing::error!("Failed to get messages for download: {}", e);
-            ServerToWeb::Error {
-                message: "Failed to download session data".to_string(),
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod transit_truncation_tests {
@@ -404,157 +363,6 @@ pub(crate) async fn list_accessible_machines_for_user(
     }
 
     machines
-}
-
-#[cfg(test)]
-mod session_download_tests {
-    use super::*;
-    use crate::config::Config;
-    use crate::db::{Database, Session, User};
-    use crate::storage::StoredMessage;
-    use std::path::Path;
-
-    fn test_user(user_id: Uuid) -> User {
-        User {
-            id: user_id.to_string(),
-            email: format!("{user_id}@example.test"),
-            password_hash: "hash".to_string(),
-            created_at: None,
-            cluster_role: "user".to_string(),
-            account_status: "active".to_string(),
-        }
-    }
-
-    fn test_session(
-        session_id: Uuid,
-        owner_id: Uuid,
-        project_id: Uuid,
-        working_dir: &str,
-        hostname: &str,
-    ) -> Session {
-        Session {
-            id: session_id.to_string(),
-            user_id: owner_id.to_string(),
-            cli_client_id: None,
-            working_dir: Some(working_dir.to_string()),
-            hostname: Some(hostname.to_string()),
-            status: "connected".to_string(),
-            created_at: None,
-            updated_at: None,
-            is_paused: false,
-            project_id: Some(project_id.to_string()),
-            git_remote: None,
-            git_remote_url: None,
-        }
-    }
-
-    async fn test_state() -> AppState {
-        let dir = std::env::temp_dir().join(format!("apas-session-download-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("temp db dir");
-        let db_path = dir.join("apas.db").to_string_lossy().to_string();
-        let db = Database::new(&db_path).await.expect("create temp db");
-        db.run_migrations().await.expect("run migrations");
-        let mut config = Config::default();
-        config.database.path = db_path;
-        AppState::new(db, config)
-    }
-
-    fn stored_message() -> StoredMessage {
-        StoredMessage {
-            id: "msg-1".to_string(),
-            role: "assistant".to_string(),
-            content: "export me".to_string(),
-            message_type: "text".to_string(),
-            created_at: "2026-06-18T00:31:00Z".to_string(),
-            pane_type: Some("42".to_string()),
-        }
-    }
-
-    #[tokio::test]
-    async fn download_session_response_includes_metadata_and_stored_messages() {
-        let state = test_state().await;
-        let user_id = Uuid::new_v4();
-        let session_id = Uuid::new_v4();
-        let project_id = Uuid::new_v4();
-
-        state
-            .db
-            .create_user(&test_user(user_id))
-            .await
-            .expect("create user");
-        state
-            .db
-            .create_session(&test_session(
-                session_id,
-                user_id,
-                project_id,
-                "/workspace/apas",
-                "dev-host",
-            ))
-            .await
-            .expect("create session");
-        state
-            .storage
-            .append_message(&session_id, &stored_message())
-            .await
-            .expect("store message");
-
-        let response = session_download_response(&state, session_id).await;
-
-        match response {
-            ServerToWeb::SessionDownload {
-                session_id: response_session_id,
-                project_id: response_project_id,
-                messages,
-                working_dir,
-                hostname,
-                created_at,
-            } => {
-                assert_eq!(response_session_id, session_id);
-                assert_eq!(response_project_id, Some(project_id));
-                assert_eq!(working_dir.as_deref(), Some("/workspace/apas"));
-                assert_eq!(hostname.as_deref(), Some("dev-host"));
-                assert!(created_at.is_some());
-                assert_eq!(messages.len(), 1);
-                assert_eq!(messages[0].id, "msg-1");
-                assert_eq!(messages[0].role, "assistant");
-                assert_eq!(messages[0].content, "export me");
-                assert_eq!(messages[0].message_type, "text");
-                assert_eq!(
-                    messages[0].created_at.as_deref(),
-                    Some("2026-06-18T00:31:00Z")
-                );
-                assert_eq!(messages[0].pane_type.as_deref(), Some("42"));
-                assert_eq!(messages[0].pane_id, Some(42));
-            }
-            other => panic!("expected SessionDownload response, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn download_session_response_returns_existing_error_on_storage_failure() {
-        let state = test_state().await;
-        let session_id = Uuid::new_v4();
-        let storage_root = Path::new(&state.config.database.path)
-            .parent()
-            .expect("db parent");
-        let messages_path = storage_root
-            .join("sessions")
-            .join(session_id.to_string())
-            .join("messages.jsonl");
-        tokio::fs::create_dir_all(&messages_path)
-            .await
-            .expect("messages path as directory");
-
-        let response = session_download_response(&state, session_id).await;
-
-        match response {
-            ServerToWeb::Error { message } => {
-                assert_eq!(message, "Failed to download session data");
-            }
-            other => panic!("expected download error response, got {other:?}"),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1592,6 +1400,40 @@ fn reboot_cli_message(session_id: Uuid) -> ServerToCli {
     ServerToCli::RebootCli { session_id }
 }
 
+fn lifecycle_cli_message(
+    supported: bool,
+    session_id: Uuid,
+    request_id: Uuid,
+    operation: shared::CliLifecycleOperation,
+) -> Option<ServerToCli> {
+    supported.then_some(ServerToCli::CliLifecycleRequest {
+        session_id,
+        request_id,
+        operation,
+    })
+}
+
+async fn broadcast_lifecycle_status(state: &AppState, session_id: Uuid, message: ServerToWeb) {
+    let web_ids = state
+        .sessions
+        .get_session(&session_id)
+        .map(|session| session.web_connection_ids)
+        .unwrap_or_default();
+    for web_id in web_ids {
+        let authorized = match state.sessions.get_web_user(&web_id) {
+            Some(user_id) => state
+                .db
+                .check_session_access(&session_id.to_string(), &user_id.to_string())
+                .await
+                .unwrap_or(false),
+            None => false,
+        };
+        if authorized {
+            state.sessions.send_to_web(&web_id, message.clone()).await;
+        }
+    }
+}
+
 async fn handle_web_input(
     state: &AppState,
     connection_id: &Uuid,
@@ -2072,6 +1914,34 @@ mod reboot_route_tests {
             }
             other => panic!("expected RebootCli message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reconnect_is_never_downgraded_to_legacy_reboot_for_old_clis() {
+        let session_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        assert!(lifecycle_cli_message(
+            false,
+            session_id,
+            request_id,
+            shared::CliLifecycleOperation::ReconnectTransport,
+        )
+        .is_none());
+
+        let message = lifecycle_cli_message(
+            true,
+            session_id,
+            request_id,
+            shared::CliLifecycleOperation::ReconnectTransport,
+        )
+        .expect("new CLI receives correlated request");
+        assert!(matches!(
+            message,
+            ServerToCli::CliLifecycleRequest {
+                operation: shared::CliLifecycleOperation::ReconnectTransport,
+                ..
+            }
+        ));
     }
 }
 
@@ -2811,6 +2681,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 },
                             )
                             .await;
+
                         continue;
                     };
 
@@ -3217,6 +3088,173 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         }
                     }
                 }
+                Ok(WebToServer::CliLifecycleRequest {
+                    session_id: sid,
+                    request_id,
+                    operation,
+                }) => {
+                    let Some(target_sid) =
+                        resolve_target_session(&state, &connection_id, Some(sid), session_id).await
+                    else {
+                        continue;
+                    };
+                    let Some(request_user) = state.sessions.get_web_user(&connection_id) else {
+                        continue;
+                    };
+                    let cli_message = lifecycle_cli_message(
+                        state.sessions.session_supports_capability(
+                            &target_sid,
+                            shared::CLI_LIFECYCLE_CAPABILITY,
+                        ),
+                        target_sid,
+                        request_id,
+                        operation,
+                    );
+                    if cli_message.is_none() {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::CliLifecycleStatus {
+                                    session_id: target_sid,
+                                    request_id,
+                                    operation,
+                                    phase: shared::CliLifecyclePhase::Failed,
+                                    message: Some(
+                                        "This project CLI is too old for safe lifecycle controls. Upgrade it on the project host; reconnect was not converted to a reboot."
+                                            .to_string(),
+                                    ),
+                                    inventory: state
+                                        .sessions
+                                        .lifecycle_inventory(&target_sid),
+                                },
+                            )
+                            .await;
+                        continue;
+                    }
+
+                    if operation == shared::CliLifecycleOperation::RebootCli {
+                        let Some(policy) =
+                            effective_policy_for_cli_reboot(&state, &connection_id, &target_sid)
+                                .await
+                        else {
+                            continue;
+                        };
+                        if let Some(pane) = state
+                            .sessions
+                            .get_session_panes(&target_sid)
+                            .into_iter()
+                            .find(|pane| {
+                                shared::is_retired_launch(pane.provider, pane.model.as_deref())
+                                    || !policy.allows(
+                                        pane.kind,
+                                        pane.provider,
+                                        pane.model.as_deref(),
+                                    )
+                            })
+                        {
+                            send_policy_error(
+                                &state,
+                                &connection_id,
+                                format!(
+                                    "Pane {} is not allowed by current cluster policy and blocks CLI reboot",
+                                    pane.pane_id
+                                ),
+                            )
+                            .await;
+                            continue;
+                        }
+                    }
+
+                    match state.sessions.claim_lifecycle_request(
+                        request_id,
+                        target_sid,
+                        request_user,
+                        operation,
+                    ) {
+                        crate::session::LifecycleRequestClaim::Conflict => {
+                            state
+                                .sessions
+                                .send_to_web(
+                                    &connection_id,
+                                    ServerToWeb::CliLifecycleStatus {
+                                        session_id: target_sid,
+                                        request_id,
+                                        operation,
+                                        phase: shared::CliLifecyclePhase::Failed,
+                                        message: Some(
+                                            "That request ID is already bound to another lifecycle operation."
+                                                .to_string(),
+                                        ),
+                                        inventory: None,
+                                    },
+                                )
+                                .await;
+                        }
+                        crate::session::LifecycleRequestClaim::InFlight(status)
+                        | crate::session::LifecycleRequestClaim::Replay(status) => {
+                            state
+                                .sessions
+                                .send_to_web(&connection_id, status.message())
+                                .await;
+                        }
+                        crate::session::LifecycleRequestClaim::New => {
+                            let accepted = state
+                                .sessions
+                                .update_lifecycle_request(
+                                    request_id,
+                                    target_sid,
+                                    operation,
+                                    shared::CliLifecyclePhase::Accepted,
+                                    None,
+                                    state.sessions.lifecycle_inventory(&target_sid),
+                                )
+                                .expect("new lifecycle request must be retained");
+                            broadcast_lifecycle_status(&state, target_sid, accepted.message())
+                                .await;
+                            let routed = state
+                                .sessions
+                                .route_to_cli(
+                                    &target_sid,
+                                    cli_message.expect("capability was checked above"),
+                                )
+                                .await;
+                            if !routed {
+                                if let Some(failed) = state.sessions.update_lifecycle_request(
+                                    request_id,
+                                    target_sid,
+                                    operation,
+                                    shared::CliLifecyclePhase::Failed,
+                                    Some(
+                                        "The request could not be delivered. Start or restart the CLI manually on the project host."
+                                            .to_string(),
+                                    ),
+                                    None,
+                                ) {
+                                    broadcast_lifecycle_status(&state, target_sid, failed.message())
+                                        .await;
+                                }
+                                continue;
+                            }
+
+                            let timeout_state = state.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(crate::session::LIFECYCLE_REQUEST_TIMEOUT).await;
+                                if let Some(timed_out) =
+                                    timeout_state.sessions.timeout_lifecycle_request(request_id)
+                                {
+                                    tracing::warn!(%target_sid, %request_id, ?operation, "CLI lifecycle operation timed out");
+                                    broadcast_lifecycle_status(
+                                        &timeout_state,
+                                        target_sid,
+                                        timed_out.message(),
+                                    )
+                                    .await;
+                                }
+                            });
+                        }
+                    }
+                }
                 Ok(WebToServer::StartMachineProjectCli {
                     machine_id,
                     project_id,
@@ -3407,7 +3445,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                     if !state
                         .sessions
-                        .send_to_daemon(&machine_id, ServerToDaemon::StopProjectCli { project_id })
+                        .send_to_daemon(
+                            &machine_id,
+                            ServerToDaemon::StopProjectCli {
+                                project_id,
+                                request_id: None,
+                            },
+                        )
                         .await
                     {
                         state
@@ -4197,7 +4241,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .mobile_metrics
                             .increment(MobileMetric::TerminalAttachEmpty);
                     }
-                    let (data_b64, seq, truncated, instance_id, lifecycle, status) =
+                    let (data_b64, seq, truncated, instance_id, lifecycle, status, runtime) =
                         match retained_snapshot {
                             Some(snapshot) => (
                                 base64::engine::general_purpose::STANDARD.encode(&snapshot.bytes),
@@ -4206,6 +4250,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 snapshot.instance_id,
                                 snapshot.lifecycle,
                                 snapshot.status,
+                                snapshot.runtime,
                             ),
                             // No output yet (pane just spawned). Reply with an
                             // empty snapshot rather than staying silent so the
@@ -4217,6 +4262,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 false,
                                 None,
                                 TerminalLifecycle::Unknown,
+                                None,
                                 None,
                             ),
                         };
@@ -4233,6 +4279,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 truncated,
                                 lifecycle,
                                 status,
+                                runtime,
                             },
                         )
                         .await;
@@ -4954,6 +5001,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             )
                             .await;
 
+                        if let Some(inventory) = state.sessions.lifecycle_inventory(&sid) {
+                            state
+                                .sessions
+                                .send_to_web(
+                                    &connection_id,
+                                    ServerToWeb::CliLifecycleInventory {
+                                        session_id: sid,
+                                        inventory,
+                                    },
+                                )
+                                .await;
+                        }
+
                         // Replay current usage stats so the Overview panel is
                         // populated immediately on attach / hard refresh.
                         match state.db.get_project_usage_stats(&sid.to_string()).await {
@@ -5574,27 +5634,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             "Failed to refresh pane summary"
                         ),
                     }
-                }
-                Ok(WebToServer::DownloadSession { session_id: sid }) => {
-                    let Some(uid) = user_id else {
-                        continue;
-                    };
-                    if !state
-                        .db
-                        .check_session_access(&sid.to_string(), &uid.to_string())
-                        .await
-                        .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    let Ok((_project_id, _project_guard)) =
-                        state.active_session_operation(&sid.to_string()).await
-                    else {
-                        continue;
-                    };
-                    tracing::info!("Downloading session data for {}", sid);
-                    let response = session_download_response(&state, sid).await;
-                    state.sessions.send_to_web(&connection_id, response).await;
                 }
                 Ok(WebToServer::UpdateProjectOperations {
                     session_id: msg_sid,

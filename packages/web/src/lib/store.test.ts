@@ -12,6 +12,9 @@ describe('useStore', () => {
       sessionId: null,
       ws: null,
       cliClients: [],
+      cliLifecycleInventories: {},
+      cliLifecycleOperations: {},
+      cliLifecycleLatestBySession: {},
       sessions: [],
       workingPanesBySession: new Map(),
       messages: [],
@@ -704,6 +707,171 @@ describe('useStore', () => {
         'error',
       );
     });
+
+    it('routes transport reconnect through a request-ID lifecycle operation', () => {
+      const ws = makeWs();
+      useStore.setState({
+        sessionId: 'session-lifecycle',
+        ws,
+        cliLifecycleInventories: {
+          'session-lifecycle': {
+            reconnect_transport: true,
+            persistent_terminal_hosting: true,
+            panes: [],
+          },
+        },
+      });
+
+      const requestId = useStore.getState().reconnectCli();
+      const payload = JSON.parse(ws.send.mock.calls[0][0] as string);
+
+      expect(requestId).toBeTruthy();
+      expect(payload).toEqual({
+        type: 'cli_lifecycle_request',
+        session_id: 'session-lifecycle',
+        request_id: requestId,
+        operation: 'reconnect_transport',
+      });
+      expect(useStore.getState().cliLifecycleOperations[requestId!]).toMatchObject({
+        operation: 'reconnect_transport',
+        phase: 'accepted',
+      });
+    });
+
+    it('uses correlated reboot with the advertised preservation inventory', () => {
+      const ws = makeWs();
+      useStore.setState({
+        sessionId: 'session-lifecycle-reboot',
+        ws,
+        paneConfigs: [],
+        projectPolicies: {
+          'session-lifecycle-reboot': {
+            teamAvailable: true,
+            allowedLaunchProfiles: [],
+            version: 1,
+            projectSuspended: false,
+            noncompliantPaneIds: [],
+          },
+        },
+        cliLifecycleInventories: {
+          'session-lifecycle-reboot': {
+            reconnect_transport: true,
+            persistent_terminal_hosting: true,
+            panes: [{ pane_id: 1, mode: 'live_adoptable' }],
+          },
+        },
+      });
+
+      const requestId = useStore.getState().rebootCli();
+      expect(JSON.parse(ws.send.mock.calls[0][0] as string)).toEqual({
+        type: 'cli_lifecycle_request',
+        session_id: 'session-lifecycle-reboot',
+        request_id: requestId,
+        operation: 'reboot_cli',
+      });
+    });
+
+    it('never maps unsupported reconnect to legacy reboot and gives upgrade guidance', () => {
+      const ws = makeWs();
+      const showToast = vi.fn();
+      useStore.setState({ sessionId: 'old-cli', ws, showToast });
+
+      expect(useStore.getState().reconnectCli()).toBeNull();
+
+      expect(ws.send).not.toHaveBeenCalled();
+      expect(showToast).toHaveBeenCalledWith(
+        expect.stringContaining('too old for safe server reconnect'),
+        'error',
+      );
+    });
+
+    it('tracks server success and authorization failure by request ID', () => {
+      const showToast = vi.fn();
+      useStore.setState({ showToast });
+      handleServerMessage({
+        type: 'cli_lifecycle_status',
+        session_id: 'session-a',
+        request_id: 'request-success',
+        operation: 'reconnect_transport',
+        phase: 'succeeded',
+        message: 'Transport restored',
+      }, useStore.setState, useStore.getState);
+      handleServerMessage({
+        type: 'cli_lifecycle_status',
+        session_id: 'session-b',
+        request_id: 'request-failed',
+        operation: 'reboot_cli',
+        phase: 'failed',
+        message: 'Project access is no longer authorized',
+      }, useStore.setState, useStore.getState);
+
+      expect(useStore.getState().cliLifecycleOperations['request-success'].phase).toBe('succeeded');
+      expect(useStore.getState().cliLifecycleOperations['request-failed'].phase).toBe('failed');
+      expect(showToast).toHaveBeenCalledWith('Project access is no longer authorized', 'error');
+    });
+
+    it('times out an unfinished lifecycle operation with recovery guidance', () => {
+      vi.useFakeTimers();
+      try {
+        const ws = makeWs();
+        const showToast = vi.fn();
+        useStore.setState({
+          sessionId: 'session-timeout',
+          ws,
+          showToast,
+          cliLifecycleInventories: {
+            'session-timeout': {
+              reconnect_transport: true,
+              persistent_terminal_hosting: false,
+              panes: [],
+            },
+          },
+        });
+        const requestId = useStore.getState().reconnectCli();
+
+        vi.advanceTimersByTime(185_000);
+
+        expect(useStore.getState().cliLifecycleOperations[requestId!]).toMatchObject({
+          phase: 'timed_out',
+          message: expect.stringContaining('project host'),
+        });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('keeps pending progress across project navigation and removes it on access revocation', () => {
+      const ws = makeWs();
+      useStore.setState({
+        sessionId: 'session-a',
+        ws,
+        sessions: [
+          { id: 'session-a', projectId: 'project-a', status: 'connected' },
+          { id: 'session-b', projectId: 'project-b', status: 'connected' },
+        ],
+        cliLifecycleOperations: {
+          'request-a': {
+            sessionId: 'session-a',
+            requestId: 'request-a',
+            operation: 'reboot_cli',
+            phase: 'preparing',
+            startedAt: 1,
+            updatedAt: 2,
+          },
+        },
+        cliLifecycleLatestBySession: { 'session-a': 'request-a' },
+      });
+
+      useStore.getState().attachSession('session-b');
+      expect(useStore.getState().cliLifecycleOperations['request-a'].phase).toBe('preparing');
+
+      handleServerMessage({
+        type: 'project_access_changed',
+        project_id: 'project-a',
+        change: 'revoked',
+      }, useStore.setState, useStore.getState);
+      expect(useStore.getState().cliLifecycleOperations['request-a']).toBeUndefined();
+    });
   });
 
   describe('server error visibility', () => {
@@ -724,48 +892,6 @@ describe('useStore', () => {
         content: 'This project CLI is too old to reboot from the web. Reboot the CLI manually.',
       });
       consoleSpy.mockRestore();
-    });
-  });
-
-  describe('session download', () => {
-    function makeWs(readyState: number = WebSocket.OPEN) {
-      const send = vi.fn();
-      return {
-        readyState,
-        send,
-        close: vi.fn(),
-      } as unknown as WebSocket & { send: typeof send };
-    }
-
-    it('downloadSession sends a download_session request for the active session', () => {
-      const ws = makeWs();
-      useStore.setState({ sessionId: 'session-download', ws });
-
-      useStore.getState().downloadSession();
-
-      expect(ws.send).toHaveBeenCalledOnce();
-      expect(ws.send).toHaveBeenCalledWith(JSON.stringify({
-        type: 'download_session',
-        session_id: 'session-download',
-      }));
-    });
-
-    it('downloadSession does not send without an active session id', () => {
-      const ws = makeWs();
-      useStore.setState({ sessionId: null, ws });
-
-      useStore.getState().downloadSession();
-
-      expect(ws.send).not.toHaveBeenCalled();
-    });
-
-    it('downloadSession does not send when the websocket is closed', () => {
-      const ws = makeWs(WebSocket.CLOSED);
-      useStore.setState({ sessionId: 'session-download', ws });
-
-      useStore.getState().downloadSession();
-
-      expect(ws.send).not.toHaveBeenCalled();
     });
   });
 

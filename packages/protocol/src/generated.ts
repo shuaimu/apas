@@ -84,6 +84,22 @@ export type ServerToWeb =
       [k: string]: unknown;
     }
   | {
+      inventory?: CliLifecycleInventory;
+      session_id: string;
+      type: "cli_lifecycle_inventory";
+      [k: string]: unknown;
+    }
+  | {
+      inventory?: CliLifecycleInventory1 | null;
+      message?: string | null;
+      operation: CliLifecycleOperation;
+      phase: CliLifecyclePhase;
+      request_id: string;
+      session_id: string;
+      type: "cli_lifecycle_status";
+      [k: string]: unknown;
+    }
+  | {
       pane_id?: number | null;
       pane_type?: PaneType | null;
       session_id: string;
@@ -237,16 +253,6 @@ export type ServerToWeb =
       [k: string]: unknown;
     }
   | {
-      created_at?: string | null;
-      hostname?: string | null;
-      messages: MessageInfo[];
-      project_id?: string | null;
-      session_id: string;
-      type: "session_download";
-      working_dir?: string | null;
-      [k: string]: unknown;
-    }
-  | {
       record: TeamScratchpadRecord;
       session_id: string;
       type: "team_record";
@@ -360,6 +366,7 @@ export type ServerToWeb =
        */
       lifecycle?: "unknown" | "running" | "disconnected" | "exited";
       pane_id: number;
+      runtime?: TerminalRuntimeReconciliation | null;
       seq: number;
       session_id: string;
       status?: string | null;
@@ -387,6 +394,7 @@ export type ServerToWeb =
        */
       lifecycle?: "unknown" | "running" | "disconnected" | "exited";
       pane_id: number;
+      runtime?: TerminalRuntimeReconciliation | null;
       session_id: string;
       status?: string | null;
       type: "terminal_state";
@@ -419,6 +427,22 @@ export type ServerToWeb =
       [k: string]: unknown;
     };
 export type MutationKind = "approval" | "question" | "plan_review" | "interrupt";
+/**
+ * Whether one configured pane can retain its exact live process during a
+ * full CLI replacement.
+ */
+export type PanePreservationMode = "live_adoptable" | "restart_required_on_cli_reboot" | "structured_pane_may_resume";
+/**
+ * A project-level lifecycle operation. Reconnect is deliberately distinct
+ * from reboot so mixed-version routing can never turn transport recovery into
+ * a destructive process replacement.
+ */
+export type CliLifecycleOperation = "reconnect_transport" | "reboot_cli";
+/**
+ * Authoritative progress for a correlated lifecycle request.
+ */
+export type CliLifecyclePhase =
+  "accepted" | "preparing" | "reconnecting" | "handoff" | "reconciling" | "succeeded" | "failed" | "timed_out";
 /**
  * Pane type for dual-pane mode (legacy - kept for backward compatibility)
  */
@@ -741,6 +765,13 @@ export type WebToServer =
       [k: string]: unknown;
     }
   | {
+      operation: CliLifecycleOperation;
+      request_id: string;
+      session_id: string;
+      type: "cli_lifecycle_request";
+      [k: string]: unknown;
+    }
+  | {
       machine_id: string;
       project_id: string;
       type: "start_machine_project_cli";
@@ -785,11 +816,6 @@ export type WebToServer =
       clear_api_key?: boolean;
       machine_id: string;
       type: "set_machine_deepseek_config";
-      [k: string]: unknown;
-    }
-  | {
-      session_id: string;
-      type: "download_session";
       [k: string]: unknown;
     }
   | {
@@ -1225,6 +1251,32 @@ export interface MobilePushTokenRequest {
 export interface MobileRefreshRequest {
   installation_id: string;
   refresh_token: string;
+  [k: string]: unknown;
+}
+/**
+ * Current lifecycle capabilities and the per-pane reboot consequence list.
+ * Empty/default values make the message safe while CLI versions roll out.
+ */
+export interface CliLifecycleInventory {
+  panes?: PanePreservationInfo[];
+  persistent_terminal_hosting?: boolean;
+  reconnect_transport?: boolean;
+  [k: string]: unknown;
+}
+export interface PanePreservationInfo {
+  mode: PanePreservationMode;
+  pane_id: number;
+  runtime_id?: string | null;
+  [k: string]: unknown;
+}
+/**
+ * Current lifecycle capabilities and the per-pane reboot consequence list.
+ * Empty/default values make the message safe while CLI versions roll out.
+ */
+export interface CliLifecycleInventory1 {
+  panes?: PanePreservationInfo[];
+  persistent_terminal_hosting?: boolean;
+  reconnect_transport?: boolean;
   [k: string]: unknown;
 }
 /**
@@ -1678,6 +1730,17 @@ export interface SuggestedWorkerMsg {
   label: string;
   needs_worktree?: boolean;
   role: string;
+  [k: string]: unknown;
+}
+/**
+ * Host-owned terminal continuity metadata reported during reconciliation.
+ */
+export interface TerminalRuntimeReconciliation {
+  current_seq?: number;
+  live_adopted?: boolean;
+  oldest_seq?: number;
+  runtime_id?: string | null;
+  truncated?: boolean;
   [k: string]: unknown;
 }
 /**

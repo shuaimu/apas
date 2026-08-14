@@ -18,6 +18,7 @@ mod file_watcher;
 mod manager;
 mod mcp;
 mod mode;
+mod pane_host;
 mod pane_status;
 mod plan_review;
 mod project;
@@ -145,6 +146,13 @@ enum Commands {
     Worktree {
         #[command(subcommand)]
         action: WorktreeAction,
+    },
+    /// Internal persistent terminal runtime. Started under project-scoped
+    /// tmux supervision; not intended for direct use.
+    #[command(hide = true)]
+    PaneHost {
+        #[arg(long)]
+        runtime_dir: PathBuf,
     },
 }
 
@@ -277,6 +285,9 @@ async fn main() -> Result<()> {
                 // subscriber above), so nothing extra is needed here beyond not
                 // printing.
                 return mcp::run(project_dir, pane_id).await;
+            }
+            Commands::PaneHost { runtime_dir } => {
+                return pane_host::run_host(runtime_dir);
             }
             Commands::Daemon { roots } => {
                 let state_path = config::Config::daemon_state_path()?;
@@ -708,7 +719,7 @@ fn is_apas_daemon_process(pid: u32) -> bool {
     has_apas_binary && has_daemon_arg
 }
 
-const CONFIG_KEYS: &str = "server, token, claude_path, codex_path, opencode_path, cursor_agent_path, deepseek_api_base_url, deepseek_api_key, daemon_machine_id, daemon_roots, summary_enabled, summary_adapter, summary_model, summary_timeout_seconds, summary_max_input_bytes, summary_allow_cross_provider";
+const CONFIG_KEYS: &str = "server, token, claude_path, codex_path, opencode_path, cursor_agent_path, deepseek_api_base_url, deepseek_api_key, pane_host_adoption_grace_seconds, pane_host_reboot_grace_seconds, daemon_machine_id, daemon_roots, summary_enabled, summary_adapter, summary_model, summary_timeout_seconds, summary_max_input_bytes, summary_allow_cross_provider";
 
 fn set_config_value(config: &mut config::Config, key: &str, value: String) -> Result<()> {
     match key {
@@ -731,6 +742,22 @@ fn set_config_value(config: &mut config::Config, key: &str, value: String) -> Re
             } else {
                 Some(value)
             }
+        }
+        "pane_host_adoption_grace_seconds" => {
+            let seconds: u64 = value.parse()?;
+            anyhow::ensure!(
+                (30..=60 * 60).contains(&seconds),
+                "pane_host_adoption_grace_seconds must be between 30 and 3600"
+            );
+            config.local.pane_host_adoption_grace_seconds = seconds;
+        }
+        "pane_host_reboot_grace_seconds" => {
+            let seconds: u64 = value.parse()?;
+            anyhow::ensure!(
+                (60..=2 * 60 * 60).contains(&seconds),
+                "pane_host_reboot_grace_seconds must be between 60 and 7200"
+            );
+            config.local.pane_host_reboot_grace_seconds = seconds;
         }
         "daemon_machine_id" => config.daemon.machine_id = Some(value),
         "daemon_roots" => {
@@ -1000,6 +1027,10 @@ fn get_config_value(config: &config::Config, key: &str) -> Result<String> {
             .as_ref()
             .map(|_| "****".to_string())
             .unwrap_or_default(),
+        "pane_host_adoption_grace_seconds" => {
+            config.local.pane_host_adoption_grace_seconds.to_string()
+        }
+        "pane_host_reboot_grace_seconds" => config.local.pane_host_reboot_grace_seconds.to_string(),
         "daemon_machine_id" => config.daemon.machine_id.clone().unwrap_or_default(),
         "daemon_roots" => config.daemon.project_roots.join(","),
         "summary_enabled" => config.summaries.enabled.to_string(),
@@ -1057,6 +1088,14 @@ async fn handle_config_command(action: ConfigAction) -> Result<()> {
                     .as_ref()
                     .map(|_| "****")
                     .unwrap_or("")
+            );
+            println!(
+                "pane_host_adoption_grace_seconds: {}",
+                config.local.pane_host_adoption_grace_seconds
+            );
+            println!(
+                "pane_host_reboot_grace_seconds: {}",
+                config.local.pane_host_reboot_grace_seconds
             );
             println!(
                 "daemon_machine_id: {}",

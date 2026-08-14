@@ -31,6 +31,8 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use shared::{CliToServer, Provider, TerminalLifecycle};
 use std::collections::HashMap;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -43,7 +45,475 @@ use uuid::Uuid;
 /// is a prompt string routed into a turn loop, terminal input is raw
 /// keystrokes written straight to a pty. Keeping them apart means the
 /// `Terminal*` messages never touch the agent path.
-pub type TerminalPanes = Arc<Mutex<HashMap<u32, TerminalHandle>>>;
+pub type TerminalPanes = Arc<Mutex<HashMap<u32, TerminalRuntimeHandle>>>;
+
+/// One server-facing terminal runtime. Persistent hosting is attempted for
+/// supported Unix project CLIs; the established in-process PTY remains the
+/// safe fallback when prerequisites are unavailable.
+#[derive(Clone)]
+pub enum TerminalRuntimeHandle {
+    Direct(TerminalHandle),
+    #[cfg(unix)]
+    Hosted(HostedTerminalHandle),
+}
+
+impl TerminalRuntimeHandle {
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn(
+        pane_id: u32,
+        session_id: Uuid,
+        conversation_id: Uuid,
+        provider: &Provider,
+        binary_path: &str,
+        cwd: &str,
+        env: &[(String, String)],
+        resume: bool,
+        initial_prompt: Option<&str>,
+        server_tx: tokio_mpsc::Sender<CliToServer>,
+    ) -> Result<Self> {
+        #[cfg(unix)]
+        if crate::pane_host::persistent_hosting_available() {
+            match HostedTerminalHandle::adopt_existing(pane_id, session_id, server_tx.clone()) {
+                Ok(Some(handle)) => return Ok(Self::Hosted(handle)),
+                Ok(None) => match HostedTerminalHandle::create(
+                    pane_id,
+                    session_id,
+                    conversation_id,
+                    provider,
+                    binary_path,
+                    cwd,
+                    env,
+                    resume,
+                    initial_prompt,
+                    server_tx.clone(),
+                ) {
+                    Ok(handle) => return Ok(Self::Hosted(handle)),
+                    Err(error) => {
+                        tracing::warn!(pane_id, %error, "persistent pane host launch failed; using direct PTY fallback")
+                    }
+                },
+                Err(error) => {
+                    // A descriptor for this pane exists but could not be
+                    // exclusively adopted. Starting another provider would
+                    // duplicate a possibly live autonomous agent, so fail
+                    // closed and let the caller surface unavailability.
+                    return Err(error.context("existing pane host could not be adopted"));
+                }
+            }
+        }
+
+        Ok(Self::Direct(TerminalHandle::spawn(
+            pane_id,
+            session_id,
+            conversation_id,
+            provider,
+            binary_path,
+            cwd,
+            env,
+            resume,
+            initial_prompt,
+            server_tx,
+        )?))
+    }
+
+    pub fn write_bytes(&self, data: &[u8]) -> Result<()> {
+        match self {
+            Self::Direct(handle) => handle.write_bytes(data),
+            #[cfg(unix)]
+            Self::Hosted(handle) => handle.write_bytes(data),
+        }
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        match self {
+            Self::Direct(handle) => handle.resize(cols, rows),
+            #[cfg(unix)]
+            Self::Hosted(handle) => handle.resize(cols, rows),
+        }
+    }
+
+    pub fn instance_id(&self) -> Uuid {
+        match self {
+            Self::Direct(handle) => handle.instance_id(),
+            #[cfg(unix)]
+            Self::Hosted(handle) => handle.instance_id(),
+        }
+    }
+
+    pub fn state_message(&self, session_id: Uuid) -> CliToServer {
+        match self {
+            Self::Direct(handle) => handle.state_message(session_id),
+            #[cfg(unix)]
+            Self::Hosted(handle) => handle.state_message(session_id),
+        }
+    }
+
+    pub fn shutdown(&self) {
+        match self {
+            Self::Direct(handle) => handle.shutdown(),
+            #[cfg(unix)]
+            Self::Hosted(handle) => handle.shutdown(),
+        }
+    }
+
+    pub fn preservation(&self, pane_id: u32) -> shared::PanePreservationInfo {
+        match self {
+            Self::Direct(_) => shared::PanePreservationInfo {
+                pane_id,
+                mode: shared::PanePreservationMode::RestartRequiredOnCliReboot,
+                runtime_id: None,
+            },
+            #[cfg(unix)]
+            Self::Hosted(handle) => shared::PanePreservationInfo {
+                pane_id,
+                mode: shared::PanePreservationMode::LiveAdoptable,
+                runtime_id: Some(handle.runtime_id()),
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn detach_for_reboot(&self) -> Result<()> {
+        match self {
+            Self::Direct(_) => Ok(()),
+            Self::Hosted(handle) => handle.detach_for_reboot(),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+pub struct HostedTerminalHandle {
+    pane_id: u32,
+    instance_id: Uuid,
+    descriptor: crate::pane_host::RuntimeDescriptor,
+    stream: Arc<Mutex<UnixStream>>,
+    lifecycle: Arc<Mutex<(TerminalLifecycle, Option<String>)>>,
+    runtime: Arc<Mutex<shared::TerminalRuntimeReconciliation>>,
+    shutting_down: Arc<AtomicBool>,
+}
+
+#[cfg(unix)]
+impl HostedTerminalHandle {
+    #[allow(clippy::too_many_arguments)]
+    fn create(
+        pane_id: u32,
+        session_id: Uuid,
+        conversation_id: Uuid,
+        provider: &Provider,
+        binary_path: &str,
+        cwd: &str,
+        env: &[(String, String)],
+        resume: bool,
+        initial_prompt: Option<&str>,
+        server_tx: tokio_mpsc::Sender<CliToServer>,
+    ) -> Result<Self> {
+        let (descriptor, credential, _paths) = crate::pane_host::launch_host(session_id, pane_id)?;
+        let mut stream = crate::pane_host::connect_with_retry(
+            &descriptor.socket_path,
+            std::time::Duration::from_secs(5),
+        )?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        crate::pane_host::write_frame(
+            &mut stream,
+            &crate::pane_host::ControllerToHost::Create {
+                protocol_version: crate::pane_host::HOST_PROTOCOL_VERSION,
+                credential,
+                project_id: session_id,
+                pane_id,
+                runtime_id: descriptor.runtime_id,
+                controller_id: Uuid::new_v4(),
+                controller_generation: descriptor.controller_generation,
+                provider: *provider,
+                binary_path: binary_path.to_string(),
+                cwd: cwd.to_string(),
+                env: env.to_vec(),
+                conversation_id,
+                resume,
+                initial_prompt: initial_prompt.map(ToString::to_string),
+            },
+        )?;
+        Self::finish_attach(stream, descriptor, session_id, server_tx, false)
+    }
+
+    fn adopt_existing(
+        pane_id: u32,
+        session_id: Uuid,
+        server_tx: tokio_mpsc::Sender<CliToServer>,
+    ) -> Result<Option<Self>> {
+        let Some((_path, mut descriptor)) =
+            crate::pane_host::descriptor_for_pane(session_id, pane_id)?
+        else {
+            return Ok(None);
+        };
+        if descriptor.project_id != session_id || descriptor.pane_id != pane_id {
+            anyhow::bail!("pane-host descriptor identity mismatch");
+        }
+        // A descriptor may outlive a crashed tmux host by a few milliseconds.
+        // It is safe to discard only when supervision proves the old runtime
+        // no longer exists; a live-but-unreachable host must still fail closed
+        // so we never start a duplicate autonomous provider.
+        if !crate::pane_host::runtime_is_live(&descriptor) {
+            if let Some(runtime_dir) = descriptor.socket_path.parent() {
+                let _ = std::fs::remove_dir_all(runtime_dir);
+            }
+            tracing::warn!(
+                pane_id,
+                runtime_id = %descriptor.runtime_id,
+                "discarded stale pane-host descriptor; provider will resume in a new runtime"
+            );
+            return Ok(None);
+        }
+        let credential = crate::pane_host::read_credential(&descriptor.credential_path)?;
+        let mut stream = crate::pane_host::connect_with_retry(
+            &descriptor.socket_path,
+            std::time::Duration::from_secs(5),
+        )?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        descriptor.controller_generation = descriptor.controller_generation.saturating_add(1);
+        crate::pane_host::write_frame(
+            &mut stream,
+            &crate::pane_host::ControllerToHost::Adopt {
+                protocol_version: crate::pane_host::HOST_PROTOCOL_VERSION,
+                credential,
+                project_id: session_id,
+                pane_id,
+                runtime_id: descriptor.runtime_id,
+                controller_id: Uuid::new_v4(),
+                controller_generation: descriptor.controller_generation,
+                // Replaying the full volatile ring is safe because the
+                // server deduplicates stable instance/sequence pairs.
+                acknowledged_seq: None,
+            },
+        )?;
+        match Self::finish_attach(stream, descriptor.clone(), session_id, server_tx, true) {
+            Ok(handle) => {
+                if handle
+                    .lifecycle
+                    .lock()
+                    .is_ok_and(|state| state.0 == TerminalLifecycle::Exited)
+                {
+                    handle.shutdown();
+                    Ok(None)
+                } else {
+                    tracing::info!(pane_id, runtime_id = %descriptor.runtime_id, instance_id = %descriptor.instance_id, "adopted persistent terminal pane");
+                    Ok(Some(handle))
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn finish_attach(
+        mut stream: UnixStream,
+        descriptor: crate::pane_host::RuntimeDescriptor,
+        session_id: Uuid,
+        server_tx: tokio_mpsc::Sender<CliToServer>,
+        live_adopted: bool,
+    ) -> Result<Self> {
+        let adopted =
+            crate::pane_host::read_frame::<crate::pane_host::HostToController>(&mut stream)?;
+        let crate::pane_host::HostToController::Adopted {
+            protocol_version,
+            runtime_id,
+            instance_id,
+            lifecycle,
+            status,
+            oldest_seq,
+            current_seq,
+            truncated,
+            ..
+        } = adopted
+        else {
+            if let crate::pane_host::HostToController::Error { message } = adopted {
+                anyhow::bail!("pane host rejected controller: {message}");
+            }
+            anyhow::bail!("pane host did not acknowledge adoption");
+        };
+        if protocol_version != crate::pane_host::HOST_PROTOCOL_VERSION
+            || runtime_id != descriptor.runtime_id
+            || instance_id != descriptor.instance_id
+        {
+            anyhow::bail!("pane-host adoption response identity mismatch");
+        }
+        stream.set_read_timeout(None)?;
+        let reader = stream.try_clone()?;
+        let lifecycle_state = Arc::new(Mutex::new((lifecycle, status.clone())));
+        let runtime_state = Arc::new(Mutex::new(shared::TerminalRuntimeReconciliation {
+            runtime_id: Some(runtime_id),
+            oldest_seq,
+            current_seq,
+            truncated,
+            live_adopted,
+        }));
+        let handle = Self {
+            pane_id: descriptor.pane_id,
+            instance_id,
+            descriptor,
+            stream: Arc::new(Mutex::new(stream)),
+            lifecycle: lifecycle_state,
+            runtime: runtime_state,
+            shutting_down: Arc::new(AtomicBool::new(false)),
+        };
+        handle.start_reader(session_id, reader, server_tx);
+        tracing::info!(
+            pane_id = handle.pane_id,
+            runtime_id = %runtime_id,
+            instance_id = %instance_id,
+            host_protocol = protocol_version,
+            oldest_seq,
+            current_seq,
+            truncated,
+            live_adopted,
+            "attached persistent terminal runtime"
+        );
+        Ok(handle)
+    }
+
+    fn start_reader(
+        &self,
+        session_id: Uuid,
+        mut reader: UnixStream,
+        server_tx: tokio_mpsc::Sender<CliToServer>,
+    ) {
+        let pane_id = self.pane_id;
+        let instance_id = self.instance_id;
+        let lifecycle = self.lifecycle.clone();
+        let runtime = self.runtime.clone();
+        let shutting_down = self.shutting_down.clone();
+        let initial_runtime = runtime
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_default();
+        let initial_state = lifecycle
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or((TerminalLifecycle::Unknown, None));
+        let _ = server_tx.try_send(CliToServer::TerminalState {
+            session_id,
+            pane_id,
+            instance_id: Some(instance_id),
+            lifecycle: initial_state.0,
+            status: initial_state.1,
+            runtime: Some(initial_runtime),
+        });
+        thread::Builder::new()
+            .name(format!("apas-hosted-term-{pane_id}"))
+            .spawn(move || loop {
+                match crate::pane_host::read_frame::<crate::pane_host::HostToController>(
+                    &mut reader,
+                ) {
+                    Ok(crate::pane_host::HostToController::Output { seq, data }) => {
+                        if let Ok(mut metadata) = runtime.lock() {
+                            metadata.current_seq = metadata.current_seq.max(seq);
+                        }
+                        let _ = server_tx.blocking_send(CliToServer::TerminalOutput {
+                            session_id,
+                            pane_id,
+                            instance_id: Some(instance_id),
+                            data_b64: base64::engine::general_purpose::STANDARD.encode(data),
+                            seq,
+                        });
+                    }
+                    Ok(crate::pane_host::HostToController::State {
+                        lifecycle: next,
+                        status,
+                    }) => {
+                        if let Ok(mut state) = lifecycle.lock() {
+                            *state = (next, status.clone());
+                        }
+                        let metadata = runtime.lock().map(|value| value.clone()).ok();
+                        let _ = server_tx.blocking_send(CliToServer::TerminalState {
+                            session_id,
+                            pane_id,
+                            instance_id: Some(instance_id),
+                            lifecycle: next,
+                            status: status.clone(),
+                            runtime: metadata,
+                        });
+                        if next == TerminalLifecycle::Exited {
+                            let _ = server_tx.blocking_send(CliToServer::TerminalExited {
+                                session_id,
+                                pane_id,
+                                instance_id: Some(instance_id),
+                                status,
+                            });
+                        }
+                    }
+                    Ok(crate::pane_host::HostToController::Error { message }) => {
+                        tracing::warn!(pane_id, %message, "pane-host controller error");
+                        break;
+                    }
+                    Ok(crate::pane_host::HostToController::Adopted { .. }) => continue,
+                    Err(error) => {
+                        if !shutting_down.load(Ordering::Relaxed) {
+                            tracing::info!(pane_id, %error, "pane-host controller detached");
+                        }
+                        break;
+                    }
+                }
+            })
+            .expect("failed to spawn pane-host reader");
+    }
+
+    fn write_command(&self, command: crate::pane_host::ControllerToHost) -> Result<()> {
+        let mut stream = self
+            .stream
+            .lock()
+            .map_err(|_| anyhow::anyhow!("pane-host stream mutex poisoned"))?;
+        crate::pane_host::write_frame(&mut stream, &command)
+    }
+
+    pub fn write_bytes(&self, data: &[u8]) -> Result<()> {
+        self.write_command(crate::pane_host::ControllerToHost::Input {
+            data: data.to_vec(),
+        })
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        if cols == 0 || rows == 0 {
+            anyhow::bail!("terminal size must be non-zero");
+        }
+        self.write_command(crate::pane_host::ControllerToHost::Resize { cols, rows })
+    }
+
+    pub fn instance_id(&self) -> Uuid {
+        self.instance_id
+    }
+
+    pub fn runtime_id(&self) -> Uuid {
+        self.descriptor.runtime_id
+    }
+
+    pub fn state_message(&self, session_id: Uuid) -> CliToServer {
+        let (lifecycle, status) = self.lifecycle.lock().map(|value| value.clone()).unwrap_or((
+            TerminalLifecycle::Unknown,
+            Some("pane-host lifecycle unavailable".to_string()),
+        ));
+        CliToServer::TerminalState {
+            session_id,
+            pane_id: self.pane_id,
+            instance_id: Some(self.instance_id),
+            lifecycle,
+            status,
+            runtime: self.runtime.lock().map(|value| value.clone()).ok(),
+        }
+    }
+
+    pub fn detach_for_reboot(&self) -> Result<()> {
+        self.write_command(crate::pane_host::ControllerToHost::Detach { reboot: true })
+    }
+
+    pub fn shutdown(&self) {
+        if self.shutting_down.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _ = self.write_command(crate::pane_host::ControllerToHost::Shutdown);
+        if let Err(error) = crate::pane_host::terminate_tmux_host(&self.descriptor) {
+            tracing::warn!(pane_id = self.pane_id, %error, "failed to clean pane-host tmux session");
+        }
+    }
+}
 
 /// Bytes pulled from the pty per read. Large enough that a TUI redraw
 /// usually lands in one frame, small enough to stay interactive.
@@ -113,7 +583,7 @@ fn permission_bypass_flag_for(provider: &Provider) -> Option<&'static str> {
 
 /// Provider-specific interactive CLI arguments, separated from pty setup so
 /// tests can pin the exact command line without spawning a real agent.
-fn terminal_args_for(
+pub(crate) fn terminal_args_for(
     provider: &Provider,
     conversation_id: Uuid,
     resume: bool,
@@ -301,6 +771,7 @@ impl TerminalHandle {
                     instance_id: Some(instance_id),
                     lifecycle: TerminalLifecycle::Running,
                     status: None,
+                    runtime: None,
                 });
                 let mut buf = vec![0u8; READ_CHUNK_BYTES];
                 loop {
@@ -355,6 +826,7 @@ impl TerminalHandle {
                     instance_id: Some(instance_id),
                     lifecycle: TerminalLifecycle::Exited,
                     status: status.clone(),
+                    runtime: None,
                 });
                 let _ = server_tx.blocking_send(CliToServer::TerminalExited {
                     session_id,
@@ -413,6 +885,11 @@ impl TerminalHandle {
         self.instance_id
     }
 
+    #[cfg(test)]
+    pub fn provider_pid(&self) -> Option<u32> {
+        self.child.lock().ok().and_then(|child| child.process_id())
+    }
+
     /// Reconcile the child before reporting cached lifecycle. Usually the
     /// reader thread records an exit first; `try_wait` closes the smaller
     /// race where reconnect lands after process death but before pty EOF.
@@ -449,6 +926,7 @@ impl TerminalHandle {
             instance_id: Some(self.instance_id),
             lifecycle,
             status,
+            runtime: None,
         }
     }
 

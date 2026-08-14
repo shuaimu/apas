@@ -379,9 +379,79 @@ pub fn read_opencode_turns(
 ///
 /// Heuristic by necessity — codex has no flag to pin a session id. Requiring an
 /// exact cwd match keeps the ambiguity to panes sharing a directory.
+/// The identifying header of a codex rollout, taken from its `session_meta`.
+struct CodexRolloutMeta {
+    cwd: String,
+    /// Immutable session start. Selection keys on this rather than mtime
+    /// precisely because it cannot change while the file is being appended to.
+    started_at: String,
+    /// `user` for a session a person drives, `subagent` for a thread codex
+    /// spawned itself. Absent on rollouts written by older codex versions.
+    thread_source: Option<String>,
+}
+
+impl CodexRolloutMeta {
+    /// Whether this rollout belongs to a thread codex spawned on its own.
+    ///
+    /// Anything that is not explicitly a non-user thread counts as the user's:
+    /// codex versions predating `thread_source` omit the field entirely, and
+    /// treating those as subagents would leave their panes with no transcript.
+    fn is_subagent(&self) -> bool {
+        self.thread_source
+            .as_deref()
+            .is_some_and(|source| !source.eq_ignore_ascii_case("user"))
+    }
+}
+
+/// Read just the `session_meta` header that leads every codex rollout.
+///
+/// Deliberately reads one line rather than the whole file. These rollouts reach
+/// hundreds of megabytes (one live example was 458 MB), and the previous
+/// `read_to_string` pulled every candidate fully into memory on every poll of
+/// every terminal pane just to look at line 1.
+fn read_codex_rollout_meta(path: &Path) -> Option<CodexRolloutMeta> {
+    use std::io::BufRead;
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut first = String::new();
+    std::io::BufReader::new(file).read_line(&mut first).ok()?;
+    let d: Value = serde_json::from_str(first.trim()).ok()?;
+    let meta = d.get("payload").unwrap_or(&d);
+    Some(CodexRolloutMeta {
+        cwd: meta.get("cwd").and_then(Value::as_str)?.to_string(),
+        started_at: meta
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .or_else(|| d.get("timestamp").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string(),
+        thread_source: meta
+            .get("thread_source")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+/// Locate the rollout for the codex session running in `cwd`.
+///
+/// Two properties matter more than they look:
+///
+/// * **Subagent threads are skipped.** Codex spawns its own threads and each
+///   writes a separate rollout carrying the *parent's* cwd, so matching on cwd
+///   alone returns several live files for one pane.
+/// * **Selection keys on the session's start timestamp, not mtime.** Those
+///   sibling rollouts are appended to concurrently, so the newest-mtime file
+///   changes from poll to poll. The start timestamp is fixed once written.
+///
+/// Together those caused a production outage: the selection flapped between a
+/// pane's real session and three subagent threads, and every flip looked like a
+/// new transcript and republished it from the beginning — 4 million duplicate
+/// messages, a 2.9 GB message store, and a server that exhausted its memory
+/// limit. A newer *user* session still wins, which is the intended behaviour
+/// when someone restarts codex in the same directory.
 pub fn find_codex_rollout(home: &Path, cwd: &Path) -> Option<PathBuf> {
     let root = home.join(".codex").join("sessions");
-    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    let mut best: Option<(String, PathBuf)> = None;
     let mut stack = vec![root];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -396,25 +466,23 @@ pub fn find_codex_rollout(home: &Path, cwd: &Path) -> Option<PathBuf> {
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            // Only the first line is needed: session_meta leads the file.
-            let Ok(raw) = std::fs::read_to_string(&path) else {
+            let Some(meta) = read_codex_rollout_meta(&path) else {
                 continue;
             };
-            let Some(first) = raw.lines().next() else {
-                continue;
-            };
-            let Ok(d) = serde_json::from_str::<Value>(first) else {
-                continue;
-            };
-            let meta = d.get("payload").unwrap_or(&d);
-            if meta.get("cwd").and_then(Value::as_str) != Some(&cwd.to_string_lossy()) {
+            if meta.cwd != cwd.to_string_lossy() || meta.is_subagent() {
                 continue;
             }
-            let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
-                continue;
+            // Tie-break on path so two rollouts sharing a start timestamp
+            // still resolve to the same file on every poll.
+            let key = meta.started_at;
+            let better = match best.as_ref() {
+                None => true,
+                Some((best_key, best_path)) => {
+                    (&key, &path) > (best_key, best_path)
+                }
             };
-            if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
-                best = Some((mtime, path));
+            if better {
+                best = Some((key, path));
             }
         }
     }
@@ -681,5 +749,123 @@ mod tests {
             Some("rollout-b.jsonl")
         );
         assert!(find_codex_rollout(home.path(), Path::new("/nothing-here")).is_none());
+    }
+
+    /// Write a rollout header; `source` of `None` mimics a codex old enough to
+    /// predate the `thread_source` field.
+    fn write_rollout(dir: &Path, name: &str, cwd: &str, started_at: &str, source: Option<&str>) {
+        let thread_source = match source {
+            Some(s) => format!(r#","thread_source":"{s}""#),
+            None => String::new(),
+        };
+        std::fs::write(
+            dir.join(name),
+            format!(
+                r#"{{"type":"session_meta","payload":{{"cwd":"{cwd}","timestamp":"{started_at}"{thread_source}}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn codex_rollout_lookup_ignores_subagent_threads_in_the_same_cwd() {
+        // Codex spawns its own threads and each writes a rollout carrying the
+        // *parent's* cwd. Following one means tailing a transcript that is not
+        // the pane's, and alternating between them republishes history.
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join(".codex/sessions/2026/08/13");
+        std::fs::create_dir_all(&sessions).unwrap();
+        write_rollout(
+            &sessions,
+            "rollout-user.jsonl",
+            "/repo",
+            "2026-08-08T00:09:14Z",
+            Some("user"),
+        );
+        // Started later than the user's session — under the old newest-wins
+        // rule these would win outright.
+        write_rollout(
+            &sessions,
+            "rollout-sub-1.jsonl",
+            "/repo",
+            "2026-08-13T18:56:57Z",
+            Some("subagent"),
+        );
+        write_rollout(
+            &sessions,
+            "rollout-sub-2.jsonl",
+            "/repo",
+            "2026-08-14T00:33:34Z",
+            Some("subagent"),
+        );
+
+        assert_eq!(
+            find_codex_rollout(home.path(), Path::new("/repo"))
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
+            Some("rollout-user.jsonl")
+        );
+    }
+
+    #[test]
+    fn codex_rollout_lookup_is_stable_while_siblings_are_appended_to() {
+        // The selection must not depend on mtime: sibling rollouts in one cwd
+        // are written concurrently, so whichever was touched last changes from
+        // poll to poll, and every change looked like a brand-new transcript.
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join(".codex/sessions/2026/08/13");
+        std::fs::create_dir_all(&sessions).unwrap();
+        write_rollout(
+            &sessions,
+            "rollout-old.jsonl",
+            "/repo",
+            "2026-08-08T00:00:00Z",
+            Some("user"),
+        );
+        write_rollout(
+            &sessions,
+            "rollout-new.jsonl",
+            "/repo",
+            "2026-08-09T00:00:00Z",
+            Some("user"),
+        );
+
+        let first = find_codex_rollout(home.path(), Path::new("/repo"));
+        // Touch the older file, exactly as a concurrent append would.
+        std::fs::write(
+            sessions.join("rollout-old.jsonl"),
+            std::fs::read(sessions.join("rollout-old.jsonl")).unwrap(),
+        )
+        .unwrap();
+        let second = find_codex_rollout(home.path(), Path::new("/repo"));
+
+        assert_eq!(first, second, "selection flapped after a sibling was written");
+        assert_eq!(
+            first
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
+            Some("rollout-new.jsonl"),
+            "the newest user session should still win"
+        );
+    }
+
+    #[test]
+    fn codex_rollout_lookup_keeps_pre_thread_source_rollouts() {
+        // Older codex writes no thread_source. Those are real user sessions and
+        // must not be filtered out as subagents.
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join(".codex/sessions/2026/08/13");
+        std::fs::create_dir_all(&sessions).unwrap();
+        write_rollout(
+            &sessions,
+            "rollout-legacy.jsonl",
+            "/repo",
+            "2026-08-08T00:00:00Z",
+            None,
+        );
+
+        assert!(find_codex_rollout(home.path(), Path::new("/repo")).is_some());
     }
 }

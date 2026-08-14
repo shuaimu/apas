@@ -1,7 +1,7 @@
 import { createEvent, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TabBar } from "./TabBar";
-import type { PaneConfig } from "@/lib/store";
+import type { CliLifecycleInventory, CliLifecycleStatus, PaneConfig } from "@/lib/store";
 
 function pane(overrides: Partial<PaneConfig> & Pick<PaneConfig, "pane_id" | "label" | "role">): PaneConfig {
   return {
@@ -22,7 +22,10 @@ function renderTabBar(
     activeTabId?: number;
     onSelectTab?: ReturnType<typeof vi.fn>;
     onAddTab?: ReturnType<typeof vi.fn>;
+    onReconnectCli?: ReturnType<typeof vi.fn>;
     onRebootCli?: ReturnType<typeof vi.fn>;
+    lifecycleInventory?: CliLifecycleInventory;
+    lifecycleStatus?: CliLifecycleStatus;
     onRenameTab?: ReturnType<typeof vi.fn>;
     onReorderTabs?: ReturnType<typeof vi.fn>;
     showRebootButton?: boolean;
@@ -51,7 +54,10 @@ function renderTabBar(
       onAddTab={onAddTab as Parameters<typeof TabBar>[0]["onAddTab"]}
       onRenameTab={onRenameTab as Parameters<typeof TabBar>[0]["onRenameTab"]}
       onReorderTabs={onReorderTabs as Parameters<typeof TabBar>[0]["onReorderTabs"]}
+      onReconnectCli={overrides.onReconnectCli as Parameters<typeof TabBar>[0]["onReconnectCli"]}
       onRebootCli={overrides.onRebootCli as Parameters<typeof TabBar>[0]["onRebootCli"]}
+      lifecycleInventory={overrides.lifecycleInventory}
+      lifecycleStatus={overrides.lifecycleStatus}
       showRebootButton={overrides.showRebootButton}
       showOverview={overrides.showOverview}
       paneStatuses={{}}
@@ -166,14 +172,15 @@ describe("TabBar coordinator close controls", () => {
     expect(onAddTab).toHaveBeenCalledWith("claude", undefined, undefined, "terminal");
   });
 
-  it("keeps full-process reboot behind the explicit Reboot CLI control", () => {
+  it("keeps full-process reboot behind the desktop lifecycle menu", () => {
     const onRebootCli = vi.fn();
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     renderTabBar({ onRebootCli, showRebootButton: true });
 
+    fireEvent.click(screen.getByTitle("Project CLI lifecycle actions"));
     fireEvent.click(screen.getByText("Reboot CLI"));
 
-    expect(confirmSpy).toHaveBeenCalledWith("Are you sure you want to reboot the CLI?");
+    expect(confirmSpy.mock.calls[0][0]).toContain("older project CLI");
     expect(onRebootCli).toHaveBeenCalledOnce();
     confirmSpy.mockRestore();
   });
@@ -193,11 +200,92 @@ describe("TabBar coordinator close controls", () => {
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
     renderTabBar({ onRebootCli, showRebootButton: true });
 
+    fireEvent.click(screen.getByTitle("Project CLI lifecycle actions"));
     fireEvent.click(screen.getByText("Reboot CLI"));
 
-    expect(confirmSpy).toHaveBeenCalledWith("Are you sure you want to reboot the CLI?");
+    expect(confirmSpy.mock.calls[0][0]).toContain("older project CLI");
     expect(onRebootCli).not.toHaveBeenCalled();
     confirmSpy.mockRestore();
+  });
+
+  it("offers recommended transport reconnect without pane-reboot language", () => {
+    const onReconnectCli = vi.fn();
+    const onRebootCli = vi.fn();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderTabBar({
+      onReconnectCli,
+      onRebootCli,
+      showRebootButton: true,
+      lifecycleInventory: {
+        reconnect_transport: true,
+        persistent_terminal_hosting: true,
+        panes: [],
+      },
+    });
+
+    fireEvent.click(screen.getByTitle("Project CLI lifecycle actions"));
+    expect(screen.getByText("Recommended")).toBeTruthy();
+    fireEvent.click(screen.getByText("Reconnect Server"));
+
+    expect(confirmSpy.mock.calls[0][0]).toContain("every pane will keep running");
+    expect(confirmSpy.mock.calls[0][0]).not.toContain("restart");
+    expect(onReconnectCli).toHaveBeenCalledOnce();
+    expect(onRebootCli).not.toHaveBeenCalled();
+    confirmSpy.mockRestore();
+  });
+
+  it("enumerates preservation consequences before reboot", () => {
+    const onRebootCli = vi.fn();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderTabBar({
+      onRebootCli,
+      showRebootButton: true,
+      lifecycleInventory: {
+        reconnect_transport: true,
+        persistent_terminal_hosting: true,
+        panes: [
+          { pane_id: 1, mode: "live_adoptable" },
+          { pane_id: 2, mode: "restart_required_on_cli_reboot" },
+          { pane_id: 3, mode: "structured_pane_may_resume" },
+        ],
+      },
+    });
+
+    fireEvent.click(screen.getByTitle("Project CLI lifecycle actions"));
+    fireEvent.click(screen.getByText("Reboot CLI"));
+
+    const warning = String(confirmSpy.mock.calls[0][0]);
+    expect(warning).toContain("1 terminal pane will stay live");
+    expect(warning).toContain("1 terminal pane will restart");
+    expect(warning).toContain("1 structured pane may restart");
+    expect(onRebootCli).toHaveBeenCalledOnce();
+    confirmSpy.mockRestore();
+  });
+
+  it("shows correlated reconnect progress without reboot labels", () => {
+    renderTabBar({
+      onReconnectCli: vi.fn(),
+      onRebootCli: vi.fn(),
+      showRebootButton: true,
+      lifecycleInventory: {
+        reconnect_transport: true,
+        persistent_terminal_hosting: true,
+        panes: [],
+      },
+      lifecycleStatus: {
+        sessionId: "session-a",
+        requestId: "request-a",
+        operation: "reconnect_transport",
+        phase: "reconnecting",
+        message: "Reconnecting server transport",
+        startedAt: 1,
+        updatedAt: 2,
+      },
+    });
+
+    fireEvent.click(screen.getByTitle("Project CLI lifecycle actions"));
+    expect(screen.getByRole("status").textContent).toContain("Reconnecting server transport");
+    expect(screen.getByRole("status").textContent).not.toContain("reboot");
   });
 });
 

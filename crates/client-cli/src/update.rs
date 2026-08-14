@@ -1,11 +1,11 @@
 //! Auto-update functionality for the APAS CLI
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 const REPO_URL: &str = "https://github.com/shuaimu/apas.git";
 const CURRENT_VERSION: &str = env!("APAS_VERSION");
@@ -15,6 +15,11 @@ const CURRENT_VERSION: &str = env!("APAS_VERSION");
 /// reboots exec a known-good path even after `current_exe()` starts
 /// returning an NFS silly-renamed `.nfsXXX` inode.
 static LAUNCH_BINARY_PATH: OnceLock<PathBuf> = OnceLock::new();
+static PREPARED_RESTART_PATH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+
+fn prepared_restart_slot() -> &'static Mutex<Option<PathBuf>> {
+    PREPARED_RESTART_PATH.get_or_init(|| Mutex::new(None))
+}
 
 /// Capture the exec path at startup. Call this from `main` before any
 /// long-running work (and definitely before the daemon could survive
@@ -193,8 +198,7 @@ pub fn apas_binary_fingerprint() -> Option<(u64, i64)> {
 /// Deliberately executes it rather than trusting a recorded value: the whole
 /// point is to learn about a binary that replaced ours, and only the file
 /// itself knows what it is.
-fn installed_binary_version() -> Option<String> {
-    let path = resolve_preferred_apas_executable();
+pub fn binary_version(path: &Path) -> Option<String> {
     let out = std::process::Command::new(path)
         .arg("--version")
         .output()
@@ -205,6 +209,10 @@ fn installed_binary_version() -> Option<String> {
     // `apas --version` prints "apas YY.MM.N".
     let text = String::from_utf8_lossy(&out.stdout);
     text.split_whitespace().nth(1).map(str::to_string)
+}
+
+fn installed_binary_version() -> Option<String> {
+    binary_version(&resolve_preferred_apas_executable())
 }
 
 /// The installed binary's version, when it is strictly newer than the running
@@ -646,6 +654,50 @@ fn restart_self() {
     eprintln!("[Auto-update] Please restart manually to use the new version");
 }
 
+/// Complete every fallible update/install step while the current CLI and its
+/// pane controllers are still attached. A correlated reboot calls this before
+/// writing a handoff marker or setting shutdown; failure therefore leaves the
+/// existing process fully operational.
+pub fn prepare_cli_restart() -> Result<PathBuf> {
+    if let Some(newer) = check_for_update_available() {
+        if pending_update_needs_rebuild() {
+            eprintln!(
+                "[Restart] Newer git version detected ({} > {}), preparing update while panes stay attached...",
+                newer, CURRENT_VERSION
+            );
+            let binary = pull_and_build()?;
+            install_binary(&binary)?;
+        } else {
+            eprintln!(
+                "[Restart] Version {} only changes web/docs; validating the current binary",
+                newer
+            );
+        }
+    }
+
+    let executable = resolve_preferred_apas_executable();
+    let metadata = fs::metadata(&executable).with_context(|| {
+        format!(
+            "prepared executable {} is unavailable",
+            executable.display()
+        )
+    })?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        anyhow::bail!("prepared executable {} is invalid", executable.display());
+    }
+    let status = Command::new(&executable)
+        .arg("--version")
+        .status()
+        .with_context(|| format!("validate prepared executable {}", executable.display()))?;
+    if !status.success() {
+        anyhow::bail!("prepared executable failed its version probe");
+    }
+    *prepared_restart_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(executable.clone());
+    Ok(executable)
+}
+
 /// Restart the CLI process (public, can be called from other modules)
 /// This function will not return on success (it exec's the new binary)
 #[cfg(unix)]
@@ -654,34 +706,41 @@ pub fn restart_cli() {
 
     let args: Vec<String> = env::args().collect();
 
-    if let Some(newer) = check_for_update_available() {
-        if pending_update_needs_rebuild() {
-            eprintln!(
-                "[Restart] Newer git version detected ({} > {}), updating before reboot...",
-                newer, CURRENT_VERSION
-            );
-            match pull_and_build().and_then(|binary| install_binary(&binary)) {
-                Ok(()) => {
-                    eprintln!("[Restart] Update installed, rebooting into {}", newer);
-                }
-                Err(err) => {
-                    eprintln!(
+    let prepared = prepared_restart_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+
+    if prepared.is_none() {
+        if let Some(newer) = check_for_update_available() {
+            if pending_update_needs_rebuild() {
+                eprintln!(
+                    "[Restart] Newer git version detected ({} > {}), updating before reboot...",
+                    newer, CURRENT_VERSION
+                );
+                match pull_and_build().and_then(|binary| install_binary(&binary)) {
+                    Ok(()) => {
+                        eprintln!("[Restart] Update installed, rebooting into {}", newer);
+                    }
+                    Err(err) => {
+                        eprintln!(
                         "[Restart] Update before reboot failed ({}), continuing with installed binary",
                         err
                     );
+                    }
                 }
+            } else {
+                // New commits exist ({newer}) but none touch the binary (web/docs
+                // only) — skip the multi-minute cargo build and just re-exec.
+                eprintln!(
+                    "[Restart] Version {} available but only changes web/docs — skipping rebuild, restarting current binary",
+                    newer
+                );
             }
-        } else {
-            // New commits exist ({newer}) but none touch the binary (web/docs
-            // only) — skip the multi-minute cargo build and just re-exec.
-            eprintln!(
-                "[Restart] Version {} available but only changes web/docs — skipping rebuild, restarting current binary",
-                newer
-            );
         }
     }
 
-    let exe = resolve_preferred_apas_executable();
+    let exe = prepared.unwrap_or_else(resolve_preferred_apas_executable);
 
     // Clear terminal screen and show countdown
     print!("\x1B[2J\x1B[H");
@@ -697,6 +756,14 @@ pub fn restart_cli() {
     let err = Command::new(&exe).args(&args[1..]).exec();
 
     // If we get here, exec failed
+    if let Some(marker_path) = env::var_os("APAS_REBOOT_HANDOFF") {
+        // The old image is still alive but its hosted controllers have
+        // already detached. Do not leave a stale marker that a later manual
+        // start could mistake for this failed replacement attempt. The pane
+        // hosts retain their bounded reboot lease for recovery.
+        let _ = fs::remove_file(marker_path);
+        env::remove_var("APAS_REBOOT_HANDOFF");
+    }
     eprintln!("[Restart] Failed to restart: {}", err);
     eprintln!("[Restart] Executable: {:?}", exe);
     eprintln!("[Restart] Please restart manually.");

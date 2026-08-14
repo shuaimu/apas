@@ -834,9 +834,69 @@ and reconnect project CLIs so they advertise `terminal_opencode_v1`. Install and
 authenticate OpenCode and opt the intended policies into its profile only after
 the host CLI has reconnected.
 
-**Lifetime.** The pty is a child of the CLI process, so a terminal pane dies
-when `apas` restarts; the restore path re-execs with the provider's own resume
-flow (`claude --resume <pane session id>`, `codex resume`, `opencode
---continue`). Claude's pane session id is APAS-visible and remains pinned
-across that restore; Codex and OpenCode select their newest session for the
-pane cwd.
+### Persistent pane hosts and CLI lifecycle
+
+On supported Unix project hosts, each new Claude, Codex, or OpenCode terminal
+pane is owned by a hidden `apas pane-host` process in its own project-scoped
+tmux session. The replaceable project CLI is only its authenticated controller.
+This removes the CLI process from the provider's lifetime: a transport-only
+`Reconnect Server` leaves the CLI, pane hosts, PTYs, queues, and structured
+turns untouched, while `Reboot CLI` prepares the update first and then adopts
+the same hosted terminal processes after `exec`.
+
+The feature is advertised only when Unix sockets, tmux, the installed
+`apas pane-host` subcommand, and secure runtime storage all validate. Otherwise
+terminal panes keep using the direct PTY implementation and the lifecycle menu
+warns that they must restart/resume. Existing direct PTYs are not migrated in
+place; after their first restart under a capable CLI they become host-backed.
+Structured `kind: "agent"` panes retain their existing restart/resume behavior
+and are never described as live-adopted.
+
+Pane-host state is host-local, volatile, and outside the project directory:
+
+- Root: `${XDG_RUNTIME_DIR}/apas/ph`, or `/tmp/apas-<uid>/apas/ph` when
+  `XDG_RUNTIME_DIR` is unavailable.
+- Project/runtime directories are `0700`; `runtime.json`, `credential`, the
+  Unix socket, and reboot `handoff.json` are `0600`.
+- `runtime.json` contains identity, protocol, tmux session, and socket paths,
+  but no credential or terminal content. The random 256-bit credential is in a
+  separate owner-only file and is never sent to providers or the server.
+- Raw detached output remains only in the pane-host's bounded in-memory ring;
+  it is not written to `.apas`, SQLite, JSONL, or a spool file.
+
+Unexpected controller loss keeps the provider alive for 600 seconds by
+default; an authenticated reboot handoff gets 900 seconds. Configure the
+bounded values with:
+
+```bash
+apas config set pane_host_adoption_grace_seconds 600  # allowed: 30..3600
+apas config set pane_host_reboot_grace_seconds 900    # allowed: 60..7200
+```
+
+Pane close, provider switch/reboot, project stop/suspension, and project
+deletion bypass grace: they tombstone the project, authenticate shutdown where
+possible, terminate the provider process group, kill the exact pane-host tmux
+session, and remove local runtime files. An unexpected orphan self-terminates
+when its lease expires.
+
+Operational inspection must not print `credential` contents. Safe checks are:
+
+```bash
+apas config path
+find "${XDG_RUNTIME_DIR:-/tmp/apas-$(id -u)}/apas/ph" -name runtime.json -type f -print
+tmux -L "apas-<full-project-uuid>" list-sessions
+journalctl --user --since '15 minutes ago' | grep -E 'pane-host|lifecycle'
+```
+
+Use the web Machines/Admin project stop action for cleanup; the daemon can
+enumerate and terminate pane hosts even when the project CLI is absent. If
+manual recovery is unavoidable, first identify the exact session from its
+owner-only `runtime.json`, then use `tmux -L <socket> kill-session -t <session>`;
+never recursively delete a runtime root while a listed host is still alive.
+
+Roll out in this order: server/shared protocol, web lifecycle menu, then CLI
+and daemon. Old CLIs keep the legacy reboot control and never receive a
+reconnect disguised as reboot. Rollback disables new host creation; already
+running compatible hosts should be allowed to close normally or stopped by a
+new daemon. Forcing an old CLI/daemon to clean them up interrupts active
+terminal turns.

@@ -5,8 +5,9 @@ use shared::{
     ServerToDaemon, ServerToWeb, TerminalLifecycle, UsageLimits,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 fn normalize_machine_hostname(raw: &str) -> String {
@@ -92,6 +93,9 @@ pub struct SessionManager {
     daemon_users: DashMap<Uuid, Uuid>,
     /// Protocol capabilities negotiated by each connected daemon.
     daemon_capabilities: DashMap<Uuid, HashSet<String>>,
+    /// Correlated daemon acknowledgements used to make project deletion wait
+    /// for host-local pane-runtime cleanup.
+    daemon_stop_waiters: DashMap<Uuid, oneshot::Sender<(String, bool, usize, Option<String>)>>,
     /// Protocol capabilities negotiated by each authenticated web socket.
     web_capabilities: DashMap<Uuid, HashSet<String>>,
     /// Map of machine ID -> machine metadata
@@ -126,6 +130,12 @@ pub struct SessionManager {
     mutation_requests: DashMap<(Uuid, String), MutationRequestState>,
     /// Bounded completion order used to evict old acknowledgement results.
     mutation_request_order: DashMap<Uuid, VecDeque<String>>,
+    /// Bounded correlated CLI lifecycle requests. Entries are volatile: a
+    /// server restart never manufactures a reboot/reconnect success.
+    lifecycle_requests: DashMap<Uuid, LifecycleRequestState>,
+    lifecycle_request_order: Mutex<VecDeque<Uuid>>,
+    /// Latest connected-CLI preservation inventory per session.
+    lifecycle_inventories: DashMap<Uuid, shared::CliLifecycleInventory>,
     /// Raw pty presentation and lifecycle per (session, pane) for
     /// `PaneKind::Terminal` panes. In memory only and deliberately never
     /// persisted: these are ANSI byte streams, not chat records, and writing
@@ -155,6 +165,43 @@ enum MutationRequestState {
 }
 
 #[derive(Debug, Clone)]
+pub struct LifecycleRequestState {
+    pub request_id: Uuid,
+    pub session_id: Uuid,
+    pub user_id: Uuid,
+    pub operation: shared::CliLifecycleOperation,
+    pub phase: shared::CliLifecyclePhase,
+    pub message: Option<String>,
+    pub inventory: Option<shared::CliLifecycleInventory>,
+    pub created_at: Instant,
+    pub updated_at: Instant,
+}
+
+impl LifecycleRequestState {
+    pub fn message(&self) -> ServerToWeb {
+        ServerToWeb::CliLifecycleStatus {
+            session_id: self.session_id,
+            request_id: self.request_id,
+            operation: self.operation,
+            phase: self.phase,
+            message: self.message.clone(),
+            inventory: self.inventory.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum LifecycleRequestClaim {
+    New,
+    InFlight(LifecycleRequestState),
+    Replay(LifecycleRequestState),
+    Conflict,
+}
+
+const MAX_LIFECYCLE_REQUESTS: usize = 256;
+pub const LIFECYCLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+
+#[derive(Debug, Clone)]
 pub enum MutationRequestClaim {
     New,
     InFlight,
@@ -179,6 +226,7 @@ pub struct TerminalStateEntry {
     instance_id: Option<Uuid>,
     lifecycle: TerminalLifecycle,
     status: Option<String>,
+    runtime: Option<shared::TerminalRuntimeReconciliation>,
 }
 
 /// Immutable terminal state returned to attach handlers and lifecycle fans.
@@ -190,6 +238,7 @@ pub struct TerminalSnapshotState {
     pub instance_id: Option<Uuid>,
     pub lifecycle: TerminalLifecycle,
     pub status: Option<String>,
+    pub runtime: Option<shared::TerminalRuntimeReconciliation>,
 }
 
 impl TerminalStateEntry {
@@ -201,6 +250,7 @@ impl TerminalStateEntry {
             instance_id: self.instance_id,
             lifecycle: self.lifecycle,
             status: self.status.clone(),
+            runtime: self.runtime.clone(),
         }
     }
 
@@ -212,6 +262,7 @@ impl TerminalStateEntry {
         self.instance_id = Some(instance_id);
         self.lifecycle = TerminalLifecycle::Unknown;
         self.status = None;
+        self.runtime = None;
     }
 }
 
@@ -260,6 +311,7 @@ impl SessionManager {
             daemon_senders: DashMap::new(),
             daemon_users: DashMap::new(),
             daemon_capabilities: DashMap::new(),
+            daemon_stop_waiters: DashMap::new(),
             web_capabilities: DashMap::new(),
             machine_infos: DashMap::new(),
             machine_projects: DashMap::new(),
@@ -269,6 +321,9 @@ impl SessionManager {
             pending_decisions: DashMap::new(),
             mutation_requests: DashMap::new(),
             mutation_request_order: DashMap::new(),
+            lifecycle_requests: DashMap::new(),
+            lifecycle_request_order: Mutex::new(VecDeque::new()),
+            lifecycle_inventories: DashMap::new(),
             terminal_states: DashMap::new(),
         }
     }
@@ -324,6 +379,7 @@ impl SessionManager {
         instance_id: Option<Uuid>,
         lifecycle: TerminalLifecycle,
         status: Option<String>,
+        runtime: Option<shared::TerminalRuntimeReconciliation>,
     ) -> Option<TerminalSnapshotState> {
         let mut entry = self
             .terminal_states
@@ -352,6 +408,7 @@ impl SessionManager {
 
         entry.lifecycle = lifecycle;
         entry.status = status;
+        entry.runtime = runtime;
         Some(entry.snapshot())
     }
 
@@ -685,6 +742,119 @@ impl SessionManager {
             .is_some_and(|capabilities| capabilities.contains(capability))
     }
 
+    pub fn set_lifecycle_inventory(
+        &self,
+        session_id: Uuid,
+        inventory: shared::CliLifecycleInventory,
+    ) {
+        self.lifecycle_inventories.insert(session_id, inventory);
+    }
+
+    pub fn lifecycle_inventory(&self, session_id: &Uuid) -> Option<shared::CliLifecycleInventory> {
+        self.lifecycle_inventories
+            .get(session_id)
+            .map(|inventory| inventory.clone())
+    }
+
+    pub fn claim_lifecycle_request(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        user_id: Uuid,
+        operation: shared::CliLifecycleOperation,
+    ) -> LifecycleRequestClaim {
+        if let Some(existing) = self.lifecycle_requests.get(&request_id) {
+            if existing.session_id != session_id
+                || existing.user_id != user_id
+                || existing.operation != operation
+            {
+                return LifecycleRequestClaim::Conflict;
+            }
+            return if existing.phase.is_terminal() {
+                LifecycleRequestClaim::Replay(existing.clone())
+            } else {
+                LifecycleRequestClaim::InFlight(existing.clone())
+            };
+        }
+
+        let state = LifecycleRequestState {
+            request_id,
+            session_id,
+            user_id,
+            operation,
+            phase: shared::CliLifecyclePhase::Accepted,
+            message: None,
+            inventory: self.lifecycle_inventory(&session_id),
+            created_at: Instant::now(),
+            updated_at: Instant::now(),
+        };
+        self.lifecycle_requests.insert(request_id, state);
+        let mut order = self
+            .lifecycle_request_order
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        order.push_back(request_id);
+        while order.len() > MAX_LIFECYCLE_REQUESTS {
+            if let Some(expired) = order.pop_front() {
+                self.lifecycle_requests.remove(&expired);
+            }
+        }
+        LifecycleRequestClaim::New
+    }
+
+    pub fn update_lifecycle_request(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        operation: shared::CliLifecycleOperation,
+        phase: shared::CliLifecyclePhase,
+        message: Option<String>,
+        inventory: Option<shared::CliLifecycleInventory>,
+    ) -> Option<LifecycleRequestState> {
+        let mut state = self.lifecycle_requests.get_mut(&request_id)?;
+        if state.session_id != session_id || state.operation != operation {
+            return None;
+        }
+        // No delayed event, including a second terminal event, can overwrite
+        // the first authoritative outcome retained for idempotent replay.
+        if state.phase.is_terminal() {
+            return None;
+        }
+        state.phase = phase;
+        state.message = message;
+        if inventory.is_some() {
+            state.inventory = inventory;
+        }
+        state.updated_at = Instant::now();
+        Some(state.clone())
+    }
+
+    pub fn timeout_lifecycle_request(&self, request_id: Uuid) -> Option<LifecycleRequestState> {
+        let mut state = self.lifecycle_requests.get_mut(&request_id)?;
+        if state.phase.is_terminal() {
+            return None;
+        }
+        state.phase = shared::CliLifecyclePhase::TimedOut;
+        state.message = Some(
+            "The CLI did not finish the lifecycle operation in time; inspect or restart it on the project host."
+                .to_string(),
+        );
+        state.updated_at = Instant::now();
+        Some(state.clone())
+    }
+
+    pub fn clear_lifecycle_for_session_user(&self, session_id: Uuid, user_id: Uuid) {
+        let request_ids: Vec<Uuid> = self
+            .lifecycle_requests
+            .iter()
+            .filter(|entry| entry.session_id == session_id && entry.user_id == user_id)
+            .map(|entry| *entry.key())
+            .collect();
+        for request_id in request_ids {
+            self.lifecycle_requests.remove(&request_id);
+        }
+    }
+
     pub fn set_web_capabilities(&self, connection_id: Uuid, capabilities: Vec<String>) {
         self.web_capabilities
             .insert(connection_id, capabilities.into_iter().collect());
@@ -829,6 +999,7 @@ impl SessionManager {
         let mut revoked_cli_ids = HashSet::new();
 
         for session_id in session_ids {
+            self.clear_lifecycle_for_session_user(session_id, *user_id);
             let mut revoked_cli = None;
             if let Some(mut session) = self.sessions.get_mut(&session_id) {
                 let before = session.web_connection_ids.len();
@@ -1038,6 +1209,86 @@ impl SessionManager {
         }
     }
 
+    pub fn complete_project_runtime_stop(
+        &self,
+        request_id: Uuid,
+        project_id: String,
+        success: bool,
+        remaining_pane_hosts: usize,
+        error: Option<String>,
+    ) {
+        if let Some((_, waiter)) = self.daemon_stop_waiters.remove(&request_id) {
+            let _ = waiter.send((project_id, success, remaining_pane_hosts, error));
+        } else {
+            tracing::warn!(%request_id, "ignored unknown project-runtime stop acknowledgement");
+        }
+    }
+
+    /// Stop every known machine-local runtime for a project and, for capable
+    /// daemons, wait until no pane host remains. Legacy daemons receive the
+    /// backward-compatible uncorrelated stop; they predate persistent hosts.
+    pub async fn confirm_project_runtime_stopped(&self, project_id: &str) -> anyhow::Result<usize> {
+        let machine_ids = self
+            .machine_projects
+            .iter()
+            .filter(|entry| entry.iter().any(|project| project.project_id == project_id))
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
+        let mut confirmed = 0;
+        for machine_id in machine_ids {
+            if !self
+                .daemon_supports_capability(&machine_id, shared::PANE_HOST_CLEANUP_ACK_CAPABILITY)
+            {
+                anyhow::ensure!(
+                    self.send_to_daemon(
+                        &machine_id,
+                        ServerToDaemon::StopProjectCli {
+                            project_id: project_id.to_string(),
+                            request_id: None,
+                        },
+                    )
+                    .await,
+                    "project host daemon is offline during cleanup"
+                );
+                confirmed += 1;
+                continue;
+            }
+
+            let request_id = Uuid::new_v4();
+            let (tx, rx) = oneshot::channel();
+            self.daemon_stop_waiters.insert(request_id, tx);
+            if !self
+                .send_to_daemon(
+                    &machine_id,
+                    ServerToDaemon::StopProjectCli {
+                        project_id: project_id.to_string(),
+                        request_id: Some(request_id),
+                    },
+                )
+                .await
+            {
+                self.daemon_stop_waiters.remove(&request_id);
+                anyhow::bail!("project host daemon disconnected during cleanup");
+            }
+            let result = tokio::time::timeout(Duration::from_secs(20), rx).await;
+            self.daemon_stop_waiters.remove(&request_id);
+            let (ack_project, success, remaining, error) = result
+                .map_err(|_| anyhow::anyhow!("project runtime cleanup acknowledgement timed out"))?
+                .map_err(|_| anyhow::anyhow!("project runtime cleanup acknowledgement was lost"))?;
+            anyhow::ensure!(
+                ack_project == project_id,
+                "project runtime cleanup identity mismatch"
+            );
+            anyhow::ensure!(
+                success && remaining == 0,
+                "project runtime cleanup incomplete: {}",
+                error.unwrap_or_else(|| format!("{remaining} pane host(s) remain"))
+            );
+            confirmed += 1;
+        }
+        Ok(confirmed)
+    }
+
     pub async fn stop_project_runtime(&self, project_id: &str) -> usize {
         self.stop_project_runtime_with_reason(
             project_id,
@@ -1069,6 +1320,16 @@ impl SessionManager {
         let mut cli_ids = HashSet::new();
         let mut sent = 0;
         for (session_id, cli_id, web_ids) in &affected_sessions {
+            self.lifecycle_inventories.remove(session_id);
+            let lifecycle_ids: Vec<Uuid> = self
+                .lifecycle_requests
+                .iter()
+                .filter(|entry| entry.session_id == *session_id)
+                .map(|entry| *entry.key())
+                .collect();
+            for request_id in lifecycle_ids {
+                self.lifecycle_requests.remove(&request_id);
+            }
             if let Some(cli_id) = cli_id {
                 if self
                     .send_to_cli(
@@ -1114,6 +1375,7 @@ impl SessionManager {
                     &machine_id,
                     ServerToDaemon::StopProjectCli {
                         project_id: project_id.to_string(),
+                        request_id: None,
                     },
                 )
                 .await
@@ -2618,6 +2880,7 @@ mod tests {
             Some(running_instance),
             TerminalLifecycle::Running,
             None,
+            None,
         );
         sessions.append_terminal_output(&dead, 1, Some(running_instance), b"x", 0);
         sessions.reconcile_terminal_state(
@@ -2626,6 +2889,7 @@ mod tests {
             Some(exited_instance),
             TerminalLifecycle::Exited,
             Some("status 7".into()),
+            None,
         );
         sessions.append_terminal_output(&dead, 2, Some(exited_instance), b"y", 0);
         sessions.append_terminal_output(&alive, 1, None, b"z", 0);
@@ -2655,12 +2919,20 @@ mod tests {
             Some(instance),
             TerminalLifecycle::Running,
             None,
+            None,
         );
         sessions.append_terminal_output(&sid, 2, Some(instance), b"before", 0);
         sessions.mark_session_terminals_disconnected(&sid);
 
         let reconciled = sessions
-            .reconcile_terminal_state(&sid, 2, Some(instance), TerminalLifecycle::Running, None)
+            .reconcile_terminal_state(
+                &sid,
+                2,
+                Some(instance),
+                TerminalLifecycle::Running,
+                None,
+                None,
+            )
             .expect("same instance accepted");
         assert_eq!(reconciled.bytes, b"before");
         assert_eq!(reconciled.lifecycle, TerminalLifecycle::Running);
@@ -2677,11 +2949,18 @@ mod tests {
         let sid = Uuid::new_v4();
         let old = Uuid::new_v4();
         let new = Uuid::new_v4();
-        sessions.reconcile_terminal_state(&sid, 3, Some(old), TerminalLifecycle::Running, None);
+        sessions.reconcile_terminal_state(
+            &sid,
+            3,
+            Some(old),
+            TerminalLifecycle::Running,
+            None,
+            None,
+        );
         sessions.append_terminal_output(&sid, 3, Some(old), b"old", 4);
 
         let replacement = sessions
-            .reconcile_terminal_state(&sid, 3, Some(new), TerminalLifecycle::Running, None)
+            .reconcile_terminal_state(&sid, 3, Some(new), TerminalLifecycle::Running, None, None)
             .expect("new running instance replaces old state");
         assert!(replacement.bytes.is_empty());
         assert_eq!(replacement.seq, 0);
@@ -2699,6 +2978,7 @@ mod tests {
                 Some(old),
                 TerminalLifecycle::Exited,
                 Some("old state".into()),
+                None,
             )
             .is_none());
         let current = sessions.terminal_snapshot(&sid, 3).unwrap();
@@ -2855,5 +3135,111 @@ mod tests {
             sessions.claim_mutation_request(second_user, "request-128"),
             MutationRequestClaim::New
         ));
+    }
+
+    #[test]
+    fn lifecycle_requests_deduplicate_scope_and_replay_terminal_outcomes() {
+        let sessions = SessionManager::new();
+        let request_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let operation = shared::CliLifecycleOperation::ReconnectTransport;
+        assert!(matches!(
+            sessions.claim_lifecycle_request(request_id, session_id, user_id, operation),
+            LifecycleRequestClaim::New
+        ));
+        assert!(matches!(
+            sessions.claim_lifecycle_request(request_id, session_id, user_id, operation),
+            LifecycleRequestClaim::InFlight(_)
+        ));
+        assert!(matches!(
+            sessions.claim_lifecycle_request(request_id, Uuid::new_v4(), user_id, operation),
+            LifecycleRequestClaim::Conflict
+        ));
+
+        sessions
+            .update_lifecycle_request(
+                request_id,
+                session_id,
+                operation,
+                shared::CliLifecyclePhase::Succeeded,
+                Some("reconciled".to_string()),
+                None,
+            )
+            .expect("known lifecycle request");
+        let LifecycleRequestClaim::Replay(replayed) =
+            sessions.claim_lifecycle_request(request_id, session_id, user_id, operation)
+        else {
+            panic!("terminal result must replay");
+        };
+        assert_eq!(replayed.phase, shared::CliLifecyclePhase::Succeeded);
+        assert!(sessions
+            .update_lifecycle_request(
+                request_id,
+                session_id,
+                operation,
+                shared::CliLifecyclePhase::Reconnecting,
+                None,
+                None,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn lifecycle_timeout_and_access_revocation_are_authoritative() {
+        let sessions = SessionManager::new();
+        let request_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let operation = shared::CliLifecycleOperation::RebootCli;
+        assert!(matches!(
+            sessions.claim_lifecycle_request(request_id, session_id, user_id, operation),
+            LifecycleRequestClaim::New
+        ));
+        let timed_out = sessions
+            .timeout_lifecycle_request(request_id)
+            .expect("pending request times out");
+        assert_eq!(timed_out.phase, shared::CliLifecyclePhase::TimedOut);
+        sessions.clear_lifecycle_for_session_user(session_id, user_id);
+        assert!(matches!(
+            sessions.claim_lifecycle_request(request_id, session_id, user_id, operation),
+            LifecycleRequestClaim::New
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_cleanup_waits_for_zero_remaining_pane_hosts() {
+        let sessions = std::sync::Arc::new(SessionManager::new());
+        let machine_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let (daemon_tx, mut daemon_rx) = mpsc::channel(4);
+        sessions.register_daemon(
+            machine_id,
+            user_id,
+            daemon_tx,
+            test_machine(machine_id, "host-a"),
+            vec![test_project("project-a", "/work/project-a")],
+        );
+        sessions.set_daemon_capabilities(
+            machine_id,
+            vec![shared::PANE_HOST_CLEANUP_ACK_CAPABILITY.to_string()],
+        );
+
+        let waiting_sessions = sessions.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_sessions
+                .confirm_project_runtime_stopped("project-a")
+                .await
+        });
+        let ServerToDaemon::StopProjectCli {
+            project_id,
+            request_id: Some(request_id),
+        } = daemon_rx.recv().await.expect("cleanup command")
+        else {
+            panic!("expected correlated project cleanup command");
+        };
+        sessions.complete_project_runtime_stop(request_id, project_id, true, 0, None);
+
+        assert_eq!(waiting.await.unwrap().unwrap(), 1);
     }
 }

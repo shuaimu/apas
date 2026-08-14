@@ -1,8 +1,14 @@
 "use client";
 
 import { useCallback, useRef, useEffect, useState, type ReactNode } from "react";
-import { Bot } from "lucide-react";
-import { PaneConfig, PaneKind, paneKey } from "@/lib/store";
+import { Bot, ChevronDown, LoaderCircle, RefreshCw } from "lucide-react";
+import {
+  type CliLifecycleInventory,
+  type CliLifecycleStatus,
+  PaneConfig,
+  PaneKind,
+  paneKey,
+} from "@/lib/store";
 import { useIsLaunchProfileAllowed } from "@/lib/tabTypes";
 import {
   isDeepseekModel,
@@ -26,7 +32,10 @@ interface TabBarProps {
   onRenameTab?: (paneId: number, newLabel: string) => void;
   onReorderTabs?: (orderedIds: number[]) => void;
   onBootCli?: () => void;
+  onReconnectCli?: () => void;
   onRebootCli?: () => void;
+  lifecycleInventory?: CliLifecycleInventory;
+  lifecycleStatus?: CliLifecycleStatus;
   showBootButton?: boolean;
   showRebootButton?: boolean;
   /** The Overview pseudo-tab is a team-mode surface. Hide it when the
@@ -39,6 +48,38 @@ interface TabBarProps {
    *  of the bar; callers gate their own visibility (e.g. md:hidden). */
   leading?: ReactNode;
   trailing?: ReactNode;
+}
+
+function rebootConfirmation(inventory?: CliLifecycleInventory): string {
+  if (!inventory) {
+    return [
+      "Reboot this older project CLI?",
+      "",
+      "All panes may restart. Upgrade the CLI on the project host to see preservation details and use transport-only reconnect.",
+    ].join("\n");
+  }
+  const adoptable = inventory.panes.filter((pane) => pane.mode === "live_adoptable").length;
+  const restarting = inventory.panes.filter(
+    (pane) => pane.mode === "restart_required_on_cli_reboot",
+  ).length;
+  const structured = inventory.panes.filter(
+    (pane) => pane.mode === "structured_pane_may_resume",
+  ).length;
+  return [
+    "Reboot the project CLI?",
+    "",
+    `${adoptable} terminal pane${adoptable === 1 ? "" : "s"} will stay live and be reattached.`,
+    `${restarting} terminal pane${restarting === 1 ? "" : "s"} will restart and resume where supported.`,
+    `${structured} structured pane${structured === 1 ? "" : "s"} may restart and resume.`,
+  ].join("\n");
+}
+
+function lifecyclePhaseLabel(status?: CliLifecycleStatus): string | null {
+  if (!status) return null;
+  if (status.message) return status.message;
+  return status.operation === "reconnect_transport"
+    ? `Server reconnect: ${status.phase.replaceAll("_", " ")}`
+    : `CLI reboot: ${status.phase.replaceAll("_", " ")}`;
 }
 
 function isDeepseekTab(provider: string, model?: string, label?: string): boolean {
@@ -112,7 +153,10 @@ export function TabBar({
   onRenameTab,
   onReorderTabs,
   onBootCli,
+  onReconnectCli,
   onRebootCli,
+  lifecycleInventory,
+  lifecycleStatus,
   showBootButton = false,
   showRebootButton = false,
   showOverview = true,
@@ -127,6 +171,8 @@ export function TabBar({
   const [renameDraft, setRenameDraft] = useState("");
   const renameInputRef = useRef<HTMLInputElement>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
+  const lifecycleMenuRef = useRef<HTMLDivElement>(null);
+  const [lifecycleMenuOpen, setLifecycleMenuOpen] = useState(false);
 
   // Drag-and-drop state
   const [draggedPaneId, setDraggedPaneId] = useState<number | null>(null);
@@ -153,6 +199,17 @@ export function TabBar({
     document.addEventListener("mousedown", handleClick);
     return () => document.removeEventListener("mousedown", handleClick);
   }, [contextMenu]);
+
+  useEffect(() => {
+    if (!lifecycleMenuOpen) return;
+    const handleClick = (event: MouseEvent) => {
+      if (!lifecycleMenuRef.current?.contains(event.target as Node)) {
+        setLifecycleMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [lifecycleMenuOpen]);
 
   // Auto-focus rename input
   useEffect(() => {
@@ -445,15 +502,71 @@ export function TabBar({
           </button>
         )}
         {showRebootButton && onRebootCli && (
-          <button
-            onClick={() => {
-              if (confirm("Are you sure you want to reboot the CLI?")) onRebootCli();
-            }}
-            className="px-2.5 h-8 my-1 text-xs font-medium rounded transition-colors bg-red-500 hover:bg-red-600 text-white"
-            title="Reboot the entire CLI (all panes restart). Use the per-pane Reboot for a single agent."
-          >
-            Reboot CLI
-          </button>
+          <div ref={lifecycleMenuRef} className="relative hidden md:block">
+            <button
+              onClick={() => setLifecycleMenuOpen((open) => !open)}
+              className="flex items-center gap-1 px-2.5 h-8 my-1 text-xs font-medium rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 hover:bg-gray-50 dark:hover:bg-gray-700"
+              title="Project CLI lifecycle actions"
+              aria-expanded={lifecycleMenuOpen}
+            >
+              {lifecycleStatus && !["succeeded", "failed", "timed_out"].includes(lifecycleStatus.phase)
+                ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-label="CLI operation pending" />
+                : <RefreshCw className="h-3.5 w-3.5" />}
+              CLI
+              <ChevronDown className="h-3 w-3" />
+            </button>
+            {lifecycleMenuOpen && (
+              <div className="absolute right-0 top-full z-50 w-80 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 shadow-xl p-1.5">
+                {lifecycleInventory?.reconnect_transport && onReconnectCli ? (
+                  <button
+                    disabled={Boolean(lifecycleStatus && !["succeeded", "failed", "timed_out"].includes(lifecycleStatus.phase))}
+                    onClick={() => {
+                      if (confirm("Reconnect APAS server transport? The CLI and every pane will keep running.")) {
+                        onReconnectCli();
+                        setLifecycleMenuOpen(false);
+                      }
+                    }}
+                    className="w-full rounded px-3 py-2 text-left text-sm hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50"
+                  >
+                    <span className="flex items-center justify-between font-medium">
+                      Reconnect Server
+                      <span className="text-[10px] uppercase tracking-wide text-blue-600 dark:text-blue-400">Recommended</span>
+                    </span>
+                    <span className="mt-0.5 block text-xs text-gray-500 dark:text-gray-400">
+                      Reconnect only the server transport; agents and panes keep running.
+                    </span>
+                  </button>
+                ) : (
+                  <div className="px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+                    Upgrade this project CLI on its host to use safe transport-only reconnect.
+                  </div>
+                )}
+                <button
+                  disabled={Boolean(lifecycleStatus && !["succeeded", "failed", "timed_out"].includes(lifecycleStatus.phase))}
+                  onClick={() => {
+                    if (confirm(rebootConfirmation(lifecycleInventory))) {
+                      onRebootCli();
+                      setLifecycleMenuOpen(false);
+                    }
+                  }}
+                  className="w-full rounded px-3 py-2 text-left text-sm text-red-700 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-950/40 disabled:opacity-50"
+                >
+                  <span className="font-medium">Reboot CLI</span>
+                  <span className="mt-0.5 block text-xs text-gray-500 dark:text-gray-400">
+                    Replace the CLI process; unsupported panes may restart or resume.
+                  </span>
+                </button>
+                {lifecyclePhaseLabel(lifecycleStatus) && (
+                  <div
+                    className="mt-1 border-t border-gray-200 dark:border-gray-700 px-3 py-2 text-xs text-gray-600 dark:text-gray-300"
+                    role="status"
+                  >
+                    {lifecyclePhaseLabel(lifecycleStatus)}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         )}
       </div>
       {trailing}

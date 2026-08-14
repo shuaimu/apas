@@ -42,6 +42,44 @@ export interface CliClient {
   activeSession?: string;
 }
 
+export type CliLifecycleOperation = "reconnect_transport" | "reboot_cli";
+export type CliLifecyclePhase =
+  | "accepted"
+  | "preparing"
+  | "reconnecting"
+  | "handoff"
+  | "reconciling"
+  | "succeeded"
+  | "failed"
+  | "timed_out";
+export type PanePreservationMode =
+  | "live_adoptable"
+  | "restart_required_on_cli_reboot"
+  | "structured_pane_may_resume";
+
+export interface PanePreservationInfo {
+  pane_id: number;
+  mode: PanePreservationMode;
+  runtime_id?: string | null;
+}
+
+export interface CliLifecycleInventory {
+  reconnect_transport: boolean;
+  persistent_terminal_hosting: boolean;
+  panes: PanePreservationInfo[];
+}
+
+export interface CliLifecycleStatus {
+  sessionId: string;
+  requestId: string;
+  operation: CliLifecycleOperation;
+  phase: CliLifecyclePhase;
+  message?: string;
+  inventory?: CliLifecycleInventory;
+  startedAt: number;
+  updatedAt: number;
+}
+
 export interface SessionInfo {
   id: string;
   /** Stable project identity from `.apas`. Sidebar groups by this so moving
@@ -574,6 +612,12 @@ interface AppState {
   // CLI clients
   cliClients: CliClient[];
 
+  // Capability and correlated progress for project CLI lifecycle controls.
+  // Operations are keyed by request ID so they survive project navigation.
+  cliLifecycleInventories: Record<string, CliLifecycleInventory>;
+  cliLifecycleOperations: Record<string, CliLifecycleStatus>;
+  cliLifecycleLatestBySession: Record<string, string>;
+
   // Persisted sessions
   sessions: SessionInfo[];
 
@@ -823,8 +867,8 @@ interface AppState {
     effort?: string,
   ) => void;
   stopBot: (paneId: number) => void;
-  rebootCli: () => void;
-  downloadSession: () => void;
+  reconnectCli: () => string | null;
+  rebootCli: () => string | null;
   requestPaneDiff: (paneId: number) => void;
   paneDiffs: Record<number, PaneDiff>;
   createPanePr: (paneId: number) => void;
@@ -954,6 +998,104 @@ export interface PlanReviewPendingItem {
   arrivedAt: number;
 }
 
+const CLI_LIFECYCLE_TIMEOUT_MS = 185_000;
+
+function isTerminalLifecyclePhase(phase: CliLifecyclePhase): boolean {
+  return phase === "succeeded" || phase === "failed" || phase === "timed_out";
+}
+
+function sendCliLifecycleRequest(
+  get: () => AppState,
+  set: (partial: Partial<AppState> | ((state: AppState) => Partial<AppState>)) => void,
+  operation: CliLifecycleOperation,
+): string | null {
+  const { ws, sessionId, cliLifecycleInventories, showToast } = get();
+  if (!sessionId) {
+    showToast("Select a project before using CLI lifecycle controls", "error");
+    return null;
+  }
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    showToast("Not connected — manage the CLI manually on the project host", "error");
+    return null;
+  }
+  const inventory = cliLifecycleInventories[sessionId];
+  if (!inventory || (operation === "reconnect_transport" && !inventory.reconnect_transport)) {
+    showToast(
+      "This project CLI is too old for safe server reconnect. Upgrade it on the project host.",
+      "error",
+    );
+    return null;
+  }
+
+  const requestId = generateId();
+  const now = Date.now();
+  const optimistic: CliLifecycleStatus = {
+    sessionId,
+    requestId,
+    operation,
+    phase: "accepted",
+    message: operation === "reconnect_transport"
+      ? "Requesting a transport-only server reconnect"
+      : "Requesting a full CLI reboot",
+    inventory,
+    startedAt: now,
+    updatedAt: now,
+  };
+  set((state) => ({
+    cliLifecycleOperations: {
+      ...state.cliLifecycleOperations,
+      [requestId]: optimistic,
+    },
+    cliLifecycleLatestBySession: {
+      ...state.cliLifecycleLatestBySession,
+      [sessionId]: requestId,
+    },
+  }));
+
+  try {
+    ws.send(JSON.stringify({
+      type: "cli_lifecycle_request",
+      session_id: sessionId,
+      request_id: requestId,
+      operation,
+    }));
+  } catch {
+    set((state) => ({
+      cliLifecycleOperations: {
+        ...state.cliLifecycleOperations,
+        [requestId]: {
+          ...optimistic,
+          phase: "failed",
+          message: "The lifecycle request could not be sent. Manage the CLI manually on the project host.",
+          updatedAt: Date.now(),
+        },
+      },
+    }));
+    showToast("The lifecycle request could not be sent", "error");
+    return requestId;
+  }
+
+  const timeout = setTimeout(() => {
+    const current = get().cliLifecycleOperations[requestId];
+    if (!current || isTerminalLifecyclePhase(current.phase)) return;
+    set((state) => ({
+      cliLifecycleOperations: {
+        ...state.cliLifecycleOperations,
+        [requestId]: {
+          ...current,
+          phase: "timed_out",
+          message: "The operation timed out. Check the project host and restart the CLI manually if needed.",
+          updatedAt: Date.now(),
+        },
+      },
+    }));
+    get().showToast("CLI lifecycle operation timed out", "error");
+  }, CLI_LIFECYCLE_TIMEOUT_MS);
+  // Node-based component tests should not stay alive solely for this UI timer.
+  (timeout as unknown as { unref?: () => void }).unref?.();
+  return requestId;
+}
+
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "wss://apas.mpaxos.com";
 const DEEPSEEK_API_BASE_URL = "https://api.deepseek.com/anthropic";
 
@@ -984,6 +1126,9 @@ export const useStore = create<AppState>((set, get) => ({
   reconnectTimeout: null,
   visibilityHandler: null,
   cliClients: [],
+  cliLifecycleInventories: {},
+  cliLifecycleOperations: {},
+  cliLifecycleLatestBySession: {},
   sessions: [],
   messages: [],
   hasMoreMessages: false,
@@ -1089,6 +1234,9 @@ export const useStore = create<AppState>((set, get) => ({
       serverVersion: null,
       negotiatedCapabilities: new Set(),
       cliClients: [],
+      cliLifecycleInventories: {},
+      cliLifecycleOperations: {},
+      cliLifecycleLatestBySession: {},
       sessions: [],
       workingPanesBySession: new Map(),
       machines: [],
@@ -1170,7 +1318,7 @@ export const useStore = create<AppState>((set, get) => ({
       ws.send(JSON.stringify({
         type: "authenticate",
         token,
-        capabilities: ["project_policy_v1", "pane_work_summary_v1"],
+        capabilities: ["project_policy_v1", "pane_work_summary_v1", "cli_lifecycle_v1"],
         client_kind: "web",
         app_version: process.env.NEXT_PUBLIC_WEB_UI_VERSION || "development",
         protocol_version: 1,
@@ -1278,6 +1426,9 @@ export const useStore = create<AppState>((set, get) => ({
       teamRecords: [],
       serverVersion: null,
       cliClients: [],
+      cliLifecycleInventories: {},
+      cliLifecycleOperations: {},
+      cliLifecycleLatestBySession: {},
       machines: [],
       paneModes: {},
       isAttached: false,
@@ -1497,6 +1648,21 @@ export const useStore = create<AppState>((set, get) => ({
           ([key]) => ![...removedSessionIds].some((id) => key.startsWith(`${id}/`)),
         ),
       );
+      const cliLifecycleInventories = Object.fromEntries(
+        Object.entries(state.cliLifecycleInventories).filter(
+          ([sessionId]) => !removedSessionIds.has(sessionId),
+        ),
+      );
+      const cliLifecycleOperations = Object.fromEntries(
+        Object.entries(state.cliLifecycleOperations).filter(
+          ([, status]) => !removedSessionIds.has(status.sessionId),
+        ),
+      );
+      const cliLifecycleLatestBySession = Object.fromEntries(
+        Object.entries(state.cliLifecycleLatestBySession).filter(
+          ([sessionId]) => !removedSessionIds.has(sessionId),
+        ),
+      );
       for (const id of removedSessionIds) {
         sessionCache.delete(id);
         teamRecordsBySession.delete(id);
@@ -1520,6 +1686,9 @@ export const useStore = create<AppState>((set, get) => ({
         teamTodoStates,
         suggestedWorkersBySession,
         paneWorkSummaries,
+        cliLifecycleInventories,
+        cliLifecycleOperations,
+        cliLifecycleLatestBySession,
         ...(activeRemoved
           ? {
               sessionId: null,
@@ -2843,33 +3012,44 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
+  reconnectCli: () => sendCliLifecycleRequest(get, set, "reconnect_transport"),
+
   rebootCli: () => {
-    const { ws, sessionId, paneConfigs, projectPolicies, showToast } = get();
+    const {
+      ws,
+      sessionId,
+      paneConfigs,
+      projectPolicies,
+      cliLifecycleInventories,
+      showToast,
+    } = get();
     const policy = sessionId ? projectPolicies[sessionId] : undefined;
     if (!policy || paneConfigs.some((pane) =>
       (pane.managed && !policy.teamAvailable)
       || !policyAllowsLaunch(policy, pane.kind ?? "agent", pane.provider, pane.model)
     )) {
       showToast("CLI reboot refused because one or more panes are outside cluster policy", "error");
-      return;
+      return null;
     }
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       showToast("Not connected — reboot the CLI manually on the project host", "error");
-      return;
+      return null;
     }
+    // A new CLI publishes an inventory on attach. Use the correlated path so
+    // progress and preservation outcomes remain visible across navigation.
+    if (sessionId && cliLifecycleInventories[sessionId]) {
+      return sendCliLifecycleRequest(get, set, "reboot_cli");
+    }
+    // Mixed-version rollout: old CLIs retain the explicit legacy reboot path.
+    // Reconnect never uses this fallback because it would be destructive.
     try {
       ws.send(JSON.stringify({ type: "reboot_cli", session_id: get().sessionId }));
     } catch {
       showToast("The reboot request could not be sent — reboot the CLI manually on the project host", "error");
     }
+    return null;
   },
 
-  downloadSession: () => {
-    const { ws, sessionId } = get();
-    if (ws && ws.readyState === WebSocket.OPEN && sessionId) {
-      ws.send(JSON.stringify({ type: "download_session", session_id: sessionId }));
-    }
-  },
 }));
 
 // Hydrate the per-session message snapshots from IndexedDB on app boot.
@@ -3648,6 +3828,34 @@ function decodePaneWorkSummary(value: unknown): PaneWorkSummary | null {
   };
 }
 
+function parseCliLifecycleInventory(raw: unknown): CliLifecycleInventory {
+  const value = raw && typeof raw === "object"
+    ? raw as Record<string, unknown>
+    : {};
+  const panes = Array.isArray(value.panes)
+    ? value.panes.flatMap((item) => {
+        if (!item || typeof item !== "object") return [];
+        const pane = item as Record<string, unknown>;
+        const mode = pane.mode;
+        if (typeof pane.pane_id !== "number" || ![
+          "live_adoptable",
+          "restart_required_on_cli_reboot",
+          "structured_pane_may_resume",
+        ].includes(String(mode))) return [];
+        return [{
+          pane_id: pane.pane_id,
+          mode: mode as PanePreservationMode,
+          runtime_id: typeof pane.runtime_id === "string" ? pane.runtime_id : undefined,
+        }];
+      })
+    : [];
+  return {
+    reconnect_transport: value.reconnect_transport === true,
+    persistent_terminal_hosting: value.persistent_terminal_hosting === true,
+    panes,
+  };
+}
+
 export function handleServerMessage(
   data: Record<string, unknown>,
   set: (partial: Partial<AppState> | ((state: AppState) => Partial<AppState>)) => void,
@@ -3766,6 +3974,71 @@ export function handleServerMessage(
           });
       }
       break;
+
+    case "cli_lifecycle_inventory": {
+      const lifecycleSessionId = data.session_id as string | undefined;
+      if (!lifecycleSessionId) break;
+      const inventory = parseCliLifecycleInventory(data.inventory);
+      set((state) => ({
+        cliLifecycleInventories: {
+          ...state.cliLifecycleInventories,
+          [lifecycleSessionId]: inventory,
+        },
+      }));
+      break;
+    }
+
+    case "cli_lifecycle_status": {
+      const lifecycleSessionId = data.session_id as string | undefined;
+      const requestId = data.request_id as string | undefined;
+      const operation = data.operation as CliLifecycleOperation | undefined;
+      const phase = data.phase as CliLifecyclePhase | undefined;
+      if (!lifecycleSessionId || !requestId || !operation || !phase) break;
+      const prior = get().cliLifecycleOperations[requestId];
+      const inventory = data.inventory == null
+        ? prior?.inventory
+        : parseCliLifecycleInventory(data.inventory);
+      const next: CliLifecycleStatus = {
+        sessionId: lifecycleSessionId,
+        requestId,
+        operation,
+        phase,
+        message: typeof data.message === "string" ? data.message : undefined,
+        inventory,
+        startedAt: prior?.startedAt ?? Date.now(),
+        updatedAt: Date.now(),
+      };
+      set((state) => ({
+        cliLifecycleOperations: {
+          ...state.cliLifecycleOperations,
+          [requestId]: next,
+        },
+        cliLifecycleLatestBySession: {
+          ...state.cliLifecycleLatestBySession,
+          [lifecycleSessionId]: requestId,
+        },
+        ...(inventory ? {
+          cliLifecycleInventories: {
+            ...state.cliLifecycleInventories,
+            [lifecycleSessionId]: inventory,
+          },
+        } : {}),
+      }));
+      if (phase === "succeeded") {
+        get().showToast(
+          operation === "reconnect_transport"
+            ? "Server transport reconnected; panes kept running"
+            : "CLI reboot completed",
+          "success",
+        );
+      } else if (phase === "failed" || phase === "timed_out") {
+        get().showToast(
+          next.message ?? "CLI lifecycle operation failed",
+          "error",
+        );
+      }
+      break;
+    }
 
     case "authentication_failed":
       console.error("Authentication failed:", data.reason);
@@ -5281,39 +5554,6 @@ export function handleServerMessage(
         // Legacy compat
         isDeadloopPaused: paneId === PANE_ID_DEADLOOP ? isPaused : state.isDeadloopPaused,
       }));
-      break;
-    }
-
-    case "session_download": {
-      const sessionId = data.session_id as string;
-      const projectId = data.project_id as string | undefined;
-      const messages = data.messages as Array<Record<string, unknown>> || [];
-      const workingDir = data.working_dir as string | undefined;
-      const hostname = data.hostname as string | undefined;
-      const createdAt = data.created_at as string | undefined;
-
-      const downloadData = {
-        session_id: sessionId,
-        project_id: projectId,
-        working_dir: workingDir,
-        hostname: hostname,
-        created_at: createdAt,
-        exported_at: new Date().toISOString(),
-        message_count: messages.length,
-        messages: messages,
-      };
-
-      const blob = new Blob([JSON.stringify(downloadData, null, 2)], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `apas-session-${sessionId.slice(0, 8)}-${new Date().toISOString().slice(0, 10)}.json`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-
-      storeDebugLog(`Downloaded session ${sessionId} with ${messages.length} messages`);
       break;
     }
 

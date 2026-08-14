@@ -23,7 +23,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use uuid::Uuid;
 
 use crate::project::{get_or_create_project, save_project};
-use crate::terminal_pane::{terminal_binary_for, TerminalHandle, TerminalPanes};
+use crate::terminal_pane::{terminal_binary_for, TerminalPanes, TerminalRuntimeHandle};
 use crate::tui::{App, PaneOutput, TuiCommand, TuiEvent};
 
 type ProjectPolicyState = Arc<Mutex<Option<shared::EffectiveProjectPolicy>>>;
@@ -1097,7 +1097,7 @@ fn spawn_terminal_pane(
     let cwd = worktree_path.unwrap_or(working_dir);
     let env = build_pane_env_overrides(provider, None)?;
 
-    let handle = TerminalHandle::spawn(
+    let handle = TerminalRuntimeHandle::spawn(
         pane_id,
         session_id,
         claude_session_id,
@@ -1163,10 +1163,85 @@ fn terminal_state_reports(
                     instance_id: None,
                     lifecycle: shared::TerminalLifecycle::Exited,
                     status: Some("terminal process unavailable".to_string()),
+                    runtime: None,
                 },
             }
         })
         .collect()
+}
+
+fn build_lifecycle_inventory(
+    pane_metas: &PaneMetas,
+    terminal_panes: &TerminalPanes,
+) -> shared::CliLifecycleInventory {
+    let handles = terminal_panes.lock().ok();
+    let mut panes = pane_metas
+        .lock()
+        .map(|metas| {
+            metas
+                .iter()
+                .map(|(pane_id, meta)| shared::PanePreservationInfo {
+                    pane_id: *pane_id,
+                    mode: if meta.kind.is_terminal() {
+                        handles
+                            .as_ref()
+                            .and_then(|handles| handles.get(pane_id))
+                            .map(|handle| handle.preservation(*pane_id).mode)
+                            .unwrap_or(shared::PanePreservationMode::RestartRequiredOnCliReboot)
+                    } else {
+                        shared::PanePreservationMode::StructuredPaneMayResume
+                    },
+                    runtime_id: if meta.kind.is_terminal() {
+                        handles
+                            .as_ref()
+                            .and_then(|handles| handles.get(pane_id))
+                            .and_then(|handle| handle.preservation(*pane_id).runtime_id)
+                    } else {
+                        None
+                    },
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    panes.sort_by_key(|pane| pane.pane_id);
+    shared::CliLifecycleInventory {
+        reconnect_transport: true,
+        persistent_terminal_hosting: crate::pane_host::persistent_hosting_available(),
+        panes,
+    }
+}
+
+fn load_reboot_handoff(
+    project_id: Uuid,
+) -> Option<(std::path::PathBuf, crate::pane_host::RebootHandoffMarker)> {
+    let path = std::env::var_os("APAS_REBOOT_HANDOFF").map(std::path::PathBuf::from)?;
+    std::env::remove_var("APAS_REBOOT_HANDOFF");
+    match crate::pane_host::read_handoff_marker(&path) {
+        Ok(marker)
+            if marker.project_id == project_id
+                && marker.expected_version == env!("APAS_VERSION")
+                && marker.expected_executable
+                    == crate::update::resolve_preferred_apas_executable() =>
+        {
+            Some((path, marker))
+        }
+        Ok(marker) => {
+            tracing::warn!(
+                marker_project = %marker.project_id,
+                expected_project = %project_id,
+                marker_version = %marker.expected_version,
+                running_version = env!("APAS_VERSION"),
+                "ignoring mismatched reboot handoff marker"
+            );
+            let _ = std::fs::remove_file(path);
+            None
+        }
+        Err(error) => {
+            tracing::warn!(%error, marker = %path.display(), "ignoring invalid reboot handoff marker");
+            let _ = std::fs::remove_file(path);
+            None
+        }
+    }
 }
 
 /// Per-pane pause flags (for deadloop panes).
@@ -1656,6 +1731,7 @@ async fn run_inner(
     // Load or create project metadata
     let mut metadata = get_or_create_project(working_dir)?;
     let session_id = metadata.id;
+    let reboot_handoff = load_reboot_handoff(session_id);
     // `None` means the authoritative server policy has not arrived yet and
     // launch-like mutations fail closed. Existing processes may keep running
     // and will be reported as noncompliant rather than terminated.
@@ -1767,6 +1843,19 @@ async fn run_inner(
         );
     }
     save_project(working_dir, &metadata)?;
+
+    let configured_terminal_panes = metadata
+        .panes
+        .iter()
+        .filter_map(|pane| pane.kind.is_terminal().then_some(pane.pane_id))
+        .collect::<std::collections::HashSet<_>>();
+    match crate::pane_host::reconcile_project_hosts(session_id, &configured_terminal_panes) {
+        Ok(removed) if removed > 0 => {
+            tracing::info!(removed, "removed unrostered pane-host runtimes")
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "could not reconcile persistent pane-host registry"),
+    }
 
     // Orphan-cleanup sweep: drop `## pane:<id>` sections in team-todo.md
     // for panes that no longer exist in .apas (typically: user removed
@@ -2170,6 +2259,7 @@ async fn run_inner(
                 status_tx,
                 event_tx_for_server,
                 project_policy_for_server,
+                reboot_handoff,
             )
             .await
         })
@@ -2758,9 +2848,25 @@ async fn run_inner(
                         }
                     });
                     if *tracked_source != source {
+                        // Baseline to the end of the new transcript rather than
+                        // replaying it. A switch does not mean the turns are
+                        // new: `codex resume` and thread forks open a file that
+                        // already contains the prior conversation, so starting
+                        // at 0 republishes all of it as if it had just been
+                        // said. That is what flooded one session with 4 million
+                        // duplicate messages and took the server out of memory.
+                        // The cost of this choice is at most one poll interval
+                        // of turns missed at a genuine switch, which is a far
+                        // better failure than unbounded duplication.
                         *tracked_source = source;
-                        *cursor = 0;
-                        *completed = 0;
+                        *cursor = turns.len();
+                        *completed = completion_count;
+                    }
+                    // A truncated or rotated transcript would otherwise leave
+                    // the cursor past the end and stall the pane permanently.
+                    if *cursor > turns.len() {
+                        *cursor = turns.len();
+                        *completed = completion_count;
                     }
                     let previous_cursor = *cursor;
                     if turns.len() > previous_cursor {
@@ -2924,6 +3030,16 @@ async fn run_inner(
         &pane_pauses,
         &pane_stop_requests,
     );
+
+    // An intentional project CLI stop owns terminal cleanup. Full CLI reboot
+    // execs before this path, leaving host-backed providers available for the
+    // replacement controller; ordinary stop reaches here and shuts them down.
+    if let Ok(mut terminals) = terminal_panes.lock() {
+        for handle in terminals.values() {
+            handle.shutdown();
+        }
+        terminals.clear();
+    }
 
     // Kill every pane's agent and everything it spawned. Without the group
     // kill, the agents' bash commands / subagents / mcp-servers outlive APAS.
@@ -5185,7 +5301,7 @@ mod tests {
         build_pane_reboot_events, build_user_envelope_line, convert_opencode_to_claude,
         deadloop_wait_plan, evaluate_deadloop_watchdog, is_codex_stale_session_error,
         manual_create_pr_worktree_path, normalize_codex_effort, normalize_effort_level,
-        promote_pane_to_managed, refresh_stale_managed_builtin_prompts,
+        promote_pane_to_managed, queue_transport_reconnect, refresh_stale_managed_builtin_prompts,
         reset_deadloop_codex_stale_session, resolve_pane_binary_path, restored_pane_mode_and_pause,
         retired_launch_rejection_output, route_web_input_to_pane, run_deadloop_session_inner,
         save_pane_configs, should_recover_deadloop_stale_session, start_bot_preserved_fields,
@@ -5198,6 +5314,7 @@ mod tests {
     use crate::project::{get_or_create_project, save_project};
     use crate::terminal_pane::TerminalPanes;
     use crate::tui::{PaneOutput, TuiEvent};
+    use base64::Engine as _;
     use shared::{ClaudeContentBlock, ClaudeStreamMessage, CliToServer, Provider};
     use std::collections::{HashMap, HashSet};
     use std::path::Path;
@@ -6218,6 +6335,7 @@ mod tests {
                 instance_id,
                 lifecycle,
                 status,
+                ..
             } => {
                 assert_eq!(*got_session, session_id);
                 assert_eq!(*pane_id, 888);
@@ -6227,6 +6345,88 @@ mod tests {
             }
             other => panic!("unexpected report: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn transport_reconnect_requests_preserve_terminal_and_structured_turn_state() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = root.path().join("reconnect-provider.sh");
+        std::fs::write(
+            &provider,
+            b"#!/bin/sh\nprintf 'ready\\n'\nwhile IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (server_tx, mut server_rx) = tokio_mpsc::channel(16);
+        let session_id = Uuid::new_v4();
+        let terminal = crate::terminal_pane::TerminalHandle::spawn(
+            41,
+            session_id,
+            Uuid::new_v4(),
+            &Provider::Claude,
+            provider.to_str().unwrap(),
+            root.path().to_str().unwrap(),
+            &[],
+            false,
+            None,
+            server_tx,
+        )
+        .unwrap();
+        let instance_before = terminal.instance_id();
+        let pid_before = terminal.provider_pid();
+        terminal.write_bytes(b"before-reconnect\n").unwrap();
+
+        let (structured_tx, structured_rx) = mpsc::channel();
+        structured_tx
+            .send(("turn remains queued".to_string(), false))
+            .unwrap();
+        let request_a = Uuid::new_v4();
+        let request_b = Uuid::new_v4();
+        let mut pending = Vec::new();
+        assert!(queue_transport_reconnect(&mut pending, request_a));
+        assert!(!queue_transport_reconnect(&mut pending, request_a));
+        assert!(queue_transport_reconnect(&mut pending, request_b));
+        assert_eq!(pending, vec![request_a, request_b]);
+
+        // A failed connection attempt leaves correlated requests queued and
+        // does not touch either in-process transport consumer.
+        assert_eq!(structured_rx.recv().unwrap().0, "turn remains queued");
+        terminal.write_bytes(b"during-reconnect\n").unwrap();
+        assert_eq!(terminal.instance_id(), instance_before);
+        assert_eq!(terminal.provider_pid(), pid_before);
+        assert_eq!(pending.len(), 2);
+
+        let mut saw_during = false;
+        for _ in 0..8 {
+            let Some(message) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), server_rx.recv())
+                    .await
+                    .unwrap()
+            else {
+                break;
+            };
+            if let CliToServer::TerminalOutput {
+                instance_id: Some(instance_id),
+                data_b64,
+                ..
+            } = message
+            {
+                assert_eq!(instance_id, instance_before);
+                let data = base64::engine::general_purpose::STANDARD
+                    .decode(data_b64)
+                    .unwrap();
+                if String::from_utf8_lossy(&data).contains("during-reconnect") {
+                    saw_during = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            saw_during,
+            "terminal output stopped during transport reconnect"
+        );
+        terminal.shutdown();
     }
 
     #[test]
@@ -11174,6 +11374,14 @@ async fn report_retired_launch_rejection<S>(
 }
 
 /// Run server connection with automatic reconnection
+fn queue_transport_reconnect(pending: &mut Vec<Uuid>, request_id: Uuid) -> bool {
+    if pending.contains(&request_id) {
+        return false;
+    }
+    pending.push(request_id);
+    true
+}
+
 async fn run_server_connection(
     server_url: &str,
     token: &str,
@@ -11191,6 +11399,7 @@ async fn run_server_connection(
     status_tx: mpsc::Sender<PaneOutput>,
     tui_event_tx: mpsc::Sender<TuiEvent>,
     project_policy: ProjectPolicyState,
+    mut reboot_handoff: Option<(std::path::PathBuf, crate::pane_host::RebootHandoffMarker)>,
 ) -> Result<()> {
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -11201,6 +11410,9 @@ async fn run_server_connection(
     let mut reconnect_delay = std::time::Duration::from_secs(1);
     let max_reconnect_delay = std::time::Duration::from_secs(60);
     let mut connection_count = 0u32;
+    let mut immediate_reconnect = false;
+    let mut pending_reconnects: Vec<Uuid> = Vec::new();
+    let mut reconnect_started_at: HashMap<Uuid, std::time::Instant> = HashMap::new();
 
     // Resolve the project's git remote once: it can't change between
     // reconnects, so we avoid re-shelling out to git on every loop iteration.
@@ -11244,9 +11456,13 @@ async fn run_server_connection(
                     shared::PROJECT_POLICY_CAPABILITY.to_string(),
                     shared::MOBILE_TASK_LAUNCH_CAPABILITY.to_string(),
                     shared::OPENCODE_TERMINAL_CAPABILITY.to_string(),
+                    shared::CLI_LIFECYCLE_CAPABILITY.to_string(),
                 ];
                 if summary_runner.is_some() {
                     capabilities.push(shared::PANE_WORK_SUMMARY_CAPABILITY.to_string());
+                }
+                if crate::pane_host::persistent_hosting_available() {
+                    capabilities.push(shared::PERSISTENT_TERMINAL_HOST_CAPABILITY.to_string());
                 }
                 let register_msg = CliToServer::Register {
                     token: token.to_string(),
@@ -11441,6 +11657,81 @@ async fn run_server_connection(
                     continue;
                 }
 
+                let lifecycle_inventory = build_lifecycle_inventory(&pane_metas, &terminal_panes);
+                let inventory_message = CliToServer::CliLifecycleInventory {
+                    session_id,
+                    inventory: lifecycle_inventory.clone(),
+                };
+                if let Ok(text) = serde_json::to_string(&inventory_message) {
+                    if ws_sender.send(Message::Text(text.into())).await.is_err() {
+                        continue;
+                    }
+                }
+
+                let mut completed_reconnects = 0;
+                for request_id in pending_reconnects.iter().copied() {
+                    let completed = CliToServer::CliLifecycleStatus {
+                        session_id,
+                        request_id,
+                        operation: shared::CliLifecycleOperation::ReconnectTransport,
+                        phase: shared::CliLifecyclePhase::Succeeded,
+                        message: Some(
+                            "Server transport reconnected and pane state reconciled".to_string(),
+                        ),
+                        inventory: Some(lifecycle_inventory.clone()),
+                    };
+                    if let Ok(text) = serde_json::to_string(&completed) {
+                        if ws_sender.send(Message::Text(text.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    let duration_ms = reconnect_started_at
+                        .remove(&request_id)
+                        .map(|started| started.elapsed().as_millis())
+                        .unwrap_or_default();
+                    tracing::info!(%request_id, duration_ms, "transport-only reconnect completed");
+                    completed_reconnects += 1;
+                }
+                if completed_reconnects > 0 {
+                    pending_reconnects.drain(..completed_reconnects);
+                }
+                if !pending_reconnects.is_empty() {
+                    continue;
+                }
+
+                if let Some((marker_path, marker)) = reboot_handoff.take() {
+                    let live_adopted = lifecycle_inventory
+                        .panes
+                        .iter()
+                        .filter(|pane| pane.mode == shared::PanePreservationMode::LiveAdoptable)
+                        .count();
+                    let restarted = lifecycle_inventory
+                        .panes
+                        .iter()
+                        .filter(|pane| {
+                            pane.mode == shared::PanePreservationMode::RestartRequiredOnCliReboot
+                        })
+                        .count();
+                    let completed = CliToServer::CliLifecycleStatus {
+                        session_id,
+                        request_id: marker.request_id,
+                        operation: shared::CliLifecycleOperation::RebootCli,
+                        phase: shared::CliLifecyclePhase::Succeeded,
+                        message: Some(format!(
+                            "CLI replacement reconciled: {live_adopted} terminal pane(s) live-adopted, {restarted} restarted or unavailable"
+                        )),
+                        inventory: Some(lifecycle_inventory.clone()),
+                    };
+                    if let Ok(text) = serde_json::to_string(&completed) {
+                        if ws_sender.send(Message::Text(text.into())).await.is_err() {
+                            reboot_handoff = Some((marker_path, marker));
+                            continue;
+                        }
+                    }
+                    let _ = std::fs::remove_file(&marker_path);
+                    tracing::info!(request_id = %marker.request_id, live_adopted, restarted, "CLI reboot handoff completed");
+                }
+
                 let mut heartbeat_interval =
                     tokio::time::interval(std::time::Duration::from_secs(25));
                 heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -11448,10 +11739,142 @@ async fn run_server_connection(
 
                 let mut usage_interval = tokio::time::interval(USAGE_FETCH_INTERVAL);
                 usage_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut reboot_preparation: Option<(
+                    Uuid,
+                    std::time::Instant,
+                    tokio::task::JoinHandle<anyhow::Result<std::path::PathBuf>>,
+                )> = None;
 
                 // Main loop
                 loop {
                     tokio::select! {
+                        prepared = async {
+                            match reboot_preparation.as_mut() {
+                                Some((_, _, task)) => Some(task.await),
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            let (request_id, preparation_started, _) = reboot_preparation
+                                .take()
+                                .expect("completed reboot preparation was present");
+                            let prepared = prepared
+                                .expect("reboot preparation result")
+                                .map_err(anyhow::Error::from)
+                                .and_then(|result| result);
+                            match prepared {
+                                Ok(executable) => {
+                                    tracing::info!(
+                                        %request_id,
+                                        preparation_duration_ms = preparation_started.elapsed().as_millis(),
+                                        "CLI reboot preparation completed"
+                                    );
+                                    save_pane_configs(
+                                        working_dir,
+                                        &pane_sessions,
+                                        &pane_metas,
+                                        &pane_pauses,
+                                        &pane_stop_requests,
+                                    );
+                                    let inventory = build_lifecycle_inventory(&pane_metas, &terminal_panes);
+                                    let runtime_ids = inventory
+                                        .panes
+                                        .iter()
+                                        .filter_map(|pane| pane.runtime_id)
+                                        .collect::<Vec<_>>();
+                                    let marker_path = crate::pane_host::handoff_marker_path(session_id)?;
+                                    let deadline_unix_ms = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis()
+                                        .saturating_add(15 * 60 * 1000)
+                                        .try_into()
+                                        .unwrap_or(u64::MAX);
+                                    let marker = crate::pane_host::RebootHandoffMarker {
+                                        protocol_version: crate::pane_host::HOST_PROTOCOL_VERSION,
+                                        request_id,
+                                        project_id: session_id,
+                                        expected_version: crate::update::binary_version(&executable)
+                                            .unwrap_or_else(|| env!("APAS_VERSION").to_string()),
+                                        expected_executable: executable,
+                                        controller_generation: 1,
+                                        runtime_ids,
+                                        deadline_unix_ms,
+                                    };
+                                    if let Err(error) = crate::pane_host::write_handoff_marker(&marker_path, &marker) {
+                                        let failed = CliToServer::CliLifecycleStatus {
+                                            session_id,
+                                            request_id,
+                                            operation: shared::CliLifecycleOperation::RebootCli,
+                                            phase: shared::CliLifecyclePhase::Failed,
+                                            message: Some(format!("Could not write secure reboot handoff marker: {error}")),
+                                            inventory: Some(inventory),
+                                        };
+                                        if let Ok(text) = serde_json::to_string(&failed) {
+                                            let _ = ws_sender.send(Message::Text(text.into())).await;
+                                        }
+                                        continue;
+                                    }
+
+                                    let detach_failures = terminal_panes
+                                        .lock()
+                                        .map(|panes| {
+                                            panes
+                                                .iter()
+                                                .filter_map(|(pane_id, handle)| {
+                                                    handle
+                                                        .detach_for_reboot()
+                                                        .err()
+                                                        .map(|error| (*pane_id, error.to_string()))
+                                                })
+                                                .collect::<Vec<_>>()
+                                        })
+                                        .unwrap_or_default();
+                                    let handoff = CliToServer::CliLifecycleStatus {
+                                        session_id,
+                                        request_id,
+                                        operation: shared::CliLifecycleOperation::RebootCli,
+                                        phase: shared::CliLifecyclePhase::Handoff,
+                                        message: Some(if detach_failures.is_empty() {
+                                            "Update prepared; replacing CLI and adopting terminal runtimes".to_string()
+                                        } else {
+                                            format!(
+                                                "Update prepared; replacing CLI with {} pane detach warning(s)",
+                                                detach_failures.len()
+                                            )
+                                        }),
+                                        inventory: Some(inventory),
+                                    };
+                                    if let Ok(text) = serde_json::to_string(&handoff) {
+                                        let _ = ws_sender.send(Message::Text(text.into())).await;
+                                        let _ = ws_sender.flush().await;
+                                    }
+                                    std::env::set_var("APAS_REBOOT_HANDOFF", &marker_path);
+                                    tracing::info!(%request_id, marker = %marker_path.display(), detach_failures = detach_failures.len(), "reboot handoff ready");
+                                    reboot_requested.store(true, Ordering::SeqCst);
+                                    shutdown.store(true, Ordering::SeqCst);
+                                    return Ok(());
+                                }
+                                Err(error) => {
+                                    let failed = CliToServer::CliLifecycleStatus {
+                                        session_id,
+                                        request_id,
+                                        operation: shared::CliLifecycleOperation::RebootCli,
+                                        phase: shared::CliLifecyclePhase::Failed,
+                                        message: Some(format!("CLI reboot preparation failed; current CLI and panes remain running: {error}")),
+                                        inventory: Some(build_lifecycle_inventory(&pane_metas, &terminal_panes)),
+                                    };
+                                    if let Ok(text) = serde_json::to_string(&failed) {
+                                        let _ = ws_sender.send(Message::Text(text.into())).await;
+                                    }
+                                    tracing::warn!(
+                                        %request_id,
+                                        %error,
+                                        preparation_duration_ms = preparation_started.elapsed().as_millis(),
+                                        "CLI reboot preparation failed without detaching panes"
+                                    );
+                                }
+                            }
+                        }
                         Some(msg) = output_rx.recv() => {
                             let msg_text = match serde_json::to_string(&msg) {
                                 Ok(t) => t,
@@ -12456,6 +12879,75 @@ async fn run_server_connection(
                                                 shutdown.store(true, Ordering::SeqCst);
                                                 return Ok(());
                                             }
+                                            ServerToCli::CliLifecycleRequest {
+                                                session_id: requested_session,
+                                                request_id,
+                                                operation: shared::CliLifecycleOperation::ReconnectTransport,
+                                            } => {
+                                                if requested_session != session_id {
+                                                    continue;
+                                                }
+                                                let accepted = CliToServer::CliLifecycleStatus {
+                                                    session_id,
+                                                    request_id,
+                                                    operation: shared::CliLifecycleOperation::ReconnectTransport,
+                                                    phase: shared::CliLifecyclePhase::Reconnecting,
+                                                    message: Some("Closing only the current server transport".to_string()),
+                                                    inventory: Some(build_lifecycle_inventory(&pane_metas, &terminal_panes)),
+                                                };
+                                                if let Ok(text) = serde_json::to_string(&accepted) {
+                                                    let _ = ws_sender.send(Message::Text(text.into())).await;
+                                                    let _ = ws_sender.flush().await;
+                                                }
+                                                if queue_transport_reconnect(&mut pending_reconnects, request_id) {
+                                                    reconnect_started_at.insert(request_id, std::time::Instant::now());
+                                                    immediate_reconnect = true;
+                                                }
+                                                tracing::info!(%request_id, "starting transport-only reconnect; pane runtimes remain untouched");
+                                                let _ = ws_sender.close().await;
+                                                break;
+                                            }
+                                            ServerToCli::CliLifecycleRequest {
+                                                session_id: requested_session,
+                                                request_id,
+                                                operation: shared::CliLifecycleOperation::RebootCli,
+                                            } => {
+                                                if requested_session != session_id {
+                                                    continue;
+                                                }
+                                                if reboot_preparation.is_some() {
+                                                    let failed = CliToServer::CliLifecycleStatus {
+                                                        session_id,
+                                                        request_id,
+                                                        operation: shared::CliLifecycleOperation::RebootCli,
+                                                        phase: shared::CliLifecyclePhase::Failed,
+                                                        message: Some("A CLI reboot is already being prepared".to_string()),
+                                                        inventory: Some(build_lifecycle_inventory(&pane_metas, &terminal_panes)),
+                                                    };
+                                                    if let Ok(text) = serde_json::to_string(&failed) {
+                                                        let _ = ws_sender.send(Message::Text(text.into())).await;
+                                                    }
+                                                    continue;
+                                                }
+                                                let preparing = CliToServer::CliLifecycleStatus {
+                                                    session_id,
+                                                    request_id,
+                                                    operation: shared::CliLifecycleOperation::RebootCli,
+                                                    phase: shared::CliLifecyclePhase::Preparing,
+                                                    message: Some("Preparing CLI replacement".to_string()),
+                                                    inventory: Some(build_lifecycle_inventory(&pane_metas, &terminal_panes)),
+                                                };
+                                                if let Ok(text) = serde_json::to_string(&preparing) {
+                                                    let _ = ws_sender.send(Message::Text(text.into())).await;
+                                                    let _ = ws_sender.flush().await;
+                                                }
+                                                reboot_preparation = Some((
+                                                    request_id,
+                                                    std::time::Instant::now(),
+                                                    tokio::task::spawn_blocking(crate::update::prepare_cli_restart),
+                                                ));
+                                                tracing::info!(%request_id, "preparing CLI replacement while pane controllers remain attached");
+                                            }
                                             ServerToCli::RequestPaneList { .. } => {
                                                 let panes = build_pane_list(&pane_metas, &input_channels, session_id,
                                                     &pane_sessions, &pane_pauses, &pane_stop_requests);
@@ -12924,6 +13416,13 @@ async fn run_server_connection(
                                                 // input_channels[target_pane], dropping the old
                                                 // sender — the worker's input_rx then EOFs too as
                                                 // a belt-and-suspenders.
+                                                if let Some(terminal) = terminal_panes
+                                                    .lock()
+                                                    .ok()
+                                                    .and_then(|mut panes| panes.remove(&target_pane))
+                                                {
+                                                    terminal.shutdown();
+                                                }
                                                 if let Ok(mut guard) = child_process.lock() {
                                                     if let Some(ref mut child) = *guard {
                                                         let _ = child.kill();
@@ -13806,7 +14305,11 @@ async fn run_server_connection(
                         ),
                         pane_id: shared::PANE_ID_DEADLOOP,
                     });
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    if immediate_reconnect {
+                        immediate_reconnect = false;
+                    } else {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
                 }
             }
             Err(e) => {
