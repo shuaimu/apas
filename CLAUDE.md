@@ -243,7 +243,8 @@ distinguishes a pre-`panes` file from a new project.
 `disallowed_tab_types` are project-level policy flags. `team_enabled` gates
 managed team mode entirely (see "Team mode is opt-in" below);
 `disallowed_tab_types` restricts which tab types users may create (see "Tab-type
-policy"); the other two are read by the Tech Lead loop. All are owner/admin-only. Managed pane entries are restored as team roles; new unmanaged
+policy"); the other two are read by the Tech Lead loop. All are settable by the
+project owner or the operator of the cluster hosting it. Managed pane entries are restored as team roles; new unmanaged
 work is created as a terminal pane. `kind` defaults to `"agent"` when absent
 solely for compatibility, so `.apas` files written before terminal panes
 existed keep loading unchanged — see "Terminal panes" under Key Concepts.
@@ -274,8 +275,9 @@ under Key Concepts for why.
 
 `WebToServer::UpdateProjectFlags` carries the project policy flags
 (`team_enabled`, `auto_approve_todos`, `auto_merge_prs`) from the web to the
-server. The server **rejects the whole message from anyone below admin**
-(`ws_web::can_manage_project_settings`) — this is the only role gate in the
+server. The server **rejects the whole message from anyone who is neither the
+project owner nor the operator of the cluster hosting it**
+(`ws_web::can_manage_project_settings`) — this is the only authority gate in the
 WebSocket layer, everything else there authorizes on session *access* alone.
 It then forwards `ServerToCli::UpdateProjectFlags` to the CLI for `.apas`
 persistence; the CLI emits `CliToServer::ProjectFlagsChanged`, and the server
@@ -412,6 +414,11 @@ journalctl -u nginx -f
 (cd packages/web && npm ci && npm run audit:npm)
 (cd packages/web && pnpm install --frozen-lockfile && pnpm run audit:pnpm)
 
+# Configure the system administrator BEFORE deploying the server. Without it,
+# /admin cannot be entered at all, and this deploy removes every account's
+# deployment-wide authority. Keep apas-server.toml mode 0600.
+ssh root@apas.mpaxos.com "grep -q '^\[system_admin\]' /opt/apas/apas-server.toml || echo 'MISSING [system_admin] BLOCK'"
+
 # Build locally
 # cargo build -p apas-server --release
 cargo build --release
@@ -453,6 +460,9 @@ ssh root@apas.mpaxos.com "cd /opt/apas/web && npm ci && NEXT_PUBLIC_WEB_UI_VERSI
 # Verify service state, public pages, API health, referenced /_next/static assets,
 # WebSocket/terminal attachment from the UI, and recent service errors.
 for path in / /login /machines /share /admin /health; do curl -fsSL "https://apas.mpaxos.com${path}" >/dev/null; done
+# Then sign in at https://apas.mpaxos.com/admin with the configured credential
+# and rotate it: the surface warns while it is still the bootstrap value, and
+# rotation invalidates every token issued against it.
 ssh root@apas.mpaxos.com "systemctl is-active apas-web apas-server && journalctl -u apas-web --since '5 minutes ago' -p err --no-pager -q && journalctl -u apas-server --since '5 minutes ago' -p err --no-pager -q"
 ```
 
@@ -514,11 +524,88 @@ of the project entirely.
 templates, and an owner restricting *user* tab types has not asked to break
 their own team.
 
+## Virtual clusters and system administration
+
+These are two different jobs and two different surfaces. They used to be one
+page behind one `cluster_role = "admin"` flag, which meant running *your own*
+machines required deployment-wide authority over everyone else's projects.
+
+**A virtual cluster is derived, not stored.** Every account operates exactly
+one: the machines whose client registered under it, plus the projects hosted in
+it. A project is hosted in an account's cluster when the account **owns it** or
+when **at least one of its sessions was created under it** (`db::
+project_in_user_cluster`). Sessions are the durable evidence of where a project
+actually runs — machines live only in memory, and projects carry no machine
+column. So a project owned by `soumojit.dalui` that runs on your daemon is in
+*your* cluster, and you administer it without being a member of it.
+
+**Belonging to a project is deliberately not hosting it.** Content access is
+owner ∨ member ∨ host; administration (lifecycle, stop-runtime, membership,
+ownership, policy) is host only. Otherwise anyone you shared a project with
+could suspend it. Running it on your own machine *does* make you a host — that
+is the point, not a loophole.
+
+The cluster surface is `/machines` (kept at that route so links still work),
+available to every active account with no role check: `routes/cluster.rs`
+scopes every request through the hosting predicate. `routes/admin.rs` backs the
+deployment-wide surface and both call the same DB operations, so the two cannot
+drift.
+
+**System administration is a credential, not an account.** One per deployment,
+stored in `system_admin_credential` outside the `users` table, seeded from
+`[system_admin]` in `apas-server.toml` only when no row exists — so editing the
+config later cannot revert a rotation. Its token carries `sub =
+"system-admin"`, `token_kind = "system_admin"`, and the credential version;
+rotating the password bumps that version and invalidates every outstanding
+token. An account token is rejected by `/admin/*` and this token is rejected
+everywhere else. No UI can grant it, and `bootstrap_admin_email` is gone —
+registration now always requires an invitation, which the system administrator
+issues.
+
+**The `/admin` login must stay inline on the page.** nginx proxies the whole
+`/admin/` prefix to `apas-server`, so a Next.js route at `/admin/login` would
+never be served. The page renders its own form when it holds no token, and
+keeps that token in `sessionStorage` under its own key — never in the zustand
+store, never in `localStorage`, so it dies with the tab. Nothing in the ordinary
+interface links to it.
+
+**`cluster_role` no longer means anything.** Every account migrates to `user`,
+and the column plus its wire field survive only so older web and mobile builds
+keep parsing identity responses. Two deployment-wide reads went with it: web
+machine listings no longer have an all-machines branch, and no account can
+revoke another account's mobile device.
+
+**Policy resolves over three levels** — deployment default (system
+administrator) → cluster default (`cluster_default_policies`, one row per
+account) → project override. The launch-profile allowlist **narrows
+monotonically**: each level may only restrict what the level above allows, and
+a widening write is rejected rather than silently clamped. It intersects over
+*every* hosting cluster, not just the owner's, so your cluster default governs
+the foreign-owned projects on your machines; intersection is order-independent,
+so a multi-hosted project still has one answer.
+
+`team_available` is the exception and does **not** narrow: the lowest level
+that states a value wins. Its deployment default ships `false`, and team mode
+has always been switched on per project against that default — folding it with
+AND would have stripped team mode from every project that runs it today. Only
+the allowlist is a genuine ceiling, so only it is enforced as one.
+
+**Audit carries an actor kind and a cluster.** `admin_audit_events` was rebuilt
+once (create-copy-drop-rename, guarded by `schema_migrations`) because
+`actor_user_id` referenced `users(id)` with `PRAGMA foreign_keys=ON`, which made
+a non-account actor unrecordable. `cluster_invitations.created_by` was rebuilt
+for the same reason. `project_members.invited_by` keeps its key, so a
+system-administrator membership change is attributed there to the project owner
+while the audit row records who actually did it. An operator's audit view also
+applies the live hosting predicate, so a project hosted in several clusters is
+visible to each of them and pre-attribution rows still land where they belong.
+
 ## Team mode is opt-in (`team_enabled`)
 
 Managed team mode is **off for every project** until someone turns it on, and
-only a project's **owner or admin** can turn it on or off. Users the project was
-shared with can work in it but cannot change this.
+only a project's **owner** or the operator of the virtual cluster hosting it can
+turn it on or off. Users the project was shared with can work in it but cannot
+change this.
 
 Why off by default: enabling team mode spawns four autonomous panes that read
 the repo, write worktrees, and open PRs. That should never be something a
@@ -534,8 +621,9 @@ Three enforcement points, because each covers a different failure:
 
 - **Server** (`ws_web::can_manage_project_settings`) — the actual permission
   check. Reuses `share::ProjectRole::can_manage_access` rather than re-deriving
-  the owner/admin boundary, so the WS and HTTP paths cannot drift. Fails closed
-  on an unknown user or a failed lookup.
+  the owner boundary, so the WS and HTTP paths cannot drift, then falls through
+  to `db::project_in_user_cluster` so the hosting cluster's operator qualifies
+  too. Fails closed on an unknown user or a failed lookup.
 - **CLI** (`team_enabled_for`) — refuses `ServerToCli::StartTeam` while the flag
   is false, re-reading `.apas` at the point of use. `.apas` is the source of
   truth, and a cached `true` would let a `StartTeam` that raced the toggle spawn
