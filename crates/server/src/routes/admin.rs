@@ -7,11 +7,11 @@ use chrono::{Duration, Utc};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
-use super::authz::require_cluster_admin;
+use super::authz::require_system_admin;
 use crate::{
     db::{
-        AccountStatus, AdminProjectSummary, ClusterInvitation, ClusterRole, ClusterUserSummary,
-        ProjectLifecycle, ProjectMemberInfo,
+        AccountStatus, AdminProjectSummary, ClusterInvitation, ClusterSummary, ClusterUserSummary,
+        ProjectLifecycle, ProjectMemberInfo, SYSTEM_ADMIN_ACTOR,
     },
     error::AppError,
     state::AppState,
@@ -68,7 +68,7 @@ pub async fn get_stats(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<SystemStats>, AppError> {
-    require_cluster_admin(&headers, &state).await?;
+    require_system_admin(&headers, &state).await?;
     let total_users = state.db.get_user_count().await.unwrap_or(0);
     let recent_users_7d = state.db.get_recent_user_count().await.unwrap_or(0);
     let total_sessions = state.db.get_session_count().await.unwrap_or(0);
@@ -109,7 +109,7 @@ pub async fn get_mobile_metrics(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<MobileOperationalStats>, AppError> {
-    require_cluster_admin(&headers, &state).await?;
+    require_system_admin(&headers, &state).await?;
     Ok(Json(MobileOperationalStats {
         process: state.mobile_metrics.snapshot(),
         persistent: state.db.mobile_persistence_metrics().await?,
@@ -121,7 +121,7 @@ pub async fn list_users(
     headers: HeaderMap,
     Query(query): Query<PageQuery>,
 ) -> Result<Json<Page<ClusterUserSummary>>, AppError> {
-    require_cluster_admin(&headers, &state).await?;
+    require_system_admin(&headers, &state).await?;
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let offset = query.offset.unwrap_or(0).max(0);
     let items = state
@@ -153,7 +153,8 @@ pub async fn invite_user(
     headers: HeaderMap,
     Json(request): Json<CreateInvitationRequest>,
 ) -> Result<Json<CreateInvitationResponse>, AppError> {
-    let actor = require_cluster_admin(&headers, &state).await?;
+    require_system_admin(&headers, &state).await?;
+    let actor_id = SYSTEM_ADMIN_ACTOR;
     let email = request.email.trim().to_ascii_lowercase();
     if email.is_empty() || !email.contains('@') {
         return Err(AppError::BadRequest(
@@ -176,7 +177,7 @@ pub async fn invite_user(
         .create_cluster_invitation(&ClusterInvitation {
             code: code.clone(),
             email: email.clone(),
-            created_by: actor.id.clone(),
+            created_by: actor_id.to_string(),
             expires_at: expires_at.clone(),
             redeemed_at: None,
             created_at: None,
@@ -185,7 +186,7 @@ pub async fn invite_user(
     state
         .db
         .record_audit(
-            &actor.id,
+            actor_id,
             "cluster_user.invited",
             "cluster_invitation",
             &email,
@@ -202,7 +203,6 @@ pub async fn invite_user(
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateUserRequest {
-    pub cluster_role: Option<String>,
     pub account_status: Option<String>,
 }
 
@@ -212,19 +212,11 @@ pub async fn update_user(
     Path(target_user_id): Path<String>,
     Json(request): Json<UpdateUserRequest>,
 ) -> Result<Json<ClusterUserSummary>, AppError> {
-    let actor = require_cluster_admin(&headers, &state).await?;
-    if let Some(raw) = request.cluster_role {
-        let role = match raw.trim().to_ascii_lowercase().as_str() {
-            "admin" => ClusterRole::Admin,
-            "user" => ClusterRole::User,
-            _ => return Err(AppError::BadRequest("Invalid cluster role".to_string())),
-        };
-        state
-            .db
-            .update_cluster_user_role(&actor.id, &target_user_id, role)
-            .await
-            .map_err(|error| AppError::BadRequest(error.to_string()))?;
-    }
+    require_system_admin(&headers, &state).await?;
+    let actor_id = SYSTEM_ADMIN_ACTOR;
+    // There is no cluster role to change any more: authority over a virtual
+    // cluster follows from hosting its projects, and deployment authority is
+    // this credential alone.
     if let Some(raw) = request.account_status {
         let status = match raw.trim().to_ascii_lowercase().as_str() {
             "active" => AccountStatus::Active,
@@ -233,7 +225,7 @@ pub async fn update_user(
         };
         state
             .db
-            .update_cluster_user_status(&actor.id, &target_user_id, status)
+            .update_cluster_user_status(actor_id, &target_user_id, status)
             .await
             .map_err(|error| AppError::BadRequest(error.to_string()))?;
         if status == AccountStatus::Suspended {
@@ -254,12 +246,28 @@ pub async fn update_user(
     }))
 }
 
+/// Every virtual cluster in the deployment. A cluster is derived, not stored,
+/// so this enumerates accounts and summarises what each one hosts.
+pub async fn list_clusters(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Page<ClusterSummary>>, AppError> {
+    require_system_admin(&headers, &state).await?;
+    let items = state.db.cluster_summaries().await?;
+    let limit = items.len() as i64;
+    Ok(Json(Page {
+        items,
+        limit,
+        offset: 0,
+    }))
+}
+
 pub async fn list_projects(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<PageQuery>,
 ) -> Result<Json<Page<AdminProjectInventory>>, AppError> {
-    require_cluster_admin(&headers, &state).await?;
+    require_system_admin(&headers, &state).await?;
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let offset = query.offset.unwrap_or(0).max(0);
     let summaries = state
@@ -304,7 +312,7 @@ pub async fn get_project(
     headers: HeaderMap,
     Path(project_id): Path<String>,
 ) -> Result<Json<AdminProjectDetail>, AppError> {
-    require_cluster_admin(&headers, &state).await?;
+    require_system_admin(&headers, &state).await?;
     let project = state
         .db
         .list_admin_projects(Some(&project_id), 200, 0)
@@ -334,10 +342,11 @@ pub async fn add_project_member(
     Path(project_id): Path<String>,
     Json(request): Json<AddProjectMemberRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let actor = require_cluster_admin(&headers, &state).await?;
+    require_system_admin(&headers, &state).await?;
+    let actor_id = SYSTEM_ADMIN_ACTOR;
     state
         .db
-        .add_project_member(&actor.id, &project_id, &request.user_id)
+        .add_project_member(actor_id, &project_id, &request.user_id)
         .await
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
     Ok(Json(serde_json::json!({ "success": true })))
@@ -348,10 +357,11 @@ pub async fn remove_project_member(
     headers: HeaderMap,
     Path((project_id, user_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let actor = require_cluster_admin(&headers, &state).await?;
+    require_system_admin(&headers, &state).await?;
+    let actor_id = SYSTEM_ADMIN_ACTOR;
     let removed = state
         .db
-        .remove_project_member(&actor.id, &project_id, &user_id)
+        .remove_project_member(actor_id, &project_id, &user_id)
         .await?;
     Ok(Json(serde_json::json!({ "success": removed })))
 }
@@ -367,10 +377,11 @@ pub async fn transfer_owner(
     Path(project_id): Path<String>,
     Json(request): Json<TransferOwnerRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let actor = require_cluster_admin(&headers, &state).await?;
+    require_system_admin(&headers, &state).await?;
+    let actor_id = SYSTEM_ADMIN_ACTOR;
     let changed = state
         .db
-        .transfer_project_ownership(&actor.id, &project_id, &request.user_id)
+        .transfer_project_ownership(actor_id, &project_id, &request.user_id)
         .await
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
     Ok(Json(serde_json::json!({ "success": changed })))
@@ -387,7 +398,8 @@ pub async fn update_lifecycle(
     Path(project_id): Path<String>,
     Json(request): Json<LifecycleRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let actor = require_cluster_admin(&headers, &state).await?;
+    require_system_admin(&headers, &state).await?;
+    let actor_id = SYSTEM_ADMIN_ACTOR;
     let lifecycle = match request.status.trim().to_ascii_lowercase().as_str() {
         "active" => ProjectLifecycle::Active,
         "suspended" => ProjectLifecycle::Suspended,
@@ -395,7 +407,7 @@ pub async fn update_lifecycle(
     };
     let changed = state
         .db
-        .set_project_lifecycle(&actor.id, &project_id, lifecycle)
+        .set_project_lifecycle(actor_id, &project_id, lifecycle)
         .await?;
     if lifecycle == ProjectLifecycle::Suspended {
         state.sessions.stop_project_runtime(&project_id).await;
@@ -410,12 +422,13 @@ pub async fn stop_runtime(
     headers: HeaderMap,
     Path(project_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let actor = require_cluster_admin(&headers, &state).await?;
+    require_system_admin(&headers, &state).await?;
+    let actor_id = SYSTEM_ADMIN_ACTOR;
     let stopped = state.sessions.stop_project_runtime(&project_id).await;
     state
         .db
         .record_audit(
-            &actor.id,
+            actor_id,
             "project.runtime_stopped",
             "project",
             &project_id,
@@ -439,11 +452,12 @@ pub async fn update_policy(
     Path(project_id): Path<String>,
     Json(request): Json<UpdatePolicyRequest>,
 ) -> Result<Json<shared::EffectiveProjectPolicy>, AppError> {
-    let actor = require_cluster_admin(&headers, &state).await?;
+    require_system_admin(&headers, &state).await?;
+    let actor_id = SYSTEM_ADMIN_ACTOR;
     let policy = state
         .db
         .set_project_policy_override(
-            &actor.id,
+            actor_id,
             &project_id,
             request.team_available,
             request.allowed_launch_profiles,
@@ -457,12 +471,15 @@ pub async fn update_policy(
     Ok(Json(policy))
 }
 
+/// The deployment default: the outer bound every cluster default and project
+/// override must stay inside. Narrowing it narrows every project immediately;
+/// widening it only permits clusters to widen their own.
 pub async fn get_default_policy(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<shared::EffectiveProjectPolicy>, AppError> {
-    require_cluster_admin(&headers, &state).await?;
-    Ok(Json(state.db.get_cluster_default_policy().await?))
+    require_system_admin(&headers, &state).await?;
+    Ok(Json(state.db.get_deployment_default_policy().await?))
 }
 
 pub async fn update_default_policy(
@@ -470,12 +487,13 @@ pub async fn update_default_policy(
     headers: HeaderMap,
     Json(request): Json<UpdatePolicyRequest>,
 ) -> Result<Json<shared::EffectiveProjectPolicy>, AppError> {
-    let actor = require_cluster_admin(&headers, &state).await?;
-    let current = state.db.get_cluster_default_policy().await?;
+    require_system_admin(&headers, &state).await?;
+    let actor_id = SYSTEM_ADMIN_ACTOR;
+    let current = state.db.get_deployment_default_policy().await?;
     let policy = state
         .db
-        .set_cluster_default_policy(
-            &actor.id,
+        .set_deployment_default_policy(
+            actor_id,
             request.team_available.unwrap_or(current.team_available),
             request
                 .allowed_launch_profiles
@@ -499,7 +517,7 @@ pub async fn list_profiles(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<shared::LaunchProfile>>, AppError> {
-    require_cluster_admin(&headers, &state).await?;
+    require_system_admin(&headers, &state).await?;
     Ok(Json(shared::supported_launch_profiles()))
 }
 
@@ -508,7 +526,7 @@ pub async fn list_audit(
     headers: HeaderMap,
     Query(query): Query<PageQuery>,
 ) -> Result<Json<Page<crate::db::AdminAuditEvent>>, AppError> {
-    require_cluster_admin(&headers, &state).await?;
+    require_system_admin(&headers, &state).await?;
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let offset = query.offset.unwrap_or(0).max(0);
     let items = state.db.list_audit_events(limit, offset).await?;

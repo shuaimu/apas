@@ -62,6 +62,10 @@ pub struct Claims {
     pub device_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_kind: Option<String>,
+    /// Set only on system-administration tokens. Rotating the credential bumps
+    /// the stored version, which is what invalidates tokens issued before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_version: Option<i64>,
 }
 
 pub async fn register(
@@ -74,16 +78,12 @@ pub async fn register(
     }
 
     let email = req.email.trim().to_ascii_lowercase();
-    let is_bootstrap = email.eq_ignore_ascii_case(&state.config.auth.bootstrap_admin_email)
-        && state
-            .db
-            .list_cluster_users(None, 200, 0)
-            .await?
-            .iter()
-            .all(|user| user.cluster_role != "admin" || user.account_status != "active");
-    let invitation = if is_bootstrap {
-        None
-    } else {
+    // Registration always requires an invitation. The old bootstrap-by-email
+    // exemption is gone: the first account of a deployment is invited by the
+    // system administrator, who signs in with the configured credential
+    // rather than by registering an account whose address matched a config
+    // value.
+    let invitation = {
         let code = req
             .invitation_code
             .as_deref()
@@ -103,7 +103,7 @@ pub async fn register(
                 "Invalid or expired cluster invitation".to_string(),
             ));
         }
-        Some(invitation)
+        invitation
     };
 
     // Hash password
@@ -121,21 +121,17 @@ pub async fn register(
         email,
         password_hash,
         created_at: None,
-        cluster_role: if is_bootstrap { "admin" } else { "user" }.to_string(),
+        cluster_role: "user".to_string(),
         account_status: "active".to_string(),
     };
-    if let Some(invitation) = invitation {
-        if !state
-            .db
-            .create_user_redeeming_cluster_invitation(&user, &invitation.code)
-            .await?
-        {
-            return Err(AppError::AuthError(
-                "Cluster invitation was already redeemed or expired".to_string(),
-            ));
-        }
-    } else {
-        state.db.create_user(&user).await?;
+    if !state
+        .db
+        .create_user_redeeming_cluster_invitation(&user, &invitation.code)
+        .await?
+    {
+        return Err(AppError::AuthError(
+            "Cluster invitation was already redeemed or expired".to_string(),
+        ));
     }
 
     // Generate token
@@ -226,6 +222,7 @@ fn generate_token(
         exp: expiration,
         device_session_id: None,
         token_kind: None,
+        credential_version: None,
     };
 
     encode(
@@ -251,6 +248,7 @@ pub fn generate_mobile_access_token(
         exp: expires_at.timestamp() as usize,
         device_session_id: Some(device_session_id.to_string()),
         token_kind: Some("mobile_access".to_string()),
+        credential_version: None,
     };
     let token = encode(
         &Header::default(),
@@ -262,6 +260,14 @@ pub fn generate_mobile_access_token(
 }
 
 pub async fn require_active_claims(state: &AppState, claims: &Claims) -> Result<User, AppError> {
+    // System-administration tokens are not account credentials. They carry a
+    // `sub` that is not a user id, so this would fail anyway; failing here
+    // makes the reason explicit and keeps the boundary in one place.
+    if super::system_admin::claims_are_system_admin(claims) {
+        return Err(AppError::AuthError(
+            "System administrator tokens do not grant account access".to_string(),
+        ));
+    }
     let user = state
         .db
         .get_user_by_id(&claims.sub)

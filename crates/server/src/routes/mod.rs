@@ -10,15 +10,19 @@ use crate::state::AppState;
 mod admin;
 pub mod auth;
 mod authz;
+mod cluster;
 mod health;
 mod mobile;
 mod mobile_auth;
 mod mobile_notifications;
 mod projects;
 mod share;
+pub mod system_admin;
 mod ws_cli;
 mod ws_daemon;
 mod ws_web;
+
+pub use system_admin::seed_system_admin;
 
 pub fn create_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
@@ -59,7 +63,13 @@ pub fn create_router(state: AppState) -> Router {
         // Password reset
         .route("/auth/forgot-password", post(auth::forgot_password))
         .route("/auth/reset-password", post(auth::reset_password))
-        // Cluster administration control plane
+        // System administration. The whole /admin/ prefix is proxied to this
+        // server, so the login lives here rather than at a page route; the web
+        // surface renders its form inline at exactly /admin.
+        .route("/admin/auth/login", post(system_admin::login))
+        .route("/admin/auth/me", get(system_admin::me))
+        .route("/admin/auth/password", post(system_admin::change_password))
+        .route("/admin/clusters", get(admin::list_clusters))
         .route("/admin/stats", get(admin::get_stats))
         .route("/admin/mobile/metrics", get(admin::get_mobile_metrics))
         .route("/admin/users", get(admin::list_users))
@@ -97,6 +107,41 @@ pub fn create_router(state: AppState) -> Router {
             get(admin::get_default_policy).patch(admin::update_default_policy),
         )
         .route("/admin/audit", get(admin::list_audit))
+        // Virtual-cluster self-service: every active account administers the
+        // machines it registered and the projects hosted on them.
+        .route("/cluster/overview", get(cluster::overview))
+        .route("/cluster/projects", get(cluster::list_projects))
+        .route("/cluster/projects/:project_id", get(cluster::get_project))
+        .route(
+            "/cluster/projects/:project_id/members",
+            post(cluster::add_project_member),
+        )
+        .route(
+            "/cluster/projects/:project_id/members/:user_id",
+            delete(cluster::remove_project_member),
+        )
+        .route(
+            "/cluster/projects/:project_id/owner",
+            patch(cluster::transfer_owner),
+        )
+        .route(
+            "/cluster/projects/:project_id/lifecycle",
+            patch(cluster::update_lifecycle),
+        )
+        .route(
+            "/cluster/projects/:project_id/stop-runtime",
+            post(cluster::stop_runtime),
+        )
+        .route(
+            "/cluster/projects/:project_id/policy",
+            patch(cluster::update_policy),
+        )
+        .route("/cluster/launch-profiles", get(cluster::list_profiles))
+        .route(
+            "/cluster/policy/default",
+            get(cluster::get_default_policy).patch(cluster::update_default_policy),
+        )
+        .route("/cluster/audit", get(cluster::list_audit))
         // Project lifecycle self-service
         .route(
             "/projects/:project_id/owner",
@@ -152,6 +197,10 @@ mod cluster_authorization_tests {
         let mut config = crate::config::Config::default();
         config.database.path = db_path.to_string_lossy().into_owned();
         config.auth.jwt_secret = "route-test-secret".to_string();
+        config.system_admin.bootstrap_password = "route-test-bootstrap".to_string();
+        system_admin::seed_system_admin(&db, &config.system_admin)
+            .await
+            .unwrap();
         AppState::new(db, config)
     }
 
@@ -178,6 +227,29 @@ mod cluster_authorization_tests {
                 exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
                 device_session_id: None,
                 token_kind: None,
+                credential_version: None,
+            },
+            &EncodingKey::from_secret(state.config.auth.jwt_secret.as_bytes()),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    async fn system_admin_headers(state: &AppState) -> HeaderMap {
+        let credential = state.db.get_system_admin_credential().await.unwrap().unwrap();
+        let token = encode(
+            &Header::default(),
+            &auth::Claims {
+                sub: system_admin::SYSTEM_ADMIN_SUBJECT.to_string(),
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+                device_session_id: None,
+                token_kind: Some(system_admin::SYSTEM_ADMIN_TOKEN_KIND.to_string()),
+                credential_version: Some(credential.credential_version),
             },
             &EncodingKey::from_secret(state.config.auth.jwt_secret.as_bytes()),
         )
@@ -191,50 +263,227 @@ mod cluster_authorization_tests {
     }
 
     #[tokio::test]
-    async fn cluster_inventory_requires_admin_but_does_not_grant_content_access() {
+    async fn deployment_inventory_requires_the_system_administrator() {
         let state = state().await;
         add_user(&state, "owner", "user", "active").await;
-        add_user(&state, "admin", "admin", "active").await;
+        add_user(&state, "other", "user", "active").await;
+        state
+            .db
+            .authorize_project_registration("project-a", "owner")
+            .await
+            .unwrap();
+        state
+            .db
+            .authorize_project_registration("project-b", "other")
+            .await
+            .unwrap();
+
+        // No account reaches the deployment surface, whatever its stored role.
+        for account in ["owner", "other"] {
+            assert!(admin::list_projects(
+                State(state.clone()),
+                headers(&state, account),
+                Query(admin::PageQuery::default()),
+            )
+            .await
+            .is_err());
+        }
+
+        let admin_headers = system_admin_headers(&state).await;
+        let inventory = admin::list_projects(
+            State(state.clone()),
+            admin_headers.clone(),
+            Query(admin::PageQuery::default()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(inventory.items.len(), 2, "every cluster is in the inventory");
+        let json = serde_json::to_value(&inventory.items[0]).unwrap();
+        for content_field in ["messages", "files", "diff", "terminal", "conversation"] {
+            assert!(json.get(content_field).is_none());
+        }
+
+        // Cross-cluster lifecycle is the system administrator's to exercise.
+        let _ = admin::update_lifecycle(
+            State(state.clone()),
+            admin_headers.clone(),
+            Path("project-b".to_string()),
+            Json(admin::LifecycleRequest {
+                status: "suspended".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state
+                .db
+                .get_project("project-b")
+                .await
+                .unwrap()
+                .unwrap()
+                .lifecycle_status,
+            "suspended"
+        );
+
+        // Its actions are recorded as the system administrator, not as an
+        // account, and carry no cluster.
+        let event = state
+            .db
+            .list_audit_events(100, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|event| event.action == "project.lifecycle_changed")
+            .expect("lifecycle change is audited");
+        assert_eq!(event.actor_kind, "system_admin");
+        assert!(event.cluster_user_id.is_none());
+
+        // A system-administration token authorizes nothing else.
+        assert!(cluster::overview(State(state.clone()), admin_headers)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn cluster_routes_are_scoped_to_the_callers_own_cluster() {
+        let state = state().await;
+        add_user(&state, "host", "user", "active").await;
+        add_user(&state, "owner", "user", "active").await;
+        add_user(&state, "member", "user", "active").await;
+        state
+            .db
+            .authorize_project_registration("project-a", "owner")
+            .await
+            .unwrap();
+        state
+            .db
+            .add_project_member("owner", "project-a", "member")
+            .await
+            .unwrap();
+        state
+            .db
+            .create_session(&crate::db::Session {
+                id: "host-instance".to_string(),
+                user_id: "host".to_string(),
+                cli_client_id: None,
+                working_dir: Some("/work/project-a".to_string()),
+                hostname: Some("host-a".to_string()),
+                status: "active".to_string(),
+                created_at: None,
+                updated_at: None,
+                is_paused: false,
+                project_id: Some("project-a".to_string()),
+                git_remote: None,
+                git_remote_url: None,
+            })
+            .await
+            .unwrap();
+
+        // The hosting account administers a project another account owns,
+        // without being a member of it.
+        let _ = cluster::update_lifecycle(
+            State(state.clone()),
+            headers(&state, "host"),
+            Path("project-a".to_string()),
+            Json(admin::LifecycleRequest {
+                status: "suspended".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        // Administering a project in your cluster never joins it.
+        assert!(state
+            .db
+            .list_project_members("project-a")
+            .await
+            .unwrap()
+            .iter()
+            .all(|entry| entry.user_id != "host"));
+        assert!(
+            authz::require_project_member(&headers(&state, "host"), &state, "project-a")
+                .await
+                .is_err()
+        );
+        let _ = cluster::update_lifecycle(
+            State(state.clone()),
+            headers(&state, "host"),
+            Path("project-a".to_string()),
+            Json(admin::LifecycleRequest {
+                status: "active".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        // A member that does not host it cannot.
+        assert!(cluster::update_lifecycle(
+            State(state.clone()),
+            headers(&state, "member"),
+            Path("project-a".to_string()),
+            Json(admin::LifecycleRequest {
+                status: "suspended".to_string(),
+            }),
+        )
+        .await
+        .is_err());
+        assert!(cluster::get_project(
+            State(state.clone()),
+            headers(&state, "member"),
+            Path("project-a".to_string()),
+        )
+        .await
+        .is_err());
+
+        // The owner's own cluster contains it too.
+        assert_eq!(
+            cluster::list_projects(
+                State(state.clone()),
+                headers(&state, "owner"),
+                Query(admin::PageQuery::default()),
+            )
+            .await
+            .unwrap()
+            .0
+            .items
+            .len(),
+            1
+        );
+
+        // A suspended account administers nothing.
+        state
+            .db
+            .update_cluster_user_status("host", "host", crate::db::AccountStatus::Suspended)
+            .await
+            .unwrap();
+        assert!(cluster::list_projects(
+            State(state.clone()),
+            headers(&state, "host"),
+            Query(admin::PageQuery::default()),
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_rejected_control_plane_mutation_is_never_audited_as_successful() {
+        let state = state().await;
+        add_user(&state, "owner", "user", "active").await;
+        add_user(&state, "stranger", "user", "active").await;
         state
             .db
             .authorize_project_registration("project-a", "owner")
             .await
             .unwrap();
 
-        assert!(admin::list_projects(
-            State(state.clone()),
-            headers(&state, "owner"),
-            Query(admin::PageQuery::default()),
-        )
-        .await
-        .is_err());
-        let inventory = admin::list_projects(
-            State(state.clone()),
-            headers(&state, "admin"),
-            Query(admin::PageQuery::default()),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(inventory.items.len(), 1);
-        let json = serde_json::to_value(&inventory.items[0]).unwrap();
-        for content_field in ["messages", "files", "diff", "terminal", "conversation"] {
-            assert!(json.get(content_field).is_none());
-        }
-        assert!(
-            authz::require_project_member(&headers(&state, "admin"), &state, "project-a",)
-                .await
-                .is_err()
-        );
-
         let audit_before = state.db.list_audit_events(100, 0).await.unwrap().len();
-        assert!(admin::update_policy(
+        assert!(cluster::update_policy(
             State(state.clone()),
-            headers(&state, "owner"),
+            headers(&state, "stranger"),
             Path("project-a".to_string()),
             Json(admin::UpdatePolicyRequest {
                 team_available: Some(true),
-                allowed_launch_profiles: Some(vec!["agent:codex:official:default".to_string(),]),
+                allowed_launch_profiles: Some(vec!["agent:codex:official:default".to_string()]),
             }),
         )
         .await
@@ -244,9 +493,10 @@ mod cluster_authorization_tests {
             audit_before,
             "a rejected control-plane mutation is not a successful audit event",
         );
-        let _ = admin::update_policy(
+
+        cluster::update_policy(
             State(state.clone()),
-            headers(&state, "admin"),
+            headers(&state, "owner"),
             Path("project-a".to_string()),
             Json(admin::UpdatePolicyRequest {
                 team_available: Some(true),
@@ -255,39 +505,104 @@ mod cluster_authorization_tests {
         )
         .await
         .unwrap();
-        assert!(state
-            .db
-            .list_audit_events(100, 0)
-            .await
-            .unwrap()
+        let events = state.db.list_audit_events(100, 0).await.unwrap();
+        assert!(events
             .iter()
             .any(|event| event.action == "project.policy_changed"));
+        // The operator sees their own cluster's record; a stranger sees none.
+        assert!(!state
+            .db
+            .list_cluster_audit_events("owner", 100, 0)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .db
+            .list_cluster_audit_events("stranger", 100, 0)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
-    async fn mutable_role_and_status_are_reloaded_for_every_http_guard() {
-        let state = state().await;
-        add_user(&state, "admin", "admin", "active").await;
-        let bearer = headers(&state, "admin");
-        assert!(authz::require_cluster_admin(&bearer, &state).await.is_ok());
-        state
-            .db
-            .create_user(&crate::db::User {
-                id: "other-admin".to_string(),
-                email: "other-admin@test".to_string(),
-                password_hash: "hash".to_string(),
-                created_at: None,
-                cluster_role: "admin".to_string(),
-                account_status: "active".to_string(),
-            })
+    async fn system_admin_credentials_rotate_and_throttle() {
+        let mut state = state().await;
+        state.config.system_admin.max_failed_attempts = 2;
+        state.config.system_admin.lockout_seconds = 300;
+
+        // Wrong credentials never say which half was wrong, and repeated
+        // failures lock the source out.
+        for _ in 0..2 {
+            assert!(system_admin::login(
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(system_admin::LoginRequest {
+                    username: "admin".to_string(),
+                    password: "wrong-password".to_string(),
+                }),
+            )
             .await
-            .unwrap();
-        state
-            .db
-            .update_cluster_user_status("other-admin", "admin", crate::db::AccountStatus::Suspended)
+            .is_err());
+        }
+        assert!(system_admin::login(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(system_admin::LoginRequest {
+                username: "admin".to_string(),
+                password: "route-test-bootstrap".to_string(),
+            }),
+        )
+        .await
+        .is_err());
+        state.system_admin_auth_attempts.clear();
+
+        let session = system_admin::login(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(system_admin::LoginRequest {
+                username: "admin".to_string(),
+                password: "route-test-bootstrap".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(session.bootstrap_pending);
+
+        let mut bearer = HeaderMap::new();
+        bearer.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", session.token)).unwrap(),
+        );
+        assert!(system_admin::me(State(state.clone()), bearer.clone())
             .await
-            .unwrap();
-        assert!(authz::require_cluster_admin(&bearer, &state).await.is_err());
+            .is_ok());
+
+        // Rotation invalidates every token issued against the old secret.
+        let rotated = system_admin::change_password(
+            State(state.clone()),
+            bearer.clone(),
+            Json(system_admin::ChangePasswordRequest {
+                current_password: "route-test-bootstrap".to_string(),
+                new_password: "a-much-longer-secret".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(!rotated.bootstrap_pending);
+        assert!(system_admin::me(State(state.clone()), bearer).await.is_err());
+
+        let mut fresh = HeaderMap::new();
+        fresh.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", rotated.token)).unwrap(),
+        );
+        assert!(system_admin::me(State(state.clone()), fresh.clone())
+            .await
+            .is_ok());
+        // And it is still not an account credential.
+        assert!(authz::require_active_user(&fresh, &state).await.is_err());
     }
 }
 

@@ -46,16 +46,7 @@ async fn async_main() -> Result<()> {
     // Initialize database
     let db = db::Database::new(&config.database.path).await?;
     db.run_migrations().await?;
-    if !config.auth.bootstrap_admin_email.trim().is_empty()
-        && !db
-            .bootstrap_cluster_admin(&config.auth.bootstrap_admin_email)
-            .await?
-    {
-        tracing::debug!(
-            bootstrap_email = %config.auth.bootstrap_admin_email,
-            "Cluster administrator already exists or bootstrap account is not registered"
-        );
-    }
+    routes::seed_system_admin(&db, &config.system_admin).await?;
 
     // Create app state
     let state = AppState::new(db, config.clone());

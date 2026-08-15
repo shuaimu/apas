@@ -315,6 +315,7 @@ mod tests {
             exp: (Utc::now() + Duration::hours(1)).timestamp() as usize,
             device_session_id: None,
             token_kind: None,
+            credential_version: None,
         };
         encode(
             &Header::default(),

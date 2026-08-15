@@ -1521,13 +1521,6 @@ impl SessionManager {
             .collect()
     }
 
-    pub fn get_all_machines(&self) -> Vec<MachineWithProjects> {
-        self.machine_infos
-            .iter()
-            .map(|entry| self.build_machine_with_projects(*entry.key(), entry.value()))
-            .collect()
-    }
-
     fn build_machine_with_projects(
         &self,
         machine_id: Uuid,

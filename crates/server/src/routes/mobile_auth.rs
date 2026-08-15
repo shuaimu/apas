@@ -16,7 +16,7 @@ use shared::{
 use uuid::Uuid;
 
 use crate::{
-    db::{ClusterRole, MobileDeviceSessionRecord, MobileRefreshFailure},
+    db::{MobileDeviceSessionRecord, MobileRefreshFailure},
     error::AppError,
     mobile_metrics::{MobileMetric, MobileMetrics},
     routes::{
@@ -387,7 +387,10 @@ pub async fn revoke_device(
         .revoke_mobile_device_session(
             &user.id,
             &device_session_id,
-            user.role() == ClusterRole::Admin,
+            // No account revokes another account's devices: deployment-wide
+            // authority is the system-administrator credential, which does not
+            // authenticate here.
+            false,
             "explicit_revocation",
         )
         .await
@@ -656,7 +659,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_refresh_is_rejected_and_cluster_admin_can_revoke_any_device() {
+    async fn expired_refresh_is_rejected_and_no_account_revokes_another_accounts_device() {
         let state = state_with_user().await;
         let user = state
             .db
@@ -713,6 +716,7 @@ mod tests {
                 exp: (Utc::now() + Duration::hours(1)).timestamp() as usize,
                 device_session_id: None,
                 token_kind: None,
+                credential_version: None,
             },
             &jsonwebtoken::EncodingKey::from_secret(state.config.auth.jwt_secret.as_bytes()),
         )
@@ -722,10 +726,35 @@ mod tests {
             header::AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {admin_token}")).unwrap(),
         );
+        // No account revokes another account's device any more: the cluster
+        // administrator role that allowed this is gone, and the system
+        // administrator is a credential that does not authenticate here.
+        assert!(revoke_device(
+            State(state.clone()),
+            admin_headers,
+            Path(active.device_session_id.to_string()),
+        )
+        .await
+        .is_err());
+        assert!(state
+            .db
+            .is_mobile_device_session_active(
+                &active.device_session_id.to_string(),
+                &active.user_id.to_string()
+            )
+            .await
+            .unwrap());
+
+        // The owning account still revokes its own.
+        let mut owner_headers = secure_headers();
+        owner_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", active.access_token)).unwrap(),
+        );
         assert_eq!(
             revoke_device(
                 State(state.clone()),
-                admin_headers,
+                owner_headers,
                 Path(active.device_session_id.to_string()),
             )
             .await

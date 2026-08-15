@@ -3,31 +3,6 @@ use sqlx::FromRow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum ClusterRole {
-    Admin,
-    #[default]
-    User,
-}
-
-impl ClusterRole {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Admin => "admin",
-            Self::User => "user",
-        }
-    }
-
-    pub fn parse(raw: &str) -> Self {
-        if raw.trim().eq_ignore_ascii_case("admin") {
-            Self::Admin
-        } else {
-            Self::User
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
 pub enum AccountStatus {
     Suspended,
     #[default]
@@ -89,6 +64,11 @@ pub struct User {
     pub email: String,
     pub password_hash: String,
     pub created_at: Option<String>,
+    /// Retained for the wire only: every account reads `user`, and nothing
+    /// authorizes on it. An account's authority is the virtual cluster it
+    /// hosts; deployment authority is the separate system-administrator
+    /// credential. Older web and mobile builds still parse this field, which
+    /// is the only reason it survives.
     #[sqlx(default)]
     pub cluster_role: String,
     #[sqlx(default)]
@@ -96,10 +76,6 @@ pub struct User {
 }
 
 impl User {
-    pub fn role(&self) -> ClusterRole {
-        ClusterRole::parse(&self.cluster_role)
-    }
-
     pub fn status(&self) -> AccountStatus {
         AccountStatus::parse(&self.account_status)
     }
@@ -224,11 +200,17 @@ pub struct ClusterInvitation {
 #[derive(Debug, Clone, FromRow, Serialize)]
 pub struct AdminAuditEvent {
     pub id: i64,
+    /// `user` or `system_admin`. The system administrator is a credential, so
+    /// its `actor_user_id` is a sentinel rather than an account id.
+    pub actor_kind: String,
     pub actor_user_id: String,
     pub action: String,
     pub target_type: String,
     pub target_id: String,
     pub project_id: Option<String>,
+    /// The virtual cluster on whose behalf the action was taken, when it was a
+    /// cluster-level action. Deployment-level actions carry none.
+    pub cluster_user_id: Option<String>,
     pub details: Option<String>,
     pub created_at: Option<String>,
 }
@@ -239,6 +221,23 @@ pub struct ProjectDeletionManifest {
     pub owner_user_id: String,
     pub session_ids: Vec<String>,
     pub affected_user_ids: Vec<String>,
+}
+
+/// The deployment's single system-administrator credential. Never a `users`
+/// row, and never serialized with its hash.
+#[derive(Debug, Clone, FromRow)]
+pub struct SystemAdminCredential {
+    pub username: String,
+    pub password_hash: String,
+    pub credential_version: i64,
+    pub bootstrap_pending: i64,
+    pub updated_at: Option<String>,
+}
+
+impl SystemAdminCredential {
+    pub fn bootstrap_pending(&self) -> bool {
+        self.bootstrap_pending != 0
+    }
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]
@@ -269,6 +268,33 @@ pub struct AdminProjectSummary {
     pub active_session_count: i64,
     pub last_activity: Option<String>,
     pub created_at: Option<String>,
+    /// Accounts whose virtual clusters host this project (its session
+    /// authors). The owner may not be among them when the project runs
+    /// entirely on someone else's machines.
+    pub hosting_emails: Vec<String>,
+}
+
+/// One account's virtual cluster, as shown in the system-administration
+/// inventory. The cluster itself is derived, not stored.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterSummary {
+    pub user_id: String,
+    pub email: String,
+    pub account_status: String,
+    pub hosted_project_count: i64,
+    pub owned_project_count: i64,
+    pub active_session_count: i64,
+    pub last_activity: Option<String>,
+}
+
+/// One account's cluster-level default policy. `None` on a field means the
+/// account inherits the deployment default for it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterDefaultPolicy {
+    pub user_id: String,
+    pub team_available: Option<bool>,
+    pub allowed_launch_profiles: Option<Vec<String>>,
+    pub version: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

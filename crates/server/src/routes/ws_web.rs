@@ -285,23 +285,6 @@ fn normalize_project_path(raw: &str) -> String {
     trimmed.trim_end_matches('/').to_string()
 }
 
-async fn is_active_cluster_admin(state: &AppState, user_id: &Uuid) -> bool {
-    match state.db.get_user_by_id(&user_id.to_string()).await {
-        Ok(Some(user)) => {
-            user.role() == crate::db::ClusterRole::Admin && user.is_active()
-        }
-        Ok(None) => false,
-        Err(err) => {
-            tracing::warn!(
-                "Cluster role lookup failed for admin machine access (user {}): {}",
-                user_id,
-                err
-            );
-            false
-        }
-    }
-}
-
 async fn get_shared_project_access_refs(
     state: &AppState,
     user_id: &Uuid,
@@ -353,9 +336,9 @@ pub(crate) async fn list_accessible_machines_for_user(
     state: &AppState,
     user_id: &Uuid,
 ) -> Vec<shared::MachineWithProjects> {
-    if is_active_cluster_admin(state, user_id).await {
-        return state.sessions.get_all_machines();
-    }
+    // Machines belong to the account whose client registered them. There is no
+    // deployment-wide branch here any more: an account sees its own cluster,
+    // plus machines reachable through projects shared with it.
     let mut machines = state.sessions.get_machines_for_user(user_id);
     let (host_path_refs, wildcard_paths) = get_shared_project_access_refs(state, user_id).await;
     // Cache the refs so heartbeat-driven `broadcast_machines_update_for_user`
@@ -611,8 +594,24 @@ async fn can_manage_project_settings(
         .get_session_role_for_user(&session_id.to_string(), &user_id.to_string())
         .await
     {
-        Ok(Some(role)) => super::share::parse_share_role(&role).can_manage_access(),
-        Ok(None) => false,
+        Ok(Some(role)) if super::share::parse_share_role(&role).can_manage_access() => true,
+        Ok(_) => {
+            // The operator of the cluster hosting this project manages its
+            // settings too: the project runs on their machines even when
+            // another account owns it.
+            let Ok(Some(project_id)) = state
+                .db
+                .get_project_id_for_session(&session_id.to_string())
+                .await
+            else {
+                return false;
+            };
+            state
+                .db
+                .project_in_user_cluster(&project_id, &user_id.to_string())
+                .await
+                .unwrap_or(false)
+        }
         Err(err) => {
             tracing::warn!(
                 %err,
@@ -3310,8 +3309,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         machine_id,
                         project_id
                     );
-                    let allowed = is_active_cluster_admin(&state, &uid).await
-                        || state
+                    let allowed = state
                             .sessions
                             .get_machines_for_user(&uid)
                             .into_iter()
@@ -3444,8 +3442,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         continue;
                     };
 
-                    let allowed = is_active_cluster_admin(&state, &uid).await
-                        || state
+                    let allowed = state
                             .sessions
                             .get_machines_for_user(&uid)
                             .into_iter()

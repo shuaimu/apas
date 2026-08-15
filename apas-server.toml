@@ -9,7 +9,18 @@ path = "./data/apas.db"
 # IMPORTANT: Change this in production!
 jwt_secret = "change-me-in-production-use-a-secure-random-string"
 token_expiry_hours = 24
-# One-time migration/bootstrap identity. Set this to an existing account
-# before the first upgraded server start. It is ignored once an active
-# cluster administrator exists.
-bootstrap_admin_email = "shuai@cs.stonybrook.edu"
+
+# The deployment's single system administrator, reachable only at /admin with
+# its own login. This is a credential, not an account: it is stored outside the
+# users table and cannot be granted to any account through the UI.
+#
+# `bootstrap_password` seeds the credential the first time the server starts
+# without one, and is ignored afterwards. Set it before the first upgraded
+# start, keep this file mode 0600, and rotate the password from the
+# administration surface after signing in.
+[system_admin]
+username = "admin"
+bootstrap_password = ""
+token_expiry_minutes = 120
+max_failed_attempts = 5
+lockout_seconds = 300

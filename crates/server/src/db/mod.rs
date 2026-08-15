@@ -1,4 +1,9 @@
 use anyhow::Result;
+
+/// Actor id recorded for actions taken by the deployment's system
+/// administrator. It is a credential rather than an account, so it has no
+/// `users` row; this sentinel can never collide with a generated user id.
+pub const SYSTEM_ADMIN_ACTOR: &str = "system-admin";
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
 use std::path::Path;
 use std::time::Duration;
@@ -117,7 +122,12 @@ impl Database {
         )
         .execute(&self.pool)
         .await;
-        sqlx::query("UPDATE users SET cluster_role = 'user' WHERE cluster_role NOT IN ('admin', 'user') OR cluster_role IS NULL")
+        // The cluster role no longer confers authority anywhere: an account
+        // administers the virtual cluster it hosts, and deployment authority is
+        // the separate system-administrator credential. The column and its wire
+        // field stay so older web and mobile builds keep parsing identity
+        // responses, but every account reads as an ordinary user.
+        sqlx::query("UPDATE users SET cluster_role = 'user' WHERE cluster_role IS NOT 'user'")
             .execute(&self.pool)
             .await?;
         sqlx::query("UPDATE users SET account_status = 'active' WHERE account_status NOT IN ('active', 'suspended') OR account_status IS NULL")
@@ -476,6 +486,24 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // Per-account cluster default policy. An absent row and a NULL field
+        // both mean "inherit"; a present value may only narrow the deployment
+        // default, never widen it. Nothing is seeded, so every existing
+        // project's effective policy is unchanged by this table's arrival.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS cluster_default_policies (
+                user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                team_available INTEGER,
+                allowed_launch_profiles TEXT,
+                version INTEGER NOT NULL DEFAULT 1,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS project_policy_overrides (
@@ -502,6 +530,26 @@ impl Database {
             );
         }
 
+        // The deployment's single system administrator. Deliberately not a
+        // `users` row: an account with a password hash would have to be
+        // excluded from ordinary login, project ownership, membership, and
+        // every listing, which is exactly the entanglement this credential
+        // exists to avoid. The CHECK keeps "exactly one" a schema property.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS system_admin_credential (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                username TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                credential_version INTEGER NOT NULL DEFAULT 1,
+                bootstrap_pending INTEGER NOT NULL DEFAULT 1,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS cluster_invitations (
@@ -519,6 +567,53 @@ impl Database {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_cluster_invitations_email ON cluster_invitations(email)")
             .execute(&self.pool)
             .await?;
+
+        // Only the system administrator invites accounts now, and it is a
+        // credential rather than a `users` row, so `created_by` can no longer
+        // carry a foreign key. Rebuild once.
+        let invitations_rebuilt = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM schema_migrations WHERE name = 'cluster_invitations_actor_v1'",
+        )
+        .fetch_one(&self.pool)
+        .await?
+            > 0;
+        if !invitations_rebuilt {
+            let mut tx = self.pool.begin().await?;
+            sqlx::query(
+                r#"
+                CREATE TABLE cluster_invitations_v2 (
+                    code TEXT PRIMARY KEY,
+                    email TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    expires_at DATETIME NOT NULL,
+                    redeemed_at DATETIME,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+                "#,
+            )
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO cluster_invitations_v2 (code, email, created_by, expires_at, redeemed_at, created_at) SELECT code, email, created_by, expires_at, redeemed_at, created_at FROM cluster_invitations",
+            )
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DROP TABLE cluster_invitations")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("ALTER TABLE cluster_invitations_v2 RENAME TO cluster_invitations")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "INSERT INTO schema_migrations (name) VALUES ('cluster_invitations_actor_v1')",
+            )
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            sqlx::query("CREATE INDEX IF NOT EXISTS idx_cluster_invitations_email ON cluster_invitations(email)")
+                .execute(&self.pool)
+                .await?;
+        }
 
         sqlx::query(
             r#"
@@ -542,6 +637,76 @@ impl Database {
             .execute(&self.pool)
             .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_admin_audit_project ON admin_audit_events(project_id, id)")
+            .execute(&self.pool)
+            .await?;
+
+        // The actor column referenced users(id) and foreign keys are enforced
+        // on this pool, so a system-administrator actor — which is a
+        // credential, not an account — could not be recorded at all. SQLite
+        // cannot drop a constraint in place, so rebuild once: create, copy,
+        // drop, rename. Guarded by schema_migrations so it happens exactly
+        // once. The same pass adds the cluster attribution.
+        let audit_rebuilt = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM schema_migrations WHERE name = 'audit_actor_kind_cluster_v1'",
+        )
+        .fetch_one(&self.pool)
+        .await?
+            > 0;
+        if !audit_rebuilt {
+            let mut tx = self.pool.begin().await?;
+            sqlx::query(
+                r#"
+                CREATE TABLE admin_audit_events_v2 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    actor_kind TEXT NOT NULL DEFAULT 'user',
+                    actor_user_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    target_type TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    project_id TEXT,
+                    cluster_user_id TEXT,
+                    details TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+                "#,
+            )
+            .execute(&mut *tx)
+            .await?;
+            // Historical rows were all written by accounts. Attribute them to
+            // the project's owning cluster where the project is known; the
+            // rest stay NULL and are visible to the system administrator only.
+            sqlx::query(
+                r#"
+                INSERT INTO admin_audit_events_v2
+                    (id, actor_kind, actor_user_id, action, target_type, target_id,
+                     project_id, cluster_user_id, details, created_at)
+                SELECT a.id, 'user', a.actor_user_id, a.action, a.target_type, a.target_id,
+                       a.project_id,
+                       (SELECT p.owner_user_id FROM projects p WHERE p.id = a.project_id),
+                       a.details, a.created_at
+                FROM admin_audit_events a
+                "#,
+            )
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DROP TABLE admin_audit_events")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("ALTER TABLE admin_audit_events_v2 RENAME TO admin_audit_events")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("INSERT INTO schema_migrations (name) VALUES ('audit_actor_kind_cluster_v1')")
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+        }
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_admin_audit_created ON admin_audit_events(created_at DESC, id DESC)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_admin_audit_project ON admin_audit_events(project_id, id)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_admin_audit_cluster ON admin_audit_events(cluster_user_id, id)")
             .execute(&self.pool)
             .await?;
 
@@ -1032,12 +1197,106 @@ impl Database {
         Ok(user)
     }
 
-    async fn user_is_cluster_admin(&self, user_id: &str) -> Result<bool> {
-        let user = self
-            .get_user_by_id(user_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("cluster account not found"))?;
-        Ok(user.role() == ClusterRole::Admin && user.is_active())
+    /// Whether `project_id` is hosted in `user_id`'s virtual cluster.
+    ///
+    /// A project is hosted in an account's cluster when the account owns it or
+    /// when at least one of its sessions was created under that account — the
+    /// durable evidence that the project runs on that account's machines.
+    /// Plain project membership deliberately does not count: hosting is what
+    /// confers administration, and letting a member suspend or re-own a
+    /// project they merely joined would be an escalation, not a convenience.
+    /// Suspended accounts host nothing.
+    pub async fn project_in_user_cluster(&self, project_id: &str, user_id: &str) -> Result<bool> {
+        let hosted = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM users u
+            WHERE u.id = ?
+              AND u.account_status = 'active'
+              AND (
+                  EXISTS (
+                      SELECT 1 FROM projects p
+                      WHERE p.id = ? AND p.owner_user_id = u.id
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM sessions s
+                      WHERE COALESCE(s.project_id, s.id) = ? AND s.user_id = u.id
+                  )
+              )
+            "#,
+        )
+        .bind(user_id)
+        .bind(project_id)
+        .bind(project_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(hosted > 0)
+    }
+
+    /// The accounts whose virtual clusters host `project_id`, i.e. the owner
+    /// plus every account that has created a session for it.
+    pub async fn project_cluster_user_ids(&self, project_id: &str) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT owner_user_id FROM projects WHERE id = ?
+            UNION
+            SELECT DISTINCT user_id FROM sessions WHERE COALESCE(project_id, id) = ?
+            "#,
+        )
+        .bind(project_id)
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn get_system_admin_credential(&self) -> Result<Option<SystemAdminCredential>> {
+        Ok(sqlx::query_as::<_, SystemAdminCredential>(
+            "SELECT username, password_hash, credential_version, bootstrap_pending, updated_at FROM system_admin_credential WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Seed the credential from configuration. Returns whether a row was
+    /// written: an existing credential is never overwritten, so editing the
+    /// configured bootstrap secret after the first start does nothing and a
+    /// rotated password cannot be silently reverted by a config file.
+    pub async fn seed_system_admin_credential(
+        &self,
+        username: &str,
+        password_hash: &str,
+    ) -> Result<bool> {
+        let seeded = sqlx::query(
+            "INSERT OR IGNORE INTO system_admin_credential (id, username, password_hash, credential_version, bootstrap_pending) VALUES (1, ?, ?, 1, 1)",
+        )
+        .bind(username)
+        .bind(password_hash)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            > 0;
+        Ok(seeded)
+    }
+
+    /// Rotate the credential. Bumping the version invalidates every token
+    /// issued against the previous secret.
+    pub async fn rotate_system_admin_password(&self, password_hash: &str) -> Result<i64> {
+        let mut tx = self.pool.begin().await?;
+        let next_version = sqlx::query_scalar::<_, i64>(
+            "SELECT credential_version + 1 FROM system_admin_credential WHERE id = 1",
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no system administrator is configured"))?;
+        sqlx::query(
+            "UPDATE system_admin_credential SET password_hash = ?, credential_version = ?, bootstrap_pending = 0, updated_at = CURRENT_TIMESTAMP WHERE id = 1",
+        )
+        .bind(password_hash)
+        .bind(next_version)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(next_version)
     }
 
     pub async fn update_user_password(&self, email: &str, password_hash: &str) -> Result<bool> {
@@ -1925,43 +2184,6 @@ impl Database {
         .await?)
     }
 
-    pub async fn bootstrap_cluster_admin(&self, email: &str) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
-        let active_admins = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM users WHERE cluster_role = 'admin' AND account_status = 'active'",
-        )
-        .fetch_one(&mut *tx)
-        .await?;
-        if active_admins > 0 {
-            tx.commit().await?;
-            return Ok(false);
-        }
-        let result = sqlx::query(
-            "UPDATE users SET cluster_role = 'admin', account_status = 'active' WHERE lower(email) = lower(?)",
-        )
-        .bind(email.trim())
-        .execute(&mut *tx)
-        .await?;
-        if result.rows_affected() > 0 {
-            let admin_id = sqlx::query_scalar::<_, String>(
-                "SELECT id FROM users WHERE lower(email) = lower(?)",
-            )
-            .bind(email.trim())
-            .fetch_one(&mut *tx)
-            .await?;
-            sqlx::query(
-                "INSERT INTO admin_audit_events (actor_user_id, action, target_type, target_id, details) VALUES (?, 'migration.bootstrap_cluster_admin', 'user', ?, ?)",
-            )
-            .bind(&admin_id)
-            .bind(&admin_id)
-            .bind(serde_json::json!({ "email": email.trim() }).to_string())
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(result.rows_affected() > 0)
-    }
-
     pub async fn list_cluster_users(
         &self,
         search: Option<&str>,
@@ -1986,55 +2208,6 @@ impl Database {
         .await?)
     }
 
-    pub async fn update_cluster_user_role(
-        &self,
-        actor_user_id: &str,
-        target_user_id: &str,
-        role: ClusterRole,
-    ) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
-        let current: Option<(String, String)> =
-            sqlx::query_as("SELECT cluster_role, account_status FROM users WHERE id = ?")
-                .bind(target_user_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some((current_role, current_status)) = current else {
-            tx.commit().await?;
-            return Ok(false);
-        };
-        if current_role == "admin" && role != ClusterRole::Admin && current_status == "active" {
-            let admins = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM users WHERE cluster_role = 'admin' AND account_status = 'active'",
-            )
-            .fetch_one(&mut *tx)
-            .await?;
-            anyhow::ensure!(
-                admins > 1,
-                "cannot demote the last active cluster administrator"
-            );
-        }
-        let changed = sqlx::query("UPDATE users SET cluster_role = ? WHERE id = ?")
-            .bind(role.as_str())
-            .bind(target_user_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected()
-            > 0;
-        if changed {
-            Self::insert_audit_tx(
-                &mut tx,
-                actor_user_id,
-                "cluster_user.role_changed",
-                "user",
-                target_user_id,
-                Some(serde_json::json!({ "from": current_role, "to": role.as_str() })),
-            )
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(changed)
-    }
-
     pub async fn update_cluster_user_status(
         &self,
         actor_user_id: &str,
@@ -2047,21 +2220,14 @@ impl Database {
                 .bind(target_user_id)
                 .fetch_optional(&mut *tx)
                 .await?;
-        let Some((role, current_status)) = current else {
+        let Some((_role, current_status)) = current else {
             tx.commit().await?;
             return Ok(false);
         };
-        if role == "admin" && current_status == "active" && status == AccountStatus::Suspended {
-            let admins = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM users WHERE cluster_role = 'admin' AND account_status = 'active'",
-            )
-            .fetch_one(&mut *tx)
-            .await?;
-            anyhow::ensure!(
-                admins > 1,
-                "cannot suspend the last active cluster administrator"
-            );
-        }
+        // No "last administrator" guard: suspending every account can no
+        // longer lock anyone out of administering the deployment, because that
+        // authority is the system-administrator credential rather than an
+        // account role.
         let changed = sqlx::query("UPDATE users SET account_status = ? WHERE id = ?")
             .bind(status.as_str())
             .bind(target_user_id)
@@ -2196,18 +2362,66 @@ impl Database {
                 .and_then(serde_json::Value::as_str)
                 .map(ToString::to_string)
         };
+        // Attribute the record to the cluster on whose behalf the action was
+        // taken: the actor's own cluster when the actor hosts the project (or
+        // the action is that cluster's own), otherwise none. Reads also apply
+        // the live hosting predicate, so a project hosted in several clusters
+        // stays visible to every one of them.
+        let system_admin = actor_user_id == SYSTEM_ADMIN_ACTOR;
+        let cluster_user_id = if system_admin {
+            // The system administrator acts deployment-wide, never on behalf
+            // of a cluster.
+            None
+        } else if target_type == "cluster" && target_id == actor_user_id {
+            Some(actor_user_id.to_string())
+        } else if let Some(project) = project_id.as_deref() {
+            let hosts = sqlx::query_scalar::<_, i64>(
+                r#"
+                SELECT COUNT(*) FROM projects p
+                WHERE p.id = ?
+                  AND (p.owner_user_id = ?
+                       OR EXISTS (
+                           SELECT 1 FROM sessions s
+                           WHERE COALESCE(s.project_id, s.id) = p.id AND s.user_id = ?
+                       ))
+                "#,
+            )
+            .bind(project)
+            .bind(actor_user_id)
+            .bind(actor_user_id)
+            .fetch_one(&mut **tx)
+            .await?;
+            (hosts > 0).then(|| actor_user_id.to_string())
+        } else {
+            None
+        };
         sqlx::query(
-            "INSERT INTO admin_audit_events (actor_user_id, action, target_type, target_id, project_id, details) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO admin_audit_events (actor_kind, actor_user_id, action, target_type, target_id, project_id, cluster_user_id, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
+        .bind(if system_admin { "system_admin" } else { "user" })
         .bind(actor_user_id)
         .bind(action)
         .bind(target_type)
         .bind(target_id)
         .bind(project_id)
+        .bind(cluster_user_id)
         .bind(details.map(|value| value.to_string()))
         .execute(&mut **tx)
         .await?;
         Ok(())
+    }
+
+    /// Audit write for the system administrator, whose actor is a credential
+    /// rather than an account.
+    pub async fn record_system_admin_audit(
+        &self,
+        action: &str,
+        target_type: &str,
+        target_id: &str,
+        details: Option<serde_json::Value>,
+    ) -> Result<()> {
+        self.record_audit(SYSTEM_ADMIN_ACTOR, action, target_type, target_id, details)
+            .await
     }
 
     pub async fn record_audit(
@@ -2232,10 +2446,52 @@ impl Database {
         Ok(())
     }
 
+    /// Deployment-wide audit history, for the system administrator.
     pub async fn list_audit_events(&self, limit: i64, offset: i64) -> Result<Vec<AdminAuditEvent>> {
         Ok(sqlx::query_as::<_, AdminAuditEvent>(
-            "SELECT id, actor_user_id, action, target_type, target_id, project_id, details, created_at FROM admin_audit_events ORDER BY id DESC LIMIT ? OFFSET ?",
+            "SELECT id, actor_kind, actor_user_id, action, target_type, target_id, project_id, cluster_user_id, details, created_at FROM admin_audit_events ORDER BY id DESC LIMIT ? OFFSET ?",
         )
+        .bind(limit.clamp(1, 200))
+        .bind(offset.max(0))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// One cluster's audit history: records stamped with this cluster, the
+    /// account's own actions, and anything touching a project it hosts. The
+    /// last arm is evaluated live so a project hosted in several clusters is
+    /// visible to each of them, and so historical rows written before cluster
+    /// attribution existed still appear where they belong.
+    pub async fn list_cluster_audit_events(
+        &self,
+        cluster_user_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AdminAuditEvent>> {
+        Ok(sqlx::query_as::<_, AdminAuditEvent>(
+            r#"
+            SELECT a.id, a.actor_kind, a.actor_user_id, a.action, a.target_type, a.target_id,
+                   a.project_id, a.cluster_user_id, a.details, a.created_at
+            FROM admin_audit_events a
+            WHERE a.cluster_user_id = ?
+               OR (a.actor_kind = 'user' AND a.actor_user_id = ?)
+               OR (a.project_id IS NOT NULL AND EXISTS (
+                       SELECT 1 FROM projects p
+                       WHERE p.id = a.project_id
+                         AND (p.owner_user_id = ?
+                              OR EXISTS (
+                                  SELECT 1 FROM sessions s
+                                  WHERE COALESCE(s.project_id, s.id) = p.id AND s.user_id = ?
+                              ))
+                   ))
+            ORDER BY a.id DESC
+            LIMIT ? OFFSET ?
+            "#,
+        )
+        .bind(cluster_user_id)
+        .bind(cluster_user_id)
+        .bind(cluster_user_id)
+        .bind(cluster_user_id)
         .bind(limit.clamp(1, 200))
         .bind(offset.max(0))
         .fetch_all(&self.pool)
@@ -2423,11 +2679,11 @@ impl Database {
             ProjectLifecycle::Suspended => anyhow::bail!("project is suspended"),
             ProjectLifecycle::Deleting => anyhow::bail!("project deletion is in progress"),
         }
-        // Cluster administrators additionally control projects that are
-        // present in their own virtual cluster: a project the administrator
-        // has a session for is openable even when another account owns it.
-        // Projects that exist only in other accounts' clusters keep their
-        // owner/member gating.
+        // Every account operates its own virtual cluster: a project it has a
+        // session for is openable even when another account owns it, because
+        // that session is the evidence the project runs on this account's
+        // machines. Projects that exist only in other accounts' clusters keep
+        // their owner/member gating.
         let has_access = project.owner_user_id == user_id
             || sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM project_members WHERE project_id = ? AND user_id = ?",
@@ -2436,19 +2692,8 @@ impl Database {
             .bind(user_id)
             .fetch_one(&self.pool)
             .await?
-                > 0;
-        if !has_access && user.role() == ClusterRole::Admin {
-            let in_cluster = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM sessions WHERE COALESCE(project_id, id) = ? AND user_id = ?",
-            )
-            .bind(project_id)
-            .bind(user_id)
-            .fetch_one(&self.pool)
-            .await?
-                > 0;
-            anyhow::ensure!(in_cluster, "user is not a member of this project");
-            return Ok(project);
-        }
+                > 0
+            || self.project_in_user_cluster(project_id, user_id).await?;
         anyhow::ensure!(has_access, "user is not a member of this project");
         Ok(project)
     }
@@ -2515,12 +2760,20 @@ impl Database {
             "owner is already part of the project"
         );
         let mut tx = self.pool.begin().await?;
+        // `invited_by` references an account, and the system administrator is
+        // not one. Attribute the row to the project owner in that case; the
+        // audit event below still records who actually did it.
+        let invited_by = if actor_user_id == SYSTEM_ADMIN_ACTOR {
+            project.owner_user_id.as_str()
+        } else {
+            actor_user_id
+        };
         let changed = sqlx::query(
             "INSERT OR IGNORE INTO project_members (project_id, user_id, invited_by) VALUES (?, ?, ?)",
         )
         .bind(project_id)
         .bind(user_id)
-        .bind(actor_user_id)
+        .bind(invited_by)
         .execute(&mut *tx)
         .await?
         .rows_affected()
@@ -3009,8 +3262,32 @@ impl Database {
         Ok(deleted)
     }
 
+    /// Deployment-wide project inventory for the system administrator.
     pub async fn list_admin_projects(
         &self,
+        search: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AdminProjectSummary>> {
+        self.list_projects_scoped(None, search, limit, offset).await
+    }
+
+    /// The projects hosted in one account's virtual cluster, in the same shape
+    /// as the deployment inventory so both surfaces render identically.
+    pub async fn list_cluster_projects(
+        &self,
+        cluster_user_id: &str,
+        search: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AdminProjectSummary>> {
+        self.list_projects_scoped(Some(cluster_user_id), search, limit, offset)
+            .await
+    }
+
+    async fn list_projects_scoped(
+        &self,
+        cluster_user_id: Option<&str>,
         search: Option<&str>,
         limit: i64,
         offset: i64,
@@ -3033,6 +3310,9 @@ impl Database {
                    (SELECT COUNT(*) FROM project_members pm WHERE pm.project_id = p.id) AS member_count,
                    (SELECT COUNT(*) FROM sessions s WHERE COALESCE(s.project_id, s.id) = p.id AND s.status = 'active') AS active_session_count,
                    (SELECT MAX(s.updated_at) FROM sessions s WHERE COALESCE(s.project_id, s.id) = p.id) AS last_activity,
+                   (SELECT GROUP_CONCAT(DISTINCT hu.email)
+                      FROM sessions hs JOIN users hu ON hu.id = hs.user_id
+                     WHERE COALESCE(hs.project_id, hs.id) = p.id) AS hosting_emails,
                    p.created_at, rs.working_dir, rs.hostname, rs.git_remote
             FROM projects p
             JOIN users u ON u.id = p.owner_user_id
@@ -3043,6 +3323,12 @@ impl Database {
                    OR lower(u.email) LIKE lower(?)
                    OR lower(COALESCE(rs.working_dir, '')) LIKE lower(?)
                    OR lower(COALESCE(rs.hostname, '')) LIKE lower(?))
+              AND (? IS NULL
+                   OR p.owner_user_id = ?
+                   OR EXISTS (
+                       SELECT 1 FROM sessions cs
+                       WHERE COALESCE(cs.project_id, cs.id) = p.id AND cs.user_id = ?
+                   ))
             ORDER BY COALESCE(last_activity, p.created_at) DESC
             LIMIT ? OFFSET ?
             "#,
@@ -3052,6 +3338,9 @@ impl Database {
         .bind(&pattern)
         .bind(&pattern)
         .bind(&pattern)
+        .bind(cluster_user_id)
+        .bind(cluster_user_id)
+        .bind(cluster_user_id)
         .bind(limit.clamp(1, 200))
         .bind(offset.max(0))
         .fetch_all(&self.pool)
@@ -3073,7 +3362,57 @@ impl Database {
                     active_session_count: row.get("active_session_count"),
                     last_activity: row.get("last_activity"),
                     created_at: row.get("created_at"),
+                    hosting_emails: row
+                        .get::<Option<String>, _>("hosting_emails")
+                        .map(|joined| {
+                            joined
+                                .split(',')
+                                .map(str::trim)
+                                .filter(|email| !email.is_empty())
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 }
+            })
+            .collect())
+    }
+
+    /// Every account's virtual cluster, for the system-administration
+    /// inventory. A cluster exists for every account; one with no hosted
+    /// projects is simply empty rather than absent, so suspending or
+    /// inspecting a quiet account is still possible.
+    pub async fn cluster_summaries(&self) -> Result<Vec<ClusterSummary>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT u.id AS user_id, u.email, u.account_status,
+                   (SELECT COUNT(*) FROM projects p
+                     WHERE p.owner_user_id = u.id
+                        OR EXISTS (
+                            SELECT 1 FROM sessions hs
+                            WHERE COALESCE(hs.project_id, hs.id) = p.id AND hs.user_id = u.id
+                        )) AS hosted_project_count,
+                   (SELECT COUNT(*) FROM projects p WHERE p.owner_user_id = u.id) AS owned_project_count,
+                   (SELECT COUNT(*) FROM sessions s
+                     WHERE s.user_id = u.id AND s.status = 'active') AS active_session_count,
+                   (SELECT MAX(s.updated_at) FROM sessions s WHERE s.user_id = u.id) AS last_activity
+            FROM users u
+            ORDER BY u.email
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        use sqlx::Row;
+        Ok(rows
+            .into_iter()
+            .map(|row| ClusterSummary {
+                user_id: row.get("user_id"),
+                email: row.get("email"),
+                account_status: row.get("account_status"),
+                hosted_project_count: row.get("hosted_project_count"),
+                owned_project_count: row.get("owned_project_count"),
+                active_session_count: row.get("active_session_count"),
+                last_activity: row.get("last_activity"),
             })
             .collect())
     }
@@ -3086,7 +3425,148 @@ impl Database {
         )
     }
 
-    pub async fn get_cluster_default_policy(&self) -> Result<shared::EffectiveProjectPolicy> {
+    fn validate_launch_profiles(profiles: &[String]) -> Result<()> {
+        anyhow::ensure!(
+            profiles
+                .iter()
+                .all(|profile| !shared::is_retired_launch_profile_key(profile)),
+            "policy contains a retired launch profile"
+        );
+        let supported = shared::supported_launch_profiles()
+            .into_iter()
+            .map(|profile| profile.key)
+            .collect::<std::collections::HashSet<_>>();
+        anyhow::ensure!(
+            profiles.iter().all(|profile| supported.contains(profile)),
+            "policy contains an unsupported launch profile"
+        );
+        Ok(())
+    }
+
+    /// The launch-profile allowlist narrows as it descends: a level may only
+    /// restrict what the level above permits, and an attempt to re-enable
+    /// something is rejected outright rather than silently clamped, so an
+    /// operator is told their cluster cannot exceed the deployment instead of
+    /// being shown a saved policy that does not take effect.
+    ///
+    /// `team_available` deliberately does not narrow. Its deployment value is a
+    /// *default*, not a prohibition — it ships `false`, and team mode has
+    /// always been switched on for individual projects against that default.
+    /// Folding it with AND would have made every project that runs team mode
+    /// today lose it on upgrade, which is the opposite of preserving existing
+    /// behavior. Each level therefore sets it for what it governs, and the
+    /// lowest level that states a value wins.
+    fn ensure_policy_narrows(
+        _team_available: Option<bool>,
+        allowed_launch_profiles: Option<&[String]>,
+        bound: &shared::EffectiveProjectPolicy,
+        bound_name: &str,
+    ) -> Result<()> {
+        if let Some(profiles) = allowed_launch_profiles {
+            if let Some(extra) = profiles
+                .iter()
+                .find(|profile| !bound.allowed_launch_profiles.contains(profile))
+            {
+                anyhow::bail!(
+                    "policy cannot allow launch profile '{extra}': the {bound_name} disallows it"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// One account's cluster default. `None` means the account has never set
+    /// one and inherits the deployment default entirely.
+    pub async fn get_cluster_default_policy(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<ClusterDefaultPolicy>> {
+        let row = sqlx::query_as::<_, (Option<i64>, Option<String>, i64)>(
+            "SELECT team_available, allowed_launch_profiles, version FROM cluster_default_policies WHERE user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(team_available, profiles, version)| ClusterDefaultPolicy {
+            user_id: user_id.to_string(),
+            team_available: team_available.map(|value| value != 0),
+            allowed_launch_profiles: profiles
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok()),
+            version,
+        }))
+    }
+
+    pub async fn set_cluster_default_policy(
+        &self,
+        actor_user_id: &str,
+        cluster_user_id: &str,
+        team_available: Option<bool>,
+        allowed_launch_profiles: Option<Vec<String>>,
+    ) -> Result<Option<ClusterDefaultPolicy>> {
+        if let Some(profiles) = &allowed_launch_profiles {
+            Self::validate_launch_profiles(profiles)?;
+        }
+        let deployment = self.get_deployment_default_policy().await?;
+        Self::ensure_policy_narrows(
+            team_available,
+            allowed_launch_profiles.as_deref(),
+            &deployment,
+            "deployment default",
+        )?;
+        let profiles_json = allowed_launch_profiles
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let mut tx = self.pool.begin().await?;
+        let next_version = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT MAX(version) + 1 FROM (
+                SELECT version FROM cluster_settings WHERE id = 1
+                UNION ALL
+                SELECT version FROM cluster_default_policies WHERE user_id = ?
+            )
+            "#,
+        )
+        .bind(cluster_user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO cluster_default_policies
+                (user_id, team_available, allowed_launch_profiles, version, updated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                team_available = excluded.team_available,
+                allowed_launch_profiles = excluded.allowed_launch_profiles,
+                version = excluded.version,
+                updated_at = CURRENT_TIMESTAMP
+            "#,
+        )
+        .bind(cluster_user_id)
+        .bind(team_available.map(i64::from))
+        .bind(&profiles_json)
+        .bind(next_version)
+        .execute(&mut *tx)
+        .await?;
+        Self::insert_audit_tx(
+            &mut tx,
+            actor_user_id,
+            "cluster.default_policy_changed",
+            "cluster",
+            cluster_user_id,
+            Some(serde_json::json!({
+                "team_available": team_available,
+                "allowed_launch_profiles": allowed_launch_profiles,
+                "version": next_version,
+            })),
+        )
+        .await?;
+        tx.commit().await?;
+        self.get_cluster_default_policy(cluster_user_id).await
+    }
+
+    pub async fn get_deployment_default_policy(&self) -> Result<shared::EffectiveProjectPolicy> {
         let (team_available, profiles_json, version) =
             sqlx::query_as::<_, (i64, String, i64)>(
                 "SELECT team_available, allowed_launch_profiles, version FROM cluster_settings WHERE id = 1",
@@ -3103,28 +3583,13 @@ impl Database {
         })
     }
 
-    pub async fn set_cluster_default_policy(
+    pub async fn set_deployment_default_policy(
         &self,
         actor_user_id: &str,
         team_available: bool,
         allowed_launch_profiles: Vec<String>,
     ) -> Result<shared::EffectiveProjectPolicy> {
-        anyhow::ensure!(
-            allowed_launch_profiles
-                .iter()
-                .all(|profile| !shared::is_retired_launch_profile_key(profile)),
-            "policy contains a retired launch profile"
-        );
-        let supported = shared::supported_launch_profiles()
-            .into_iter()
-            .map(|profile| profile.key)
-            .collect::<std::collections::HashSet<_>>();
-        anyhow::ensure!(
-            allowed_launch_profiles
-                .iter()
-                .all(|profile| supported.contains(profile)),
-            "policy contains an unsupported launch profile"
-        );
+        Self::validate_launch_profiles(&allowed_launch_profiles)?;
         let profiles_json = serde_json::to_string(&allowed_launch_profiles)?;
         let mut tx = self.pool.begin().await?;
         let next_version = sqlx::query_scalar::<_, i64>(
@@ -3160,9 +3625,18 @@ impl Database {
         )
         .await?;
         tx.commit().await?;
-        self.get_cluster_default_policy().await
+        self.get_deployment_default_policy().await
     }
 
+    /// Effective policy is the monotone narrowing of three levels:
+    /// deployment default ∧ every hosting cluster's default ∧ the project
+    /// override. `team_available` folds with boolean AND, launch profiles
+    /// with set intersection, so a lower level can only restrict what the
+    /// level above allows. Intersecting over *all* hosting clusters — not
+    /// just the owner's — is what makes a cluster default govern the foreign
+    /// projects running on that account's machines, and set intersection is
+    /// order-independent, so a project hosted in several clusters still has
+    /// one deterministic answer.
     pub async fn get_effective_project_policy(
         &self,
         project_id: &str,
@@ -3185,29 +3659,110 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?
         .ok_or_else(|| anyhow::anyhow!("project not found"))?;
+
         let default_profiles: String = row.get("default_profiles");
-        let override_profiles: Option<String> = row.get("override_profiles");
-        let profiles_json = override_profiles.as_ref().unwrap_or(&default_profiles);
-        let allowed_launch_profiles = serde_json::from_str::<Vec<String>>(profiles_json)
+        let mut team_available = row.get::<i64, _>("default_team") != 0;
+        let mut allowed = serde_json::from_str::<Vec<String>>(&default_profiles)
             .unwrap_or_else(|_| shared::EffectiveProjectPolicy::default().allowed_launch_profiles);
-        let default_team = row.get::<i64, _>("default_team") != 0;
-        let override_team = row
-            .try_get::<Option<i64>, _>("override_team")
-            .unwrap_or(None);
-        let default_version: i64 = row.get("default_version");
-        let override_version = row
+        let mut version: i64 = row.get("default_version");
+
+        for (cluster_team, cluster_profiles, cluster_version) in sqlx::query_as::<
+            _,
+            (Option<i64>, Option<String>, i64),
+        >(
+            r#"
+            SELECT team_available, allowed_launch_profiles, version
+            FROM cluster_default_policies
+            WHERE user_id IN (
+                SELECT owner_user_id FROM projects WHERE id = ?
+                UNION
+                SELECT DISTINCT user_id FROM sessions WHERE COALESCE(project_id, id) = ?
+            )
+            "#,
+        )
+        .bind(project_id)
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await?
+        {
+            // Lowest stated value wins for team availability; profiles
+            // intersect. A project hosted in several clusters therefore takes
+            // the most restrictive profile set of all of them, and the team
+            // setting of whichever cluster states one.
+            if let Some(value) = cluster_team {
+                team_available = value != 0;
+            }
+            if let Some(profiles) = cluster_profiles
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+            {
+                allowed.retain(|profile| profiles.contains(profile));
+            }
+            version = version.max(cluster_version);
+        }
+
+        if let Some(override_team) = row.try_get::<Option<i64>, _>("override_team").unwrap_or(None) {
+            team_available = override_team != 0;
+        }
+        if let Some(profiles) = row
+            .get::<Option<String>, _>("override_profiles")
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        {
+            allowed.retain(|profile| profiles.contains(profile));
+        }
+        if let Some(override_version) = row
             .try_get::<Option<i64>, _>("override_version")
-            .unwrap_or(None);
+            .unwrap_or(None)
+        {
+            version = version.max(override_version);
+        }
+
         Ok(shared::EffectiveProjectPolicy {
-            team_available: override_team
-                .map(|value| value != 0)
-                .unwrap_or(default_team),
-            allowed_launch_profiles,
-            version: override_version
-                .unwrap_or(default_version)
-                .max(default_version),
+            team_available,
+            allowed_launch_profiles: allowed,
+            version,
             project_suspended: row.get::<String, _>("lifecycle_status") == "suspended",
         })
+    }
+
+    /// The bound a project's override must stay inside: everything above it,
+    /// i.e. the deployment default narrowed by every hosting cluster default.
+    async fn project_policy_bound(
+        &self,
+        project_id: &str,
+    ) -> Result<shared::EffectiveProjectPolicy> {
+        let mut bound = self.get_deployment_default_policy().await?;
+        for (cluster_team, cluster_profiles, _) in
+            sqlx::query_as::<_, (Option<i64>, Option<String>, i64)>(
+                r#"
+            SELECT team_available, allowed_launch_profiles, version
+            FROM cluster_default_policies
+            WHERE user_id IN (
+                SELECT owner_user_id FROM projects WHERE id = ?
+                UNION
+                SELECT DISTINCT user_id FROM sessions WHERE COALESCE(project_id, id) = ?
+            )
+            "#,
+            )
+            .bind(project_id)
+            .bind(project_id)
+            .fetch_all(&self.pool)
+            .await?
+        {
+            if let Some(value) = cluster_team {
+                bound.team_available = value != 0;
+            }
+            if let Some(profiles) = cluster_profiles
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+            {
+                bound
+                    .allowed_launch_profiles
+                    .retain(|profile| profiles.contains(profile));
+            }
+        }
+        Ok(bound)
     }
 
     pub async fn get_project_policy_override(
@@ -3256,21 +3811,15 @@ impl Database {
             "project deletion is in progress"
         );
         if let Some(profiles) = &allowed_launch_profiles {
-            anyhow::ensure!(
-                profiles
-                    .iter()
-                    .all(|profile| !shared::is_retired_launch_profile_key(profile)),
-                "policy contains a retired launch profile"
-            );
-            let supported = shared::supported_launch_profiles()
-                .into_iter()
-                .map(|profile| profile.key)
-                .collect::<std::collections::HashSet<_>>();
-            anyhow::ensure!(
-                profiles.iter().all(|profile| supported.contains(profile)),
-                "policy contains an unsupported launch profile"
-            );
+            Self::validate_launch_profiles(profiles)?;
         }
+        let bound = self.project_policy_bound(project_id).await?;
+        Self::ensure_policy_narrows(
+            team_available,
+            allowed_launch_profiles.as_deref(),
+            &bound,
+            "policy above it",
+        )?;
         let profiles_json = allowed_launch_profiles
             .as_ref()
             .map(serde_json::to_string)
@@ -3521,54 +4070,32 @@ impl Database {
     }
 
     pub async fn get_sessions_for_user(&self, user_id: &str) -> Result<Vec<Session>> {
-        // Cluster administrators see the sessions of their own virtual
-        // cluster: projects they own, projects they belong to, and sessions
-        // created under their account. Other accounts' projects stay out.
-        let admin = self.user_is_cluster_admin(user_id).await.unwrap_or(false);
-        let sessions = if admin {
-            sqlx::query_as::<_, Session>(
-                r#"
-                SELECT s.id, p.owner_user_id AS user_id, s.cli_client_id, s.working_dir,
-                       s.hostname, s.status, s.created_at, s.updated_at,
-                       COALESCE(s.is_paused, 0) AS is_paused,
-                       COALESCE(s.project_id, s.id) AS project_id,
-                       s.git_remote, s.git_remote_url
-                FROM sessions s
-                JOIN projects p ON p.id = COALESCE(s.project_id, s.id)
-                WHERE p.owner_user_id = ?
-                   OR s.user_id = ?
-                   OR EXISTS (
-                       SELECT 1 FROM project_members pm
-                       WHERE pm.project_id = p.id AND pm.user_id = ?
-                   )
-                ORDER BY s.created_at DESC
-                LIMIT 50
-                "#,
-            )
-            .bind(user_id)
-            .bind(user_id)
-            .bind(user_id)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, Session>(
-                r#"
-                SELECT s.id, p.owner_user_id AS user_id, s.cli_client_id, s.working_dir,
-                       s.hostname, s.status, s.created_at, s.updated_at,
-                       COALESCE(s.is_paused, 0) AS is_paused,
-                       COALESCE(s.project_id, s.id) AS project_id,
-                       s.git_remote, s.git_remote_url
-                FROM sessions s
-                JOIN projects p ON p.id = COALESCE(s.project_id, s.id)
-                WHERE p.owner_user_id = ?
-                ORDER BY s.created_at DESC
-                LIMIT 50
-                "#,
-            )
-            .bind(user_id)
-            .fetch_all(&self.pool)
-            .await?
-        };
+        // An account's own list is its virtual cluster: projects it owns plus
+        // projects with a session created under it. Projects it merely belongs
+        // to arrive through get_shared_sessions_for_user, which excludes this
+        // set so the web's union cannot double-list one project.
+        let sessions = sqlx::query_as::<_, Session>(
+            r#"
+            SELECT s.id, p.owner_user_id AS user_id, s.cli_client_id, s.working_dir,
+                   s.hostname, s.status, s.created_at, s.updated_at,
+                   COALESCE(s.is_paused, 0) AS is_paused,
+                   COALESCE(s.project_id, s.id) AS project_id,
+                   s.git_remote, s.git_remote_url
+            FROM sessions s
+            JOIN projects p ON p.id = COALESCE(s.project_id, s.id)
+            WHERE p.owner_user_id = ?
+               OR EXISTS (
+                   SELECT 1 FROM sessions hs
+                   WHERE COALESCE(hs.project_id, hs.id) = p.id AND hs.user_id = ?
+               )
+            ORDER BY s.created_at DESC
+            LIMIT 50
+            "#,
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(sessions)
     }
 
@@ -3786,14 +4313,10 @@ impl Database {
         &self,
         user_id: &str,
     ) -> Result<Vec<(Session, String, String)>> {
-        // Cluster administrators already receive their full cluster-scoped
-        // session list from get_sessions_for_user; skip the membership list
-        // to avoid doubles.
-        if self.user_is_cluster_admin(user_id).await.unwrap_or(false) {
-            return Ok(Vec::new());
-        }
-        // Compatibility shape for the web session list, now sourced from
-        // canonical project membership rather than per-session role rows.
+        // Compatibility shape for the web session list, sourced from canonical
+        // project membership rather than per-session role rows. Projects the
+        // account already hosts are excluded: get_sessions_for_user returns
+        // those, and the web unions the two lists.
         let rows = sqlx::query(
             r#"
             SELECT s.id, p.owner_user_id AS user_id, s.cli_client_id, s.working_dir, s.hostname, s.status, s.created_at, s.updated_at, COALESCE(s.is_paused, 0) as is_paused, COALESCE(s.project_id, s.id) as project_id, s.git_remote, s.git_remote_url, u.email, 'user' AS role
@@ -3802,10 +4325,17 @@ impl Database {
             INNER JOIN project_members pm ON pm.project_id = p.id
             INNER JOIN users u ON p.owner_user_id = u.id
             WHERE pm.user_id = ?
+              AND p.owner_user_id <> ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM sessions hs
+                  WHERE COALESCE(hs.project_id, hs.id) = p.id AND hs.user_id = ?
+              )
             ORDER BY s.created_at DESC
             LIMIT 50
             "#,
         )
+        .bind(user_id)
+        .bind(user_id)
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
@@ -3879,28 +4409,10 @@ impl Database {
     }
 
     pub async fn check_session_access(&self, session_id: &str, user_id: &str) -> Result<bool> {
-        // Cluster administrators can attach to sessions running under their
-        // own account even when another account owns the project. Owner and
-        // member access is evaluated below for everyone.
-        if self.user_is_cluster_admin(user_id).await.unwrap_or(false) {
-            let own_session = sqlx::query_scalar::<_, i64>(
-                r#"
-                SELECT COUNT(*)
-                FROM sessions s
-                JOIN projects p ON p.id = COALESCE(s.project_id, s.id)
-                WHERE s.id = ?
-                  AND p.lifecycle_status = 'active'
-                  AND s.user_id = ?
-                "#,
-            )
-            .bind(session_id)
-            .bind(user_id)
-            .fetch_one(&self.pool)
-            .await?;
-            if own_session > 0 {
-                return Ok(true);
-            }
-        }
+        // Content access is owner, member, or host: an account that runs any
+        // session of a project on its own machines can open that project's
+        // sessions. Suspended accounts are excluded here rather than relying
+        // on each caller having checked.
         let result = sqlx::query_scalar::<_, i64>(
             r#"
             SELECT COUNT(*)
@@ -3908,15 +4420,24 @@ impl Database {
             JOIN projects p ON p.id = COALESCE(s.project_id, s.id)
             WHERE s.id = ?
               AND p.lifecycle_status = 'active'
+              AND EXISTS (
+                  SELECT 1 FROM users u
+                  WHERE u.id = ? AND u.account_status = 'active'
+              )
               AND (
                   p.owner_user_id = ? OR EXISTS (
                       SELECT 1 FROM project_members pm
                       WHERE pm.project_id = p.id AND pm.user_id = ?
+                  ) OR EXISTS (
+                      SELECT 1 FROM sessions hs
+                      WHERE COALESCE(hs.project_id, hs.id) = p.id AND hs.user_id = ?
                   )
               )
             "#,
         )
         .bind(session_id)
+        .bind(user_id)
+        .bind(user_id)
         .bind(user_id)
         .bind(user_id)
         .fetch_one(&self.pool)
@@ -5096,36 +5617,79 @@ mod cluster_administration_tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_and_last_active_admin_guards_are_transactional() {
-        let db = database("admin-guard").await;
+    async fn the_system_administrator_is_one_credential_outside_the_account_table() {
+        let db = database("system-admin-credential").await;
         db.run_migrations().await.unwrap();
+        assert!(db.get_system_admin_credential().await.unwrap().is_none());
+
+        assert!(db
+            .seed_system_admin_credential("admin", "hash-one")
+            .await
+            .unwrap());
+        // A second seed never overwrites the stored credential, so editing the
+        // configured bootstrap secret later cannot revert a rotation.
+        assert!(!db
+            .seed_system_admin_credential("other", "hash-two")
+            .await
+            .unwrap());
+        let credential = db.get_system_admin_credential().await.unwrap().unwrap();
+        assert_eq!(credential.username, "admin");
+        assert_eq!(credential.password_hash, "hash-one");
+        assert!(credential.bootstrap_pending());
+
+        let version = db.rotate_system_admin_password("hash-three").await.unwrap();
+        let rotated = db.get_system_admin_credential().await.unwrap().unwrap();
+        assert_eq!(rotated.credential_version, version);
+        assert!(version > credential.credential_version);
+        assert!(!rotated.bootstrap_pending());
+
+        // It is not an account: no users row exists for it, and suspending
+        // every account cannot strand the deployment.
+        assert!(db.get_user_by_id(SYSTEM_ADMIN_ACTOR).await.unwrap().is_none());
         db.create_user(&user("u1", "first@test", "user"))
             .await
             .unwrap();
-        db.create_user(&user("u2", "second@test", "user"))
-            .await
-            .unwrap();
-        assert!(db.bootstrap_cluster_admin("first@test").await.unwrap());
-        assert!(!db.bootstrap_cluster_admin("second@test").await.unwrap());
         assert!(db
-            .update_cluster_user_role("u1", "u1", ClusterRole::User)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("last active"));
-        assert!(db
-            .update_cluster_user_status("u1", "u1", AccountStatus::Suspended)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("last active"));
-        db.update_cluster_user_role("u1", "u2", ClusterRole::Admin)
-            .await
-            .unwrap();
-        assert!(db
-            .update_cluster_user_status("u2", "u1", AccountStatus::Suspended)
+            .update_cluster_user_status(SYSTEM_ADMIN_ACTOR, "u1", AccountStatus::Suspended)
             .await
             .unwrap());
+        let event = db
+            .list_audit_events(10, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|event| event.action == "cluster_user.status_changed")
+            .unwrap();
+        assert_eq!(event.actor_kind, "system_admin");
+        assert!(event.cluster_user_id.is_none());
+        // Deployment-level records belong to no cluster, so no operator sees
+        // them — not even the account they were taken against.
+        assert!(db
+            .list_cluster_audit_events("u1", 10, 0)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn upgrade_demotes_every_account_to_an_ordinary_user() {
+        let db = database("role-demotion").await;
+        db.run_migrations().await.unwrap();
+        db.create_user(&user("legacy-admin", "admin@test", "admin"))
+            .await
+            .unwrap();
+        db.create_user(&user("plain", "plain@test", "user"))
+            .await
+            .unwrap();
+        // A second migration pass is what an upgrade performs.
+        db.run_migrations().await.unwrap();
+        for id in ["legacy-admin", "plain"] {
+            assert_eq!(
+                db.get_user_by_id(id).await.unwrap().unwrap().cluster_role,
+                "user",
+                "no account keeps deployment-wide authority after upgrade"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5142,7 +5706,7 @@ mod cluster_administration_tests {
         let initial = db.get_effective_project_policy("project-a").await.unwrap();
         assert!(!initial.team_available);
         let defaults = db
-            .set_cluster_default_policy(
+            .set_deployment_default_policy(
                 "admin",
                 true,
                 vec!["agent:codex:official:default".to_string()],
@@ -5163,7 +5727,9 @@ mod cluster_administration_tests {
             .unwrap();
         assert_eq!(ignored, inherited);
 
-        let overridden = db
+        // An override may only narrow: re-enabling a profile the deployment
+        // default disallows is rejected rather than saved and ignored.
+        assert!(db
             .set_project_policy_override(
                 "admin",
                 "project-a",
@@ -5171,10 +5737,22 @@ mod cluster_administration_tests {
                 Some(vec!["agent:claude:official:default".to_string()]),
             )
             .await
+            .unwrap_err()
+            .to_string()
+            .contains("cannot allow launch profile"));
+
+        let overridden = db
+            .set_project_policy_override(
+                "admin",
+                "project-a",
+                Some(false),
+                Some(vec!["agent:codex:official:default".to_string()]),
+            )
+            .await
             .unwrap();
         assert!(overridden.version > inherited.version);
         assert!(!overridden.team_available);
-        assert!(overridden.allows(shared::PaneKind::Agent, shared::Provider::Claude, None));
+        assert!(overridden.allows(shared::PaneKind::Agent, shared::Provider::Codex, None));
 
         let after_legacy = db
             .import_legacy_project_policy("project-a", true, &[])
@@ -5307,7 +5885,7 @@ mod cluster_administration_tests {
 
         let retired = vec!["agent:claude:glm:glm-5.1".to_string()];
         assert!(db
-            .set_cluster_default_policy("admin", true, retired.clone())
+            .set_deployment_default_policy("admin", true, retired.clone())
             .await
             .unwrap_err()
             .to_string()
@@ -5319,7 +5897,7 @@ mod cluster_administration_tests {
             .to_string()
             .contains("retired"));
         assert!(db
-            .set_cluster_default_policy(
+            .set_deployment_default_policy(
                 "admin",
                 true,
                 vec!["agent:claude:official:unknown".to_string()],
@@ -5934,27 +6512,29 @@ mod cluster_administration_tests {
     }
 
     #[tokio::test]
-    async fn cluster_admins_open_projects_present_in_their_own_cluster() {
-        let db = database("admin-project-access").await;
+    async fn accounts_open_projects_present_in_their_own_cluster() {
+        let db = database("cluster-project-access").await;
         db.run_migrations().await.unwrap();
-        db.create_user(&user("admin", "admin@test", "admin"))
-            .await
-            .unwrap();
-        db.create_user(&user("owner", "owner@test", "user"))
-            .await
-            .unwrap();
-        db.create_user(&user("outsider", "outsider@test", "user"))
-            .await
-            .unwrap();
+        for (id, email) in [
+            ("host", "host@test"),
+            ("owner", "owner@test"),
+            ("member", "member@test"),
+            ("outsider", "outsider@test"),
+        ] {
+            db.create_user(&user(id, email, "user")).await.unwrap();
+        }
         db.authorize_project_registration("project-a", "owner")
             .await
             .unwrap();
         db.authorize_project_registration("project-b", "owner")
             .await
             .unwrap();
+        db.add_project_member("owner", "project-a", "member")
+            .await
+            .unwrap();
         db.create_session(&Session {
-            id: "admin-instance".to_string(),
-            user_id: "admin".to_string(),
+            id: "host-instance".to_string(),
+            user_id: "host".to_string(),
             cli_client_id: None,
             working_dir: Some("/work/project-a".to_string()),
             hostname: Some("host-a".to_string()),
@@ -5969,72 +6549,100 @@ mod cluster_administration_tests {
         .await
         .unwrap();
 
-        // Active admin opens the project owned by another account because a
-        // session of that project runs under the admin's account.
+        // An ordinary account opens the project owned by another account
+        // because a session of that project runs under its own account. No
+        // role is involved.
         let project = db
-            .authorize_project_registration("project-a", "admin")
+            .authorize_project_registration("project-a", "host")
             .await
             .unwrap();
         assert_eq!(project.owner_user_id, "owner");
+        assert!(db
+            .project_in_user_cluster("project-a", "host")
+            .await
+            .unwrap());
 
-        // The admin cannot open a project that exists only in another
+        // Membership alone does not place a project in the member's cluster:
+        // the member reaches the project as a member, not as its operator.
+        assert!(db
+            .authorize_project_registration("project-a", "member")
+            .await
+            .is_ok());
+        assert!(!db
+            .project_in_user_cluster("project-a", "member")
+            .await
+            .unwrap());
+
+        // The host cannot open a project that exists only in another
         // account's cluster.
         assert!(db
-            .authorize_project_registration("project-b", "admin")
+            .authorize_project_registration("project-b", "host")
             .await
             .is_err());
+        assert!(!db
+            .project_in_user_cluster("project-b", "host")
+            .await
+            .unwrap());
 
-        // Ordinary non-member, non-admin is still rejected.
+        // Unrelated account is still rejected.
         assert!(db
             .authorize_project_registration("project-a", "outsider")
             .await
             .is_err());
 
-        // Suspended admin is rejected.
-        sqlx::query("UPDATE users SET account_status = 'suspended' WHERE id = 'admin'")
+        // Suspended account hosts nothing.
+        sqlx::query("UPDATE users SET account_status = 'suspended' WHERE id = 'host'")
             .execute(&db.pool)
             .await
             .unwrap();
         assert!(db
-            .authorize_project_registration("project-a", "admin")
+            .authorize_project_registration("project-a", "host")
             .await
             .is_err());
+        assert!(!db
+            .project_in_user_cluster("project-a", "host")
+            .await
+            .unwrap());
+        assert!(!db
+            .check_session_access("host-instance", "host")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
-    async fn cluster_admin_listings_stay_within_their_own_cluster() {
-        let db = database("admin-session-list").await;
+    async fn session_listings_stay_within_each_accounts_cluster() {
+        let db = database("cluster-session-list").await;
         db.run_migrations().await.unwrap();
-        db.create_user(&user("admin", "admin@test", "admin"))
-            .await
-            .unwrap();
-        db.create_user(&user("owner", "owner@test", "user"))
-            .await
-            .unwrap();
-        db.create_user(&user("member", "member@test", "user"))
-            .await
-            .unwrap();
-        db.create_user(&user("other", "other@test", "user"))
-            .await
-            .unwrap();
+        for (id, email) in [
+            ("host", "host@test"),
+            ("owner", "owner@test"),
+            ("member", "member@test"),
+            ("reader", "reader@test"),
+            ("other", "other@test"),
+        ] {
+            db.create_user(&user(id, email, "user")).await.unwrap();
+        }
         db.authorize_project_registration("project-a", "owner")
             .await
             .unwrap();
         db.add_project_member("owner", "project-a", "member")
             .await
             .unwrap();
+        db.add_project_member("owner", "project-a", "reader")
+            .await
+            .unwrap();
         db.authorize_project_registration("project-b", "other")
             .await
             .unwrap();
-        db.authorize_project_registration("project-c", "admin")
+        db.authorize_project_registration("project-c", "host")
             .await
             .unwrap();
         for (id, session_user, project_id) in [
             ("session-owner", "owner", "project-a"),
             ("session-member", "member", "project-a"),
-            ("session-admin-foreign", "admin", "project-b"),
+            ("session-host-foreign", "host", "project-b"),
             ("session-other", "other", "project-b"),
-            ("session-admin-own", "admin", "project-c"),
+            ("session-host-own", "host", "project-c"),
         ] {
             db.create_session(&Session {
                 id: id.to_string(),
@@ -6054,35 +6662,268 @@ mod cluster_administration_tests {
             .unwrap();
         }
 
-        // The admin sees projects they own and sessions running under their
-        // account — including a project owned by another account — but not
-        // unrelated projects in other accounts' clusters.
-        let admin_ids: Vec<String> = db
-            .get_sessions_for_user("admin")
+        // The host sees its own project and every session of the foreign
+        // project it hosts — the whole project runs on its machines — but no
+        // project that exists only in another account's cluster.
+        let host_ids: Vec<String> = db
+            .get_sessions_for_user("host")
             .await
             .unwrap()
             .into_iter()
             .map(|s| s.id)
             .collect();
-        assert_eq!(admin_ids.len(), 2);
-        assert!(admin_ids.contains(&"session-admin-foreign".to_string()));
-        assert!(admin_ids.contains(&"session-admin-own".to_string()));
+        assert_eq!(host_ids.len(), 3);
+        assert!(host_ids.contains(&"session-host-foreign".to_string()));
+        assert!(host_ids.contains(&"session-other".to_string()));
+        assert!(host_ids.contains(&"session-host-own".to_string()));
+        assert!(!host_ids.contains(&"session-owner".to_string()));
         assert!(db
-            .get_shared_sessions_for_user("admin")
+            .get_shared_sessions_for_user("host")
             .await
             .unwrap()
             .is_empty());
 
-        // Ordinary member sees the shared project sessions and nothing else.
-        assert!(db.get_sessions_for_user("member").await.unwrap().is_empty());
-        let shared_ids: Vec<String> = db
+        // A member that ran the project on its own machine hosts it, so the
+        // project moves from its shared list to its own list. The union the
+        // web renders is unchanged either way.
+        let member_ids: Vec<String> = db
+            .get_sessions_for_user("member")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(member_ids.len(), 2);
+        assert!(db
             .get_shared_sessions_for_user("member")
+            .await
+            .unwrap()
+            .is_empty());
+
+        // A member that never ran it keeps reaching it through membership
+        // alone, and does not host it.
+        assert!(db.get_sessions_for_user("reader").await.unwrap().is_empty());
+        let shared_ids: Vec<String> = db
+            .get_shared_sessions_for_user("reader")
             .await
             .unwrap()
             .into_iter()
             .map(|(s, _, _)| s.id)
             .collect();
         assert_eq!(shared_ids.len(), 2);
+        assert!(db
+            .check_session_access("session-owner", "reader")
+            .await
+            .unwrap());
+        assert!(!db
+            .project_in_user_cluster("project-a", "reader")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn cluster_defaults_narrow_but_never_widen_effective_policy() {
+        let db = database("cluster-policy-narrowing").await;
+        db.run_migrations().await.unwrap();
+        for (id, email) in [
+            ("host", "host@test"),
+            ("owner", "owner@test"),
+            ("second", "second@test"),
+        ] {
+            db.create_user(&user(id, email, "user")).await.unwrap();
+        }
+        db.authorize_project_registration("project-a", "owner")
+            .await
+            .unwrap();
+        db.set_deployment_default_policy(
+            "owner",
+            true,
+            vec![
+                "agent:claude:official:default".to_string(),
+                "agent:codex:official:default".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // With no cluster row the effective policy is exactly the deployment
+        // default: the new level cannot change an existing project.
+        let baseline = db.get_effective_project_policy("project-a").await.unwrap();
+        assert!(baseline.team_available);
+        assert_eq!(baseline.allowed_launch_profiles.len(), 2);
+        assert!(db.get_cluster_default_policy("owner").await.unwrap().is_none());
+
+        // A hosting account's cluster default narrows the project even though
+        // another account owns it.
+        db.create_session(&Session {
+            id: "host-instance".to_string(),
+            user_id: "host".to_string(),
+            cli_client_id: None,
+            working_dir: Some("/work/project-a".to_string()),
+            hostname: Some("host-a".to_string()),
+            status: "active".to_string(),
+            created_at: None,
+            updated_at: None,
+            is_paused: false,
+            project_id: Some("project-a".to_string()),
+            git_remote: None,
+            git_remote_url: None,
+        })
+        .await
+        .unwrap();
+        db.set_cluster_default_policy(
+            "host",
+            "host",
+            Some(false),
+            Some(vec!["agent:codex:official:default".to_string()]),
+        )
+        .await
+        .unwrap();
+        let narrowed = db.get_effective_project_policy("project-a").await.unwrap();
+        assert!(!narrowed.team_available);
+        assert_eq!(
+            narrowed.allowed_launch_profiles,
+            vec!["agent:codex:official:default".to_string()]
+        );
+        assert!(narrowed.version > baseline.version);
+
+        // A cluster default cannot exceed the deployment default.
+        assert!(db
+            .set_cluster_default_policy(
+                "host",
+                "host",
+                Some(true),
+                Some(vec!["agent:opencode:official:default".to_string()]),
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("cannot allow launch profile"));
+
+        // A project hosted in two clusters gets the intersection of both.
+        db.create_session(&Session {
+            id: "second-instance".to_string(),
+            user_id: "second".to_string(),
+            cli_client_id: None,
+            working_dir: Some("/work/project-a".to_string()),
+            hostname: Some("host-b".to_string()),
+            status: "active".to_string(),
+            created_at: None,
+            updated_at: None,
+            is_paused: false,
+            project_id: Some("project-a".to_string()),
+            git_remote: None,
+            git_remote_url: None,
+        })
+        .await
+        .unwrap();
+        db.set_cluster_default_policy(
+            "second",
+            "second",
+            None,
+            Some(vec!["agent:claude:official:default".to_string()]),
+        )
+        .await
+        .unwrap();
+        let intersected = db.get_effective_project_policy("project-a").await.unwrap();
+        assert!(intersected.allowed_launch_profiles.is_empty());
+
+        // An override cannot re-open a launch profile a hosting cluster closed.
+        assert!(db
+            .set_project_policy_override(
+                "owner",
+                "project-a",
+                Some(true),
+                Some(vec!["agent:codex:official:default".to_string()]),
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("cannot allow launch profile"));
+
+        // Team availability is a default rather than a ceiling: the lowest
+        // level that states a value wins, so one project can still run team
+        // mode inside a cluster whose default leaves it off.
+        let team_on = db
+            .set_project_policy_override("owner", "project-a", Some(true), None)
+            .await
+            .unwrap();
+        assert!(team_on.team_available);
+        assert!(team_on.allowed_launch_profiles.is_empty());
+
+        // A project outside both clusters is untouched by their defaults.
+        db.authorize_project_registration("project-b", "owner")
+            .await
+            .unwrap();
+        let untouched = db.get_effective_project_policy("project-b").await.unwrap();
+        assert!(untouched.team_available);
+        assert_eq!(untouched.allowed_launch_profiles.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cluster_project_listing_is_scoped_to_the_hosting_account() {
+        let db = database("cluster-project-listing").await;
+        db.run_migrations().await.unwrap();
+        for (id, email) in [
+            ("host", "host@test"),
+            ("owner", "owner@test"),
+            ("other", "other@test"),
+        ] {
+            db.create_user(&user(id, email, "user")).await.unwrap();
+        }
+        db.authorize_project_registration("project-a", "owner")
+            .await
+            .unwrap();
+        db.authorize_project_registration("project-b", "other")
+            .await
+            .unwrap();
+        db.create_session(&Session {
+            id: "host-instance".to_string(),
+            user_id: "host".to_string(),
+            cli_client_id: None,
+            working_dir: Some("/work/project-a".to_string()),
+            hostname: Some("host-a".to_string()),
+            status: "active".to_string(),
+            created_at: None,
+            updated_at: None,
+            is_paused: false,
+            project_id: Some("project-a".to_string()),
+            git_remote: None,
+            git_remote_url: None,
+        })
+        .await
+        .unwrap();
+
+        let hosted = db
+            .list_cluster_projects("host", None, 50, 0)
+            .await
+            .unwrap();
+        assert_eq!(hosted.len(), 1);
+        assert_eq!(hosted[0].id, "project-a");
+        assert_eq!(hosted[0].owner_email, "owner@test");
+        assert_eq!(hosted[0].hosting_emails, vec!["host@test".to_string()]);
+
+        assert!(db
+            .list_cluster_projects("other", None, 50, 0)
+            .await
+            .unwrap()
+            .iter()
+            .all(|project| project.id == "project-b"));
+        assert_eq!(db.list_admin_projects(None, 50, 0).await.unwrap().len(), 2);
+
+        let clusters = db.cluster_summaries().await.unwrap();
+        let host = clusters
+            .iter()
+            .find(|cluster| cluster.user_id == "host")
+            .unwrap();
+        assert_eq!(host.hosted_project_count, 1);
+        assert_eq!(host.owned_project_count, 0);
+        let owner = clusters
+            .iter()
+            .find(|cluster| cluster.user_id == "owner")
+            .unwrap();
+        assert_eq!(owner.hosted_project_count, 1);
+        assert_eq!(owner.owned_project_count, 1);
     }
 }
 

@@ -32,6 +32,8 @@ pub struct AppState {
     pub device_codes: Arc<DashMap<String, DeviceCodeState>>,
     pub password_reset_tokens: Arc<DashMap<String, PasswordResetState>>,
     pub mobile_auth_attempts: Arc<DashMap<String, Vec<DateTime<Utc>>>>,
+    /// Failed system-administration sign-ins per source: (failures, last try).
+    pub system_admin_auth_attempts: Arc<DashMap<String, (u32, DateTime<Utc>)>>,
     pub mobile_metrics: Arc<MobileMetrics>,
     pub pane_work_summaries: Arc<PaneWorkSummaryService>,
     mobile_task_launch_gates: Arc<DashMap<Uuid, Arc<Mutex<()>>>>,
@@ -64,6 +66,7 @@ impl AppState {
             device_codes: Arc::new(DashMap::new()),
             password_reset_tokens: Arc::new(DashMap::new()),
             mobile_auth_attempts: Arc::new(DashMap::new()),
+            system_admin_auth_attempts: Arc::new(DashMap::new()),
             mobile_metrics: Arc::new(MobileMetrics::default()),
             pane_work_summaries,
             mobile_task_launch_gates: Arc::new(DashMap::new()),

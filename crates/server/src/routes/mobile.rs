@@ -519,6 +519,7 @@ mod tests {
                 exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
                 device_session_id: None,
                 token_kind: None,
+                credential_version: None,
             },
             &EncodingKey::from_secret(state.config.auth.jwt_secret.as_bytes()),
         )

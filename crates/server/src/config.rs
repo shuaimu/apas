@@ -13,6 +13,55 @@ pub struct Config {
     pub mobile: MobileConfig,
     #[serde(default)]
     pub summaries: SummaryConfig,
+    #[serde(default)]
+    pub system_admin: SystemAdminConfig,
+}
+
+/// The deployment's single system administrator. This is a credential, not an
+/// account: it lives outside the `users` table, cannot be granted through any
+/// UI, and its token authorizes nothing but `/admin/*`. The bootstrap secret
+/// is used only to seed the credential when none is stored yet; rotate it from
+/// the administration surface after the first sign-in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemAdminConfig {
+    #[serde(default = "default_system_admin_username")]
+    pub username: String,
+    #[serde(default)]
+    pub bootstrap_password: String,
+    #[serde(default = "default_system_admin_token_expiry_minutes")]
+    pub token_expiry_minutes: u64,
+    #[serde(default = "default_system_admin_max_failures")]
+    pub max_failed_attempts: u32,
+    #[serde(default = "default_system_admin_lockout_seconds")]
+    pub lockout_seconds: u64,
+}
+
+fn default_system_admin_username() -> String {
+    "admin".to_string()
+}
+
+fn default_system_admin_token_expiry_minutes() -> u64 {
+    120
+}
+
+fn default_system_admin_max_failures() -> u32 {
+    5
+}
+
+fn default_system_admin_lockout_seconds() -> u64 {
+    300
+}
+
+impl Default for SystemAdminConfig {
+    fn default() -> Self {
+        Self {
+            username: default_system_admin_username(),
+            bootstrap_password: String::new(),
+            token_expiry_minutes: default_system_admin_token_expiry_minutes(),
+            max_failed_attempts: default_system_admin_max_failures(),
+            lockout_seconds: default_system_admin_lockout_seconds(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,18 +209,10 @@ pub struct DatabaseConfig {
 pub struct AuthConfig {
     pub jwt_secret: String,
     pub token_expiry_hours: u64,
-    /// One-time migration/bootstrap identity. Consulted only while the
-    /// database has no active cluster administrator.
-    #[serde(default = "default_bootstrap_admin_email")]
-    pub bootstrap_admin_email: String,
     #[serde(default = "default_mobile_access_expiry_minutes")]
     pub mobile_access_expiry_minutes: u64,
     #[serde(default = "default_mobile_refresh_expiry_days")]
     pub mobile_refresh_expiry_days: u64,
-}
-
-fn default_bootstrap_admin_email() -> String {
-    "shuai@cs.stonybrook.edu".to_string()
 }
 
 fn default_mobile_access_expiry_minutes() -> u64 {
@@ -239,13 +280,13 @@ impl Default for Config {
             auth: AuthConfig {
                 jwt_secret: "change-me-in-production".to_string(),
                 token_expiry_hours: 876000, // ~100 years (never expire)
-                bootstrap_admin_email: default_bootstrap_admin_email(),
                 mobile_access_expiry_minutes: default_mobile_access_expiry_minutes(),
                 mobile_refresh_expiry_days: default_mobile_refresh_expiry_days(),
             },
             smtp: SmtpConfig::default(),
             mobile: MobileConfig::default(),
             summaries: SummaryConfig::default(),
+            system_admin: SystemAdminConfig::default(),
         }
     }
 }
