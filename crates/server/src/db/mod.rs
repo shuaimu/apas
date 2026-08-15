@@ -2423,11 +2423,11 @@ impl Database {
             ProjectLifecycle::Suspended => anyhow::bail!("project is suspended"),
             ProjectLifecycle::Deleting => anyhow::bail!("project deletion is in progress"),
         }
-        // Cluster administrators access every project in the cluster without
-        // an ownership or membership row. Ordinary users still require one.
-        if user.role() == ClusterRole::Admin {
-            return Ok(project);
-        }
+        // Cluster administrators additionally control projects that are
+        // present in their own virtual cluster: a project the administrator
+        // has a session for is openable even when another account owns it.
+        // Projects that exist only in other accounts' clusters keep their
+        // owner/member gating.
         let has_access = project.owner_user_id == user_id
             || sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM project_members WHERE project_id = ? AND user_id = ?",
@@ -2437,6 +2437,18 @@ impl Database {
             .fetch_one(&self.pool)
             .await?
                 > 0;
+        if !has_access && user.role() == ClusterRole::Admin {
+            let in_cluster = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sessions WHERE COALESCE(project_id, id) = ? AND user_id = ?",
+            )
+            .bind(project_id)
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await?
+                > 0;
+            anyhow::ensure!(in_cluster, "user is not a member of this project");
+            return Ok(project);
+        }
         anyhow::ensure!(has_access, "user is not a member of this project");
         Ok(project)
     }
@@ -3509,7 +3521,9 @@ impl Database {
     }
 
     pub async fn get_sessions_for_user(&self, user_id: &str) -> Result<Vec<Session>> {
-        // Cluster administrators see every session in the cluster.
+        // Cluster administrators see the sessions of their own virtual
+        // cluster: projects they own, projects they belong to, and sessions
+        // created under their account. Other accounts' projects stay out.
         let admin = self.user_is_cluster_admin(user_id).await.unwrap_or(false);
         let sessions = if admin {
             sqlx::query_as::<_, Session>(
@@ -3521,10 +3535,19 @@ impl Database {
                        s.git_remote, s.git_remote_url
                 FROM sessions s
                 JOIN projects p ON p.id = COALESCE(s.project_id, s.id)
+                WHERE p.owner_user_id = ?
+                   OR s.user_id = ?
+                   OR EXISTS (
+                       SELECT 1 FROM project_members pm
+                       WHERE pm.project_id = p.id AND pm.user_id = ?
+                   )
                 ORDER BY s.created_at DESC
                 LIMIT 50
                 "#,
             )
+            .bind(user_id)
+            .bind(user_id)
+            .bind(user_id)
             .fetch_all(&self.pool)
             .await?
         } else {
@@ -3763,8 +3786,9 @@ impl Database {
         &self,
         user_id: &str,
     ) -> Result<Vec<(Session, String, String)>> {
-        // Cluster administrators already receive the full session list from
-        // get_sessions_for_user; skip the membership list to avoid doubles.
+        // Cluster administrators already receive their full cluster-scoped
+        // session list from get_sessions_for_user; skip the membership list
+        // to avoid doubles.
         if self.user_is_cluster_admin(user_id).await.unwrap_or(false) {
             return Ok(Vec::new());
         }
@@ -3855,22 +3879,27 @@ impl Database {
     }
 
     pub async fn check_session_access(&self, session_id: &str, user_id: &str) -> Result<bool> {
-        // Cluster administrators can attach to any active session in the
-        // cluster without an ownership or membership row.
+        // Cluster administrators can attach to sessions running under their
+        // own account even when another account owns the project. Owner and
+        // member access is evaluated below for everyone.
         if self.user_is_cluster_admin(user_id).await.unwrap_or(false) {
-            let result = sqlx::query_scalar::<_, i64>(
+            let own_session = sqlx::query_scalar::<_, i64>(
                 r#"
                 SELECT COUNT(*)
                 FROM sessions s
                 JOIN projects p ON p.id = COALESCE(s.project_id, s.id)
                 WHERE s.id = ?
                   AND p.lifecycle_status = 'active'
+                  AND s.user_id = ?
                 "#,
             )
             .bind(session_id)
+            .bind(user_id)
             .fetch_one(&self.pool)
             .await?;
-            return Ok(result > 0);
+            if own_session > 0 {
+                return Ok(true);
+            }
         }
         let result = sqlx::query_scalar::<_, i64>(
             r#"
@@ -5311,10 +5340,7 @@ mod cluster_administration_tests {
         db.create_user(&user("member", "member@test", "user"))
             .await
             .unwrap();
-        db.create_user(&user("stranger", "stranger@test", "user"))
-            .await
-            .unwrap();
-        db.create_user(&user("admin", "admin@test", "admin"))
+        db.create_user(&user("stranger", "stranger@test", "admin"))
             .await
             .unwrap();
         db.authorize_project_registration("project-a", "owner")
@@ -5342,20 +5368,16 @@ mod cluster_administration_tests {
             .unwrap();
             assert!(db.check_session_access(id, "owner").await.unwrap());
             assert!(db.check_session_access(id, "member").await.unwrap());
-            // Cluster administrators access project content without membership.
-            assert!(db.check_session_access(id, "admin").await.unwrap());
-            // Ordinary non-members remain denied.
+            // Cluster administration does not reach projects outside the
+            // administrator's own virtual cluster: no session of this project
+            // runs under the administrator's account.
             assert!(!db.check_session_access(id, "stranger").await.unwrap());
         }
-        db.set_project_lifecycle("admin", "project-a", ProjectLifecycle::Suspended)
+        db.set_project_lifecycle("stranger", "project-a", ProjectLifecycle::Suspended)
             .await
             .unwrap();
         assert!(!db
             .check_session_access("instance-a", "owner")
-            .await
-            .unwrap());
-        assert!(!db
-            .check_session_access("instance-a", "admin")
             .await
             .unwrap());
         assert!(db
@@ -5912,7 +5934,7 @@ mod cluster_administration_tests {
     }
 
     #[tokio::test]
-    async fn cluster_admins_open_any_project_without_membership() {
+    async fn cluster_admins_open_projects_present_in_their_own_cluster() {
         let db = database("admin-project-access").await;
         db.run_migrations().await.unwrap();
         db.create_user(&user("admin", "admin@test", "admin"))
@@ -5927,13 +5949,40 @@ mod cluster_administration_tests {
         db.authorize_project_registration("project-a", "owner")
             .await
             .unwrap();
+        db.authorize_project_registration("project-b", "owner")
+            .await
+            .unwrap();
+        db.create_session(&Session {
+            id: "admin-instance".to_string(),
+            user_id: "admin".to_string(),
+            cli_client_id: None,
+            working_dir: Some("/work/project-a".to_string()),
+            hostname: Some("host-a".to_string()),
+            status: "active".to_string(),
+            created_at: None,
+            updated_at: None,
+            is_paused: false,
+            project_id: Some("project-a".to_string()),
+            git_remote: None,
+            git_remote_url: None,
+        })
+        .await
+        .unwrap();
 
-        // Active admin opens the project without any ownership or membership row.
+        // Active admin opens the project owned by another account because a
+        // session of that project runs under the admin's account.
         let project = db
             .authorize_project_registration("project-a", "admin")
             .await
             .unwrap();
         assert_eq!(project.owner_user_id, "owner");
+
+        // The admin cannot open a project that exists only in another
+        // account's cluster.
+        assert!(db
+            .authorize_project_registration("project-b", "admin")
+            .await
+            .is_err());
 
         // Ordinary non-member, non-admin is still rejected.
         assert!(db
@@ -5953,7 +6002,7 @@ mod cluster_administration_tests {
     }
 
     #[tokio::test]
-    async fn cluster_admins_see_all_sessions_without_shared_duplicates() {
+    async fn cluster_admin_listings_stay_within_their_own_cluster() {
         let db = database("admin-session-list").await;
         db.run_migrations().await.unwrap();
         db.create_user(&user("admin", "admin@test", "admin"))
@@ -5965,48 +6014,75 @@ mod cluster_administration_tests {
         db.create_user(&user("member", "member@test", "user"))
             .await
             .unwrap();
+        db.create_user(&user("other", "other@test", "user"))
+            .await
+            .unwrap();
         db.authorize_project_registration("project-a", "owner")
             .await
             .unwrap();
         db.add_project_member("owner", "project-a", "member")
             .await
             .unwrap();
-        db.create_session(&Session {
-            id: "session-a".to_string(),
-            user_id: "owner".to_string(),
-            cli_client_id: None,
-            working_dir: Some("/work/project-a".to_string()),
-            hostname: Some("host-a".to_string()),
-            status: "active".to_string(),
-            created_at: None,
-            updated_at: None,
-            is_paused: false,
-            project_id: Some("project-a".to_string()),
-            git_remote: None,
-            git_remote_url: None,
-        })
-        .await
-        .unwrap();
+        db.authorize_project_registration("project-b", "other")
+            .await
+            .unwrap();
+        db.authorize_project_registration("project-c", "admin")
+            .await
+            .unwrap();
+        for (id, session_user, project_id) in [
+            ("session-owner", "owner", "project-a"),
+            ("session-member", "member", "project-a"),
+            ("session-admin-foreign", "admin", "project-b"),
+            ("session-other", "other", "project-b"),
+            ("session-admin-own", "admin", "project-c"),
+        ] {
+            db.create_session(&Session {
+                id: id.to_string(),
+                user_id: session_user.to_string(),
+                cli_client_id: None,
+                working_dir: Some(format!("/work/{id}")),
+                hostname: Some("host-a".to_string()),
+                status: "active".to_string(),
+                created_at: None,
+                updated_at: None,
+                is_paused: false,
+                project_id: Some(project_id.to_string()),
+                git_remote: None,
+                git_remote_url: None,
+            })
+            .await
+            .unwrap();
+        }
 
-        // Ordinary member sees the session through the shared list, not the
-        // owned list.
-        assert!(db.get_sessions_for_user("member").await.unwrap().is_empty());
-        assert_eq!(
-            db.get_shared_sessions_for_user("member").await.unwrap().len(),
-            1
-        );
-
-        // Admin sees every session through the owned list with the real owner
-        // surfaced, and nothing is duplicated in the shared list.
-        let admin_sessions = db.get_sessions_for_user("admin").await.unwrap();
-        assert_eq!(admin_sessions.len(), 1);
-        assert_eq!(admin_sessions[0].id, "session-a");
-        assert_eq!(admin_sessions[0].user_id, "owner");
+        // The admin sees projects they own and sessions running under their
+        // account — including a project owned by another account — but not
+        // unrelated projects in other accounts' clusters.
+        let admin_ids: Vec<String> = db
+            .get_sessions_for_user("admin")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(admin_ids.len(), 2);
+        assert!(admin_ids.contains(&"session-admin-foreign".to_string()));
+        assert!(admin_ids.contains(&"session-admin-own".to_string()));
         assert!(db
             .get_shared_sessions_for_user("admin")
             .await
             .unwrap()
             .is_empty());
+
+        // Ordinary member sees the shared project sessions and nothing else.
+        assert!(db.get_sessions_for_user("member").await.unwrap().is_empty());
+        let shared_ids: Vec<String> = db
+            .get_shared_sessions_for_user("member")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(s, _, _)| s.id)
+            .collect();
+        assert_eq!(shared_ids.len(), 2);
     }
 }
 

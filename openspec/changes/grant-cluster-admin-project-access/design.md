@@ -1,40 +1,41 @@
 ## Context
 
-See proposal.md - Why. Enforcement today funnels through a few DB/route choke points:
+See proposal.md - Why. Enforcement today funnels through a few DB choke points:
 
-- `db::authorize_project_registration(project_id, user_id)` (crates/server/src/db/mod.rs:2392) is the shared gate for CLI `SessionStart` (routes/ws_cli.rs:482) and mobile bootstrap (routes/mobile.rs:278). It creates-or-ignores the project row and then requires the caller to be owner or member.
-- Web bootstrap and session lists call `db::get_sessions_for_user` (owner-scoped, db/mod.rs:3498) and `db::get_shared_sessions_for_user` (member-scoped, db/mod.rs:3729).
-- Web machine operations gate on `sessions::get_machines_for_user` (in-memory, session/mod.rs:1511) plus `get_shared_project_access_refs` in routes/ws_web.rs (e.g. the `StartMachineProjectCli` allowed check at ws_web.rs:3293).
-- `authz::require_cluster_admin` already exists and the user's cluster role is already loaded (`User::role() -> ClusterRole`), so no new auth primitives are needed.
+- `db::authorize_project_registration(project_id, user_id)` (crates/server/src/db/mod.rs) is the shared gate for CLI `SessionStart` (routes/ws_cli.rs:482) and mobile bootstrap (routes/mobile.rs:278). It creates-or-ignores the project row and then requires the caller to be owner or member.
+- Web attach and control paths check `db::check_session_access(session_id, user_id)`; web bootstrap and session lists call `db::get_sessions_for_user` (owner-scoped) and `db::get_shared_sessions_for_user` (member-scoped).
+- Machine listings already follow the same model as the rest of the change: `get_machines_for_user` returns only machines whose daemon registered under the requester's account, which is exactly "the requester's own virtual cluster". No machine-path change is needed.
+- `User::role() -> ClusterRole` already exists, so no new auth primitives are needed.
 
 ## Goals / Non-Goals
 
 **Goals:**
 
-- Active cluster admins pass project content authorization everywhere without owner/member rows.
-- Ordinary users keep exactly today's gating.
-- Suspended admin accounts stay denied.
-- Keep the change readable and testable: the admin branch lives in the DB authorization helpers, not scattered per route.
+- Active cluster admins pass project content authorization for projects present in their own virtual cluster: projects they own, projects they belong to, or projects with at least one session created under their account.
+- Admin listings reflect the same boundary: no other users' clusters leak into the admin's sidebar.
+- Ordinary users keep exactly today's gating. Suspended admin accounts stay denied.
 
 **Non-Goals:**
 
+- Granting admins blanket access to every project in the deployment (rejected: the "cluster" is the admin's virtual cluster, not the physical cluster; other users' projects stay out).
 - Changing owner/member management semantics (transfer, add/remove, policy, lifecycle stay as-is).
-- Changing web UI rendering beyond what the session/machine lists already support.
-- Any data migration: no schema or row changes; cluster role is read live from `users`.
+- Any data migration: no schema or row changes; cluster role and session authorship are read live.
 
 ## Decisions
 
-1. **Admin bypass inside `authorize_project_registration`.** After the existing active-account and project-lifecycle checks, short-circuit the owner/member test when `user.role() == ClusterRole::Admin`. Rationale: it is the single shared gate for CLI and mobile content access; one branch fixes both paths. Alternative considered: bypass only in ws_cli.rs — rejected because it leaves mobile and future callers inconsistent with the spec.
+1. **Admin bypass inside `authorize_project_registration`, gated on session authorship.** After the existing active-account and project-lifecycle checks, an admin who is neither owner nor member passes only when a session row exists with `COALESCE(project_id, id) = project` and `user_id = admin` — i.e. the project is present in the admin's virtual cluster. Alternative considered: blanket admin return (first implementation) — rejected because it leaked every other user's projects into the admin's listings and access.
 
-2. **Session listing via role-aware DB queries.** Add a private helper `user_is_cluster_admin(user_id)` and branch inside `get_sessions_for_user` (admins: all sessions ordered by recency, same LIMIT) and `get_shared_sessions_for_user` (admins: return empty so bootstrap does not double-list). Rationale: callers keep their shapes; the admin distinction stays in one layer. Alternative considered: fetch role in each route and pick a different function — rejected as it would spread the branch across ws_web and mobile call sites.
+2. **Session listing via cluster-scoped admin query.** For admins, `get_sessions_for_user` returns sessions where the admin owns the project, belongs to it, or authored the session (`s.user_id = ?`); `get_shared_sessions_for_user` returns empty for admins so the union does not double-list. Callers keep their shapes. Alternative considered: route-level role branches — rejected as spreading the distinction across call sites.
 
-3. **Machine access via explicit admin check at the web control plane.** `get_machines_for_user` is in-memory and has no DB access; add an admin path at its call sites in ws_web.rs (bootstrap machine list and `StartMachineProjectCli` allowed check) using `state.db.get_user_by_id(&uid)` role lookup. Alternative considered: pushing cluster roles into the in-memory session manager at register time — rejected because role changes would require invalidation plumbing.
+3. **`check_session_access` evaluates admin session authorship as an additional grant, not an early return.** The admin branch returns true only when the target session's row was created under the admin's account and the project is active; otherwise evaluation falls through to the regular owner/member check, so an admin who owns a project still reaches member-run sessions through the owner branch.
 
-4. **Project creation semantics unchanged for admins.** `authorize_project_registration` still INSERT-OR-IGNOREs the project row with the caller as owner when the project does not exist yet; the admin bypass only skips the membership assertion afterwards. This keeps first-registration-owns behavior for every account type.
+4. **No changes to machine paths.** `get_machines_for_user`, `list_accessible_machines_for_user`, and the `StartMachineProjectCli`/`StopMachineProjectCli` allowed checks are already scoped to the requester's own daemon registrations (their virtual cluster), which matches the corrected model. The earlier `get_all_machines` addition is withdrawn.
+
+5. **Project creation semantics unchanged.** `authorize_project_registration` still INSERT-OR-IGNOREs the project row with the caller as owner when the project does not exist yet; first-registration-owns behavior is kept for every account type.
 
 ## Risks / Trade-offs
 
-- [Wider blast radius than the one reported rejection] Admin content access now applies to web/mobile too, not just the CLI. → This is exactly the spec the owner asked for; mitigation is comprehensive tests pinning ordinary-user behavior.
-- [Admin bypass could mask a copied `.apas` collision] An admin launching a directory that shares another user's project id will now attach to that project's history instead of being rejected. → Acceptable: that is the intended semantics of canonical project identity plus admin access.
-- [Suspended-admin edge] The bypass must not fire for suspended accounts. → Keep the existing `user.is_active()` ensure at the top of `authorize_project_registration` and mirror it in the web role check.
-- [No rollback data] If this is later reversed, no migration is needed; behavior-only change. → Standard binary rollback suffices.
+- [Admin copying a `.apas` from another account's project cannot adopt it] First launch is rejected until the admin regenerates the `.apas` or gains membership, because no session of that project exists under the admin yet. → Accepted: this is the intended boundary between virtual clusters; the existing "already owned by another user" hint and the membership invite flow cover the remedy.
+- [Session authorship is historical evidence, not a current grant] A project stays in the admin's cluster even after the admin's last session for it ends. → Accepted and intended: the virtual cluster is defined by the sessions created under the account; removal is an explicit membership/cleanup operation.
+- [Suspended-admin edge] The bypass must not fire for suspended accounts. → The existing `user.is_active()` ensure at the top of `authorize_project_registration` and the active-account read in `user_is_cluster_admin` cover this.
+- [No rollback data] Behavior-only change. → Standard binary rollback suffices.
