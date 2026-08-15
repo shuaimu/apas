@@ -107,6 +107,20 @@ describe("Sidebar project list", () => {
     });
   });
 
+  it("links to the account's own cluster and never to system administration", () => {
+    seedSidebarState({ sessions: [] });
+    render(<Sidebar />);
+
+    const cluster = screen.getByRole("link", { name: /My Cluster/ });
+    expect(cluster.getAttribute("href")).toBe("/machines");
+    // System administration has its own URL and its own credential. Nothing in
+    // the ordinary interface advertises it, for any account.
+    expect(screen.queryByRole("link", { name: /Administration/i })).toBeNull();
+    expect(
+      screen.queryAllByRole("link").some((link) => link.getAttribute("href") === "/admin"),
+    ).toBe(false);
+  });
+
   it("deduplicates by project id and sorts active CLI and daemon projects before inactive history", () => {
     seedSidebarState({
       cliClients: [

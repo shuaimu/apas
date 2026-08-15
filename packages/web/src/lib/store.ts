@@ -591,7 +591,6 @@ interface AppState {
   token: string | null;
   userId: string | null;
   userEmail: string | null;
-  clusterRole: "admin" | "user" | null;
   accountStatus: "active" | "suspended" | null;
   serverVersion: string | null;
   negotiatedCapabilities: Set<string>;
@@ -747,13 +746,11 @@ interface AppState {
     token: string,
     userId: string,
     userEmail: string,
-    clusterRole?: "admin" | "user",
     accountStatus?: "active" | "suspended",
   ) => void;
   setUserEmail: (userEmail: string) => void;
   setClusterIdentity: (
     userEmail: string,
-    clusterRole: "admin" | "user",
     accountStatus: "active" | "suspended",
   ) => void;
   logout: () => void;
@@ -1100,9 +1097,6 @@ export const useStore = create<AppState>((set, get) => ({
   token: typeof window !== 'undefined' ? localStorage.getItem("apas_token") : null,
   userId: typeof window !== 'undefined' ? localStorage.getItem("apas_user_id") : null,
   userEmail: typeof window !== 'undefined' ? localStorage.getItem("apas_user_email") : null,
-  clusterRole: typeof window !== 'undefined'
-    ? (localStorage.getItem("apas_cluster_role") as "admin" | "user" | null)
-    : null,
   accountStatus: typeof window !== 'undefined'
     ? (localStorage.getItem("apas_account_status") as "active" | "suspended" | null)
     : null,
@@ -1172,13 +1166,16 @@ export const useStore = create<AppState>((set, get) => ({
   usageLimits: new Map(),
   machines: [],
 
-  login: (token, userId, userEmail, clusterRole = "user", accountStatus = "active") => {
+  // The server still returns `cluster_role` for older clients, but it confers
+  // nothing: an account administers the virtual cluster it hosts, and system
+  // administration is a separate credential on a separate surface. It is
+  // deliberately not stored.
+  login: (token, userId, userEmail, accountStatus = "active") => {
     localStorage.setItem("apas_token", token);
     localStorage.setItem("apas_user_id", userId);
     localStorage.setItem("apas_user_email", userEmail);
-    localStorage.setItem("apas_cluster_role", clusterRole);
     localStorage.setItem("apas_account_status", accountStatus);
-    set({ token, userId, userEmail, clusterRole, accountStatus, isAuthenticated: true });
+    set({ token, userId, userEmail, accountStatus, isAuthenticated: true });
   },
 
   setUserEmail: (userEmail: string) => {
@@ -1186,17 +1183,18 @@ export const useStore = create<AppState>((set, get) => ({
     set({ userEmail });
   },
 
-  setClusterIdentity: (userEmail, clusterRole, accountStatus) => {
+  setClusterIdentity: (userEmail, accountStatus) => {
     localStorage.setItem("apas_user_email", userEmail);
-    localStorage.setItem("apas_cluster_role", clusterRole);
     localStorage.setItem("apas_account_status", accountStatus);
-    set({ userEmail, clusterRole, accountStatus });
+    set({ userEmail, accountStatus });
   },
 
   logout: () => {
     localStorage.removeItem("apas_token");
     localStorage.removeItem("apas_user_id");
     localStorage.removeItem("apas_user_email");
+    // Cleared, not stored: older builds persisted a cluster role here and it
+    // no longer means anything.
     localStorage.removeItem("apas_cluster_role");
     localStorage.removeItem("apas_account_status");
     localStorage.removeItem("apas_session_id");
@@ -1219,7 +1217,6 @@ export const useStore = create<AppState>((set, get) => ({
       token: null,
       userId: null,
       userEmail: null,
-      clusterRole: null,
       accountStatus: null,
       isAuthenticated: false,
       connected: false,
@@ -3862,7 +3859,6 @@ export function handleServerMessage(
         isAuthenticated: true,
         userId: data.user_id as string,
         userEmail: (data.user_email as string | undefined) ?? get().userEmail,
-        clusterRole: (data.cluster_role as "admin" | "user" | undefined) ?? null,
         accountStatus:
           (data.account_status as "active" | "suspended" | undefined) ?? null,
         serverVersion: (data.server_version as string | undefined) ?? null,
@@ -3874,9 +3870,6 @@ export function handleServerMessage(
       });
       if (data.user_email) {
         localStorage.setItem("apas_user_email", data.user_email as string);
-      }
-      if (data.cluster_role) {
-        localStorage.setItem("apas_cluster_role", data.cluster_role as string);
       }
       if (data.account_status) {
         localStorage.setItem("apas_account_status", data.account_status as string);
@@ -4037,7 +4030,6 @@ export function handleServerMessage(
       localStorage.removeItem("apas_token");
       localStorage.removeItem("apas_user_id");
       localStorage.removeItem("apas_user_email");
-      localStorage.removeItem("apas_cluster_role");
       localStorage.removeItem("apas_account_status");
       set({
         connected: false,
@@ -4045,7 +4037,6 @@ export function handleServerMessage(
         token: null,
         userId: null,
         userEmail: null,
-        clusterRole: null,
         accountStatus: null,
         serverVersion: null,
       });

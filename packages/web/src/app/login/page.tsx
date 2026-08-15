@@ -45,12 +45,12 @@ function LoginForm() {
         throw new Error(data.message || "Login failed");
       }
 
-      const { token, user_id, user_email, cluster_role, account_status } = await res.json();
+      const { token, user_id, user_email, account_status } = await res.json();
 
       // Store auth in app state + localStorage
       // If server doesn't return user_email (older backend), use the login email input.
-      if (cluster_role && account_status) {
-        login(token, user_id, user_email || email, cluster_role, account_status);
+      if (account_status) {
+        login(token, user_id, user_email || email, account_status);
       } else {
         login(token, user_id, user_email || email);
       }

@@ -99,7 +99,7 @@ interface ShareListState {
 }
 
 export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
-  const { cliClients, sessions, machines, attachSession, forgetProject, refreshCliClients, listSessions, sessionId, connected, token, clusterRole } = useStore();
+  const { cliClients, sessions, machines, attachSession, forgetProject, refreshCliClients, listSessions, sessionId, connected, token } = useStore();
   const unreadSessions = useStore((s) => s.unreadSessions);
   const [shareModalOpen, setShareModalOpen] = useState(false);
   const [mounted, setMounted] = useState(false);
@@ -742,28 +742,18 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
         )}
       </div>
 
+      {/* Every account administers its own virtual cluster here: the machines
+          it registered and the projects hosted on them. System administration
+          is a separate surface with its own login, deliberately unlinked. */}
       <div className="border-t border-gray-200 dark:border-gray-800 p-2 flex-shrink-0">
         <Link
           href="/machines"
           className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors"
         >
           <Server className="w-4 h-4" />
-          Machines
+          My Cluster
         </Link>
       </div>
-
-      {/* Cluster control plane is visible only to server-authorized admins. */}
-      {clusterRole === "admin" && (
-        <div className="border-t border-gray-200 dark:border-gray-800 p-2 flex-shrink-0">
-          <Link
-            href="/admin"
-            className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors"
-          >
-            <BarChart3 className="w-4 h-4" />
-            Cluster Administration
-          </Link>
-        </div>
-      )}
 
       {/* Share Modal - rendered via portal to escape transform context */}
       {shareModalOpen && mounted && createPortal(
