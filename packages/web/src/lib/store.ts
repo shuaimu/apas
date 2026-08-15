@@ -3501,6 +3501,25 @@ function savePendingAnswers(items: PendingAnswer[]) {
   }
 }
 
+/// Recover the answers from the prose a provider records for an answered
+/// question: `The user answered: "Which?"="This", "And?"="That"`.
+///
+/// Terminal panes have no structured echo — the transcript is the only record
+/// — so this is what lets the card settle on what the agent actually took,
+/// rather than on the option the human clicked.
+export function parseRecordedAnswers(
+  content: unknown,
+): Record<string, string> | undefined {
+  if (typeof content !== "string" || !content.includes("answered")) return undefined;
+  const answers: Record<string, string> = {};
+  const pair = /"((?:[^"\\]|\\.)*)"\s*=\s*"((?:[^"\\]|\\.)*)"/g;
+  for (const match of content.matchAll(pair)) {
+    const unescape = (s: string) => s.replace(/\\(["\\])/g, "$1");
+    answers[unescape(match[1])] = unescape(match[2]);
+  }
+  return Object.keys(answers).length > 0 ? answers : undefined;
+}
+
 /// Persisted mirror of `answeredQuestions`. Restores the
 /// AskUserQuestionCard's "submitted" state after a refresh so the
 /// user isn't asked to re-answer a question they've already answered.
@@ -4837,16 +4856,22 @@ export function handleServerMessage(
                 typeof resultData.tool_use_result === "object"
                   ? (resultData.tool_use_result as Record<string, unknown>)
                   : undefined;
-              const answers = resultObj?.answers as
-                | Record<string, string>
-                | undefined;
+              const answers =
+                (resultObj?.answers as Record<string, string> | undefined) ??
+                // A terminal pane has no control_response to echo a structured
+                // answer back: its answer is whatever the provider wrote in
+                // its own transcript, as prose. Parse it, because what was
+                // recorded is the truth and what we submitted is only a hope —
+                // the keystrokes that carried it were written blind.
+                parseRecordedAnswers(displayContent);
               set((state) => {
                 const patch: Partial<AppState> = {};
-                if (
-                  answers &&
-                  typeof answers === "object" &&
-                  !state.answeredQuestions.has(toolUseId)
-                ) {
+                const previous = state.answeredQuestions.get(toolUseId);
+                const differs =
+                  !!answers &&
+                  (!previous ||
+                    Object.keys(answers).some((q) => previous[q] !== answers[q]));
+                if (answers && typeof answers === "object" && differs) {
                   const nextMap = new Map(state.answeredQuestions);
                   nextMap.set(toolUseId, answers);
                   saveAnsweredQuestions(nextMap);

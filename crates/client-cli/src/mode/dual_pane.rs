@@ -347,6 +347,127 @@ fn stop_retired_panes(
 /// A turn with token counts yields a second `Result` message, because that is
 /// the variant the server reads usage out of (`ws_cli` looks for
 /// `extra.usage`). Without it the turn is recorded but bills nothing.
+/// A question a terminal pane is waiting on. Held only while it is unanswered.
+#[derive(Debug, Clone)]
+struct TerminalQuestion {
+    pane_id: u32,
+    /// Question text → the option labels offered for it, in the order the TUI
+    /// lists them. The order is what makes an answer addressable: the picker
+    /// is navigated by position, not by label.
+    options: Vec<(String, Vec<String>)>,
+    /// Set once keystrokes have been written. A second answer for the same
+    /// question sends nothing — retransmits are expected, double-typing is not.
+    delivered: bool,
+}
+
+type TerminalQuestions = Arc<Mutex<HashMap<String, TerminalQuestion>>>;
+
+/// The option labels a question offers, in order, from the tool call's input.
+fn question_options(input: &serde_json::Value) -> Vec<(String, Vec<String>)> {
+    input
+        .get("questions")
+        .and_then(serde_json::Value::as_array)
+        .map(|questions| {
+            questions
+                .iter()
+                .map(|q| {
+                    let text = q
+                        .get("question")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let labels = q
+                        .get("options")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|options| {
+                            options
+                                .iter()
+                                .filter_map(|o| {
+                                    o.get("label")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::to_string)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (text, labels)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Encode an answer as the keystrokes the provider's picker accepts.
+///
+/// Observed against Claude Code 2.1.233 by driving the real TUI on a pty: the
+/// dialog prints its own contract — "Enter to select · ↑/↓ to navigate · Esc to
+/// cancel" — arrow-down moves the `❯` marker, and digits do not. The agent's
+/// own options occupy positions 1..N and the TUI appends its own entries
+/// ("Type something", "Chat about this") below them, so stepping down by the
+/// option's index from the default first entry can only ever land on an
+/// option the agent offered.
+///
+/// Returns `None` when a selection names an option the question never offered,
+/// rather than guessing — a wrong keystroke here answers on the human's behalf.
+fn encode_answer_keystrokes(
+    options: &[(String, Vec<String>)],
+    answers: &HashMap<String, String>,
+) -> Option<Vec<u8>> {
+    const DOWN: &[u8] = b"\x1b[B";
+    const CONFIRM: &[u8] = b"\r";
+    let mut keys = Vec::new();
+    for (question, labels) in options {
+        let selected = answers.get(question)?;
+        let index = labels.iter().position(|label| label == selected)?;
+        for _ in 0..index {
+            keys.extend_from_slice(DOWN);
+        }
+        keys.extend_from_slice(CONFIRM);
+    }
+    (!keys.is_empty()).then_some(keys)
+}
+
+/// What to do with an answer aimed at a terminal pane. Kept separate from the
+/// IO so the guards — the part that stops a blind write going somewhere it
+/// should not — are testable on their own.
+#[derive(Debug, PartialEq)]
+enum TerminalAnswerPlan {
+    /// Write these keystrokes to this pane's pty.
+    Deliver { pane_id: u32, keys: Vec<u8> },
+    /// Keystrokes already went out for this question; sending them again would
+    /// type into whatever the TUI is showing now.
+    AlreadyDelivered { pane_id: u32 },
+    /// The selection names an option this question never offered.
+    UnknownOption { pane_id: u32 },
+    /// Not a question this pane is waiting on — answered already, expired, or
+    /// never asked here.
+    NotPending,
+}
+
+fn plan_terminal_answer(
+    questions: &HashMap<String, TerminalQuestion>,
+    tool_use_id: &str,
+    answers: &HashMap<String, String>,
+) -> TerminalAnswerPlan {
+    let Some(question) = questions.get(tool_use_id) else {
+        return TerminalAnswerPlan::NotPending;
+    };
+    if question.delivered {
+        return TerminalAnswerPlan::AlreadyDelivered {
+            pane_id: question.pane_id,
+        };
+    }
+    match encode_answer_keystrokes(&question.options, answers) {
+        Some(keys) => TerminalAnswerPlan::Deliver {
+            pane_id: question.pane_id,
+            keys,
+        },
+        None => TerminalAnswerPlan::UnknownOption {
+            pane_id: question.pane_id,
+        },
+    }
+}
+
 fn conversation_turn_to_stream_messages(
     turn: &crate::conversation::TurnRecord,
     session_id: Uuid,
@@ -362,6 +483,53 @@ fn conversation_turn_to_stream_messages(
     // assistant turns came through fine. `UserInput` is the channel meant for
     // this — the server stores it as role "user" against the pane and routes
     // it to the web.
+    // A question is published as the tool call it already is, so the web's
+    // existing AskUserQuestionCard renders it — no new wire message, no new
+    // renderer, no new storage path. An answer rides `User` + `ToolResult`,
+    // deliberately the one variant the server's converter reads for tool
+    // results, which is why ordinary non-assistant turns avoid it.
+    if let Some(answer) = &turn.answer {
+        return vec![CliToServer::StreamMessage {
+            session_id,
+            message: shared::ClaudeStreamMessage::User {
+                message: shared::ClaudeUserMessage {
+                    content: vec![shared::ClaudeContentBlock::ToolResult {
+                        tool_use_id: answer.tool_use_id.clone(),
+                        content: answer.recorded.clone(),
+                        is_error: false,
+                    }],
+                    role: "user".to_string(),
+                },
+                session_id: sid,
+                tool_use_result: None,
+                extra: serde_json::Value::Null,
+            },
+            pane_type: None,
+            pane_id: Some(turn.pane_id),
+        }];
+    }
+    if let Some(question) = &turn.question {
+        return vec![CliToServer::StreamMessage {
+            session_id,
+            message: shared::ClaudeStreamMessage::Assistant {
+                message: shared::ClaudeAssistantMessage {
+                    content: vec![shared::ClaudeContentBlock::ToolUse {
+                        id: question.tool_use_id.clone(),
+                        name: question.tool_name.clone(),
+                        input: question.input.clone(),
+                    }],
+                    model: turn.model.clone().unwrap_or_default(),
+                    extra: serde_json::Value::Null,
+                },
+                session_id: sid,
+                // A pending question is not a finished turn: the pane is
+                // blocked on the human, not idle.
+                extra: serde_json::json!({ "terminal_turn_complete": false }),
+            },
+            pane_type: None,
+            pane_id: Some(turn.pane_id),
+        }];
+    }
     let mut out = if turn.is_assistant() {
         vec![CliToServer::StreamMessage {
             session_id,
@@ -2068,6 +2236,13 @@ async fn run_inner(
     // Live pty handles for `PaneKind::Terminal` panes. Kept apart from
     // `input_channels` so raw terminal I/O never crosses the agent path.
     let terminal_panes: TerminalPanes = Arc::new(Mutex::new(HashMap::new()));
+    // Questions a terminal pane is currently blocked on, keyed by tool_use_id
+    // and derived from the transcript rather than stored: a question is
+    // pending once its tool_use is published and gone once its tool_result is.
+    // The AnswerQuestion handler consults this to refuse an answer for a
+    // question that is not pending, which is what makes a stale browser tab
+    // harmless when the write itself is blind.
+    let terminal_questions: TerminalQuestions = Arc::new(Mutex::new(HashMap::new()));
 
     // Track pane_id -> claude_session_id for persistence
     let pane_sessions: Arc<Mutex<HashMap<u32, Uuid>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -2310,6 +2485,7 @@ async fn run_inner(
         let pane_metas = pane_metas.clone();
         let pane_sessions = pane_sessions.clone();
         let terminal_panes_for_server = terminal_panes.clone();
+        let terminal_questions_for_server = terminal_questions.clone();
         let event_tx_for_server = event_tx.clone();
         let project_policy_for_server = project_policy.clone();
         tokio::spawn(async move {
@@ -2327,6 +2503,7 @@ async fn run_inner(
                 pane_metas,
                 pane_sessions,
                 terminal_panes_for_server,
+                terminal_questions_for_server,
                 status_tx,
                 event_tx_for_server,
                 project_policy_for_server,
@@ -2802,6 +2979,7 @@ async fn run_inner(
     // needs to know *how much* was appended so it can resume from a cursor.
     {
         let server_tx_for_turns = server_tx.clone();
+        let terminal_questions_for_turns = terminal_questions.clone();
         let shutdown_for_turns = shutdown.clone();
         let project_for_turns = std::path::PathBuf::from(working_dir_str.clone());
         let metas_for_turns = pane_metas.clone();
@@ -2995,6 +3173,26 @@ async fn run_inner(
                     let previous_cursor = *cursor;
                     if turns.len() > previous_cursor {
                         for turn in &turns[previous_cursor..] {
+                            // Pending state is derived from the transcript, so
+                            // it survives a CLI restart and cannot disagree
+                            // with what the conversation view is showing.
+                            if let Some(question) = &turn.question {
+                                if let Ok(mut pending) = terminal_questions_for_turns.lock() {
+                                    pending.insert(
+                                        question.tool_use_id.clone(),
+                                        TerminalQuestion {
+                                            pane_id: turn.pane_id,
+                                            options: question_options(&question.input),
+                                            delivered: false,
+                                        },
+                                    );
+                                }
+                            }
+                            if let Some(answer) = &turn.answer {
+                                if let Ok(mut pending) = terminal_questions_for_turns.lock() {
+                                    pending.remove(&answer.tool_use_id);
+                                }
+                            }
                             for msg in
                                 conversation_turn_to_stream_messages(turn, session_id, conv_id)
                             {
@@ -8012,6 +8210,214 @@ Use a project-specific custom dispatch loop.";
             input_tokens: None,
             output_tokens: None,
             completes_work: false,
+            question: None,
+            answer: None,
+        }
+    }
+
+    fn pending_fruit_question(delivered: bool) -> HashMap<String, super::TerminalQuestion> {
+        let mut questions = HashMap::new();
+        questions.insert(
+            "toolu_1".to_string(),
+            super::TerminalQuestion {
+                pane_id: 7,
+                options: fruit_options(),
+                delivered,
+            },
+        );
+        questions
+    }
+
+    fn banana() -> HashMap<String, String> {
+        let mut answers = HashMap::new();
+        answers.insert("Pick a fruit".to_string(), "Banana".to_string());
+        answers
+    }
+
+    /// The guards exist because the write is blind: a stale tab, a retransmit,
+    /// or a question that was answered in the terminal must all send nothing.
+    #[test]
+    fn only_a_pending_undelivered_question_is_ever_typed_into() {
+        assert_eq!(
+            super::plan_terminal_answer(&pending_fruit_question(false), "toolu_1", &banana()),
+            super::TerminalAnswerPlan::Deliver {
+                pane_id: 7,
+                keys: b"\x1b[B\r".to_vec()
+            },
+        );
+
+        // The web resends unacked answers; the pane must not type twice.
+        assert_eq!(
+            super::plan_terminal_answer(&pending_fruit_question(true), "toolu_1", &banana()),
+            super::TerminalAnswerPlan::AlreadyDelivered { pane_id: 7 },
+        );
+
+        // Answered in the terminal already: the transcript removed it, so a
+        // client that has not caught up gets nothing sent on its behalf.
+        assert_eq!(
+            super::plan_terminal_answer(&HashMap::new(), "toolu_1", &banana()),
+            super::TerminalAnswerPlan::NotPending,
+        );
+
+        // An id belonging to some other pane's question is not this one's.
+        assert_eq!(
+            super::plan_terminal_answer(&pending_fruit_question(false), "toolu_other", &banana()),
+            super::TerminalAnswerPlan::NotPending,
+        );
+
+        let mut bogus = HashMap::new();
+        bogus.insert("Pick a fruit".to_string(), "Durian".to_string());
+        assert_eq!(
+            super::plan_terminal_answer(&pending_fruit_question(false), "toolu_1", &bogus),
+            super::TerminalAnswerPlan::UnknownOption { pane_id: 7 },
+        );
+    }
+
+    fn fruit_options() -> Vec<(String, Vec<String>)> {
+        vec![(
+            "Pick a fruit".to_string(),
+            vec!["Apple".to_string(), "Banana".to_string(), "Cherry".to_string()],
+        )]
+    }
+
+    /// The encoding is the TUI's own stated contract: ↑/↓ to navigate, Enter
+    /// to select. Selecting the first option must therefore send no movement
+    /// at all — the cursor already starts there.
+    #[test]
+    fn an_answer_encodes_as_the_arrow_keys_the_picker_accepts() {
+        let mut answers = HashMap::new();
+        answers.insert("Pick a fruit".to_string(), "Apple".to_string());
+        assert_eq!(
+            super::encode_answer_keystrokes(&fruit_options(), &answers),
+            Some(b"\r".to_vec()),
+        );
+
+        answers.insert("Pick a fruit".to_string(), "Cherry".to_string());
+        assert_eq!(
+            super::encode_answer_keystrokes(&fruit_options(), &answers),
+            Some(b"\x1b[B\x1b[B\r".to_vec()),
+            "two steps down from the default first entry",
+        );
+    }
+
+    /// A label the question never offered would otherwise be encoded as some
+    /// arbitrary position — answering on the human's behalf. Refuse instead.
+    #[test]
+    fn an_unoffered_option_is_refused_rather_than_guessed() {
+        let mut answers = HashMap::new();
+        answers.insert("Pick a fruit".to_string(), "Durian".to_string());
+        assert_eq!(
+            super::encode_answer_keystrokes(&fruit_options(), &answers),
+            None,
+        );
+
+        let mut wrong_question = HashMap::new();
+        wrong_question.insert("Pick a colour".to_string(), "Apple".to_string());
+        assert_eq!(
+            super::encode_answer_keystrokes(&fruit_options(), &wrong_question),
+            None,
+        );
+    }
+
+    /// A multi-question call walks the picker question by question, so the
+    /// selections are concatenated in the order the questions were asked.
+    #[test]
+    fn a_multi_question_answer_is_one_sequence_in_question_order() {
+        let options = vec![
+            ("First".to_string(), vec!["a".to_string(), "b".to_string()]),
+            ("Second".to_string(), vec!["x".to_string(), "y".to_string()]),
+        ];
+        let mut answers = HashMap::new();
+        answers.insert("First".to_string(), "b".to_string());
+        answers.insert("Second".to_string(), "x".to_string());
+        assert_eq!(
+            super::encode_answer_keystrokes(&options, &answers),
+            Some(b"\x1b[B\r\r".to_vec()),
+        );
+    }
+
+    /// The option list the encoder addresses comes from the tool call itself,
+    /// so the positions match what the TUI renders.
+    #[test]
+    fn question_options_are_read_from_the_tool_call_in_order() {
+        let input = serde_json::json!({
+            "questions": [{
+                "question": "Pick a fruit",
+                "options": [{"label": "Apple"}, {"label": "Banana"}]
+            }]
+        });
+        assert_eq!(
+            super::question_options(&input),
+            vec![(
+                "Pick a fruit".to_string(),
+                vec!["Apple".to_string(), "Banana".to_string()]
+            )]
+        );
+        assert!(super::question_options(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn a_question_turn_becomes_the_tool_use_the_existing_card_renders() {
+        let mut turn = recorded_turn("assistant", "");
+        turn.question = Some(crate::conversation::TurnQuestion {
+            tool_use_id: "toolu_1".into(),
+            tool_name: "AskUserQuestion".into(),
+            input: serde_json::json!({
+                "questions": [{"question": "Pick a fruit", "options": [{"label": "Apple"}]}]
+            }),
+        });
+        let msgs =
+            super::conversation_turn_to_stream_messages(&turn, Uuid::new_v4(), Uuid::new_v4());
+
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0] {
+            CliToServer::StreamMessage {
+                message: shared::ClaudeStreamMessage::Assistant { message, extra, .. },
+                ..
+            } => {
+                match &message.content[0] {
+                    shared::ClaudeContentBlock::ToolUse { id, name, input } => {
+                        assert_eq!(id, "toolu_1");
+                        assert_eq!(name, "AskUserQuestion");
+                        assert_eq!(input["questions"][0]["question"], "Pick a fruit");
+                    }
+                    other => panic!("expected a tool_use block, got {other:?}"),
+                }
+                // A pending question is not an idle boundary.
+                assert_eq!(extra["terminal_turn_complete"], serde_json::json!(false));
+            }
+            other => panic!("expected an assistant stream message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_answer_turn_becomes_the_tool_result_the_ack_path_waits_for() {
+        let mut turn = recorded_turn("user", "");
+        turn.answer = Some(crate::conversation::TurnAnswer {
+            tool_use_id: "toolu_1".into(),
+            recorded: "The user answered: \"Pick a fruit\"=\"Banana\"".into(),
+        });
+        let msgs =
+            super::conversation_turn_to_stream_messages(&turn, Uuid::new_v4(), Uuid::new_v4());
+
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0] {
+            CliToServer::StreamMessage {
+                message: shared::ClaudeStreamMessage::User { message, .. },
+                ..
+            } => match &message.content[0] {
+                shared::ClaudeContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => {
+                    assert_eq!(tool_use_id, "toolu_1");
+                    assert!(content.contains("Banana"));
+                    assert!(!is_error);
+                }
+                other => panic!("expected a tool_result block, got {other:?}"),
+            },
+            other => panic!("expected a user stream message, got {other:?}"),
         }
     }
 
@@ -11535,6 +11941,9 @@ async fn run_server_connection(
     pane_metas: PaneMetas,
     pane_sessions: Arc<Mutex<HashMap<u32, Uuid>>>,
     terminal_panes: TerminalPanes,
+    // Questions terminal panes are blocked on, so an answer can be refused
+    // when it is stale, duplicated, or for a pane that is not asking.
+    terminal_questions: TerminalQuestions,
     status_tx: mpsc::Sender<PaneOutput>,
     tui_event_tx: mpsc::Sender<TuiEvent>,
     project_policy: ProjectPolicyState,
@@ -13663,6 +14072,80 @@ async fn run_server_connection(
                                                         }
                                                         handled = true;
                                                         break;
+                                                    }
+                                                }
+                                                // A terminal pane has no stdin control channel:
+                                                // it hosts the provider's real TUI, so the answer
+                                                // has to arrive as keystrokes. Everything above
+                                                // this point in the pipeline is shared with agent
+                                                // panes; only this last hop differs.
+                                                if !handled {
+                                                    let plan = terminal_questions
+                                                        .lock()
+                                                        .map(|questions| plan_terminal_answer(&questions, &tool_use_id, &answers))
+                                                        .unwrap_or(TerminalAnswerPlan::NotPending);
+                                                    match plan {
+                                                        TerminalAnswerPlan::AlreadyDelivered { pane_id: pid } => {
+                                                            // Retransmits are expected — the web
+                                                            // resends unacked answers — but typing
+                                                            // twice into a live TUI is not.
+                                                            tracing::info!(
+                                                                pane_id = pid,
+                                                                tool_use_id = tool_use_id.as_str(),
+                                                                "AnswerQuestion: already delivered to the terminal, sending nothing",
+                                                            );
+                                                            handled = true;
+                                                        }
+                                                        TerminalAnswerPlan::UnknownOption { pane_id: pid } => {
+                                                            tracing::warn!(
+                                                                pane_id = pid,
+                                                                tool_use_id = tool_use_id.as_str(),
+                                                                "AnswerQuestion: answer names an option this question never offered",
+                                                            );
+                                                        }
+                                                        TerminalAnswerPlan::Deliver { pane_id: pid, keys } => {
+                                                            let handle = terminal_panes
+                                                                .lock()
+                                                                .ok()
+                                                                .and_then(|m| m.get(&pid).cloned());
+                                                            match handle {
+                                                                Some(handle) => match handle.write_bytes(&keys) {
+                                                                    Ok(()) => {
+                                                                        if let Ok(mut questions) = terminal_questions.lock() {
+                                                                            if let Some(entry) = questions.get_mut(&tool_use_id) {
+                                                                                entry.delivered = true;
+                                                                            }
+                                                                        }
+                                                                        // Delivered, not answered: the
+                                                                        // transcript's tool_result is what
+                                                                        // confirms it, and it is what the
+                                                                        // conversation view will show.
+                                                                        tracing::info!(
+                                                                            pane_id = pid,
+                                                                            tool_use_id = tool_use_id.as_str(),
+                                                                            "AnswerQuestion: wrote selection to the terminal",
+                                                                        );
+                                                                        handled = true;
+                                                                    }
+                                                                    Err(e) => {
+                                                                        tracing::warn!(
+                                                                            pane_id = pid,
+                                                                            tool_use_id = tool_use_id.as_str(),
+                                                                            error = %e,
+                                                                            "AnswerQuestion: terminal write failed; question stays pending",
+                                                                        );
+                                                                    }
+                                                                },
+                                                                None => {
+                                                                    tracing::warn!(
+                                                                        pane_id = pid,
+                                                                        tool_use_id = tool_use_id.as_str(),
+                                                                        "AnswerQuestion: terminal pane has no live pty",
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                        TerminalAnswerPlan::NotPending => {}
                                                     }
                                                 }
                                                 if !handled {

@@ -47,6 +47,34 @@ pub struct TurnRecord {
     /// of an assistant turn alone is not an idle boundary.
     #[serde(default)]
     pub completes_work: bool,
+    /// A question the agent asked the human, when this turn is one. Tool calls
+    /// are otherwise not conversation and are skipped, but a question is the
+    /// one that is: the pane is blocked until it is answered, and on a phone
+    /// the conversation view is the only practical place to answer it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<TurnQuestion>,
+    /// The recorded answer to an earlier question, keyed by the same
+    /// `tool_use_id`. This is what settles the pending state — an answer is
+    /// confirmed by what the provider recorded, never by what we sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<TurnAnswer>,
+}
+
+/// A question turn, carrying the provider's own tool call verbatim so the web
+/// renders it with the card it already has.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnQuestion {
+    pub tool_use_id: String,
+    pub tool_name: String,
+    /// The tool call's `input`, unaltered.
+    pub input: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnAnswer {
+    pub tool_use_id: String,
+    /// What the provider recorded, verbatim.
+    pub recorded: String,
 }
 
 impl TurnRecord {
@@ -74,6 +102,8 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
             completes_work: false,
+            question: None,
+            answer: None,
         }
     }
 

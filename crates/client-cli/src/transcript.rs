@@ -119,6 +119,66 @@ pub fn find_claude_switch_candidate(
     best.map(|(_, path)| path)
 }
 
+/// Tools whose call *is* the conversation: the agent is asking the human
+/// something and the pane is blocked until it is answered. Everything else a
+/// tool does stays out of the history.
+const QUESTION_TOOLS: &[&str] = &["AskUserQuestion"];
+
+/// The question a claude assistant record is asking, if it is asking one.
+fn claude_question(content: &Value) -> Option<crate::conversation::TurnQuestion> {
+    content.as_array()?.iter().find_map(|b| {
+        if b.get("type").and_then(Value::as_str) != Some("tool_use") {
+            return None;
+        }
+        let name = b.get("name").and_then(Value::as_str)?;
+        if !QUESTION_TOOLS.contains(&name) {
+            return None;
+        }
+        Some(crate::conversation::TurnQuestion {
+            tool_use_id: b.get("id").and_then(Value::as_str)?.to_string(),
+            tool_name: name.to_string(),
+            input: b.get("input").cloned().unwrap_or(Value::Null),
+        })
+    })
+}
+
+/// The recorded answer a claude user record carries, if it is answering a
+/// question. Only the answer to a question is kept; ordinary tool results are
+/// not conversation.
+fn claude_answer(
+    content: &Value,
+    pending: &HashSet<String>,
+) -> Option<crate::conversation::TurnAnswer> {
+    content.as_array()?.iter().find_map(|b| {
+        if b.get("type").and_then(Value::as_str) != Some("tool_result") {
+            return None;
+        }
+        let id = b.get("tool_use_id").and_then(Value::as_str)?;
+        if !pending.contains(id) {
+            return None;
+        }
+        let raw = b.get("content");
+        let recorded = match raw {
+            Some(Value::String(s)) => s.clone(),
+            Some(other) => other
+                .as_array()
+                .map(|blocks| {
+                    blocks
+                        .iter()
+                        .filter_map(|x| x.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+                .unwrap_or_default(),
+            None => String::new(),
+        };
+        Some(crate::conversation::TurnAnswer {
+            tool_use_id: id.to_string(),
+            recorded,
+        })
+    })
+}
+
 /// Pull the text out of a claude content field, which is either a bare string
 /// or an array of typed blocks.
 fn claude_text(content: &Value) -> String {
@@ -140,6 +200,9 @@ fn claude_text(content: &Value) -> String {
 /// conversation and would be noise in the pane's history.
 pub fn parse_claude(raw: &str) -> Vec<TurnRecord> {
     let mut out: Vec<TurnRecord> = Vec::new();
+    // tool_use_ids of questions seen so far, so a tool_result is recognised as
+    // an answer to one rather than as ordinary tool output.
+    let mut asked: HashSet<String> = HashSet::new();
     for line in raw.lines().filter(|l| !l.trim().is_empty()) {
         let Ok(d) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -161,15 +224,28 @@ pub fn parse_claude(raw: &str) -> Vec<TurnRecord> {
             _ => continue,
         };
         let msg = d.get("message").unwrap_or(&Value::Null);
-        let text = claude_text(msg.get("content").unwrap_or(&Value::Null));
+        let content = msg.get("content").unwrap_or(&Value::Null);
+        let text = claude_text(content);
         let completes_work = role == "assistant"
             && msg
                 .get("stop_reason")
                 .and_then(Value::as_str)
                 .is_some_and(|reason| reason != "tool_use");
-        if text.trim().is_empty() {
+        let question = (role == "assistant")
+            .then(|| claude_question(content))
+            .flatten();
+        if let Some(q) = &question {
+            asked.insert(q.tool_use_id.clone());
+        }
+        let answer = (role == "user")
+            .then(|| claude_answer(content, &asked))
+            .flatten();
+        if text.trim().is_empty() && question.is_none() && answer.is_none() {
             // Tool-use-only turns carry no text. Skipping keeps the history
-            // readable; the tool calls themselves are not conversation.
+            // readable; the tool calls themselves are not conversation. A
+            // question is the exception: it has no text either, but the pane
+            // is blocked on it, so dropping it hides the one turn the human
+            // has to act on.
             if completes_work {
                 if let Some(turn) = out.iter_mut().rev().find(|turn| turn.is_assistant()) {
                     turn.completes_work = true;
@@ -193,6 +269,8 @@ pub fn parse_claude(raw: &str) -> Vec<TurnRecord> {
             input_tokens: tok("input_tokens"),
             output_tokens: tok("output_tokens"),
             completes_work,
+            question,
+            answer,
         });
     }
     out
@@ -265,6 +343,10 @@ pub fn parse_codex(raw: &str) -> Vec<TurnRecord> {
             input_tokens: None,
             output_tokens: None,
             completes_work: false,
+            // Codex and OpenCode have their own approval interfaces; only
+            // the claude parser recognises questions.
+            question: None,
+            answer: None,
         });
     }
     out
@@ -361,6 +443,10 @@ pub fn parse_opencode(raw: &str) -> Vec<TurnRecord> {
             input_tokens: token("input"),
             output_tokens: token("output"),
             completes_work,
+            // Codex and OpenCode have their own approval interfaces; only
+            // the claude parser recognises questions.
+            question: None,
+            answer: None,
         });
     }
     turns
@@ -649,6 +735,52 @@ mod tests {
     #[test]
     fn a_tool_only_turn_is_skipped_rather_than_recorded_blank() {
         let raw = r#"{"type":"assistant","timestamp":"t","message":{"content":[{"type":"tool_use","id":"1","name":"Bash","input":{}}]}}"#;
+        assert!(parse_claude(raw).is_empty());
+    }
+
+    /// Shapes taken verbatim from a real transcript, not invented: a question
+    /// is an assistant record whose only content is the tool call, and its
+    /// answer is a tool_result on a user record.
+    #[test]
+    fn a_question_survives_with_its_options_and_its_recorded_answer() {
+        let raw = concat!(
+            r#"{"type":"assistant","timestamp":"t1","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_1","name":"AskUserQuestion","input":{"questions":[{"question":"Pick a fruit","header":"Fruit","options":[{"label":"Apple"},{"label":"Banana"}]}]}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"t2","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"The user answered: \"Pick a fruit\"=\"Banana\""}]}}"#,
+        );
+        let turns = parse_claude(raw);
+        assert_eq!(turns.len(), 2, "question and answer are both turns");
+
+        let question = turns[0].question.as_ref().expect("question kept");
+        assert_eq!(question.tool_use_id, "toolu_1");
+        assert_eq!(question.tool_name, "AskUserQuestion");
+        let options = question.input["questions"][0]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["label"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(options, vec!["Apple", "Banana"]);
+
+        let answer = turns[1].answer.as_ref().expect("answer kept");
+        assert_eq!(answer.tool_use_id, "toolu_1");
+        assert!(answer.recorded.contains("Banana"));
+    }
+
+    #[test]
+    fn an_unanswered_question_yields_no_answer_turn() {
+        let raw = r#"{"type":"assistant","timestamp":"t","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_1","name":"AskUserQuestion","input":{"questions":[]}}]}}"#;
+        let turns = parse_claude(raw);
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].question.is_some());
+        assert!(turns[0].answer.is_none());
+    }
+
+    /// A tool_result for something that was never a question is ordinary tool
+    /// output, and stays out of the history.
+    #[test]
+    fn an_ordinary_tool_result_is_not_an_answer() {
+        let raw = r#"{"type":"user","timestamp":"t","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_bash","content":"file listing"}]}}"#;
         assert!(parse_claude(raw).is_empty());
     }
 

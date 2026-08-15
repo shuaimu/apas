@@ -754,6 +754,37 @@ recorded blank. In-progress OpenCode assistant messages are held until their
 completion timestamp arrives so APAS never advances its cursor over a partial
 reply.
 
+**Agent questions appear in the conversation view, and can be answered there.**
+The parser drops tool-use-only turns as noise — right for `Bash`, wrong for
+`AskUserQuestion`, which has no text either but is the one turn the human has
+to act on. Across the transcripts on one machine, 170 questions were recorded
+and 169 were being discarded, so a terminal pane could sit blocked on a
+question nobody could see. A question turn is now published as the `tool_use`
+block it already is, so the web's existing `AskUserQuestionCard` renders it
+with no new wire message, storage path, or renderer.
+
+Answering reuses the whole `AnswerQuestion` pipeline agent panes use (web →
+server → CLI); only the last hop differs, because a terminal pane has no
+stream-json control channel. The CLI writes **keystrokes** to the pty instead:
+`↑/↓` to navigate and `Enter` to select, which is the contract the picker
+prints in its own footer — verified by driving the real TUI (Claude Code
+2.1.233), where digits notably do *not* move the selection. The agent's options
+occupy positions 1..N with the TUI's own `Type something` / `Chat about this`
+beneath them, so stepping down by an option's index can only land on an option
+the agent offered.
+
+**The answer is confirmed by reading, never by writing.** A successful pty
+write proves only that bytes were accepted, so the acknowledgement is the
+`tool_result` the provider records, republished as `User` + `ToolResult` — the
+one variant the server's converter reads for tool results, which is exactly why
+ordinary non-assistant turns avoid it. A terminal pane has no structured echo,
+so the recorded answer arrives as prose (`The user answered: "Q"="A"`) and is
+parsed, letting the card settle on what the agent *took* rather than on what
+was clicked. Pending state is derived the same way — a question is open while
+its `tool_use` has no `tool_result` — which is what makes a blind write safe:
+a stale tab, a retransmit, or a question already answered in the terminal all
+send nothing.
+
 **The conversation view is writable, and that is the point on mobile.** An
 xterm TUI on a phone is close to unusable — no modifier keys, tiny hit targets,
 scrolling that fights the page — so the conversation view plus its text box is
@@ -775,8 +806,8 @@ agent pane gets — the captured turns arrive as ordinary pane messages, so
 `MessagePane` renders them with no special casing. The two are not equivalent
 and the UI says so: the terminal is live and interactive, while the
 conversation is a *reading* of the transcript that lags by up to one poll,
-shows only user/assistant turns, and sends typed messages into the same live
-pty. The terminal stays
+shows user/assistant turns plus the questions the agent asks, and sends typed
+messages and answers into the same live pty. The terminal stays
 mounted-but-hidden behind the conversation view, because unmounting would tear
 down the xterm instance and force a re-attach, losing scroll position and focus
 on every glance at the transcript.
