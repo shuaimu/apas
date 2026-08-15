@@ -19,6 +19,7 @@ mod manager;
 mod mcp;
 mod mode;
 mod pane_host;
+mod supervisor;
 mod pane_status;
 mod plan_review;
 mod project;

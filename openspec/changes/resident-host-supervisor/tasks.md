@@ -1,6 +1,6 @@
 ## 1. Find the seams before moving anything
 
-- [ ] 1.1 Establish what an interactive `apas` holds that a headless one does not, and which of it the TUI reads directly rather than from the server stream — this is the gap that decides how thin an attached CLI can be
+- [x] 1.1 Establish what an interactive `apas` holds that a headless one does not, and which of it the TUI reads directly rather than from the server stream — this is the gap that decides how thin an attached CLI can be
 - [ ] 1.2 Enumerate every consumer of `headless_pid_for` / `is_headless_running_for` / `snapshot_projects` and record which need running-state truth versus a pid
 - [ ] 1.3 Reproduce the duplicate-CLI case (`apas` in a directory whose project the daemon already runs) and capture what actually breaks, so the fix is verified against the real failure
 

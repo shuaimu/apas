@@ -211,7 +211,7 @@ pub fn runtime_paths(project_id: Uuid, pane_id: u32, runtime_id: Uuid) -> Result
     })
 }
 
-fn ensure_private_dir(path: &Path) -> Result<()> {
+pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     let metadata = fs::metadata(path)?;
@@ -221,7 +221,7 @@ fn ensure_private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true).mode(0o600);
     let mut file = options.open(path)?;
@@ -262,7 +262,7 @@ fn verify_private_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn random_credential() -> Result<String> {
+pub(crate) fn random_credential() -> Result<String> {
     let mut bytes = [0u8; 32];
     File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
