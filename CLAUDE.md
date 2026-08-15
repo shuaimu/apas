@@ -346,7 +346,8 @@ The APAS server and web UI are deployed on an LXC container:
   version-controlled at **`deploy/nginx-apas.conf`** and deployed to
   `/etc/nginx/conf.d/apas.conf` — edit the repo copy, `scp` it, `nginx -t`,
   then `systemctl reload nginx`. `/ws/ /auth/ /admin/ /share/ /health` →
-  `apas-server` (`127.0.0.1:8080`); everything else → the Next.js app
+  `apas-server` (`127.0.0.1:8080`), along with `/cluster/ /projects/
+  /mobile/`; everything else → the Next.js app
   (`127.0.0.1:3000`). This exists so the web's WebSocket + HTTP API ride the
   standard port 80 (`wss://apas.mpaxos.com/ws/web`) instead of the non-standard
   `:8080`, which mobile carriers/Wi-Fi block — that broke mobile entirely.
@@ -368,6 +369,15 @@ The APAS server and web UI are deployed on an LXC container:
   an API prefix that shares a name with a Next.js page**, and check
   `curl -sL -o /dev/null -w '%{http_code} %{num_redirects}' <url>` — a page
   answering `200 1` instead of `200 0` is this bug.
+
+  **The mirror-image mistake is easier to make: a new API prefix nginx does not
+  proxy at all.** Everything unmatched falls through to Next.js, so the route
+  answers `200` with the app's HTML instead of JSON, and only the caller
+  notices. `/cluster/` shipped this way and broke the entire cluster surface
+  until it was added here. **Whenever you add a route prefix to
+  `routes/create_router`, add the matching `location` in this file in the same
+  change**, and smoke-test it with `curl -s <url> | head -c 40` — an HTML
+  doctype where JSON belongs is this bug.
 - **apas-server**: `127.0.0.1:8080` — still also bound publicly on `:8080` for
   the **CLI/daemon** (`wss://apas.mpaxos.com/ws/cli`); do not firewall 8080.
 - **Next.js web (apas-web)**: `127.0.0.1:3000` (moved off 80 via a systemd
