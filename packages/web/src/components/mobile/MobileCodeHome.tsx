@@ -133,10 +133,6 @@ export interface MobileCodeHomeProps {
   onAccount: () => void;
   onManageMachines: () => void;
   onOpenSession: (sessionId: string, projectName: string) => void;
-  /// Reboot that session's project CLI, without opening it first. Rebooting
-  /// no longer disturbs terminal panes — the pane hosts own those — which is
-  /// what makes this safe to offer from a list.
-  onRebootCli: (sessionId: string, projectName: string) => void;
   /// Reboot the daemon on a machine. Targeted by machine id: a daemon is
   /// per-machine, so no project on it identifies the right one.
   onRebootDaemon: (machineId: string, hostname: string) => void;
@@ -150,7 +146,6 @@ export function MobileCodeHome({
   onAccount,
   onManageMachines,
   onOpenSession,
-  onRebootCli,
   onRebootDaemon,
 }: MobileCodeHomeProps) {
   const [remoteSessions, setRemoteSessions] = useState<MobileSessionSummary[] | null>(null);
@@ -160,9 +155,6 @@ export function MobileCodeHome({
     useState<{ id: string; hostname: string } | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [newTaskOpen, setNewTaskOpen] = useState(false);
-  // Rebooting is disruptive and the control lives a thumb-width from the card
-  // that opens the project, so it confirms first.
-  const [rebootTarget, setRebootTarget] = useState<{ id: string; name: string } | null>(null);
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
     if (!active || !token) return;
@@ -341,55 +333,36 @@ export function MobileCodeHome({
               const name = session.project_name || "Coding session";
               const attention = session.attention_count ?? 0;
               return (
-                // The card is a div rather than a button so the reboot control
-                // can sit beside the open control: a button inside a button is
-                // invalid, and nesting them makes the inner tap unreliable.
-                <div
+                <button
                   key={session.id}
-                  className="rounded-2xl border border-[#dedee7] bg-white shadow-sm transition hover:border-[#bdbdc9] dark:border-[#383842] dark:bg-[#1b1b21] dark:hover:border-[#50505c]"
+                  type="button"
+                  aria-label={`Open ${name}`}
+                  onClick={() => onOpenSession(session.id, name)}
+                  className="w-full rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left shadow-sm transition hover:border-[#bdbdc9] active:opacity-75 dark:border-[#383842] dark:bg-[#1b1b21] dark:hover:border-[#50505c]"
                 >
-                  <button
-                    type="button"
-                    aria-label={`Open ${name}`}
-                    onClick={() => onOpenSession(session.id, name)}
-                    className="w-full p-3.5 pb-0 text-left active:opacity-75"
-                  >
-                    <div className="flex items-center justify-between gap-2.5">
-                      <span className="min-w-0 flex-1 truncate text-base font-bold">{name}</span>
-                      <span className={`shrink-0 rounded-full px-2.5 py-1 text-[0.7rem] font-bold ${
-                        session.is_working
-                          ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300"
-                          : session.is_active
-                            ? "bg-[#efeff5] text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]"
-                            : "bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300"
-                      }`}>
-                        {statusLabel(session)}
-                      </span>
-                    </div>
-                    <p className="mt-2 truncate text-sm text-[#686873] dark:text-[#aaaab6]">{sessionTarget(session)}</p>
-                    {session.latest_summary && <p className="mt-2 line-clamp-2 text-sm leading-5">{session.latest_summary}</p>}
-                  </button>
-                  <div className="flex items-center justify-between gap-2.5 px-3.5 pb-3.5 pt-2.5">
+                  <div className="flex items-center justify-between gap-2.5">
+                    <span className="min-w-0 flex-1 truncate text-base font-bold">{name}</span>
+                    <span className={`shrink-0 rounded-full px-2.5 py-1 text-[0.7rem] font-bold ${
+                      session.is_working
+                        ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300"
+                        : session.is_active
+                          ? "bg-[#efeff5] text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]"
+                          : "bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300"
+                    }`}>
+                      {statusLabel(session)}
+                    </span>
+                  </div>
+                  <p className="mt-2 truncate text-sm text-[#686873] dark:text-[#aaaab6]">{sessionTarget(session)}</p>
+                  {session.latest_summary && <p className="mt-2 line-clamp-2 text-sm leading-5">{session.latest_summary}</p>}
+                  <div className="mt-2.5 flex items-center justify-between gap-2.5">
                     <span className="min-w-0 flex-1 truncate text-xs text-[#686873] dark:text-[#aaaab6]">{formatUpdatedAt(session.latest_update_at)}</span>
                     {attention > 0 && (
                       <span className="shrink-0 rounded-full bg-amber-100 px-2.5 py-1 text-[0.7rem] font-bold text-amber-800 dark:bg-amber-950/60 dark:text-amber-200">
                         {attention} attention
                       </span>
                     )}
-                    <button
-                      type="button"
-                      aria-label={`Reboot CLI for ${name}`}
-                      title="Reboot this project's CLI"
-                      onClick={() => setRebootTarget({ id: session.id, name })}
-                      // Generous hit area: this sits next to the card's own
-                      // tap target on a phone, and a mis-tap here restarts
-                      // someone's project.
-                      className="-m-2 shrink-0 rounded-xl p-2 text-[#686873] active:opacity-60 dark:text-[#aaaab6]"
-                    >
-                      <RotateCcw className="h-4 w-4" />
-                    </button>
                   </div>
-                </div>
+                </button>
               );
             })}
           </div>
@@ -446,43 +419,6 @@ export function MobileCodeHome({
                 className="flex-1 rounded-xl bg-[#6d5efc] px-4 py-2.5 text-sm font-bold text-white hover:bg-[#5547dc]"
               >
                 Reboot daemon
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {rebootTarget && (
-        <div className="fixed inset-0 z-[90] flex items-end bg-black/45" onClick={() => setRebootTarget(null)}>
-          <div
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="mobile-reboot-title"
-            className="w-full rounded-t-[1.4rem] border-t border-[#dedee7] bg-[#f7f7fa] p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-2xl dark:border-[#383842] dark:bg-[#111115]"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <h2 id="mobile-reboot-title" className="text-lg font-extrabold">Reboot this project&apos;s CLI?</h2>
-            <p className="mt-1.5 text-sm leading-5 text-[#686873] dark:text-[#aaaab6]">
-              {rebootTarget.name} reconnects with a fresh CLI. Terminal panes keep running — their
-              agents are owned by the project host, not by the CLI.
-            </p>
-            <div className="mt-4 flex gap-2.5">
-              <button
-                type="button"
-                onClick={() => setRebootTarget(null)}
-                className="flex-1 rounded-xl border border-[#dedee7] px-4 py-2.5 text-sm font-bold dark:border-[#383842]"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  onRebootCli(rebootTarget.id, rebootTarget.name);
-                  setRebootTarget(null);
-                }}
-                className="flex-1 rounded-xl bg-[#6d5efc] px-4 py-2.5 text-sm font-bold text-white hover:bg-[#5547dc]"
-              >
-                Reboot CLI
               </button>
             </div>
           </div>

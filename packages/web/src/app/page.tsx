@@ -64,7 +64,7 @@ function useMobileViewport(): boolean {
 
 export default function Home() {
   const router = useRouter();
-  const { connected, connect, disconnect, sessionId, isAuthenticated, logout, token, userId, userEmail, serverVersion, cliClientId, cliClients, sessions, attachSession, listSessions, rebootSessionCli, rebootDaemon, setUserEmail, setClusterIdentity } = useStore();
+  const { connected, connect, disconnect, sessionId, isAuthenticated, logout, token, userId, userEmail, serverVersion, cliClientId, cliClients, sessions, attachSession, listSessions, rebootDaemon, setUserEmail, setClusterIdentity } = useStore();
   const isMobileViewport = useMobileViewport();
   const [isCheckingAuth, setIsCheckingAuth] = useState(true);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -236,10 +236,6 @@ export default function Home() {
                 attachSession(targetSessionId);
                 setMobileScreen("session");
               }}
-              // Routed by explicit session id rather than by whatever is
-              // attached: from a list, the session being rebooted is usually
-              // not the attached one.
-              onRebootCli={(targetSessionId) => rebootSessionCli(targetSessionId)}
               onRebootDaemon={(machineId) => rebootDaemon(machineId)}
             />
           ) : (
