@@ -3308,10 +3308,72 @@ async fn run_inner(
     }
 
     if headless {
-        // Headless mode: drain output (nobody reads it) and wait for server task
-        drop(output_rx);
-        drop(command_rx);
+        // A worker's TUI channels used to be dropped because nobody read them.
+        // They are now fanned out to attached controllers instead: the project
+        // runs here, and a person's `apas` in this directory watches it rather
+        // than starting a second CLI over the same `.apas` and worktrees.
         drop(tui_input_tx);
+        match crate::supervisor::worker_paths(session_id) {
+            Ok((socket, credential_path)) => {
+                match crate::pane_host::random_credential().and_then(|credential| {
+                    crate::pane_host::write_private(&credential_path, credential.as_bytes())?;
+                    Ok(credential)
+                }) {
+                    Ok(credential) => {
+                        let attachments = crate::attach::Attachments::new();
+                        let snapshot_metas = pane_metas.clone();
+                        let snapshot = move || {
+                            snapshot_metas
+                                .lock()
+                                .map(|panes| {
+                                    let mut tabs: Vec<crate::supervisor::AttachedTab> = panes
+                                        .iter()
+                                        .map(|(pane_id, meta)| crate::supervisor::AttachedTab {
+                                            pane_id: *pane_id,
+                                            label: meta.label.clone(),
+                                            mode: meta.mode.clone(),
+                                        })
+                                        .collect();
+                                    tabs.sort_by_key(|tab| tab.pane_id);
+                                    tabs
+                                })
+                                .unwrap_or_default()
+                        };
+                        match crate::attach::serve(
+                            &socket,
+                            credential,
+                            attachments.clone(),
+                            snapshot,
+                        ) {
+                            Ok(()) => {
+                                crate::attach::forward_channels(
+                                    attachments,
+                                    output_rx,
+                                    command_rx,
+                                );
+                            }
+                            Err(err) => {
+                                // Not fatal: a project that cannot be attached
+                                // to still runs, which is the part that matters.
+                                tracing::warn!(%err, "worker attach socket unavailable");
+                                drop(output_rx);
+                                drop(command_rx);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(%err, "worker attach credential unavailable");
+                        drop(output_rx);
+                        drop(command_rx);
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(%err, "worker runtime directory unavailable");
+                drop(output_rx);
+                drop(command_rx);
+            }
+        }
         tracing::info!("Running in headless mode, waiting for server connection...");
         let _ = server_task.await;
         // Reboot request from web should also restart daemon-spawned headless CLIs.

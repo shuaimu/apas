@@ -155,7 +155,7 @@ fn config_dir_for_registry() -> std::path::PathBuf {
 /// Check if there's already a running `apas --headless` process for the given project path.
 /// Prevents the daemon from spawning duplicates when a CLI was started externally
 /// or survived a daemon restart.
-fn is_headless_running_for(project_path: &Path) -> bool {
+pub(crate) fn is_headless_running_for(project_path: &Path) -> bool {
     headless_pid_for(project_path).is_some()
 }
 

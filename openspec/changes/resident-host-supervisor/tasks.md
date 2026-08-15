@@ -20,10 +20,10 @@
 
 ## 4. Attach instead of compete
 
-- [ ] 4.1 Make the default project path ask the supervisor for the project rather than launching `dual_pane` directly
-- [ ] 4.2 Start the worker when the project is not running, then attach once it is
-- [ ] 4.3 Render the attached TUI against the worker; an attached CLI's exit must not stop the project
-- [ ] 4.4 Support more than one attachment to the same project
+- [ ] 4.1 Make the default project path ask the supervisor for the project rather than launching `dual_pane` directly — partially done: it discovers the running worker directly and attaches, but does not yet go through the supervisor
+- [ ] 4.2 Start the worker when the project is not running, then attach once it is — not done: it still falls through to today's in-process launch
+- [x] 4.3 Render the attached TUI against the worker; an attached CLI's exit must not stop the project
+- [x] 4.4 Support more than one attachment to the same project
 - [ ] 4.5 Tests: `apas` twice in one directory yields one worker and two attachments; attachment exit leaves the project running; a remote start racing a local one yields one worker
 
 ## 5. Retire the inference

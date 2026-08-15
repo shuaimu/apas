@@ -36,7 +36,9 @@ const CURRENT_VERSION: &str = env!("APAS_VERSION");
 /// captures; the status app counts errors and keeps the most recent text
 /// per pane, but throws away the full scrollback (the web has the real
 /// chat).
-#[derive(Debug, Clone)]
+// Serializable because an attached CLI renders these from another process:
+// the worker owns the panes, the controller only draws them.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PaneOutput {
     pub text: String,
     pub pane_id: u32,
@@ -93,7 +95,7 @@ pub enum TuiEvent {
 /// Commands sent into the TUI from event handlers — used by dual_pane to
 /// reflect pane lifecycle (add / remove / mode change) into the status
 /// display.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TuiCommand {
     AddTab {
         pane_id: u32,

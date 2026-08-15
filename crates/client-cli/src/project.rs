@@ -560,6 +560,17 @@ fn project_metadata_tmp_path(path: &Path) -> PathBuf {
 }
 
 /// Get the .apas file path for a directory
+/// The project id recorded in `.apas`, without creating one.
+///
+/// `get_or_create_project` writes a `.apas` when there is none, which is right
+/// when launching a project and wrong when merely asking whether one is
+/// already running here.
+pub fn read_project_id(dir: &Path) -> Option<uuid::Uuid> {
+    let raw = std::fs::read_to_string(get_apas_path(dir)).ok()?;
+    let metadata: ProjectMetadata = serde_json::from_str(&raw).ok()?;
+    Some(metadata.id)
+}
+
 pub fn get_apas_path(dir: &Path) -> PathBuf {
     dir.join(APAS_FILE)
 }

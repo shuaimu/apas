@@ -50,6 +50,22 @@ pub fn supervisor_paths() -> Result<SupervisorPaths> {
     })
 }
 
+/// Where a worker's attach socket and credential live, keyed by project.
+///
+/// The worker creates these itself rather than receiving them from the
+/// supervisor, so a project started by any means — the supervisor, a person,
+/// or a leftover script — is attachable on the same terms. A worker from
+/// before this existed simply has no such directory, which is exactly what
+/// `worker_socket: None` reports.
+pub fn worker_paths(project_id: Uuid) -> Result<(PathBuf, PathBuf)> {
+    let dir = crate::config::Config::runtime_dir()?
+        .join("sup")
+        .join("w")
+        .join(&project_id.simple().to_string()[..12]);
+    ensure_private_dir(&dir)?;
+    Ok((dir.join("w.sock"), dir.join("credential")))
+}
+
 /// Non-secret identity of the running supervisor. Never carries the
 /// credential — that is a separate owner-only file, the same split pane hosts
 /// use.
@@ -105,6 +121,44 @@ pub enum SupervisorToController {
     Error {
         message: String,
     },
+}
+
+/// What an attaching controller sends its worker.
+///
+/// One message, because the TUI is read-only: `App` consumes `output_rx` and
+/// `command_rx` and nothing else, so there is no input to carry back.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ControllerToWorker {
+    Attach { credential: String },
+}
+
+/// What a worker streams to each attached controller.
+///
+/// `Snapshot` first so a controller attaching to a project that has been
+/// running for hours starts with the panes that exist, not with whatever
+/// happens to be said next.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkerToController {
+    Snapshot {
+        tabs: Vec<AttachedTab>,
+    },
+    Output(crate::tui::PaneOutput),
+    Command(crate::tui::TuiCommand),
+    /// The worker is going away. A reboot replaces the worker, and an
+    /// attachment to the old one cannot silently keep rendering a dead
+    /// process — it says so and ends.
+    Ending {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AttachedTab {
+    pub pane_id: u32,
+    pub label: String,
+    pub mode: shared::PaneMode,
 }
 
 /// One project as the supervisor knows it. This is the answer to "is it

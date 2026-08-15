@@ -18,6 +18,7 @@ mod file_watcher;
 mod manager;
 mod mcp;
 mod mode;
+mod attach;
 mod pane_host;
 mod supervisor;
 mod pane_status;
@@ -500,6 +501,20 @@ async fn main() -> Result<()> {
             WEB_UI_URL
         );
 
+        // Attach to the project if this host is already running it, rather
+        // than starting a second CLI over the same `.apas` and worktrees.
+        // Nothing used to stop that: `is_headless_running_for` guards only the
+        // daemon's own spawns, so typing `apas` in a directory the daemon was
+        // already running produced two owners of one project.
+        match attach_to_running_project(&working_dir) {
+            AttachOutcome::Attached => return Ok(()),
+            AttachOutcome::Refused(message) => {
+                eprintln!("\x1b[33m{message}\x1b[0m");
+                return Ok(());
+            }
+            AttachOutcome::NotRunning => {}
+        }
+
         tracing::info!("Starting in dual-pane mode (streaming to {})", server);
         mode::dual_pane::run(&server, &token, &working_dir).await?;
     }
@@ -522,6 +537,70 @@ fn maybe_auto_start_daemon(cli: &Cli) -> Result<()> {
         .unwrap_or_else(|| DEFAULT_SERVER.to_string());
 
     ensure_daemon_running(&server, &config.daemon.project_roots, CURRENT_VERSION)
+}
+
+enum AttachOutcome {
+    /// Rendered the running project and returned when the user left.
+    Attached,
+    /// The project is running here but cannot be attached to, so this process
+    /// must not start a second one. Carries what to tell the user.
+    Refused(String),
+    /// Nothing is running for this project here; start it normally.
+    NotRunning,
+}
+
+/// Attach to a worker already running this project on this host.
+///
+/// A worker that predates attachment support has no socket. Refusing is the
+/// deliberate choice over falling back to today's behaviour: the fallback
+/// would keep the duplicate-CLI bug alive for exactly the projects that
+/// predate the change, which at first is all of them.
+fn attach_to_running_project(working_dir: &std::path::Path) -> AttachOutcome {
+    let Some(project_id) = project::read_project_id(working_dir) else {
+        return AttachOutcome::NotRunning;
+    };
+    let Ok((socket, credential_path)) = supervisor::worker_paths(project_id) else {
+        return AttachOutcome::NotRunning;
+    };
+    if !socket.exists() {
+        // Running here, but from before attachment existed. Refuse rather than
+        // fall back: falling back would start a second CLI over the same
+        // `.apas` and worktrees, which is the bug this exists to close, and it
+        // would do so for exactly the projects that predate the change.
+        if mode::daemon::is_headless_running_for(working_dir) {
+            return AttachOutcome::Refused(format!(
+                "This project is already running on this host, but that worker predates \
+                 attachment and cannot be attached to.\n   \
+                 Restart it to get an attachable worker: apas project stop, then apas.\n   \
+                 Refusing to start a second CLI over {}",
+                working_dir.display()
+            ));
+        }
+        return AttachOutcome::NotRunning;
+    }
+    let Ok(credential) = std::fs::read_to_string(&credential_path) else {
+        return AttachOutcome::NotRunning;
+    };
+    match attach::Attachment::connect(&socket, credential.trim()) {
+        Ok((attachment, tabs)) => {
+            eprintln!("\x1b[36m📎 Attached to the running project on this host.\x1b[0m");
+            eprintln!("   Closing this window leaves it running.");
+            if let Err(err) = attach::run_attached_tui(
+                attachment,
+                tabs,
+                working_dir.display().to_string(),
+            ) {
+                tracing::error!(%err, "attached session ended with an error");
+            }
+            AttachOutcome::Attached
+        }
+        Err(err) => {
+            // The socket exists but did not accept us. A stale file from a
+            // crashed worker is the common case, and it names nothing.
+            tracing::debug!(%err, "no live worker behind the attach socket");
+            AttachOutcome::NotRunning
+        }
+    }
 }
 
 fn ensure_daemon_running(server: &str, roots: &[String], target_version: &str) -> Result<()> {
