@@ -3,9 +3,7 @@
 ## Purpose
 
 Defines project-scoped ownership and collaboration separately from cluster administration so project access has only owner and user roles and applies consistently to every instance of a project.
-
 ## Requirements
-
 ### Requirement: Project creation assigns one owner
 An active cluster user SHALL be allowed to create or register a project and SHALL become that project's single owner. A suspended account SHALL NOT create or register a project.
 
@@ -66,14 +64,6 @@ A cluster administrator SHALL be able to inspect membership, add or remove proje
 - **THEN** the requested membership change succeeds
 - **AND** the administrator remains outside the project membership
 
-### Requirement: Control-plane authority does not grant project-content access
-A cluster administrator who is not the project owner or a project user SHALL NOT receive project conversations, files, diffs, terminal access, or ordinary interactive project controls. Content access SHALL require explicit project membership.
-
-#### Scenario: Non-member administrator opens project content
-- **WHEN** a cluster administrator attempts to attach to project conversations without project membership
-- **THEN** the system denies content and interactive access
-- **AND** continues to allow the administrator to view administrative metadata and status
-
 ### Requirement: Legacy project-admin memberships migrate without elevation
 During upgrade, every legacy project-admin membership SHALL become an ordinary project-user membership. Existing ownership SHALL be retained, and duplicate session-scoped memberships for the same canonical project and user SHALL collapse to one project membership.
 
@@ -85,3 +75,39 @@ During upgrade, every legacy project-admin membership SHALL become an ordinary p
 #### Scenario: Membership exists on multiple project sessions
 - **WHEN** the same account has shares on multiple sessions of one canonical project
 - **THEN** migration creates one project-user membership that applies to all of them
+
+### Requirement: Cluster administrators access projects within their own cluster
+
+An active cluster administrator SHALL receive project content access for projects present in the administrator's own virtual cluster: projects the administrator owns, projects the administrator belongs to, and projects with at least one session created under the administrator's account. An administrator SHALL NOT receive content access to projects that exist only in other accounts' clusters. A suspended administrator account SHALL NOT receive this access. Project ownership and membership SHALL continue to gate ordinary (non-admin) users.
+
+#### Scenario: Administrator opens a project running under their account
+
+- **WHEN** an active cluster administrator's client starts or attaches to a session whose canonical project is owned by another user but has an existing session created under the administrator's account
+- **THEN** the system grants the session start or attach
+
+#### Scenario: Administrator listings stay within their own cluster
+
+- **WHEN** an active cluster administrator opens the project or session listings
+- **THEN** the system includes projects the administrator owns, projects the administrator belongs to, and sessions created under the administrator's account
+- **AND** excludes projects and sessions that exist only under other accounts
+
+#### Scenario: Administrator starts a project CLI on their own machines
+
+- **WHEN** an active cluster administrator starts a project CLI for a machine registered under the administrator's account
+- **THEN** the system allows the start without project ownership or membership
+
+#### Scenario: Administrator opening a foreign project is denied
+
+- **WHEN** an active cluster administrator attempts to open or attach to a project that has no session under the administrator's account and no ownership or membership row for the administrator
+- **THEN** the system denies the attempt
+
+#### Scenario: Suspended administrator is denied
+
+- **WHEN** a suspended administrator account attempts to open or start any project session
+- **THEN** the system denies the attempt
+
+#### Scenario: Ordinary non-member user is still denied
+
+- **WHEN** an ordinary cluster user who is neither the owner nor a member of a project attempts to open that project's sessions or content
+- **THEN** the system denies the attempt as before
+
