@@ -864,6 +864,8 @@ interface AppState {
   ) => void;
   stopBot: (paneId: number) => void;
   rebootCli: () => string | null;
+  /// Reboot a specific session's CLI from a list, without attaching to it.
+  rebootSessionCli: (targetSessionId: string) => string | null;
   requestPaneDiff: (paneId: number) => void;
   paneDiffs: Record<number, PaneDiff>;
   createPanePr: (paneId: number) => void;
@@ -1003,8 +1005,14 @@ function sendCliLifecycleRequest(
   get: () => AppState,
   set: (partial: Partial<AppState> | ((state: AppState) => Partial<AppState>)) => void,
   operation: CliLifecycleOperation,
+  /// Target session. Defaults to the attached one; the session list passes an
+  /// explicit id because the session being rebooted is usually not the one
+  /// currently attached, and routing by "whatever is attached" is how these
+  /// controls misfire on mobile.
+  targetSessionId?: string,
 ): string | null {
-  const { ws, sessionId, cliLifecycleInventories, showToast } = get();
+  const { ws, cliLifecycleInventories, showToast } = get();
+  const sessionId = targetSessionId ?? get().sessionId;
   if (!sessionId) {
     showToast("Select a project before using CLI lifecycle controls", "error");
     return null;
@@ -3005,6 +3013,35 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
+
+  /// Reboot one session's CLI without attaching to it first.
+  ///
+  /// The correlated lifecycle path needs an inventory, and an inventory only
+  /// reaches a client attached to that session — so from the list it is
+  /// usually absent, and its guard would report "CLI too old" for a CLI that
+  /// is perfectly current. Fall back to the direct request in that case: the
+  /// server resolves the target session itself and enforces the same retired
+  /// provider and cluster policy checks against its own pane list, refusing
+  /// with an error that surfaces as a toast. What is lost is progress
+  /// reporting, not safety.
+  rebootSessionCli: (targetSessionId: string) => {
+    const { ws, cliLifecycleInventories, showToast } = get();
+    if (!targetSessionId) return null;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      showToast("Not connected — reboot the CLI manually on the project host", "error");
+      return null;
+    }
+    if (cliLifecycleInventories[targetSessionId]) {
+      return sendCliLifecycleRequest(get, set, "reboot_cli", targetSessionId);
+    }
+    try {
+      ws.send(JSON.stringify({ type: "reboot_cli", session_id: targetSessionId }));
+      showToast("Reboot requested — the project will reconnect shortly", "info");
+    } catch {
+      showToast("The reboot request could not be sent — reboot the CLI manually on the project host", "error");
+    }
+    return null;
+  },
 
   rebootCli: () => {
     const {

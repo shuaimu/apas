@@ -23,6 +23,7 @@ function renderHome(overrides: Partial<MobileCodeHomeProps> = {}) {
     onAccount: vi.fn(),
     onManageMachines: vi.fn(),
     onOpenSession: vi.fn(),
+    onRebootCli: vi.fn(),
     ...overrides,
   };
   render(<MobileCodeHome {...props} />);
@@ -180,6 +181,42 @@ describe("MobileCodeHome", () => {
 
     fireEvent.click(chooser.getByRole("button", { name: /alpha/ }));
     expect(props.onOpenSession).toHaveBeenCalledWith("session-a", "alpha");
+  });
+
+  it("reboots the CLI of the session whose icon was tapped, after confirming", () => {
+    const props = renderHome();
+
+    // The control names its project, because the list shows several and a
+    // mis-tap here restarts someone's work.
+    fireEvent.click(screen.getByRole("button", { name: "Reboot CLI for beta" }));
+    expect(props.onRebootCli).not.toHaveBeenCalled();
+
+    const dialog = screen.getByRole("dialog", { name: /Reboot this project/ });
+    expect(within(dialog).getByText(/Terminal panes keep running/)).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Reboot CLI" }));
+
+    // Routed by the session that was tapped, not by whatever is attached.
+    expect(props.onRebootCli).toHaveBeenCalledWith("session-b", "beta");
+  });
+
+  it("does nothing when the reboot confirmation is dismissed", () => {
+    const props = renderHome();
+
+    fireEvent.click(screen.getByRole("button", { name: "Reboot CLI for alpha" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(props.onRebootCli).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: /Reboot this project/ })).toBeNull();
+  });
+
+  it("keeps opening a project distinct from rebooting it", () => {
+    const props = renderHome();
+
+    // The two controls sit a thumb-width apart; tapping the card must open,
+    // never reboot.
+    fireEvent.click(screen.getByRole("button", { name: "Open alpha" }));
+    expect(props.onOpenSession).toHaveBeenCalledWith("session-a", "alpha");
+    expect(props.onRebootCli).not.toHaveBeenCalled();
   });
 
   it("keeps Account and machine management reachable without permanent bars", () => {
