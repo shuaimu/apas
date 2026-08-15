@@ -1,0 +1,29 @@
+8.5 pane-host audit — 2026-08-15T02:56:03Z — host zoo-005
+
+PROJECT        PANE   TMUX     CONTROLLER PROVIDER  SESSION
+4366dc38-914   189    ALIVE    no         3876098   ph_189_2f83c1d2
+73757577-63d   305    ALIVE    no         1964252   ph_305_048a8b68
+73757577-63d   826    ALIVE    no         1209561   ph_826_e13f513e
+73757577-63d   888    ALIVE    no         3882775   ph_888_f28547ee
+f150d041-ed6   294    ALIVE    no         1912964   ph_294_f7b07c2b
+f150d041-ed6   423    ALIVE    no         3887567   ph_423_9b071fab
+f150d041-ed6   7      ALIVE    no         3071328   ph_7_3bf461ce
+
+reverse check — tmux pane-host sessions with no runtime.json:
+  socket apas-4366dc38-9145-458a-a0eb-713ffbeb8438
+  socket apas-73757577-63d9-4133-8253-e76a65dbb0f3
+  socket apas-9ea02fb0-b964-4c80-af0a-20393fd41a45
+  socket apas-ca0a71cf-ab73-48a9-adae-abf780d0bb31
+  socket apas-e58bdefb-585c-4e5b-b641-0db01d07b33a
+  socket apas-f150d041-ed63-4b9a-bed9-02a44c75df28
+  (sockets enumerated below)
+    apas-4366dc38-9145-458a-a0eb-713ffbeb8438
+    apas-73757577-63d9-4133-8253-e76a65dbb0f3
+    apas-9ea02fb0-b964-4c80-af0a-20393fd41a45
+    apas-ca0a71cf-ab73-48a9-adae-abf780d0bb31
+    apas-e58bdefb-585c-4e5b-b641-0db01d07b33a
+    apas-f150d041-ed63-4b9a-bed9-02a44c75df28
+    default
+
+tombstones (projects mid-cleanup):
+  (none listed = no cleanup in progress)

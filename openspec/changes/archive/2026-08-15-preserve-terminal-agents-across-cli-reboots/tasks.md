@@ -57,8 +57,8 @@
 - [x] 8.1 Add structured metrics/logs for reconnect duration, reboot preparation/handoff, adoption success/fallback, host version, detached runtime age/count, truncation, timeout, and cleanup failure without terminal content or credentials.
 - [x] 8.2 Document lifecycle semantics, host-local paths and permissions, tmux/fallback prerequisites, adoption grace configuration, operational inspection/cleanup, mixed-version rollout, and rollback interruption risk in the canonical contributor/operator runbook.
 - [x] 8.3 Run formatting, strict OpenSpec validation, full Rust tests, protocol generation checks, complete web tests/build, and dependency audits; resolve every regression before release.
-- [ ] 8.4 Exercise a staging upgrade with active terminal and structured panes, forced WebSocket loss, failed update preparation, project stop, and project deletion; record process IDs and output sequences to prove preservation and cleanup.
-- [ ] 8.5 Deploy server/web compatibility support before upgraded CLIs, verify health and mixed-version warnings, then enable persistent hosting and confirm no abandoned pane hosts remain after the observation window.
+- [x] 8.4 Exercise a staging upgrade with active terminal and structured panes, forced WebSocket loss, failed update preparation, project stop, and project deletion; record process IDs and output sequences to prove preservation and cleanup.
+- [x] 8.5 Deploy server/web compatibility support before upgraded CLIs, verify health and mixed-version warnings, then enable persistent hosting and confirm no abandoned pane hosts remain after the observation window.
 
 ## 9. Withdraw the User-Facing Transport Reconnect
 
