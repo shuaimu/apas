@@ -1032,6 +1032,14 @@ impl Database {
         Ok(user)
     }
 
+    async fn user_is_cluster_admin(&self, user_id: &str) -> Result<bool> {
+        let user = self
+            .get_user_by_id(user_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("cluster account not found"))?;
+        Ok(user.role() == ClusterRole::Admin && user.is_active())
+    }
+
     pub async fn update_user_password(&self, email: &str, password_hash: &str) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
         let user_id = sqlx::query_scalar::<_, String>("SELECT id FROM users WHERE email = ?")
@@ -2415,6 +2423,11 @@ impl Database {
             ProjectLifecycle::Suspended => anyhow::bail!("project is suspended"),
             ProjectLifecycle::Deleting => anyhow::bail!("project deletion is in progress"),
         }
+        // Cluster administrators access every project in the cluster without
+        // an ownership or membership row. Ordinary users still require one.
+        if user.role() == ClusterRole::Admin {
+            return Ok(project);
+        }
         let has_access = project.owner_user_id == user_id
             || sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM project_members WHERE project_id = ? AND user_id = ?",
@@ -3496,23 +3509,43 @@ impl Database {
     }
 
     pub async fn get_sessions_for_user(&self, user_id: &str) -> Result<Vec<Session>> {
-        let sessions = sqlx::query_as::<_, Session>(
-            r#"
-            SELECT s.id, p.owner_user_id AS user_id, s.cli_client_id, s.working_dir,
-                   s.hostname, s.status, s.created_at, s.updated_at,
-                   COALESCE(s.is_paused, 0) AS is_paused,
-                   COALESCE(s.project_id, s.id) AS project_id,
-                   s.git_remote, s.git_remote_url
-            FROM sessions s
-            JOIN projects p ON p.id = COALESCE(s.project_id, s.id)
-            WHERE p.owner_user_id = ?
-            ORDER BY s.created_at DESC
-            LIMIT 50
-            "#,
-        )
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await?;
+        // Cluster administrators see every session in the cluster.
+        let admin = self.user_is_cluster_admin(user_id).await.unwrap_or(false);
+        let sessions = if admin {
+            sqlx::query_as::<_, Session>(
+                r#"
+                SELECT s.id, p.owner_user_id AS user_id, s.cli_client_id, s.working_dir,
+                       s.hostname, s.status, s.created_at, s.updated_at,
+                       COALESCE(s.is_paused, 0) AS is_paused,
+                       COALESCE(s.project_id, s.id) AS project_id,
+                       s.git_remote, s.git_remote_url
+                FROM sessions s
+                JOIN projects p ON p.id = COALESCE(s.project_id, s.id)
+                ORDER BY s.created_at DESC
+                LIMIT 50
+                "#,
+            )
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, Session>(
+                r#"
+                SELECT s.id, p.owner_user_id AS user_id, s.cli_client_id, s.working_dir,
+                       s.hostname, s.status, s.created_at, s.updated_at,
+                       COALESCE(s.is_paused, 0) AS is_paused,
+                       COALESCE(s.project_id, s.id) AS project_id,
+                       s.git_remote, s.git_remote_url
+                FROM sessions s
+                JOIN projects p ON p.id = COALESCE(s.project_id, s.id)
+                WHERE p.owner_user_id = ?
+                ORDER BY s.created_at DESC
+                LIMIT 50
+                "#,
+            )
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await?
+        };
         Ok(sessions)
     }
 
@@ -3730,6 +3763,11 @@ impl Database {
         &self,
         user_id: &str,
     ) -> Result<Vec<(Session, String, String)>> {
+        // Cluster administrators already receive the full session list from
+        // get_sessions_for_user; skip the membership list to avoid doubles.
+        if self.user_is_cluster_admin(user_id).await.unwrap_or(false) {
+            return Ok(Vec::new());
+        }
         // Compatibility shape for the web session list, now sourced from
         // canonical project membership rather than per-session role rows.
         let rows = sqlx::query(
@@ -3817,6 +3855,23 @@ impl Database {
     }
 
     pub async fn check_session_access(&self, session_id: &str, user_id: &str) -> Result<bool> {
+        // Cluster administrators can attach to any active session in the
+        // cluster without an ownership or membership row.
+        if self.user_is_cluster_admin(user_id).await.unwrap_or(false) {
+            let result = sqlx::query_scalar::<_, i64>(
+                r#"
+                SELECT COUNT(*)
+                FROM sessions s
+                JOIN projects p ON p.id = COALESCE(s.project_id, s.id)
+                WHERE s.id = ?
+                  AND p.lifecycle_status = 'active'
+                "#,
+            )
+            .bind(session_id)
+            .fetch_one(&self.pool)
+            .await?;
+            return Ok(result > 0);
+        }
         let result = sqlx::query_scalar::<_, i64>(
             r#"
             SELECT COUNT(*)
@@ -5256,7 +5311,10 @@ mod cluster_administration_tests {
         db.create_user(&user("member", "member@test", "user"))
             .await
             .unwrap();
-        db.create_user(&user("stranger", "stranger@test", "admin"))
+        db.create_user(&user("stranger", "stranger@test", "user"))
+            .await
+            .unwrap();
+        db.create_user(&user("admin", "admin@test", "admin"))
             .await
             .unwrap();
         db.authorize_project_registration("project-a", "owner")
@@ -5284,14 +5342,20 @@ mod cluster_administration_tests {
             .unwrap();
             assert!(db.check_session_access(id, "owner").await.unwrap());
             assert!(db.check_session_access(id, "member").await.unwrap());
-            // Cluster administration never implies content-plane access.
+            // Cluster administrators access project content without membership.
+            assert!(db.check_session_access(id, "admin").await.unwrap());
+            // Ordinary non-members remain denied.
             assert!(!db.check_session_access(id, "stranger").await.unwrap());
         }
-        db.set_project_lifecycle("stranger", "project-a", ProjectLifecycle::Suspended)
+        db.set_project_lifecycle("admin", "project-a", ProjectLifecycle::Suspended)
             .await
             .unwrap();
         assert!(!db
             .check_session_access("instance-a", "owner")
+            .await
+            .unwrap());
+        assert!(!db
+            .check_session_access("instance-a", "admin")
             .await
             .unwrap());
         assert!(db
@@ -5845,6 +5909,104 @@ mod cluster_administration_tests {
             owner_membership, 0,
             "the sole owner is never duplicated as a user"
         );
+    }
+
+    #[tokio::test]
+    async fn cluster_admins_open_any_project_without_membership() {
+        let db = database("admin-project-access").await;
+        db.run_migrations().await.unwrap();
+        db.create_user(&user("admin", "admin@test", "admin"))
+            .await
+            .unwrap();
+        db.create_user(&user("owner", "owner@test", "user"))
+            .await
+            .unwrap();
+        db.create_user(&user("outsider", "outsider@test", "user"))
+            .await
+            .unwrap();
+        db.authorize_project_registration("project-a", "owner")
+            .await
+            .unwrap();
+
+        // Active admin opens the project without any ownership or membership row.
+        let project = db
+            .authorize_project_registration("project-a", "admin")
+            .await
+            .unwrap();
+        assert_eq!(project.owner_user_id, "owner");
+
+        // Ordinary non-member, non-admin is still rejected.
+        assert!(db
+            .authorize_project_registration("project-a", "outsider")
+            .await
+            .is_err());
+
+        // Suspended admin is rejected.
+        sqlx::query("UPDATE users SET account_status = 'suspended' WHERE id = 'admin'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(db
+            .authorize_project_registration("project-a", "admin")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn cluster_admins_see_all_sessions_without_shared_duplicates() {
+        let db = database("admin-session-list").await;
+        db.run_migrations().await.unwrap();
+        db.create_user(&user("admin", "admin@test", "admin"))
+            .await
+            .unwrap();
+        db.create_user(&user("owner", "owner@test", "user"))
+            .await
+            .unwrap();
+        db.create_user(&user("member", "member@test", "user"))
+            .await
+            .unwrap();
+        db.authorize_project_registration("project-a", "owner")
+            .await
+            .unwrap();
+        db.add_project_member("owner", "project-a", "member")
+            .await
+            .unwrap();
+        db.create_session(&Session {
+            id: "session-a".to_string(),
+            user_id: "owner".to_string(),
+            cli_client_id: None,
+            working_dir: Some("/work/project-a".to_string()),
+            hostname: Some("host-a".to_string()),
+            status: "active".to_string(),
+            created_at: None,
+            updated_at: None,
+            is_paused: false,
+            project_id: Some("project-a".to_string()),
+            git_remote: None,
+            git_remote_url: None,
+        })
+        .await
+        .unwrap();
+
+        // Ordinary member sees the session through the shared list, not the
+        // owned list.
+        assert!(db.get_sessions_for_user("member").await.unwrap().is_empty());
+        assert_eq!(
+            db.get_shared_sessions_for_user("member").await.unwrap().len(),
+            1
+        );
+
+        // Admin sees every session through the owned list with the real owner
+        // surfaced, and nothing is duplicated in the shared list.
+        let admin_sessions = db.get_sessions_for_user("admin").await.unwrap();
+        assert_eq!(admin_sessions.len(), 1);
+        assert_eq!(admin_sessions[0].id, "session-a");
+        assert_eq!(admin_sessions[0].user_id, "owner");
+        assert!(db
+            .get_shared_sessions_for_user("admin")
+            .await
+            .unwrap()
+            .is_empty());
     }
 }
 

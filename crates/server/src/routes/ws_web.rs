@@ -285,6 +285,23 @@ fn normalize_project_path(raw: &str) -> String {
     trimmed.trim_end_matches('/').to_string()
 }
 
+async fn is_active_cluster_admin(state: &AppState, user_id: &Uuid) -> bool {
+    match state.db.get_user_by_id(&user_id.to_string()).await {
+        Ok(Some(user)) => {
+            user.role() == crate::db::ClusterRole::Admin && user.is_active()
+        }
+        Ok(None) => false,
+        Err(err) => {
+            tracing::warn!(
+                "Cluster role lookup failed for admin machine access (user {}): {}",
+                user_id,
+                err
+            );
+            false
+        }
+    }
+}
+
 async fn get_shared_project_access_refs(
     state: &AppState,
     user_id: &Uuid,
@@ -336,6 +353,9 @@ pub(crate) async fn list_accessible_machines_for_user(
     state: &AppState,
     user_id: &Uuid,
 ) -> Vec<shared::MachineWithProjects> {
+    if is_active_cluster_admin(state, user_id).await {
+        return state.sessions.get_all_machines();
+    }
     let mut machines = state.sessions.get_machines_for_user(user_id);
     let (host_path_refs, wildcard_paths) = get_shared_project_access_refs(state, user_id).await;
     // Cache the refs so heartbeat-driven `broadcast_machines_update_for_user`
@@ -3290,14 +3310,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         machine_id,
                         project_id
                     );
-                    let allowed = state
-                        .sessions
-                        .get_machines_for_user(&uid)
-                        .into_iter()
-                        .any(|m| {
-                            m.machine.machine_id == machine_id
-                                && m.projects.iter().any(|p| p.project_id == project_id)
-                        })
+                    let allowed = is_active_cluster_admin(&state, &uid).await
+                        || state
+                            .sessions
+                            .get_machines_for_user(&uid)
+                            .into_iter()
+                            .any(|m| {
+                                m.machine.machine_id == machine_id
+                                    && m.projects.iter().any(|p| p.project_id == project_id)
+                            })
                         || {
                             let (host_path_refs, wildcard_paths) =
                                 get_shared_project_access_refs(&state, &uid).await;
@@ -3423,14 +3444,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         continue;
                     };
 
-                    let allowed = state
-                        .sessions
-                        .get_machines_for_user(&uid)
-                        .into_iter()
-                        .any(|m| {
-                            m.machine.machine_id == machine_id
-                                && m.projects.iter().any(|p| p.project_id == project_id)
-                        })
+                    let allowed = is_active_cluster_admin(&state, &uid).await
+                        || state
+                            .sessions
+                            .get_machines_for_user(&uid)
+                            .into_iter()
+                            .any(|m| {
+                                m.machine.machine_id == machine_id
+                                    && m.projects.iter().any(|p| p.project_id == project_id)
+                            })
                         || {
                             let (host_path_refs, wildcard_paths) =
                                 get_shared_project_access_refs(&state, &uid).await;

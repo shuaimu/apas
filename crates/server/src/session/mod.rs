@@ -1509,58 +1509,62 @@ impl SessionManager {
     }
 
     pub fn get_machines_for_user(&self, user_id: &Uuid) -> Vec<MachineWithProjects> {
-        // Collect working dirs of active CLI sessions grouped by hostname
-        let mut active_dirs_by_host: HashMap<String, HashSet<String>> = HashMap::new();
+        self.machine_infos
+            .iter()
+            .filter(|entry| {
+                self.daemon_users
+                    .get(entry.key())
+                    .map(|owner| *owner == *user_id)
+                    .unwrap_or(false)
+            })
+            .map(|entry| self.build_machine_with_projects(*entry.key(), entry.value()))
+            .collect()
+    }
+
+    pub fn get_all_machines(&self) -> Vec<MachineWithProjects> {
+        self.machine_infos
+            .iter()
+            .map(|entry| self.build_machine_with_projects(*entry.key(), entry.value()))
+            .collect()
+    }
+
+    fn build_machine_with_projects(
+        &self,
+        machine_id: Uuid,
+        machine: &MachineInfo,
+    ) -> MachineWithProjects {
+        let mut projects = self
+            .machine_projects
+            .get(&machine_id)
+            .map(|p| p.clone())
+            .unwrap_or_default();
+
+        // Enrich is_running from active CLI sessions on the same host
         for session_entry in self.sessions.iter() {
             let session = session_entry.value();
-            if session.cli_client_id.is_some() {
-                if let (Some(hostname), Some(working_dir)) =
-                    (&session.hostname, &session.working_dir)
-                {
-                    active_dirs_by_host
-                        .entry(normalize_machine_hostname(hostname))
-                        .or_default()
-                        .insert(normalize_project_path(working_dir));
+            if session.cli_client_id.is_none() {
+                continue;
+            }
+            let (Some(hostname), Some(working_dir)) = (&session.hostname, &session.working_dir)
+            else {
+                continue;
+            };
+            if normalize_machine_hostname(hostname) != normalize_machine_hostname(&machine.hostname)
+            {
+                continue;
+            }
+            let active_dir = normalize_project_path(working_dir);
+            for project in &mut projects {
+                if !project.is_running && normalize_project_path(&project.path) == active_dir {
+                    project.is_running = true;
                 }
             }
         }
 
-        self.machine_infos
-            .iter()
-            .filter_map(|entry| {
-                let machine_id = *entry.key();
-                let owner_matches = self
-                    .daemon_users
-                    .get(&machine_id)
-                    .map(|owner| *owner == *user_id)
-                    .unwrap_or(false);
-                if !owner_matches {
-                    return None;
-                }
-
-                let machine = entry.value().clone();
-                let mut projects = self
-                    .machine_projects
-                    .get(&machine_id)
-                    .map(|p| p.clone())
-                    .unwrap_or_default();
-
-                // Enrich is_running from active CLI sessions on the same host
-                if let Some(active_dirs) =
-                    active_dirs_by_host.get(&normalize_machine_hostname(&machine.hostname))
-                {
-                    for project in &mut projects {
-                        if !project.is_running
-                            && active_dirs.contains(&normalize_project_path(&project.path))
-                        {
-                            project.is_running = true;
-                        }
-                    }
-                }
-
-                Some(MachineWithProjects { machine, projects })
-            })
-            .collect()
+        MachineWithProjects {
+            machine: machine.clone(),
+            projects,
+        }
     }
 
     pub fn get_machines_for_project_refs(
