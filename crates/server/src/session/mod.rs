@@ -3143,7 +3143,7 @@ mod tests {
         let request_id = Uuid::new_v4();
         let session_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
-        let operation = shared::CliLifecycleOperation::ReconnectTransport;
+        let operation = shared::CliLifecycleOperation::RebootCli;
         assert!(matches!(
             sessions.claim_lifecycle_request(request_id, session_id, user_id, operation),
             LifecycleRequestClaim::New

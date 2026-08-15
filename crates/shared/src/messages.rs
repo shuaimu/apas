@@ -85,14 +85,37 @@ pub enum TerminalLifecycle {
     Exited,
 }
 
-/// A project-level lifecycle operation. Reconnect is deliberately distinct
-/// from reboot so mixed-version routing can never turn transport recovery into
-/// a destructive process replacement.
+/// A project-level lifecycle operation.
+///
+/// Only reboot is a user decision. Transport recovery used to be a second
+/// variant here, driven by a `Reconnect Server` button, and was withdrawn: the
+/// CLI already re-dials a lost transport on its own with bounded backoff, and a
+/// request to do so has to travel over the very transport that is down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CliLifecycleOperation {
-    ReconnectTransport,
     RebootCli,
+}
+
+/// Deserialize a lifecycle operation, tolerating an operation this build no
+/// longer knows.
+///
+/// A browser holding a bundle from before an operation was retired still sends
+/// it. Without this the unknown tag fails the whole `WebToServer` decode, so one
+/// stale request would take the socket down rather than being ignored — a much
+/// worse outcome than dropping the request. Resolution goes through the enum's
+/// own `Deserialize` so it cannot drift from `rename_all`.
+fn lenient_lifecycle_operation<'de, D>(
+    deserializer: D,
+) -> Result<Option<CliLifecycleOperation>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::IntoDeserializer;
+    let raw = String::deserialize(deserializer)?;
+    let parsed: Result<CliLifecycleOperation, serde::de::value::Error> =
+        CliLifecycleOperation::deserialize(raw.into_deserializer());
+    Ok(parsed.ok())
 }
 
 /// Authoritative progress for a correlated lifecycle request.
@@ -137,8 +160,6 @@ pub struct PanePreservationInfo {
 /// Empty/default values make the message safe while CLI versions roll out.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CliLifecycleInventory {
-    #[serde(default)]
-    pub reconnect_transport: bool,
     #[serde(default)]
     pub persistent_terminal_hosting: bool,
     #[serde(default)]
@@ -1317,7 +1338,9 @@ pub enum WebToServer {
     CliLifecycleRequest {
         session_id: Uuid,
         request_id: Uuid,
-        operation: CliLifecycleOperation,
+        /// `None` when the client asked for an operation this build retired.
+        #[serde(deserialize_with = "lenient_lifecycle_operation")]
+        operation: Option<CliLifecycleOperation>,
     },
 
     /// Start APAS CLI for a daemon project
@@ -4209,18 +4232,36 @@ mod tests {
     fn lifecycle_protocol_is_correlated_and_legacy_reboot_is_unchanged() {
         let session_id = Uuid::new_v4();
         let request_id = Uuid::new_v4();
-        let reconnect = WebToServer::CliLifecycleRequest {
+        let reboot = WebToServer::CliLifecycleRequest {
             session_id,
             request_id,
-            operation: CliLifecycleOperation::ReconnectTransport,
+            operation: Some(CliLifecycleOperation::RebootCli),
         };
-        let json = serde_json::to_string(&reconnect).unwrap();
+        let json = serde_json::to_string(&reboot).unwrap();
         assert!(json.contains("\"type\":\"cli_lifecycle_request\""));
-        assert!(json.contains("\"operation\":\"reconnect_transport\""));
+        assert!(json.contains("\"operation\":\"reboot_cli\""));
         match serde_json::from_str::<WebToServer>(&json).unwrap() {
             WebToServer::CliLifecycleRequest {
-                request_id: got, ..
-            } => assert_eq!(got, request_id),
+                request_id: got,
+                operation,
+                ..
+            } => {
+                assert_eq!(got, request_id);
+                assert_eq!(operation, Some(CliLifecycleOperation::RebootCli));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        // A browser still running a bundle from before `reconnect_transport`
+        // was retired must not take the socket down: the message has to decode
+        // with the operation dropped, not fail outright.
+        let stale = format!(
+            r#"{{"type":"cli_lifecycle_request","session_id":"{session_id}","request_id":"{request_id}","operation":"reconnect_transport"}}"#
+        );
+        match serde_json::from_str::<WebToServer>(&stale)
+            .expect("a retired operation must not fail the whole decode")
+        {
+            WebToServer::CliLifecycleRequest { operation, .. } => assert_eq!(operation, None),
             other => panic!("unexpected variant: {other:?}"),
         }
 
@@ -4239,8 +4280,7 @@ mod tests {
         }"#;
         match serde_json::from_str::<CliToServer>(json).unwrap() {
             CliToServer::CliLifecycleInventory { inventory, .. } => {
-                assert!(!inventory.reconnect_transport);
-                assert!(!inventory.persistent_terminal_hosting);
+                        assert!(!inventory.persistent_terminal_hosting);
                 assert!(inventory.panes.is_empty());
             }
             other => panic!("unexpected variant: {other:?}"),

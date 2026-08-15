@@ -32,7 +32,6 @@ interface TabBarProps {
   onRenameTab?: (paneId: number, newLabel: string) => void;
   onReorderTabs?: (orderedIds: number[]) => void;
   onBootCli?: () => void;
-  onReconnectCli?: () => void;
   onRebootCli?: () => void;
   lifecycleInventory?: CliLifecycleInventory;
   lifecycleStatus?: CliLifecycleStatus;
@@ -77,9 +76,7 @@ function rebootConfirmation(inventory?: CliLifecycleInventory): string {
 function lifecyclePhaseLabel(status?: CliLifecycleStatus): string | null {
   if (!status) return null;
   if (status.message) return status.message;
-  return status.operation === "reconnect_transport"
-    ? `Server reconnect: ${status.phase.replaceAll("_", " ")}`
-    : `CLI reboot: ${status.phase.replaceAll("_", " ")}`;
+  return `CLI reboot: ${status.phase.replaceAll("_", " ")}`;
 }
 
 function isDeepseekTab(provider: string, model?: string, label?: string): boolean {
@@ -153,7 +150,6 @@ export function TabBar({
   onRenameTab,
   onReorderTabs,
   onBootCli,
-  onReconnectCli,
   onRebootCli,
   lifecycleInventory,
   lifecycleStatus,
@@ -517,30 +513,6 @@ export function TabBar({
             </button>
             {lifecycleMenuOpen && (
               <div className="absolute right-0 top-full z-50 w-80 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 shadow-xl p-1.5">
-                {lifecycleInventory?.reconnect_transport && onReconnectCli ? (
-                  <button
-                    disabled={Boolean(lifecycleStatus && !["succeeded", "failed", "timed_out"].includes(lifecycleStatus.phase))}
-                    onClick={() => {
-                      if (confirm("Reconnect APAS server transport? The CLI and every pane will keep running.")) {
-                        onReconnectCli();
-                        setLifecycleMenuOpen(false);
-                      }
-                    }}
-                    className="w-full rounded px-3 py-2 text-left text-sm hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50"
-                  >
-                    <span className="flex items-center justify-between font-medium">
-                      Reconnect Server
-                      <span className="text-[10px] uppercase tracking-wide text-blue-600 dark:text-blue-400">Recommended</span>
-                    </span>
-                    <span className="mt-0.5 block text-xs text-gray-500 dark:text-gray-400">
-                      Reconnect only the server transport; agents and panes keep running.
-                    </span>
-                  </button>
-                ) : (
-                  <div className="px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-                    Upgrade this project CLI on its host to use safe transport-only reconnect.
-                  </div>
-                )}
                 <button
                   disabled={Boolean(lifecycleStatus && !["succeeded", "failed", "timed_out"].includes(lifecycleStatus.phase))}
                   onClick={() => {

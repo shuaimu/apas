@@ -433,11 +433,14 @@ export type MutationKind = "approval" | "question" | "plan_review" | "interrupt"
  */
 export type PanePreservationMode = "live_adoptable" | "restart_required_on_cli_reboot" | "structured_pane_may_resume";
 /**
- * A project-level lifecycle operation. Reconnect is deliberately distinct
- * from reboot so mixed-version routing can never turn transport recovery into
- * a destructive process replacement.
+ * A project-level lifecycle operation.
+ *
+ * Only reboot is a user decision. Transport recovery used to be a second
+ * variant here, driven by a `Reconnect Server` button, and was withdrawn: the
+ * CLI already re-dials a lost transport on its own with bounded backoff, and a
+ * request to do so has to travel over the very transport that is down.
  */
-export type CliLifecycleOperation = "reconnect_transport" | "reboot_cli";
+export type CliLifecycleOperation = "reboot_cli";
 /**
  * Authoritative progress for a correlated lifecycle request.
  */
@@ -765,7 +768,10 @@ export type WebToServer =
       [k: string]: unknown;
     }
   | {
-      operation: CliLifecycleOperation;
+      /**
+       * `None` when the client asked for an operation this build retired.
+       */
+      operation?: CliLifecycleOperation | null;
       request_id: string;
       session_id: string;
       type: "cli_lifecycle_request";
@@ -1260,7 +1266,6 @@ export interface MobileRefreshRequest {
 export interface CliLifecycleInventory {
   panes?: PanePreservationInfo[];
   persistent_terminal_hosting?: boolean;
-  reconnect_transport?: boolean;
   [k: string]: unknown;
 }
 export interface PanePreservationInfo {
@@ -1276,7 +1281,6 @@ export interface PanePreservationInfo {
 export interface CliLifecycleInventory1 {
   panes?: PanePreservationInfo[];
   persistent_terminal_hosting?: boolean;
-  reconnect_transport?: boolean;
   [k: string]: unknown;
 }
 /**

@@ -5,7 +5,7 @@
 - [x] 1.3 Implement authorized server routing for lifecycle requests, scoped to the currently owning project CLI, with request deduplication, bounded pending state, timeout outcomes, and access-revocation cleanup.
 - [x] 1.4 Broadcast lifecycle capabilities, preservation inventory, and operation progress only to currently authorized project viewers, with mixed-version server tests proving reconnect never falls back to reboot.
 
-## 2. Transport-Only Reconnect
+## 2. Transport-Only Reconnect (superseded by section 9)
 
 - [x] 2.1 Add an in-process reconnect signal to the project CLI connection loop that deliberately closes only the current WebSocket, skips retry backoff, and leaves all pane state, queues, processes, watchers, and terminal handles untouched.
 - [x] 2.2 Correlate reconnect acceptance and completion to the request ID, reporting success only after registration, session start, pane roster, and terminal lifecycle reconciliation complete.
@@ -59,3 +59,16 @@
 - [x] 8.3 Run formatting, strict OpenSpec validation, full Rust tests, protocol generation checks, complete web tests/build, and dependency audits; resolve every regression before release.
 - [ ] 8.4 Exercise a staging upgrade with active terminal and structured panes, forced WebSocket loss, failed update preparation, project stop, and project deletion; record process IDs and output sequences to prove preservation and cleanup.
 - [ ] 8.5 Deploy server/web compatibility support before upgraded CLIs, verify health and mixed-version warnings, then enable persistent hosting and confirm no abandoned pane hosts remain after the observation window.
+
+## 9. Withdraw the User-Facing Transport Reconnect
+
+Section 2 and tasks 7.2-7.4 shipped a user-triggered reconnect. That decision was
+reversed (see design decision 1); their entries stay checked because the work was
+really done. These tasks remove it.
+
+- [x] 9.1 Remove the `Reconnect Server` entry and the `onReconnectCli` prop from `packages/web/src/components/tabs/TabBar.tsx`, leaving `Reboot CLI` as the only lifecycle action, and drop its wiring in `TabbedView.tsx`.
+- [x] 9.2 Remove the `reconnectCli` action and its type from `packages/web/src/lib/store.ts`, and the reconnect cases from `TabBar.test.tsx` and `store.test.ts`. Add a test asserting the lifecycle menu offers no transport-reconnect action.
+- [x] 9.3 Remove the `CliLifecycleOperation::ReconnectTransport` variant from `crates/shared/src/messages.rs` and its handling in `crates/server/src/routes/ws_web.rs` and `crates/server/src/session/mod.rs`, keeping reboot request correlation, authorization, and progress reporting intact.
+- [x] 9.4 Remove the CLI's requested-reconnect path — the `ReconnectTransport` handler plus `queue_transport_reconnect`, `pending_reconnects`, `reconnect_started_at`, and `immediate_reconnect` — leaving the automatic outer reconnect loop and its bounded backoff untouched. Add or retain a test proving a dropped transport recovers with pane process identity unchanged.
+- [x] 9.5 Make the server ignore an unrecognised lifecycle operation rather than failing to decode the enclosing message, so a stale web bundle still sending `reconnect_transport` cannot drop the socket. Cover it with a test.
+- [x] 9.6 Regenerate `packages/protocol` so the generated contract drops the retired operation, and confirm the `Mobile protocol` CI gate passes.

@@ -10,7 +10,7 @@ The machine daemon already uses project-scoped tmux servers so headless project 
 
 - Make transport recovery an explicit in-process operation with no pane lifecycle side effects.
 - Preserve the exact live provider process for supported terminal panes while the project CLI binary is replaced.
-- Reuse the existing server instance/sequence model so reconnect and reboot cannot duplicate or reorder output.
+- Reuse the existing server instance/sequence model so transport recovery and reboot cannot duplicate or reorder output.
 - Make local adoption exclusive, authenticated, bounded, observable, and safely cleanable.
 - Roll out across mixed server, web, daemon, CLI, and persistent-host versions without turning an unsupported request into a destructive operation.
 
@@ -24,11 +24,13 @@ The machine daemon already uses project-scoped tmux servers so headless project 
 
 ## Decisions
 
-### 1. Add a first-class transport reconnect instead of overloading reboot
+### 1. Leave transport recovery automatic; make reboot the only lifecycle control
 
-Introduce a capability-gated lifecycle request with a client-generated request ID and operation enum. The new web uses `ReconnectTransport` for connection recovery and `RebootCli` only for binary replacement. The server reauthorizes the project, records a bounded pending operation, and routes the exact request to the owning CLI.
+Introduce a capability-gated lifecycle request with a client-generated request ID and operation enum carrying exactly one operation: `RebootCli`, for binary replacement. The server reauthorizes the project, records a bounded pending operation, and routes the exact request to the owning CLI.
 
-For `ReconnectTransport`, `run_server_connection` sends an accepted status, deliberately closes its current WebSocket, skips normal retry backoff, and immediately returns to its existing outer connection loop. It does not set the project shutdown flag, rebuild state, save/restore panes, or touch any input/PTY handle. Once registration, `SessionStart`, `PaneList`, and terminal reconciliation complete, the CLI reports success for the same request ID. Concurrent reconnect requests coalesce around the active request.
+Connection recovery needs no request at all. `run_server_connection` already re-dials a lost WebSocket from its outer loop with exponential backoff (1s, doubling, capped at 60s) without setting the project shutdown flag, rebuilding state, saving/restoring panes, or touching any input/PTY handle. That path is the whole mechanism.
+
+This reverses an earlier decision in this change, which added a user-triggered `ReconnectTransport` operation alongside reboot. It was withdrawn deliberately, and the reasoning is worth keeping: a reconnect button asks the user to diagnose a transport state they cannot observe, and its presence next to `Reboot CLI` frames a dead connection as something to choose a remedy for. In practice a degraded transport is either already recovering on its own or the CLI is not reachable at all — and in the second case the request cannot be delivered, because it would travel over the very transport that is down. The control could therefore only ever help in the case that needed no help. Withdrawing it also removes the in-process `queue_transport_reconnect` / `immediate_reconnect` path whose sole purpose was to skip the automatic backoff for a requested reconnect.
 
 Alternatives considered:
 
@@ -114,15 +116,15 @@ Startup reconciliation validates registry entries against live tmux sessions, ho
 
 ### 7. Capability detection is per operation and per live pane
 
-Add protocol capabilities for lifecycle requests and persistent terminal hosting. The CLI advertises transport reconnect whenever the in-process path is supported. It advertises persistent hosting only after validating Unix sockets, secure host-local runtime storage, the pane-host subcommand, and tmux.
+Add protocol capabilities for lifecycle requests and persistent terminal hosting. The CLI advertises lifecycle-request support whenever the reboot path is supported. It advertises persistent hosting only after validating Unix sockets, secure host-local runtime storage, the pane-host subcommand, and tmux.
 
 Preservation is also reported per terminal pane because a CLI upgraded in place may still own pre-feature PTYs that cannot be migrated live. Such panes remain usable but are marked `restart_required_on_cli_reboot`. Newly created/restored host-backed panes report their runtime ID and `live_adoptable`. After one fallback restart under the new architecture, future reboots can preserve them.
 
-The server forwards lifecycle capabilities and statuses to currently authorized web clients. The new web never maps unsupported `ReconnectTransport` to legacy `RebootCli`. Legacy reboot messages remain accepted during rollout and retain their current behavior and stronger warning.
+The server forwards lifecycle capabilities and statuses to currently authorized web clients. The web sends only `RebootCli`. Because an older web bundle may still send a retired lifecycle operation, the server ignores an operation it does not recognise rather than failing to decode the whole message and dropping the socket. Legacy reboot messages remain accepted during rollout and retain their current behavior and stronger warning.
 
 ### 8. Keep the toolbar concise and move lifecycle detail into one action menu
 
-The existing top tab bar keeps its project-level lifecycle location, but replaces an ambiguous direct reboot confirmation with a compact action menu. `Reconnect Server` is the recommended recovery action when supported. `Reboot CLI` shows the current preservation inventory (adoptable terminal count, non-adoptable terminal count, structured pane count) and explicit consequences. Progress is keyed by request ID and survives tab/project navigation in web state until success, failure, or timeout.
+The existing top tab bar keeps its project-level lifecycle location, but replaces an ambiguous direct reboot confirmation with a compact action menu. `Reboot CLI` is the only entry, and shows the current preservation inventory (adoptable terminal count, non-adoptable terminal count, structured pane count) and explicit consequences. Progress is keyed by request ID and survives tab/project navigation in web state until success, failure, or timeout.
 
 This does not return Bot, provider, or Role controls to terminal toolbars and does not add lifecycle controls to mobile in the first release.
 
@@ -141,9 +143,9 @@ This does not return Bot, provider, or Role controls to terminal toolbars and do
 
 1. Deploy server/shared protocol support that accepts legacy reboot messages, stores bounded lifecycle-operation state, and ignores unknown persistent-host metadata safely.
 2. Deploy the web action menu capability-gated; old CLIs continue to show only the legacy reboot path with its destructive warning.
-3. Ship the CLI reconnect path and pane-host subcommand behind capability probing. Existing CLI-owned terminal panes are reported non-adoptable; no live PTY is migrated.
+3. Ship the pane-host subcommand behind capability probing. Existing CLI-owned terminal panes are reported non-adoptable; no live PTY is migrated.
 4. Create new terminal panes under persistent hosts. On the first CLI reboot after upgrade, old CLI-owned panes restart through existing continuation behavior and are recreated host-backed; later reboots adopt them live.
 5. Extend daemon stop/reconciliation and project deletion checks before enabling the persistent-host capability by default.
 6. Monitor operation latency, adoption success/fallback, detached-host count/age, output truncation, and cleanup failures without logging terminal content or credentials.
 
-Rollback disables new host creation and hides reconnect/reboot enhancements while leaving already running hosts untouched until their panes close. If an older CLI cannot adopt them, an operator or newer daemon explicitly stops the project hosts, after which the older CLI restores provider sessions using existing behavior. Rollback documentation SHALL identify that this interrupts active terminal turns.
+Rollback disables new host creation and hides the reboot enhancements while leaving already running hosts untouched until their panes close. If an older CLI cannot adopt them, an operator or newer daemon explicitly stops the project hosts, after which the older CLI restores provider sessions using existing behavior. Rollback documentation SHALL identify that this interrupts active terminal turns.

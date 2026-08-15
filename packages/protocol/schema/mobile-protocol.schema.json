@@ -368,18 +368,13 @@
         "persistent_terminal_hosting": {
           "type": "boolean",
           "default": false
-        },
-        "reconnect_transport": {
-          "type": "boolean",
-          "default": false
         }
       }
     },
     "CliLifecycleOperation": {
-      "description": "A project-level lifecycle operation. Reconnect is deliberately distinct\nfrom reboot so mixed-version routing can never turn transport recovery into\na destructive process replacement.",
+      "description": "A project-level lifecycle operation.\n\nOnly reboot is a user decision. Transport recovery used to be a second\nvariant here, driven by a `Reconnect Server` button, and was withdrawn: the\nCLI already re-dials a lost transport on its own with bounded backoff, and a\nrequest to do so has to travel over the very transport that is down.",
       "type": "string",
       "enum": [
-        "reconnect_transport",
         "reboot_cli"
       ]
     },
@@ -2053,8 +2048,7 @@
               "$ref": "#/$defs/CliLifecycleInventory",
               "default": {
                 "panes": [],
-                "persistent_terminal_hosting": false,
-                "reconnect_transport": false
+                "persistent_terminal_hosting": false
               }
             },
             "session_id": {
@@ -4608,7 +4602,15 @@
           "type": "object",
           "properties": {
             "operation": {
-              "$ref": "#/$defs/CliLifecycleOperation"
+              "description": "`None` when the client asked for an operation this build retired.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/CliLifecycleOperation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "request_id": {
               "type": "string",
@@ -4626,8 +4628,7 @@
           "required": [
             "type",
             "session_id",
-            "request_id",
-            "operation"
+            "request_id"
           ]
         },
         {

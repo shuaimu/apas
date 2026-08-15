@@ -1248,7 +1248,6 @@ fn build_lifecycle_inventory(
         .unwrap_or_default();
     panes.sort_by_key(|pane| pane.pane_id);
     shared::CliLifecycleInventory {
-        reconnect_transport: true,
         persistent_terminal_hosting: crate::pane_host::persistent_hosting_available(),
         panes,
     }
@@ -5344,7 +5343,7 @@ mod tests {
         build_pane_reboot_events, build_user_envelope_line, convert_opencode_to_claude,
         deadloop_wait_plan, evaluate_deadloop_watchdog, is_codex_stale_session_error,
         manual_create_pr_worktree_path, normalize_codex_effort, normalize_effort_level,
-        promote_pane_to_managed, queue_transport_reconnect, refresh_stale_managed_builtin_prompts,
+        promote_pane_to_managed, refresh_stale_managed_builtin_prompts,
         reset_deadloop_codex_stale_session, resolve_pane_binary_path, resolve_terminal_binary,
         restored_pane_mode_and_pause, retired_launch_rejection_output, route_web_input_to_pane,
         run_deadloop_session_inner, save_pane_configs, should_recover_deadloop_stale_session,
@@ -6391,7 +6390,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_reconnect_requests_preserve_terminal_and_structured_turn_state() {
+    async fn a_dropped_transport_preserves_terminal_and_structured_turn_state() {
         let root = tempfile::tempdir().unwrap();
         let provider = root.path().join("reconnect-provider.sh");
         std::fs::write(
@@ -6424,21 +6423,12 @@ mod tests {
         structured_tx
             .send(("turn remains queued".to_string(), false))
             .unwrap();
-        let request_a = Uuid::new_v4();
-        let request_b = Uuid::new_v4();
-        let mut pending = Vec::new();
-        assert!(queue_transport_reconnect(&mut pending, request_a));
-        assert!(!queue_transport_reconnect(&mut pending, request_a));
-        assert!(queue_transport_reconnect(&mut pending, request_b));
-        assert_eq!(pending, vec![request_a, request_b]);
-
-        // A failed connection attempt leaves correlated requests queued and
-        // does not touch either in-process transport consumer.
+        // A failed connection attempt does not touch either in-process
+        // transport consumer: automatic recovery must never cost pane state.
         assert_eq!(structured_rx.recv().unwrap().0, "turn remains queued");
         terminal.write_bytes(b"during-reconnect\n").unwrap();
         assert_eq!(terminal.instance_id(), instance_before);
         assert_eq!(terminal.provider_pid(), pid_before);
-        assert_eq!(pending.len(), 2);
 
         let mut saw_during = false;
         for _ in 0..8 {
@@ -11448,15 +11438,7 @@ async fn report_retired_launch_rejection<S>(
     }
 }
 
-/// Run server connection with automatic reconnection
-fn queue_transport_reconnect(pending: &mut Vec<Uuid>, request_id: Uuid) -> bool {
-    if pending.contains(&request_id) {
-        return false;
-    }
-    pending.push(request_id);
-    true
-}
-
+/// Run server connection, reconnecting automatically with bounded backoff.
 async fn run_server_connection(
     server_url: &str,
     token: &str,
@@ -11485,9 +11467,6 @@ async fn run_server_connection(
     let mut reconnect_delay = std::time::Duration::from_secs(1);
     let max_reconnect_delay = std::time::Duration::from_secs(60);
     let mut connection_count = 0u32;
-    let mut immediate_reconnect = false;
-    let mut pending_reconnects: Vec<Uuid> = Vec::new();
-    let mut reconnect_started_at: HashMap<Uuid, std::time::Instant> = HashMap::new();
 
     // Resolve the project's git remote once: it can't change between
     // reconnects, so we avoid re-shelling out to git on every loop iteration.
@@ -11741,37 +11720,6 @@ async fn run_server_connection(
                     if ws_sender.send(Message::Text(text.into())).await.is_err() {
                         continue;
                     }
-                }
-
-                let mut completed_reconnects = 0;
-                for request_id in pending_reconnects.iter().copied() {
-                    let completed = CliToServer::CliLifecycleStatus {
-                        session_id,
-                        request_id,
-                        operation: shared::CliLifecycleOperation::ReconnectTransport,
-                        phase: shared::CliLifecyclePhase::Succeeded,
-                        message: Some(
-                            "Server transport reconnected and pane state reconciled".to_string(),
-                        ),
-                        inventory: Some(lifecycle_inventory.clone()),
-                    };
-                    if let Ok(text) = serde_json::to_string(&completed) {
-                        if ws_sender.send(Message::Text(text.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                    let duration_ms = reconnect_started_at
-                        .remove(&request_id)
-                        .map(|started| started.elapsed().as_millis())
-                        .unwrap_or_default();
-                    tracing::info!(%request_id, duration_ms, "transport-only reconnect completed");
-                    completed_reconnects += 1;
-                }
-                if completed_reconnects > 0 {
-                    pending_reconnects.drain(..completed_reconnects);
-                }
-                if !pending_reconnects.is_empty() {
-                    continue;
                 }
 
                 if let Some((marker_path, marker)) = reboot_handoff.take() {
@@ -12953,34 +12901,6 @@ async fn run_server_connection(
                                                 reboot_requested.store(true, Ordering::SeqCst);
                                                 shutdown.store(true, Ordering::SeqCst);
                                                 return Ok(());
-                                            }
-                                            ServerToCli::CliLifecycleRequest {
-                                                session_id: requested_session,
-                                                request_id,
-                                                operation: shared::CliLifecycleOperation::ReconnectTransport,
-                                            } => {
-                                                if requested_session != session_id {
-                                                    continue;
-                                                }
-                                                let accepted = CliToServer::CliLifecycleStatus {
-                                                    session_id,
-                                                    request_id,
-                                                    operation: shared::CliLifecycleOperation::ReconnectTransport,
-                                                    phase: shared::CliLifecyclePhase::Reconnecting,
-                                                    message: Some("Closing only the current server transport".to_string()),
-                                                    inventory: Some(build_lifecycle_inventory(&pane_metas, &terminal_panes)),
-                                                };
-                                                if let Ok(text) = serde_json::to_string(&accepted) {
-                                                    let _ = ws_sender.send(Message::Text(text.into())).await;
-                                                    let _ = ws_sender.flush().await;
-                                                }
-                                                if queue_transport_reconnect(&mut pending_reconnects, request_id) {
-                                                    reconnect_started_at.insert(request_id, std::time::Instant::now());
-                                                    immediate_reconnect = true;
-                                                }
-                                                tracing::info!(%request_id, "starting transport-only reconnect; pane runtimes remain untouched");
-                                                let _ = ws_sender.close().await;
-                                                break;
                                             }
                                             ServerToCli::CliLifecycleRequest {
                                                 session_id: requested_session,
@@ -14380,11 +14300,7 @@ async fn run_server_connection(
                         ),
                         pane_id: shared::PANE_ID_DEADLOOP,
                     });
-                    if immediate_reconnect {
-                        immediate_reconnect = false;
-                    } else {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             }
             Err(e) => {

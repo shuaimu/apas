@@ -42,7 +42,7 @@ export interface CliClient {
   activeSession?: string;
 }
 
-export type CliLifecycleOperation = "reconnect_transport" | "reboot_cli";
+export type CliLifecycleOperation = "reboot_cli";
 export type CliLifecyclePhase =
   | "accepted"
   | "preparing"
@@ -64,7 +64,6 @@ export interface PanePreservationInfo {
 }
 
 export interface CliLifecycleInventory {
-  reconnect_transport: boolean;
   persistent_terminal_hosting: boolean;
   panes: PanePreservationInfo[];
 }
@@ -867,7 +866,6 @@ interface AppState {
     effort?: string,
   ) => void;
   stopBot: (paneId: number) => void;
-  reconnectCli: () => string | null;
   rebootCli: () => string | null;
   requestPaneDiff: (paneId: number) => void;
   paneDiffs: Record<number, PaneDiff>;
@@ -1019,9 +1017,9 @@ function sendCliLifecycleRequest(
     return null;
   }
   const inventory = cliLifecycleInventories[sessionId];
-  if (!inventory || (operation === "reconnect_transport" && !inventory.reconnect_transport)) {
+  if (!inventory) {
     showToast(
-      "This project CLI is too old for safe server reconnect. Upgrade it on the project host.",
+      "This project CLI is too old for safe lifecycle controls. Upgrade it on the project host.",
       "error",
     );
     return null;
@@ -1034,9 +1032,7 @@ function sendCliLifecycleRequest(
     requestId,
     operation,
     phase: "accepted",
-    message: operation === "reconnect_transport"
-      ? "Requesting a transport-only server reconnect"
-      : "Requesting a full CLI reboot",
+    message: "Requesting a full CLI reboot",
     inventory,
     startedAt: now,
     updatedAt: now,
@@ -3012,7 +3008,6 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  reconnectCli: () => sendCliLifecycleRequest(get, set, "reconnect_transport"),
 
   rebootCli: () => {
     const {
@@ -3850,7 +3845,6 @@ function parseCliLifecycleInventory(raw: unknown): CliLifecycleInventory {
       })
     : [];
   return {
-    reconnect_transport: value.reconnect_transport === true,
     persistent_terminal_hosting: value.persistent_terminal_hosting === true,
     panes,
   };
@@ -4026,9 +4020,7 @@ export function handleServerMessage(
       }));
       if (phase === "succeeded") {
         get().showToast(
-          operation === "reconnect_transport"
-            ? "Server transport reconnected; panes kept running"
-            : "CLI reboot completed",
+          "CLI reboot completed",
           "success",
         );
       } else if (phase === "failed" || phase === "timed_out") {

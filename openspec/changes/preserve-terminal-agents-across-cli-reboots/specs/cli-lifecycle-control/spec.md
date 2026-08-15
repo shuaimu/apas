@@ -1,26 +1,33 @@
 ## Purpose
 
-Defines safe, observable controls for reconnecting a project CLI transport or replacing the CLI process without conflating the two operations or unnecessarily interrupting active work.
+Defines how a project CLI recovers its server transport automatically, and the separate, observable control for replacing the CLI process, so that recovering a connection is never conflated with interrupting active work.
 
 ## ADDED Requirements
 
-### Requirement: Transport reconnect does not restart project work
-The system SHALL allow an authorized user to request reconnection of an attached project's server transport without exiting or replacing the project CLI process. A transport reconnect SHALL leave every pane process, terminal instance, active turn, input queue, and project-local watcher unchanged.
+### Requirement: Transport recovery is automatic and does not restart project work
+A project CLI SHALL re-establish a lost or unhealthy server transport on its own, retrying with bounded exponential backoff, without exiting or replacing the CLI process. Transport recovery SHALL leave every pane process, terminal instance, active turn, input queue, and project-local watcher unchanged.
 
-#### Scenario: User reconnects an unhealthy server transport
-- **WHEN** an authorized user requests a server reconnect for an attached project
-- **THEN** the project CLI closes and re-establishes only its server transport
+Transport recovery SHALL NOT be exposed as a user-facing control. It is plumbing: a control would ask a user to diagnose a connection state they cannot observe, and offering one invites reaching for a full reboot when the connection is merely degraded. A full CLI reboot SHALL NOT be presented as the remedy for a transport-only problem.
+
+#### Scenario: Transport drops while the project is attached
+- **WHEN** an attached project CLI loses its server transport
+- **THEN** the CLI re-establishes only that transport, without user action
 - **AND** all pane processes retain their process identity and continue running
 
-#### Scenario: Agent produces output during reconnect
+#### Scenario: Agent produces output during recovery
 - **WHEN** a pane produces output while the project CLI is re-establishing its server transport
 - **THEN** the transport recovery path preserves or replays that output through its existing bounded reconnect behavior
 - **AND** does not restart the pane to recover delivery
 
-#### Scenario: Reconnect is requested repeatedly
-- **WHEN** multiple reconnect requests overlap for the same project CLI
-- **THEN** the system coalesces them into at most one active reconnect attempt
+#### Scenario: Recovery keeps failing
+- **WHEN** successive reconnection attempts fail
+- **THEN** the CLI backs off between attempts up to a bounded maximum interval and keeps retrying
 - **AND** does not create concurrent project sessions or duplicate pane processes
+
+#### Scenario: No transport control is offered
+- **WHEN** a user opens lifecycle actions for an attached project
+- **THEN** no transport-reconnect action is presented, whatever the CLI's version
+- **AND** the interface does not substitute a full reboot for connection recovery
 
 ### Requirement: Full CLI reboot remains a distinct operation
 The system SHALL retain a separate full CLI reboot operation for installing or activating a new APAS binary. Before starting it, the interface SHALL explain which live pane kinds the connected CLI can preserve and which pane kinds will restart or resume. A full reboot SHALL NOT be presented as the normal remedy for a transport-only problem.
@@ -41,12 +48,7 @@ The system SHALL retain a separate full CLI reboot operation for installing or a
 - **AND** the user receives an actionable failure result instead of a false reboot success
 
 ### Requirement: Lifecycle operations report authoritative progress and outcome
-Reconnect and reboot operations SHALL be correlated to one project and one request identifier. The system SHALL report accepted, in-progress, succeeded, or failed outcomes to authorized clients and SHALL NOT infer success solely from a transient disconnect.
-
-#### Scenario: Transport reconnect succeeds
-- **WHEN** a requested transport reconnect completes registration and session reconciliation
-- **THEN** the requesting client receives a success outcome for that request
-- **AND** ordinary project availability is restored without a CLI-reboot status
+Reboot operations SHALL be correlated to one project and one request identifier. The system SHALL report accepted, in-progress, succeeded, or failed outcomes to authorized clients and SHALL NOT infer success solely from a transient disconnect.
 
 #### Scenario: Full reboot disconnects during handoff
 - **WHEN** the old CLI transport closes after accepting a full reboot
@@ -62,14 +64,9 @@ Reconnect and reboot operations SHALL be correlated to one project and one reque
 The server SHALL authorize each lifecycle request against current project access and route it only to the requested project's owning CLI. New controls SHALL be capability-gated so mixed-version participants fail safely without disconnecting compatible sessions.
 
 #### Scenario: User lacks current project access
-- **WHEN** a non-member or user whose membership was revoked requests reconnect or reboot
+- **WHEN** a non-member or user whose membership was revoked requests a reboot
 - **THEN** the server rejects the operation
 - **AND** sends no lifecycle command to the project CLI
-
-#### Scenario: Older CLI receives no reconnect command
-- **WHEN** the attached project CLI does not advertise transport-reconnect support
-- **THEN** the interface hides or disables the reconnect control with an upgrade explanation
-- **AND** the server does not substitute a destructive full reboot
 
 #### Scenario: Request targets another project
 - **WHEN** a lifecycle request carries a stale or mismatched project session identifier

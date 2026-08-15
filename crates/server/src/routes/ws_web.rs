@@ -1917,14 +1917,16 @@ mod reboot_route_tests {
     }
 
     #[test]
-    fn reconnect_is_never_downgraded_to_legacy_reboot_for_old_clis() {
+    fn an_old_cli_receives_no_lifecycle_request_at_all() {
+        // The routing must not invent a substitute for a CLI that cannot handle
+        // correlated lifecycle requests — the caller reports an upgrade instead.
         let session_id = Uuid::new_v4();
         let request_id = Uuid::new_v4();
         assert!(lifecycle_cli_message(
             false,
             session_id,
             request_id,
-            shared::CliLifecycleOperation::ReconnectTransport,
+            shared::CliLifecycleOperation::RebootCli,
         )
         .is_none());
 
@@ -1932,13 +1934,13 @@ mod reboot_route_tests {
             true,
             session_id,
             request_id,
-            shared::CliLifecycleOperation::ReconnectTransport,
+            shared::CliLifecycleOperation::RebootCli,
         )
         .expect("new CLI receives correlated request");
         assert!(matches!(
             message,
             ServerToCli::CliLifecycleRequest {
-                operation: shared::CliLifecycleOperation::ReconnectTransport,
+                operation: shared::CliLifecycleOperation::RebootCli,
                 ..
             }
         ));
@@ -3093,6 +3095,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     request_id,
                     operation,
                 }) => {
+                    // A client running a bundle from before an operation was
+                    // retired decodes to `None`. Drop the request; the socket
+                    // stays up and every other message keeps flowing.
+                    let Some(operation) = operation else {
+                        tracing::debug!(
+                            %request_id,
+                            "ignoring a lifecycle request for a retired operation"
+                        );
+                        continue;
+                    };
                     let Some(target_sid) =
                         resolve_target_session(&state, &connection_id, Some(sid), session_id).await
                     else {
@@ -3121,7 +3133,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     operation,
                                     phase: shared::CliLifecyclePhase::Failed,
                                     message: Some(
-                                        "This project CLI is too old for safe lifecycle controls. Upgrade it on the project host; reconnect was not converted to a reboot."
+                                        "This project CLI is too old for safe lifecycle controls. Upgrade it on the project host."
                                             .to_string(),
                                     ),
                                     inventory: state

@@ -708,35 +708,6 @@ describe('useStore', () => {
       );
     });
 
-    it('routes transport reconnect through a request-ID lifecycle operation', () => {
-      const ws = makeWs();
-      useStore.setState({
-        sessionId: 'session-lifecycle',
-        ws,
-        cliLifecycleInventories: {
-          'session-lifecycle': {
-            reconnect_transport: true,
-            persistent_terminal_hosting: true,
-            panes: [],
-          },
-        },
-      });
-
-      const requestId = useStore.getState().reconnectCli();
-      const payload = JSON.parse(ws.send.mock.calls[0][0] as string);
-
-      expect(requestId).toBeTruthy();
-      expect(payload).toEqual({
-        type: 'cli_lifecycle_request',
-        session_id: 'session-lifecycle',
-        request_id: requestId,
-        operation: 'reconnect_transport',
-      });
-      expect(useStore.getState().cliLifecycleOperations[requestId!]).toMatchObject({
-        operation: 'reconnect_transport',
-        phase: 'accepted',
-      });
-    });
 
     it('uses correlated reboot with the advertised preservation inventory', () => {
       const ws = makeWs();
@@ -755,7 +726,6 @@ describe('useStore', () => {
         },
         cliLifecycleInventories: {
           'session-lifecycle-reboot': {
-            reconnect_transport: true,
             persistent_terminal_hosting: true,
             panes: [{ pane_id: 1, mode: 'live_adoptable' }],
           },
@@ -771,19 +741,6 @@ describe('useStore', () => {
       });
     });
 
-    it('never maps unsupported reconnect to legacy reboot and gives upgrade guidance', () => {
-      const ws = makeWs();
-      const showToast = vi.fn();
-      useStore.setState({ sessionId: 'old-cli', ws, showToast });
-
-      expect(useStore.getState().reconnectCli()).toBeNull();
-
-      expect(ws.send).not.toHaveBeenCalled();
-      expect(showToast).toHaveBeenCalledWith(
-        expect.stringContaining('too old for safe server reconnect'),
-        'error',
-      );
-    });
 
     it('tracks server success and authorization failure by request ID', () => {
       const showToast = vi.fn();
@@ -792,7 +749,7 @@ describe('useStore', () => {
         type: 'cli_lifecycle_status',
         session_id: 'session-a',
         request_id: 'request-success',
-        operation: 'reconnect_transport',
+        operation: 'reboot_cli',
         phase: 'succeeded',
         message: 'Transport restored',
       }, useStore.setState, useStore.getState);
@@ -819,15 +776,24 @@ describe('useStore', () => {
           sessionId: 'session-timeout',
           ws,
           showToast,
+          paneConfigs: [],
+          projectPolicies: {
+            'session-timeout': {
+              teamAvailable: true,
+              allowedLaunchProfiles: [],
+              version: 1,
+              projectSuspended: false,
+              noncompliantPaneIds: [],
+            },
+          },
           cliLifecycleInventories: {
             'session-timeout': {
-              reconnect_transport: true,
               persistent_terminal_hosting: false,
               panes: [],
             },
           },
         });
-        const requestId = useStore.getState().reconnectCli();
+        const requestId = useStore.getState().rebootCli();
 
         vi.advanceTimersByTime(185_000);
 

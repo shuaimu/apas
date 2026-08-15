@@ -471,7 +471,6 @@ export function TabbedView({
   const startBot = useStore((s) => s.startBot);
   const stopBot = useStore((s) => s.stopBot);
   const startMachineProjectCli = useStore((s) => s.startMachineProjectCli);
-  const reconnectCli = useStore((s) => s.reconnectCli);
   const rebootCli = useStore((s) => s.rebootCli);
   const lifecycleInventory = useStore((s) =>
     s.sessionId ? s.cliLifecycleInventories[s.sessionId] : undefined,
@@ -1111,7 +1110,6 @@ export function TabbedView({
         onRenameTab={handleRenameTab}
         onReorderTabs={handleReorderTabs}
         onBootCli={handleBootCli}
-        onReconnectCli={reconnectCli}
         onRebootCli={rebootCli}
         lifecycleInventory={lifecycleInventory}
         lifecycleStatus={lifecycleStatus}
