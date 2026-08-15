@@ -2,32 +2,34 @@
 
 The CLI is no longer the agent's parent. Pane hosts own the PTYs in their own tmux sessions, the daemon owns no long-lived children, and a self-upgrade `exec`s in place. "Daemon" and "project CLI" have converged into the same thing — a process that connects to the server and supervises work it does not own — and the duplication shows in how they find each other: they don't. They infer each other's existence from `/proc`.
 
-That inference is the source of the awkward machinery around them. `headless_pid_for` matches a `-d <path>` substring in another process's command line. `snapshot_projects` reports `is_running` from `/proc` rather than from the daemon's own map, because the map and reality drift. `reconcile_running_claims` exists because a restarted daemon comes back owning nothing while its projects keep running. And nothing guards the interactive path at all: `apas` in a project directory calls `ensure_daemon_running` and goes straight into `dual_pane` without ever asking whether that project is already running here — `is_headless_running_for` guards only the daemon's own spawns. Two CLIs for one project, one `.apas`, and one set of worktrees is reachable today by typing `apas` in the wrong directory.
+Nothing guards the interactive path at all: `apas` in a project directory calls `ensure_daemon_running` and goes straight into `dual_pane` without ever asking whether that project is already running here — `is_headless_running_for` guards only the daemon's own spawns. Two CLIs for one project, one `.apas`, and one set of worktrees is reachable today by typing `apas` in the wrong directory.
+
+The fix is not to make the second process cooperate with the first. It is to not have a second process. `detect_running_daemon` already implements exactly the check — a pid state file, a verification that the process really is `apas`, and cleanup of a stale record — and `apas daemon` already just quits when one is running. That rule simply was never applied to plain `apas`.
 
 ## What Changes
 
-- A host has **one resident supervisor**. It is the process `apas daemon` already starts; it gains an authoritative record of which projects are running here and a real channel to each of them.
-- **Project workers become the supervisor's known children rather than strangers.** Each keeps its own process and its own tmux session — one project must not be able to take down the host's supervision — but it is reached over a Unix socket instead of located by scanning `/proc`.
-- **`apas` in a project directory attaches instead of competing.** It asks the resident supervisor to ensure that project is running and then renders its TUI against it. Closing the terminal leaves the project running, and typing `apas` twice attaches twice rather than starting a second CLI over the same `.apas` and worktrees.
-- **Intra-host truth comes from the supervisor.** `/proc` scanning stops being the source of "is this project running", and the in-memory map stops being something that can silently disagree with it.
-- **Cross-host claims stay.** They solve a different problem — two hosts sharing one NFS home must not both run a project — which one resident process per host does not address.
-- **The surface does not move.** `apas`, `apas daemon`, `apas --headless`, the Machines page, and the lifecycle controls behave exactly as they do now. This is an internal consolidation, and a user should not be able to tell the difference except that the duplicate-CLI foot-gun is gone.
+- **A user launches at most one `apas` instance per host.** Running it again does not start anything: it defers to the instance that is already there and exits. This is the existing `apas daemon` behaviour, applied to the command people actually type.
+- **`apas` in a project directory registers that project and exits**, pointing at the web UI. The project becomes visible on the Machines page, where it is started.
+- **Projects are launched from the web.** `apas` no longer starts one as a side effect of being run in its directory.
+- **The interactive TUI goes away by default.** It displays nothing but tab names, and under a single-instance rule it would essentially never run, since `ensure_daemon_running` means an instance almost always exists. It stays reachable behind an explicit `--attach` for a local view when the web is unavailable.
+- **Headless project workers are unchanged.** The daemon still spawns one per project in its own tmux session. They are its children, not instances a user launched, so the rule does not apply to them.
+- **Cross-host claims are unchanged.** They decide which of several hosts sharing one NFS home may run a project — a different question from how many instances one user has on one host.
+- **BREAKING**: two visible losses. `apas` no longer opens a terminal UI, and it no longer starts the project in the directory it was run from.
 
 ## Capabilities
 
 ### New Capabilities
 
-- `host-supervision`: the resident per-host supervisor — single ownership of the host's running projects, an authoritative running-state record, attachment by a project CLI, and what happens when the supervisor or a worker dies.
+- `host-supervision`: one resident instance per host — how a second launch defers to it, what still runs when it is gone, and why this does not replace cross-host exclusion.
 
 ### Modified Capabilities
 
-- `cli-lifecycle-control`: reboot and transport recovery are expressed against the supervisor's record of a project rather than against a `/proc` match, and an attached CLI's exit is distinguished from the project stopping.
+(none)
 
 ## Impact
 
-- `crates/client-cli/src/mode/daemon.rs`: gains the supervisor socket, the project table, and worker supervision; loses `headless_pid_for` / `is_headless_running_for` as the intra-host source of truth.
-- `crates/client-cli/src/main.rs`: the default project path becomes attach-or-start against the supervisor rather than an unconditional `dual_pane` launch.
-- `crates/client-cli/src/pane_host.rs`: its runtime-directory, credential, socket, and adoption-grace machinery is the proven pattern this reuses rather than reinvents.
-- `crates/client-cli/src/daemon_registry.rs`: cross-host claims stay; the intra-host reconciliation that existed to paper over `/proc` drift goes away.
-- No server or web change: the Machines page already derives project state from what the daemon reports.
-- Docs: the daemon and pane-host sections of `CLAUDE.md`, which currently document `/proc`-derived running state as deliberate.
+- `crates/client-cli/src/main.rs`: the default project path becomes register-and-defer instead of launching `dual_pane`; the existing singleton check is reused rather than a second one written.
+- `crates/client-cli/src/mode/dual_pane.rs`: the interactive branch stops being the default path. The `headless` flag's other half is what every project now runs as.
+- `crates/client-cli/src/attach.rs`: retained behind `--attach` only. With no default caller it is a candidate for deletion, and it should be deleted rather than carried indefinitely if `--attach` finds no use.
+- No server or web change: the Machines page already starts and stops projects.
+- Docs: the daemon section of `CLAUDE.md`, and whatever tells people to run `apas` in a project directory to start it.

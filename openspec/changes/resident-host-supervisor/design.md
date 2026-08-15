@@ -3,58 +3,53 @@
 See proposal.md — Why. The current process model per host:
 
 - **One daemon** (`apas daemon`): host registration, machine listing, project start/stop, cross-host claims in an NFS-shared registry, self-upgrade by `exec` every 15 minutes.
-- **N project CLIs** (`apas --headless -d <path>`), each in its own tmux session on its own tmux socket, spawned by the daemon but not owned by it.
+- **N project workers** (`apas --headless -d <path>`), each in its own tmux session on its own tmux socket, spawned by the daemon.
 - **M pane hosts** (`apas pane-host`), each in a project-scoped tmux session, owning one PTY.
 - Optionally an **interactive `apas`**, which runs `dual_pane` in the foreground and is nobody's child.
 
-The daemon finds project CLIs by scanning `/proc` for a `-d <path>` match (`headless_pid_for`), which is also how `snapshot_projects` answers `is_running`. `mode/dual_pane.rs` is ~14.9k lines and holds everything a project does: panes, worktrees, team files, transcripts, MCP servers, the server WebSocket.
+Two facts decided the approach:
 
-Two pieces of existing machinery matter because this reuses rather than invents them: `pane_host.rs` already runs a supervised child behind a Unix socket with a runtime directory, an owner-only credential, an adoption grace period, and a reboot handoff. `daemon_registry.rs` already solves cross-host exclusion over NFS.
+- **The singleton check already exists.** `detect_running_daemon` reads a pid state file, verifies the process really is `apas`, and deletes the record when it is stale. `Commands::Daemon` already prints and returns when one is running. Nothing of this had to be designed; it had to be applied to the command people type.
+- **The TUI is not worth preserving.** `App` holds only `output_rx: Receiver<PaneOutput>` and `command_rx: Receiver<TuiCommand>` — the `input_tx` and `event_tx` handed to `App::new` are dropped immediately — and it renders little beyond tab names. That is what made attaching *possible* (a snapshot plus two one-way streams, no input path); it is also why attaching is not worth building.
 
 ## Goals / Non-Goals
 
 **Goals:**
 
-- One process per host that knows, without inspecting strangers, which projects are running there.
-- A project CLI that attaches to a project instead of becoming a second owner of it.
-- Identical surface: same commands, same Machines page, same lifecycle controls.
-- No regression in what already survives today — pane hosts, terminal panes, and headless projects keep surviving CLI and daemon replacement.
+- One user-launched instance per host, enforced where a person can actually trip over it.
+- A launch that finds one already running does something useful — registers the project — rather than failing or duplicating.
+- No new IPC, no new protocol, no new runtime state.
 
 **Non-Goals:**
 
-- Running every project inside the supervisor process. One project's panic must not take down the host's supervision, and `dual_pane` is far too large to make process-shared safely in one change.
-- Removing cross-host claims, which solve a problem per-host supervision does not.
-- Changing what a project *does* once running: panes, worktrees, team mode, and transcripts are untouched.
-- A new user-visible command or page.
+- Running every project inside one process. One project's panic must not take down the host, and `dual_pane` is ~14.9k lines of per-project state; making it multi-project in-process would be a rewrite with a far worse failure mode than the bug it fixes.
+- Removing cross-host claims, which answer a different question.
+- Preserving the interactive TUI as the default experience.
+- A supervisor control socket, per-project worker sockets, or attachment. The earlier draft of this change specified all three; the single-instance rule removes the problem they were solving.
 
 ## Decisions
 
-1. **The supervisor is the daemon, extended — not a new process.** It gains a Unix socket, a project table, and worker supervision. Alternative considered: a new `apas supervisor` process alongside the daemon — rejected, because it would add a third role to a change whose entire purpose is that there are already two too many.
+1. **The rule is enforced by refusing to be a second instance, not by cooperating with the first.** A second launch defers and exits. This is a smaller change than any protocol between the two, and it cannot drift: there is no second process left to disagree with anything.
 
-2. **Project workers stay separate processes, reached over a socket.** They keep their own tmux session, so a crash or an OOM kill is contained to one project, and the supervisor keeps a socket to each rather than a `/proc` match. This is the pane-host relationship one level up, and it is deliberately the same shape: runtime directory, owner-only credential, adoption grace, tombstone on deliberate stop. Alternative considered: running projects as threads inside the supervisor — rejected on blast radius and on the size of `dual_pane`.
+2. **Reuse `detect_running_daemon` rather than write a second check.** It already handles the stale-record case, which is the only genuinely fiddly part — a pid file outlives a crash, and a check that trusted it would refuse to ever start again.
 
-3. **`apas <project>` becomes attach-or-start.** It asks the supervisor for the project, which starts a worker if there is none, then renders the TUI against that worker. This is what removes the duplicate-CLI foot-gun, and it is also what makes closing a terminal harmless. The interactive process stops being an owner and becomes a viewer.
+3. **A deferring launch registers the project.** Otherwise `apas` in a fresh project directory would appear to do nothing at all, and the project would never become visible to manage. Registration is what makes "launch from the web" workable rather than a dead end.
 
-4. **The supervisor's table is the only intra-host answer to "is it running".** `headless_pid_for` stops being consulted for state. It survives only as an *adoption* probe at supervisor startup — finding workers that outlived a supervisor is exactly the case where there is no socket to ask yet.
+4. **Projects are started from the web, not by being run in.** `start_project` is only reached from instance creation and an explicit start from the Machines page; making a deferring launch also *start* the project would add a request path for a convenience the web already provides.
 
-5. **Adoption, not duplication, on supervisor restart.** A starting supervisor reconnects to the sockets of workers already running before it creates any. This subsumes `reconcile_running_claims`: that function exists because a restarted daemon came back owning nothing, which stops being true once ownership is a socket rather than a memory of having spawned something.
+5. **Headless workers are out of scope for the rule.** They are `apas` processes, but they are the daemon's children rather than instances a user launched. Applying the rule to them would stop the daemon running more than one project.
 
-6. **Cross-host claims are untouched.** They gate *whether this host may run the project at all*; the supervisor gates *how many workers exist here*. Collapsing the two would reintroduce the multi-host duplication the claim system was written for.
+6. **The TUI stays behind `--attach`, and is expected to be deleted.** The attachment machinery exists and is tested, so keeping it costs nothing today. It has no default caller, which makes it a liability rather than an asset over time: it should go if `--attach` finds no use, not be carried indefinitely because it was built.
 
-7. **Rollout is by ordinary self-upgrade, and the two models coexist.** A supervisor that finds pre-existing workers adopts them by probe rather than by socket, so a host mid-upgrade is a host with some adopted-by-probe workers and some socket-attached ones. That has to work anyway for crash recovery, so it is not extra machinery for the rollout.
+7. **The `/proc` probe stays.** The earlier draft retired it in favour of an authoritative table reachable over a socket. With no socket there is no table, and `is_headless_running_for` remains how the daemon avoids spawning a duplicate for a project that survived it.
 
 ## Risks / Trade-offs
 
-- [The attach path is new for the interactive TUI] → Resolved by task 1.1, and the seam is narrower than feared. `run()` and `run_headless()` are the same `run_inner` with one `headless: bool`, whose only effect is whether the TUI block runs — so the worker already exists and is exactly what the daemon spawns today. `App` holds just `output_rx: Receiver<PaneOutput>` and `command_rx: Receiver<TuiCommand>`; the `input_tx` and `event_tx` handed to `App::new` are dropped immediately. The TUI is therefore **read-only**, and attaching needs one snapshot (`Vec<(u32, String, PaneMode)>` of initial tabs) plus two one-way streams from worker to attached CLI. There is no input path to build, because the TUI has none — input already reaches panes from the server.
-- [One socket per project is more moving parts than one `/proc` scan] → It is also the difference between knowing and guessing, and pane-host already proves the pattern in this codebase. The parts are bounded: a runtime directory per project, cleaned on deliberate stop, self-terminating on lease expiry.
-- [A partially upgraded host runs both models at once] → Adoption-by-probe is required for crash recovery regardless, so the mixed state is the recovery path, exercised rather than special.
-- [Behaviour people rely on could change silently: closing a terminal no longer stops a project] → It already does not stop pane hosts; making it explicit for projects is the point. Worth calling out in the release note, because "I closed the window" has been an informal way to stop things.
-- [`dual_pane` is 14.9k lines and every seam is load-bearing] → Nothing about what a project does changes here; only who starts it and who is told about it. The change should be provable by the existing project tests continuing to pass untouched.
+- [Someone types `apas` expecting it to start their project and it exits instead] → It prints what it did and where to go. This is the visible cost of the change, and it should be in the release note rather than discovered.
+- [Losing the TUI removes the only local view when the server is unreachable] → `--attach` remains for that case. If it turns out to matter, the evidence will be people using it; if nobody does, that is the signal to delete it.
+- [One instance per user per host is not one per project directory] → Intentional. A user working in three project directories registers three projects and manages them from one place, rather than running three processes that cannot see each other.
+- [The rule keys on the user, so two accounts on one host still get two instances] → Correct: their projects, claims, and runtime directories are already per-user, and merging them would be a different and worse change.
 
 ## Migration Plan
 
-Behaviour-preserving and self-upgrading: hosts pick it up on `apas update` or the next Reboot CLI, both of which already leave pane hosts running. A host running the old model keeps working; a host running the new one adopts whatever it finds. Rollback is a binary swap, after which projects started by a supervisor are once again found by `/proc` — which is precisely why decision 4 keeps that probe rather than deleting it.
-
-## Open Questions
-
-- Whether an attached CLI should follow a rebooted project automatically or report that the attachment ended. Both satisfy the spec; the choice is a UX preference that can be made when the reboot path is wired, and it does not change the socket design.
+Behaviour-preserving for everything except the two documented losses, and self-upgrading: hosts pick it up from the shared binary, and each daemon re-execs into it on its own upgrade tick. A host part-way through the rollout has an older `apas` that still opens a TUI and a newer one that defers; both leave the running projects alone. Rollback is a binary swap.

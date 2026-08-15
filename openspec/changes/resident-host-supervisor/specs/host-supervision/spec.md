@@ -1,98 +1,84 @@
 ## Purpose
 
-Defines the single resident supervisor each project host runs: how it owns the projects running there, how a project CLI attaches to one instead of starting a competing copy, and what survives when the supervisor or a project worker dies.
+Defines the single resident instance each project host runs for a user: how a second launch defers to it rather than becoming a rival, what keeps running when it is gone, and why this does not replace cross-host exclusion.
 
 ## ADDED Requirements
 
-### Requirement: A host runs one resident supervisor
+### Requirement: A host runs one resident instance per user
 
-A project host SHALL have at most one resident supervisor process, and it SHALL be the authority on which projects are running on that host. Starting a supervisor while one is already running SHALL NOT produce a second one. Every project started on the host SHALL be recorded by the supervisor, whether it was started remotely, on a schedule, or by a person at a terminal.
+A user SHALL have at most one resident instance running on a host. Launching one while another is already running SHALL NOT produce a second, and SHALL leave the running one and its work undisturbed. A record of an instance that is no longer running SHALL NOT prevent a new one from starting.
 
-#### Scenario: A second supervisor is started
+#### Scenario: A second launch while one is running
 
-- **WHEN** a supervisor is started on a host that already has one running
-- **THEN** the host still has exactly one supervisor
-- **AND** the projects running on it are undisturbed
+- **WHEN** a user launches an instance on a host where theirs is already running
+- **THEN** the host still has exactly one
+- **AND** the projects it is running are undisturbed
 
-#### Scenario: A project is started from anywhere
+#### Scenario: A stale record from a crash
 
-- **WHEN** a project is started on the host by any means
-- **THEN** the supervisor records it as running on that host
+- **WHEN** a user launches an instance on a host whose previous one died without cleaning up
+- **THEN** the new instance starts
+- **AND** the stale record does not prevent it
 
-### Requirement: Running state comes from the supervisor, not from process inspection
+### Requirement: A second launch defers instead of competing
 
-The system SHALL answer "is this project running on this host" from the supervisor's own record of its workers. It SHALL NOT depend on inspecting unrelated processes' command lines to decide whether a project is running, and the reported state SHALL NOT be able to disagree with the host's actual workers.
+A launch that finds an instance already running SHALL NOT start, attach to, or duplicate any project. When it was run from a project directory it SHALL register that project so it becomes visible for management, then report where the project can be managed and exit.
 
-#### Scenario: Running state is reported
+#### Scenario: Launched from a project directory
 
-- **WHEN** the running projects of a host are reported
-- **THEN** the report reflects the supervisor's own record of its workers
+- **WHEN** a user runs it in a project directory while their instance is already running
+- **THEN** the project is registered and becomes visible for management
+- **AND** the user is told where to manage it
+- **AND** no second process is left running for that project
 
-#### Scenario: A worker exits unexpectedly
+#### Scenario: Launched from a directory that is not a project
 
-- **WHEN** a project's worker exits without being asked to stop
-- **THEN** the supervisor stops reporting that project as running
-- **AND** the project can be started again without manual cleanup
+- **WHEN** a user runs it outside any project while their instance is already running
+- **THEN** it reports the running instance and exits
+- **AND** registers nothing
+
+#### Scenario: The same project directory twice
+
+- **WHEN** a user runs it twice in the same project directory
+- **THEN** the project is registered once
+- **AND** no process is left running for it either time
 
 ### Requirement: A project runs at most once per host
 
-The system SHALL NOT run two workers for the same project on one host. A request to start a project that is already running there SHALL attach to the running one rather than start another, regardless of how either was initiated.
+The system SHALL NOT run two workers for the same project on one host, regardless of how each was initiated.
 
-#### Scenario: A person starts a project the host already runs
+#### Scenario: A person acts on a project the host already runs
 
-- **WHEN** someone starts a project in a directory whose project is already running on that host
+- **WHEN** a project that is already running on a host is started there again
 - **THEN** no second worker is created for it
-- **AND** they are attached to the project that is already running
 
-#### Scenario: A remote start races a local one
+#### Scenario: A remote start races a local registration
 
-- **WHEN** a project is started remotely at the same moment as locally on the same host
+- **WHEN** a project is started remotely at the same moment as it is registered locally on the same host
 - **THEN** exactly one worker exists for that project afterwards
 
-### Requirement: A project CLI attaches to a project rather than owning it
+### Requirement: Projects outlive the instance that started them
 
-A project CLI SHALL attach to a project the supervisor is running and present it, and its own exit SHALL NOT stop that project. Attaching SHALL be possible more than once for the same project, and each attachment SHALL see that project's current state.
+Loss of the resident instance SHALL NOT stop the projects running on the host. When an instance starts and finds project workers already running there, it SHALL adopt them rather than duplicate or orphan them, and SHALL report them as running.
 
-#### Scenario: The person closes their terminal
+#### Scenario: The instance is replaced
 
-- **WHEN** an attached project CLI exits for any reason
-- **THEN** the project keeps running on the host
-- **AND** its panes and agents are undisturbed
-
-#### Scenario: Attaching to a project that is not running yet
-
-- **WHEN** someone attaches to a project that is not currently running on the host
-- **THEN** the supervisor starts it
-- **AND** the attachment presents it once it is running
-
-#### Scenario: Two attachments to one project
-
-- **WHEN** a project is attached to twice
-- **THEN** both attachments present the same project
-- **AND** neither is a separate copy of it
-
-### Requirement: Projects outlive their supervisor
-
-Loss of the supervisor SHALL NOT stop the projects running on the host. When a supervisor starts and finds workers already running there, it SHALL adopt them rather than duplicate or orphan them, and SHALL report them as running.
-
-#### Scenario: The supervisor is replaced
-
-- **WHEN** the supervisor is restarted or upgraded while projects are running
+- **WHEN** the resident instance is restarted or upgraded while projects are running
 - **THEN** those projects keep running throughout
-- **AND** the new supervisor reports them as running and can stop them
+- **AND** the new instance reports them as running and can stop them
 
-#### Scenario: The supervisor is absent
+#### Scenario: The instance is absent
 
-- **WHEN** projects are running on a host with no supervisor
+- **WHEN** projects are running on a host with no resident instance
 - **THEN** they keep running
-- **AND** a supervisor started afterwards adopts them
+- **AND** an instance started afterwards adopts them
 
-### Requirement: Host supervision does not replace cross-host exclusion
+### Requirement: Single instance does not replace cross-host exclusion
 
-Single supervision per host SHALL NOT be treated as protection against two hosts running the same project. Where hosts share project storage, the existing cross-host exclusion SHALL continue to decide which host may run a project.
+One instance per user per host SHALL NOT be treated as protection against two hosts running the same project. Where hosts share project storage, the existing cross-host exclusion SHALL continue to decide which host may run a project.
 
 #### Scenario: Two hosts share one project directory
 
 - **WHEN** two hosts sharing storage would each run the same project
 - **THEN** cross-host exclusion still decides which one does
-- **AND** per-host supervision does not by itself permit both
+- **AND** the per-host single-instance rule does not by itself permit both
