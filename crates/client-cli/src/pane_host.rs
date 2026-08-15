@@ -177,6 +177,26 @@ pub fn clear_project_host_tombstone(project_id: Uuid) {
     if let Ok(path) = project_tombstone(project_id) {
         let _ = fs::remove_file(path);
     }
+    prune_project_runtime_root(project_id);
+}
+
+/// Remove a project's runtime directory once nothing is left in it.
+///
+/// Pane cleanup only ever removed the per-pane directory, so every project that
+/// had hosted a pane left an empty skeleton under the runtime root forever. They
+/// cost almost nothing individually — this is a tmpfs and the directories are
+/// empty — but they accumulate without bound and they actively obscure real
+/// state: an audit that lists project directories reads dozens of dead projects
+/// alongside the live ones.
+///
+/// `remove_dir` rather than a check-then-delete: it refuses on a non-empty
+/// directory, so a surviving pane, an in-progress `tombstone`, or a pending
+/// `handoff.json` all keep the directory automatically, with no window between
+/// deciding it is empty and removing it.
+fn prune_project_runtime_root(project_id: Uuid) {
+    if let Ok(root) = project_runtime_root(project_id) {
+        let _ = fs::remove_dir(root);
+    }
 }
 
 pub fn runtime_paths(project_id: Uuid, pane_id: u32, runtime_id: Uuid) -> Result<RuntimePaths> {
@@ -463,6 +483,7 @@ pub fn terminate_tmux_host(descriptor: &RuntimeDescriptor) -> Result<()> {
     if let Some(dir) = descriptor.socket_path.parent() {
         let _ = fs::remove_dir_all(dir);
     }
+    prune_project_runtime_root(descriptor.project_id);
     Ok(())
 }
 
@@ -1415,6 +1436,67 @@ mod tests {
         assert_eq!(shutdown_project_hosts(project_id).unwrap(), 0);
         assert!(!project_tombstone(project_id).unwrap().exists());
         let _ = fs::remove_dir_all(project_runtime_root(project_id).unwrap());
+    }
+
+    #[test]
+    fn pane_cleanup_removes_the_project_directory_only_once_it_is_empty() {
+        // The per-pane directory was always removed; the project directory above
+        // it never was, so every project that hosted a pane left an empty
+        // skeleton behind forever.
+        let root = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("XDG_RUNTIME_DIR");
+        std::env::set_var("XDG_RUNTIME_DIR", root.path());
+
+        let project = Uuid::new_v4();
+        let project_dir = project_runtime_root(project).unwrap();
+
+        let first = runtime_paths(project, 1, Uuid::new_v4()).unwrap();
+        let second = runtime_paths(project, 2, Uuid::new_v4()).unwrap();
+        assert!(first.dir.exists() && second.dir.exists());
+
+        let desc = |paths: &RuntimePaths, pane_id: u32| RuntimeDescriptor {
+            protocol_version: HOST_PROTOCOL_VERSION,
+            project_id: project,
+            pane_id,
+            runtime_id: Uuid::new_v4(),
+            instance_id: Uuid::new_v4(),
+            controller_id: Some(Uuid::new_v4()),
+            controller_generation: 1,
+            owner_uid: unsafe { libc::getuid() },
+            created_at_unix_ms: 0,
+            session_name: format!("ph_{pane_id}_test"),
+            socket_path: paths.socket.clone(),
+            credential_path: paths.credential.clone(),
+        };
+
+        // One pane closing must not take the project directory with it — its
+        // sibling is still hosted there.
+        terminate_tmux_host(&desc(&first, 1)).unwrap();
+        assert!(!first.dir.exists(), "closed pane's directory should be gone");
+        assert!(
+            project_dir.exists(),
+            "project directory must survive while another pane is hosted"
+        );
+
+        // A tombstone means cleanup is in flight; the directory has to stay.
+        tombstone_project_hosts(project).unwrap();
+        terminate_tmux_host(&desc(&second, 2)).unwrap();
+        assert!(
+            project_dir.exists(),
+            "project directory must survive an in-progress tombstone"
+        );
+
+        // Clearing the tombstone empties it, and only then is it removed.
+        clear_project_host_tombstone(project);
+        assert!(
+            !project_dir.exists(),
+            "empty project directory should be pruned"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
     }
 
     #[test]
