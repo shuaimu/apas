@@ -36,6 +36,7 @@
 
 use anyhow::{Context, Result};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -54,6 +55,68 @@ pub fn claude_transcript_path(home: &Path, cwd: &Path, session_id: &str) -> Path
         .join("projects")
         .join(claude_dir_slug(cwd))
         .join(format!("{session_id}.jsonl"))
+}
+
+/// Find the newest session file a claude terminal pane should follow after an
+/// in-TUI session switch.
+///
+/// Candidates are `.jsonl` files in the pane's cwd slug directory that are not
+/// the currently tracked file, whose names are not in `excluded_ids` (the
+/// session ids pinned to *other* panes of the project), and whose modification
+/// time is strictly newer than `last_growth` (the currently tracked file's
+/// last observed change). The pane's own pinned id is deliberately NOT in
+/// `excluded_ids` so a user who switches back to the pinned session is
+/// followed again.
+///
+/// Returns `None` when no switch has happened.
+pub fn find_claude_switch_candidate(
+    home: &Path,
+    cwd: &Path,
+    current_path: &Path,
+    last_growth: std::time::SystemTime,
+    excluded_ids: &HashSet<String>,
+) -> Option<PathBuf> {
+    let dir = home
+        .join(".claude")
+        .join("projects")
+        .join(claude_dir_slug(cwd));
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(_) => return None,
+    };
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        if !path.is_file() || path == current_path {
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if excluded_ids.contains(stem) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
+        if mtime <= last_growth {
+            continue;
+        }
+        let better = best
+            .as_ref()
+            .map(|(newest, _)| mtime > *newest)
+            .unwrap_or(true);
+        if better {
+            best = Some((mtime, path));
+        }
+    }
+    best.map(|(_, path)| path)
 }
 
 /// Pull the text out of a claude content field, which is either a bare string
@@ -867,5 +930,125 @@ mod tests {
         );
 
         assert!(find_codex_rollout(home.path(), Path::new("/repo")).is_some());
+    }
+
+    fn claude_projects_dir(home: &Path, cwd: &str) -> PathBuf {
+        let dir = home
+            .join(".claude")
+            .join("projects")
+            .join(claude_dir_slug(Path::new(cwd)));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_session(dir: &Path, name: &str) {
+        std::fs::write(dir.join(name), "{}").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    #[test]
+    fn claude_switch_candidate_follows_the_newest_unpinned_file() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = claude_projects_dir(home.path(), "/wanted");
+        write_session(&dir, "stale-unpinned.jsonl");
+        write_session(&dir, "pinned.jsonl");
+        let pinned = dir.join("pinned.jsonl");
+        let last_growth = std::fs::metadata(&pinned)
+            .unwrap()
+            .modified()
+            .unwrap();
+        // Another pane's pinned session: newer, but excluded.
+        write_session(&dir, "other-pane.jsonl");
+        write_session(&dir, "switch.jsonl");
+        write_session(&dir, "newest.jsonl");
+
+        let excluded: HashSet<String> = ["other-pane".to_string()].into_iter().collect();
+        let found = find_claude_switch_candidate(
+            home.path(),
+            Path::new("/wanted"),
+            &pinned,
+            last_growth,
+            &excluded,
+        );
+        assert_eq!(
+            found.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()),
+            Some("newest.jsonl"),
+            "the newest unpinned session wins; other panes' pins are ignored"
+        );
+    }
+
+    #[test]
+    fn claude_switch_candidate_ignores_stale_and_excluded_files() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = claude_projects_dir(home.path(), "/wanted");
+        write_session(&dir, "pinned.jsonl");
+        let pinned = dir.join("pinned.jsonl");
+        let last_growth = std::fs::metadata(&pinned)
+            .unwrap()
+            .modified()
+            .unwrap();
+        // Excluded ids stay excluded even when newer.
+        write_session(&dir, "other-pane.jsonl");
+
+        let excluded: HashSet<String> = ["other-pane".to_string()].into_iter().collect();
+        assert!(find_claude_switch_candidate(
+            home.path(),
+            Path::new("/wanted"),
+            &pinned,
+            last_growth,
+            &excluded,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn claude_switch_candidate_follows_back_to_the_own_pinned_file() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = claude_projects_dir(home.path(), "/wanted");
+        write_session(&dir, "pinned.jsonl");
+        write_session(&dir, "switched-away.jsonl");
+        let current = dir.join("switched-away.jsonl");
+        let last_growth = std::fs::metadata(&current)
+            .unwrap()
+            .modified()
+            .unwrap();
+        // The user resumes the pinned session again after the switch.
+        write_session(&dir, "pinned.jsonl");
+
+        // Only OTHER panes' pins are excluded; the pane's own pinned file is
+        // eligible, so the switch back is followed.
+        let excluded: HashSet<String> = ["other-pane".to_string()].into_iter().collect();
+        let found = find_claude_switch_candidate(
+            home.path(),
+            Path::new("/wanted"),
+            &current,
+            last_growth,
+            &excluded,
+        );
+        assert_eq!(
+            found.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()),
+            Some("pinned.jsonl")
+        );
+    }
+
+    #[test]
+    fn claude_switch_candidate_never_returns_the_current_file() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = claude_projects_dir(home.path(), "/wanted");
+        write_session(&dir, "pinned.jsonl");
+        let pinned = dir.join("pinned.jsonl");
+        let last_growth = std::fs::metadata(&pinned)
+            .unwrap()
+            .modified()
+            .unwrap();
+        let excluded: HashSet<String> = HashSet::new();
+        assert!(find_claude_switch_candidate(
+            home.path(),
+            Path::new("/wanted"),
+            &pinned,
+            last_growth,
+            &excluded,
+        )
+        .is_none());
     }
 }

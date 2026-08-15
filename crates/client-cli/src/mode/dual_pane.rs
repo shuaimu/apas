@@ -444,6 +444,35 @@ fn initial_terminal_transcript_cursor(restored_at_watcher_start: bool, turn_coun
     }
 }
 
+/// Consecutive unchanged polls of the tracked claude transcript before an
+/// in-TUI session switch is considered. Two polls ≈ six seconds of idleness,
+/// which keeps a streaming turn (whose file grows continuously) from ever
+/// being abandoned.
+const CLAUDE_SWITCH_IDLE_POLLS: u32 = 2;
+
+/// Watch state for one claude terminal pane's transcript source.
+///
+/// Tracks the currently read file plus its last observed size and mtime so
+/// the poller can distinguish "still growing" from "the user switched to a
+/// different session inside the TUI".
+struct ClaudeWatchState {
+    path: std::path::PathBuf,
+    size: u64,
+    mtime: Option<std::time::SystemTime>,
+    idle_polls: u32,
+}
+
+impl ClaudeWatchState {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self {
+            path,
+            size: 0,
+            mtime: None,
+            idle_polls: 0,
+        }
+    }
+}
+
 /// Spawn whichever team panes (Manager, Tech Lead, Reviewer, Developer)
 /// are missing for this project. Idempotent: each role is gated on
 /// whether a managed pane with that role already exists in
@@ -2798,6 +2827,9 @@ async fn run_inner(
             // change from applying an old file's cursor to a new transcript.
             let mut seen: HashMap<u32, (String, usize)> = HashMap::new();
             let mut seen_completions: HashMap<u32, usize> = HashMap::new();
+            // Per-pane claude transcript watch state (growth + idle tracking
+            // for in-TUI session-switch detection).
+            let mut claude_watch: HashMap<u32, ClaudeWatchState> = HashMap::new();
             while !shutdown_for_turns.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_secs(3));
 
@@ -2861,11 +2893,61 @@ async fn run_inner(
                             let Some(home) = home.as_deref() else {
                                 continue;
                             };
-                            let path = crate::transcript::claude_transcript_path(
+                            let pinned = crate::transcript::claude_transcript_path(
                                 home,
                                 &transcript_cwd,
                                 &conv_id.to_string(),
                             );
+                            // Follow the conversation the user is actually in:
+                            // an in-TUI /resume to another session writes to a
+                            // different file in the same cwd slug directory.
+                            // The pinned-set filter keeps sibling panes' pinned
+                            // sessions (and this pane's own pinned session,
+                            // while tracking an unpinned file) out of the
+                            // candidate set appropriately.
+                            let watch = claude_watch
+                                .entry(pane_id)
+                                .or_insert_with(|| ClaudeWatchState::new(pinned.clone()));
+                            let meta = std::fs::metadata(&watch.path).ok();
+                            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                            let mtime = meta.as_ref().and_then(|m| m.modified().ok());
+                            let grown = size != watch.size || mtime != watch.mtime;
+                            watch.size = size;
+                            watch.mtime = mtime;
+                            if grown {
+                                watch.idle_polls = 0;
+                            } else {
+                                watch.idle_polls += 1;
+                            }
+                            if watch.idle_polls >= CLAUDE_SWITCH_IDLE_POLLS {
+                                let excluded: HashSet<String> = sessions_for_turns
+                                    .lock()
+                                    .ok()
+                                    .map(|sessions| {
+                                        sessions
+                                            .iter()
+                                            .filter(|(other_pane_id, _)| **other_pane_id != pane_id)
+                                            .map(|(_, other_conv_id)| other_conv_id.to_string())
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                if let Some(next) = crate::transcript::find_claude_switch_candidate(
+                                    home,
+                                    &transcript_cwd,
+                                    &watch.path,
+                                    watch.mtime.unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                                    &excluded,
+                                ) {
+                                    tracing::info!(
+                                        pane_id,
+                                        from = %watch.path.display(),
+                                        to = %next.display(),
+                                        "claude terminal pane followed an in-TUI session switch"
+                                    );
+                                    *watch = ClaudeWatchState::new(next);
+                                }
+                            }
+                            let path = watch.path.clone();
                             let Ok(turns) = crate::transcript::read_turns(&path, pane_id, false)
                             else {
                                 continue;
