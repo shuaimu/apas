@@ -960,6 +960,14 @@ pub enum ServerToDaemon {
         request_id: Option<String>,
     },
 
+    /// Replace this daemon, applying an available update first.
+    ///
+    /// Handled with the same update-then-`exec` path the unattended
+    /// self-upgrade uses: `exec` preserves the pid, keeps the process
+    /// detached, and skips destructors, so the host record and project claims
+    /// are never withdrawn across the replacement.
+    RebootDaemon,
+
     /// Request a fresh project scan/update push
     RefreshProjects,
 
@@ -1354,6 +1362,14 @@ pub enum WebToServer {
         machine_id: Uuid,
         project_id: String,
     },
+
+    /// Restart the daemon on one machine, applying an available update first.
+    ///
+    /// Targeted by machine rather than by a project on it: a daemon is
+    /// per-machine, and a machine running nothing has no project to route
+    /// through. Restarting a daemon does not disturb the projects, panes, or
+    /// agents on that host — the daemon owns no long-lived children.
+    RebootDaemon { machine_id: Uuid },
 
     /// Create a brand-new project instance under a repo on a chosen machine:
     /// the daemon clones `clone_url` into `~/apas_projects/<instance_name>`
@@ -4488,5 +4504,46 @@ mod tests {
         assert!(!policy.allows(PaneKind::Agent, Provider::Claude, Some("future-model")));
         policy.project_suspended = true;
         assert!(!policy.allows(PaneKind::Agent, Provider::Codex, None));
+    }
+}
+
+#[cfg(test)]
+mod daemon_reboot_tests {
+    use super::*;
+
+    /// The request names a machine, not a project. A machine running nothing
+    /// still has a daemon worth restarting, so a project-derived route would
+    /// be unable to reach it.
+    #[test]
+    fn a_daemon_reboot_is_addressed_by_machine() {
+        let machine_id = Uuid::new_v4();
+        let raw = serde_json::to_string(&WebToServer::RebootDaemon { machine_id }).unwrap();
+        assert!(raw.contains("reboot_daemon"), "wire tag: {raw}");
+        assert!(!raw.contains("project_id"));
+        match serde_json::from_str::<WebToServer>(&raw).unwrap() {
+            WebToServer::RebootDaemon { machine_id: got } => assert_eq!(got, machine_id),
+            other => panic!("expected RebootDaemon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_daemon_command_round_trips() {
+        let raw = serde_json::to_string(&ServerToDaemon::RebootDaemon).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ServerToDaemon>(&raw).unwrap(),
+            ServerToDaemon::RebootDaemon
+        ));
+    }
+
+    /// An older daemon never receives this because nothing sends it there;
+    /// what matters is that adding it did not disturb the commands it does
+    /// receive.
+    #[test]
+    fn existing_daemon_commands_still_parse() {
+        let legacy = r#"{"type":"refresh_projects"}"#;
+        assert!(matches!(
+            serde_json::from_str::<ServerToDaemon>(legacy).unwrap(),
+            ServerToDaemon::RefreshProjects
+        ));
     }
 }

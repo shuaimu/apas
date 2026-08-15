@@ -3496,6 +3496,59 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
+                Ok(WebToServer::RebootDaemon { machine_id }) => {
+                    let Some(uid) = user_id else {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Not authenticated".to_string(),
+                                },
+                            )
+                            .await;
+                        continue;
+                    };
+
+                    // Authorized by machine ownership alone, not by a project
+                    // on it: a daemon is per-machine, and a machine running
+                    // nothing still has a daemon worth restarting.
+                    let allowed = state
+                        .sessions
+                        .get_machines_for_user(&uid)
+                        .into_iter()
+                        .any(|m| m.machine.machine_id == machine_id);
+                    if !allowed {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Machine not found".to_string(),
+                                },
+                            )
+                            .await;
+                        continue;
+                    }
+
+                    tracing::info!(%machine_id, "Rebooting daemon");
+                    if !state
+                        .sessions
+                        .send_to_daemon(&machine_id, ServerToDaemon::RebootDaemon)
+                        .await
+                    {
+                        state
+                            .sessions
+                            .send_to_web(
+                                &connection_id,
+                                ServerToWeb::Error {
+                                    message: "Daemon is offline — the reboot was not delivered"
+                                        .to_string(),
+                                },
+                            )
+                            .await;
+                    }
+                }
                 Ok(WebToServer::CreateProjectInstance {
                     machine_id,
                     git_remote,

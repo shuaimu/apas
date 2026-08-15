@@ -11,6 +11,14 @@ function session(overrides: Partial<SessionInfo> & Pick<SessionInfo, "id">): Ses
   };
 }
 
+/// The home fetches one bootstrap document; machines ride along in it.
+function stubBootstrap(body: Record<string, unknown>) {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+    ok: true,
+    json: async () => body,
+  }));
+}
+
 function renderHome(overrides: Partial<MobileCodeHomeProps> = {}) {
   const props: MobileCodeHomeProps = {
     active: false,
@@ -24,6 +32,7 @@ function renderHome(overrides: Partial<MobileCodeHomeProps> = {}) {
     onManageMachines: vi.fn(),
     onOpenSession: vi.fn(),
     onRebootCli: vi.fn(),
+    onRebootDaemon: vi.fn(),
     ...overrides,
   };
   render(<MobileCodeHome {...props} />);
@@ -217,6 +226,98 @@ describe("MobileCodeHome", () => {
     fireEvent.click(screen.getByRole("button", { name: "Open alpha" }));
     expect(props.onOpenSession).toHaveBeenCalledWith("session-a", "alpha");
     expect(props.onRebootCli).not.toHaveBeenCalled();
+  });
+
+  it("lists machines in place of the sessions when Machines is selected", async () => {
+    // The bootstrap already carries machines; the list must not cost a
+    // second request.
+    stubBootstrap({
+      sessions: [],
+      machines: [
+        {
+          machine: {
+            machine_id: "machine-1",
+            hostname: "zoo-005",
+            os: "linux",
+            arch: "x86_64",
+            last_seen: new Date().toISOString(),
+          },
+          projects: [{ project_id: "p1", is_running: true }, { project_id: "p2" }],
+        },
+      ],
+    });
+    renderHome({ active: true });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Machines" }));
+    expect(await screen.findByText("zoo-005")).toBeTruthy();
+    expect(screen.getByText(/linux\/x86_64/)).toBeTruthy();
+    expect(screen.getByText(/1 project running/)).toBeTruthy();
+    expect(screen.getByText("Connected")).toBeTruthy();
+  });
+
+  it("reports a machine whose daemon has gone quiet as offline", async () => {
+    stubBootstrap({
+      sessions: [],
+      machines: [
+        {
+          machine: {
+            machine_id: "machine-1",
+            hostname: "zoo-002",
+            last_seen: new Date(Date.now() - 10 * 60_000).toISOString(),
+          },
+          projects: [],
+        },
+      ],
+    });
+    renderHome({ active: true });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Machines" }));
+    expect(await screen.findByText("Offline")).toBeTruthy();
+    expect(screen.getByText(/0 projects running/)).toBeTruthy();
+  });
+
+  it("reboots the daemon of the machine whose control was tapped, after confirming", async () => {
+    stubBootstrap({
+      sessions: [],
+      machines: [
+        { machine: { machine_id: "machine-a", hostname: "zoo-005" }, projects: [] },
+        { machine: { machine_id: "machine-b", hostname: "zoo-006" }, projects: [] },
+      ],
+    });
+    const props = renderHome({ active: true });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Machines" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Reboot daemon on zoo-006" }));
+    expect(props.onRebootDaemon).not.toHaveBeenCalled();
+
+    const dialog = screen.getByRole("dialog", { name: /Reboot the daemon on zoo-006/ });
+    // The reassurance is the point: this restarts a process, not the work.
+    expect(within(dialog).getByText(/keep running/)).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Reboot daemon" }));
+
+    expect(props.onRebootDaemon).toHaveBeenCalledWith("machine-b", "zoo-006");
+  });
+
+  it("sends nothing when a daemon reboot is dismissed", async () => {
+    stubBootstrap({
+      sessions: [],
+      machines: [{ machine: { machine_id: "machine-a", hostname: "zoo-005" }, projects: [] }],
+    });
+    const props = renderHome({ active: true });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Machines" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Reboot daemon on zoo-005" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(props.onRebootDaemon).not.toHaveBeenCalled();
+  });
+
+  it("says so plainly when the account can reach no machines", async () => {
+    stubBootstrap({ sessions: [], machines: [] });
+    renderHome({ active: true });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Machines" }));
+    expect(await screen.findByText("No machines yet")).toBeTruthy();
   });
 
   it("keeps Account and machine management reachable without permanent bars", () => {

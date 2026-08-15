@@ -866,6 +866,8 @@ interface AppState {
   rebootCli: () => string | null;
   /// Reboot a specific session's CLI from a list, without attaching to it.
   rebootSessionCli: (targetSessionId: string) => string | null;
+  /// Reboot the daemon on a machine, targeted by machine id.
+  rebootDaemon: (machineId: string) => void;
   requestPaneDiff: (paneId: number) => void;
   paneDiffs: Record<number, PaneDiff>;
   createPanePr: (paneId: number) => void;
@@ -3013,6 +3015,27 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
+
+  /// Reboot the daemon on one machine.
+  ///
+  /// Targeted by machine id rather than through a project: a daemon is
+  /// per-machine, and a machine running nothing still has one. The server
+  /// authorizes the machine against the ones this account can reach and
+  /// reports an offline daemon rather than silently dropping the request.
+  rebootDaemon: (machineId: string) => {
+    const { ws, showToast } = get();
+    if (!machineId) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      showToast("Not connected — reboot the daemon manually on the machine", "error");
+      return;
+    }
+    try {
+      ws.send(JSON.stringify({ type: "reboot_daemon", machine_id: machineId }));
+      showToast("Daemon reboot requested", "info");
+    } catch {
+      showToast("The reboot request could not be sent", "error");
+    }
+  },
 
   /// Reboot one session's CLI without attaching to it first.
   ///

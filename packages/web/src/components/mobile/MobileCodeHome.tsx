@@ -6,6 +6,9 @@ import type { SessionInfo } from "@/lib/store";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://apas.mpaxos.com";
 
+// "machines" is a third selection rather than a screen: the home already
+// switches lists, and a handful of machine rows does not warrant navigation.
+type HomeView = "all" | "idle" | "machines";
 type SessionFilter = "all" | "idle";
 
 interface MobileSessionSummary {
@@ -25,14 +28,46 @@ interface MobileSessionSummary {
   owner_email?: string | null;
 }
 
-interface MobileBootstrapResponse {
-  sessions: MobileSessionSummary[];
+interface MobileMachineProject {
+  project_id: string;
+  is_running?: boolean;
 }
 
-const FILTERS: { key: SessionFilter; label: string }[] = [
+interface MobileMachineSummary {
+  machine: {
+    machine_id: string;
+    hostname: string;
+    os?: string | null;
+    arch?: string | null;
+    last_seen?: string | null;
+  };
+  projects?: MobileMachineProject[];
+}
+
+interface MobileBootstrapResponse {
+  sessions: MobileSessionSummary[];
+  /// Already on the wire and previously discarded here — the machines list
+  /// costs no extra request.
+  machines?: MobileMachineSummary[];
+}
+
+const FILTERS: { key: HomeView; label: string }[] = [
   { key: "all", label: "All projects" },
   { key: "idle", label: "Idle projects" },
+  { key: "machines", label: "Machines" },
 ];
+
+/// A machine is connected when its daemon has reported recently. The daemon
+/// heartbeats every 10s; a minute of silence is a disconnect rather than a
+/// slow tick.
+const MACHINE_STALE_MS = 60_000;
+
+function machineConnected(machine: MobileMachineSummary): boolean {
+  const lastSeen = machine.machine.last_seen;
+  if (!lastSeen) return false;
+  const at = Date.parse(lastSeen);
+  return Number.isFinite(at) && Date.now() - at < MACHINE_STALE_MS;
+}
 
 function projectName(session: SessionInfo): string {
   const value = session.gitRemote?.split("/").pop()
@@ -102,6 +137,9 @@ export interface MobileCodeHomeProps {
   /// no longer disturbs terminal panes — the pane hosts own those — which is
   /// what makes this safe to offer from a list.
   onRebootCli: (sessionId: string, projectName: string) => void;
+  /// Reboot the daemon on a machine. Targeted by machine id: a daemon is
+  /// per-machine, so no project on it identifies the right one.
+  onRebootDaemon: (machineId: string, hostname: string) => void;
 }
 
 export function MobileCodeHome({
@@ -113,9 +151,13 @@ export function MobileCodeHome({
   onManageMachines,
   onOpenSession,
   onRebootCli,
+  onRebootDaemon,
 }: MobileCodeHomeProps) {
   const [remoteSessions, setRemoteSessions] = useState<MobileSessionSummary[] | null>(null);
-  const [filter, setFilter] = useState<SessionFilter>("all");
+  const [filter, setFilter] = useState<HomeView>("all");
+  const [machines, setMachines] = useState<MobileMachineSummary[]>([]);
+  const [machineRebootTarget, setMachineRebootTarget] =
+    useState<{ id: string; hostname: string } | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [newTaskOpen, setNewTaskOpen] = useState(false);
   // Rebooting is disruptive and the control lives a thumb-width from the card
@@ -132,6 +174,7 @@ export function MobileCodeHome({
       if (!response.ok) throw new Error(`Request failed (${response.status})`);
       const bootstrap = await response.json() as MobileBootstrapResponse;
       setRemoteSessions(Array.isArray(bootstrap.sessions) ? bootstrap.sessions : []);
+      setMachines(Array.isArray(bootstrap.machines) ? bootstrap.machines : []);
       setLoadError(null);
     } catch (error) {
       if (signal?.aborted) return;
@@ -167,7 +210,9 @@ export function MobileCodeHome({
 
   const filteredSessions = useMemo(
     () => sessions
-      .filter((session) => matches(session, filter))
+      // The machines view lists no sessions; keep the session filter total
+      // over the two values it was written for.
+      .filter((session) => filter !== "machines" && matches(session, filter))
       .sort(compareSessionRecency),
     [filter, sessions],
   );
@@ -238,7 +283,59 @@ export function MobileCodeHome({
       )}
 
       <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
-        {filteredSessions.length > 0 ? (
+        {filter === "machines" ? (
+          machines.length > 0 ? (
+            <div className="space-y-2.5">
+              {machines.map((entry) => {
+                const hostname = entry.machine.hostname || "Unknown machine";
+                const connected = machineConnected(entry);
+                const running = (entry.projects ?? []).filter((project) => project.is_running).length;
+                return (
+                  <div
+                    key={entry.machine.machine_id}
+                    className="rounded-2xl border border-[#dedee7] bg-white p-3.5 shadow-sm dark:border-[#383842] dark:bg-[#1b1b21]"
+                  >
+                    <div className="flex items-center justify-between gap-2.5">
+                      <span className="min-w-0 flex-1 truncate text-base font-bold">{hostname}</span>
+                      <span className={`shrink-0 rounded-full px-2.5 py-1 text-[0.7rem] font-bold ${
+                        connected
+                          ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300"
+                          : "bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300"
+                      }`}>
+                        {connected ? "Connected" : "Offline"}
+                      </span>
+                    </div>
+                    <p className="mt-2 truncate text-sm text-[#686873] dark:text-[#aaaab6]">
+                      {[entry.machine.os, entry.machine.arch].filter(Boolean).join("/") || "Unknown platform"}
+                      {" · "}
+                      {running === 1 ? "1 project running" : `${running} projects running`}
+                    </p>
+                    <div className="mt-2.5 flex items-center justify-end">
+                      <button
+                        type="button"
+                        aria-label={`Reboot daemon on ${hostname}`}
+                        onClick={() => setMachineRebootTarget({ id: entry.machine.machine_id, hostname })}
+                        className="inline-flex items-center gap-1.5 rounded-xl border border-[#dedee7] px-3 py-2 text-sm font-semibold active:opacity-60 dark:border-[#383842]"
+                      >
+                        <RotateCcw className="h-4 w-4" /> Reboot daemon
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="flex h-full min-h-52 flex-col items-center justify-center px-5 text-center">
+              <div className="mb-3 rounded-2xl bg-[#efeff5] p-3 dark:bg-[#25252d]">
+                <AlertTriangle className="h-6 w-6 text-[#686873] dark:text-[#aaaab6]" />
+              </div>
+              <h2 className="text-lg font-extrabold">No machines yet</h2>
+              <p className="mt-1.5 max-w-sm text-sm leading-5 text-[#686873] dark:text-[#aaaab6]">
+                Run `apas daemon` on a machine and it will appear here.
+              </p>
+            </div>
+          )
+        ) : filteredSessions.length > 0 ? (
           <div className="space-y-2.5">
             {filteredSessions.map((session) => {
               const name = session.project_name || "Coding session";
@@ -315,6 +412,45 @@ export function MobileCodeHome({
           </div>
         )}
       </div>
+
+      {machineRebootTarget && (
+        <div className="fixed inset-0 z-[90] flex items-end bg-black/45" onClick={() => setMachineRebootTarget(null)}>
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="mobile-machine-reboot-title"
+            className="w-full rounded-t-[1.4rem] border-t border-[#dedee7] bg-[#f7f7fa] p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-2xl dark:border-[#383842] dark:bg-[#111115]"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h2 id="mobile-machine-reboot-title" className="text-lg font-extrabold">
+              Reboot the daemon on {machineRebootTarget.hostname}?
+            </h2>
+            <p className="mt-1.5 text-sm leading-5 text-[#686873] dark:text-[#aaaab6]">
+              It updates to the latest version if one is available. Projects, panes, and agents on
+              this machine keep running — the daemon does not own them.
+            </p>
+            <div className="mt-4 flex gap-2.5">
+              <button
+                type="button"
+                onClick={() => setMachineRebootTarget(null)}
+                className="flex-1 rounded-xl border border-[#dedee7] px-4 py-2.5 text-sm font-bold dark:border-[#383842]"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  onRebootDaemon(machineRebootTarget.id, machineRebootTarget.hostname);
+                  setMachineRebootTarget(null);
+                }}
+                className="flex-1 rounded-xl bg-[#6d5efc] px-4 py-2.5 text-sm font-bold text-white hover:bg-[#5547dc]"
+              >
+                Reboot daemon
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {rebootTarget && (
         <div className="fixed inset-0 z-[90] flex items-end bg-black/45" onClick={() => setRebootTarget(null)}>

@@ -29,6 +29,31 @@ beforeEach(() => {
   useStore.setState({ cliLifecycleInventories: {}, toasts: [] });
 });
 
+describe("rebootDaemon", () => {
+  it("targets the machine it was given", async () => {
+    const ws = await connected();
+    // A daemon is per-machine: no project on it identifies the right one.
+    useStore.setState({ sessionId: "some-session" });
+
+    useStore.getState().rebootDaemon("machine-b");
+
+    expect(lastSent(ws)).toMatchObject({
+      type: "reboot_daemon",
+      machine_id: "machine-b",
+    });
+  });
+
+  it("reports rather than pretends when the socket is closed", () => {
+    useStore.setState({ ws: null });
+
+    useStore.getState().rebootDaemon("machine-b");
+
+    expect(
+      useStore.getState().toasts.some((toast) => toast.kind === "error"),
+    ).toBe(true);
+  });
+});
+
 describe("rebootSessionCli", () => {
   it("routes to the session it was given, not the attached one", async () => {
     const ws = await connected();

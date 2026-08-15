@@ -285,6 +285,55 @@ fn exec_into_newer_binary(version: &str) -> std::io::Error {
     std::process::Command::new(exe).args(args).exec()
 }
 
+/// What a requested daemon restart should do before replacing itself.
+///
+/// Separated from the replacement so the decision is testable: the `exec` that
+/// follows never returns, which makes it the one part that cannot be asserted
+/// on directly.
+#[derive(Debug, PartialEq)]
+enum RestartPlan {
+    /// A newer version is available; install it, then replace.
+    UpdateThenReplace(String),
+    /// Already current; replace with the same binary.
+    ReplaceInPlace,
+}
+
+fn plan_daemon_restart(available: Option<String>) -> RestartPlan {
+    match available {
+        Some(newer) => RestartPlan::UpdateThenReplace(newer),
+        None => RestartPlan::ReplaceInPlace,
+    }
+}
+
+/// Apply a requested restart. Returns only on failure — success replaces this
+/// process image.
+///
+/// Every fallible step runs while this daemon is still serving, so a failed
+/// update leaves a working daemon rather than a machine with none. That is
+/// the same discipline `prepare_cli_restart` uses for project CLIs.
+#[cfg(unix)]
+fn perform_requested_restart() -> anyhow::Error {
+    match plan_daemon_restart(crate::update::check_for_update_available()) {
+        RestartPlan::UpdateThenReplace(newer) => {
+            tracing::info!(%newer, "daemon restart requested: preparing update before replacing");
+            match crate::update::prepare_cli_restart() {
+                Ok(_) => {}
+                Err(err) => {
+                    // Nothing has been replaced, so the machine keeps the
+                    // daemon it had.
+                    tracing::error!(%err, "daemon restart: update failed; staying on the current daemon");
+                    return err;
+                }
+            }
+            anyhow::Error::from(exec_into_newer_binary(&newer))
+        }
+        RestartPlan::ReplaceInPlace => {
+            tracing::info!("daemon restart requested: already current, replacing in place");
+            anyhow::Error::from(exec_into_newer_binary(env!("APAS_VERSION")))
+        }
+    }
+}
+
 #[derive(Debug)]
 struct DaemonState {
     machine_info: MachineInfo,
@@ -1043,6 +1092,25 @@ async fn run_connection(
                                     .send(Message::Text(serde_json::to_string(&update)?.into()))
                                     .await?;
                             }
+                            ServerToDaemon::RebootDaemon => {
+                                // The projects on this host are owned by their
+                                // own tmux sessions, not by this process, so
+                                // replacing it disturbs nothing that is running.
+                                #[cfg(unix)]
+                                {
+                                    let err = perform_requested_restart();
+                                    tracing::error!(
+                                        %err,
+                                        "requested daemon restart failed; continuing on the current daemon"
+                                    );
+                                }
+                                #[cfg(not(unix))]
+                                {
+                                    tracing::warn!(
+                                        "requested daemon restart is not supported on this platform"
+                                    );
+                                }
+                            }
                             ServerToDaemon::RefreshProjects => {
                                 state.refresh_projects();
                                 let refresh_msg = DaemonToServer::Heartbeat {
@@ -1120,5 +1188,25 @@ async fn refresh_usage_limits_cache() {
     match crate::usage::refresh_codex_usage_limits().await {
         Ok(_) => tracing::debug!("Refreshed Codex usage limits cache"),
         Err(err) => tracing::debug!("Failed to refresh Codex usage limits cache: {}", err),
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::{plan_daemon_restart, RestartPlan};
+
+    /// A requested restart is worth requesting because it picks up an update.
+    /// Restarting the same binary is the fallback, not the purpose.
+    #[test]
+    fn a_requested_restart_updates_when_an_update_is_available() {
+        assert_eq!(
+            plan_daemon_restart(Some("26.08.99".to_string())),
+            RestartPlan::UpdateThenReplace("26.08.99".to_string()),
+        );
+    }
+
+    #[test]
+    fn an_up_to_date_daemon_replaces_itself_in_place() {
+        assert_eq!(plan_daemon_restart(None), RestartPlan::ReplaceInPlace);
     }
 }

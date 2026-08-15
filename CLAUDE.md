@@ -703,6 +703,23 @@ being reset by the re-exec costs nothing — the web still shows them running. T
 map self-heals on the next `StartProjectCli`, which re-checks `/proc` before
 spawning and therefore cannot double-start a project that is already up.
 
+**A restart can also be requested**, from the Machines list on mobile
+(`WebToServer::RebootDaemon { machine_id }` → `ServerToDaemon::RebootDaemon`).
+It is addressed by **machine**, not through a project: a daemon is per-machine,
+and a host running nothing still has one worth restarting. The server
+authorizes the machine against the requester's own daemon registrations — the
+same check `StartMachineProjectCli` uses — and reports an offline daemon rather
+than dropping the request.
+
+A requested restart **applies an available update first**, via
+`prepare_cli_restart`, so pull/build/install all complete while the current
+daemon is still serving and a failure leaves that daemon working rather than
+the machine with none. Without that it would only restart the same binary,
+which is not the reason anyone reaches for it: it is what lets a CLI update
+roll out from a phone instead of an SSH session. Progress past "requested" is
+deliberately not reported — the daemon replaces its own process image, so
+anything further would have to outlive the process that would report it.
+
 It upgrades only. Equal, older, or unparseable versions do nothing — equal would
 re-exec every tick forever, and an accidental downgrade across a cluster sharing
 one NFS home would be painful to unpick.
