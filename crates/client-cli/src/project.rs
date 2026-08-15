@@ -580,8 +580,49 @@ pub fn is_project(dir: &Path) -> bool {
     dir.join(APAS_FILE).exists()
 }
 
+/// Environment isolation shared by every test that touches the project
+/// registry. It lives outside `mod tests` because `main.rs` needs it too, and
+/// a second copy of the lock would not serialise against this one — which is
+/// the whole point, since these tests mutate `HOME` and `XDG_CONFIG_HOME`
+/// process-wide.
+#[cfg(test)]
+pub(crate) mod test_support {
+
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn restore_env_var(key: &str, value: Option<std::ffi::OsString>) {
+        if let Some(value) = value {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
+        }
+    }
+
+    pub(crate) fn with_isolated_config<T>(test: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let xdg_config_home = tempfile::tempdir().expect("temp xdg config home");
+        let home = tempfile::tempdir().expect("temp home");
+        let old_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
+        let old_home = std::env::var_os("HOME");
+
+        std::env::set_var("XDG_CONFIG_HOME", xdg_config_home.path());
+        std::env::set_var("HOME", home.path());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test));
+
+        restore_env_var("XDG_CONFIG_HOME", old_xdg_config_home);
+        restore_env_var("HOME", old_home);
+
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::with_isolated_config;
 
     #[test]
     fn a_new_project_starts_with_no_panes() {
@@ -651,10 +692,7 @@ mod tests {
         assert!(meta.panes.is_empty(), "nothing to migrate, nothing created");
     }
     use super::*;
-    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn unique_temp_dir(label: &str) -> PathBuf {
         let stamp = SystemTime::now()
@@ -669,34 +707,7 @@ mod tests {
         ))
     }
 
-    fn restore_env_var(key: &str, value: Option<std::ffi::OsString>) {
-        if let Some(value) = value {
-            std::env::set_var(key, value);
-        } else {
-            std::env::remove_var(key);
-        }
-    }
 
-    fn with_isolated_config<T>(test: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
-        let xdg_config_home = tempfile::tempdir().expect("temp xdg config home");
-        let home = tempfile::tempdir().expect("temp home");
-        let old_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
-        let old_home = std::env::var_os("HOME");
-
-        std::env::set_var("XDG_CONFIG_HOME", xdg_config_home.path());
-        std::env::set_var("HOME", home.path());
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test));
-
-        restore_env_var("XDG_CONFIG_HOME", old_xdg_config_home);
-        restore_env_var("HOME", old_home);
-
-        match result {
-            Ok(value) => value,
-            Err(payload) => std::panic::resume_unwind(payload),
-        }
-    }
 
     fn metadata_with_id(id: Uuid, name: &str) -> ProjectMetadata {
         let mut metadata = ProjectMetadata::with_name(name.to_string());

@@ -92,6 +92,15 @@ struct Cli {
     #[arg(long, conflicts_with_all = ["offline", "remote", "hybrid"])]
     headless: bool,
 
+    /// Open the terminal UI for a project already running on this host.
+    ///
+    /// Not the default: running `apas` in a project directory registers it and
+    /// exits, because a host runs one instance per user and projects are
+    /// started from the web. This is the local view for when the web is not
+    /// reachable, and it renders little beyond pane names.
+    #[arg(long, conflicts_with_all = ["offline", "remote", "hybrid", "headless"])]
+    attach: bool,
+
     /// Run in hybrid mode - single pane with local terminal + streaming (legacy)
     #[arg(long, conflicts_with_all = ["offline", "remote"])]
     hybrid: bool,
@@ -480,43 +489,56 @@ async fn main() -> Result<()> {
         tracing::info!("Starting in hybrid mode (local + streaming to {})", server);
         mode::hybrid::run(&server, &token, &working_dir).await?;
     } else {
-        // Default: tabbed mode (interactive tab by default)
+        // Default: register this project with the host's resident instance and
+        // exit. Neither this path nor `--attach` opens a server connection —
+        // the resident instance owns that — so no server URL or token is
+        // resolved here. The login check stays because an unauthenticated
+        // machine has nothing that can manage what we would register.
         let config = config::Config::load()?;
-        let server = cli
-            .server
-            .or(config.remote.server)
-            .unwrap_or_else(|| DEFAULT_SERVER.to_string());
-        let token = match cli.token.or(config.remote.token) {
-            Some(t) => t,
-            None => {
-                eprintln!("\x1b[33m🔐 Not logged in.\x1b[0m");
-                eprintln!("   Run '\x1b[1mapas login\x1b[0m' to authenticate.");
-                return Ok(());
-            }
-        };
-
-        // Show web UI hint
-        eprintln!(
-            "\x1b[36m📺 View this session in browser: {}\x1b[0m",
-            WEB_UI_URL
-        );
-
-        // Attach to the project if this host is already running it, rather
-        // than starting a second CLI over the same `.apas` and worktrees.
-        // Nothing used to stop that: `is_headless_running_for` guards only the
-        // daemon's own spawns, so typing `apas` in a directory the daemon was
-        // already running produced two owners of one project.
-        match attach_to_running_project(&working_dir) {
-            AttachOutcome::Attached => return Ok(()),
-            AttachOutcome::Refused(message) => {
-                eprintln!("\x1b[33m{message}\x1b[0m");
-                return Ok(());
-            }
-            AttachOutcome::NotRunning => {}
+        if cli.token.or(config.remote.token).is_none() {
+            eprintln!("\x1b[33m🔐 Not logged in.\x1b[0m");
+            eprintln!("   Run '\x1b[1mapas login\x1b[0m' to authenticate.");
+            return Ok(());
         }
 
-        tracing::info!("Starting in dual-pane mode (streaming to {})", server);
-        mode::dual_pane::run(&server, &token, &working_dir).await?;
+        if cli.attach {
+            // The terminal UI, on request. Only reaches a project that is
+            // already running here, because it renders a worker rather than
+            // owning one.
+            match attach_to_running_project(&working_dir) {
+                AttachOutcome::Attached => return Ok(()),
+                AttachOutcome::Refused(message) => {
+                    eprintln!("\x1b[33m{message}\x1b[0m");
+                    return Ok(());
+                }
+                AttachOutcome::NotRunning => {
+                    eprintln!(
+                        "\x1b[33mNo project is running here to attach to.\x1b[0m"
+                    );
+                    eprintln!("   Start it from {WEB_UI_URL}");
+                    return Ok(());
+                }
+            }
+        }
+
+        // A host runs one instance per user. This one has already ensured the
+        // resident instance exists, so its job is to make this project
+        // manageable and get out of the way — not to become a second owner of
+        // it. Nothing used to stop that: `is_headless_running_for` guards only
+        // the daemon's own spawns, so `apas` in a directory the daemon was
+        // already running produced two owners of one project.
+        match register_and_defer(&working_dir) {
+            Ok(message) => {
+                eprintln!("{message}");
+                return Ok(());
+            }
+            Err(err) => {
+                // Registration is the whole point of the launch; failing it
+                // silently would leave a project that never appears anywhere.
+                eprintln!("\x1b[31mCould not register this project: {err}\x1b[0m");
+                return Err(err);
+            }
+        }
     }
 
     Ok(())
@@ -537,6 +559,29 @@ fn maybe_auto_start_daemon(cli: &Cli) -> Result<()> {
         .unwrap_or_else(|| DEFAULT_SERVER.to_string());
 
     ensure_daemon_running(&server, &config.daemon.project_roots, CURRENT_VERSION)
+}
+
+/// Make this directory's project manageable, then get out of the way.
+///
+/// A host runs one instance per user, and by this point it exists — either it
+/// was already running or `maybe_auto_start_daemon` just started it. So the
+/// useful thing a launch can do is register the project, which is all the
+/// resident instance needs: it reads the shared registry on every heartbeat
+/// and reports what it finds to the server. No IPC, no start request.
+///
+/// Returns what to tell the user, which is mostly where to go next: projects
+/// are started from the web now, not by being run in.
+fn register_and_defer(working_dir: &std::path::Path) -> Result<String> {
+    let metadata = project::get_or_create_project(working_dir)?;
+    let name = metadata
+        .name
+        .clone()
+        .unwrap_or_else(|| working_dir.display().to_string());
+    Ok(format!(
+        "\x1b[36m✓ {name} is registered on this machine.\x1b[0m\n   \
+         Start and manage it at {WEB_UI_URL}\n   \
+         This host runs one APAS instance per user; it is already running."
+    ))
 }
 
 enum AttachOutcome {
@@ -1066,6 +1111,63 @@ mod tests {
         assert_eq!(running.version, None);
         assert!(!state_path.exists());
         assert!(legacy_pid_path.exists());
+    }
+
+    #[test]
+    fn a_deferring_launch_registers_the_project_and_starts_nothing() {
+        crate::project::test_support::with_isolated_config(|| {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let project_dir = dir.path().join("work");
+            fs::create_dir_all(&project_dir).expect("project dir");
+
+            let message = super::register_and_defer(&project_dir).expect("register");
+
+            // Registered where the resident instance will find it: it reads
+            // this registry on every heartbeat, which is why no IPC is needed.
+            let registered = crate::project::list_registered_projects().expect("registry");
+            assert_eq!(registered.len(), 1);
+            assert!(message.contains("registered on this machine"));
+            // Projects are started from the web now, so the launch says where.
+            assert!(message.contains(super::WEB_UI_URL));
+        });
+    }
+
+    #[test]
+    fn running_it_twice_in_one_directory_registers_once() {
+        crate::project::test_support::with_isolated_config(|| {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let project_dir = dir.path().join("work");
+            fs::create_dir_all(&project_dir).expect("project dir");
+
+            super::register_and_defer(&project_dir).expect("first");
+            let first = crate::project::read_project_id(&project_dir).expect("id");
+            super::register_and_defer(&project_dir).expect("second");
+            let second = crate::project::read_project_id(&project_dir).expect("id");
+
+            // The second launch is not a new project: same id, one entry.
+            assert_eq!(first, second);
+            assert_eq!(
+                crate::project::list_registered_projects().expect("registry").len(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn a_directory_that_is_not_yet_a_project_becomes_one() {
+        // This change governs how many instances run, not when a project comes
+        // into being: onboarding a local directory stays a thing a launch does,
+        // because the web's create flow only clones into a new directory.
+        crate::project::test_support::with_isolated_config(|| {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let fresh = dir.path().join("fresh");
+            fs::create_dir_all(&fresh).expect("dir");
+            assert!(crate::project::read_project_id(&fresh).is_none());
+
+            super::register_and_defer(&fresh).expect("register");
+
+            assert!(crate::project::read_project_id(&fresh).is_some());
+        });
     }
 
     #[test]

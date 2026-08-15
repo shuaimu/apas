@@ -326,7 +326,9 @@ RUST_LOG=info cargo run -p apas-server
 # Terminal 2: Web frontend
 cd packages/web && npm run dev
 
-# Terminal 3: CLI (in any project directory)
+# Terminal 3: CLI (in any project directory). Registers the project and exits;
+# start it from the web. `--attach` opens the terminal UI for one already
+# running here.
 cargo run -p apas
 ```
 
@@ -647,6 +649,40 @@ turn, the same end state as the Overview's "Stop team" button. It pauses before
 interrupting, where the web does the reverse — between an interrupt and the
 pause landing, a sibling pane's write can wake the loop for one more iteration.
 Unmanaged side chats are never touched.
+
+## One instance per user per host
+
+Running `apas` in a project directory **registers that project and exits**. It
+does not open a terminal UI and does not start the project — projects are
+started from the web. A host runs one APAS instance per user, and by the time
+a launch gets there it already exists, because `ensure_daemon_running` started
+it.
+
+This is the existing `apas daemon` rule applied to the command people actually
+type. `detect_running_daemon` already reads a pid state file, verifies the
+process really is `apas`, and deletes a stale record; `apas daemon` already
+prints and returns when one is running. The gap was that plain `apas` went
+straight into `dual_pane` without asking, so typing it in a directory the
+daemon was already running produced two owners of one project, one `.apas`,
+and one set of worktrees — `is_headless_running_for` guards only the daemon's
+own spawns.
+
+Registration is all a launch needs to do: the daemon reads the shared registry
+(`list_registered_projects`) on every heartbeat and reports what it finds, so
+the project appears on the Machines page with no IPC and no start request.
+
+**Creating a project from a local directory is still a thing a launch does.**
+`apas` in a directory that is not yet a project creates and registers it. This
+rule governs how many instances run, not when a project comes into being, and
+the web's create flow only clones a repository into a *new* directory.
+
+**Headless workers are exempt.** They are `apas` processes, but the daemon's
+children rather than instances a user launched; applying the rule to them
+would stop the daemon running more than one project.
+
+`apas --attach` opens the terminal UI for a project already running here. It
+is a local view for when the web is unreachable, it renders little beyond pane
+names, and it is expected to be removed if nothing uses it.
 
 ## The daemon upgrades itself
 

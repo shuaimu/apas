@@ -31,11 +31,15 @@ A launch that finds an instance already running SHALL NOT start, attach to, or d
 - **AND** the user is told where to manage it
 - **AND** no second process is left running for that project
 
-#### Scenario: Launched from a directory that is not a project
+#### Scenario: Launched from a directory that is not yet a project
 
-- **WHEN** a user runs it outside any project while their instance is already running
-- **THEN** it reports the running instance and exits
-- **AND** registers nothing
+- **WHEN** a user runs it in a directory that is not yet a project while their instance is already running
+- **THEN** that directory becomes a project and is registered, as it is today
+- **AND** it reports where to manage it and exits
+
+Creating a project from a local directory stays a thing a launch does: this
+change governs how many instances run, not when a project comes into being,
+and the web's create flow only clones a repository into a new directory.
 
 #### Scenario: The same project directory twice
 
