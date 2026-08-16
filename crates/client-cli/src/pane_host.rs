@@ -1443,6 +1443,12 @@ mod tests {
         // The per-pane directory was always removed; the project directory above
         // it never was, so every project that hosted a pane left an empty
         // skeleton behind forever.
+        // Serialise against every other test that mutates the environment.
+        // Concurrent `setenv` calls race on the environ array itself, so this
+        // one racing the HOME/XDG_CONFIG_HOME writers made a registry test read
+        // a stale XDG_CONFIG_HOME, conclude the preferred registry was absent,
+        // and migrate the legacy file out from under its own assertion.
+        let _env = crate::project::test_support::env_lock();
         let root = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("XDG_RUNTIME_DIR");
         std::env::set_var("XDG_RUNTIME_DIR", root.path());

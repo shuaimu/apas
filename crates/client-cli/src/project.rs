@@ -590,6 +590,18 @@ pub(crate) mod test_support {
 
     pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Take the environment lock, tolerating a previous holder's panic.
+    ///
+    /// A failing test unwinds through the guard and poisons the mutex, so one
+    /// genuine assertion failure turned into eight unrelated ones and buried
+    /// the real defect. Poisoning protects invariants inside the data; there is
+    /// no data here, only the serialisation.
+    pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn restore_env_var(key: &str, value: Option<std::ffi::OsString>) {
         if let Some(value) = value {
             std::env::set_var(key, value);
@@ -599,7 +611,7 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn with_isolated_config<T>(test: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let guard = env_lock();
         let xdg_config_home = tempfile::tempdir().expect("temp xdg config home");
         let home = tempfile::tempdir().expect("temp home");
         let old_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
@@ -612,6 +624,10 @@ pub(crate) mod test_support {
 
         restore_env_var("XDG_CONFIG_HOME", old_xdg_config_home);
         restore_env_var("HOME", old_home);
+
+        // Release before resuming: unwinding through the guard is what poisoned
+        // the lock for every test that came after.
+        drop(guard);
 
         match result {
             Ok(value) => value,
