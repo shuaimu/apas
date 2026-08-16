@@ -19,6 +19,26 @@ function stubBootstrap(body: Record<string, unknown>) {
   }));
 }
 
+function renderHomeWith(overrides: Partial<MobileCodeHomeProps> = {}) {
+  const props: MobileCodeHomeProps = {
+    active: false,
+    connected: true,
+    legacySessions: [],
+    token: "token",
+    onAccount: vi.fn(),
+    onManageMachines: vi.fn(),
+    onOpenSession: vi.fn(),
+    onRebootDaemon: vi.fn(),
+    onRefreshMachines: vi.fn(),
+    ...overrides,
+  };
+  const view = render(<MobileCodeHome {...props} />);
+  return {
+    props,
+    rerender: (next: MobileCodeHomeProps) => view.rerender(<MobileCodeHome {...next} />),
+  };
+}
+
 function renderHome(overrides: Partial<MobileCodeHomeProps> = {}) {
   const props: MobileCodeHomeProps = {
     active: false,
@@ -330,6 +350,68 @@ describe("MobileCodeHome", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: "Reboot to update" }));
 
     expect(props.onRebootDaemon).toHaveBeenCalledWith("machine-b", "zoo-006");
+  });
+
+  it("shows the pushed machine list rather than the bootstrap snapshot", async () => {
+    // The bug: bootstrap is fetched once, so a daemon restarted onto a new
+    // version kept reading as the old one until the page was reloaded by hand.
+    stubBootstrap({
+      sessions: [],
+      machines: [
+        { machine: { machine_id: "machine-a", hostname: "zoo-005", daemon_version: "26.08.74" }, projects: [] },
+      ],
+    });
+    const { rerender, props } = renderHomeWith({
+      active: true,
+      liveMachines: [
+        {
+          machine: { machineId: "machine-a", hostname: "zoo-005", os: "linux", arch: "x64", daemonVersion: "26.08.74" },
+          projects: [],
+        },
+      ],
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Machines" }));
+    expect(await screen.findByText(/26\.08\.74/)).toBeTruthy();
+
+    // The daemon comes back on a new version; the server pushes it.
+    rerender({
+      ...props,
+      liveMachines: [
+        {
+          machine: { machineId: "machine-a", hostname: "zoo-005", os: "linux", arch: "x64", daemonVersion: "26.08.78" },
+          projects: [],
+        },
+      ],
+    });
+
+    expect(await screen.findByText(/26\.08\.78/)).toBeTruthy();
+    expect(screen.queryByText(/26\.08\.74/)).toBeNull();
+  });
+
+  it("falls back to the bootstrap snapshot until a list has been pushed", async () => {
+    // A cold open is a heartbeat away from the first push, and an empty list
+    // reads as "no machines" rather than "not yet".
+    stubBootstrap({
+      sessions: [],
+      machines: [
+        { machine: { machine_id: "machine-a", hostname: "zoo-005", daemon_version: "26.08.74" }, projects: [] },
+      ],
+    });
+    renderHomeWith({ active: true, liveMachines: [] });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Machines" }));
+    expect(await screen.findByText("zoo-005")).toBeTruthy();
+    expect(screen.queryByText(/No machines yet/)).toBeNull();
+  });
+
+  it("asks for a machine list when the machines tab is opened", async () => {
+    stubBootstrap({ sessions: [], machines: [] });
+    const { props } = renderHomeWith({ active: true });
+
+    expect(props.onRefreshMachines).not.toHaveBeenCalled();
+    fireEvent.click(await screen.findByRole("button", { name: "Machines" }));
+    expect(props.onRefreshMachines).toHaveBeenCalled();
   });
 
   it("sends nothing when a daemon reboot is dismissed", async () => {

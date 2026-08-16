@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { AlertTriangle, ChevronRight, Plus, RotateCcw, WifiOff, X } from "lucide-react";
-import type { SessionInfo } from "@/lib/store";
+import type { MachineWithProjects, SessionInfo } from "@/lib/store";
 import {
   daemonVersionLabel,
   isMachineBehind,
@@ -69,6 +69,24 @@ const FILTERS: { key: HomeView; label: string }[] = [
 /// heartbeats every 10s; a minute of silence is a disconnect rather than a
 /// slow tick.
 const MACHINE_STALE_MS = 60_000;
+
+/// The pushed list carries the same facts under the client's own names.
+function adaptMachine(entry: MachineWithProjects): MobileMachineSummary {
+  return {
+    machine: {
+      machine_id: entry.machine.machineId,
+      hostname: entry.machine.hostname,
+      os: entry.machine.os,
+      arch: entry.machine.arch,
+      daemon_version: entry.machine.daemonVersion,
+      last_seen: entry.machine.lastSeen,
+    },
+    projects: entry.projects.map((project) => ({
+      project_id: project.projectId,
+      is_running: project.isRunning,
+    })),
+  };
+}
 
 function machineConnected(machine: MobileMachineSummary): boolean {
   const lastSeen = machine.machine.last_seen;
@@ -144,6 +162,15 @@ export interface MobileCodeHomeProps {
   /// Reboot the daemon on a machine. Targeted by machine id: a daemon is
   /// per-machine, so no project on it identifies the right one.
   onRebootDaemon: (machineId: string, hostname: string) => void;
+  /// Machines as the server last pushed them. The bootstrap document is a
+  /// snapshot taken once, so a machine that changed since — most visibly one
+  /// whose daemon was just restarted onto a new version — kept reading as it
+  /// was until the page was reloaded by hand. The server already broadcasts
+  /// this on every daemon heartbeat; this list is that broadcast.
+  liveMachines?: MachineWithProjects[];
+  /// Ask for a machine list now, so the first paint does not wait for the next
+  /// heartbeat.
+  onRefreshMachines?: () => void;
   /// The connected server's own version, so a fleet that is uniformly behind a
   /// newer deployment is still recognisable — nothing the machines report is
   /// newer than each other in that case.
@@ -160,13 +187,25 @@ export function MobileCodeHome({
   onOpenSession,
   onRebootDaemon,
   serverVersion,
+  liveMachines,
+  onRefreshMachines,
 }: MobileCodeHomeProps) {
   const [remoteSessions, setRemoteSessions] = useState<MobileSessionSummary[] | null>(null);
   const [filter, setFilter] = useState<HomeView>("all");
-  const [machines, setMachines] = useState<MobileMachineSummary[]>([]);
+  const [bootstrapMachines, setBootstrapMachines] = useState<MobileMachineSummary[]>([]);
   const [machineRebootTarget, setMachineRebootTarget] =
     useState<{ id: string; hostname: string; behind: boolean } | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  // Live when the server has pushed a list, the bootstrap snapshot until then.
+  // Falling back matters on a cold open: the first heartbeat can be ten seconds
+  // out, and an empty machines tab reads as "no machines" rather than "not yet".
+  const machines = useMemo(
+    () =>
+      liveMachines && liveMachines.length > 0
+        ? liveMachines.map(adaptMachine)
+        : bootstrapMachines,
+    [liveMachines, bootstrapMachines],
+  );
   // Both sources: the server catches a fleet that is uniformly behind a newer
   // deployment, the machines catch a rollout part-way through the cluster.
   const latestVersion = useMemo(
@@ -189,7 +228,7 @@ export function MobileCodeHome({
       if (!response.ok) throw new Error(`Request failed (${response.status})`);
       const bootstrap = await response.json() as MobileBootstrapResponse;
       setRemoteSessions(Array.isArray(bootstrap.sessions) ? bootstrap.sessions : []);
-      setMachines(Array.isArray(bootstrap.machines) ? bootstrap.machines : []);
+      setBootstrapMachines(Array.isArray(bootstrap.machines) ? bootstrap.machines : []);
       setLoadError(null);
     } catch (error) {
       if (signal?.aborted) return;
@@ -202,6 +241,11 @@ export function MobileCodeHome({
     void refresh(controller.signal);
     return () => controller.abort();
   }, [refresh, connected]);
+
+  useEffect(() => {
+    if (!active || filter !== "machines") return;
+    onRefreshMachines?.();
+  }, [active, filter, onRefreshMachines]);
 
   const sessions = useMemo(() => {
     const legacyById = new Map(legacySessions.map((session) => [session.id, session]));
