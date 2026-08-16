@@ -244,7 +244,6 @@ export default function Home() {
           ) : (
             <MobileSessionActivity
               connected={connected}
-              onAccount={() => setSettingsOpen(true)}
               onBack={() => {
                 setMobileScreen("home");
                 listSessions();

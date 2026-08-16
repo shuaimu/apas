@@ -17,6 +17,7 @@ import {
   X,
 } from "lucide-react";
 import { AskUserQuestionCard } from "@/components/tools/AskUserQuestionCard";
+import { MobileProjectManageSheet } from "./MobileProjectManageSheet";
 import { MobilePaneWorkSummarySheet } from "./MobilePaneWorkSummarySheet";
 import {
   paneKey,
@@ -109,7 +110,6 @@ interface LaunchOption {
 
 export interface MobileSessionActivityProps {
   connected: boolean;
-  onAccount: () => void;
   onBack: () => void;
   onReconnect: () => void;
 }
@@ -266,7 +266,7 @@ function MobileEventCard({
   );
 }
 
-export function MobileSessionActivity({ connected, onAccount, onBack, onReconnect }: MobileSessionActivityProps) {
+export function MobileSessionActivity({ connected, onBack, onReconnect }: MobileSessionActivityProps) {
   const sessionId = useStore((state) => state.sessionId);
   const sessions = useStore((state) => state.sessions);
   const paneConfigs = useStore((state) => state.paneConfigs);
@@ -296,6 +296,7 @@ export function MobileSessionActivity({ connected, onAccount, onBack, onReconnec
   const [terminalPaneId, setTerminalPaneId] = useState<number | null>(null);
   const [newPaneOpen, setNewPaneOpen] = useState(false);
   const [summaryOpen, setSummaryOpen] = useState(false);
+  const [manageOpen, setManageOpen] = useState(false);
   const activityScrollRef = useRef<HTMLDivElement>(null);
   const restoredScrollContextRef = useRef<string | null>(null);
   const restoredScrollElementRef = useRef<HTMLDivElement | null>(null);
@@ -514,49 +515,48 @@ export function MobileSessionActivity({ connected, onAccount, onBack, onReconnec
         </button>
       )}
 
-      <div className="shrink-0 border-b border-[#dedee7] px-4 pt-3 pb-3 dark:border-[#383842]">
-        <div className="flex items-start justify-between gap-3">
-          <button type="button" aria-label="Back to coding sessions" onClick={onBack} className="-ml-2 rounded-lg p-2 text-[#686873] hover:bg-[#efeff5] dark:text-[#aaaab6] dark:hover:bg-[#25252d]"><ArrowLeft className="h-5 w-5" /></button>
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2">
-              <h1 className="truncate text-xl font-extrabold">{projectName}</h1>
-              <span className={`shrink-0 rounded-full px-2.5 py-1 text-[0.68rem] font-extrabold ${session.isActive ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300" : "bg-[#efeff5] text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]"}`}>
-                {session.isActive ? "Active" : session.status}
-              </span>
-            </div>
-            <p className="mt-0.5 truncate text-xs text-[#686873] dark:text-[#aaaab6]">{session.hostname || session.workingDir || "Unknown target"}</p>
+      {/* Switching panes is the thing done constantly here, so it sits in the
+          top row; the project's identity is read once and takes the small line
+          beneath. Account left entirely — it navigates away from the session,
+          and the home screen has it. */}
+      <div className="shrink-0 border-b border-[#dedee7] px-4 pt-3 pb-2.5 dark:border-[#383842]">
+        <div className="flex items-center gap-2">
+          <button type="button" aria-label="Back to coding sessions" onClick={onBack} className="-ml-2 shrink-0 rounded-lg p-2 text-[#686873] hover:bg-[#efeff5] dark:text-[#aaaab6] dark:hover:bg-[#25252d]"><ArrowLeft className="h-5 w-5" /></button>
+          <div className="no-scrollbar flex min-w-0 flex-1 items-center gap-2 overflow-x-auto">
+            {paneConfigs.length > 0 ? paneConfigs.map((pane) => {
+              const selected = pane.pane_id === selectedPaneId;
+              return (
+                <button key={pane.pane_id} type="button" aria-pressed={selected} onClick={() => selectPane(pane.pane_id)} className={`shrink-0 rounded-full border px-3 py-1.5 text-xs font-bold ${selected ? "border-[#6d5efc] text-[#6d5efc]" : "border-[#dedee7] text-[#686873] dark:border-[#383842] dark:text-[#aaaab6]"}`}>
+                  {paneLabel(pane)}{paneStatuses[paneKey(pane.pane_id)] ? " · working" : ""}
+                </button>
+              );
+            }) : (
+              <span className="shrink-0 text-xs text-[#686873] dark:text-[#aaaab6]">Waiting for panes…</span>
+            )}
+            <button type="button" aria-label="Create pane" onClick={() => setNewPaneOpen(true)} className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[#6d5efc] text-white"><Plus className="h-4 w-4" /></button>
           </div>
-          <button type="button" onClick={onAccount} className="min-h-9 px-1 text-sm font-bold text-[#6d5efc]">Account</button>
+          <button type="button" onClick={() => setManageOpen(true)} className="min-h-9 shrink-0 px-1 text-sm font-bold text-[#6d5efc]">Manage</button>
         </div>
 
-        <div className="no-scrollbar mt-3 flex gap-2 overflow-x-auto">
-          <button type="button" onClick={() => setNewPaneOpen(true)} className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-[#6d5efc] px-3 py-2 text-xs font-bold text-white"><Plus className="h-4 w-4" /> Pane</button>
-          <button type="button" disabled={!selectedIsTerminal} onClick={() => {
-            if (selectedPaneId === null) return;
-            persistActivityScroll();
-            setTerminalPaneId(selectedPaneId);
-          }} className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-[#dedee7] bg-white px-3 py-2 text-xs font-bold disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"><SquareTerminal className="h-4 w-4" /> Raw terminal</button>
-          {summarySupported && (
-            <button type="button" disabled={selectedPaneId === null} onClick={() => setSummaryOpen(true)} className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-[#dedee7] bg-white px-3 py-2 text-xs font-bold disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"><History className="h-4 w-4" /> Summary</button>
-          )}
+        <div className="mt-1.5 flex items-center gap-2">
+          {/* Still the screen's heading, just no longer the largest thing on
+              it — losing the h1 would leave the screen without one. */}
+          {/* The heading is the project alone; the target rides beside it, so
+              the screen keeps a heading that names one thing. */}
+          <div className="flex min-w-0 flex-1 items-baseline gap-1.5">
+            <h1 className="shrink-0 max-w-[55%] truncate text-sm font-bold">{projectName}</h1>
+            <span className="min-w-0 flex-1 truncate text-xs text-[#686873] dark:text-[#aaaab6]">
+              {session.hostname || session.workingDir || "Unknown target"}
+            </span>
+          </div>
+          <span className={`shrink-0 rounded-full px-2.5 py-1 text-[0.68rem] font-extrabold ${session.isActive ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300" : "bg-[#efeff5] text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]"}`}>
+            {session.isActive ? "Active" : session.status}
+          </span>
         </div>
       </div>
 
       {actionError && <div className="mx-4 mt-3 flex shrink-0 items-center gap-2 rounded-xl border border-red-300 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300"><AlertTriangle className="h-4 w-4 shrink-0" /> {actionError}</div>}
 
-      <div className="no-scrollbar flex shrink-0 items-center gap-2 overflow-x-auto px-4 py-2.5">
-        <span className="shrink-0 text-xs font-medium text-[#686873] dark:text-[#aaaab6]">Steer pane:</span>
-        {paneConfigs.length > 0 ? paneConfigs.map((pane) => {
-          const selected = pane.pane_id === selectedPaneId;
-          return (
-            <button key={pane.pane_id} type="button" aria-pressed={selected} onClick={() => selectPane(pane.pane_id)} className={`shrink-0 rounded-full border px-3 py-1.5 text-xs font-bold ${selected ? "border-[#6d5efc] text-[#6d5efc]" : "border-[#dedee7] text-[#686873] dark:border-[#383842] dark:text-[#aaaab6]"}`}>
-              {paneLabel(pane)}{paneStatuses[paneKey(pane.pane_id)] ? " · working" : ""}
-            </button>
-          );
-        }) : (
-          <span className="text-xs text-[#686873] dark:text-[#aaaab6]">Waiting for panes…</span>
-        )}
-      </div>
 
       <div ref={activityScrollRef} role="log" aria-label="Conversation activity" onScroll={handleActivityScroll} className="min-h-0 flex-1 overflow-y-auto px-4 pb-4">
         {selectedPlanReviews.length > 0 && (
@@ -601,6 +601,16 @@ export function MobileSessionActivity({ connected, onAccount, onBack, onReconnec
         {connected && !sessionIsRunning && canCompose && <p className="mb-1.5 text-[11px] text-amber-700 dark:text-amber-300">You can draft a message, but this project must be running before it can be sent.</p>}
         <div className="flex items-end gap-2">
           <textarea value={followUp} onChange={(event) => setFollowUp(event.target.value)} rows={2} placeholder={selectedIsBot ? "Stop the bot before steering it" : selectedIsTerminal ? "Message this terminal conversation" : "Steer this session and pane"} disabled={!canCompose} className="min-h-[2.75rem] flex-1 resize-none rounded-xl border border-[#dedee7] bg-white px-3 py-2 text-sm outline-none focus:border-[#6d5efc] disabled:opacity-50 dark:border-[#383842] dark:bg-[#1b1b21]" />
+          {/* Occasional, and about the selected pane rather than the
+              conversation — so they sit here instead of costing a row above it. */}
+          <button type="button" aria-label="Open raw terminal" disabled={!selectedIsTerminal} onClick={() => {
+            if (selectedPaneId === null) return;
+            persistActivityScroll();
+            setTerminalPaneId(selectedPaneId);
+          }} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-[#dedee7] bg-white text-[#686873] disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21] dark:text-[#aaaab6]"><SquareTerminal className="h-5 w-5" /></button>
+          {summarySupported && (
+            <button type="button" aria-label="Open work summary" disabled={selectedPaneId === null} onClick={() => setSummaryOpen(true)} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-[#dedee7] bg-white text-[#686873] disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21] dark:text-[#aaaab6]"><History className="h-5 w-5" /></button>
+          )}
           <button type="button" aria-label={selectedIsTerminal ? "Send conversation message" : "Send follow-up"} disabled={!canSend || !followUp.trim()} onClick={sendFollowUp} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-[#6d5efc] text-white disabled:opacity-40"><Send className="h-5 w-5" /></button>
         </div>
       </div>
@@ -616,6 +626,8 @@ export function MobileSessionActivity({ connected, onAccount, onBack, onReconnec
           </div>
         </div>
       )}
+
+      {manageOpen && <MobileProjectManageSheet onClose={() => setManageOpen(false)} />}
 
       {summaryOpen && selectedPaneId !== null && (
         <MobilePaneWorkSummarySheet

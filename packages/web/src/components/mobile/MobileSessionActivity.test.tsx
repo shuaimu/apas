@@ -133,7 +133,6 @@ function seedStore(overrides: Record<string, unknown> = {}) {
 function renderActivity(overrides: Partial<MobileSessionActivityProps> = {}) {
   const props: MobileSessionActivityProps = {
     connected: true,
-    onAccount: vi.fn(),
     onBack: vi.fn(),
     onReconnect: vi.fn(),
     ...overrides,
@@ -232,7 +231,7 @@ describe("MobileSessionActivity", () => {
       activity.scrollTop = 275;
       fireEvent.scroll(activity);
 
-      fireEvent.click(screen.getByRole("button", { name: /Raw terminal/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Open raw terminal" }));
       expect(await screen.findByRole("region", { name: "Mobile terminal" })).toBeTruthy();
       fireEvent.click(screen.getByRole("button", { name: /Conversation/ }));
 
@@ -388,7 +387,7 @@ describe("MobileSessionActivity", () => {
     expect(actions.sendTerminalInput).not.toHaveBeenCalled();
     expect(actions.sendMessageToPane).not.toHaveBeenCalled();
 
-    fireEvent.click(screen.getByRole("button", { name: /Raw terminal/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Open raw terminal" }));
     expect(await screen.findByRole("region", { name: "Mobile terminal" })).toBeTruthy();
     expect(screen.queryByRole("region", { name: "Mobile session activity" })).toBeNull();
   });
@@ -413,7 +412,7 @@ describe("MobileSessionActivity", () => {
   it("creates panes only from profiles allowed by project policy", async () => {
     const actions = seedStore();
     renderActivity();
-    fireEvent.click(screen.getByRole("button", { name: /^Pane$/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Create pane" }));
 
     expect(screen.getByRole("dialog", { name: "Create pane" })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: /Codex terminal/ }));
@@ -430,15 +429,48 @@ describe("MobileSessionActivity", () => {
     );
   });
 
-  it("keeps back, Account, and reconnect controls available without old navigation bars", () => {
+  it("puts the pane list in the top row, beside the back control", () => {
+    seedStore({ paneConfigs: [pane({ pane_id: 3 }), pane({ pane_id: 4, label: "Reviewer" })] });
+    renderActivity();
+
+    // The row that carries "back" is the row that carries the panes: switching
+    // panes is what this screen is used for, so it must not sit third.
+    const back = screen.getByRole("button", { name: "Back to coding sessions" });
+    const topRow = back.parentElement as HTMLElement;
+    expect(within(topRow).getByRole("button", { name: /Reviewer/ })).toBeTruthy();
+    expect(within(topRow).getByRole("button", { name: "Create pane" })).toBeTruthy();
+    expect(within(topRow).getByRole("button", { name: "Manage" })).toBeTruthy();
+
+    fireEvent.click(within(topRow).getByRole("button", { name: /Reviewer/ }));
+    expect(screen.getByRole("button", { name: /Reviewer/ }).getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("opens project management from the session screen", () => {
+    seedStore({
+      projectFlags: {
+        "session-a": {
+          autoApproveTodos: false,
+          autoMergePrs: false,
+          teamEnabled: true,
+          disallowedTabTypes: [],
+        },
+      },
+    });
+    renderActivity();
+
+    fireEvent.click(screen.getByRole("button", { name: "Manage" }));
+    expect(screen.getByRole("dialog", { name: "Manage project" })).toBeTruthy();
+  });
+
+  it("keeps back and reconnect available, and no longer navigates to account settings", () => {
     const props = renderActivity({ connected: false });
 
     fireEvent.click(screen.getByRole("button", { name: "Back to coding sessions" }));
     expect(props.onBack).toHaveBeenCalledTimes(1);
-    fireEvent.click(screen.getByRole("button", { name: "Account" }));
-    expect(props.onAccount).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByText(/tap to reconnect/));
     expect(props.onReconnect).toHaveBeenCalledTimes(1);
+    // Account leaves the session entirely; the home screen has it.
+    expect(screen.queryByRole("button", { name: "Account" })).toBeNull();
   });
 
   it("opens pane-scoped summaries and sends exact refresh and retry requests", async () => {
@@ -465,7 +497,7 @@ describe("MobileSessionActivity", () => {
     });
     renderActivity();
 
-    fireEvent.click(screen.getByRole("button", { name: "Summary" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open work summary" }));
     expect(await screen.findByRole("dialog", { name: "Work summaries for Codex 3" })).toBeTruthy();
     expect(actions.listPaneWorkSummaries).toHaveBeenCalledWith("session-a", 3, true);
     expect(screen.getByText(/Implemented the selected pane workflow/)).toBeTruthy();
@@ -498,7 +530,7 @@ describe("MobileSessionActivity", () => {
       },
     });
     renderActivity();
-    fireEvent.click(screen.getByRole("button", { name: "Summary" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open work summary" }));
     expect(await screen.findByText("Only summary three")).toBeTruthy();
 
     fireEvent.click(within(screen.getByRole("dialog", { name: "Work summaries for Codex 3" })).getByRole("button", { name: "Claude 4" }));
@@ -514,7 +546,7 @@ describe("MobileSessionActivity", () => {
     conversation.scrollTop = 123;
     fireEvent.scroll(conversation);
 
-    fireEvent.click(screen.getByRole("button", { name: "Summary" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open work summary" }));
     fireEvent.click(screen.getByRole("button", { name: "Close work summary" }));
 
     const restored = screen.getByRole("log", { name: "Conversation activity" }) as HTMLDivElement;
