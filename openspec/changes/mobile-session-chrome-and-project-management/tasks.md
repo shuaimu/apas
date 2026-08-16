@@ -20,7 +20,16 @@
 - [x] 3.2 Present a type the cluster policy forbids as unavailable rather than permitted, not togglable by anyone, and say the restriction is not the project's
 - [x] 3.3 Tests: a type outside the cluster policy reads as unavailable and cannot be toggled by an owner; a type inside it stays owner-togglable
 
-## 4. Verification
+## 4. Gather the occasional actions behind one control
 
-- [x] 4.1 Web lint, type-check, and test suite clean
-- [ ] 4.2 Live on the mobile browser: open a project, switch panes from the top row, open the raw terminal and summary from the composer, and restrict a tab type as the owner
+- [x] 4.1 Replace the standalone Manage control with a single overflow control in the same row
+- [x] 4.2 Offer raw terminal, work summary, close pane, and project management from it, each acting on the selected pane or project
+- [x] 4.3 Take raw terminal and summary back out of the composer row, leaving it to composing and sending
+- [x] 4.4 Confirm before closing, and offer the worktree choices for a pane that owns one rather than discarding silently
+- [x] 4.5 Select a remaining pane after closing the selected one
+- [x] 4.6 Tests: the menu opens each surface for the selected pane; the composer carries neither; closing confirms first, sends the close for the right pane, and a worktree pane is offered its choices
+
+## 5. Verification
+
+- [x] 5.1 Web lint, type-check, and test suite clean
+- [ ] 5.2 Live on the mobile browser: open a project, switch panes from the top row, open the raw terminal and summary from the composer, and restrict a tab type as the owner

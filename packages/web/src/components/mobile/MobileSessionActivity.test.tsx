@@ -62,6 +62,7 @@ function seedStore(overrides: Record<string, unknown> = {}) {
   const addPane = vi.fn(() => ({ success: true }));
   const listPaneWorkSummaries = vi.fn(() => true);
   const refreshPaneWorkSummary = vi.fn(() => true);
+  const removePane = vi.fn();
 
   act(() => {
     useStore.setState({
@@ -108,6 +109,7 @@ function seedStore(overrides: Record<string, unknown> = {}) {
       addPane,
       listPaneWorkSummaries,
       refreshPaneWorkSummary,
+      removePane,
       ...overrides,
     });
   });
@@ -124,6 +126,7 @@ function seedStore(overrides: Record<string, unknown> = {}) {
     reject,
     requestPaneDiff,
     refreshPaneWorkSummary,
+    removePane,
     sendMessageToPane,
     sendTerminalConversationMessage,
     sendTerminalInput,
@@ -231,7 +234,8 @@ describe("MobileSessionActivity", () => {
       activity.scrollTop = 275;
       fireEvent.scroll(activity);
 
-      fireEvent.click(screen.getByRole("button", { name: "Open raw terminal" }));
+      fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open raw terminal" }));
       expect(await screen.findByRole("region", { name: "Mobile terminal" })).toBeTruthy();
       fireEvent.click(screen.getByRole("button", { name: /Conversation/ }));
 
@@ -387,6 +391,7 @@ describe("MobileSessionActivity", () => {
     expect(actions.sendTerminalInput).not.toHaveBeenCalled();
     expect(actions.sendMessageToPane).not.toHaveBeenCalled();
 
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
     fireEvent.click(screen.getByRole("button", { name: "Open raw terminal" }));
     expect(await screen.findByRole("region", { name: "Mobile terminal" })).toBeTruthy();
     expect(screen.queryByRole("region", { name: "Mobile session activity" })).toBeNull();
@@ -439,7 +444,7 @@ describe("MobileSessionActivity", () => {
     const topRow = back.parentElement as HTMLElement;
     expect(within(topRow).getByRole("button", { name: /Reviewer/ })).toBeTruthy();
     expect(within(topRow).getByRole("button", { name: "Create pane" })).toBeTruthy();
-    expect(within(topRow).getByRole("button", { name: "Manage" })).toBeTruthy();
+    expect(within(topRow).getByRole("button", { name: "More actions" })).toBeTruthy();
 
     fireEvent.click(within(topRow).getByRole("button", { name: /Reviewer/ }));
     expect(screen.getByRole("button", { name: /Reviewer/ }).getAttribute("aria-pressed")).toBe("true");
@@ -458,8 +463,69 @@ describe("MobileSessionActivity", () => {
     });
     renderActivity();
 
-    fireEvent.click(screen.getByRole("button", { name: "Manage" }));
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Manage project" }));
     expect(screen.getByRole("dialog", { name: "Manage project" })).toBeTruthy();
+  });
+
+  it("keeps the composer for composing, with the occasional actions behind one control", () => {
+    seedStore({
+      paneConfigs: [pane({ pane_id: 3 })],
+      negotiatedCapabilities: new Set(["pane_work_summary_v1"]),
+    });
+    renderActivity();
+
+    // Not duplicated next to Send — that row is for writing and sending.
+    expect(screen.queryByRole("button", { name: "Open raw terminal" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Open work summary" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    expect(screen.getByRole("button", { name: "Open raw terminal" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Open work summary" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Manage project" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Close this pane" })).toBeTruthy();
+  });
+
+  it("confirms before closing a pane, then closes the selected one", () => {
+    const actions = seedStore({
+      paneConfigs: [pane({ pane_id: 3 }), pane({ pane_id: 4, label: "Reviewer" })],
+    });
+    renderActivity();
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close this pane" }));
+    expect(actions.removePane).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close pane" }));
+    expect(actions.removePane).toHaveBeenCalledWith(3, undefined);
+  });
+
+  it("sends nothing when closing is dismissed", () => {
+    const actions = seedStore({ paneConfigs: [pane({ pane_id: 3 })] });
+    renderActivity();
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close this pane" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(actions.removePane).not.toHaveBeenCalled();
+  });
+
+  it("offers the worktree choices rather than discarding that work silently", () => {
+    const actions = seedStore({
+      paneConfigs: [pane({ pane_id: 3, worktree_path: "/w/apas-pane-3" })],
+    });
+    renderActivity();
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close this pane" }));
+
+    // A plain confirm would throw the branch away with no way to say otherwise.
+    expect(screen.queryByRole("button", { name: "Close pane" })).toBeNull();
+    expect(screen.getByText(/Keep the branch, remove the pane/)).toBeTruthy();
+    fireEvent.click(screen.getByText(/Merge into the branch, then remove/));
+
+    expect(actions.removePane).toHaveBeenCalledWith(3, "merge_and_remove");
   });
 
   it("keeps back and reconnect available, and no longer navigates to account settings", () => {
@@ -497,6 +563,7 @@ describe("MobileSessionActivity", () => {
     });
     renderActivity();
 
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
     fireEvent.click(screen.getByRole("button", { name: "Open work summary" }));
     expect(await screen.findByRole("dialog", { name: "Work summaries for Codex 3" })).toBeTruthy();
     expect(actions.listPaneWorkSummaries).toHaveBeenCalledWith("session-a", 3, true);
@@ -530,6 +597,7 @@ describe("MobileSessionActivity", () => {
       },
     });
     renderActivity();
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
     fireEvent.click(screen.getByRole("button", { name: "Open work summary" }));
     expect(await screen.findByText("Only summary three")).toBeTruthy();
 
@@ -546,6 +614,7 @@ describe("MobileSessionActivity", () => {
     conversation.scrollTop = 123;
     fireEvent.scroll(conversation);
 
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
     fireEvent.click(screen.getByRole("button", { name: "Open work summary" }));
     fireEvent.click(screen.getByRole("button", { name: "Close work summary" }));
 

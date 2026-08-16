@@ -9,7 +9,10 @@ import {
   ChevronUp,
   History,
   LoaderCircle,
+  MoreVertical,
   Plus,
+  Settings2,
+  Trash2,
   Send,
   SquareTerminal,
   Wifi,
@@ -23,6 +26,7 @@ import {
   paneKey,
   useStore,
   type Message,
+  type PaneCleanupAction,
   type PaneConfig,
   type PaneKind,
   type Provider,
@@ -270,6 +274,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const sessionId = useStore((state) => state.sessionId);
   const sessions = useStore((state) => state.sessions);
   const paneConfigs = useStore((state) => state.paneConfigs);
+  const removePane = useStore((state) => state.removePane);
   const messages = useStore((state) => state.messages);
   const paneMessages = useStore((state) => state.paneMessages);
   const paneStatuses = useStore((state) => state.paneStatuses);
@@ -297,6 +302,8 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const [newPaneOpen, setNewPaneOpen] = useState(false);
   const [summaryOpen, setSummaryOpen] = useState(false);
   const [manageOpen, setManageOpen] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
+  const [closeTarget, setCloseTarget] = useState<PaneConfig | null>(null);
   const activityScrollRef = useRef<HTMLDivElement>(null);
   const restoredScrollContextRef = useRef<string | null>(null);
   const restoredScrollElementRef = useRef<HTMLDivElement | null>(null);
@@ -420,6 +427,16 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
       });
   }, [projectPolicies, sessionId]);
 
+  const closePane = (pane: PaneConfig, cleanup?: PaneCleanupAction) => {
+    removePane(pane.pane_id, cleanup);
+    setCloseTarget(null);
+    if (pane.pane_id === selectedPaneId) {
+      // Otherwise the screen keeps steering a pane that is going away.
+      const remaining = paneConfigs.filter((candidate) => candidate.pane_id !== pane.pane_id);
+      setSelectedPaneId(remaining.length > 0 ? remaining[0].pane_id : null);
+    }
+  };
+
   const selectPane = (paneId: number) => {
     persistActivityScroll();
     if (sessionId) writeSelectedPane(sessionId, paneId);
@@ -535,7 +552,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
             )}
             <button type="button" aria-label="Create pane" onClick={() => setNewPaneOpen(true)} className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[#6d5efc] text-white"><Plus className="h-4 w-4" /></button>
           </div>
-          <button type="button" onClick={() => setManageOpen(true)} className="min-h-9 shrink-0 px-1 text-sm font-bold text-[#6d5efc]">Manage</button>
+          <button type="button" aria-label="More actions" onClick={() => setMoreOpen(true)} className="-mr-2 shrink-0 rounded-lg p-2 text-[#686873] hover:bg-[#efeff5] dark:text-[#aaaab6] dark:hover:bg-[#25252d]"><MoreVertical className="h-5 w-5" /></button>
         </div>
 
         <div className="mt-1.5 flex items-center gap-2">
@@ -601,16 +618,6 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
         {connected && !sessionIsRunning && canCompose && <p className="mb-1.5 text-[11px] text-amber-700 dark:text-amber-300">You can draft a message, but this project must be running before it can be sent.</p>}
         <div className="flex items-end gap-2">
           <textarea value={followUp} onChange={(event) => setFollowUp(event.target.value)} rows={2} placeholder={selectedIsBot ? "Stop the bot before steering it" : selectedIsTerminal ? "Message this terminal conversation" : "Steer this session and pane"} disabled={!canCompose} className="min-h-[2.75rem] flex-1 resize-none rounded-xl border border-[#dedee7] bg-white px-3 py-2 text-sm outline-none focus:border-[#6d5efc] disabled:opacity-50 dark:border-[#383842] dark:bg-[#1b1b21]" />
-          {/* Occasional, and about the selected pane rather than the
-              conversation — so they sit here instead of costing a row above it. */}
-          <button type="button" aria-label="Open raw terminal" disabled={!selectedIsTerminal} onClick={() => {
-            if (selectedPaneId === null) return;
-            persistActivityScroll();
-            setTerminalPaneId(selectedPaneId);
-          }} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-[#dedee7] bg-white text-[#686873] disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21] dark:text-[#aaaab6]"><SquareTerminal className="h-5 w-5" /></button>
-          {summarySupported && (
-            <button type="button" aria-label="Open work summary" disabled={selectedPaneId === null} onClick={() => setSummaryOpen(true)} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-[#dedee7] bg-white text-[#686873] disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21] dark:text-[#aaaab6]"><History className="h-5 w-5" /></button>
-          )}
           <button type="button" aria-label={selectedIsTerminal ? "Send conversation message" : "Send follow-up"} disabled={!canSend || !followUp.trim()} onClick={sendFollowUp} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-[#6d5efc] text-white disabled:opacity-40"><Send className="h-5 w-5" /></button>
         </div>
       </div>
@@ -623,6 +630,62 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
               {launchOptions.map((option) => <button key={option.key} type="button" onClick={() => createPane(option)} className="flex w-full items-center justify-between rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left dark:border-[#383842] dark:bg-[#1b1b21]"><span><span className="block font-bold">{option.label}</span><span className="mt-0.5 block text-xs text-[#686873] dark:text-[#aaaab6]">{option.kind === "terminal" ? "Interactive TUI" : "Coding activity pane"}</span></span><Plus className="h-5 w-5 text-[#6d5efc]" /></button>)}
               {launchOptions.length === 0 && <div className="rounded-2xl border border-[#dedee7] bg-white p-4 text-sm text-[#686873] dark:border-[#383842] dark:bg-[#1b1b21] dark:text-[#aaaab6]">Waiting for the project's launch policy, or no profiles are currently allowed.</div>}
             </div>
+          </div>
+        </div>
+      )}
+
+      {moreOpen && (
+        <div className="fixed inset-0 z-[95] flex items-end bg-black/45" onClick={() => setMoreOpen(false)}>
+          <div role="dialog" aria-modal="true" aria-label="Pane actions" onClick={(event) => event.stopPropagation()} className="w-full rounded-t-[1.4rem] border-t border-[#dedee7] bg-[#f7f7fa] p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-2xl dark:border-[#383842] dark:bg-[#111115]">
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-extrabold">{selectedPane ? paneLabel(selectedPane) : "No pane selected"}</h2>
+              <button type="button" aria-label="Close actions" onClick={() => setMoreOpen(false)} className="rounded-lg p-2 hover:bg-[#efeff5] dark:hover:bg-[#25252d]"><X className="h-5 w-5" /></button>
+            </div>
+            <div className="mt-3 space-y-2">
+              <button type="button" aria-label="Open raw terminal" disabled={!selectedIsTerminal} onClick={() => {
+                if (selectedPaneId === null) return;
+                setMoreOpen(false);
+                persistActivityScroll();
+                setTerminalPaneId(selectedPaneId);
+              }} className="flex w-full items-center gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left font-bold disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"><SquareTerminal className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Raw terminal</button>
+              {summarySupported && (
+                <button type="button" aria-label="Open work summary" disabled={selectedPaneId === null} onClick={() => { setMoreOpen(false); setSummaryOpen(true); }} className="flex w-full items-center gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left font-bold disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"><History className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Work summary</button>
+              )}
+              {/* The only place project management can live: it is per-project,
+                  so there is no session-independent screen to move it to. */}
+              <button type="button" aria-label="Manage project" onClick={() => { setMoreOpen(false); setManageOpen(true); }} className="flex w-full items-center gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left font-bold dark:border-[#383842] dark:bg-[#1b1b21]"><Settings2 className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Manage project</button>
+              <button type="button" aria-label="Close this pane" disabled={!selectedPane} onClick={() => { setMoreOpen(false); setCloseTarget(selectedPane ?? null); }} className="flex w-full items-center gap-3 rounded-2xl border border-red-200 bg-white p-3.5 text-left font-bold text-red-700 disabled:opacity-40 dark:border-red-900 dark:bg-[#1b1b21] dark:text-red-300"><Trash2 className="h-5 w-5 shrink-0" /> Close this pane</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {closeTarget && (
+        <div className="fixed inset-0 z-[96] flex items-end bg-black/45" onClick={() => setCloseTarget(null)}>
+          <div role="dialog" aria-modal="true" aria-label={`Close ${paneLabel(closeTarget)}`} onClick={(event) => event.stopPropagation()} className="w-full rounded-t-[1.4rem] border-t border-[#dedee7] bg-[#f7f7fa] p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-2xl dark:border-[#383842] dark:bg-[#111115]">
+            <h2 className="text-lg font-extrabold">Close {paneLabel(closeTarget)}?</h2>
+            <p className="mt-1.5 text-sm leading-5 text-[#686873] dark:text-[#aaaab6]">
+              {closeTarget.worktree_path
+                ? "This pane has its own worktree. Choose what happens to that work."
+                : "The agent in this pane is stopped and the pane is removed."}
+            </p>
+            {closeTarget.worktree_path ? (
+              <div className="mt-4 space-y-2">
+                {([
+                  ["merge_and_remove", "Merge into the branch, then remove"],
+                  ["leave_as_branch", "Keep the branch, remove the pane"],
+                  ["discard", "Discard the work"],
+                ] as const).map(([action, label]) => (
+                  <button key={action} type="button" onClick={() => closePane(closeTarget, action)} className={`w-full rounded-2xl border p-3.5 text-left font-bold ${action === "discard" ? "border-red-200 text-red-700 dark:border-red-900 dark:text-red-300" : "border-[#dedee7] dark:border-[#383842]"} bg-white dark:bg-[#1b1b21]`}>{label}</button>
+                ))}
+                <button type="button" onClick={() => setCloseTarget(null)} className="w-full rounded-xl border border-[#dedee7] px-4 py-2.5 text-sm font-bold dark:border-[#383842]">Cancel</button>
+              </div>
+            ) : (
+              <div className="mt-4 flex gap-2.5">
+                <button type="button" onClick={() => setCloseTarget(null)} className="flex-1 rounded-xl border border-[#dedee7] px-4 py-2.5 text-sm font-bold dark:border-[#383842]">Cancel</button>
+                <button type="button" onClick={() => closePane(closeTarget)} className="flex-1 rounded-xl bg-red-600 px-4 py-2.5 text-sm font-bold text-white">Close pane</button>
+              </div>
+            )}
           </div>
         </div>
       )}
