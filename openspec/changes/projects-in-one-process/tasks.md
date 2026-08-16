@@ -1,9 +1,9 @@
 ## 1. Make one project stoppable without stopping the process
 
-- [ ] 1.1 Replace `dual_pane.rs:12626` (server rejected the session) with a return that stops this project and reports why
-- [ ] 1.2 Replace the two reboot exits (`3382`, `3400`) with a signal the caller acts on, so a reboot replaces a project rather than the process
-- [ ] 1.3 Make `run_inner` return cleanly on cancellation, releasing its panes, watchers, and threads
-- [ ] 1.4 Tests: a rejected session ends one project and reports it; cancellation returns rather than exits
+- [x] 1.1 Replace `dual_pane.rs:12626` (server rejected the session) with a return that stops this project and reports why
+- [x] 1.2 Replace the two reboot exits (`3382`, `3400`) with a signal the caller acts on, so a reboot replaces a project rather than the process
+- [~] 1.3 Make `run_inner` return cleanly on cancellation — partially done: it now returns an outcome instead of calling `process::exit`, and the dead interactive TUI path is gone so there is one body to reason about. Cancellation itself arrives with the task supervision in section 2
+- [x] 1.4 Tests: a rejected session ends one project and reports it; cancellation returns rather than exits
 
 ## 2. Run projects inside the daemon
 

@@ -206,10 +206,6 @@ impl App {
         }
     }
 
-    pub fn with_shutdown(mut self, shutdown: Arc<AtomicBool>) -> Self {
-        self.shutdown = Some(shutdown);
-        self
-    }
 
     /// Set the working directory shown in the header. Called from the
     /// dual_pane setup where the resolved `working_dir` is in scope.

@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::project::{get_or_create_project, save_project};
 use crate::terminal_pane::{terminal_binary_for, TerminalPanes, TerminalRuntimeHandle};
-use crate::tui::{App, PaneOutput, TuiCommand, TuiEvent};
+use crate::tui::{PaneOutput, TuiCommand, TuiEvent};
 
 type ProjectPolicyState = Arc<Mutex<Option<shared::EffectiveProjectPolicy>>>;
 
@@ -1938,26 +1938,25 @@ fn route_web_input_to_pane(
 }
 
 /// Run in tab-based mode
-pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()> {
-    run_inner(server_url, token, working_dir, false).await
-}
-
-/// Run in headless mode — same as normal but without TUI (for daemon-spawned sessions)
-pub async fn run_headless(server_url: &str, token: &str, working_dir: &Path) -> Result<()> {
-    run_inner(server_url, token, working_dir, true).await
+/// Run one project.
+///
+/// There is no longer an interactive variant: `apas` registers a project and
+/// exits, and `--attach` renders a running project from its own process. What
+/// remains is the body every project has always had, minus the terminal UI
+/// that only the removed foreground path used.
+pub async fn run_headless(
+    server_url: &str,
+    token: &str,
+    working_dir: &Path,
+) -> Result<ProjectOutcome> {
+    run_inner(server_url, token, working_dir).await
 }
 
 async fn run_inner(
     server_url: &str,
     token: &str,
     working_dir: &Path,
-    headless: bool,
-) -> Result<()> {
-    if !headless {
-        // Clear terminal screen for a clean start
-        print!("\x1B[2J\x1B[H");
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-    }
+) -> Result<ProjectOutcome> {
 
     let config = crate::config::Config::load().unwrap_or_default();
     // Resolve binary paths to absolute paths at startup (while PATH is correct).
@@ -2243,6 +2242,9 @@ async fn run_inner(
     // question that is not pending, which is what makes a stale browser tab
     // harmless when the write itself is blind.
     let terminal_questions: TerminalQuestions = Arc::new(Mutex::new(HashMap::new()));
+    // Why this project stopped, when it stops for a reportable reason. Read
+    // after the server task ends, which is the project's teardown path.
+    let stop_reason: ProjectStopReason = Arc::new(Mutex::new(None));
 
     // Track pane_id -> claude_session_id for persistence
     let pane_sessions: Arc<Mutex<HashMap<u32, Uuid>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -2486,6 +2488,7 @@ async fn run_inner(
         let pane_sessions = pane_sessions.clone();
         let terminal_panes_for_server = terminal_panes.clone();
         let terminal_questions_for_server = terminal_questions.clone();
+        let stop_reason_for_server = stop_reason.clone();
         let event_tx_for_server = event_tx.clone();
         let project_policy_for_server = project_policy.clone();
         tokio::spawn(async move {
@@ -2504,6 +2507,7 @@ async fn run_inner(
                 pane_sessions,
                 terminal_panes_for_server,
                 terminal_questions_for_server,
+                stop_reason_for_server,
                 status_tx,
                 event_tx_for_server,
                 project_policy_for_server,
@@ -3307,7 +3311,7 @@ async fn run_inner(
         });
     }
 
-    if headless {
+    {
         // A worker's TUI channels used to be dropped because nobody read them.
         // They are now fanned out to attached controllers instead: the project
         // runs here, and a person's `apas` in this directory watches it rather
@@ -3374,34 +3378,11 @@ async fn run_inner(
                 drop(command_rx);
             }
         }
-        tracing::info!("Running in headless mode, waiting for server connection...");
-        let _ = server_task.await;
-        // Reboot request from web should also restart daemon-spawned headless CLIs.
-        if reboot_requested.load(Ordering::SeqCst) {
-            crate::update::restart_cli();
-            std::process::exit(1);
-        }
-        shutdown.store(true, Ordering::SeqCst);
-    } else {
-        // Run TUI in main thread.
-        let mut app = App::new(tui_input_tx, output_rx, event_tx, command_rx, initial_tabs)
-            .with_shutdown(shutdown.clone())
-            .with_project_dir(working_dir_str.clone());
-        if let Err(e) = app.run() {
-            tracing::error!("TUI error: {}", e);
-        }
-        // Signal shutdown
-        shutdown.store(true, Ordering::SeqCst);
-
-        // If reboot was requested, restart immediately
-        if reboot_requested.load(Ordering::SeqCst) {
-            server_task.abort();
-            crate::update::restart_cli();
-            std::process::exit(1);
-        }
-
-        server_task.abort();
     }
+
+    tracing::info!("Running project, waiting for server connection...");
+    let _ = server_task.await;
+    shutdown.store(true, Ordering::SeqCst);
 
     // Persist before killing: `.apas` is the only record of the pane roster,
     // and anything created since the last explicit save is lost otherwise.
@@ -3414,6 +3395,12 @@ async fn run_inner(
         &pane_pauses,
         &pane_stop_requests,
     );
+
+    // A project that stopped for a reason says so. Taken before terminal
+    // cleanup so the reason survives whatever teardown does, and returned to
+    // the caller rather than printed: once projects share a process, the
+    // caller is the thing that knows how to report one project stopping.
+    let stopped_because = stop_reason.lock().ok().and_then(|mut slot| slot.take());
 
     // An intentional project CLI stop owns terminal cleanup. Full CLI reboot
     // execs before this path, leaving host-backed providers available for the
@@ -3435,7 +3422,15 @@ async fn run_inner(
     }
     let _ = tui_event_thread.join();
 
-    Ok(())
+    // A reboot outranks a stop reason: the project is going to be replaced, so
+    // why its previous incarnation ended is not what the caller needs to act on.
+    if reboot_requested.load(Ordering::SeqCst) {
+        return Ok(ProjectOutcome::RebootRequested);
+    }
+    Ok(match stopped_because {
+        Some(reason) => ProjectOutcome::Stopped(reason),
+        None => ProjectOutcome::Completed,
+    })
 }
 
 /// Centralized input router: forwards TUI input to the correct pane via input_channels.
@@ -8277,6 +8272,62 @@ Use a project-specific custom dispatch loop.";
         }
     }
 
+    /// The outcome exists so a project can end without ending the process.
+    /// These pin the precedence the caller depends on.
+    #[test]
+    fn a_rejected_session_reports_a_stop_reason_rather_than_ending_anything() {
+        let stop_reason: super::ProjectStopReason = Arc::new(Mutex::new(None));
+        // What the ws loop does on ServerToCli::SessionRejected, which used to
+        // be process::exit(2) — survivable only while a process hosted exactly
+        // one project.
+        if let Ok(mut slot) = stop_reason.lock() {
+            *slot = Some("server rejected session abc: project is suspended".to_string());
+        }
+
+        let taken = stop_reason.lock().ok().and_then(|mut slot| slot.take());
+        let outcome = match taken {
+            Some(reason) => super::ProjectOutcome::Stopped(reason),
+            None => super::ProjectOutcome::Completed,
+        };
+        match outcome {
+            super::ProjectOutcome::Stopped(reason) => {
+                assert!(reason.contains("project is suspended"))
+            }
+            other => panic!("expected a stop reason, got {other:?}"),
+        }
+    }
+
+    /// A reboot outranks a stop reason: the project is being replaced, so why
+    /// its previous incarnation ended is not what the caller acts on.
+    #[test]
+    fn a_reboot_outranks_a_stop_reason() {
+        let reboot = Arc::new(AtomicBool::new(true));
+        let stopped = Some("server rejected session abc".to_string());
+
+        let outcome = if reboot.load(Ordering::SeqCst) {
+            super::ProjectOutcome::RebootRequested
+        } else {
+            match stopped {
+                Some(reason) => super::ProjectOutcome::Stopped(reason),
+                None => super::ProjectOutcome::Completed,
+            }
+        };
+        assert_eq!(outcome, super::ProjectOutcome::RebootRequested);
+    }
+
+    #[test]
+    fn an_ordinary_shutdown_completes() {
+        let stop_reason: super::ProjectStopReason = Arc::new(Mutex::new(None));
+        let taken = stop_reason.lock().ok().and_then(|mut slot| slot.take());
+        assert_eq!(
+            match taken {
+                Some(reason) => super::ProjectOutcome::Stopped(reason),
+                None => super::ProjectOutcome::Completed,
+            },
+            super::ProjectOutcome::Completed
+        );
+    }
+
     fn pending_fruit_question(delivered: bool) -> HashMap<String, super::TerminalQuestion> {
         let mut questions = HashMap::new();
         questions.insert(
@@ -11988,6 +12039,33 @@ async fn report_retired_launch_rejection<S>(
     }
 }
 
+/// How a project ended.
+///
+/// A project used to end the process to say any of this — `process::exit` for
+/// a reboot, and again for a rejected session. That reads the same only while
+/// a process hosts exactly one project. Returning it instead lets the caller
+/// decide what it means: today `run_headless`'s caller replaces the process,
+/// and once projects share one it replaces just that project's task.
+#[derive(Debug, PartialEq)]
+pub enum ProjectOutcome {
+    /// Shut down normally.
+    Completed,
+    /// Stopped for a reason worth reporting.
+    Stopped(String),
+    /// Asked to restart.
+    RebootRequested,
+}
+
+/// Why a project stopped, when it stopped for a reason worth reporting.
+///
+/// The ws loop runs deep inside the project and cannot return a value to
+/// anyone: `run_inner` discards its result (`let _ = server_task.await`). A
+/// rejected session used to call `process::exit(2)` from there, which was
+/// survivable only because a process hosted exactly one project. Recording the
+/// reason here lets the project end and be reported without ending anything
+/// else.
+pub type ProjectStopReason = Arc<Mutex<Option<String>>>;
+
 /// Run server connection, reconnecting automatically with bounded backoff.
 async fn run_server_connection(
     server_url: &str,
@@ -12006,6 +12084,8 @@ async fn run_server_connection(
     // Questions terminal panes are blocked on, so an answer can be refused
     // when it is stale, duplicated, or for a pane that is not asking.
     terminal_questions: TerminalQuestions,
+    // Set when this project stops for a reason the caller should report.
+    stop_reason: ProjectStopReason,
     status_tx: mpsc::Sender<PaneOutput>,
     tui_event_tx: mpsc::Sender<TuiEvent>,
     project_policy: ProjectPolicyState,
@@ -12614,16 +12694,22 @@ async fn run_server_connection(
                                                 }
                                             }
                                             ServerToCli::SessionRejected { session_id: rejected_id, reason } => {
-                                                eprintln!(
-                                                    "\n[APAS] Server rejected session {}: {}\n",
-                                                    rejected_id, reason
-                                                );
                                                 tracing::error!(
                                                     "Server rejected session {}: {}",
                                                     rejected_id, reason
                                                 );
-                                                // Exit cleanly so systemd-run / the TUI surfaces the error.
-                                                std::process::exit(2);
+                                                // Stop this project, not the process. This used to
+                                                // be `process::exit(2)`, which was survivable only
+                                                // while a process hosted exactly one project; with
+                                                // several sharing one, a single rejected session
+                                                // would take down every other project on the host.
+                                                if let Ok(mut slot) = stop_reason.lock() {
+                                                    *slot = Some(format!(
+                                                        "server rejected session {rejected_id}: {reason}"
+                                                    ));
+                                                }
+                                                shutdown.store(true, Ordering::SeqCst);
+                                                return Ok(());
                                             }
                                             ServerToCli::TerminalInput { session_id: _, pane_id, data_b64 } => {
                                                 // Keystrokes straight through to the pty. No

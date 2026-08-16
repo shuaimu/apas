@@ -439,7 +439,21 @@ async fn main() -> Result<()> {
         };
 
         tracing::info!("Starting in headless mode (streaming to {})", server);
-        mode::dual_pane::run_headless(&server, &token, &working_dir).await?;
+        // Replacing the process is this caller's decision, not the project's.
+        // The project used to `exec` from inside itself, which reads the same
+        // only while a process hosts exactly one project.
+        match mode::dual_pane::run_headless(&server, &token, &working_dir).await? {
+            mode::dual_pane::ProjectOutcome::RebootRequested => {
+                update::restart_cli();
+                std::process::exit(1);
+            }
+            mode::dual_pane::ProjectOutcome::Stopped(reason) => {
+                eprintln!("\n[APAS] {reason}\n");
+                // Exit non-zero so whatever supervises this run surfaces it.
+                std::process::exit(2);
+            }
+            mode::dual_pane::ProjectOutcome::Completed => {}
+        }
     } else if cli.remote {
         // Remote-only mode - no local I/O
         let config = config::Config::load()?;
