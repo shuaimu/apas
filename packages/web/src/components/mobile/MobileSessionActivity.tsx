@@ -11,6 +11,7 @@ import {
   LoaderCircle,
   MoreVertical,
   Plus,
+  RotateCcw,
   Settings2,
   Trash2,
   Send,
@@ -275,6 +276,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const sessions = useStore((state) => state.sessions);
   const paneConfigs = useStore((state) => state.paneConfigs);
   const removePane = useStore((state) => state.removePane);
+  const rebootPane = useStore((state) => state.rebootPane);
   const messages = useStore((state) => state.messages);
   const paneMessages = useStore((state) => state.paneMessages);
   const paneStatuses = useStore((state) => state.paneStatuses);
@@ -304,6 +306,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const [manageOpen, setManageOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
   const [closeTarget, setCloseTarget] = useState<PaneConfig | null>(null);
+  const [rebootTarget, setRebootTarget] = useState<PaneConfig | null>(null);
   const activityScrollRef = useRef<HTMLDivElement>(null);
   const restoredScrollContextRef = useRef<string | null>(null);
   const restoredScrollElementRef = useRef<HTMLDivElement | null>(null);
@@ -651,10 +654,31 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
               {summarySupported && (
                 <button type="button" aria-label="Open work summary" disabled={selectedPaneId === null} onClick={() => { setMoreOpen(false); setSummaryOpen(true); }} className="flex w-full items-center gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left font-bold disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"><History className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Work summary</button>
               )}
-              {/* The only place project management can live: it is per-project,
-                  so there is no session-independent screen to move it to. */}
-              <button type="button" aria-label="Manage project" onClick={() => { setMoreOpen(false); setManageOpen(true); }} className="flex w-full items-center gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left font-bold dark:border-[#383842] dark:bg-[#1b1b21]"><Settings2 className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Manage project</button>
+              <button type="button" aria-label="Reboot this pane" disabled={!selectedPane} onClick={() => { setMoreOpen(false); setRebootTarget(selectedPane ?? null); }} className="flex w-full items-center gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left font-bold disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"><RotateCcw className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Reboot this pane</button>
               <button type="button" aria-label="Close this pane" disabled={!selectedPane} onClick={() => { setMoreOpen(false); setCloseTarget(selectedPane ?? null); }} className="flex w-full items-center gap-3 rounded-2xl border border-red-200 bg-white p-3.5 text-left font-bold text-red-700 disabled:opacity-40 dark:border-red-900 dark:bg-[#1b1b21] dark:text-red-300"><Trash2 className="h-5 w-5 shrink-0" /> Close this pane</button>
+              {/* Different scope from the four above, and the only place it can
+                  live: project management is per-project, so there is no
+                  session-independent screen to move it to. */}
+              <button type="button" aria-label="Manage project" onClick={() => { setMoreOpen(false); setManageOpen(true); }} className="mt-1 flex w-full items-center gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left font-bold dark:border-[#383842] dark:bg-[#1b1b21]"><Settings2 className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Manage project</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {rebootTarget && (
+        <div className="fixed inset-0 z-[96] flex items-end bg-black/45" onClick={() => setRebootTarget(null)}>
+          <div role="dialog" aria-modal="true" aria-label={`Reboot ${paneLabel(rebootTarget)}`} onClick={(event) => event.stopPropagation()} className="w-full rounded-t-[1.4rem] border-t border-[#dedee7] bg-[#f7f7fa] p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-2xl dark:border-[#383842] dark:bg-[#111115]">
+            <h2 className="text-lg font-extrabold">Reboot {paneLabel(rebootTarget)}?</h2>
+            {/* The reassurance is the point, and it is what the desktop
+                promises too: the respawn is on the same session, so the agent
+                comes back with its conversation rather than a blank one. */}
+            <p className="mt-1.5 text-sm leading-5 text-[#686873] dark:text-[#aaaab6]">
+              The running process is killed and respawned on the same session, so the agent resumes
+              with its prior conversation.
+            </p>
+            <div className="mt-4 flex gap-2.5">
+              <button type="button" onClick={() => setRebootTarget(null)} className="flex-1 rounded-xl border border-[#dedee7] px-4 py-2.5 text-sm font-bold dark:border-[#383842]">Cancel</button>
+              <button type="button" onClick={() => { rebootPane(rebootTarget.pane_id); setRebootTarget(null); }} className="flex-1 rounded-xl bg-[#6d5efc] px-4 py-2.5 text-sm font-bold text-white">Reboot pane</button>
             </div>
           </div>
         </div>

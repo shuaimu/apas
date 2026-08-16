@@ -18,7 +18,7 @@ On a session screen the controls used while following a conversation SHALL be re
 #### Scenario: Occasional pane actions
 
 - **WHEN** a user opens the control that gathers the occasional actions
-- **THEN** it offers the raw terminal and the work summary for the selected pane, and closing that pane
+- **THEN** it offers the raw terminal and the work summary for the selected pane, and rebooting or closing that pane
 - **AND** each acts on the selected pane
 
 #### Scenario: The composer is for composing
@@ -26,6 +26,12 @@ On a session screen the controls used while following a conversation SHALL be re
 - **WHEN** a user looks at the message composer
 - **THEN** it carries only composing and sending
 - **AND** the occasional pane actions are not duplicated there
+
+#### Scenario: Rebooting the selected pane
+
+- **WHEN** a user chooses to reboot the selected pane
+- **THEN** the system confirms before anything is restarted
+- **AND** states that the agent returns on the same session with its prior conversation, since the action otherwise reads as losing it
 
 #### Scenario: Closing the selected pane
 

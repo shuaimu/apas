@@ -23,11 +23,11 @@
 ## 4. Gather the occasional actions behind one control
 
 - [x] 4.1 Replace the standalone Manage control with a single overflow control in the same row
-- [x] 4.2 Offer raw terminal, work summary, close pane, and project management from it, each acting on the selected pane or project
+- [x] 4.2 Offer raw terminal, work summary, reboot pane, close pane, and project management from it, each acting on the selected pane or project
 - [x] 4.3 Take raw terminal and summary back out of the composer row, leaving it to composing and sending
 - [x] 4.4 Confirm before closing, and offer the worktree choices for a pane that owns one rather than discarding silently
 - [x] 4.5 Select a remaining pane after closing the selected one
-- [x] 4.6 Tests: the menu opens each surface for the selected pane; the composer carries neither; closing confirms first, sends the close for the right pane, and a worktree pane is offered its choices
+- [x] 4.6 Tests: the menu opens each surface for the selected pane; the composer carries neither; rebooting and closing each confirm first and act on the right pane; a worktree pane is offered its choices
 
 ## 5. Verification
 

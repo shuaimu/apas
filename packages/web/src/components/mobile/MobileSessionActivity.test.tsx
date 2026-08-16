@@ -63,6 +63,7 @@ function seedStore(overrides: Record<string, unknown> = {}) {
   const listPaneWorkSummaries = vi.fn(() => true);
   const refreshPaneWorkSummary = vi.fn(() => true);
   const removePane = vi.fn();
+  const rebootPane = vi.fn();
 
   act(() => {
     useStore.setState({
@@ -110,6 +111,7 @@ function seedStore(overrides: Record<string, unknown> = {}) {
       listPaneWorkSummaries,
       refreshPaneWorkSummary,
       removePane,
+      rebootPane,
       ...overrides,
     });
   });
@@ -126,6 +128,7 @@ function seedStore(overrides: Record<string, unknown> = {}) {
     reject,
     requestPaneDiff,
     refreshPaneWorkSummary,
+    rebootPane,
     removePane,
     sendMessageToPane,
     sendTerminalConversationMessage,
@@ -483,7 +486,39 @@ describe("MobileSessionActivity", () => {
     expect(screen.getByRole("button", { name: "Open raw terminal" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Open work summary" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Manage project" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Reboot this pane" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Close this pane" })).toBeTruthy();
+  });
+
+  it("confirms before rebooting, and says the conversation survives", () => {
+    const actions = seedStore({
+      paneConfigs: [pane({ pane_id: 3 }), pane({ pane_id: 4, label: "Reviewer" })],
+    });
+    renderActivity();
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Reboot this pane" }));
+    expect(actions.rebootPane).not.toHaveBeenCalled();
+
+    // Rebooting looks destructive; what makes it safe is that the respawn is
+    // on the same session, and the dialog has to say so.
+    const dialog = screen.getByRole("dialog", { name: /Reboot/ });
+    expect(within(dialog).getByText(/same session/)).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Reboot pane" }));
+
+    expect(actions.rebootPane).toHaveBeenCalledWith(3);
+    expect(actions.removePane).not.toHaveBeenCalled();
+  });
+
+  it("sends nothing when a reboot is dismissed", () => {
+    const actions = seedStore({ paneConfigs: [pane({ pane_id: 3 })] });
+    renderActivity();
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Reboot this pane" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(actions.rebootPane).not.toHaveBeenCalled();
   });
 
   it("confirms before closing a pane, then closes the selected one", () => {
