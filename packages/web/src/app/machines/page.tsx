@@ -11,13 +11,20 @@
  */
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, FolderOpen, Play, RefreshCw, Square } from "lucide-react";
+import { ArrowLeft, FolderOpen, Play, RefreshCw, RotateCcw, Square } from "lucide-react";
 import { useStore } from "@/lib/store";
 import { AllProvidersUsage } from "@/components/UsageLimits";
 import { EffectivePolicy, LaunchProfile, PolicyEditor } from "@/components/PolicyEditor";
 import { isRetiredLaunchProfileKey } from "@/lib/providerOptions";
+import {
+  daemonVersionLabel,
+  isMachineBehind,
+  latestSeenVersion,
+  rebootActionLabelFor,
+  rebootLabelFor,
+} from "@/lib/daemonVersion";
 
 const DEEPSEEK_API_BASE_URL = "https://api.deepseek.com/anthropic";
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://apas.mpaxos.com";
@@ -82,6 +89,8 @@ export default function MachinesPage() {
     stopMachineProjectCli,
     setMachineDeepseekConfig,
     pendingInstances,
+    rebootDaemon,
+    serverVersion,
   } = useStore();
   const [deepseekDrafts, setDeepseekDrafts] = useState<Record<string, string>>({});
   const [deepseekSaved, setDeepseekSaved] = useState<Record<string, boolean>>({});
@@ -91,8 +100,22 @@ export default function MachinesPage() {
   const [profiles, setProfiles] = useState<LaunchProfile[]>([]);
   const [audit, setAudit] = useState<AuditEvent[]>([]);
   const [clusterError, setClusterError] = useState<string | null>(null);
+  const [rebootTarget, setRebootTarget] =
+    useState<{ id: string; hostname: string; behind: boolean } | null>(null);
   const [memberUserId, setMemberUserId] = useState("");
   const [ownerUserId, setOwnerUserId] = useState("");
+
+  // Both sources, for the same reason the mobile list uses both: the server
+  // catches a fleet uniformly behind a newer deployment, the machines catch a
+  // rollout that has reached some hosts and not others.
+  const latestVersion = useMemo(
+    () =>
+      latestSeenVersion([
+        serverVersion,
+        ...machines.map(({ machine }) => machine.daemonVersion),
+      ]),
+    [serverVersion, machines],
+  );
 
   useEffect(() => {
     const storedToken = localStorage.getItem("apas_token");
@@ -201,14 +224,29 @@ export default function MachinesPage() {
           <AllProvidersUsage />
         </section>
 
-        {machines.map(({ machine, projects }) => (
+        {machines.map(({ machine, projects }) => {
+          const behind = isMachineBehind(machine.daemonVersion, latestVersion);
+          return (
           <section key={machine.machineId} className="rounded-lg border border-gray-200 bg-white shadow-sm dark:border-gray-800 dark:bg-gray-900">
-            <div className="border-b border-gray-200 px-4 py-3 dark:border-gray-800">
-              <div className="font-medium">{machine.hostname}</div>
-              <div className="text-xs text-gray-500">
-                {machine.os}/{machine.arch}
-                {machine.lastSeen ? ` • Last seen ${new Date(machine.lastSeen).toLocaleString()}` : ""}
+            <div className="flex flex-wrap items-start justify-between gap-3 border-b border-gray-200 px-4 py-3 dark:border-gray-800">
+              <div className="min-w-0">
+                <div className="font-medium">{machine.hostname}</div>
+                <div className="text-xs text-gray-500">
+                  {machine.os}/{machine.arch}
+                  {" • "}
+                  {daemonVersionLabel(machine.daemonVersion)}
+                  {machine.lastSeen ? ` • Last seen ${new Date(machine.lastSeen).toLocaleString()}` : ""}
+                </div>
               </div>
+              {/* A daemon is per-machine, so the restart is targeted by machine
+                  rather than through any project running on it. */}
+              <button
+                aria-label={rebootActionLabelFor(behind, machine.hostname)}
+                onClick={() => setRebootTarget({ id: machine.machineId, hostname: machine.hostname, behind })}
+                className="inline-flex shrink-0 items-center gap-1 rounded border border-gray-300 px-3 py-1.5 text-sm hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-gray-800"
+              >
+                <RotateCcw className="h-4 w-4" /> {rebootLabelFor(behind)}
+              </button>
             </div>
 
             <div className="border-b border-gray-200 px-4 py-3 dark:border-gray-800">
@@ -284,7 +322,52 @@ export default function MachinesPage() {
               ))}
             </div>
           </section>
-        ))}
+          );
+        })}
+
+        {rebootTarget && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+            onClick={() => setRebootTarget(null)}
+          >
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label={rebootActionLabelFor(rebootTarget.behind, rebootTarget.hostname)}
+              className="w-full max-w-md rounded-lg border border-gray-200 bg-white p-4 shadow-xl dark:border-gray-800 dark:bg-gray-900"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <h2 className="text-base font-semibold">
+                {`${rebootActionLabelFor(rebootTarget.behind, rebootTarget.hostname)}?`}
+              </h2>
+              <p className="mt-2 text-sm text-gray-600 dark:text-gray-300">
+                {rebootTarget.behind
+                  ? "This machine is behind, so the reboot updates it first."
+                  : "It updates to the latest version if one is available."}
+                {" "}
+                Projects, panes, and agents on this machine keep running — the daemon does not own
+                them.
+              </p>
+              <div className="mt-4 flex justify-end gap-2">
+                <button
+                  onClick={() => setRebootTarget(null)}
+                  className="rounded border border-gray-300 px-3 py-1.5 text-sm hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-gray-800"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => {
+                    rebootDaemon(rebootTarget.id);
+                    setRebootTarget(null);
+                  }}
+                  className="inline-flex items-center gap-1 rounded bg-indigo-600 px-3 py-1.5 text-sm text-white hover:bg-indigo-700"
+                >
+                  <RotateCcw className="h-4 w-4" /> {rebootLabelFor(rebootTarget.behind)}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {clusterError && (
           <div className="rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-800 dark:bg-red-950/40 dark:text-red-300">

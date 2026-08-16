@@ -237,6 +237,7 @@ export default function Home() {
                 setMobileScreen("session");
               }}
               onRebootDaemon={(machineId) => rebootDaemon(machineId)}
+              serverVersion={serverVersion}
             />
           ) : (
             <MobileSessionActivity

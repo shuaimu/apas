@@ -3,6 +3,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { AlertTriangle, ChevronRight, Plus, RotateCcw, WifiOff, X } from "lucide-react";
 import type { SessionInfo } from "@/lib/store";
+import {
+  daemonVersionLabel,
+  isMachineBehind,
+  latestSeenVersion,
+  rebootActionLabelFor,
+  rebootLabelFor,
+} from "@/lib/daemonVersion";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://apas.mpaxos.com";
 
@@ -39,6 +46,7 @@ interface MobileMachineSummary {
     hostname: string;
     os?: string | null;
     arch?: string | null;
+    daemon_version?: string | null;
     last_seen?: string | null;
   };
   projects?: MobileMachineProject[];
@@ -136,6 +144,10 @@ export interface MobileCodeHomeProps {
   /// Reboot the daemon on a machine. Targeted by machine id: a daemon is
   /// per-machine, so no project on it identifies the right one.
   onRebootDaemon: (machineId: string, hostname: string) => void;
+  /// The connected server's own version, so a fleet that is uniformly behind a
+  /// newer deployment is still recognisable — nothing the machines report is
+  /// newer than each other in that case.
+  serverVersion?: string | null;
 }
 
 export function MobileCodeHome({
@@ -147,13 +159,24 @@ export function MobileCodeHome({
   onManageMachines,
   onOpenSession,
   onRebootDaemon,
+  serverVersion,
 }: MobileCodeHomeProps) {
   const [remoteSessions, setRemoteSessions] = useState<MobileSessionSummary[] | null>(null);
   const [filter, setFilter] = useState<HomeView>("all");
   const [machines, setMachines] = useState<MobileMachineSummary[]>([]);
   const [machineRebootTarget, setMachineRebootTarget] =
-    useState<{ id: string; hostname: string } | null>(null);
+    useState<{ id: string; hostname: string; behind: boolean } | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  // Both sources: the server catches a fleet that is uniformly behind a newer
+  // deployment, the machines catch a rollout part-way through the cluster.
+  const latestVersion = useMemo(
+    () =>
+      latestSeenVersion([
+        serverVersion,
+        ...machines.map((entry) => entry.machine.daemon_version),
+      ]),
+    [serverVersion, machines],
+  );
   const [newTaskOpen, setNewTaskOpen] = useState(false);
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
@@ -282,6 +305,7 @@ export function MobileCodeHome({
                 const hostname = entry.machine.hostname || "Unknown machine";
                 const connected = machineConnected(entry);
                 const running = (entry.projects ?? []).filter((project) => project.is_running).length;
+                const behind = isMachineBehind(entry.machine.daemon_version, latestVersion);
                 return (
                   <div
                     key={entry.machine.machine_id}
@@ -301,15 +325,19 @@ export function MobileCodeHome({
                       {[entry.machine.os, entry.machine.arch].filter(Boolean).join("/") || "Unknown platform"}
                       {" · "}
                       {running === 1 ? "1 project running" : `${running} projects running`}
+                      {" · "}
+                      {daemonVersionLabel(entry.machine.daemon_version)}
                     </p>
                     <div className="mt-2.5 flex items-center justify-end">
                       <button
                         type="button"
-                        aria-label={`Reboot daemon on ${hostname}`}
-                        onClick={() => setMachineRebootTarget({ id: entry.machine.machine_id, hostname })}
+                        aria-label={rebootActionLabelFor(behind, hostname)}
+                        onClick={() =>
+                          setMachineRebootTarget({ id: entry.machine.machine_id, hostname, behind })
+                        }
                         className="inline-flex items-center gap-1.5 rounded-xl border border-[#dedee7] px-3 py-2 text-sm font-semibold active:opacity-60 dark:border-[#383842]"
                       >
-                        <RotateCcw className="h-4 w-4" /> Reboot daemon
+                        <RotateCcw className="h-4 w-4" /> {rebootLabelFor(behind)}
                       </button>
                     </div>
                   </div>
@@ -396,11 +424,15 @@ export function MobileCodeHome({
             onClick={(event) => event.stopPropagation()}
           >
             <h2 id="mobile-machine-reboot-title" className="text-lg font-extrabold">
-              Reboot the daemon on {machineRebootTarget.hostname}?
+              {`${rebootActionLabelFor(machineRebootTarget.behind, machineRebootTarget.hostname)}?`}
             </h2>
             <p className="mt-1.5 text-sm leading-5 text-[#686873] dark:text-[#aaaab6]">
-              It updates to the latest version if one is available. Projects, panes, and agents on
-              this machine keep running — the daemon does not own them.
+              {machineRebootTarget.behind
+                ? "This machine is behind, so the reboot updates it first."
+                : "It updates to the latest version if one is available."}
+              {" "}
+              Projects, panes, and agents on this machine keep running — the daemon does not own
+              them.
             </p>
             <div className="mt-4 flex gap-2.5">
               <button
@@ -418,7 +450,7 @@ export function MobileCodeHome({
                 }}
                 className="flex-1 rounded-xl bg-[#6d5efc] px-4 py-2.5 text-sm font-bold text-white hover:bg-[#5547dc]"
               >
-                Reboot daemon
+                {rebootLabelFor(machineRebootTarget.behind)}
               </button>
             </div>
           </div>

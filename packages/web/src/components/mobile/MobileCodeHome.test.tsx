@@ -250,13 +250,84 @@ describe("MobileCodeHome", () => {
     const props = renderHome({ active: true });
 
     fireEvent.click(await screen.findByRole("button", { name: "Machines" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Reboot daemon on zoo-006" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Reboot the daemon on zoo-006" }));
     expect(props.onRebootDaemon).not.toHaveBeenCalled();
 
     const dialog = screen.getByRole("dialog", { name: /Reboot the daemon on zoo-006/ });
     // The reassurance is the point: this restarts a process, not the work.
     expect(within(dialog).getByText(/keep running/)).toBeTruthy();
-    fireEvent.click(within(dialog).getByRole("button", { name: "Reboot daemon" }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Reboot" }));
+
+    expect(props.onRebootDaemon).toHaveBeenCalledWith("machine-b", "zoo-006");
+  });
+
+  it("offers to update the machines that are behind, and only those", async () => {
+    stubBootstrap({
+      sessions: [],
+      machines: [
+        { machine: { machine_id: "machine-a", hostname: "zoo-005", daemon_version: "26.08.74" }, projects: [] },
+        { machine: { machine_id: "machine-b", hostname: "zoo-006", daemon_version: "26.08.70" }, projects: [] },
+      ],
+    });
+    renderHome({ active: true });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Machines" }));
+    // zoo-006 is behind a machine it can see; zoo-005 is the newest thing there is.
+    expect(await screen.findByRole("button", { name: "Reboot and update the daemon on zoo-006" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Reboot the daemon on zoo-005" })).toBeTruthy();
+    expect(screen.getByText("Reboot to update")).toBeTruthy();
+  });
+
+  it("recognises a fleet that is uniformly behind the server", async () => {
+    stubBootstrap({
+      sessions: [],
+      machines: [
+        { machine: { machine_id: "machine-a", hostname: "zoo-005", daemon_version: "26.08.74" }, projects: [] },
+        { machine: { machine_id: "machine-b", hostname: "zoo-006", daemon_version: "26.08.74" }, projects: [] },
+      ],
+    });
+    // Nothing the machines report is newer than each other, so without the
+    // server's version every one of them would read as current.
+    renderHome({ active: true, serverVersion: "26.09.3" });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Machines" }));
+    expect(await screen.findByRole("button", { name: "Reboot and update the daemon on zoo-005" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Reboot and update the daemon on zoo-006" })).toBeTruthy();
+  });
+
+  it("shows each machine's version, and says so when there is none", async () => {
+    stubBootstrap({
+      sessions: [],
+      machines: [
+        { machine: { machine_id: "machine-a", hostname: "zoo-005", daemon_version: "26.08.74" }, projects: [] },
+        { machine: { machine_id: "machine-b", hostname: "zoo-006" }, projects: [] },
+      ],
+    });
+    renderHome({ active: true });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Machines" }));
+    expect(await screen.findByText(/26\.08\.74/)).toBeTruthy();
+    expect(screen.getByText(/version unknown/)).toBeTruthy();
+    // An unreadable version is not evidence of being behind.
+    expect(screen.getByRole("button", { name: "Reboot the daemon on zoo-006" })).toBeTruthy();
+  });
+
+  it("sends the same request from either wording", async () => {
+    stubBootstrap({
+      sessions: [],
+      machines: [
+        { machine: { machine_id: "machine-a", hostname: "zoo-005", daemon_version: "26.08.74" }, projects: [] },
+        { machine: { machine_id: "machine-b", hostname: "zoo-006", daemon_version: "26.08.70" }, projects: [] },
+      ],
+    });
+    const props = renderHome({ active: true });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Machines" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Reboot and update the daemon on zoo-006" }));
+    const dialog = screen.getByRole("dialog", { name: /Reboot and update the daemon on zoo-006/ });
+    expect(within(dialog).getByText(/behind/)).toBeTruthy();
+    expect(within(dialog).getByText(/keep running/)).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Reboot to update" }));
 
     expect(props.onRebootDaemon).toHaveBeenCalledWith("machine-b", "zoo-006");
   });
@@ -269,7 +340,7 @@ describe("MobileCodeHome", () => {
     const props = renderHome({ active: true });
 
     fireEvent.click(await screen.findByRole("button", { name: "Machines" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Reboot daemon on zoo-005" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Reboot the daemon on zoo-005" }));
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
 
     expect(props.onRebootDaemon).not.toHaveBeenCalled();

@@ -139,6 +139,13 @@ function machineEntry(): MachineWithProjects {
   };
 }
 
+function machineAt(machineId: string, hostname: string, daemonVersion?: string): MachineWithProjects {
+  return {
+    machine: { machineId, hostname, os: "linux", arch: "x64", daemonVersion },
+    projects: [],
+  };
+}
+
 function seedMachines(machines: MachineWithProjects[] = [machineEntry()]) {
   const actions = {
     connect: vi.fn(),
@@ -146,6 +153,7 @@ function seedMachines(machines: MachineWithProjects[] = [machineEntry()]) {
     startMachineProjectCli: vi.fn(),
     stopMachineProjectCli: vi.fn(),
     setMachineDeepseekConfig: vi.fn(),
+    rebootDaemon: vi.fn(),
   };
 
   window.localStorage.setItem("apas_token", "test-token");
@@ -174,6 +182,82 @@ afterEach(() => {
   globalThis.fetch = originalFetch;
   act(() => {
     useStore.setState(initialStore, true);
+  });
+});
+
+describe("MachinesPage daemon restart", () => {
+  it("offers the restart control on every machine, which the page never had", () => {
+    seedMachines([
+      machineAt("machine-a", "zoo-005", "26.08.74"),
+      machineAt("machine-b", "zoo-006", "26.08.74"),
+    ]);
+
+    render(<MachinesPage />);
+
+    expect(screen.getByRole("button", { name: "Reboot the daemon on zoo-005" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Reboot the daemon on zoo-006" })).toBeTruthy();
+  });
+
+  it("shows each machine's version, and says so when it reports none", () => {
+    seedMachines([machineAt("machine-a", "zoo-005", "26.08.74"), machineAt("machine-b", "zoo-006")]);
+
+    render(<MachinesPage />);
+
+    expect(screen.getByText(/26\.08\.74/)).toBeTruthy();
+    expect(screen.getByText(/version unknown/)).toBeTruthy();
+    // Unknown is not evidence of being behind.
+    expect(screen.getByRole("button", { name: "Reboot the daemon on zoo-006" })).toBeTruthy();
+  });
+
+  it("says a restart will update the machines that are behind", () => {
+    seedMachines([
+      machineAt("machine-a", "zoo-005", "26.08.74"),
+      machineAt("machine-b", "zoo-006", "26.08.70"),
+    ]);
+
+    render(<MachinesPage />);
+
+    expect(screen.getByRole("button", { name: "Reboot and update the daemon on zoo-006" })).toBeTruthy();
+    expect(screen.getByText("Reboot to update")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Reboot the daemon on zoo-005" })).toBeTruthy();
+  });
+
+  it("recognises a fleet uniformly behind the server", () => {
+    seedMachines([machineAt("machine-a", "zoo-005", "26.08.74")]);
+    act(() => {
+      useStore.setState({ serverVersion: "26.09.3" });
+    });
+
+    render(<MachinesPage />);
+
+    expect(screen.getByRole("button", { name: "Reboot and update the daemon on zoo-005" })).toBeTruthy();
+  });
+
+  it("confirms before sending, and sends for the machine whose control was used", () => {
+    const actions = seedMachines([
+      machineAt("machine-a", "zoo-005", "26.08.74"),
+      machineAt("machine-b", "zoo-006", "26.08.70"),
+    ]);
+
+    render(<MachinesPage />);
+    fireEvent.click(screen.getByRole("button", { name: "Reboot and update the daemon on zoo-006" }));
+    expect(actions.rebootDaemon).not.toHaveBeenCalled();
+
+    const dialog = screen.getByRole("dialog", { name: "Reboot and update the daemon on zoo-006" });
+    expect(dialog).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Reboot to update" }));
+
+    expect(actions.rebootDaemon).toHaveBeenCalledWith("machine-b");
+  });
+
+  it("sends nothing when the confirmation is dismissed", () => {
+    const actions = seedMachines([machineAt("machine-a", "zoo-005", "26.08.74")]);
+
+    render(<MachinesPage />);
+    fireEvent.click(screen.getByRole("button", { name: "Reboot the daemon on zoo-005" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(actions.rebootDaemon).not.toHaveBeenCalled();
   });
 });
 
