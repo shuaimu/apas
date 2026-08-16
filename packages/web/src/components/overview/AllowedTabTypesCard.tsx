@@ -29,8 +29,10 @@ export function AllowedTabTypesCard() {
         </div>
       )}
       {policy && policy.noncompliantPaneIds.length > 0 && (
-        <p className="mt-2 text-xs text-amber-700 dark:text-amber-400">
-          Running panes {policy.noncompliantPaneIds.join(", ")} are noncompliant. They remain visible but cannot be relaunched.
+        <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">
+          Panes {policy.noncompliantPaneIds.join(", ")} use a combination this policy no longer
+          allows. They keep running and can be relaunched; the combination just cannot be chosen
+          for a new tab.
         </p>
       )}
     </div>

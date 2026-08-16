@@ -48,10 +48,15 @@ describe("AllowedTabTypesCard", () => {
     expect(screen.getByText(/No new panes may be launched/)).toBeTruthy();
   });
 
-  it("reports running panes that became noncompliant", () => {
+  it("names panes outside the policy without claiming they are stuck", () => {
+    // The allowlist governs what may be created. These panes run and relaunch;
+    // all that is true of them is that their combination cannot be chosen for
+    // something new.
     seed(["agent:codex:official:default"], [2, 9]);
     render(<AllowedTabTypesCard />);
-    expect(screen.getByText(/Running panes 2, 9 are noncompliant/)).toBeTruthy();
+    expect(screen.getByText(/Panes 2, 9 use a combination this policy no longer allows/)).toBeTruthy();
+    expect(screen.getByText(/can be relaunched/)).toBeTruthy();
+    expect(screen.queryByText(/cannot be relaunched/)).toBeNull();
   });
 
   it("waits for an authoritative snapshot instead of showing legacy controls", () => {

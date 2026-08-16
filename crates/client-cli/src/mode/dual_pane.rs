@@ -134,6 +134,31 @@ fn launch_allowed_by_server_policy(
         .is_some_and(|policy| policy.allows(kind, provider, model))
 }
 
+/// Whether an **existing** pane may be brought back — resumed, rebooted, or
+/// started.
+///
+/// The launch-profile allowlist is deliberately not consulted. It decides which
+/// combinations may be brought into existence; a pane that exists is a decision
+/// already taken under whatever policy applied then. Applying the allowlist here
+/// never removed the pane it disapproved of — the pane kept running — it only
+/// made that pane impossible to bring back.
+///
+/// Team availability still applies, because it is the switch that stops a
+/// running team rather than a catalogue entry: without it, a team an owner just
+/// disabled could be resurrected one pane at a time. Retired providers are
+/// refused separately, before this is reached, since their backend genuinely no
+/// longer exists.
+fn existing_pane_relaunch_allowed(policy_state: &ProjectPolicyState, managed: bool) -> bool {
+    if !managed {
+        return true;
+    }
+    policy_state
+        .lock()
+        .ok()
+        .and_then(|policy| policy.clone())
+        .is_some_and(|policy| policy.team_available)
+}
+
 fn team_allowed_by_server_policy(
     policy_state: &ProjectPolicyState,
     roles: &[&shared::TeamRoleSpec],
@@ -4251,19 +4276,12 @@ fn handle_tui_events(
                     continue;
                 }
 
-                if (preserved_fields.managed
-                    && !project_policy
-                        .lock()
-                        .ok()
-                        .and_then(|policy| policy.clone())
-                        .is_some_and(|policy| policy.team_available))
-                    || !launch_allowed_by_server_policy(
-                        &project_policy,
-                        existing_kind,
-                        provider,
-                        existing_model.as_deref(),
-                    )
-                {
+                // The allowlist is not consulted for a pane that already
+                // exists — it decides what may be created. Team availability
+                // still is: it is the switch that stops a running team, and
+                // honouring it here is what stops a disabled team coming back
+                // one pane at a time.
+                if !existing_pane_relaunch_allowed(&project_policy, preserved_fields.managed) {
                     let denied = shared::launch_profile_key(
                         existing_kind,
                         provider,
@@ -8768,6 +8786,62 @@ Use a project-specific custom dispatch loop.";
 
     // --- team mode on/off ---------------------------------------------------
 
+    /// The allowlist decides what may be created. A pane that exists already
+    /// embodies a decision taken under whatever policy applied then, and
+    /// refusing to bring it back never removed it — it kept running, just
+    /// unrecoverable if it ever stopped.
+    #[test]
+    fn an_existing_pane_relaunches_even_outside_the_allowlist() {
+        let policy = Arc::new(Mutex::new(Some(shared::EffectiveProjectPolicy {
+            team_available: true,
+            // Deliberately allows nothing this pane could be.
+            allowed_launch_profiles: vec!["agent:codex:official:default".to_string()],
+            version: 9,
+            project_suspended: false,
+        })));
+
+        // An unmanaged pane relaunches regardless of the allowlist...
+        assert!(super::existing_pane_relaunch_allowed(&policy, false));
+        // ...and the allowlist still refuses to create that same profile.
+        assert!(!super::launch_allowed_by_server_policy(
+            &policy,
+            shared::PaneKind::Terminal,
+            Provider::Claude,
+            None,
+        ));
+    }
+
+    /// Team availability is the switch that stops a running team, not a
+    /// catalogue entry — without it a disabled team comes back a pane at a time.
+    #[test]
+    fn a_managed_pane_still_needs_team_mode_to_relaunch() {
+        let policy = Arc::new(Mutex::new(Some(shared::EffectiveProjectPolicy {
+            team_available: false,
+            allowed_launch_profiles: vec![],
+            version: 9,
+            project_suspended: false,
+        })));
+        assert!(!super::existing_pane_relaunch_allowed(&policy, true));
+        assert!(super::existing_pane_relaunch_allowed(&policy, false));
+
+        if let Ok(mut current) = policy.lock() {
+            if let Some(policy) = current.as_mut() {
+                policy.team_available = true;
+            }
+        }
+        assert!(super::existing_pane_relaunch_allowed(&policy, true));
+    }
+
+    /// Unlike creation, this does not fail closed. A policy that has not
+    /// arrived yet must not strand every existing pane; the pane is already
+    /// there either way.
+    #[test]
+    fn an_unmanaged_pane_relaunches_before_any_policy_arrives() {
+        let policy: super::ProjectPolicyState = Arc::new(Mutex::new(None));
+        assert!(super::existing_pane_relaunch_allowed(&policy, false));
+        assert!(!super::existing_pane_relaunch_allowed(&policy, true));
+    }
+
     #[test]
     fn server_policy_checks_fail_closed_and_validate_team_profiles() {
         let policy = Arc::new(Mutex::new(None));
@@ -12700,26 +12774,6 @@ async fn run_server_connection(
                                                 if policy_session_id != session_id {
                                                     continue;
                                                 }
-                                                let noncompliant = pane_metas
-                                                    .lock()
-                                                    .map(|panes| {
-                                                        panes
-                                                            .iter()
-                                                            .filter(|(_, pane)| {
-                                                                !shared::is_retired_launch(
-                                                                    pane.provider,
-                                                                    pane.model.as_deref(),
-                                                                ) && ((!policy.team_available && pane.managed)
-                                                                    || !policy.allows(
-                                                                        pane.kind,
-                                                                        pane.provider,
-                                                                        pane.model.as_deref(),
-                                                                    ))
-                                                            })
-                                                            .map(|(pane_id, _)| *pane_id)
-                                                            .collect::<Vec<_>>()
-                                                    })
-                                                    .unwrap_or_default();
                                                 if let Ok(mut current) = project_policy.lock() {
                                                     *current = Some(policy.clone());
                                                 }
@@ -12768,16 +12822,17 @@ async fn run_server_connection(
                                                         });
                                                     }
                                                 }
-                                                if !noncompliant.is_empty() {
-                                                    let _ = status_tx.send(PaneOutput {
-                                                        text: format!(
-                                                            "[Cluster policy v{} marks panes {:?} noncompliant; they may keep running but cannot be relaunched]",
-                                                            policy.version,
-                                                            noncompliant
-                                                        ),
-                                                        pane_id: 0,
-                                                    });
-                                                }
+                                                // Deliberately not announced.
+                                                // The message existed to
+                                                // explain a restriction that no
+                                                // longer applies: these panes
+                                                // run and relaunch, and all
+                                                // that is true of them is that
+                                                // their profile could not be
+                                                // chosen for something new. The
+                                                // ids still travel to the web,
+                                                // which shows them where the
+                                                // profiles are listed.
                                             }
                                             ServerToCli::SessionRejected { session_id: rejected_id, reason } => {
                                                 tracing::error!(
@@ -13131,16 +13186,9 @@ async fn run_server_connection(
                                                     .ok()
                                                     .and_then(|panes| panes.get(&target_pane).cloned())
                                                     .is_some_and(|pane| {
-                                                        (!pane.managed || project_policy
-                                                            .lock()
-                                                            .ok()
-                                                            .and_then(|policy| policy.clone())
-                                                            .is_some_and(|policy| policy.team_available))
-                                                            && launch_allowed_by_server_policy(
+                                                        existing_pane_relaunch_allowed(
                                                             &project_policy,
-                                                            pane.kind,
-                                                            pane.provider,
-                                                            pane.model.as_deref(),
+                                                            pane.managed,
                                                         )
                                                     });
                                                 if !allowed {
@@ -13368,16 +13416,9 @@ async fn run_server_connection(
                                                     .await;
                                                     continue;
                                                 }
-                                                if (meta.managed && !project_policy
-                                                    .lock()
-                                                    .ok()
-                                                    .and_then(|policy| policy.clone())
-                                                    .is_some_and(|policy| policy.team_available))
-                                                    || !launch_allowed_by_server_policy(
+                                                if !existing_pane_relaunch_allowed(
                                                     &project_policy,
-                                                    meta.kind,
-                                                    meta.provider,
-                                                    meta.model.as_deref(),
+                                                    meta.managed,
                                                 ) {
                                                     let _ = status_tx.send(PaneOutput {
                                                         text: "[Reboot refused by the current cluster policy]".to_string(),

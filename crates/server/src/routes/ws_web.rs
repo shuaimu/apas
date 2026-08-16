@@ -911,6 +911,19 @@ async fn authorize_new_pane_launch(
     .await
 }
 
+/// Authorize bringing an **existing** pane back — resume, reboot, start.
+///
+/// The launch-profile allowlist deliberately does not apply here. It decides
+/// which combinations may be brought into existence; a pane that exists is a
+/// decision already taken under whatever policy applied then. Applying it to a
+/// relaunch never removed the pane it disapproved of — the pane kept running —
+/// it only made that pane impossible to bring back, which bites hardest exactly
+/// when someone needs it back.
+///
+/// What still refuses: a retired backend, which genuinely cannot run, and a
+/// managed pane while team mode is unavailable, which is the switch that stops
+/// a running team rather than a catalogue entry. Without the latter a disabled
+/// team could be resurrected one pane at a time.
 async fn authorize_existing_pane_launch(
     state: &AppState,
     connection_id: &Uuid,
@@ -926,16 +939,34 @@ async fn authorize_existing_pane_launch(
         send_policy_error(state, connection_id, "Pane not found").await;
         return false;
     };
-    authorize_profile_launch(
+    if shared::is_retired_launch(pane.provider, pane.model.as_deref()) {
+        send_policy_error(
+            state,
+            connection_id,
+            "Unsupported provider: this backend has been retired",
+        )
+        .await;
+        return false;
+    }
+    if !pane.managed {
+        return true;
+    }
+    let Some(policy) = effective_policy_for_launch(state, connection_id, session_id).await else {
+        return false;
+    };
+    if policy.team_available {
+        return true;
+    }
+    send_policy_error(
         state,
         connection_id,
-        session_id,
-        pane.kind,
-        pane.provider,
-        pane.model.as_deref(),
-        pane.managed,
+        format!(
+            "Managed pane launch is disabled by cluster policy (policy version {})",
+            policy.version
+        ),
     )
-    .await
+    .await;
+    false
 }
 
 async fn authorize_team_launch(
@@ -1063,6 +1094,91 @@ mod retired_launch_authorization_tests {
             .sessions
             .set_cli_capabilities(cli_id, vec![shared::PROJECT_POLICY_CAPABILITY.to_string()]);
         (state, connection_id, session_id, web_rx, cli_rx, cli_id)
+    }
+
+    fn pane(pane_id: u32, provider: shared::Provider, managed: bool) -> shared::PaneConfig {
+        shared::PaneConfig {
+            pane_id,
+            provider,
+            mode: shared::PaneMode::Interactive,
+            kind: shared::PaneKind::Terminal,
+            session_id: Uuid::new_v4(),
+            is_paused: false,
+            stop_requested: false,
+            prompt: None,
+            min_iteration_interval_minutes: None,
+            label: None,
+            model: None,
+            effort: None,
+            worktree_path: None,
+            role: None,
+            goal: None,
+            backstory: None,
+            plan_review_mode: shared::PlanReviewMode::default(),
+            manual_mode: false,
+            managed,
+        }
+    }
+
+    /// The allowlist decides what may be created. Refusing to bring back a pane
+    /// that already exists never removed it — it kept running and simply could
+    /// not be recovered once stopped.
+    #[tokio::test]
+    async fn an_existing_pane_relaunches_outside_the_allowlist() {
+        let (state, connection_id, session_id, mut web_rx, _cli_rx, _cli_id) =
+            policy_state().await;
+        state.sessions.set_session_panes(
+            &session_id,
+            vec![pane(7, shared::Provider::Claude, false)],
+        );
+
+        assert!(authorize_existing_pane_launch(&state, &connection_id, &session_id, 7).await);
+        assert!(
+            web_rx.try_recv().is_err(),
+            "relaunching an existing pane raises no policy error"
+        );
+
+        // The same combination is still refused for a *new* pane.
+        assert!(
+            !authorize_new_pane_launch(
+                &state,
+                &connection_id,
+                &session_id,
+                shared::PaneKind::Agent,
+                shared::Provider::Claude,
+                None,
+                false,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn an_existing_pane_with_a_retired_backend_is_still_refused() {
+        let (state, connection_id, session_id, mut web_rx, _cli_rx, _cli_id) =
+            policy_state().await;
+        let mut retired = pane(8, shared::Provider::Claude, false);
+        retired.model = Some("MiniMax-M2.7".to_string());
+        state.sessions.set_session_panes(&session_id, vec![retired]);
+
+        assert!(!authorize_existing_pane_launch(&state, &connection_id, &session_id, 8).await);
+        let ServerToWeb::Error { message } = web_rx.try_recv().expect("explicit web error") else {
+            panic!("expected policy error")
+        };
+        assert!(message.contains("retired"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_pane_is_still_refused() {
+        let (state, connection_id, session_id, mut web_rx, _cli_rx, _cli_id) =
+            policy_state().await;
+        state.sessions.set_session_panes(&session_id, vec![]);
+
+        assert!(!authorize_existing_pane_launch(&state, &connection_id, &session_id, 99).await);
+        let ServerToWeb::Error { message } = web_rx.try_recv().expect("explicit web error") else {
+            panic!("expected policy error")
+        };
+        assert!(message.contains("Pane not found"), "{message}");
     }
 
     #[tokio::test]
@@ -3049,11 +3165,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
-                        let Some(policy) =
-                            effective_policy_for_cli_reboot(&state, &connection_id, &sid).await
-                        else {
+                        // Called for its own gate — it refuses a reboot from a
+                        // web client when the project CLI is too old for it —
+                        // not for the policy itself, which no longer decides
+                        // anything here.
+                        if effective_policy_for_cli_reboot(&state, &connection_id, &sid)
+                            .await
+                            .is_none()
+                        {
                             continue;
-                        };
+                        }
                         if let Some(pane) =
                             state
                                 .sessions
@@ -3074,27 +3195,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                             continue;
                         }
-                        if let Some(pane) =
-                            state
-                                .sessions
-                                .get_session_panes(&sid)
-                                .into_iter()
-                                .find(|pane| {
-                                    !policy.allows(pane.kind, pane.provider, pane.model.as_deref())
-                                })
+                        // Called for its own gate — it refuses a reboot from a
+                        // web client when the project CLI is too old for it —
+                        // not for the policy itself, which no longer decides
+                        // anything here.
+                        if effective_policy_for_cli_reboot(&state, &connection_id, &sid)
+                            .await
+                            .is_none()
                         {
-                            send_policy_error(
-                                &state,
-                                &connection_id,
-                                format!(
-                                    "Pane {} is noncompliant with cluster policy and blocks CLI reboot",
-                                    pane.pane_id
-                                ),
-                            )
-                            .await;
                             continue;
-                        }
-                        tracing::info!("Rebooting CLI for session {}", sid);
+                        }                        tracing::info!("Rebooting CLI for session {}", sid);
                         let routed = state
                             .sessions
                             .route_to_cli(&sid, reboot_cli_message(sid))
@@ -3165,30 +3275,29 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
 
                     if operation == shared::CliLifecycleOperation::RebootCli {
-                        let Some(policy) =
-                            effective_policy_for_cli_reboot(&state, &connection_id, &target_sid)
-                                .await
-                        else {
+                        // Same here: called for the too-old-CLI gate. Only a
+                        // retired backend blocks the reboot now, since it cannot
+                        // run at all; being outside the allowlist no longer
+                        // does — see `authorize_existing_pane_launch`.
+                        if effective_policy_for_cli_reboot(&state, &connection_id, &target_sid)
+                            .await
+                            .is_none()
+                        {
                             continue;
-                        };
+                        }
                         if let Some(pane) = state
                             .sessions
                             .get_session_panes(&target_sid)
                             .into_iter()
                             .find(|pane| {
                                 shared::is_retired_launch(pane.provider, pane.model.as_deref())
-                                    || !policy.allows(
-                                        pane.kind,
-                                        pane.provider,
-                                        pane.model.as_deref(),
-                                    )
                             })
                         {
                             send_policy_error(
                                 &state,
                                 &connection_id,
                                 format!(
-                                    "Pane {} is not allowed by current cluster policy and blocks CLI reboot",
+                                    "Pane {} uses a retired backend and blocks CLI reboot",
                                     pane.pane_id
                                 ),
                             )

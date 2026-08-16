@@ -187,6 +187,89 @@ describe('useStore', () => {
         noncompliantPaneIds: [4, 8],
       });
     });
+
+    it('does not announce noncompliant panes on entering a project', () => {
+      // This fired on every entry, named pane numbers, asserted they could not
+      // be relaunched — which is no longer true — and offered nothing the
+      // person reading it could act on.
+      const showToast = vi.fn();
+      useStore.setState({ showToast });
+
+      handleServerMessage({
+        type: 'project_policy_changed',
+        session_id: 'policy-session',
+        policy: {
+          team_available: true,
+          allowed_launch_profiles: ['agent:codex:official:default'],
+          version: 12,
+          project_suspended: false,
+        },
+        noncompliant_pane_ids: [4, 8],
+      }, useStore.setState, useStore.getState);
+
+      expect(showToast).not.toHaveBeenCalled();
+    });
+
+    it('still announces a suspended project', () => {
+      const showToast = vi.fn();
+      useStore.setState({ showToast });
+
+      handleServerMessage({
+        type: 'project_policy_changed',
+        session_id: 'policy-session',
+        policy: {
+          team_available: true,
+          allowed_launch_profiles: [],
+          version: 13,
+          project_suspended: true,
+        },
+        noncompliant_pane_ids: [4],
+      }, useStore.setState, useStore.getState);
+
+      expect(showToast).toHaveBeenCalledWith(
+        'This project is suspended by a cluster administrator',
+        'error',
+      );
+    });
+
+    it('relaunches an existing pane whose profile is no longer allowed', () => {
+      const send = vi.fn();
+      const showToast = vi.fn();
+      useStore.setState({
+        ws: { readyState: WebSocket.OPEN, send, close: vi.fn() } as unknown as WebSocket,
+        sessionId: 'policy-session',
+        showToast,
+        paneConfigs: [{
+          pane_id: 42,
+          provider: 'claude',
+          kind: 'terminal',
+          mode: 'interactive',
+          session_id: 'policy-session',
+          is_paused: false,
+        }] as never,
+        projectPolicies: {
+          'policy-session': {
+            teamAvailable: true,
+            // Allows nothing pane 42 could be.
+            allowedLaunchProfiles: ['agent:codex:official:default'],
+            version: 12,
+            projectSuspended: false,
+            noncompliantPaneIds: [42],
+          },
+        },
+      });
+
+      useStore.getState().resumePane(42);
+      useStore.getState().rebootPane(42);
+      useStore.getState().startBot(42);
+
+      expect(showToast).not.toHaveBeenCalled();
+      expect(send).toHaveBeenCalledTimes(3);
+
+      // Creating that same combination is still refused.
+      expect(useStore.getState().addPane('claude', 'interactive'))
+        .toEqual(expect.objectContaining({ success: false }));
+    });
   });
 
   describe('project access changes', () => {

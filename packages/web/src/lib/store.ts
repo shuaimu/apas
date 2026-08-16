@@ -2396,7 +2396,10 @@ export const useStore = create<AppState>((set, get) => ({
       showToast("This pane uses a retired provider and cannot be resumed", "error");
       return;
     }
-    if (!sessionId || !pane || (pane.managed && !policy?.teamAvailable) || !policyAllowsLaunch(policy, pane.kind ?? "agent", pane.provider, pane.model)) {
+    // No allowlist check: it decides what may be created, and this pane exists.
+    // Team availability still applies — it is the switch that stops a running
+    // team, not a catalogue of profiles.
+    if (!sessionId || !pane || (pane.managed && !policy?.teamAvailable)) {
       showToast("Resume refused by the current cluster policy", "error");
       return;
     }
@@ -2416,7 +2419,8 @@ export const useStore = create<AppState>((set, get) => ({
       showToast("This pane uses a retired provider and cannot be rebooted", "error");
       return;
     }
-    if (!sessionId || !pane || (pane.managed && !policy?.teamAvailable) || !policyAllowsLaunch(policy, pane.kind ?? "agent", pane.provider, pane.model)) {
+    // Existing pane: team availability only, never the allowlist.
+    if (!sessionId || !pane || (pane.managed && !policy?.teamAvailable)) {
       showToast("Reboot refused by the current cluster policy", "error");
       return;
     }
@@ -2976,12 +2980,8 @@ export const useStore = create<AppState>((set, get) => ({
       showToast("This pane uses a retired provider and cannot be started", "error");
       return;
     }
-    if (!sessionId || !pane || (pane.managed && !policy?.teamAvailable) || !policyAllowsLaunch(
-      policy,
-      pane.kind ?? "agent",
-      pane.provider,
-      pane.model,
-    )) {
+    // Existing pane: team availability only, never the allowlist.
+    if (!sessionId || !pane || (pane.managed && !policy?.teamAvailable)) {
       showToast("Start refused by the current cluster policy", "error");
       return;
     }
@@ -4474,13 +4474,13 @@ export function handleServerMessage(
         set((state) => ({
           projectPolicies: { ...state.projectPolicies, [sessionId]: policy },
         }));
+        // Only suspension is announced. Panes outside the allowlist used to be
+        // announced too, on every entry to the project, naming pane numbers and
+        // asserting they could not be relaunched — which is no longer true and
+        // was never actionable by the person reading it. The ids still reach
+        // the policy card, where the profiles they refer to are listed.
         if (policy.projectSuspended) {
           get().showToast("This project is suspended by a cluster administrator", "error");
-        } else if (policy.noncompliantPaneIds.length > 0) {
-          get().showToast(
-            `Panes ${policy.noncompliantPaneIds.join(", ")} are outside cluster policy and cannot be relaunched`,
-            "info",
-          );
         }
       }
       break;
