@@ -14,7 +14,13 @@
 - [x] 2.4 Render it read-only for everyone else
 - [x] 2.5 Tests: an unrestricted project shows all types permitted; clearing one writes the complementary deny list and preserves the other flags; a non-manager cannot change it
 
-## 3. Verification
+## 3. Show the ceiling, not just the project's own list
 
-- [x] 3.1 Web lint, type-check, and test suite clean
-- [ ] 3.2 Live on the mobile browser: open a project, switch panes from the top row, open the raw terminal and summary from the composer, and restrict a tab type as the owner
+- [x] 3.1 Derive whether the effective cluster policy permits each tab type at all, matching any allowed launch profile for that kind and provider
+- [x] 3.2 Present a type the cluster policy forbids as unavailable rather than permitted, not togglable by anyone, and say the restriction is not the project's
+- [x] 3.3 Tests: a type outside the cluster policy reads as unavailable and cannot be toggled by an owner; a type inside it stays owner-togglable
+
+## 4. Verification
+
+- [x] 4.1 Web lint, type-check, and test suite clean
+- [ ] 4.2 Live on the mobile browser: open a project, switch panes from the top row, open the raw terminal and summary from the composer, and restrict a tab type as the owner

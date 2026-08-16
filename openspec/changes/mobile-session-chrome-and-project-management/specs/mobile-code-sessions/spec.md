@@ -48,6 +48,13 @@ The application SHALL let a user open project management for the session they ar
 - **THEN** every tab type shows as permitted
 - **AND** nothing suggests the project is restricted
 
+#### Scenario: A tab type the cluster policy already forbids
+
+- **WHEN** a tab type is not permitted by the effective cluster policy for the project
+- **THEN** project management SHALL NOT present it as permitted
+- **AND** SHALL indicate that the restriction is not the project's to change
+- **AND** no user, including one who may manage the project, may permit it there
+
 #### Scenario: Existing panes are unaffected
 
 - **WHEN** a tab type is removed from the permitted set while panes of that type are open

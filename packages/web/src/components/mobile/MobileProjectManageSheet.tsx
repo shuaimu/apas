@@ -1,7 +1,7 @@
 "use client";
 
 import { X } from "lucide-react";
-import { ALL_TAB_TYPES } from "@/lib/tabTypes";
+import { ALL_TAB_TYPES, useTabTypeAllowedByPolicy } from "@/lib/tabTypes";
 import { useStore } from "@/lib/store";
 import { useCanManageCurrentProject } from "@/lib/projectRole";
 
@@ -24,6 +24,11 @@ export function MobileProjectManageSheet({ onClose }: { onClose: () => void }) {
   const flags = useStore((state) => (sessionId ? state.projectFlags?.[sessionId] : undefined));
   const updateProjectFlags = useStore((state) => state.updateProjectFlags);
   const canManage = useCanManageCurrentProject();
+  // The ceiling above the project's own list. Without it this sheet reported an
+  // empty deny list as "everything permitted" while the create menu offered one
+  // option — the project restricting nothing is not the same as a type being
+  // creatable.
+  const allowedByPolicy = useTabTypeAllowedByPolicy();
 
   const disallowed = flags?.disallowedTabTypes ?? [];
   const allowed = (key: string) => !disallowed.includes(key);
@@ -79,7 +84,8 @@ export function MobileProjectManageSheet({ onClose }: { onClose: () => void }) {
         ) : (
           <div className="mt-4 space-y-2">
             {ALL_TAB_TYPES.map((option) => {
-              const on = allowed(option.key);
+              const permittedByCluster = allowedByPolicy(option.kind, option.provider);
+              const on = permittedByCluster && allowed(option.key);
               return (
                 <button
                   key={option.key}
@@ -87,7 +93,7 @@ export function MobileProjectManageSheet({ onClose }: { onClose: () => void }) {
                   role="switch"
                   aria-checked={on}
                   aria-label={option.label}
-                  disabled={!canManage}
+                  disabled={!canManage || !permittedByCluster}
                   onClick={() => toggle(option.key)}
                   className="flex w-full items-center justify-between gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left disabled:opacity-60 dark:border-[#383842] dark:bg-[#1b1b21]"
                 >
@@ -96,6 +102,11 @@ export function MobileProjectManageSheet({ onClose }: { onClose: () => void }) {
                     <span className="mt-0.5 block font-mono text-[11px] text-[#686873] dark:text-[#aaaab6]">
                       {option.key}
                     </span>
+                    {!permittedByCluster && (
+                      <span className="mt-0.5 block text-[11px] text-amber-700 dark:text-amber-400">
+                        Not allowed by cluster policy — not this project&apos;s to change
+                      </span>
+                    )}
                   </span>
                   <span
                     aria-hidden="true"

@@ -77,6 +77,34 @@ export function useIsTabTypeAllowed(): (kind: PaneKind, provider: string) => boo
 }
 
 /** Current server-authoritative launch allowlist, including backend/model. */
+/**
+ * Whether the effective cluster policy permits this tab type *at all*.
+ *
+ * A tab type is a kind and a provider; a launch profile also carries a backend
+ * and a model. So the question is whether any allowed profile exists for that
+ * kind and provider, not whether one exact profile does.
+ *
+ * This is the ceiling the project's own deny list sits under, and the two are
+ * easy to confuse: an empty deny list means the *project* restricts nothing,
+ * which is not the same as the type being creatable. The deployment default
+ * currently narrows to a single profile, so a project restricting nothing still
+ * offers one tab type.
+ *
+ * Unknown policy reads as permitted, matching `useIsLaunchProfileAllowed`: the
+ * server and the CLI both re-check on submit, so an optimistic menu is
+ * recoverable while a blank one is just broken.
+ */
+export function useTabTypeAllowedByPolicy(): (kind: PaneKind, provider: string) => boolean {
+  const sessionId = useStore((state) => state.sessionId);
+  const policy = useStore((state) => sessionId ? state.projectPolicies?.[sessionId] : undefined);
+  return (kind, provider) => {
+    if (!policy) return true;
+    if (policy.projectSuspended) return false;
+    const prefix = `${kind}:${provider}:`.toLowerCase();
+    return policy.allowedLaunchProfiles.some((allowed) => allowed.toLowerCase().startsWith(prefix));
+  };
+}
+
 export function useIsLaunchProfileAllowed(): (
   kind: PaneKind,
   provider: string,

@@ -6,10 +6,13 @@ import { MobileProjectManageSheet } from "./MobileProjectManageSheet";
 
 const initialStore = useStore.getState();
 
+const EVERY_PROFILE = ALL_TAB_TYPES.map((option) => `${option.key}:official:default`);
+
 function seed({
   role = "owner" as "owner" | "user",
   disallowedTabTypes = [] as string[],
   teamEnabled = true,
+  allowedLaunchProfiles = EVERY_PROFILE,
 } = {}) {
   const updateProjectFlags = vi.fn();
   act(() => {
@@ -24,6 +27,15 @@ function seed({
         isShared: role !== "owner",
         shareRole: role,
       }] as never,
+      projectPolicies: {
+        "session-a": {
+          teamAvailable: teamEnabled,
+          allowedLaunchProfiles,
+          version: 4,
+          projectSuspended: false,
+          noncompliantPaneIds: [],
+        },
+      },
       projectFlags: {
         "session-a": {
           autoApproveTodos: true,
@@ -108,6 +120,44 @@ describe("MobileProjectManageSheet", () => {
     fireEvent.click(toggle);
     expect(updateProjectFlags).not.toHaveBeenCalled();
     expect(screen.getByText(/Only the project owner can change these/)).toBeTruthy();
+  });
+
+  it("does not present a type the cluster policy forbids as permitted", () => {
+    // The bug this fixes: an empty project deny list read as "everything
+    // permitted" while the create menu offered one option, because the
+    // deployment default narrows to a single launch profile above it.
+    const only = ALL_TAB_TYPES[1];
+    const { updateProjectFlags } = seed({
+      disallowedTabTypes: [],
+      allowedLaunchProfiles: [`${only.key}:official:default`],
+    });
+    render(<MobileProjectManageSheet onClose={vi.fn()} />);
+
+    for (const option of ALL_TAB_TYPES) {
+      const toggle = screen.getByRole("switch", { name: option.label });
+      const permitted = option.key === only.key;
+      expect(toggle.getAttribute("aria-checked"), option.key).toBe(String(permitted));
+      expect(toggle.hasAttribute("disabled"), option.key).toBe(!permitted);
+    }
+
+    // Not even an owner can permit it here — the restriction is above them.
+    fireEvent.click(screen.getByRole("switch", { name: ALL_TAB_TYPES[0].label }));
+    expect(updateProjectFlags).not.toHaveBeenCalled();
+    expect(screen.getAllByText(/Not allowed by cluster policy/).length).toBe(ALL_TAB_TYPES.length - 1);
+  });
+
+  it("a type inside the cluster policy stays the owner's to change", () => {
+    const only = ALL_TAB_TYPES[1];
+    const { updateProjectFlags } = seed({
+      disallowedTabTypes: [],
+      allowedLaunchProfiles: [`${only.key}:official:default`],
+    });
+    render(<MobileProjectManageSheet onClose={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole("switch", { name: only.label }));
+    expect(updateProjectFlags).toHaveBeenCalledWith(
+      expect.objectContaining({ disallowedTabTypes: [only.key] }),
+    );
   });
 
   it("waits rather than showing an unrestricted project before settings arrive", () => {
