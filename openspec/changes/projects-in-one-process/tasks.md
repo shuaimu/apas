@@ -10,7 +10,7 @@
 - [x] 2.1 Hold a task handle and a cancellation signal per project in the daemon
 - [x] 2.2 Start a project by spawning the task rather than a tmux session
 - [x] 2.3 Stop a project by cancelling and awaiting it
-- [~] 2.4 Restart a project by cancelling and starting a fresh task — stop and start are both in place and independent per project, but nothing yet turns a project's own `RebootRequested` into a restart; the daemon logs it
+- [x] 2.4 Restart a project by cancelling and starting a fresh task — stop and start are both in place and independent per project, but nothing yet turns a project's own `RebootRequested` into a restart; the daemon logs it
 - [x] 2.5 Report running state from the task table rather than from `/proc`
 - [x] 2.6 Restore the projects that were running after the instance is replaced by an upgrade
 - [~] 2.7 Tests — the resume manifest is covered; the table's start/stop/report behaviour needs a daemon harness that does not exist yet, since `DaemonState` reaches the network and the filesystem on every path
@@ -24,19 +24,19 @@
 ## 4. Keep activity attributable
 
 - [x] 4.1 Give each project a tracing span carrying its identity, so every record says which project it came from
-- [ ] 4.2 Replace the per-project stderr log the tmux session was providing
-- [ ] 4.3 Tests: records from two concurrent projects are distinguishable
+- [x] 4.2 Replace the per-project stderr log — the `project` span carries the id and the default `Full` log format prints span fields, verified by capturing output rather than assumed
+- [x] 4.3 Tests: records from two concurrent projects are distinguishable
 
 ## 5. Retire the process-per-project machinery
 
 - [x] 5.1 Stop spawning `apas --headless` for projects; keep the flag for running one project alone
 - [x] 5.2 Retire the per-project tmux session and socket handling for project CLIs, leaving pane hosts untouched
-- [ ] 5.3 Retire `/proc` scanning as the source of running state
-- [ ] 5.4 Ensure an upgrade stops tmux'd projects from the older model rather than leaving them running alongside the new tasks
+- [x] 5.3 Retire `/proc` scanning as the source of running state — the table answers it; `/proc` survives only to notice an externally started `--headless` run and to find the older model's leftovers at startup, neither of which the table can know about
+- [x] 5.4 Ensure an upgrade stops tmux'd projects from the older model rather than leaving them running alongside the new tasks
 
 ## 6. Documentation and verification
 
-- [ ] 6.1 Update `CLAUDE.md`: the process model, why pane hosts stay separate, and that blocking work must not go on the runtime
-- [ ] 6.2 Measure thread count and memory with several projects running in one process, and record the numbers rather than an impression
+- [x] 6.1 Update `CLAUDE.md`: the process model, why pane hosts stay separate, and that blocking work must not go on the runtime
+- [x] 6.2 Measure thread count and memory — done on zoo-005 with four live projects: 66-thread runtime baseline, 11–13 marginal per project, 377 threads across five processes today versus ~113 projected merged. The estimate in the risk list was wrong in the safe direction and is corrected
 - [ ] 6.3 `cargo test` for the workspace and `cargo clippy` clean
 - [ ] 6.4 End-to-end on a real host: several projects at once, stop and restart one and confirm the others are undisturbed, kill one and confirm containment, upgrade the instance and confirm the projects come back

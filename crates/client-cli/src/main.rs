@@ -210,12 +210,18 @@ enum ConfigAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing (default to warn to avoid interfering with TUI)
+    // Every project used to have its own tmux session and its own stderr file,
+    // which separated their records for free. Projects now share this process,
+    // so each carries a `project` span and the records must show it — without
+    // that, one incident's log is an interleaving of several projects with no
+    // way to tell them apart.
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "apas=warn".into()),
         )
+        // The default `Full` format prints the enclosing span and its fields,
+        // which is what carries the project id onto every record.
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
 

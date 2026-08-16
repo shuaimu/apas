@@ -401,6 +401,13 @@ struct RunningProject {
     handle: tokio::task::JoinHandle<()>,
 }
 
+/// A project asking to be replaced.
+///
+/// The task cannot restart itself — it is the thing being replaced, and only
+/// the instance holds the table. It says so on this channel and ends; the
+/// daemon starts a fresh task for it.
+type RestartRequests = tokio::sync::mpsc::UnboundedSender<String>;
+
 struct DaemonState {
     machine_info: MachineInfo,
     projects: HashMap<String, ProjectEntry>,
@@ -499,6 +506,52 @@ impl DaemonState {
     /// than seized. That combination means two CLIs are already live for one
     /// project, which is the thing claims exist to prevent — stealing the claim
     /// would hide it, and the operator needs to see it.
+    /// Stop anything left over from the process-per-project model.
+    ///
+    /// This is the one part of the merge that is not additive at rollout. An
+    /// older instance ran each project as `apas --headless` in its own tmux
+    /// session, and `exec` never touched those, so a newer instance that
+    /// simply started its own tasks would leave two owners of one `.apas` and
+    /// one set of worktrees — exactly the duplication everything else here
+    /// exists to prevent. The newer instance therefore stops them before it
+    /// starts anything.
+    ///
+    /// Pane hosts are deliberately untouched: they own the PTYs, and leaving
+    /// them alive is what lets the projects come back inside their adoption
+    /// grace with their terminal agents intact.
+    ///
+    /// This finds projects an older *daemon* started, which carry `-d <path>`.
+    /// It cannot find one a person started by running `apas` in a directory
+    /// before that became register-and-exit: those have no arguments at all,
+    /// and nothing distinguishes them from an `apas --attach` someone is
+    /// using. Killing by working directory would take attachments with it, so
+    /// those stay a deliberate manual step in the cutover.
+    fn retire_process_per_project_leftovers(&mut self) {
+        for (project_id, project) in &self.projects {
+            let session_name = tmux_session_name(project_id);
+            let had_session = tmux_has_session(project_id, &session_name);
+            let pids = headless_pids_for(&project.path);
+            if !had_session && pids.is_empty() {
+                continue;
+            }
+            tracing::info!(
+                project_id,
+                had_session,
+                processes = pids.len(),
+                "stopping a project left by the process-per-project model"
+            );
+            if had_session {
+                if let Err(err) = tmux_kill_session(project_id, &session_name) {
+                    tracing::warn!(project_id, %err, "could not kill the old tmux session");
+                }
+            }
+            for pid in pids {
+                let _ = Command::new("kill").arg(pid.to_string()).status();
+            }
+        }
+        self.sessions.clear();
+    }
+
     /// Projects this instance is currently running.
     fn running_project_ids(&self) -> Vec<String> {
         self.running
@@ -584,7 +637,13 @@ impl DaemonState {
         projects
     }
 
-    fn start_project(&mut self, project_id: &str, server_url: &str, token: &str) -> Result<()> {
+    fn start_project(
+        &mut self,
+        project_id: &str,
+        server_url: &str,
+        token: &str,
+        restart_tx: &RestartRequests,
+    ) -> Result<()> {
         // Reap any exited tracked processes before deciding whether to spawn.
         self.reap_exited_processes();
 
@@ -659,6 +718,7 @@ impl DaemonState {
         let server = server_url.to_string();
         let token = token.to_string();
         let id_for_task = project_id.to_string();
+        let restart_tx = restart_tx.clone();
         let handle = tokio::spawn(async move {
             // Every record this project emits carries its identity: sharing a
             // process took away the per-project tmux session and log file that
@@ -683,6 +743,10 @@ impl DaemonState {
                 }
                 Ok(crate::mode::dual_pane::ProjectOutcome::RebootRequested) => {
                     tracing::info!("project asked to restart");
+                    // Replacing one project no longer replaces the process,
+                    // which is what a reboot used to mean when a process was
+                    // a project.
+                    let _ = restart_tx.send(id_for_task.clone());
                 }
                 Err(err) => {
                     tracing::error!(%err, "project ended with an error");
@@ -756,6 +820,7 @@ impl DaemonState {
     /// (project_id, absolute path).
     fn create_instance(
         &mut self,
+        restart_tx: &RestartRequests,
         git_remote: &str,
         instance_name: &str,
         branch: &str,
@@ -810,7 +875,7 @@ impl DaemonState {
         // doesn't get a "failed" toast for an instance that was created.
         let project_id = metadata.id.to_string();
         self.refresh_projects();
-        if let Err(err) = self.start_project(&project_id, server_url, token) {
+        if let Err(err) = self.start_project(&project_id, server_url, token, restart_tx) {
             tracing::warn!(
                 "Created instance {} but failed to auto-start it: {}",
                 project_id,
@@ -937,14 +1002,22 @@ pub async fn run(
     // Adopt anything already running here before serving any request, so a
     // restart or self-upgrade never leaves a window where our projects look
     // unclaimed to peers.
+    // Before anything starts here: an older instance's projects are separate
+    // processes this one cannot supervise, and two owners of one project is
+    // the failure this whole change exists to remove.
+    state.retire_process_per_project_leftovers();
     state.reconcile_running_claims();
+
+    // Projects ask to be replaced here; only this loop holds the table that
+    // can do it.
+    let (restart_tx, mut restart_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     // Start again what this instance was running before it replaced itself.
     // Pane hosts are separate processes and survived the `exec`, so a prompt
     // resume lands inside their adoption grace and the terminal agents carry
     // straight on.
     for project_id in take_resume_manifest() {
-        if let Err(err) = state.start_project(&project_id, server_url, token) {
+        if let Err(err) = state.start_project(&project_id, server_url, token, &restart_tx) {
             tracing::warn!(project_id, %err, "could not resume project after replacement");
         } else {
             tracing::info!(project_id, "resumed project after replacement");
@@ -957,7 +1030,16 @@ pub async fn run(
         state.reap_exited_processes();
         state.refresh_projects();
 
-        match run_connection(server_url, token, &mut state, shutdown.clone()).await {
+        match run_connection(
+            server_url,
+            token,
+            &mut state,
+            shutdown.clone(),
+            &restart_tx,
+            &mut restart_rx,
+        )
+        .await
+        {
             Ok(()) => {
                 reconnect_delay = INITIAL_RECONNECT_DELAY;
             }
@@ -985,6 +1067,8 @@ async fn run_connection(
     token: &str,
     state: &mut DaemonState,
     shutdown: Arc<AtomicBool>,
+    restart_tx: &RestartRequests,
+    restart_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
 ) -> Result<()> {
     let ws_url = format!("{}/ws/daemon", server_url);
     let (ws_stream, _) = connect_async(&ws_url).await?;
@@ -1072,6 +1156,17 @@ async fn run_connection(
         crate::daemon_registry::refresh_own_claims(&registry_dir);
 
         tokio::select! {
+            Some(project_id) = restart_rx.recv() => {
+                // Stop it properly before starting a fresh one: the task has
+                // already finished, but its entry and pane hosts have not been
+                // cleaned up.
+                state.stop_running_project(&project_id).await;
+                if let Err(err) = state.start_project(&project_id, server_url, token, restart_tx) {
+                    tracing::warn!(project_id, %err, "could not restart project");
+                } else {
+                    tracing::info!(project_id, "restarted project");
+                }
+            }
             _ = usage_refresh.tick() => {
                 refresh_usage_limits_cache().await;
             }
@@ -1130,7 +1225,7 @@ async fn run_connection(
                                     );
                                     continue;
                                 }
-                                if let Err(err) = state.start_project(&project_id, server_url, token) {
+                                if let Err(err) = state.start_project(&project_id, server_url, token, restart_tx) {
                                     tracing::warn!("Failed to start project {}: {}", project_id, err);
                                 }
                                 let update = DaemonToServer::Heartbeat {
@@ -1180,6 +1275,7 @@ async fn run_connection(
                                 // very large clone briefly delays heartbeats.
                                 // GIT_TERMINAL_PROMPT=0 makes auth fail fast.
                                 let ack = match state.create_instance(
+                                    restart_tx,
                                     &git_remote,
                                     &instance_name,
                                     &branch,
@@ -1317,6 +1413,63 @@ async fn refresh_usage_limits_cache() {
     match crate::usage::refresh_codex_usage_limits().await {
         Ok(_) => tracing::debug!("Refreshed Codex usage limits cache"),
         Err(err) => tracing::debug!("Failed to refresh Codex usage limits cache: {}", err),
+    }
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Each project used to have its own tmux session and stderr file, which
+    /// told their records apart for free. Sharing a process took that away, so
+    /// the span has to carry the identity into the output — otherwise one
+    /// incident's log is several projects interleaved with no way to separate
+    /// them.
+    #[test]
+    fn records_from_two_projects_are_distinguishable() {
+        let captured = Captured::default();
+        let sink = captured.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(move || sink.clone()),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            let alpha = tracing::info_span!("project", id = "alpha");
+            alpha.in_scope(|| tracing::error!("pane failed"));
+            let beta = tracing::info_span!("project", id = "beta");
+            beta.in_scope(|| tracing::error!("pane failed"));
+        });
+
+        let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = output.lines().filter(|l| l.contains("pane failed")).collect();
+        assert_eq!(lines.len(), 2, "both records were emitted: {output}");
+        assert!(
+            lines[0].contains("alpha"),
+            "the first record names its project: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("beta"),
+            "the second record names its project: {}",
+            lines[1]
+        );
     }
 }
 

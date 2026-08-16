@@ -650,6 +650,63 @@ interrupting, where the web does the reverse — between an interrupt and the
 pause landing, a sibling pane's write can wake the loop for one more iteration.
 Unmanaged side chats are never touched.
 
+## Projects run inside the one instance
+
+A host runs one `apas` process for a user, and the projects run *in it* as
+supervised tasks. The daemon used to spawn each project as `apas --headless`
+into its own tmux session and then could not see it, which is why running state
+was inferred from `/proc` and why a restarted daemon came back owning nothing.
+A host is now one `apas` plus one **pane host per terminal pane**.
+
+**Pane hosts are deliberately not merged.** They own the PTYs so a provider
+survives the CLI being replaced — which is also what keeps this arrangement
+safe, since the blast radius is the supervision layer rather than running
+agents.
+
+**Stopping a project sets a flag it observes; it is never an aborted future.**
+Aborting would strand roughly thirty threads and every pane child. The flag
+ends the project through the same teardown an ordinary stop takes, and the wait
+is bounded at 30s so one project that will not stop cannot hold the instance
+the others are running in.
+
+**Failure containment rests on unwind.** `panic = "abort"` is not set, so a
+panicking project unwinds its own task, is reported as stopped, and leaves the
+others alone. A test fails if anyone ever sets it, because that would turn any
+project panic into a host-wide outage with nothing else looking different. The
+three `process::exit` calls that used to mean "stop this project" are gone;
+`run_inner` returns a `ProjectOutcome` and the caller decides.
+
+**Blocking work must stay off the runtime.** Each project's blocking readers
+already run on their own threads. New code that blocks in async would stall
+every other project, and a two-project test will not show it.
+
+**Two things the process boundary gave for free had to be replaced.** Each
+project carries a `project` span so its records are identifiable — the
+per-project tmux session and stderr log are gone, and the default `Full` log
+format prints the span fields. And `exec` now takes the projects with it, so an
+upgrade writes what was running to a manifest in the *runtime* directory
+(volatile, so a machine reboot starts nothing nobody asked for; cleared on read
+so a crash cannot retry forever) and starts them again afterwards. Pane hosts
+survive the `exec`, so a prompt resume lands inside their adoption grace.
+
+**A PATH trap comes with the merge.** The old model passed
+`env PATH=<login shell PATH>` on every spawned project's command line, because
+a daemon started from a minimal environment cannot find nvm/cargo-installed
+providers. In-process, projects inherit the daemon's PATH, so the daemon
+applies the login shell PATH to itself before any project starts.
+
+**The rollout is not additive.** An older instance's projects are separate
+processes this one cannot supervise, so a starting instance stops the
+process-per-project leftovers before starting anything — otherwise one `.apas`
+and one set of worktrees get two owners. It finds those by their `-d <path>`;
+it cannot find one a person started by running `apas` in a directory before
+that became register-and-exit, because those carry no arguments and nothing
+distinguishes them from an `apas --attach` in use. Those stay a manual step.
+
+`apas --headless -d <path>` survives as a way to run one project alone for
+debugging. Nothing spawns it, and a project with an external headless run is
+never given a second owner.
+
 ## One instance per user per host
 
 Running `apas` in a project directory **registers that project and exits**. It
