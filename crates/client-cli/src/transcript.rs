@@ -57,6 +57,38 @@ pub fn claude_transcript_path(home: &Path, cwd: &Path, session_id: &str) -> Path
         .join(format!("{session_id}.jsonl"))
 }
 
+/// Where a pinned claude session's transcript actually is.
+///
+/// `claude_transcript_path` is where it *should* be: the slug of the pane's
+/// cwd. Claude Code can move a session into one of its own worktrees
+/// (`.claude/worktrees/<name>`), and it then writes under the slug of that
+/// directory instead — a pane whose provider relocated leaves no file where
+/// APAS is watching, looks permanently idle, and (before the floor fix) adopted
+/// whatever else was in the project-root slug. Observed on a live pane whose
+/// provider had cwd `…/mako/.claude/worktrees/masstree-rocks`.
+///
+/// The session id is minted by APAS and names the file wherever it lands, so it
+/// can be found by name. The cwd slug is still tried first and costs one
+/// `exists` call; the scan only happens while no file is there, which is also
+/// the pane's first moments before its first turn.
+pub fn locate_claude_transcript(home: &Path, cwd: &Path, session_id: &str) -> PathBuf {
+    let expected = claude_transcript_path(home, cwd, session_id);
+    if expected.exists() {
+        return expected;
+    }
+    let file_name = format!("{session_id}.jsonl");
+    let Ok(entries) = std::fs::read_dir(home.join(".claude").join("projects")) else {
+        return expected;
+    };
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let candidate = entry.path().join(&file_name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    expected
+}
+
 /// Find the newest session file a claude terminal pane should follow after an
 /// in-TUI session switch.
 ///
@@ -70,16 +102,13 @@ pub fn claude_transcript_path(home: &Path, cwd: &Path, session_id: &str) -> Path
 ///
 /// Returns `None` when no switch has happened.
 pub fn find_claude_switch_candidate(
-    home: &Path,
-    cwd: &Path,
     current_path: &Path,
     last_growth: std::time::SystemTime,
     excluded_ids: &HashSet<String>,
 ) -> Option<PathBuf> {
-    let dir = home
-        .join(".claude")
-        .join("projects")
-        .join(claude_dir_slug(cwd));
+    // The directory of the file being tracked, not of the pane's cwd: once a
+    // session has moved into a worktree, its switches happen where it now is.
+    let dir = current_path.parent()?.to_path_buf();
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(_) => return None,
@@ -660,6 +689,55 @@ pub fn read_turns(path: &Path, pane_id: u32, is_codex: bool) -> Result<Vec<TurnR
 mod tests {
     use super::*;
 
+    /// Claude Code can move a session into one of its own worktrees, after
+    /// which it writes under that directory's slug rather than the pane's cwd.
+    /// A live pane hit this: its provider had cwd
+    /// `…/mako/.claude/worktrees/masstree-rocks`, no file ever appeared where
+    /// APAS was watching, and the pane showed an unrelated conversation
+    /// instead. The session id is ours and names the file wherever it lands.
+    #[test]
+    fn a_relocated_session_is_found_by_its_id_in_another_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let session = "11111111-2222-4333-8444-555555555555";
+        let cwd = Path::new("/home/users/shuai/mako");
+
+        // Nothing anywhere yet: the pinned path is still the answer, so a pane
+        // that has not had its first turn watches where the file should appear.
+        assert_eq!(
+            locate_claude_transcript(home.path(), cwd, session),
+            claude_transcript_path(home.path(), cwd, session),
+        );
+
+        // The provider relocated into a Claude worktree and wrote there.
+        let moved_dir = claude_projects_dir(
+            home.path(),
+            "/home/users/shuai/mako/.claude/worktrees/masstree-rocks",
+        );
+        let moved = moved_dir.join(format!("{session}.jsonl"));
+        std::fs::write(&moved, "{}").unwrap();
+
+        assert_eq!(
+            locate_claude_transcript(home.path(), cwd, session),
+            moved,
+            "the pane's own transcript is found where the provider actually wrote it"
+        );
+    }
+
+    #[test]
+    fn the_expected_location_wins_when_the_file_is_where_it_should_be() {
+        let home = tempfile::tempdir().unwrap();
+        let session = "11111111-2222-4333-8444-555555555555";
+        let cwd = Path::new("/wanted");
+        let dir = claude_projects_dir(home.path(), "/wanted");
+        let expected = dir.join(format!("{session}.jsonl"));
+        std::fs::write(&expected, "{}").unwrap();
+        // A same-named file elsewhere must not win over the cwd slug.
+        let other = claude_projects_dir(home.path(), "/elsewhere");
+        std::fs::write(other.join(format!("{session}.jsonl")), "{}").unwrap();
+
+        assert_eq!(locate_claude_transcript(home.path(), cwd, session), expected);
+    }
+
     #[test]
     fn claude_transcript_path_is_exact_for_a_pinned_session() {
         // Verified against a live transcript: the directory is the absolute
@@ -1107,9 +1185,7 @@ mod tests {
 
         assert!(
             find_claude_switch_candidate(
-                home.path(),
-                Path::new("/wanted"),
-                &pinned,
+            &pinned,
                 pane_started,
                 &HashSet::new(),
             )
@@ -1121,9 +1197,7 @@ mod tests {
         write_session(&dir, "switched-to.jsonl");
         assert_eq!(
             find_claude_switch_candidate(
-                home.path(),
-                Path::new("/wanted"),
-                &pinned,
+            &pinned,
                 pane_started,
                 &HashSet::new(),
             )
@@ -1152,8 +1226,6 @@ mod tests {
 
         let excluded: HashSet<String> = ["other-pane".to_string()].into_iter().collect();
         let found = find_claude_switch_candidate(
-            home.path(),
-            Path::new("/wanted"),
             &pinned,
             last_growth,
             &excluded,
@@ -1180,8 +1252,6 @@ mod tests {
 
         let excluded: HashSet<String> = ["other-pane".to_string()].into_iter().collect();
         assert!(find_claude_switch_candidate(
-            home.path(),
-            Path::new("/wanted"),
             &pinned,
             last_growth,
             &excluded,
@@ -1207,8 +1277,6 @@ mod tests {
         // eligible, so the switch back is followed.
         let excluded: HashSet<String> = ["other-pane".to_string()].into_iter().collect();
         let found = find_claude_switch_candidate(
-            home.path(),
-            Path::new("/wanted"),
             &current,
             last_growth,
             &excluded,
@@ -1231,8 +1299,6 @@ mod tests {
             .unwrap();
         let excluded: HashSet<String> = HashSet::new();
         assert!(find_claude_switch_candidate(
-            home.path(),
-            Path::new("/wanted"),
             &pinned,
             last_growth,
             &excluded,

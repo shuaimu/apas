@@ -3227,7 +3227,11 @@ async fn run_inner(
                             let Some(home) = home.as_deref() else {
                                 continue;
                             };
-                            let pinned = crate::transcript::claude_transcript_path(
+                            // Where the file actually is, not only where it
+                            // ought to be: Claude Code can move a session into
+                            // one of its own worktrees and write under that
+                            // directory's slug instead.
+                            let pinned = crate::transcript::locate_claude_transcript(
                                 home,
                                 &transcript_cwd,
                                 &conv_id.to_string(),
@@ -3242,6 +3246,21 @@ async fn run_inner(
                             let watch = claude_watch
                                 .entry(pane_id)
                                 .or_insert_with(|| ClaudeWatchState::new(pinned.clone()));
+                            // A watch whose file has never appeared may be
+                            // watching the wrong directory entirely — the
+                            // provider relocated before writing its first turn.
+                            // Re-point it at the pinned path once that resolves
+                            // somewhere real, rather than sitting idle until the
+                            // switch heuristic guesses.
+                            if watch.mtime.is_none() && watch.path != pinned && pinned.exists() {
+                                tracing::info!(
+                                    pane_id,
+                                    from = %watch.path.display(),
+                                    to = %pinned.display(),
+                                    "claude terminal pane found its transcript in another directory"
+                                );
+                                *watch = ClaudeWatchState::new(pinned.clone());
+                            }
                             let meta = std::fs::metadata(&watch.path).ok();
                             let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
                             let mtime = meta.as_ref().and_then(|m| m.modified().ok());
@@ -3266,8 +3285,6 @@ async fn run_inner(
                                     })
                                     .unwrap_or_default();
                                 if let Some(next) = crate::transcript::find_claude_switch_candidate(
-                                    home,
-                                    &transcript_cwd,
                                     &watch.path,
                                     watch.switch_floor(),
                                     &excluded,
