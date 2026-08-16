@@ -176,23 +176,6 @@ pub fn resolve_preferred_apas_executable() -> PathBuf {
     )
 }
 
-/// Cheap identity of the installed `apas` binary: (length, mtime seconds).
-///
-/// Used as a change gate so the version check costs one `stat` per tick
-/// instead of spawning `apas --version` every time. Length plus mtime is
-/// enough — an install writes a new file, it does not edit one in place.
-pub fn apas_binary_fingerprint() -> Option<(u64, i64)> {
-    let path = resolve_preferred_apas_executable();
-    let md = std::fs::metadata(path).ok()?;
-    let mtime = md
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs() as i64;
-    Some((md.len(), mtime))
-}
-
 /// Version reported by the installed binary, by running it.
 ///
 /// Deliberately executes it rather than trusting a recorded value: the whole
@@ -209,23 +192,6 @@ pub fn binary_version(path: &Path) -> Option<String> {
     // `apas --version` prints "apas YY.MM.N".
     let text = String::from_utf8_lossy(&out.stdout);
     text.split_whitespace().nth(1).map(str::to_string)
-}
-
-fn installed_binary_version() -> Option<String> {
-    binary_version(&resolve_preferred_apas_executable())
-}
-
-/// The installed binary's version, when it is strictly newer than the running
-/// one.
-///
-/// Returns `None` on equal, older, or unparseable versions. Refusing to act on
-/// an unparseable version is deliberate: a daemon that cannot tell which build
-/// is newer must not gamble, or a bad read could downgrade a whole cluster.
-pub fn newer_installed_version() -> Option<String> {
-    let installed = installed_binary_version()?;
-    let a = parse_version(&installed)?;
-    let b = parse_version(CURRENT_VERSION)?;
-    (a > b).then_some(installed)
 }
 
 /// Ensure the source repo exists (clone if not, fetch if exists)
@@ -778,10 +744,12 @@ pub fn restart_cli() {
 #[cfg(test)]
 mod tests {
 
-    /// The self-upgrade decision. A daemon acts on this unattended, so a wrong
-    /// answer downgrades or thrashes a machine nobody is watching.
+    /// The decision a requested restart makes: whether the version waiting in
+    /// the source repo is actually newer than the one running. Nothing acts on
+    /// this unattended any more, but a wrong answer still downgrades the
+    /// machine whose restart was asked for.
     #[test]
-    fn version_ordering_drives_the_daemon_self_upgrade() {
+    fn version_ordering_drives_a_requested_restart() {
         let newer = |a: &str, b: &str| match (parse_version(a), parse_version(b)) {
             (Some(x), Some(y)) => x > y,
             _ => false,
@@ -791,7 +759,8 @@ mod tests {
         assert!(newer("26.09.1", "26.08.99"), "later month wins over commit");
         assert!(newer("27.01.0", "26.12.99"), "later year wins over month");
 
-        // Equal must NOT restart, or the daemon re-execs every tick forever.
+        // Equal is not an update: a restart still replaces the process, but it
+        // must not report that it is bringing a new version.
         assert!(!newer("26.08.18", "26.08.18"));
 
         // Older must NOT restart. An accidental downgrade across a cluster
@@ -805,16 +774,6 @@ mod tests {
         assert!(!newer("26.08", "26.08.18"), "wrong arity is unparseable");
     }
 
-    #[test]
-    fn a_binary_fingerprint_is_available_and_stable_between_calls() {
-        // The stat gate: it must return something for the running binary, and
-        // must not change on its own, or the daemon would spawn
-        // `apas --version` on every heartbeat.
-        if let Some(first) = apas_binary_fingerprint() {
-            assert_eq!(first, apas_binary_fingerprint().unwrap());
-            assert!(first.0 > 0, "length should be non-zero");
-        }
-    }
     use super::*;
     use tempfile::tempdir;
 

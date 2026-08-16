@@ -313,26 +313,32 @@ async fn main() -> Result<()> {
                 if let Some(existing) = detect_running_daemon(&state_path, &legacy_pid_path) {
                     // Skip if the detected PID is ourselves (auto-start wrote state before we ran)
                     if existing.pid != my_pid {
-                        let should_restart = should_restart_for_version(
+                        // An older instance used to be stopped and replaced
+                        // here. It hosts this machine's projects now, and
+                        // stopping it that way (SIGTERM, four seconds, SIGKILL)
+                        // ends them without saving anything or bringing them
+                        // back. Replacing it is the restart on the Machines
+                        // page, which updates first and `exec`s in place.
+                        let older = should_restart_for_version(
                             existing.version.as_deref(),
                             CURRENT_VERSION,
                         );
-                        if should_restart {
-                            tracing::info!(
-                                "Restarting daemon pid {} due to older/unknown version {:?} -> {}",
-                                existing.pid,
-                                existing.version,
-                                CURRENT_VERSION
-                            );
-                            stop_daemon_process(existing.pid)?;
-                        } else {
+                        println!(
+                            "Daemon already running (pid {}, version {}).",
+                            existing.pid,
+                            existing
+                                .version
+                                .clone()
+                                .unwrap_or_else(|| "unknown".to_string())
+                        );
+                        if older {
                             println!(
-                                "Daemon already running (pid {}, version {}).",
-                                existing.pid,
-                                existing.version.unwrap_or_else(|| "unknown".to_string())
+                                "! It is older than this binary ({CURRENT_VERSION}) and is left running,"
                             );
-                            return Ok(());
+                            println!("   because it is running this host's projects.");
+                            println!("   Restart it from the Machines page to update it.");
                         }
+                        return Ok(());
                     }
                 }
 
@@ -668,22 +674,56 @@ fn attach_to_running_project(working_dir: &std::path::Path) -> AttachOutcome {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum LaunchDaemonPlan {
+    /// Nothing is running here; this launch starts the instance.
+    Start,
+    /// One is already running. `older` only decides what to say — never
+    /// whether to act.
+    LeaveRunning { older: bool },
+}
+
+/// What a launch does about the instance already on this host.
+///
+/// Separated from the spawning so the decision is testable, the way
+/// `plan_daemon_restart` is. The decision itself is now trivial, and that is
+/// the point: the branch that used to stop a running daemon for being older is
+/// gone, because it hosts this machine's projects.
+fn plan_launch_daemon(running: Option<&RunningDaemon>, target_version: &str) -> LaunchDaemonPlan {
+    match running {
+        None => LaunchDaemonPlan::Start,
+        Some(running) => LaunchDaemonPlan::LeaveRunning {
+            older: should_restart_for_version(running.version.as_deref(), target_version),
+        },
+    }
+}
+
 fn ensure_daemon_running(server: &str, roots: &[String], target_version: &str) -> Result<()> {
     let state_path = config::Config::daemon_state_path()?;
     let legacy_pid_path = config::Config::daemon_pid_path()?;
 
-    if let Some(running) = detect_running_daemon(&state_path, &legacy_pid_path) {
-        if should_restart_for_version(running.version.as_deref(), target_version) {
-            tracing::info!(
-                "Auto-restarting daemon pid {} for version upgrade {:?} -> {}",
-                running.pid,
-                running.version,
-                target_version
+    let running = detect_running_daemon(&state_path, &legacy_pid_path);
+    // A launch used to stop an older daemon and start a new one here, back when
+    // the daemon owned nothing and replacing it was invisible. It now runs the
+    // projects, so that would kill whatever is running on the host — and via
+    // SIGTERM/SIGKILL rather than the `exec` a real restart uses, so nothing
+    // would be saved and nothing would come back. Whoever types `apas` in a
+    // directory is a bystander to that work, not its owner.
+    if let LaunchDaemonPlan::LeaveRunning { older } =
+        plan_launch_daemon(running.as_ref(), target_version)
+    {
+        if older {
+            let version = running
+                .as_ref()
+                .and_then(|running| running.version.as_deref())
+                .unwrap_or("unknown version");
+            println!(
+                "! This machine's APAS instance is older ({version}) than this binary ({target_version})."
             );
-            stop_daemon_process(running.pid)?;
-        } else {
-            return Ok(());
+            println!("   It is left running, because it is running this host's projects.");
+            println!("   Update it from the Machines page: restart it there and it updates first.");
         }
+        return Ok(());
     }
 
     let mut cmd = Command::new(resolve_apas_executable());
@@ -791,32 +831,6 @@ fn detect_running_daemon_with_process_check(
     }
     let _ = fs::remove_file(legacy_pid_path);
     None
-}
-
-fn stop_daemon_process(pid: u32) -> Result<()> {
-    if !is_apas_daemon_process(pid) {
-        return Ok(());
-    }
-
-    let _ = Command::new("kill").arg(pid.to_string()).status();
-
-    for _ in 0..40 {
-        if !is_apas_daemon_process(pid) {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
-
-    for _ in 0..20 {
-        if !is_apas_daemon_process(pid) {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    anyhow::bail!("Failed to stop existing daemon process {}", pid)
 }
 
 fn resolve_apas_executable() -> PathBuf {
@@ -943,7 +957,8 @@ fn parse_bool_config(key: &str, value: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_running_daemon_with_process_check, get_config_value, read_daemon_state,
+        detect_running_daemon_with_process_check, get_config_value, plan_launch_daemon,
+        read_daemon_state,
         read_legacy_daemon_pid, set_config_value, should_restart_for_version, write_daemon_state,
         DaemonStateFile, DaemonStateGuard,
     };
@@ -1078,6 +1093,49 @@ mod tests {
         assert_eq!(
             read_legacy_daemon_pid(&dir.path().join("missing.pid")),
             None
+        );
+    }
+
+    /// The daemon hosts this machine's projects, so a launch that found an
+    /// older one used to end every project on the host — by SIGTERM then
+    /// SIGKILL, with no teardown, no saved pane roster, and no resume manifest.
+    #[test]
+    fn a_launch_leaves_a_running_instance_alone_however_old_it_is() {
+        use super::{LaunchDaemonPlan, RunningDaemon};
+
+        let running = |version: Option<&str>| RunningDaemon {
+            pid: 4242,
+            version: version.map(str::to_string),
+        };
+
+        // Older, and by a lot. Still left running.
+        assert_eq!(
+            plan_launch_daemon(Some(&running(Some("26.06.1"))), "26.08.77"),
+            LaunchDaemonPlan::LeaveRunning { older: true }
+        );
+        // An unknown version used to count as "restart it".
+        assert_eq!(
+            plan_launch_daemon(Some(&running(None)), "26.08.77"),
+            LaunchDaemonPlan::LeaveRunning { older: true }
+        );
+        // Same and newer are left running too, and say nothing about updating.
+        assert_eq!(
+            plan_launch_daemon(Some(&running(Some("26.08.77"))), "26.08.77"),
+            LaunchDaemonPlan::LeaveRunning { older: false }
+        );
+        assert_eq!(
+            plan_launch_daemon(Some(&running(Some("26.09.1"))), "26.08.77"),
+            LaunchDaemonPlan::LeaveRunning { older: false }
+        );
+    }
+
+    #[test]
+    fn a_launch_still_starts_an_instance_when_none_is_running() {
+        // The rule is about not replacing a running instance, not about
+        // refusing to start one.
+        assert_eq!(
+            plan_launch_daemon(None, "26.08.77"),
+            super::LaunchDaemonPlan::Start
         );
     }
 

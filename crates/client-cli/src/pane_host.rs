@@ -1411,6 +1411,9 @@ mod tests {
 
     #[test]
     fn project_host_cleanup_is_tombstoned_and_idempotent_for_stale_descriptors() {
+        // Resolves the runtime root from the environment, so it has to be
+        // serialised against the tests that move it.
+        let _env = crate::project::test_support::env_lock();
         let project_id = Uuid::new_v4();
         let runtime_id = Uuid::new_v4();
         let paths = runtime_paths(project_id, 55, runtime_id).unwrap();
@@ -1507,6 +1510,9 @@ mod tests {
 
     #[test]
     fn project_stop_wins_against_reboot_detach_and_delayed_adoption() {
+        // Resolves the runtime root from the environment, so it has to be
+        // serialised against the tests that move it.
+        let _env = crate::project::test_support::env_lock();
         let root = tempfile::tempdir().unwrap();
         let (runtime_dir, descriptor, credential) = test_runtime(&root, 56);
         let provider = root.path().join("stop-race-provider.sh");

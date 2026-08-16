@@ -741,20 +741,57 @@ would stop the daemon running more than one project.
 is a local view for when the web is unreachable, it renders little beyond pane
 names, and it is expected to be removed if nothing uses it.
 
-## The daemon upgrades itself
+## The daemon is replaced only when asked
 
-The daemon checks **every 15 minutes** whether the installed `apas` binary is
-newer than the one it is running, and re-execs into it if so. Its own interval,
-not the 10s heartbeat: an upgrade is never urgent, and tying it to the heartbeat
-exercised the version path 360x more often than anything benefited from.
+Replacing the daemon used to be nearly free: it owned no long-lived children, so
+a **15-minute self-upgrade tick** was a good trade — unattended hosts stayed
+current and nothing running noticed. zoo-002 sitting nine versions behind was
+the problem it solved.
 
-Before this, `ensure_daemon_running` was the only upgrade path, and it runs on
-*interactive CLI startup* — so a node nobody logs into keeps its daemon
-forever. zoo-002 sat nine versions behind for exactly that reason.
+Projects run **inside** the daemon now. Replacing it is the same act as stopping
+every project on the host and starting them again, so nothing does it on a
+schedule any more. **The tick is gone**, along with the `stat`-based gate it
+needed (`apas_binary_fingerprint`, `newer_installed_version`). Installing a
+binary to the shared path no longer propagates on its own.
 
-**Cost is one `stat` per tick.** The binary's (length, mtime) is the gate;
-`apas --version` is spawned only when that changes, since an install writes a
-new file rather than editing one in place.
+**A launch does not replace it either.** `apas` in a project directory, and
+`apas daemon`, both used to stop an older daemon and start a fresh one. That was
+invisible when the daemon owned nothing; now it ends every project on the host —
+and by `stop_daemon_process`'s SIGTERM/4s/SIGKILL, so nothing is saved, no
+resume manifest is written, and nothing comes back. Whoever types `apas` in a
+directory is a bystander to that work. Both paths now report that the running
+instance is older and point at the Machines page; `stop_daemon_process` is gone
+with its last caller. `plan_launch_daemon` holds the decision so it is testable
+away from the spawning, the way `plan_daemon_restart` does.
+
+**The requested restart is the whole upgrade path**, from the Machines list on
+desktop and mobile (`WebToServer::RebootDaemon { machine_id }` →
+`ServerToDaemon::RebootDaemon`). It is addressed by **machine**, not through a
+project: a daemon is per-machine, and a host running nothing still has one worth
+restarting. The server authorizes the machine against the requester's own daemon
+registrations — the same check `StartMachineProjectCli` uses — and reports an
+offline daemon rather than dropping the request.
+
+A requested restart **applies an available update first**, via
+`prepare_cli_restart`, so `check_for_update_available` syncs the git repo and
+pull/build/install all complete while the current daemon is still serving; a
+failure leaves that daemon working rather than the machine with none. It is what
+lets a CLI update roll out from a phone instead of an SSH session. A version
+that only touches the web frontend or docs skips the rebuild
+(`pending_update_needs_rebuild`). Progress past "requested" is deliberately not
+reported — the daemon replaces its own process image, so anything further would
+have to outlive the process that would report it.
+
+It upgrades only. Equal, older, or unparseable versions replace in place;
+an accidental downgrade across a cluster sharing one NFS home would be painful
+to unpick.
+
+**The cost of removing the tick is that a host nobody visits keeps its version
+forever** — exactly the zoo-002 problem, deliberately reaccepted. What makes it
+tolerable is that the machine lists now *show* it: each machine displays the
+version its daemon reports, and its restart control reads "Reboot to update"
+when that version is behind the newest one the client can see. The old failure
+was that nothing surfaced it.
 
 **It re-execs rather than spawn-and-exit**, which matters for three reasons:
 
@@ -766,6 +803,14 @@ new file rather than editing one in place.
   peer daemon sees those projects unclaimed and could spawn a duplicate CLI
   against the same `.apas` and worktrees — the race the claim system exists to
   prevent.
+
+**Stopping it stops its projects.** The signal handler is registered with
+`ctrlc`'s `termination` feature, so a SIGTERM sets the same shutdown flag a
+SIGINT does. Without that only SIGINT is handled, and a `setsid`-detached daemon
+essentially never receives one — the teardown that saves each project's pane
+roster and ends its agent subtrees would be unreachable, and nothing would look
+any different. A test fails if the feature is ever dropped, for the same reason
+one fails if `panic = "abort"` is ever set.
 
 **Claims are reconciled at daemon startup.** `reconcile_running_claims` claims
 every project this host is already running, because claims are otherwise only
@@ -784,38 +829,9 @@ the running process — so keeping the old pid left the claim un-refreshed, stal
 within `STALE_AFTER_SECS`, and free for a peer to take while we were actively
 running the project.
 
-**Headless project CLIs are untouched.** They are owned by a per-project
-`tmux:server`, not by the daemon — the daemon has no long-lived children — so
-nothing about replacing the daemon's process image reaches them. And because
-`exec` preserves the pid, even a direct child would survive.
-
-Their *reported* state survives too: `snapshot_projects` derives `is_running`
-from `headless_pid_for()`, which scans `/proc` for a headless CLI with that
-`-d <path>`, rather than from the daemon's in-memory `sessions` map. So the map
-being reset by the re-exec costs nothing — the web still shows them running. The
-map self-heals on the next `StartProjectCli`, which re-checks `/proc` before
-spawning and therefore cannot double-start a project that is already up.
-
-**A restart can also be requested**, from the Machines list on mobile
-(`WebToServer::RebootDaemon { machine_id }` → `ServerToDaemon::RebootDaemon`).
-It is addressed by **machine**, not through a project: a daemon is per-machine,
-and a host running nothing still has one worth restarting. The server
-authorizes the machine against the requester's own daemon registrations — the
-same check `StartMachineProjectCli` uses — and reports an offline daemon rather
-than dropping the request.
-
-A requested restart **applies an available update first**, via
-`prepare_cli_restart`, so pull/build/install all complete while the current
-daemon is still serving and a failure leaves that daemon working rather than
-the machine with none. Without that it would only restart the same binary,
-which is not the reason anyone reaches for it: it is what lets a CLI update
-roll out from a phone instead of an SSH session. Progress past "requested" is
-deliberately not reported — the daemon replaces its own process image, so
-anything further would have to outlive the process that would report it.
-
-It upgrades only. Equal, older, or unparseable versions do nothing — equal would
-re-exec every tick forever, and an accidental downgrade across a cluster sharing
-one NFS home would be painful to unpick.
+**Pane hosts are untouched.** They own the PTYs in their own tmux sessions, so
+nothing about replacing the daemon's process image reaches them, and a
+replacement that lands inside their adoption grace picks the terminals back up.
 
 ## Terminal-pane history: read the provider's transcript
 

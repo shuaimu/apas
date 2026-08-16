@@ -46,7 +46,11 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 hostname = "0.4.2"
-ctrlc = "3.4"
+# `termination` so SIGTERM sets the shutdown flag instead of ending the process
+# outright. Without it only SIGINT is handled, and a `setsid`-detached daemon
+# essentially never receives one — so the shutdown that stops each project and
+# saves its pane roster was unreachable in practice.
+ctrlc = { version = "3.4", features = ["termination"] }
 
 # TUI for dual-pane mode
 ratatui = "0.29"

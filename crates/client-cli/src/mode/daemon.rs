@@ -24,7 +24,6 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// fine — and the check costs a `stat` plus, on change, spawning
 /// `apas --version`. Tying it to the 10s heartbeat meant the version path was
 /// exercised 360x more often than anything could benefit from.
-const UPGRADE_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const VERSION: &str = env!("APAS_VERSION");
 const TMUX_SESSION_PREFIX: &str = "apas";
@@ -1135,16 +1134,6 @@ async fn run_connection(
     ws_sender.send(Message::Text(text.into())).await?;
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
-    // Snapshot of the installed binary at boot. A change here is what triggers
-    // the (more expensive) version comparison. Seeded now rather than left
-    // empty so an unchanged binary never provokes a check.
-    #[allow(unused_mut)]
-    let mut binary_fingerprint = crate::update::apas_binary_fingerprint();
-    let mut upgrade_check = tokio::time::interval(UPGRADE_CHECK_INTERVAL);
-    // `interval` fires immediately on first tick; that first check is harmless
-    // (the fingerprint was just seeded, so it is a no-op) and means a daemon
-    // started against an already-newer binary corrects itself at once.
-    upgrade_check.tick().await;
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut usage_refresh = tokio::time::interval(USAGE_REFRESH_INTERVAL);
     usage_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1182,26 +1171,6 @@ async fn run_connection(
             }
             _ = usage_refresh.tick() => {
                 refresh_usage_limits_cache().await;
-            }
-            _ = upgrade_check.tick() => {
-                // The stat is the gate: `apas --version` is only spawned when
-                // the binary on disk has actually changed.
-                #[cfg(unix)]
-                {
-                    let fp = crate::update::apas_binary_fingerprint();
-                    if fp != binary_fingerprint {
-                        binary_fingerprint = fp;
-                        if let Some(newer) = crate::update::newer_installed_version() {
-                            // Never returns on success.
-                            let running = state.running_project_ids();
-                            let err = exec_into_newer_binary(&newer, &running);
-                            tracing::error!(
-                                %err,
-                                "daemon self-upgrade re-exec failed; continuing on the old binary"
-                            );
-                        }
-                    }
-                }
             }
             _ = heartbeat.tick() => {
                 state.reap_exited_processes();
@@ -1492,6 +1461,27 @@ mod containment_tests {
     /// panic would abort the process and take every other project on the host
     /// with it — silently, since nothing else would change. This fails if
     /// anyone ever sets it.
+    /// The instance stops its projects on shutdown, but only when something
+    /// sets the shutdown flag. `ctrlc` handles SIGINT alone unless the
+    /// `termination` feature is on, and a `setsid`-detached daemon essentially
+    /// never receives a SIGINT — so without this the whole teardown is
+    /// unreachable and nothing looks any different. This fails if the feature
+    /// is ever dropped.
+    #[test]
+    fn stopping_the_instance_must_reach_its_teardown() {
+        let manifest = include_str!("../../Cargo.toml");
+        let line = manifest
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("ctrlc"))
+            .expect("the signal handler dependency is declared");
+        assert!(
+            line.contains("termination"),
+            "without the termination feature a SIGTERM ends the instance \
+             outright, dropping every project it hosts: {line}"
+        );
+    }
+
     #[test]
     fn a_panicking_project_must_not_be_able_to_abort_the_instance() {
         let manifests = [
