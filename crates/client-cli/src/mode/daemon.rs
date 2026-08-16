@@ -56,11 +56,6 @@ fn resolve_user_shell_path() -> Option<String> {
     }
 }
 
-fn launch_path() -> String {
-    resolve_user_shell_path()
-        .or_else(|| std::env::var("PATH").ok())
-        .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".to_string())
-}
 
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
     value.and_then(|raw| {
@@ -174,10 +169,6 @@ fn read_process_rss_kb(pid: u32) -> Option<u64> {
     None
 }
 
-/// Quote a string for safe use inside a single-quoted sh -c argument.
-fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
 
 fn sanitize_for_unit(project_id: &str) -> String {
     project_id
@@ -249,6 +240,67 @@ struct ProjectEntry {
     last_error: Option<String>,
 }
 
+/// Projects that were running when this instance replaced itself.
+///
+/// Under the process-per-project model an upgrade left projects alone: they
+/// lived in their own tmux sessions and `exec` never touched them. Running
+/// them inside this process means `exec` takes them with it, so what was
+/// running has to be written down before the replacement and started again
+/// after it.
+///
+/// Kept in the runtime directory deliberately: it is volatile, so a machine
+/// reboot clears it and nothing auto-starts on boot that nobody asked for.
+fn resume_manifest_path() -> Option<std::path::PathBuf> {
+    let dir = crate::config::Config::runtime_dir().ok()?.join("sup");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("resume.json"))
+}
+
+fn write_resume_manifest(project_ids: &[String]) {
+    let Some(path) = resume_manifest_path() else {
+        return;
+    };
+    write_resume_manifest_at(&path, project_ids);
+}
+
+/// The manifest logic, given its path. Split out so it is testable without
+/// mutating process-wide environment variables — several test modules already
+/// move `XDG_RUNTIME_DIR` under their own locks, and adding another writer
+/// makes them race rather than serialise.
+fn write_resume_manifest_at(path: &std::path::Path, project_ids: &[String]) {
+    if project_ids.is_empty() {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    match serde_json::to_vec(project_ids) {
+        Ok(bytes) => {
+            if let Err(err) = std::fs::write(path, bytes) {
+                // Losing this costs a restart of the projects, not the
+                // projects themselves, so it is not worth failing the upgrade.
+                tracing::warn!(%err, "could not record which projects to resume");
+            }
+        }
+        Err(err) => tracing::warn!(%err, "could not encode the resume manifest"),
+    }
+}
+
+/// Read and clear the manifest. Cleared on read so a crash during resume does
+/// not leave the instance trying the same start on every boot.
+fn take_resume_manifest() -> Vec<String> {
+    match resume_manifest_path() {
+        Some(path) => take_resume_manifest_at(&path),
+        None => Vec::new(),
+    }
+}
+
+fn take_resume_manifest_at(path: &std::path::Path) -> Vec<String> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    let _ = std::fs::remove_file(path);
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
 /// Re-exec into the installed binary when it is newer than the running one.
 ///
 /// The daemon is the only thing that upgrades a machine unattended. Before
@@ -273,8 +325,11 @@ struct ProjectEntry {
 ///
 /// Returns only on failure — on success the process image is gone.
 #[cfg(unix)]
-fn exec_into_newer_binary(version: &str) -> std::io::Error {
+fn exec_into_newer_binary(version: &str, running: &[String]) -> std::io::Error {
     use std::os::unix::process::CommandExt;
+    // `exec` runs no destructors, so this is the last moment the replacement
+    // can be told what was running.
+    write_resume_manifest(running);
     let exe = crate::update::resolve_preferred_apas_executable();
     let args: Vec<String> = std::env::args().skip(1).collect();
     tracing::info!(
@@ -312,7 +367,7 @@ fn plan_daemon_restart(available: Option<String>) -> RestartPlan {
 /// update leaves a working daemon rather than a machine with none. That is
 /// the same discipline `prepare_cli_restart` uses for project CLIs.
 #[cfg(unix)]
-fn perform_requested_restart() -> anyhow::Error {
+fn perform_requested_restart(running: &[String]) -> anyhow::Error {
     match plan_daemon_restart(crate::update::check_for_update_available()) {
         RestartPlan::UpdateThenReplace(newer) => {
             tracing::info!(%newer, "daemon restart requested: preparing update before replacing");
@@ -325,20 +380,33 @@ fn perform_requested_restart() -> anyhow::Error {
                     return err;
                 }
             }
-            anyhow::Error::from(exec_into_newer_binary(&newer))
+            anyhow::Error::from(exec_into_newer_binary(&newer, running))
         }
         RestartPlan::ReplaceInPlace => {
             tracing::info!("daemon restart requested: already current, replacing in place");
-            anyhow::Error::from(exec_into_newer_binary(env!("APAS_VERSION")))
+            anyhow::Error::from(exec_into_newer_binary(env!("APAS_VERSION"), running))
         }
     }
 }
 
 #[derive(Debug)]
+/// A project running inside this process.
+///
+/// The handle and the flag are the whole of supervision: the flag ends the
+/// project through its ordinary teardown, and the handle says whether it is
+/// still going. This replaces asking `/proc` whether some other process
+/// exists, which is how running state could disagree with reality.
+struct RunningProject {
+    shutdown: Arc<AtomicBool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
 struct DaemonState {
     machine_info: MachineInfo,
     projects: HashMap<String, ProjectEntry>,
     sessions: HashMap<String, String>,
+    /// Projects this instance is running, keyed by project id.
+    running: HashMap<String, RunningProject>,
 }
 
 impl DaemonState {
@@ -346,6 +414,7 @@ impl DaemonState {
         Self {
             machine_info,
             projects: HashMap::new(),
+            running: HashMap::new(),
             sessions: HashMap::new(),
         }
     }
@@ -430,6 +499,15 @@ impl DaemonState {
     /// than seized. That combination means two CLIs are already live for one
     /// project, which is the thing claims exist to prevent — stealing the claim
     /// would hide it, and the operator needs to see it.
+    /// Projects this instance is currently running.
+    fn running_project_ids(&self) -> Vec<String> {
+        self.running
+            .iter()
+            .filter(|(_, project)| !project.handle.is_finished())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     fn reconcile_running_claims(&mut self) {
         let registry_dir = config_dir_for_registry();
         for (project_id, project) in &self.projects {
@@ -469,13 +547,33 @@ impl DaemonState {
         let mut projects = Vec::with_capacity(self.projects.len());
 
         for (project_id, project) in &self.projects {
-            let pid = headless_pid_for(&project.path);
-            let memory_kb = pid.and_then(read_process_rss_kb);
+            // Held, not inferred. A project runs inside this process, so the
+            // task table is the answer; `/proc` is consulted only to notice an
+            // externally started `--headless` run, which is the debugging
+            // escape hatch rather than the normal path.
+            let running_here = self
+                .running
+                .get(project_id)
+                .is_some_and(|project| !project.handle.is_finished());
+            let external = headless_pid_for(&project.path);
+            let pid = if running_here {
+                Some(std::process::id())
+            } else {
+                external
+            };
+            // Memory is the whole instance once projects share it, so
+            // attributing it to one project would be a lie. Report it only for
+            // an external single-project run, where it still means something.
+            let memory_kb = if running_here {
+                None
+            } else {
+                external.and_then(read_process_rss_kb)
+            };
             projects.push(MachineProjectInfo {
                 project_id: project_id.clone(),
                 name: project.name.clone(),
                 path: project.path.to_string_lossy().to_string(),
-                is_running: pid.is_some(),
+                is_running: running_here || external.is_some(),
                 pid,
                 memory_kb,
                 last_error: project.last_error.clone(),
@@ -490,22 +588,23 @@ impl DaemonState {
         // Reap any exited tracked processes before deciding whether to spawn.
         self.reap_exited_processes();
 
+        // Already running here: the table answers this, not a tmux session we
+        // would have to go and look for.
         if self
-            .sessions
+            .running
             .get(project_id)
-            .map(|session_name| tmux_has_session(project_id, session_name))
-            .unwrap_or(false)
+            .is_some_and(|project| !project.handle.is_finished())
         {
             return Ok(());
         }
-        self.sessions.remove(project_id);
+        // A task that ended leaves an entry behind; drop it so the project can
+        // be started again without manual cleanup.
+        self.running.remove(project_id);
 
         let project = self
             .projects
             .get_mut(project_id)
             .ok_or_else(|| anyhow::anyhow!("Unknown project id: {}", project_id))?;
-
-        let session_name = tmux_session_name(project_id);
 
         // Cross-host guard first. `is_headless_running_for` below only reads
         // the local /proc, so on a shared-NFS cluster it cannot see a headless
@@ -535,99 +634,102 @@ impl DaemonState {
             }
         }
 
-        // Check if an external process (e.g. manually started via systemd-run,
-        // or surviving from a previous daemon) is already running for this project.
+        // An externally started `--headless -d <path>` run — the standalone
+        // debugging path, or a project left over from the process-per-project
+        // model. It is not ours to supervise, but starting a second owner for
+        // the same `.apas` and worktrees is exactly what must not happen.
         if is_headless_running_for(&project.path) {
-            if tmux_has_session(project_id, &session_name) {
-                self.sessions
-                    .insert(project_id.to_string(), session_name.clone());
-            }
             tracing::info!(
-                "Project {} already has a running headless CLI, skipping spawn",
-                project_id
+                project_id,
+                "project already has an external headless run; not starting a second"
             );
             return Ok(());
         }
 
-        // Prefer a real on-disk installed binary, never /proc/self/exe.
-        let executable = crate::update::resolve_preferred_apas_executable();
-        let child_path = launch_path();
-        if tmux_has_session(project_id, &session_name) {
-            tmux_kill_session(project_id, &session_name)?;
-        }
+        // The project runs here, as a task of this instance. It used to be a
+        // headless CLI in its own tmux session, which this daemon then could
+        // not see — running state was inferred from /proc, and a restarted
+        // daemon came back owning nothing.
+        //
+        // Blocking work inside a project stays on its own threads. Nothing
+        // here may block the runtime, or one project would stall the others.
+        let project_path = project.path.clone();
+        let project_shutdown = Arc::new(AtomicBool::new(false));
+        let task_shutdown = project_shutdown.clone();
+        let server = server_url.to_string();
+        let token = token.to_string();
+        let id_for_task = project_id.to_string();
+        let handle = tokio::spawn(async move {
+            // Every record this project emits carries its identity: sharing a
+            // process took away the per-project tmux session and log file that
+            // used to separate them for free.
+            let span = tracing::info_span!("project", id = %id_for_task);
+            let _entered = span.enter();
+            match crate::mode::dual_pane::run_project(
+                &server,
+                &token,
+                &project_path,
+                task_shutdown,
+            )
+            .await
+            {
+                Ok(crate::mode::dual_pane::ProjectOutcome::Completed) => {
+                    tracing::info!("project stopped");
+                }
+                Ok(crate::mode::dual_pane::ProjectOutcome::Stopped(reason)) => {
+                    // One project's fatal condition, contained: it used to end
+                    // the process, which would now end every other project.
+                    tracing::error!(%reason, "project stopped");
+                }
+                Ok(crate::mode::dual_pane::ProjectOutcome::RebootRequested) => {
+                    tracing::info!("project asked to restart");
+                }
+                Err(err) => {
+                    tracing::error!(%err, "project ended with an error");
+                }
+            }
+        });
 
-        // Per-project socket so each project gets its own tmux server, and
-        // one project's tmux dying doesn't affect others. tmux itself
-        // double-forks and the server reparents to PID 1 on detach, so it
-        // survives the daemon exiting and our login session ending.
-        let socket_name = tmux_socket_name(project_id);
-        // Log headless stderr to a per-project file so we can postmortem
-        // crashes (tmux normally swallows stderr into its pane buffer which
-        // is lost when tmux dies).
-        let stderr_log = format!("/tmp/apas-headless-{}.log", sanitize_for_unit(project_id));
-        // Build the command as "sh -c '... exec apas ... 2>>logfile'" so the
-        // redirection happens inside the shell tmux runs, after env/PATH have
-        // been applied.
-        // RUST_LOG=apas=info so the headless daemon emits the streaming worker's
-        // tracing::info! breadcrumbs (spawn, prompt-sent, reader-exit, inner
-        // loop break reason). Default tracing level is "warn", which hides
-        // them. The log goes to /tmp/apas-headless-<id>.log.
-        let inner_cmd = format!(
-            "exec env -u CLAUDECODE PATH={} RUST_LOG=apas=info {} --headless --server {} --token {} -d {} 2>>{}",
-            shell_escape(&child_path),
-            shell_escape(&executable.to_string_lossy()),
-            shell_escape(server_url),
-            shell_escape(token),
-            shell_escape(&project.path.to_string_lossy()),
-            shell_escape(&stderr_log),
+        project.last_error = None;
+        self.running.insert(
+            project_id.to_string(),
+            RunningProject {
+                shutdown: project_shutdown,
+                handle,
+            },
         );
-        let mut cmd = Command::new("tmux");
-        cmd.arg("-L")
-            .arg(&socket_name)
-            .arg("new-session")
-            .arg("-d")
-            .arg("-s")
-            .arg(&session_name)
-            .arg("-c")
-            .arg(&project.path)
-            .arg("sh")
-            .arg("-c")
-            .arg(&inner_cmd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        let output = cmd.output();
+        tracing::info!(project_id, "started project in this instance");
+        Ok(())
+    }
 
-        match output {
-            Ok(output) if output.status.success() => {
-                project.last_error = None;
-                self.sessions
-                    .insert(project_id.to_string(), session_name.clone());
-                tracing::info!(
-                    "Started project {} headless CLI in tmux session {}",
-                    project_id,
-                    session_name
-                );
-                Ok(())
+    /// Stop a project and wait for it to finish tearing down.
+    ///
+    /// Bounded, because teardown kills pane children and joins roughly thirty
+    /// threads: a project that will not stop must not hold the instance that
+    /// every other project is running in.
+    async fn stop_running_project(&mut self, project_id: &str) {
+        let Some(project) = self.running.remove(project_id) else {
+            return;
+        };
+        project.shutdown.store(true, Ordering::SeqCst);
+        match tokio::time::timeout(std::time::Duration::from_secs(30), project.handle).await {
+            Ok(Ok(())) => tracing::info!(project_id, "project stopped"),
+            Ok(Err(err)) => {
+                // A panicking project unwinds its own task. Reported, and the
+                // instance and every other project carry on.
+                tracing::error!(project_id, %err, "project ended abnormally");
             }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                let err_msg = if stderr.is_empty() {
-                    format!("tmux exited with status {}", output.status)
-                } else {
-                    stderr
-                };
-                project.last_error = Some(format!("Failed to start CLI: {}", err_msg));
-                Err(anyhow::anyhow!(err_msg))
-            }
-            Err(err) => {
-                project.last_error = Some(format!("Failed to start CLI: {}", err));
-                Err(err.into())
-            }
+            Err(_) => tracing::warn!(
+                project_id,
+                "project did not stop within 30s; abandoning the wait"
+            ),
         }
     }
 
-    fn stop_project(&mut self, project_id: &str) -> Result<()> {
+    async fn stop_project(&mut self, project_id: &str) -> Result<()> {
+        // Stop the task first: it owns the panes, and letting it tear down
+        // before the pane hosts are shut means it can do so cleanly.
+        self.stop_running_project(project_id).await;
         if let Ok(project_uuid) = Uuid::parse_str(project_id) {
             let stopped = crate::pane_host::shutdown_project_hosts(project_uuid)?;
             if stopped > 0 {
@@ -762,6 +864,20 @@ pub async fn run(
     machine_id: Uuid,
     _project_roots: Vec<PathBuf>,
 ) -> Result<()> {
+    // Projects run inside this process now, so they inherit this PATH rather
+    // than one set per spawned child. The old model passed
+    // `env PATH=<login shell PATH>` on every project's command line precisely
+    // because a daemon started from a minimal environment cannot find
+    // nvm/cargo-installed providers; applying it here keeps that property for
+    // every project at once. Providers are resolved to absolute paths at
+    // project startup, so this has to be right before any project starts.
+    if let Some(path) = resolve_user_shell_path() {
+        if std::env::var("PATH").ok().as_deref() != Some(path.as_str()) {
+            tracing::info!("using the login shell PATH so projects can find their providers");
+            std::env::set_var("PATH", &path);
+        }
+    }
+
     let hostname = hostname::get()
         .ok()
         .and_then(|value| value.into_string().ok())
@@ -822,6 +938,18 @@ pub async fn run(
     // restart or self-upgrade never leaves a window where our projects look
     // unclaimed to peers.
     state.reconcile_running_claims();
+
+    // Start again what this instance was running before it replaced itself.
+    // Pane hosts are separate processes and survived the `exec`, so a prompt
+    // resume lands inside their adoption grace and the terminal agents carry
+    // straight on.
+    for project_id in take_resume_manifest() {
+        if let Err(err) = state.start_project(&project_id, server_url, token) {
+            tracing::warn!(project_id, %err, "could not resume project after replacement");
+        } else {
+            tracing::info!(project_id, "resumed project after replacement");
+        }
+    }
 
     let mut reconnect_delay = INITIAL_RECONNECT_DELAY;
 
@@ -957,7 +1085,8 @@ async fn run_connection(
                         binary_fingerprint = fp;
                         if let Some(newer) = crate::update::newer_installed_version() {
                             // Never returns on success.
-                            let err = exec_into_newer_binary(&newer);
+                            let running = state.running_project_ids();
+                            let err = exec_into_newer_binary(&newer, &running);
                             tracing::error!(
                                 %err,
                                 "daemon self-upgrade re-exec failed; continuing on the old binary"
@@ -1011,7 +1140,7 @@ async fn run_connection(
                                 ws_sender.send(Message::Text(text.into())).await?;
                             }
                             ServerToDaemon::StopProjectCli { project_id, request_id } => {
-                                let stop_result = state.stop_project(&project_id);
+                                let stop_result = state.stop_project(&project_id).await;
                                 if let Err(err) = &stop_result {
                                     tracing::warn!("Failed to stop project {}: {}", project_id, err);
                                 }
@@ -1098,7 +1227,7 @@ async fn run_connection(
                                 // replacing it disturbs nothing that is running.
                                 #[cfg(unix)]
                                 {
-                                    let err = perform_requested_restart();
+                                    let err = perform_requested_restart(&state.running_project_ids());
                                     tracing::error!(
                                         %err,
                                         "requested daemon restart failed; continuing on the current daemon"
@@ -1188,6 +1317,78 @@ async fn refresh_usage_limits_cache() {
     match crate::usage::refresh_codex_usage_limits().await {
         Ok(_) => tracing::debug!("Refreshed Codex usage limits cache"),
         Err(err) => tracing::debug!("Failed to refresh Codex usage limits cache: {}", err),
+    }
+}
+
+#[cfg(test)]
+mod containment_tests {
+    /// Containment rests on unwind. With `panic = "abort"`, one project's
+    /// panic would abort the process and take every other project on the host
+    /// with it — silently, since nothing else would change. This fails if
+    /// anyone ever sets it.
+    #[test]
+    fn a_panicking_project_must_not_be_able_to_abort_the_instance() {
+        let manifests = [
+            include_str!("../../Cargo.toml"),
+            include_str!("../../../../Cargo.toml"),
+        ];
+        for manifest in manifests {
+            let offending: Vec<&str> = manifest
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("panic") && line.contains("abort"))
+                .collect();
+            assert!(
+                offending.is_empty(),
+                "panic = \"abort\" turns any project panic into a host-wide outage: {offending:?}"
+            );
+        }
+    }
+
+    /// The behaviour that relies on it: a panicking task is an error to its
+    /// joiner, not a dead process.
+    #[tokio::test]
+    async fn a_panicking_task_is_reported_and_the_rest_carry_on() {
+        let doomed = tokio::spawn(async { panic!("a project fell over") });
+        let survivor = tokio::spawn(async { "still here" });
+
+        assert!(doomed.await.is_err(), "the panic surfaces to the joiner");
+        assert_eq!(survivor.await.unwrap(), "still here");
+    }
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::{take_resume_manifest_at, write_resume_manifest_at};
+
+    /// Under the process-per-project model an upgrade left projects alone —
+    /// they were in their own tmux sessions and `exec` never touched them.
+    /// Running them inside this process means `exec` takes them with it, so
+    /// what was running has to survive the replacement in writing.
+    #[test]
+    fn what_was_running_survives_the_replacement() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("resume.json");
+
+        write_resume_manifest_at(&path, &["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(
+            take_resume_manifest_at(&path),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+
+        // Cleared on read: a crash during resume must not leave the instance
+        // retrying the same start on every boot.
+        assert!(take_resume_manifest_at(&path).is_empty());
+    }
+
+    #[test]
+    fn nothing_running_leaves_nothing_to_resume() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("resume.json");
+
+        write_resume_manifest_at(&path, &["alpha".to_string()]);
+        write_resume_manifest_at(&path, &[]);
+        assert!(take_resume_manifest_at(&path).is_empty());
     }
 }
 

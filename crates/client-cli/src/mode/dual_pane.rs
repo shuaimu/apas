@@ -1949,13 +1949,30 @@ pub async fn run_headless(
     token: &str,
     working_dir: &Path,
 ) -> Result<ProjectOutcome> {
-    run_inner(server_url, token, working_dir).await
+    run_inner(server_url, token, working_dir, Arc::new(AtomicBool::new(false))).await
+}
+
+/// Run one project, stoppable by the caller.
+///
+/// Setting `shutdown` ends the project through the same teardown an ordinary
+/// stop takes — panes killed, `.apas` saved, threads joined. Aborting the task
+/// instead would strand roughly thirty threads and every pane child, which is
+/// why cancellation is a flag the project observes rather than a cancelled
+/// future.
+pub async fn run_project(
+    server_url: &str,
+    token: &str,
+    working_dir: &Path,
+    shutdown: Arc<AtomicBool>,
+) -> Result<ProjectOutcome> {
+    run_inner(server_url, token, working_dir, shutdown).await
 }
 
 async fn run_inner(
     server_url: &str,
     token: &str,
     working_dir: &Path,
+    shutdown: Arc<AtomicBool>,
 ) -> Result<ProjectOutcome> {
 
     let config = crate::config::Config::load().unwrap_or_default();
@@ -2207,7 +2224,8 @@ async fn run_inner(
     let (server_tx, server_rx) = tokio_mpsc::channel::<CliToServer>(256);
 
     // Shutdown flag
-    let shutdown = Arc::new(AtomicBool::new(false));
+    // Supplied by the caller so a project can be stopped from outside; a
+    // standalone run passes a fresh one and nothing ever sets it.
 
     // One file watcher per project, shared across all panes. Drives
     // event-based deadloop wake-ups so panes only consume tokens when

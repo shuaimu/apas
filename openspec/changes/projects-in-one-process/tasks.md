@@ -7,30 +7,30 @@
 
 ## 2. Run projects inside the daemon
 
-- [ ] 2.1 Hold a task handle and a cancellation signal per project in the daemon
-- [ ] 2.2 Start a project by spawning the task rather than a tmux session
-- [ ] 2.3 Stop a project by cancelling and awaiting it
-- [ ] 2.4 Restart a project by cancelling and starting a fresh task, leaving the others running
-- [ ] 2.5 Report running state from the task table rather than from `/proc`
-- [ ] 2.6 Restore the projects that were running after the instance is replaced by an upgrade
-- [ ] 2.7 Tests: start, stop, restart affect only the named project; a project that ends is no longer reported; the table survives a task ending on its own
+- [x] 2.1 Hold a task handle and a cancellation signal per project in the daemon
+- [x] 2.2 Start a project by spawning the task rather than a tmux session
+- [x] 2.3 Stop a project by cancelling and awaiting it
+- [~] 2.4 Restart a project by cancelling and starting a fresh task — stop and start are both in place and independent per project, but nothing yet turns a project's own `RebootRequested` into a restart; the daemon logs it
+- [x] 2.5 Report running state from the task table rather than from `/proc`
+- [x] 2.6 Restore the projects that were running after the instance is replaced by an upgrade
+- [~] 2.7 Tests — the resume manifest is covered; the table's start/stop/report behaviour needs a daemon harness that does not exist yet, since `DaemonState` reaches the network and the filesystem on every path
 
 ## 3. Contain failure
 
-- [ ] 3.1 Treat a panicking project task as that project stopping, reported, with the others untouched
-- [ ] 3.2 Hold the line on unwind: a test that fails if `panic = "abort"` is ever set, since that would turn every project panic into a host outage
-- [ ] 3.3 Tests: one project panicking leaves the others running and the instance alive
+- [x] 3.1 Treat a panicking project task as that project stopping, reported, with the others untouched
+- [x] 3.2 Hold the line on unwind: a test that fails if `panic = "abort"` is ever set, since that would turn every project panic into a host outage
+- [x] 3.3 Tests: one project panicking leaves the others running and the instance alive
 
 ## 4. Keep activity attributable
 
-- [ ] 4.1 Give each project a tracing span carrying its identity, so every record says which project it came from
+- [x] 4.1 Give each project a tracing span carrying its identity, so every record says which project it came from
 - [ ] 4.2 Replace the per-project stderr log the tmux session was providing
 - [ ] 4.3 Tests: records from two concurrent projects are distinguishable
 
 ## 5. Retire the process-per-project machinery
 
-- [ ] 5.1 Stop spawning `apas --headless` for projects; keep the flag for running one project alone
-- [ ] 5.2 Retire the per-project tmux session and socket handling for project CLIs, leaving pane hosts untouched
+- [x] 5.1 Stop spawning `apas --headless` for projects; keep the flag for running one project alone
+- [x] 5.2 Retire the per-project tmux session and socket handling for project CLIs, leaving pane hosts untouched
 - [ ] 5.3 Retire `/proc` scanning as the source of running state
 - [ ] 5.4 Ensure an upgrade stops tmux'd projects from the older model rather than leaving them running alongside the new tasks
 
