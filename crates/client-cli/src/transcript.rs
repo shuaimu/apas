@@ -1078,6 +1078,62 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 
+    /// A brand-new pane watches a transcript Claude has not written yet, so it
+    /// has no mtime of its own. Passing the epoch as the floor made every older
+    /// conversation in the directory a valid switch target, and a new pane
+    /// silently adopted the most recently touched one — arriving with a
+    /// stranger's messages before its terminal had produced a byte. The floor
+    /// is the moment the pane started watching, so anything that predates the
+    /// pane cannot be something the pane switched to.
+    #[test]
+    fn a_pane_whose_transcript_does_not_exist_yet_adopts_nothing_older_than_itself() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = claude_projects_dir(home.path(), "/wanted");
+        // Conversations that were already in this directory, one of them large
+        // and recently touched — exactly the shape that was adopted.
+        write_session(&dir, "old-conversation.jsonl");
+        write_session(&dir, "recently-touched.jsonl");
+
+        // The floor as the caller computes it: the newest transcript already
+        // present. Taken from the filesystem, never the clock — these live on
+        // NFS, and mtime-versus-now is a cross-domain comparison.
+        let pane_started = std::fs::metadata(dir.join("recently-touched.jsonl"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        // The pane's own session id: pinned, and no file behind it yet.
+        let pinned = dir.join("brand-new-pane.jsonl");
+        assert!(!pinned.exists(), "the pane has not had a turn yet");
+
+        assert!(
+            find_claude_switch_candidate(
+                home.path(),
+                Path::new("/wanted"),
+                &pinned,
+                pane_started,
+                &HashSet::new(),
+            )
+            .is_none(),
+            "a pane must not adopt a conversation that predates it"
+        );
+
+        // A genuine in-TUI switch after the pane started is still followed.
+        write_session(&dir, "switched-to.jsonl");
+        assert_eq!(
+            find_claude_switch_candidate(
+                home.path(),
+                Path::new("/wanted"),
+                &pinned,
+                pane_started,
+                &HashSet::new(),
+            )
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str()),
+            Some("switched-to.jsonl"),
+        );
+    }
+
     #[test]
     fn claude_switch_candidate_follows_the_newest_unpinned_file() {
         let home = tempfile::tempdir().unwrap();

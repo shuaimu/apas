@@ -648,21 +648,63 @@ const CLAUDE_SWITCH_IDLE_POLLS: u32 = 2;
 /// Tracks the currently read file plus its last observed size and mtime so
 /// the poller can distinguish "still growing" from "the user switched to a
 /// different session inside the TUI".
+/// Newest mtime among the transcripts already in a directory, if any.
+fn newest_transcript_mtime(dir: Option<&std::path::Path>) -> Option<std::time::SystemTime> {
+    let entries = std::fs::read_dir(dir?).ok()?;
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+        })
+        .filter_map(|entry| entry.metadata().ok()?.modified().ok())
+        .max()
+}
+
 struct ClaudeWatchState {
     path: std::path::PathBuf,
     size: u64,
     mtime: Option<std::time::SystemTime>,
     idle_polls: u32,
+    /// The floor for what counts as a session switch while the watched file
+    /// does not exist yet: the newest transcript already in the directory when
+    /// this watch began.
+    ///
+    /// Claude writes a pane's transcript on its first turn, so a brand-new pane
+    /// watches a path with no file behind it. That file never "grows", so the
+    /// idle counter reaches the switch threshold within seconds — and with no
+    /// mtime to compare against, every transcript in the cwd looked newer than
+    /// the floor. A new pane therefore adopted the most recently touched
+    /// conversation in its directory, which is how one arrived showing a
+    /// stranger's messages before its terminal had produced a byte.
+    ///
+    /// Derived from the directory rather than the clock on purpose: these files
+    /// live on NFS, so their mtimes and this host's `now()` are different clock
+    /// domains, and skew either way would resurrect the bug or silently stop
+    /// following real switches. Comparing an mtime against an mtime cannot
+    /// skew. A file that existed before is followed only once it advances past
+    /// where it was — which is exactly an in-TUI `/resume` onto it.
+    started: std::time::SystemTime,
 }
 
 impl ClaudeWatchState {
     fn new(path: std::path::PathBuf) -> Self {
+        let started = newest_transcript_mtime(path.parent())
+            // An empty or unreadable directory has nothing to adopt, so the
+            // clock is only ever the fallback.
+            .unwrap_or_else(std::time::SystemTime::now);
         Self {
             path,
             size: 0,
             mtime: None,
             idle_polls: 0,
+            started,
         }
+    }
+
+    /// The oldest a transcript may be and still count as somewhere this pane
+    /// switched *to*. Never the epoch — see `started`.
+    fn switch_floor(&self) -> std::time::SystemTime {
+        self.mtime.unwrap_or(self.started)
     }
 }
 
@@ -3227,7 +3269,7 @@ async fn run_inner(
                                     home,
                                     &transcript_cwd,
                                     &watch.path,
-                                    watch.mtime.unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                                    watch.switch_floor(),
                                     &excluded,
                                 ) {
                                     tracing::info!(
@@ -8840,6 +8882,54 @@ Use a project-specific custom dispatch loop.";
         let policy: super::ProjectPolicyState = Arc::new(Mutex::new(None));
         assert!(super::existing_pane_relaunch_allowed(&policy, false));
         assert!(!super::existing_pane_relaunch_allowed(&policy, true));
+    }
+
+    /// The floor a fresh watch reports decides whether a pane can adopt a
+    /// conversation that was already on disk. It used to be the epoch whenever
+    /// the pane's own transcript did not exist yet — which is every new pane,
+    /// since Claude writes the file on the first turn — so everything in the
+    /// directory looked newer.
+    #[test]
+    fn a_fresh_claude_watch_never_accepts_a_transcript_older_than_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        // Conversations already in the directory when the pane appears.
+        for name in ["old-conversation.jsonl", "recently-touched.jsonl"] {
+            std::fs::write(dir.path().join(name), "{}").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let newest_existing = std::fs::metadata(dir.path().join("recently-touched.jsonl"))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        // The pane's own transcript: pinned, not written yet.
+        let watch = super::ClaudeWatchState::new(dir.path().join("brand-new-pane.jsonl"));
+
+        assert_ne!(watch.switch_floor(), std::time::SystemTime::UNIX_EPOCH);
+        assert!(
+            watch.switch_floor() >= newest_existing,
+            "a watch with no file behind it must not accept anything already there"
+        );
+    }
+
+    /// The floor comes from the directory, never the wall clock, because these
+    /// transcripts are on NFS: comparing their mtimes against this host's clock
+    /// is a cross-domain comparison that skew can break in both directions.
+    #[test]
+    fn the_switch_floor_is_taken_from_the_directory_not_the_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("existing.jsonl"), "{}").unwrap();
+        let existing = std::fs::metadata(dir.path().join("existing.jsonl"))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        let watch = super::ClaudeWatchState::new(dir.path().join("pinned.jsonl"));
+        assert_eq!(
+            watch.switch_floor(),
+            existing,
+            "the floor is the newest transcript already present"
+        );
     }
 
     #[test]
