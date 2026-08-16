@@ -1450,11 +1450,67 @@ fn build_lifecycle_inventory(
     }
 }
 
+/// Reboot markers a project left for its own restart, keyed by project.
+///
+/// This used to travel only through `APAS_REBOOT_HANDOFF`, which was sound
+/// while a reboot meant a project `exec`ing its own process. Projects now share
+/// one, and an environment variable is process-wide: whichever project started
+/// next read the marker, found another project's id in it, and discarded it —
+/// so the project it was addressed to came back without it and restarted its
+/// terminals instead of adopting the pane hosts still holding them.
+///
+/// The environment variable is still set, and is still the only channel that
+/// survives an `exec` — the standalone headless run, and a daemon self-upgrade
+/// that replaces the process image and this map with it.
+static REBOOT_HANDOFFS: std::sync::OnceLock<Mutex<HashMap<Uuid, std::path::PathBuf>>> =
+    std::sync::OnceLock::new();
+
+fn reboot_handoffs() -> &'static Mutex<HashMap<Uuid, std::path::PathBuf>> {
+    REBOOT_HANDOFFS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn store_reboot_handoff(project_id: Uuid, path: &Path) {
+    if let Ok(mut handoffs) = reboot_handoffs().lock() {
+        handoffs.insert(project_id, path.to_path_buf());
+    }
+}
+
 fn load_reboot_handoff(
     project_id: Uuid,
 ) -> Option<(std::path::PathBuf, crate::pane_host::RebootHandoffMarker)> {
-    let path = std::env::var_os("APAS_REBOOT_HANDOFF").map(std::path::PathBuf::from)?;
-    std::env::remove_var("APAS_REBOOT_HANDOFF");
+    let in_process = reboot_handoffs()
+        .lock()
+        .ok()
+        .and_then(|mut handoffs| handoffs.remove(&project_id));
+    let path = match in_process {
+        Some(path) => {
+            // Ours, and it never travelled through the environment. Clear the
+            // variable only if it points at this same marker.
+            if std::env::var_os("APAS_REBOOT_HANDOFF").map(std::path::PathBuf::from)
+                == Some(path.clone())
+            {
+                std::env::remove_var("APAS_REBOOT_HANDOFF");
+            }
+            path
+        }
+        None => {
+            let path = std::env::var_os("APAS_REBOOT_HANDOFF").map(std::path::PathBuf::from)?;
+            // Read before removing: a marker addressed to a sibling project is
+            // left where it is, so that project can still claim it.
+            match crate::pane_host::read_handoff_marker(&path) {
+                Ok(marker) if marker.project_id != project_id => {
+                    tracing::debug!(
+                        marker_project = %marker.project_id,
+                        "leaving a reboot handoff addressed to another project"
+                    );
+                    return None;
+                }
+                _ => {}
+            }
+            std::env::remove_var("APAS_REBOOT_HANDOFF");
+            path
+        }
+    };
     match crate::pane_host::read_handoff_marker(&path) {
         Ok(marker)
             if marker.project_id == project_id
@@ -2460,7 +2516,12 @@ async fn run_inner(
         tracing::warn!("No panes available to restore; UI will start with no tabs.");
     }
 
-    // Setup Ctrl+C handler
+    // Ctrl+C matters only when a project is the foreground process, which is
+    // now just the standalone `--headless -d <path>` run. Inside the resident
+    // instance the daemon has already registered its own handler, and only one
+    // exists per process — so the second project to start would fail outright.
+    // That is exactly what happened on the first live cutover: every project
+    // died with "Ctrl-C signal handler already registered".
     let shutdown_for_handler = shutdown.clone();
     let metas_for_handler = pane_metas.clone();
     let sessions_for_handler = pane_sessions.clone();
@@ -2489,7 +2550,13 @@ async fn run_inner(
         // group, but panes run in groups of their own, so nothing reaches the
         // agents unless we signal them here.
         kill_all_pane_children(&metas_for_handler);
-    })?;
+    })
+    .unwrap_or_else(|err| {
+        // Already taken means someone above us owns the signal, which is the
+        // normal case in the resident instance. Not a reason to refuse to run
+        // the project.
+        tracing::debug!(%err, "not installing a project Ctrl+C handler");
+    });
 
     // Spawn server connection task
     let server_task = {
@@ -12522,6 +12589,7 @@ async fn run_server_connection(
                                         let _ = ws_sender.send(Message::Text(text.into())).await;
                                         let _ = ws_sender.flush().await;
                                     }
+                                    store_reboot_handoff(session_id, &marker_path);
                                     std::env::set_var("APAS_REBOOT_HANDOFF", &marker_path);
                                     tracing::info!(%request_id, marker = %marker_path.display(), detach_failures = detach_failures.len(), "reboot handoff ready");
                                     reboot_requested.store(true, Ordering::SeqCst);

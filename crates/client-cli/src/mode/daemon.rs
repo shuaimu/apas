@@ -1055,10 +1055,23 @@ pub async fn run(
         }
     }
 
-    // Don't kill headless CLIs on shutdown — they are self-sufficient and will
-    // keep running with their own server reconnection loops. This allows the
-    // daemon to be restarted/upgraded without disrupting active sessions.
-    tracing::info!("Daemon stopped (headless CLIs left running)");
+    // Projects run inside this process now, so a shutdown has to stop them
+    // rather than leave them: they used to be self-sufficient processes with
+    // their own reconnection loops, and a daemon exiting simply did not
+    // concern them. Stopping each one properly is what saves its pane roster
+    // and kills its agents' subtrees; dropping the process instead would lose
+    // both.
+    //
+    // Pane hosts are untouched and keep their PTYs, so a replacement instance
+    // that starts within their adoption grace picks the terminals back up.
+    let running = state.running_project_ids();
+    if !running.is_empty() {
+        tracing::info!(count = running.len(), "stopping projects before shutdown");
+        for project_id in running {
+            state.stop_running_project(&project_id).await;
+        }
+    }
+    tracing::info!("Daemon stopped");
     Ok(())
 }
 

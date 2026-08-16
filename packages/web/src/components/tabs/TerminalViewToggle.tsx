@@ -53,7 +53,7 @@ export function TerminalViewToggle({
         <span className="hidden text-[11px] text-gray-500 dark:text-gray-400 xl:inline">
           {turnCount === 0
             ? "No turns captured yet — the transcript is read every few seconds."
-            : `${turnCount} turn${turnCount === 1 ? "" : "s"} · read-only, type in the Terminal view`}
+            : `${turnCount} turn${turnCount === 1 ? "" : "s"} · best-effort transcript match — you may notice inconsistencies`}
         </span>
       )}
     </div>
