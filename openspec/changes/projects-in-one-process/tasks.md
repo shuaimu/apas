@@ -10,7 +10,7 @@
 - [x] 2.1 Hold a task handle and a cancellation signal per project in the daemon
 - [x] 2.2 Start a project by spawning the task rather than a tmux session
 - [x] 2.3 Stop a project by cancelling and awaiting it
-- [x] 2.4 Restart a project by cancelling and starting a fresh task — stop and start are both in place and independent per project, but nothing yet turns a project's own `RebootRequested` into a restart; the daemon logs it
+- [x] 2.4 Restart a project by cancelling and starting a fresh task — a project's own `RebootRequested` now travels a channel the connection loop selects on, which stops the finished task properly (its entry and pane hosts outlive it) before starting a fresh one
 - [x] 2.5 Report running state from the task table rather than from `/proc`
 - [x] 2.6 Restore the projects that were running after the instance is replaced by an upgrade
 - [~] 2.7 Tests — the resume manifest is covered; the table's start/stop/report behaviour needs a daemon harness that does not exist yet, since `DaemonState` reaches the network and the filesystem on every path
@@ -38,5 +38,10 @@
 
 - [x] 6.1 Update `CLAUDE.md`: the process model, why pane hosts stay separate, and that blocking work must not go on the runtime
 - [x] 6.2 Measure thread count and memory — done on zoo-005 with four live projects: 66-thread runtime baseline, 11–13 marginal per project, 377 threads across five processes today versus ~113 projected merged. The estimate in the risk list was wrong in the safe direction and is corrected
-- [ ] 6.3 `cargo test` for the workspace and `cargo clippy` clean
-- [ ] 6.4 End-to-end on a real host: several projects at once, stop and restart one and confirm the others are undisturbed, kill one and confirm containment, upgrade the instance and confirm the projects come back
+- [x] 6.3 `cargo test` for the workspace and `cargo clippy` clean — and one flaky failure fixed on the way, since it was misreporting this change as a regression. `pane_host` mutated `XDG_RUNTIME_DIR` outside the lock serialising the `HOME`/`XDG_CONFIG_HOME` writers; concurrent `setenv` races on the environ array, so a registry test read a stale `XDG_CONFIG_HOME` and migrated a file out from under its own assertion, then poisoned the lock guard and took eight more tests with it
+- [~] 6.4 End-to-end on a real host — partially verified live on zoo-005 and zoo-006:
+  - [x] A project starts and runs inside the instance: `started project in this instance project_id=4366dc38…`, its pane host spawned, and no `apas --headless -d` process for it anywhere
+  - [x] Records stay attributable: every project record carries the `project{id=…}` span in the daemon's own log, which is what replaced the per-project tmux session and stderr file
+  - [x] Upgrading the instance leaves the host working: zoo-002 and zoo-006 re-exec'd onto 26.08.74 off the shared binary on their own tick, unattended
+  - [ ] Several projects in one instance, stopping and restarting one while the others keep running, and killing one for containment — needs more than one project running on a single host, so it waits on projects being started rather than on code
+  - [ ] Upgrade with projects running, confirming the resume manifest brings them back — the two self-upgrades so far both happened while nothing was running, so this path is still untested live
