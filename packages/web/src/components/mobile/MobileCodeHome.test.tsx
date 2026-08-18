@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SessionInfo } from "@/lib/store";
+import { readSelectedPane } from "@/lib/mobileSelectedPane";
 import { MobileCodeHome, type MobileCodeHomeProps } from "./MobileCodeHome";
 
 function session(overrides: Partial<SessionInfo> & Pick<SessionInfo, "id">): SessionInfo {
@@ -65,14 +66,14 @@ afterEach(() => {
 });
 
 describe("MobileCodeHome", () => {
-  it("renders only all-project and idle-project categories", () => {
+  it("renders only all-project and idle-session categories", () => {
     renderHome();
 
     expect(screen.getByRole("heading", { name: "Coding sessions" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Account" })).toBeTruthy();
     expect(screen.getByRole("button", { name: /New task/ })).toBeTruthy();
     expect(screen.getByRole("button", { name: "All projects" }).getAttribute("aria-pressed")).toBe("true");
-    expect(screen.getByRole("button", { name: "Idle projects" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Idle sessions" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Active" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Attention" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Completed" })).toBeNull();
@@ -80,9 +81,11 @@ describe("MobileCodeHome", () => {
     expect(screen.getByRole("button", { name: "Open alpha" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Open beta" })).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("button", { name: "Idle projects" }));
-    expect(screen.getByRole("button", { name: "Open alpha" })).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Open beta" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Idle sessions" }));
+    // The idle view lists agents, not projects. These legacy sessions carry no
+    // pane detail, so it reports nothing rather than listing them wholesale.
+    expect(screen.getByText("No idle sessions")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Open alpha" })).toBeNull();
   });
 
   it("uses only working, idle, and offline session badges", () => {
@@ -102,7 +105,10 @@ describe("MobileCodeHome", () => {
     }
   });
 
-  it("idle projects excludes working and offline sessions", async () => {
+  it("excludes agents in projects that are not running", async () => {
+    // Replaces the old project-level rule. A stopped project's panes report
+    // "not working" because nothing is running at all, which is not the same as
+    // an agent waiting for you.
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
@@ -113,6 +119,7 @@ describe("MobileCodeHome", () => {
             status: "active",
             is_active: true,
             is_working: true,
+            panes: [{ pane_id: 1, label: "Working one", kind: "terminal", provider: "codex", is_working: true }],
           },
           {
             id: "session-b",
@@ -120,6 +127,7 @@ describe("MobileCodeHome", () => {
             status: "active",
             is_active: true,
             is_working: false,
+            panes: [{ pane_id: 2, label: "Waiting one", kind: "terminal", provider: "claude", is_working: false }],
           },
           {
             id: "session-c",
@@ -127,18 +135,19 @@ describe("MobileCodeHome", () => {
             status: "ended",
             is_active: false,
             is_working: false,
+            panes: [{ pane_id: 3, label: "Stopped one", kind: "terminal", provider: "claude", is_working: false }],
           },
         ],
       }),
     }));
     renderHome({ active: true, legacySessions: [] });
 
-    fireEvent.click(screen.getByRole("button", { name: "Idle projects" }));
+    fireEvent.click(screen.getByRole("button", { name: "Idle sessions" }));
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: "Open beta" })).toBeTruthy();
-      expect(screen.queryByRole("button", { name: "Open alpha" })).toBeNull();
-      expect(screen.queryByRole("button", { name: "Open gamma" })).toBeNull();
+      expect(screen.getByRole("button", { name: "Open Waiting one in beta" })).toBeTruthy();
     });
+    expect(screen.queryByRole("button", { name: /Working one/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Stopped one/ })).toBeNull();
   });
 
   it("does not preserve a stale bootstrap working flag once live inventory is present", async () => {
@@ -279,6 +288,95 @@ describe("MobileCodeHome", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: "Reboot" }));
 
     expect(props.onRebootDaemon).toHaveBeenCalledWith("machine-b", "zoo-006");
+  });
+
+  it("lists idle agents one per pane, including inside a working project", async () => {
+    // The case the project-level view could not express: this project reads as
+    // working, so every idle pane in it used to be invisible.
+    stubBootstrap({
+      sessions: [
+        {
+          id: "session-a",
+          project_name: "mako",
+          hostname: "zoo-005",
+          status: "active",
+          is_active: true,
+          is_working: true,
+          panes: [
+            { pane_id: 3, label: "Claude terminal 3", kind: "terminal", provider: "claude", is_working: false },
+            { pane_id: 4, label: "Codex terminal 2", kind: "terminal", provider: "codex", is_working: true },
+          ],
+        },
+      ],
+      machines: [],
+    });
+    renderHome({ active: true, legacySessions: [] });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Idle sessions" }));
+    expect(await screen.findByRole("button", { name: "Open Claude terminal 3 in mako" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Codex terminal 2/ })).toBeNull();
+    const row = screen.getByRole("button", { name: "Open Claude terminal 3 in mako" });
+    expect(row.textContent).toContain("mako");
+    expect(row.textContent).toContain("zoo-005");
+  });
+
+  it("remembers the tapped agent so the session opens on it", async () => {
+    stubBootstrap({
+      sessions: [
+        {
+          id: "session-a",
+          project_name: "mako",
+          status: "active",
+          is_active: true,
+          panes: [
+            { pane_id: 7, label: "Claude terminal 3", kind: "terminal", provider: "claude", is_working: false },
+          ],
+        },
+      ],
+      machines: [],
+    });
+    const props = renderHome({ active: true, legacySessions: [] });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Idle sessions" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Open Claude terminal 3 in mako" }));
+
+    expect(readSelectedPane("session-a")).toBe(7);
+    expect(props.onOpenSession).toHaveBeenCalledWith("session-a", "mako");
+  });
+
+  it("treats a session with no pane detail as unknown rather than idle", async () => {
+    // An older server omits the field entirely; filling the list with every
+    // session would be worse than showing nothing.
+    stubBootstrap({
+      sessions: [{ id: "session-a", project_name: "mako", status: "active", is_active: true }],
+      machines: [],
+    });
+    renderHome({ active: true, legacySessions: [] });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Idle sessions" }));
+    expect(await screen.findByText("No idle sessions")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Open .* in mako/ })).toBeNull();
+  });
+
+  it("says so when every agent is working", async () => {
+    stubBootstrap({
+      sessions: [
+        {
+          id: "session-a",
+          project_name: "mako",
+          status: "active",
+          is_active: true,
+          is_working: true,
+          panes: [{ pane_id: 3, label: "Busy", kind: "terminal", provider: "codex", is_working: true }],
+        },
+      ],
+      machines: [],
+    });
+    renderHome({ active: true, legacySessions: [] });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Idle sessions" }));
+    expect(await screen.findByText("No idle sessions")).toBeTruthy();
+    expect(screen.getByText(/currently working/)).toBeTruthy();
   });
 
   it("offers to update the machines that are behind, and only those", async () => {

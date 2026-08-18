@@ -21,6 +21,7 @@ import {
   X,
 } from "lucide-react";
 import { AskUserQuestionCard } from "@/components/tools/AskUserQuestionCard";
+import { readSelectedPane, writeSelectedPane } from "@/lib/mobileSelectedPane";
 import { MobileProjectManageSheet } from "./MobileProjectManageSheet";
 import { MobilePaneWorkSummarySheet } from "./MobilePaneWorkSummarySheet";
 import {
@@ -44,7 +45,6 @@ const TerminalPane = dynamic(
 const MAIN_PANE_ID = 0;
 const INITIAL_ACTIVITY_LIMIT = 80;
 const MOBILE_ACTIVITY_SCROLL_PREFIX = "apas_mobile_activity_scroll:";
-const MOBILE_SELECTED_PANE_PREFIX = "apas_mobile_selected_pane:";
 const BOTTOM_FOLLOW_THRESHOLD_PX = 72;
 
 interface SavedActivityScroll {
@@ -77,25 +77,6 @@ function writeActivityScroll(sessionId: string, paneId: number, element: HTMLEle
   } catch {
     // Scroll restoration is a convenience; private-mode storage failures
     // must never take down the conversation.
-  }
-}
-
-function readSelectedPane(sessionId: string): number | null {
-  try {
-    const raw = window.localStorage.getItem(`${MOBILE_SELECTED_PANE_PREFIX}${sessionId}`);
-    if (raw === null) return null;
-    const value = Number(raw);
-    return Number.isInteger(value) && value >= 0 ? value : null;
-  } catch {
-    return null;
-  }
-}
-
-function writeSelectedPane(sessionId: string, paneId: number) {
-  try {
-    window.localStorage.setItem(`${MOBILE_SELECTED_PANE_PREFIX}${sessionId}`, String(paneId));
-  } catch {
-    // Keep navigation functional when browser storage is unavailable.
   }
 }
 

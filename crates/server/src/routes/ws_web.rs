@@ -5490,6 +5490,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 share_role: Some("owner".to_string()),
                                 is_active,
                                 is_working,
+                                // The web receives its pane roster on its own
+                                // channel; this list exists for mobile.
+                                panes: Vec::new(),
                             }
                         })
                         .collect();
@@ -5520,6 +5523,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             share_role: Some(share_role),
                             is_active,
                             is_working,
+                            panes: Vec::new(),
                         });
                     }
 

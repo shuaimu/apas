@@ -2204,6 +2204,33 @@ pub struct SessionInfo {
     /// meaningful only while `is_active` is true.
     #[serde(default)]
     pub is_working: bool,
+    /// The panes in this session and whether each is working.
+    ///
+    /// `is_working` above answers "is anything happening here", which cannot
+    /// answer "which agent is waiting for me": a project with one busy pane
+    /// reads as working, hiding every idle pane in it. Both are derived from
+    /// the same pane statuses, so they cannot disagree.
+    ///
+    /// Defaulted: an older server omits it, and a client must read that as "no
+    /// pane detail" rather than as a session with no panes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub panes: Vec<MobilePaneSummary>,
+}
+
+/// One agent pane, as mobile needs to list it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MobilePaneSummary {
+    pub pane_id: u32,
+    /// The pane's own label when it has one; the client falls back to its kind
+    /// and id, exactly as the session screen does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub kind: PaneKind,
+    pub provider: Provider,
+    /// True while this pane is reporting work, from the same pane statuses the
+    /// session-level flag is derived from.
+    #[serde(default)]
+    pub is_working: bool,
 }
 
 /// Aggregated usage counters for a pane or project over one time window.

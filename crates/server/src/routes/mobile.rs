@@ -30,6 +30,7 @@ fn session_info(
 ) -> SessionInfo {
     let session_id = Uuid::parse_str(&session.id).unwrap_or_default();
     let is_active = state.sessions.is_session_active(&session_id);
+    let working = state.sessions.get_pane_statuses(&session_id);
     SessionInfo {
         id: session_id,
         project_id: session
@@ -50,7 +51,22 @@ fn session_info(
         owner_email,
         share_role: Some(if shared { "user" } else { "owner" }.to_string()),
         is_active,
-        is_working: is_active && !state.sessions.get_pane_statuses(&session_id).is_empty(),
+        is_working: is_active && !working.is_empty(),
+        // Same map the flag above is derived from, so "this session is working"
+        // and "these panes are working" cannot disagree.
+        panes: state
+            .sessions
+            .get_session_panes(&session_id)
+            .into_iter()
+            .map(|pane| shared::MobilePaneSummary {
+                pane_id: pane.pane_id,
+                label: pane.label,
+                kind: pane.kind,
+                provider: pane.provider,
+                is_working: is_active
+                    && working.iter().any(|(_, id, _)| *id == pane.pane_id),
+            })
+            .collect(),
     }
 }
 
@@ -503,6 +519,30 @@ pub async fn bootstrap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_pane(pane_id: u32, label: &str) -> shared::PaneConfig {
+        shared::PaneConfig {
+            pane_id,
+            provider: shared::Provider::Claude,
+            mode: shared::PaneMode::Interactive,
+            kind: shared::PaneKind::Terminal,
+            session_id: Uuid::new_v4(),
+            is_paused: false,
+            stop_requested: false,
+            prompt: None,
+            min_iteration_interval_minutes: None,
+            label: Some(label.to_string()),
+            model: None,
+            effort: None,
+            worktree_path: None,
+            role: None,
+            goal: None,
+            backstory: None,
+            plan_review_mode: shared::PlanReviewMode::default(),
+            manual_mode: false,
+            managed: false,
+        }
+    }
     use crate::{
         config::Config,
         db::{Database, User},
@@ -644,6 +684,12 @@ mod tests {
         state
             .sessions
             .create_cli_session(session_id, cli_id, None, None);
+        // A project with one pane working and one idle: the case the
+        // session-level flag cannot express, since it reads as simply working.
+        state.sessions.set_session_panes(
+            &session_id,
+            vec![test_pane(3, "Busy one"), test_pane(4, "Idle one")],
+        );
         state.sessions.set_pane_status(
             &session_id,
             shared::PaneType::Interactive,
@@ -665,7 +711,21 @@ mod tests {
         );
         assert!(response.sessions[0].session.is_active);
         assert!(response.sessions[0].session.is_working);
+        // Per pane, so an idle agent inside a working project is findable.
+        let panes = &response.sessions[0].session.panes;
+        assert_eq!(panes.len(), 2, "both panes are reported");
+        let busy = panes.iter().find(|pane| pane.pane_id == 3).unwrap();
+        let idle = panes.iter().find(|pane| pane.pane_id == 4).unwrap();
+        assert!(busy.is_working);
+        assert!(!idle.is_working);
+        assert_eq!(idle.label.as_deref(), Some("Idle one"));
+        // The two views agree, because they read the same statuses.
+        assert!(panes.iter().any(|pane| pane.is_working));
         assert!(!response.sessions[1].session.is_active);
         assert!(!response.sessions[1].session.is_working);
+        assert!(
+            response.sessions[1].session.panes.is_empty(),
+            "a session with no pane roster reports none, not phantom panes"
+        );
     }
 }

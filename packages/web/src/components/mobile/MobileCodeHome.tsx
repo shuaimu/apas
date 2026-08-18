@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { AlertTriangle, ChevronRight, Plus, RotateCcw, WifiOff, X } from "lucide-react";
 import type { MachineWithProjects, SessionInfo } from "@/lib/store";
+import { writeSelectedPane } from "@/lib/mobileSelectedPane";
 import {
   daemonVersionLabel,
   isMachineBehind,
@@ -33,6 +34,15 @@ interface MobileSessionSummary {
   attention_count?: number;
   is_shared?: boolean;
   owner_email?: string | null;
+  panes?: MobilePaneSummary[];
+}
+
+interface MobilePaneSummary {
+  pane_id: number;
+  label?: string | null;
+  kind: string;
+  provider: string;
+  is_working?: boolean;
 }
 
 interface MobileMachineProject {
@@ -61,7 +71,7 @@ interface MobileBootstrapResponse {
 
 const FILTERS: { key: HomeView; label: string }[] = [
   { key: "all", label: "All projects" },
-  { key: "idle", label: "Idle projects" },
+  { key: "idle", label: "Idle sessions" },
   { key: "machines", label: "Machines" },
 ];
 
@@ -139,6 +149,11 @@ function compareSessionRecency(left: MobileSessionSummary, right: MobileSessionS
 function statusLabel(session: MobileSessionSummary): string {
   if (!session.is_active) return "Offline";
   return session.is_working ? "Working" : "Idle";
+}
+
+/// Same fallback the session screen uses, so one pane reads the same in both.
+function paneRowLabel(pane: MobilePaneSummary): string {
+  return pane.label?.trim() || `${pane.kind === "terminal" ? "Terminal" : "Pane"} ${pane.pane_id}`;
 }
 
 function sessionTarget(session: MobileSessionSummary): string {
@@ -275,6 +290,24 @@ export function MobileCodeHome({
       .sort(compareSessionRecency),
     [filter, sessions],
   );
+  /// One row per idle agent, not per project: a project with one busy pane
+  /// counts as working, which hid every idle pane inside it — exactly the panes
+  /// waiting for someone. A session reporting no pane detail contributes
+  /// nothing, since an older server omits the field and "unknown" must not read
+  /// as "idle".
+  const idlePanes = useMemo(
+    () => sessions
+      // A stopped project's agents are not idle, they are not running. Listing
+      // them would bury the ones actually waiting.
+      .filter((session) => session.is_active)
+      .flatMap((session) =>
+        (session.panes ?? [])
+          .filter((pane) => !pane.is_working)
+          .map((pane) => ({ session, pane })),
+      ),
+    [sessions],
+  );
+
   const activeSessions = useMemo(
     () => sessions.filter((session) => session.is_active).sort(compareSessionRecency),
     [sessions],
@@ -399,6 +432,51 @@ export function MobileCodeHome({
               </p>
             </div>
           )
+        ) : filter === "idle" ? (
+          idlePanes.length > 0 ? (
+            <div className="space-y-2.5">
+              {idlePanes.map(({ session, pane }) => {
+                const name = session.project_name || "Coding session";
+                return (
+                  <button
+                    key={`${session.id}:${pane.pane_id}`}
+                    type="button"
+                    aria-label={`Open ${paneRowLabel(pane)} in ${name}`}
+                    onClick={() => {
+                      // The session screen reads this on entry, so the row
+                      // lands on the agent it names rather than the last one
+                      // used in that project.
+                      writeSelectedPane(session.id, pane.pane_id);
+                      onOpenSession(session.id, name);
+                    }}
+                    className="w-full rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left shadow-sm transition hover:border-[#bdbdc9] active:opacity-75 dark:border-[#383842] dark:bg-[#1b1b21] dark:hover:border-[#50505c]"
+                  >
+                    <div className="flex items-center justify-between gap-2.5">
+                      <span className="min-w-0 flex-1 truncate text-base font-bold">{paneRowLabel(pane)}</span>
+                      <span className="shrink-0 rounded-full bg-[#efeff5] px-2.5 py-1 text-[0.7rem] font-bold text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]">Idle</span>
+                    </div>
+                    <p className="mt-2 truncate text-sm text-[#686873] dark:text-[#aaaab6]">
+                      {name}
+                      {" · "}
+                      {sessionTarget(session)}
+                    </p>
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="flex h-full min-h-52 flex-col items-center justify-center px-5 text-center">
+              <div className="mb-3 rounded-2xl bg-[#efeff5] p-3 dark:bg-[#25252d]">
+                <AlertTriangle className="h-6 w-6 text-[#686873] dark:text-[#aaaab6]" />
+              </div>
+              <h2 className="text-lg font-extrabold">No idle sessions</h2>
+              <p className="mt-1.5 max-w-sm text-sm leading-5 text-[#686873] dark:text-[#aaaab6]">
+                {sessions.length
+                  ? "Every agent that reported in is currently working."
+                  : "Start APAS in a project, then follow its coding activity here."}
+              </p>
+            </div>
+          )
         ) : filteredSessions.length > 0 ? (
           <div className="space-y-2.5">
             {filteredSessions.map((session) => {
@@ -443,9 +521,9 @@ export function MobileCodeHome({
             <div className="mb-3 rounded-2xl bg-[#efeff5] p-3 dark:bg-[#25252d]">
               <AlertTriangle className="h-6 w-6 text-[#686873] dark:text-[#aaaab6]" />
             </div>
-            <h2 className="text-lg font-extrabold">{sessions.length ? "No idle projects" : "No coding sessions yet"}</h2>
+            <h2 className="text-lg font-extrabold">No coding sessions yet</h2>
             <p className="mt-1.5 max-w-sm text-sm leading-5 text-[#686873] dark:text-[#aaaab6]">
-              {sessions.length ? "All connected projects are currently working." : "Start APAS in a project, then follow its coding activity here."}
+              Start APAS in a project, then follow its coding activity here.
             </p>
             <button
               type="button"
