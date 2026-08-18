@@ -471,6 +471,100 @@ describe("MobileSessionActivity", () => {
     expect(screen.getByRole("dialog", { name: "Manage project" })).toBeTruthy();
   });
 
+  it("says a terminal pane has not started a conversation, rather than looking quiet", () => {
+    // The reported case: a Codex pane sitting at "resume a previous session?"
+    // was indistinguishable from a healthy agent with nothing to say.
+    seedStore({
+      paneConfigs: [pane({ pane_id: 3, kind: "terminal" })],
+      paneMessages: {},
+    });
+    renderActivity();
+
+    expect(screen.getByText(/hasn't started a conversation yet/)).toBeTruthy();
+    expect(screen.getByText(/resume a previous session/)).toBeTruthy();
+    expect(screen.queryByText("No activity yet")).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Open raw terminal to finish setting up this agent" }),
+    ).toBeTruthy();
+  });
+
+  it("keeps the plain empty state for a pane that is not a terminal", () => {
+    seedStore({
+      paneConfigs: [pane({ pane_id: 3, kind: "agent" })],
+      paneMessages: {},
+    });
+    renderActivity();
+
+    expect(screen.getByText("No activity yet")).toBeTruthy();
+    expect(screen.queryByText(/hasn't started a conversation yet/)).toBeNull();
+  });
+
+  it("flags a message the agent never recorded, once the grace period passes", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const actions = seedStore({
+        paneConfigs: [pane({ pane_id: 3, kind: "terminal" })],
+        paneMessages: { "3": [message({ id: "existing" })] },
+      });
+      renderActivity();
+
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "hello" } });
+      fireEvent.click(screen.getByRole("button", { name: "Send conversation message" }));
+      expect(actions.sendTerminalConversationMessage).toHaveBeenCalledWith(3, "hello");
+
+      // Writing to the pty succeeded; that proves nothing about what the
+      // provider did with it, so nothing is claimed yet.
+      expect(screen.queryByText(/has not recorded/)).toBeNull();
+
+      await act(async () => {
+        vi.advanceTimersByTime(11_000);
+      });
+
+      expect(screen.getByText(/has not recorded your last message/)).toBeTruthy();
+      expect(
+        screen.getByRole("button", { name: "Open raw terminal to check this message" }),
+      ).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stays quiet once the agent records the message", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      seedStore({
+        paneConfigs: [pane({ pane_id: 3, kind: "terminal" })],
+        paneMessages: { "3": [] },
+      });
+      renderActivity();
+
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "hello" } });
+      fireEvent.click(screen.getByRole("button", { name: "Send conversation message" }));
+
+      // The provider records it, which is the only real confirmation.
+      act(() => {
+        useStore.setState({
+          paneMessages: {
+            "3": [{
+              id: "recorded",
+              role: "user",
+              content: "hello",
+              timestamp: new Date(),
+            }],
+          },
+        } as never);
+      });
+
+      await act(async () => {
+        vi.advanceTimersByTime(11_000);
+      });
+
+      expect(screen.queryByText(/has not recorded/)).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps the composer for composing, with the occasional actions behind one control", () => {
     seedStore({
       paneConfigs: [pane({ pane_id: 3 })],

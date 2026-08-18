@@ -22,6 +22,12 @@ import {
 } from "lucide-react";
 import { AskUserQuestionCard } from "@/components/tools/AskUserQuestionCard";
 import { readSelectedPane, writeSelectedPane } from "@/lib/mobileSelectedPane";
+import {
+  DELIVERY_GRACE_MS,
+  pruneConfirmed,
+  unconfirmedDeliveries,
+  type PendingDelivery,
+} from "@/lib/terminalDelivery";
 import { MobileProjectManageSheet } from "./MobileProjectManageSheet";
 import { MobilePaneWorkSummarySheet } from "./MobilePaneWorkSummarySheet";
 import {
@@ -288,6 +294,9 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const [moreOpen, setMoreOpen] = useState(false);
   const [closeTarget, setCloseTarget] = useState<PaneConfig | null>(null);
   const [rebootTarget, setRebootTarget] = useState<PaneConfig | null>(null);
+  // Messages written into the pty that the provider has not recorded back.
+  const [pendingDeliveries, setPendingDeliveries] = useState<PendingDelivery[]>([]);
+  const [deliveryNow, setDeliveryNow] = useState(() => Date.now());
   const activityScrollRef = useRef<HTMLDivElement>(null);
   const restoredScrollContextRef = useRef<string | null>(null);
   const restoredScrollElementRef = useRef<HTMLDivElement | null>(null);
@@ -339,6 +348,39 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
     [planReviewPending, selectedPaneId],
   );
   const visibleActivity = selectedActivity.slice(Math.max(0, selectedActivity.length - activityLimit));
+
+  // Turns for the selected pane, in the shape delivery confirmation reads.
+  const selectedTurns = useMemo(
+    () => selectedActivity.map((item) => ({
+      role: item.message.role,
+      content: item.message.content,
+      timestampMs: item.message.timestamp.getTime(),
+    })),
+    [selectedActivity],
+  );
+  // Drop what the provider has recorded, so the list stays bounded and a late
+  // confirmation clears the warning rather than leaving it stuck.
+  useEffect(() => {
+    setPendingDeliveries((previous) => {
+      const next = pruneConfirmed(previous, selectedTurns);
+      return next.length === previous.length ? previous : next;
+    });
+  }, [selectedTurns]);
+  // Nothing else re-renders when the grace period simply elapses.
+  useEffect(() => {
+    if (pendingDeliveries.length === 0) return;
+    const timer = window.setInterval(() => setDeliveryNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [pendingDeliveries.length]);
+  const unconfirmed = useMemo(
+    () => unconfirmedDeliveries(
+      pendingDeliveries.filter((entry) => entry.paneId === selectedPaneId),
+      selectedTurns,
+      deliveryNow,
+    ),
+    [pendingDeliveries, selectedPaneId, selectedTurns, deliveryNow],
+  );
+
   const firstVisibleActivityKey = visibleActivity[0]?.key;
   const lastVisibleActivityKey = visibleActivity.at(-1)?.key;
 
@@ -346,6 +388,12 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
     if (!sessionId || selectedPaneId === null || !activityScrollRef.current) return;
     writeActivityScroll(sessionId, selectedPaneId, activityScrollRef.current, followNewestRef.current);
   }, [selectedPaneId, sessionId]);
+
+  const openRawTerminal = useCallback(() => {
+    if (selectedPaneId === null) return;
+    persistActivityScroll();
+    setTerminalPaneId(selectedPaneId);
+  }, [persistActivityScroll, selectedPaneId]);
 
   const handleActivityScroll = useCallback(() => {
     const element = activityScrollRef.current;
@@ -442,6 +490,11 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
         setActionError(result.error || "The conversation message could not be sent.");
         return;
       }
+      // Written blind into the pty; only the transcript can confirm it landed.
+      setPendingDeliveries((previous) => [
+        ...previous,
+        { paneId: selectedPaneId, text: followUp, sentAt: Date.now() },
+      ]);
       setFollowUp("");
       setActionError(null);
       return;
@@ -588,15 +641,56 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
             {visibleActivity.map((item) => <MobileEventCard key={item.key} item={item} answeredQuestions={answeredQuestions} onApprove={approve} onReject={reject} />)}
           </div>
         ) : (
-          <div className="flex min-h-60 flex-col items-center justify-center text-center">
+          <div className="flex min-h-60 flex-col items-center justify-center px-5 text-center">
             <div className="rounded-2xl bg-[#efeff5] p-3 dark:bg-[#25252d]">{connected ? <Wifi className="h-6 w-6 text-[#686873]" /> : <WifiOff className="h-6 w-6 text-[#686873]" />}</div>
-            <h2 className="mt-3 text-lg font-extrabold">{connected ? "No activity yet" : "No cached activity"}</h2>
-            <p className="mt-1 text-sm text-[#686873] dark:text-[#aaaab6]">{connected ? "Instructions and agent activity for this pane will appear here." : "Reconnect to retrieve this pane's activity."}</p>
+            {connected && selectedIsTerminal ? (
+              <>
+                {/* A terminal pane records every turn, so none at all means no
+                    conversation has started — it is very likely still at a
+                    startup prompt, where typed prose does something else
+                    entirely. Saying "No activity yet" made that look like a
+                    healthy, quiet agent. */}
+                <h2 className="mt-3 text-lg font-extrabold">This agent hasn&apos;t started a conversation yet</h2>
+                <p className="mt-1 max-w-sm text-sm leading-5 text-[#686873] dark:text-[#aaaab6]">
+                  It may still be starting up, or waiting at a prompt of its own — asking whether to
+                  resume a previous session, for example. Messages typed here go to it as
+                  keystrokes, so they will not do what you mean until it is ready.
+                </p>
+                <button
+                  type="button"
+                  aria-label="Open raw terminal to finish setting up this agent"
+                  onClick={openRawTerminal}
+                  className="mt-4 inline-flex items-center gap-2 rounded-xl bg-[#6d5efc] px-4 py-2.5 text-sm font-bold text-white"
+                >
+                  <SquareTerminal className="h-4 w-4" /> Open raw terminal
+                </button>
+              </>
+            ) : (
+              <>
+                <h2 className="mt-3 text-lg font-extrabold">{connected ? "No activity yet" : "No cached activity"}</h2>
+                <p className="mt-1 text-sm text-[#686873] dark:text-[#aaaab6]">{connected ? "Instructions and agent activity for this pane will appear here." : "Reconnect to retrieve this pane's activity."}</p>
+              </>
+            )}
           </div>
         )}
       </div>
 
       <div className="shrink-0 border-t border-[#dedee7] bg-[#f7f7fa] p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] dark:border-[#383842] dark:bg-[#111115]">
+        {unconfirmed.length > 0 && (
+          <div role="status" aria-live="polite" className="mb-1.5 flex items-start gap-2 rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
+            <AlertTriangle aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" />
+            <span className="min-w-0 flex-1">
+              {unconfirmed.length === 1
+                ? "This agent has not recorded your last message."
+                : `This agent has not recorded your last ${unconfirmed.length} messages.`}
+              {" "}
+              It may be mid-turn or waiting at a prompt, where typing does something else.
+              <button type="button" aria-label="Open raw terminal to check this message" onClick={openRawTerminal} className="ml-1 underline font-bold">
+                Open raw terminal
+              </button>
+            </span>
+          </div>
+        )}
         {connected && selectedStatus && <div role="status" aria-live="polite" className="mb-1.5 flex w-fit max-w-full items-center gap-1.5 rounded-full bg-[#eeecff] px-2.5 py-1 text-xs font-bold text-[#5b4de0] dark:bg-[#292452] dark:text-[#c8c1ff]"><LoaderCircle aria-hidden="true" className="h-3.5 w-3.5 shrink-0 animate-spin" /><span className="truncate">{selectedStatus}</span></div>}
         {!connected && canCompose && <p className="mb-1.5 text-[11px] text-amber-700 dark:text-amber-300">You can keep drafting while offline. Reconnect to send.</p>}
         {connected && !sessionIsRunning && canCompose && <p className="mb-1.5 text-[11px] text-amber-700 dark:text-amber-300">You can draft a message, but this project must be running before it can be sent.</p>}
