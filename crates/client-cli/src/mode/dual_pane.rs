@@ -3227,15 +3227,22 @@ async fn run_inner(
                             let Some(home) = home.as_deref() else {
                                 continue;
                             };
-                            // Where the file actually is, not only where it
-                            // ought to be: Claude Code can move a session into
-                            // one of its own worktrees and write under that
-                            // directory's slug instead.
-                            let pinned = crate::transcript::locate_claude_transcript(
-                                home,
-                                &transcript_cwd,
-                                &conv_id.to_string(),
-                            );
+                            // What Claude itself reported through its
+                            // SessionStart hook, which is the only account that
+                            // survives the user typing `/resume` onto another
+                            // session or Claude moving into a worktree. Falls
+                            // back to derivation when nothing has been reported
+                            // — an older Claude, or a hook that could not run.
+                            let pinned = crate::claude_session_hook::reported_transcript(
+                                session_id, pane_id,
+                            )
+                            .unwrap_or_else(|| {
+                                crate::transcript::locate_claude_transcript(
+                                    home,
+                                    &transcript_cwd,
+                                    &conv_id.to_string(),
+                                )
+                            });
                             // Follow the conversation the user is actually in:
                             // an in-TUI /resume to another session writes to a
                             // different file in the same cwd slug directory.
@@ -3252,7 +3259,11 @@ async fn run_inner(
                             // Re-point it at the pinned path once that resolves
                             // somewhere real, rather than sitting idle until the
                             // switch heuristic guesses.
-                            if watch.mtime.is_none() && watch.path != pinned && pinned.exists() {
+                            // Re-point whenever the pinned path moves. When it
+                            // comes from the hook that is Claude telling us the
+                            // session changed, which no amount of watching the
+                            // old file would reveal.
+                            if watch.path != pinned && pinned.exists() {
                                 tracing::info!(
                                     pane_id,
                                     from = %watch.path.display(),

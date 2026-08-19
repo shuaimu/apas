@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 mod auth;
 mod claude;
+mod claude_session_hook;
 mod config;
 mod conversation;
 mod daemon_registry;
@@ -163,6 +164,11 @@ enum Commands {
         #[arg(long)]
         runtime_dir: PathBuf,
     },
+    /// Internal `SessionStart` hook for Claude panes: reads the hook payload on
+    /// stdin and records which transcript that pane is writing. Not intended
+    /// for direct use.
+    #[command(hide = true)]
+    SessionHook,
 }
 
 #[derive(Subcommand)]
@@ -300,6 +306,13 @@ async fn main() -> Result<()> {
                 // subscriber above), so nothing extra is needed here beyond not
                 // printing.
                 return mcp::run(project_dir, pane_id).await;
+            }
+            Commands::SessionHook => {
+                // Never fail the hook: a non-zero exit or stray output lands in
+                // the user's terminal exactly as their agent is starting, and
+                // the watcher's own derivation is still there as a fallback.
+                let _ = claude_session_hook::run();
+                return Ok(());
             }
             Commands::PaneHost { runtime_dir } => {
                 return pane_host::run_host(runtime_dir);

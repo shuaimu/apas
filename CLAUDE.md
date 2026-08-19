@@ -854,13 +854,38 @@ otherwise have had to volunteer.
 
 **Locating the file differs by provider, and so does the confidence:**
 
-- **claude** — initially spawned with `--session-id <pane's session_id>`, which
-  APAS already mints per pane, and restored with `--resume <pane's session_id>`
-  so it keeps writing that same transcript. The path is exact:
-  `~/.claude/projects/<cwd with / replaced by ->/<session-id>.jsonl`. Verified
-  against a live run, not assumed. Never substitute `--continue` here: it can
-  select another pane's most recent cwd conversation and silently disconnect
-  terminal output from APAS's transcript watcher.
+- **claude** — **the provider reports its own transcript.** Each Claude pane is
+  spawned with `--settings <pane file>` installing a `SessionStart` hook that
+  runs `apas session-hook`; Claude passes it `transcript_path` on stdin, and it
+  records that under
+  `${XDG_RUNTIME_DIR}/apas/panes/<project>/<pane>/claude-session.json` (0600,
+  written temp+rename so a poll cannot read a half-written file). The watcher
+  reads that file.
+
+  The deriving path — `--session-id <pane's session_id>` pinned at spawn, and
+  `~/.claude/projects/<cwd with / replaced by ->/<session-id>.jsonl` — remains
+  as the fallback, and both halves of it are wrong as soon as the user acts.
+  Claude Code can move a session into `.claude/worktrees/<name>` and then writes
+  under **that** directory's slug; and `/resume` onto another session appends to
+  **that session's** file, so the pinned id names a conversation the pane has
+  left. What used to cover the gap — follow the newest transcript in the
+  directory — cannot tell our pane switching files from an unrelated `claude`
+  running in the same directory, and on a live pane it published 607 records of
+  someone else's conversation while the pane's own sat unread in a worktree.
+
+  Three things were verified against Claude Code before building on it: the hook
+  fires on `startup` **and** `resume` carrying the absolute `transcript_path`;
+  `--settings` **merges** with the user's other settings layers rather than
+  replacing them, so the pane keeps its owner's model and theme; and the hook
+  process **inherits the provider's environment**, which is how `APAS_PANE_RUNTIME`
+  identifies the pane. A `claude` a person runs by hand has no such variable, so
+  it records nothing and can never be adopted.
+
+  This is deliberately unlike the `record_turn` MCP tool below, which asked the
+  *model* to cooperate and was abandoned: a hook is run by the client, not
+  chosen by the agent. Never substitute `--continue`: it can select another
+  pane's most recent cwd conversation and silently disconnect terminal output
+  from APAS's transcript watcher.
 - **codex** — has no equivalent flag. Its rollout files record `cwd` and a
   start timestamp in `session_meta`, so a pane is matched to the newest rollout
   in its own directory. That is a heuristic; two codex panes in the same

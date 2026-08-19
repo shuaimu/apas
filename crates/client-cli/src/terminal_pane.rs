@@ -588,8 +588,18 @@ pub(crate) fn terminal_args_for(
     conversation_id: Uuid,
     resume: bool,
     initial_prompt: Option<&str>,
+    // Claude's `SessionStart` hook, which reports the transcript this pane is
+    // actually writing. Settings layers merge, so this adds the hook without
+    // disturbing anything its owner configured.
+    settings_path: Option<&std::path::Path>,
 ) -> Vec<String> {
     let mut args = Vec::new();
+    if matches!(provider, Provider::Claude) {
+        if let Some(settings) = settings_path {
+            args.push("--settings".to_string());
+            args.push(settings.display().to_string());
+        }
+    }
     if resume {
         args.extend(resume_args_for(provider, conversation_id));
     }
@@ -678,12 +688,23 @@ impl TerminalHandle {
             })
             .context("failed to allocate pty for terminal pane")?;
 
+        let mut hook_env = env.to_vec();
+        let settings =
+            crate::claude_session_hook::prepare(provider, session_id, pane_id, &mut hook_env);
+        let env: &[(String, String)] = &hook_env;
+
         let mut cmd = CommandBuilder::new(binary_path);
         // Order matters: codex's resume marker is a subcommand (`codex
         // resume`) and its bypass flag follows it. The helper also prevents
         // treating OpenCode's initial instruction as its positional project
         // path.
-        for arg in terminal_args_for(provider, claude_session_id, resume, initial_prompt) {
+        for arg in terminal_args_for(
+            provider,
+            claude_session_id,
+            resume,
+            initial_prompt,
+            settings.as_deref(),
+        ) {
             cmd.arg(arg);
         }
         cmd.cwd(cwd);
@@ -1031,7 +1052,8 @@ mod tests {
                 &Provider::Opencode,
                 conversation_id,
                 false,
-                Some("fix the test")
+                Some("fix the test"),
+                None,
             ),
             vec!["--auto", "--prompt", "fix the test"]
         );
@@ -1040,7 +1062,8 @@ mod tests {
                 &Provider::Opencode,
                 conversation_id,
                 true,
-                Some("must not replay")
+                Some("must not replay"),
+                None,
             ),
             vec!["--continue", "--auto"]
         );
@@ -1048,6 +1071,15 @@ mod tests {
 
     #[test]
     fn pty_streams_output_and_reports_exit() {
+        // Spawning a Claude pane now writes its session-hook settings into the
+        // runtime tree, so point that at a temporary directory — and take the
+        // lock the other environment-mutating tests use, since relocating it
+        // under a sibling test is exactly what corrupted them before.
+        let _env = crate::project::test_support::env_lock();
+        let runtime = tempfile::tempdir().unwrap();
+        let previous_runtime = std::env::var_os("XDG_RUNTIME_DIR");
+        std::env::set_var("XDG_RUNTIME_DIR", runtime.path());
+
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1144,14 +1176,32 @@ mod tests {
             // `--session-id` is the load-bearing one: it pins claude's
             // conversation id to the pane's, which is the only reason the
             // pane's transcript can be located exactly rather than guessed.
+            let argv = String::from_utf8_lossy(&collected).trim_end().to_string();
+            // The settings path is a runtime directory, so match its shape
+            // rather than its text; everything after it is exact.
+            let (settings, rest) = argv
+                .split_once(' ')
+                .map(|(flag, rest)| (flag, rest))
+                .expect("argv has a settings flag");
+            assert_eq!(settings, "--settings");
+            let (settings_path, rest) = rest.split_once(' ').expect("argv has a settings path");
+            assert!(
+                settings_path.ends_with("claude-settings.json"),
+                "the pane's own settings file: {settings_path}"
+            );
             assert_eq!(
-                String::from_utf8_lossy(&collected).trim_end(),
+                rest,
                 format!(
                     "--dangerously-skip-permissions --session-id {conv_id} diagnose the failing test"
                 ),
             );
             handle.shutdown();
         });
+
+        match previous_runtime {
+            Some(value) => std::env::set_var("XDG_RUNTIME_DIR", value),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
     }
 
     #[test]

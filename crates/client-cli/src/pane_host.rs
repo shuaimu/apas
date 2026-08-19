@@ -145,7 +145,7 @@ pub struct RuntimePaths {
     pub socket: PathBuf,
 }
 
-fn short_uuid(id: Uuid) -> String {
+pub(crate) fn short_uuid(id: Uuid) -> String {
     id.simple().to_string()[..12].to_string()
 }
 
@@ -572,6 +572,8 @@ impl HostedProcess {
         conversation_id: Uuid,
         resume: bool,
         initial_prompt: Option<&str>,
+        project_id: Uuid,
+        pane_id: u32,
     ) -> Result<Arc<Self>> {
         let pair = native_pty_system().openpty(PtySize {
             rows: DEFAULT_ROWS,
@@ -589,11 +591,19 @@ impl HostedProcess {
         // 80-column width. Cleanup still terminates the whole tree because
         // the direct child is a session/process-group leader.
         let mut command = CommandBuilder::new(binary_path);
+        // Install Claude's SessionStart hook, which is how this pane's
+        // transcript is identified rather than guessed. Returns None for other
+        // providers and on any failure, which leaves the pane starting normally.
+        let mut env = env.to_vec();
+        let settings =
+            crate::claude_session_hook::prepare(&provider, project_id, pane_id, &mut env);
+        let env: &[(String, String)] = &env;
         for arg in crate::terminal_pane::terminal_args_for(
             &provider,
             conversation_id,
             resume,
             initial_prompt,
+            settings.as_deref(),
         ) {
             command.arg(arg);
         }
@@ -793,6 +803,8 @@ fn serve_controller(
                 conversation_id,
                 resume,
                 initial_prompt.as_deref(),
+                project_id,
+                pane_id,
             )?);
             (controller_id, controller_generation, None, false)
         }
