@@ -59,12 +59,14 @@ function seedSidebarState({
   machines = [],
   attachSession = vi.fn(),
   forgetProject = vi.fn(),
+  openSessionPane = vi.fn(),
 }: {
   sessions: SessionInfo[];
   cliClients?: CliClient[];
   machines?: MachineWithProjects[];
   attachSession?: StoreState["attachSession"];
   forgetProject?: StoreState["forgetProject"];
+  openSessionPane?: StoreState["openSessionPane"];
 }) {
   act(() => {
     useStore.setState({
@@ -74,6 +76,7 @@ function seedSidebarState({
       forgetProject,
       listSessions: vi.fn(),
       machines,
+      openSessionPane,
       refreshCliClients: vi.fn(),
       sessionId: null,
       sessions,
@@ -414,5 +417,93 @@ describe("Sidebar project list", () => {
 
     expect(await screen.findByText("Membership changed concurrently")).toBeTruthy();
     expect(forgetProject).not.toHaveBeenCalled();
+  });
+
+  it("lists idle agents one per pane, including inside a working project", () => {
+    // The case the project list cannot express: this project is working, so it
+    // reads as busy while two of its agents sit waiting.
+    seedSidebarState({
+      sessions: [makeSession({
+        id: "session-a",
+        workingDir: "/repo/mako",
+        hostname: "zoo-005",
+        isActive: true,
+        isWorking: true,
+        panes: [
+          { pane_id: 3, label: "Claude terminal 3", kind: "terminal", provider: "claude", is_working: false },
+          { pane_id: 4, label: "Codex terminal 2", kind: "terminal", provider: "codex", is_working: true },
+        ],
+      })],
+    });
+
+    render(<Sidebar />);
+    fireEvent.click(screen.getByRole("button", { name: "Idle sessions" }));
+
+    const row = screen.getByRole("button", { name: "Open Claude terminal 3 in mako" });
+    expect(row.textContent).toContain("mako");
+    expect(row.textContent).toContain("zoo-005");
+    expect(screen.queryByRole("button", { name: /Codex terminal 2/ })).toBeNull();
+  });
+
+  it("opens the agent that was named, not just its project", () => {
+    const openSessionPane = vi.fn();
+    seedSidebarState({
+      openSessionPane,
+      sessions: [makeSession({
+        id: "session-a",
+        workingDir: "/repo/mako",
+        isActive: true,
+        panes: [{ pane_id: 7, label: "Claude terminal 3", kind: "terminal", provider: "claude", is_working: false }],
+      })],
+    });
+
+    render(<Sidebar />);
+    fireEvent.click(screen.getByRole("button", { name: "Idle sessions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Claude terminal 3 in mako" }));
+
+    expect(openSessionPane).toHaveBeenCalledWith("session-a", 7);
+  });
+
+  it("excludes agents in projects that are not running", () => {
+    seedSidebarState({
+      sessions: [makeSession({
+        id: "session-a",
+        workingDir: "/repo/stopped",
+        isActive: false,
+        panes: [{ pane_id: 3, label: "Stopped one", kind: "terminal", provider: "claude", is_working: false }],
+      })],
+    });
+
+    render(<Sidebar />);
+    fireEvent.click(screen.getByRole("button", { name: "Idle sessions" }));
+
+    expect(screen.getByText("No idle sessions")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Stopped one/ })).toBeNull();
+  });
+
+  it("treats a session with no pane detail as unknown rather than idle", () => {
+    // An older server omits the field; filling the list with every project
+    // would be worse than showing nothing.
+    seedSidebarState({
+      sessions: [makeSession({ id: "session-a", workingDir: "/repo/mako", isActive: true })],
+    });
+
+    render(<Sidebar />);
+    fireEvent.click(screen.getByRole("button", { name: "Idle sessions" }));
+
+    expect(screen.getByText("No idle sessions")).toBeTruthy();
+  });
+
+  it("keeps the project list one click away", () => {
+    seedSidebarState({
+      sessions: [makeSession({ id: "session-a", workingDir: "/repo/mako", isActive: true })],
+    });
+
+    render(<Sidebar />);
+    expect(screen.getByRole("button", { name: "All projects" }).getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(screen.getByRole("button", { name: "Idle sessions" }));
+    expect(screen.queryByText("/repo/mako")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "All projects" }));
+    expect(screen.getByText("/repo/mako")).toBeTruthy();
   });
 });

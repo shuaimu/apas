@@ -53,20 +53,9 @@ fn session_info(
         is_active,
         is_working: is_active && !working.is_empty(),
         // Same map the flag above is derived from, so "this session is working"
-        // and "these panes are working" cannot disagree.
-        panes: state
-            .sessions
-            .get_session_panes(&session_id)
-            .into_iter()
-            .map(|pane| shared::MobilePaneSummary {
-                pane_id: pane.pane_id,
-                label: pane.label,
-                kind: pane.kind,
-                provider: pane.provider,
-                is_working: is_active
-                    && working.iter().any(|(_, id, _)| *id == pane.pane_id),
-            })
-            .collect(),
+        // and "these panes are working" cannot disagree — and the same helper
+        // the web list uses, so the two surfaces cannot either.
+        panes: super::ws_web::pane_summaries(state, &session_id, is_active),
     }
 }
 

@@ -723,6 +723,30 @@ async fn replay_or_claim_mutation_request(
 /// Load the latest effective policy for a launch-like mutation. Both ends of
 /// the data-plane must understand server-owned policy before a launch is
 /// routed; otherwise an older peer could silently apply local `.apas` state.
+/// The panes in a session and whether each is working.
+///
+/// Shared by the web and mobile session lists so "this project is working" and
+/// "these agents are working" are answered from one place and cannot disagree.
+pub(crate) fn pane_summaries(
+    state: &AppState,
+    session_id: &Uuid,
+    is_active: bool,
+) -> Vec<shared::MobilePaneSummary> {
+    let working = state.sessions.get_pane_statuses(session_id);
+    state
+        .sessions
+        .get_session_panes(session_id)
+        .into_iter()
+        .map(|pane| shared::MobilePaneSummary {
+            pane_id: pane.pane_id,
+            label: pane.label,
+            kind: pane.kind,
+            provider: pane.provider,
+            is_working: is_active && working.iter().any(|(_, id, _)| *id == pane.pane_id),
+        })
+        .collect()
+}
+
 async fn effective_policy_for_launch(
     state: &AppState,
     connection_id: &Uuid,
@@ -5490,9 +5514,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 share_role: Some("owner".to_string()),
                                 is_active,
                                 is_working,
-                                // The web receives its pane roster on its own
-                                // channel; this list exists for mobile.
-                                panes: Vec::new(),
+                                panes: pane_summaries(&state, &session_id, is_active),
                             }
                         })
                         .collect();
@@ -5523,7 +5545,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             share_role: Some(share_role),
                             is_active,
                             is_working,
-                            panes: Vec::new(),
+                            panes: pane_summaries(&state, &session_id, is_active),
                         });
                     }
 

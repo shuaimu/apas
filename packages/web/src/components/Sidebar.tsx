@@ -54,6 +54,18 @@ type ProjectRole = "owner" | "user";
 
 // Group key + localStorage key for collapsed repo groups in the sidebar.
 const NO_REMOTE_KEY = "__no_remote__";
+type SidebarView = "projects" | "idle";
+
+/// The same name the project list shows, so an agent row and its project agree.
+function projectNameFor(session: { workingDir?: string; projectId?: string; id: string }): string {
+  return session.workingDir?.split("/").pop()
+    || `Project ${(session.projectId || session.id).slice(0, 8)}`;
+}
+
+/// Matches the session screen's fallback so one pane reads the same everywhere.
+function paneRowLabel(pane: { label?: string | null; kind: string; pane_id: number }): string {
+  return pane.label?.trim() || `${pane.kind === "terminal" ? "Terminal" : "Pane"} ${pane.pane_id}`;
+}
 const COLLAPSED_GROUPS_STORAGE_KEY = "apas_collapsed_repo_groups";
 
 // Turn a canonical `host/owner/repo` remote into a compact header label.
@@ -99,7 +111,11 @@ interface ShareListState {
 }
 
 export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
-  const { cliClients, sessions, machines, attachSession, forgetProject, refreshCliClients, listSessions, sessionId, connected, token } = useStore();
+  const { cliClients, sessions, machines, attachSession, openSessionPane, forgetProject, refreshCliClients, listSessions, sessionId, connected, token } = useStore();
+  // Which list the sidebar is showing. Projects answer "where do I want to go";
+  // idle agents answer "who is waiting for me", which the project view cannot
+  // express — a project with one busy pane reads as working, hiding the rest.
+  const [view, setView] = useState<SidebarView>("projects");
   const unreadSessions = useStore((s) => s.unreadSessions);
   const [shareModalOpen, setShareModalOpen] = useState(false);
   const [mounted, setMounted] = useState(false);
@@ -161,7 +177,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
     for (const session of sortedSessions) {
       const projectKey = session.projectId || session.id;
       const workingDir = session.workingDir || session.id;
-      const name = session.workingDir?.split('/').pop() || `Project ${(session.projectId || session.id).slice(0, 8)}`;
+      const name = projectNameFor(session);
 
       const existing = projectMap.get(projectKey);
       if (!existing || (session.isActive && !existing.isActive)) {
@@ -224,6 +240,18 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
   // per group (including the "(no remote)" bucket). Named-repo groups keep the
   // activity/recency order inherited from `projects` (Array#sort is stable, so
   // returning 0 preserves first-seen order); the no-remote bucket sinks last.
+  const idleAgents = useMemo(
+    () => sessions
+      // A stopped project's agents are not idle, they are not running.
+      .filter((session) => session.isActive)
+      .flatMap((session) =>
+        (session.panes ?? [])
+          .filter((pane) => !pane.is_working)
+          .map((pane) => ({ session, pane })),
+      ),
+    [sessions],
+  );
+
   const repoGroups = useMemo(() => {
     const byKey = new Map<
       string,
@@ -623,7 +651,70 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
         </div>
       </div>
 
-      {/* Project list */}
+      {/* Which question the list is answering */}
+      <div className="flex gap-1 border-b border-gray-200 px-2 py-2 dark:border-gray-800">
+        {([
+          ["projects", "All projects"],
+          ["idle", "Idle sessions"],
+        ] as const).map(([key, label]) => (
+          <button
+            key={key}
+            type="button"
+            aria-pressed={view === key}
+            onClick={() => setView(key)}
+            className={`flex-1 rounded px-2 py-1 text-xs font-semibold ${
+              view === key
+                ? "bg-white text-gray-900 shadow-sm dark:bg-gray-800 dark:text-gray-100"
+                : "text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {view === "idle" ? (
+        <div className="flex-1 overflow-y-auto p-2">
+          {idleAgents.length > 0 ? (
+            <div className="space-y-1.5">
+              {idleAgents.map(({ session, pane }) => {
+                const name = projectNameFor(session);
+                return (
+                  <button
+                    key={`${session.id}:${pane.pane_id}`}
+                    type="button"
+                    aria-label={`Open ${paneRowLabel(pane)} in ${name}`}
+                    onClick={() => {
+                      // Names an agent, so it opens that agent rather than
+                      // whichever tab the project was last left on.
+                      openSessionPane(session.id, pane.pane_id);
+                      onClose?.();
+                    }}
+                    className="w-full rounded-lg border border-gray-200 bg-white p-2.5 text-left hover:border-gray-300 dark:border-gray-800 dark:bg-gray-800/60 dark:hover:border-gray-700"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="min-w-0 flex-1 truncate text-sm font-medium">{paneRowLabel(pane)}</span>
+                      <span className="shrink-0 rounded-full bg-gray-100 px-2 py-0.5 text-[0.65rem] font-semibold text-gray-600 dark:bg-gray-700 dark:text-gray-300">Idle</span>
+                    </div>
+                    <div className="mt-1 truncate text-xs text-gray-500 dark:text-gray-400">
+                      {name}
+                      {session.hostname ? ` · ${session.hostname}` : ""}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="py-8 text-center text-sm text-gray-400">
+              <FolderOpen className="mx-auto mb-2 h-8 w-8 opacity-50" />
+              <p>No idle sessions</p>
+              <p className="mt-1 text-xs">
+                {sessions.length ? "Every agent that reported in is working." : "Run `apas` in a directory to start"}
+              </p>
+            </div>
+          )}
+        </div>
+      ) : (
       <div className="flex-1 overflow-y-auto p-2">
         {projects.length === 0 ? (
           <div className="text-center text-gray-400 text-sm py-8">
@@ -741,6 +832,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
           </div>
         )}
       </div>
+      )}
 
       {/* Every account administers its own virtual cluster here: the machines
           it registered and the projects hosted on them. System administration

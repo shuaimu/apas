@@ -434,6 +434,8 @@ export function TabbedView({
   mobileTrailing?: React.ReactNode;
 } = {}) {
   const sessionId = useStore((s) => s.sessionId);
+  const pendingPaneSelection = useStore((s) => s.pendingPaneSelection);
+  const clearPendingPaneSelection = useStore((s) => s.clearPendingPaneSelection);
   const projectPolicies = useStore((s) => s.projectPolicies);
   const negotiatedCapabilities = useStore((s) => s.negotiatedCapabilities);
   const messages = useStore((s) => s.messages);
@@ -599,6 +601,17 @@ export function TabbedView({
   // fail the `ids.includes(activeTabId)` check, fall through, and
   // overwrite A's localStorage with A's first pane id.
   const lastDerivedForRef = useRef<string | null | undefined>(undefined);
+
+  // An entry point that named an agent rather than a project wins over the
+  // remembered tab: the person asked for that pane, and the preference is keyed
+  // by CLI client, which the caller could not know before attaching.
+  useEffect(() => {
+    if (!pendingPaneSelection || pendingPaneSelection.sessionId !== sessionId) return;
+    const wanted = pendingPaneSelection.paneId;
+    if (!paneConfigs.some((pane) => pane.pane_id === wanted)) return;
+    setActiveTabId(wanted);
+    clearPendingPaneSelection();
+  }, [clearPendingPaneSelection, paneConfigs, pendingPaneSelection, sessionId]);
 
   // Derive activeTabId from cliClientId + available panes + persisted
   // preference. Writes to localStorage only happen through

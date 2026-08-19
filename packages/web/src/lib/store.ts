@@ -102,6 +102,17 @@ export interface SessionInfo {
   shareRole?: "owner" | "user";
   isActive?: boolean;
   isWorking?: boolean;
+  /** The session's panes and whether each is working. `isWorking` above only
+   *  says whether *anything* is, which cannot answer which agent is idle. */
+  panes?: SessionPaneSummary[];
+}
+
+export interface SessionPaneSummary {
+  pane_id: number;
+  label?: string | null;
+  kind: string;
+  provider: string;
+  is_working?: boolean;
 }
 
 /** A `create_project_instance` still in flight. */
@@ -768,6 +779,13 @@ interface AppState {
   clearMessages: () => void;
   startSession: (cliClientId?: string) => void;
   attachSession: (sessionId: string, forceReload?: boolean) => void;
+  /** A pane to open once its session is attached, for entry points that name an
+   *  agent rather than a project. The tab preference is keyed by CLI client,
+   *  which a caller cannot know before attaching, so the intent is carried here
+   *  and consumed by the tab view. */
+  pendingPaneSelection: { sessionId: string; paneId: number } | null;
+  openSessionPane: (sessionId: string, paneId: number) => void;
+  clearPendingPaneSelection: () => void;
   /** Remove all browser-side projections for a project after access loss. */
   forgetProject: (projectId: string) => void;
   refreshCliClients: () => void;
@@ -1464,6 +1482,15 @@ export const useStore = create<AppState>((set, get) => ({
       cli_client_id: cliClientId || null
     }));
   },
+
+  pendingPaneSelection: null,
+
+  openSessionPane: (sessionId: string, paneId: number) => {
+    set({ pendingPaneSelection: { sessionId, paneId } });
+    get().attachSession(sessionId);
+  },
+
+  clearPendingPaneSelection: () => set({ pendingPaneSelection: null }),
 
   attachSession: (sessionId: string, forceReload = false) => {
     const state = get();
@@ -4728,6 +4755,7 @@ export function handleServerMessage(
         shareRole: s.share_role === "owner" ? "owner" : s.share_role ? "user" : undefined,
         isActive: s.is_active as boolean | undefined,
         isWorking: s.is_working as boolean | undefined,
+        panes: Array.isArray(s.panes) ? (s.panes as SessionPaneSummary[]) : undefined,
       }));
 
       set((state) => {
