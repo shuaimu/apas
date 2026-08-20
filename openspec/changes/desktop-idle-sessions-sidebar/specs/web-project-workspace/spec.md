@@ -2,13 +2,19 @@
 
 ### Requirement: The workspace can list idle agents as well as projects
 
-The project sidebar SHALL offer both the projects an account can reach and the agents within them that are not currently working, and SHALL make clear which is being shown. An agent that is idle SHALL be listed even when other agents in its project are working. Each entry SHALL name the agent and the project and host it belongs to.
+The project sidebar SHALL offer both the projects an account can reach and the agents within them that are not currently working, and SHALL make clear which is being shown. An agent that is idle SHALL be listed even when other agents in its project are working. Each entry SHALL name the project it belongs to before the agent, giving both equal prominence, and SHALL name its host.
 
 #### Scenario: A project with both busy and idle agents
 
 - **WHEN** a project has one agent working and others idle
 - **THEN** the idle agents are listed
 - **AND** the working one is not
+
+#### Scenario: Reading an entry
+
+- **WHEN** a user reads an entry
+- **THEN** the project is named before the agent
+- **AND** neither is presented less prominently than the other
 
 #### Scenario: Agents in a project that is not running
 

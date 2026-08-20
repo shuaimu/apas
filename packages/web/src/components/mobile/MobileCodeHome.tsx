@@ -451,13 +451,18 @@ export function MobileCodeHome({
                     }}
                     className="w-full rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left shadow-sm transition hover:border-[#bdbdc9] active:opacity-75 dark:border-[#383842] dark:bg-[#1b1b21] dark:hover:border-[#50505c]"
                   >
+                    {/* Project first, then the agent: the project is what
+                        places the row, and both matter, so neither is demoted
+                        to the muted line. The host stays there instead. */}
                     <div className="flex items-center justify-between gap-2.5">
-                      <span className="min-w-0 flex-1 truncate text-base font-bold">{paneRowLabel(pane)}</span>
+                      <span className="flex min-w-0 flex-1 items-baseline gap-1.5 truncate text-base">
+                        <span className="shrink-0 truncate font-bold">{name}</span>
+                        <span aria-hidden="true" className="shrink-0 text-[#aaaab6] dark:text-[#686873]">/</span>
+                        <span className="min-w-0 truncate font-bold text-[#6d5efc]">{paneRowLabel(pane)}</span>
+                      </span>
                       <span className="shrink-0 rounded-full bg-[#efeff5] px-2.5 py-1 text-[0.7rem] font-bold text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]">Idle</span>
                     </div>
                     <p className="mt-2 truncate text-sm text-[#686873] dark:text-[#aaaab6]">
-                      {name}
-                      {" · "}
                       {sessionTarget(session)}
                     </p>
                   </button>

@@ -2,7 +2,7 @@
 
 ### Requirement: Idle work is listed per agent, not per project
 
-The application SHALL offer a list of the agents that are not currently working, with one entry per agent rather than one per project. An agent that is idle SHALL appear there even when other agents in the same project are working. Each entry SHALL identify the agent and the project and host it belongs to, so it can be placed without opening it.
+The application SHALL offer a list of the agents that are not currently working, with one entry per agent rather than one per project. An agent that is idle SHALL appear there even when other agents in the same project are working. Each entry SHALL identify the project it belongs to before the agent, giving both equal prominence, and SHALL identify its host. The project places the entry and the agent is what opening it selects, so neither is subordinate to the other.
 
 #### Scenario: A project with both busy and idle agents
 
@@ -19,6 +19,12 @@ The application SHALL offer a list of the agents that are not currently working,
 
 - **WHEN** a user reads an entry in the list
 - **THEN** it names the agent, and the project and host it belongs to
+
+#### Scenario: Reading an entry
+
+- **WHEN** a user reads an entry
+- **THEN** the project is named before the agent
+- **AND** neither is presented less prominently than the other
 
 #### Scenario: Opening an idle agent
 

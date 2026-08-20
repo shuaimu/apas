@@ -440,8 +440,11 @@ describe("Sidebar project list", () => {
     fireEvent.click(screen.getByRole("button", { name: "Idle sessions" }));
 
     const row = screen.getByRole("button", { name: "Open Claude terminal 3 in mako" });
-    expect(row.textContent).toContain("mako");
-    expect(row.textContent).toContain("zoo-005");
+    const text = row.textContent ?? "";
+    expect(text).toContain("zoo-005");
+    // Project before agent, both on the prominent line.
+    expect(text.indexOf("mako")).toBeGreaterThanOrEqual(0);
+    expect(text.indexOf("mako")).toBeLessThan(text.indexOf("Claude terminal 3"));
     expect(screen.queryByRole("button", { name: /Codex terminal 2/ })).toBeNull();
   });
 

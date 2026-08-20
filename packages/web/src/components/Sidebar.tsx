@@ -692,14 +692,22 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                     }}
                     className="w-full rounded-lg border border-gray-200 bg-white p-2.5 text-left hover:border-gray-300 dark:border-gray-800 dark:bg-gray-800/60 dark:hover:border-gray-700"
                   >
+                    {/* Project first, then the agent, both emphasised: the
+                        project places the row and the agent is what you are
+                        opening. The host is the only detail that can be quiet. */}
                     <div className="flex items-center justify-between gap-2">
-                      <span className="min-w-0 flex-1 truncate text-sm font-medium">{paneRowLabel(pane)}</span>
+                      <span className="flex min-w-0 flex-1 items-baseline gap-1 truncate text-sm">
+                        <span className="shrink-0 truncate font-semibold">{name}</span>
+                        <span aria-hidden="true" className="shrink-0 text-gray-400 dark:text-gray-600">/</span>
+                        <span className="min-w-0 truncate font-semibold text-indigo-600 dark:text-indigo-400">{paneRowLabel(pane)}</span>
+                      </span>
                       <span className="shrink-0 rounded-full bg-gray-100 px-2 py-0.5 text-[0.65rem] font-semibold text-gray-600 dark:bg-gray-700 dark:text-gray-300">Idle</span>
                     </div>
-                    <div className="mt-1 truncate text-xs text-gray-500 dark:text-gray-400">
-                      {name}
-                      {session.hostname ? ` · ${session.hostname}` : ""}
-                    </div>
+                    {session.hostname && (
+                      <div className="mt-1 truncate text-xs text-gray-500 dark:text-gray-400">
+                        {session.hostname}
+                      </div>
+                    )}
                   </button>
                 );
               })}

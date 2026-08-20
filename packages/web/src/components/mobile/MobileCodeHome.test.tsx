@@ -316,8 +316,12 @@ describe("MobileCodeHome", () => {
     expect(await screen.findByRole("button", { name: "Open Claude terminal 3 in mako" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: /Codex terminal 2/ })).toBeNull();
     const row = screen.getByRole("button", { name: "Open Claude terminal 3 in mako" });
-    expect(row.textContent).toContain("mako");
-    expect(row.textContent).toContain("zoo-005");
+    const text = row.textContent ?? "";
+    expect(text).toContain("zoo-005");
+    // Project before agent: the project places the row, the agent is what you
+    // are opening, and both are named on the prominent line.
+    expect(text.indexOf("mako")).toBeGreaterThanOrEqual(0);
+    expect(text.indexOf("mako")).toBeLessThan(text.indexOf("Claude terminal 3"));
   });
 
   it("remembers the tapped agent so the session opens on it", async () => {
