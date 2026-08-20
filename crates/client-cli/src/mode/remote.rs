@@ -516,21 +516,13 @@ async fn run_connection(
                     | Ok(ServerToCli::AnswerQuestion { .. })
                     | Ok(ServerToCli::RequestPaneDiff { .. })
                     | Ok(ServerToCli::CreatePr { .. })
-                    | Ok(ServerToCli::UpdateProjectGoal { .. })
                     | Ok(ServerToCli::UpdateProjectFlags { .. })
                     | Ok(ServerToCli::UpdateProjectOperations { .. })
                     | Ok(ServerToCli::ProjectPolicy { .. })
-                    | Ok(ServerToCli::StartTeam { .. })
                     | Ok(ServerToCli::UpdatePaneRole { .. })
                     | Ok(ServerToCli::PlanReviewAnswer { .. })
                     | Ok(ServerToCli::UpdatePaneReviewMode { .. })
-                    | Ok(ServerToCli::UpdatePaneManualMode { .. })
-                    | Ok(ServerToCli::FetchTeamTodo { .. })
-                    | Ok(ServerToCli::TodoApproval { .. })
-                    | Ok(ServerToCli::AddTodo { .. })
-                    | Ok(ServerToCli::FetchSuggestedWorkers { .. })
-                    | Ok(ServerToCli::DismissSuggestion { .. })
-                    | Ok(ServerToCli::PromotePaneToManaged { .. }) => {
+                    | Ok(ServerToCli::UpdatePaneManualMode { .. }) => {
                         // Pause/resume/pane/bot management not supported in remote mode.
                         // AnswerQuestion is dual_pane-only — remote mode doesn't run
                         // the streaming worker that owns the pending_questions map.

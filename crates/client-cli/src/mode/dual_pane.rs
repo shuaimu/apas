@@ -5604,72 +5604,8 @@ mod tests {
         }
     }
 
-    fn team_role_spec(provider: Provider, model: &str) -> shared::TeamRoleSpec {
-        shared::TeamRoleSpec {
-            provider: Some(provider),
-            model: Some(model.to_string()),
-        }
-    }
 
-    struct ExpectedTeamPane<'a> {
-        label: &'a str,
-        mode: shared::PaneMode,
-        provider: Provider,
-        model: &'a str,
-        prompt: Option<&'a str>,
-        effort: Option<&'a str>,
-        role: &'a str,
-        goal: &'a str,
-        backstory: &'a str,
-    }
 
-    fn assert_start_team_pane(event: &TuiEvent, expected: ExpectedTeamPane<'_>) {
-        let TuiEvent::AddTabWithConfig {
-            pane_id,
-            label,
-            claude_session_id,
-            mode,
-            provider,
-            prompt,
-            min_iteration_interval_minutes,
-            model,
-            effort,
-            worktree_path,
-            initial_input,
-            role,
-            goal,
-            backstory,
-            plan_review_mode,
-            managed,
-            try_resume_first,
-            kind,
-        } = event
-        else {
-            panic!("Start team should emit AddTabWithConfig events");
-        };
-
-        // Managed team roles are always agent panes — a Manager or Tech
-        // Lead hosted on a pty would publish no stream events and so
-        // couldn't participate in the team loop at all.
-        assert_eq!(*kind, shared::PaneKind::Agent);
-        assert!(*pane_id >= 3);
-        assert_ne!(*claude_session_id, Uuid::nil());
-        assert_eq!(label, expected.label);
-        assert_eq!(mode, &expected.mode);
-        assert_eq!(*provider, expected.provider);
-        assert_eq!(model.as_deref(), Some(expected.model));
-        assert_eq!(prompt.as_deref(), expected.prompt);
-        assert_eq!(min_iteration_interval_minutes, &None);
-        assert_eq!(effort.as_deref(), expected.effort);
-        assert_eq!(worktree_path, &None);
-        assert_eq!(initial_input, &None);
-        assert_eq!(role.as_deref(), Some(expected.role));
-        assert_eq!(goal.as_deref(), Some(expected.goal));
-        assert_eq!(backstory.as_deref(), Some(expected.backstory));
-        assert_eq!(*plan_review_mode, shared::PlanReviewMode::default());
-        assert!(*managed);
-        assert!(!*try_resume_first);
-    }
 
     fn start_team_event_label(event: &TuiEvent) -> &str {
         let TuiEvent::AddTabWithConfig { label, .. } = event else {

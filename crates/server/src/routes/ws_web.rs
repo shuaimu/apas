@@ -32,8 +32,6 @@ fn is_read_only_message(message: &WebToServer) -> bool {
             | WebToServer::ListSessions
             | WebToServer::GetSessionMessages { .. }
             | WebToServer::RequestPaneDiff { .. }
-            | WebToServer::FetchTeamTodo { .. }
-            | WebToServer::FetchSuggestedWorkers { .. }
             | WebToServer::TerminalAttach { .. }
             | WebToServer::ListPaneWorkSummaries { .. }
             | WebToServer::MobileTelemetry { .. }
@@ -859,18 +857,9 @@ async fn authorize_profile_launch(
     let Some(policy) = effective_policy_for_launch(state, connection_id, session_id).await else {
         return false;
     };
-    if managed && !policy.team_available {
-        send_policy_error(
-            state,
-            connection_id,
-            format!(
-                "Managed pane launch is disabled by cluster policy (policy version {})",
-                policy.version
-            ),
-        )
-        .await;
-        return false;
-    }
+    // `managed` is vestigial: an older `.apas` may still carry it, and it no
+    // longer selects a different kind of pane or a different policy.
+    let _ = managed;
     if policy.allows(kind, provider, model) {
         return true;
     }
@@ -978,74 +967,7 @@ async fn authorize_existing_pane_launch(
     let Some(policy) = effective_policy_for_launch(state, connection_id, session_id).await else {
         return false;
     };
-    if policy.team_available {
-        return true;
-    }
-    send_policy_error(
-        state,
-        connection_id,
-        format!(
-            "Managed pane launch is disabled by cluster policy (policy version {})",
-            policy.version
-        ),
-    )
-    .await;
-    false
-}
-
-async fn authorize_team_launch(
-    state: &AppState,
-    connection_id: &Uuid,
-    session_id: &Uuid,
-    roles: &[&shared::TeamRoleSpec],
-) -> bool {
-    for role in roles {
-        let provider = role.provider.unwrap_or(shared::Provider::Claude);
-        if shared::is_retired_launch(provider, role.model.as_deref()) {
-            send_policy_error(
-                state,
-                connection_id,
-                "Unsupported provider in managed team: this backend has been retired",
-            )
-            .await;
-            return false;
-        }
-    }
-    let Some(policy) = effective_policy_for_launch(state, connection_id, session_id).await else {
-        return false;
-    };
-    if !policy.team_available {
-        send_policy_error(
-            state,
-            connection_id,
-            format!(
-                "Team launch is disabled by cluster policy (policy version {})",
-                policy.version
-            ),
-        )
-        .await;
-        return false;
-    }
-    for role in roles {
-        let provider = role.provider.unwrap_or(shared::Provider::Claude);
-        if !policy.allows(shared::PaneKind::Agent, provider, role.model.as_deref()) {
-            send_policy_error(
-                state,
-                connection_id,
-                format!(
-                    "Team launch profile '{}' is disabled by cluster policy (policy version {})",
-                    shared::launch_profile_key(
-                        shared::PaneKind::Agent,
-                        provider,
-                        role.model.as_deref(),
-                    ),
-                    policy.version
-                ),
-            )
-            .await;
-            return false;
-        }
-    }
+    let _ = policy;
     true
 }
 
@@ -1147,6 +1069,44 @@ mod retired_launch_authorization_tests {
     /// The allowlist decides what may be created. Refusing to bring back a pane
     /// that already exists never removed it — it kept running and simply could
     /// not be recovered once stopped.
+    /// `team_available` survives on the wire and in stored policy so older web
+    /// and mobile builds keep parsing what they are sent, in the same way
+    /// `cluster_role` is retained. It must decide nothing: a policy that still
+    /// carries it has to behave exactly like one that does not.
+    #[tokio::test]
+    async fn the_retained_team_field_decides_nothing() {
+        let (state, connection_id, session_id, mut web_rx, _cli_rx, _cli_id) =
+            policy_state().await;
+        state
+            .sessions
+            .set_session_panes(&session_id, vec![pane(7, shared::Provider::Claude, true)]);
+
+        // A pane an older `.apas` marked managed, under a policy that says team
+        // mode is unavailable — the combination that used to refuse both.
+        assert!(authorize_existing_pane_launch(&state, &connection_id, &session_id, 7).await);
+        assert!(
+            web_rx.try_recv().is_err(),
+            "no refusal is raised on account of the retained field"
+        );
+
+        // And creating one is permitted where the allowlist permits the
+        // profile. `managed` used to refuse here whenever team mode was
+        // unavailable, which was always, so this is the behaviour that changed.
+        assert!(
+            authorize_new_pane_launch(
+                &state,
+                &connection_id,
+                &session_id,
+                shared::PaneKind::Terminal,
+                shared::Provider::Claude,
+                None,
+                true,
+            )
+            .await,
+            "only the launch profile decides creation now"
+        );
+    }
+
     #[tokio::test]
     async fn an_existing_pane_relaunches_outside_the_allowlist() {
         let (state, connection_id, session_id, mut web_rx, _cli_rx, _cli_id) =
@@ -1230,28 +1190,6 @@ mod retired_launch_authorization_tests {
         assert!(
             cli_rx.try_recv().is_err(),
             "retired request must not reach CLI"
-        );
-    }
-
-    #[tokio::test]
-    async fn retired_team_role_is_classified_before_policy_lookup() {
-        let (state, connection_id, _session_id, mut web_rx, mut cli_rx, _cli_id) =
-            policy_state().await;
-        let role = shared::TeamRoleSpec {
-            provider: Some(shared::Provider::Claude),
-            model: Some("glm-5.1".to_string()),
-        };
-
-        assert!(!authorize_team_launch(&state, &connection_id, &Uuid::new_v4(), &[&role],).await);
-
-        let ServerToWeb::Error { message } = web_rx.try_recv().expect("explicit web error") else {
-            panic!("expected policy error")
-        };
-        assert!(message.contains("Unsupported provider"));
-        assert!(!message.contains("incompatible"));
-        assert!(
-            cli_rx.try_recv().is_err(),
-            "retired team must not reach CLI"
         );
     }
 
@@ -4263,114 +4201,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::FetchTeamTodo {
-                    session_id: msg_sid,
-                }) => {
-                    let Some(sid) =
-                        resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
-                            .await
-                    else {
-                        continue;
-                    };
-                    state
-                        .sessions
-                        .route_to_cli(&sid, ServerToCli::FetchTeamTodo { session_id: sid })
-                        .await;
-                }
-                Ok(WebToServer::TodoApproval {
-                    session_id: msg_sid,
-                    todo_id,
-                    action,
-                }) => {
-                    let Some(sid) =
-                        resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
-                            .await
-                    else {
-                        continue;
-                    };
-                    tracing::info!(
-                        "Todo approval for session {}: {} → {}",
-                        sid,
-                        todo_id,
-                        action
-                    );
-                    state
-                        .sessions
-                        .route_to_cli(
-                            &sid,
-                            ServerToCli::TodoApproval {
-                                session_id: sid,
-                                todo_id,
-                                action,
-                            },
-                        )
-                        .await;
-                }
-                Ok(WebToServer::AddTodo {
-                    session_id: msg_sid,
-                    title,
-                    body,
-                }) => {
-                    let Some(sid) =
-                        resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
-                            .await
-                    else {
-                        continue;
-                    };
-                    tracing::info!(
-                        "Add TODO for session {}: {} ({} bytes)",
-                        sid,
-                        title,
-                        body.len()
-                    );
-                    state
-                        .sessions
-                        .route_to_cli(
-                            &sid,
-                            ServerToCli::AddTodo {
-                                session_id: sid,
-                                title,
-                                body,
-                            },
-                        )
-                        .await;
-                }
-                Ok(WebToServer::FetchSuggestedWorkers {
-                    session_id: msg_sid,
-                }) => {
-                    let Some(sid) =
-                        resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
-                            .await
-                    else {
-                        continue;
-                    };
-                    state
-                        .sessions
-                        .route_to_cli(&sid, ServerToCli::FetchSuggestedWorkers { session_id: sid })
-                        .await;
-                }
-                Ok(WebToServer::DismissSuggestion {
-                    session_id: msg_sid,
-                    suggestion_id,
-                }) => {
-                    let Some(sid) =
-                        resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
-                            .await
-                    else {
-                        continue;
-                    };
-                    tracing::info!("Dismiss suggestion {} for session {}", suggestion_id, sid);
-                    state
-                        .sessions
-                        .route_to_cli(
-                            &sid,
-                            ServerToCli::DismissSuggestion {
-                                session_id: sid,
-                                suggestion_id,
-                            },
-                        )
-                        .await;
-                }
                 Ok(WebToServer::TerminalInput {
                     session_id: msg_sid,
                     pane_id,
@@ -4519,42 +4349,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     state.mobile_metrics.increment(metric);
                     tracing::info!(event = ?event, "mobile terminal bridge health event");
                 }
-                Ok(WebToServer::PromotePaneToManaged {
-                    session_id: msg_sid,
-                    pane_id,
-                }) => {
-                    let Some(sid) =
-                        resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
-                            .await
-                    else {
-                        continue;
-                    };
-                    let pane = state
-                        .sessions
-                        .get_session_panes(&sid)
-                        .into_iter()
-                        .find(|pane| pane.pane_id == pane_id);
-                    if pane.is_some_and(|pane| pane.kind == shared::PaneKind::Terminal) {
-                        send_policy_error(
-                            &state,
-                            &connection_id,
-                            "Terminal panes cannot join a managed team",
-                        )
-                        .await;
-                        continue;
-                    }
-                    tracing::info!("Promote pane {} → managed for session {}", pane_id, sid);
-                    state
-                        .sessions
-                        .route_to_cli(
-                            &sid,
-                            ServerToCli::PromotePaneToManaged {
-                                session_id: sid,
-                                pane_id,
-                            },
-                        )
-                        .await;
-                }
                 Ok(WebToServer::UpdatePaneRole {
                     session_id: msg_sid,
                     pane_id,
@@ -4631,30 +4425,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::UpdateProjectGoal {
-                    session_id: msg_sid,
-                    goal,
-                }) => {
-                    if let Some(sid) =
-                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
-                    {
-                        tracing::info!(
-                            "Update project_goal for session {} ({} bytes)",
-                            sid,
-                            goal.len()
-                        );
-                        state
-                            .sessions
-                            .route_to_cli(
-                                &sid,
-                                ServerToCli::UpdateProjectGoal {
-                                    session_id: sid,
-                                    goal,
-                                },
-                            )
-                            .await;
-                    }
-                }
                 Ok(WebToServer::UpdateProjectFlags {
                     session_id: msg_sid,
                     auto_approve_todos,
@@ -4695,42 +4465,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     session_id: sid,
                                     auto_approve_todos,
                                     auto_merge_prs,
-                                },
-                            )
-                            .await;
-                    }
-                }
-                Ok(WebToServer::StartTeam {
-                    session_id: msg_sid,
-                    manager,
-                    tech_lead,
-                    reviewer,
-                    developer,
-                }) => {
-                    if let Some(sid) =
-                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
-                    {
-                        if !authorize_team_launch(
-                            &state,
-                            &connection_id,
-                            &sid,
-                            &[&manager, &tech_lead, &reviewer, &developer],
-                        )
-                        .await
-                        {
-                            continue;
-                        }
-                        tracing::info!(session_id = %sid, "Start team");
-                        state
-                            .sessions
-                            .route_to_cli(
-                                &sid,
-                                ServerToCli::StartTeam {
-                                    session_id: sid,
-                                    manager,
-                                    tech_lead,
-                                    reviewer,
-                                    developer,
                                 },
                             )
                             .await;
@@ -5340,12 +5074,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                             let noncompliant_pane_ids = panes_to_send
                                                 .iter()
                                                 .filter(|pane| {
-                                                    (!policy.team_available && pane.managed)
-                                                        || !policy.allows(
-                                                            pane.kind,
-                                                            pane.provider,
-                                                            pane.model.as_deref(),
-                                                        )
+                                                    !policy.allows(
+                                                        pane.kind,
+                                                        pane.provider,
+                                                        pane.model.as_deref(),
+                                                    )
                                                 })
                                                 .map(|pane| pane.pane_id)
                                                 .collect();
@@ -5401,15 +5134,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 )
                                 .await;
                         }
-
-                        // Replay the cached project_goal so a hard-refreshed
-                        // web client sees the current goal without waiting
-                        // for the CLI's mtime poller to fire on an actual
-                        // file change (which may not happen for hours).
-                        state
-                            .sessions
-                            .replay_project_goal_to_web(&sid, &connection_id)
-                            .await;
 
                         state
                             .sessions

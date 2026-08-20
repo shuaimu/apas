@@ -16,10 +16,10 @@
 
 ## 3. Server and protocol
 
-- [ ] 3.1 Remove team routing and the team launch authorization
-- [ ] 3.2 Keep `team_available` on the wire and in stored policy, deciding nothing, so older clients keep parsing
-- [ ] 3.3 Remove the team message variants that no sender or receiver remains for
-- [ ] 3.4 Tests: a policy carrying the retained field resolves identically to one without it; no launch is refused on account of it
+- [x] 3.1 Remove team routing and the team launch authorization
+- [x] 3.2 Keep `team_available` on the wire and in stored policy, deciding nothing, so older clients keep parsing
+- [x] 3.3 Remove the team message variants that no sender or receiver remains for
+- [x] 3.4 Tests: a policy carrying the retained field resolves identically to one without it; no launch is refused on account of it
 
 ## 4. Documentation and verification
 

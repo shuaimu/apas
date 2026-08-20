@@ -317,14 +317,6 @@ pub enum CliToServer {
         limits: UsageLimits,
     },
 
-    /// One team-scratchpad record (Phase 2.2b). CLI pushes when it
-    /// detects new lines in `.apas-team.jsonl` (either appended by an
-    /// agent via Bash/Write, or by a future MCP-publish helper). Sent
-    /// in batches on attach, then individually as new ones land.
-    TeamRecord {
-        session_id: Uuid,
-        record: TeamScratchpadRecord,
-    },
 
     /// Phase 3.2b2: CLI requests user approval for a held tool_use.
     /// Fired when the pane's `plan_review_mode` says "hold this tool"
@@ -377,13 +369,6 @@ pub enum CliToServer {
         error: Option<String>,
     },
 
-    /// v3.1 — current contents of `project_goal.md` on the CLI host.
-    /// Pushed (a) at CLI boot once the file exists, and (b) whenever the
-    /// file's mtime changes (manager wrote to it, user clicked Save and
-    /// CLI persisted it, an outside editor touched it). The web mirrors
-    /// the latest value per session and hydrates the textbox when not
-    /// being actively edited.
-    ProjectGoalChanged { session_id: Uuid, content: String },
 
     /// Tech-Lead autonomy flags. `auto_approve_todos` lets the Tech
     /// Lead flip Global TODOs from `proposed` → `approved` without a
@@ -421,22 +406,7 @@ pub enum CliToServer {
         disallowed_tab_types: Vec<String>,
     },
 
-    /// CLI's view of `team-todo.md`. Pushed in response to
-    /// `ServerToCli::FetchTeamTodo` and after each `TodoApproval`-driven
-    /// mutation. Server forwards to web as `ServerToWeb::TeamTodoState`.
-    TeamTodoState {
-        session_id: Uuid,
-        state: TeamTodoStateMsg,
-    },
 
-    /// CLI's view of `suggested-workers.md`. Pushed in response to
-    /// `ServerToCli::FetchSuggestedWorkers` and after each
-    /// `DismissSuggestion`-driven mutation. Server forwards to web as
-    /// `ServerToWeb::SuggestedWorkersState`.
-    SuggestedWorkersState {
-        session_id: Uuid,
-        suggestions: Vec<SuggestedWorkerMsg>,
-    },
 
     /// Raw pty bytes from a [`PaneKind::Terminal`] pane.
     ///
@@ -561,46 +531,11 @@ pub enum ServerToCli {
     /// Heartbeat response
     Heartbeat,
 
-    /// Server asks the CLI to send a fresh `team-todo.md` snapshot. CLI
-    /// replies with `CliToServer::TeamTodoState`.
-    FetchTeamTodo { session_id: Uuid },
 
-    /// Server forwards a web-side approval / rejection for a Global
-    /// TODO. CLI applies it through in-process `team_todo` helpers and
-    /// republishes `CliToServer::TeamTodoState`.
-    TodoApproval {
-        session_id: Uuid,
-        todo_id: String,
-        /// "approve" | "reject"
-        action: String,
-    },
 
-    /// Server forwards a web-side request to add a new Global TODO.
-    /// CLI picks the next id, writes status=approved, origin=user, and
-    /// republishes TeamTodoState.
-    AddTodo {
-        session_id: Uuid,
-        title: String,
-        #[serde(default)]
-        body: String,
-    },
 
-    /// Server asks the CLI to send a fresh `suggested-workers.md`
-    /// snapshot. CLI replies with `CliToServer::SuggestedWorkersState`.
-    FetchSuggestedWorkers { session_id: Uuid },
 
-    /// Web user dismissed a Manager-proposed worker suggestion. CLI
-    /// removes the section from `suggested-workers.md` and republishes
-    /// the state.
-    DismissSuggestion {
-        session_id: Uuid,
-        suggestion_id: String,
-    },
 
-    /// Flip a pane's `managed` field from false to true. CLI updates
-    /// PaneMeta + persists to .apas + re-broadcasts the PaneList.
-    /// One-way; there's no demote.
-    PromotePaneToManaged { session_id: Uuid, pane_id: u32 },
 
     /// Pause the deadloop (legacy - use PausePane for new code)
     PauseDeadloop { session_id: Uuid },
@@ -746,9 +681,6 @@ pub enum ServerToCli {
     /// `CliToServer::PrCreated`.
     CreatePr { session_id: Uuid, pane_id: u32 },
 
-    /// Manager v2 — write `goal` into project_goal.md at the project
-    /// root (overwriting any existing content).
-    UpdateProjectGoal { session_id: Uuid, goal: String },
 
     /// Toggle the Tech-Lead autonomy flags. Persisted into `.apas` so
     /// they survive a CLI reboot; the Tech Lead re-reads `.apas` each
@@ -786,23 +718,6 @@ pub enum ServerToCli {
         policy: EffectiveProjectPolicy,
     },
 
-    /// Spawn the default team (Manager, Tech Lead, Reviewer, Developer)
-    /// for any role that isn't already present. Triggered by the "Start
-    /// team" button on the Overview. Idempotent — extra clicks just
-    /// fill in roles the user removed. The four `*_spec` fields carry
-    /// the per-role provider/model picks the user made in the Team
-    /// setup card; empty fields keep the CLI's defaults.
-    StartTeam {
-        session_id: Uuid,
-        #[serde(default)]
-        manager: TeamRoleSpec,
-        #[serde(default)]
-        tech_lead: TeamRoleSpec,
-        #[serde(default)]
-        reviewer: TeamRoleSpec,
-        #[serde(default)]
-        developer: TeamRoleSpec,
-    },
 
     /// Set role/goal/backstory on the named pane and persist to .apas.
     /// Phase 2.1c.
@@ -1467,15 +1382,6 @@ pub enum WebToServer {
         pane_id: u32,
     },
 
-    /// Manager v2 — overwrite the project_goal.md file at the project
-    /// root with `goal`. The deadloop manager re-reads this file on
-    /// every iteration so a goal change takes effect at the next loop
-    /// boundary, not mid-iteration.
-    UpdateProjectGoal {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        session_id: Option<Uuid>,
-        goal: String,
-    },
 
     /// Set Tech-Lead autonomy flags. CLI writes both into `.apas` and
     /// then echoes `CliToServer::ProjectFlagsChanged` so peer web
@@ -1506,23 +1412,6 @@ pub enum WebToServer {
         auto_merge_prs: bool,
     },
 
-    /// Spawn the four default team panes for any role that isn't
-    /// already present. Triggered by the Overview "Start team" button.
-    /// CLI runs `spawn_missing_team_panes`. Idempotent. Per-role
-    /// `*_spec` fields carry the provider/model the user picked in
-    /// the Team setup card.
-    StartTeam {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        session_id: Option<Uuid>,
-        #[serde(default)]
-        manager: TeamRoleSpec,
-        #[serde(default)]
-        tech_lead: TeamRoleSpec,
-        #[serde(default)]
-        reviewer: TeamRoleSpec,
-        #[serde(default)]
-        developer: TeamRoleSpec,
-    },
 
     /// Update a pane's role/goal/backstory triple (Phase 2.1c). All three
     /// fields are optional — sending null for any of them clears that
@@ -1574,48 +1463,11 @@ pub enum WebToServer {
         manual_mode: bool,
     },
 
-    /// Ask the server to fetch the current `team-todo.md` for this
-    /// session's project. Forwarded as `ServerToCli::FetchTeamTodo`;
-    /// CLI replies with `CliToServer::TeamTodoState` which the server
-    /// hands back to web as `ServerToWeb::TeamTodoState`.
-    FetchTeamTodo { session_id: Uuid },
 
-    /// User approves or rejects a Tech-Lead-proposed Global TODO from
-    /// the web Overview tab. action: "approve" | "reject".
-    TodoApproval {
-        session_id: Uuid,
-        todo_id: String,
-        action: String,
-    },
 
-    /// User adds a new Global TODO from the Overview's + Add TODO
-    /// form. CLI assigns the next id (TODO-NNN), writes status=approved,
-    /// origin=user, then publishes a fresh TeamTodoState.
-    AddTodo {
-        session_id: Uuid,
-        title: String,
-        #[serde(default)]
-        body: String,
-    },
 
-    /// Web requests a fresh snapshot of `suggested-workers.md`.
-    /// Forwarded as `ServerToCli::FetchSuggestedWorkers`; CLI replies
-    /// with `CliToServer::SuggestedWorkersState` which the server hands
-    /// back to web as `ServerToWeb::SuggestedWorkersState`.
-    FetchSuggestedWorkers { session_id: Uuid },
 
-    /// User dismissed a suggested worker. Forwarded as
-    /// `ServerToCli::DismissSuggestion`; CLI removes the entry and
-    /// republishes the state.
-    DismissSuggestion {
-        session_id: Uuid,
-        suggestion_id: String,
-    },
 
-    /// One-way promote: flip an unmanaged side-chat pane to a managed
-    /// team member. CLI sets PaneMeta.managed = true and re-broadcasts
-    /// the PaneList. There's no demote — keep it simple.
-    PromotePaneToManaged { session_id: Uuid, pane_id: u32 },
 
     /// Keystrokes typed into a terminal pane's xterm.js view. Server
     /// resolves the target session and forwards as
@@ -1896,11 +1748,6 @@ pub enum ServerToWeb {
         limits: UsageLimits,
     },
 
-    /// One team scratchpad record forwarded from the CLI. Phase 2.2b.
-    TeamRecord {
-        session_id: Uuid,
-        record: TeamScratchpadRecord,
-    },
 
     /// Plan-review request forwarded from CLI. Phase 3.2b2.
     PlanReviewRequest {
@@ -1937,10 +1784,6 @@ pub enum ServerToWeb {
         error: Option<String>,
     },
 
-    /// Forwarded from `CliToServer::ProjectGoalChanged`. The web caches
-    /// this per-session and refreshes the Project goal textbox when the
-    /// user isn't actively editing.
-    ProjectGoalChanged { session_id: Uuid, content: String },
 
     /// Per-project and per-pane usage stats (prompt/token/cost counts) for
     /// the Overview. Pushed after each turn is recorded and replayed on
@@ -1991,22 +1834,7 @@ pub enum ServerToWeb {
         noncompliant_pane_ids: Vec<u32>,
     },
 
-    /// Snapshot of the project's team-todo.md state. Sent in reply to
-    /// `WebToServer::FetchTeamTodo` and after every CLI-side mutation
-    /// triggered by `WebToServer::TodoApproval`. See
-    /// `docs/todo-driven-workflow.md`.
-    TeamTodoState {
-        session_id: Uuid,
-        state: TeamTodoStateMsg,
-    },
 
-    /// Snapshot of the project's suggested-workers.md state. Sent in
-    /// reply to `WebToServer::FetchSuggestedWorkers` and after every
-    /// CLI-side mutation triggered by `WebToServer::DismissSuggestion`.
-    SuggestedWorkersState {
-        session_id: Uuid,
-        suggestions: Vec<SuggestedWorkerMsg>,
-    },
 
     /// Live pty bytes for a terminal pane, fanned out to every web
     /// client attached to the session.

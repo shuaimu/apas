@@ -1347,25 +1347,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     )
                                     .await;
                             }
-                            Ok(CliToServer::TeamRecord { session_id, record }) => {
-                                let Ok((_project_id, _operation_guard)) = state
-                                    .active_session_operation(&session_id.to_string())
-                                    .await
-                                else {
-                                    continue;
-                                };
-                                tracing::info!(
-                                    "Team scratchpad record for session {} (kind={}, pane={:?})",
-                                    session_id, record.kind, record.pane_id,
-                                );
-                                state
-                                    .sessions
-                                    .route_to_web(
-                                        &session_id,
-                                        ServerToWeb::TeamRecord { session_id, record },
-                                    )
-                                    .await;
-                            }
                             Ok(CliToServer::PaneDiff { session_id, pane_id, branch, base, diff, error }) => {
                                 let Ok((_project_id, _operation_guard)) = state
                                     .active_session_operation(&session_id.to_string())
@@ -1389,59 +1370,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                             base,
                                             diff,
                                             error,
-                                        },
-                                    )
-                                    .await;
-                            }
-                            Ok(CliToServer::ProjectGoalChanged { session_id, content }) => {
-                                let Ok((_project_id, _operation_guard)) = state
-                                    .active_session_operation(&session_id.to_string())
-                                    .await
-                                else {
-                                    continue;
-                                };
-                                // The CLI now sends every poll tick (~3s) so
-                                // server-side cache stays fresh across server
-                                // restarts. Dedup here so we only broadcast +
-                                // log when the content actually changed.
-                                let changed = state
-                                    .sessions
-                                    .get_project_goal(&session_id)
-                                    .as_deref()
-                                    != Some(content.as_str());
-                                state.sessions.set_project_goal(&session_id, content.clone());
-                                if changed {
-                                    tracing::debug!(
-                                        "Project goal changed for session {} ({} bytes)",
-                                        session_id,
-                                        content.len()
-                                    );
-                                    state
-                                        .sessions
-                                        .route_to_web(
-                                            &session_id,
-                                            ServerToWeb::ProjectGoalChanged {
-                                                session_id,
-                                                content,
-                                            },
-                                        )
-                                        .await;
-                                }
-                            }
-                            Ok(CliToServer::TeamTodoState { session_id, state: todo_state }) => {
-                                let Ok((_project_id, _operation_guard)) = state
-                                    .active_session_operation(&session_id.to_string())
-                                    .await
-                                else {
-                                    continue;
-                                };
-                                state
-                                    .sessions
-                                    .route_to_web(
-                                        &session_id,
-                                        ServerToWeb::TeamTodoState {
-                                            session_id,
-                                            state: todo_state,
                                         },
                                     )
                                     .await;
@@ -1476,24 +1404,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                             auto_merge_prs,
                                             team_enabled,
                                             disallowed_tab_types,
-                                        },
-                                    )
-                                    .await;
-                            }
-                            Ok(CliToServer::SuggestedWorkersState { session_id, suggestions }) => {
-                                let Ok((_project_id, _operation_guard)) = state
-                                    .active_session_operation(&session_id.to_string())
-                                    .await
-                                else {
-                                    continue;
-                                };
-                                state
-                                    .sessions
-                                    .route_to_web(
-                                        &session_id,
-                                        ServerToWeb::SuggestedWorkersState {
-                                            session_id,
-                                            suggestions,
                                         },
                                     )
                                     .await;
