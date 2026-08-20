@@ -32,10 +32,13 @@ interface TabBarProps {
   onRenameTab?: (paneId: number, newLabel: string) => void;
   onReorderTabs?: (orderedIds: number[]) => void;
   onBootCli?: () => void;
+  /** Shut the project down: every agent in it stops. */
+  onCloseProject?: () => void;
   onRebootCli?: () => void;
   lifecycleInventory?: CliLifecycleInventory;
   lifecycleStatus?: CliLifecycleStatus;
   showBootButton?: boolean;
+  showCloseProjectButton?: boolean;
   showRebootButton?: boolean;
   /** The Overview pseudo-tab is a team-mode surface. Hide it when the
    * project's effective cluster policy disables team mode. */
@@ -150,10 +153,12 @@ export function TabBar({
   onRenameTab,
   onReorderTabs,
   onBootCli,
+  onCloseProject,
   onRebootCli,
   lifecycleInventory,
   lifecycleStatus,
   showBootButton = false,
+  showCloseProjectButton = false,
   showRebootButton = false,
   showOverview = true,
   paneStatuses,
@@ -486,15 +491,35 @@ export function TabBar({
       {/* Global tab-bar actions */}
       <div className="flex items-center gap-1 pr-1">
         <AddTabButton onAddTab={onAddTab} />
+        {/* One slot, two states: a project is either open or closed. Closing
+            stops every agent in it, so it is confirmed and says so — the
+            agents are the work, not the process hosting them. */}
         {showBootButton && onBootCli && (
           <button
             onClick={() => {
-              if (confirm("Boot APAS CLI for this project?")) onBootCli();
+              if (confirm("Open this project? Its APAS CLI starts on the host.")) onBootCli();
             }}
             className="px-2.5 h-8 my-1 text-xs font-medium rounded transition-colors bg-blue-500 hover:bg-blue-600 text-white"
-            title="Boot CLI"
+            title="Open this project"
           >
-            Boot
+            Open
+          </button>
+        )}
+        {showCloseProjectButton && onCloseProject && (
+          <button
+            onClick={() => {
+              if (
+                confirm(
+                  "Close this project? Every agent in it is shut down, and it stops appearing in the idle list until you open it again.",
+                )
+              ) {
+                onCloseProject();
+              }
+            }}
+            className="px-2.5 h-8 my-1 text-xs font-medium rounded border border-red-300 text-red-700 transition-colors hover:bg-red-50 dark:border-red-800 dark:text-red-300 dark:hover:bg-red-950/40"
+            title="Close this project and shut down its agents"
+          >
+            Close
           </button>
         )}
         {showRebootButton && onRebootCli && (

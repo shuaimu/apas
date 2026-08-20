@@ -23,6 +23,10 @@ function renderTabBar(
     onSelectTab?: ReturnType<typeof vi.fn>;
     onAddTab?: ReturnType<typeof vi.fn>;
     onRebootCli?: ReturnType<typeof vi.fn>;
+    onBootCli?: ReturnType<typeof vi.fn>;
+    onCloseProject?: ReturnType<typeof vi.fn>;
+    showBootButton?: boolean;
+    showCloseProjectButton?: boolean;
     lifecycleInventory?: CliLifecycleInventory;
     lifecycleStatus?: CliLifecycleStatus;
     onRenameTab?: ReturnType<typeof vi.fn>;
@@ -54,6 +58,10 @@ function renderTabBar(
       onRenameTab={onRenameTab as Parameters<typeof TabBar>[0]["onRenameTab"]}
       onReorderTabs={onReorderTabs as Parameters<typeof TabBar>[0]["onReorderTabs"]}
       onRebootCli={overrides.onRebootCli as Parameters<typeof TabBar>[0]["onRebootCli"]}
+      onBootCli={overrides.onBootCli as Parameters<typeof TabBar>[0]["onBootCli"]}
+      onCloseProject={overrides.onCloseProject as Parameters<typeof TabBar>[0]["onCloseProject"]}
+      showBootButton={overrides.showBootButton}
+      showCloseProjectButton={overrides.showCloseProjectButton}
       lifecycleInventory={overrides.lifecycleInventory}
       lifecycleStatus={overrides.lifecycleStatus}
       showRebootButton={overrides.showRebootButton}
@@ -437,5 +445,47 @@ describe("TabBar add-tab worktree controls", () => {
     fireEvent.mouseDown(document.body);
 
     expect(screen.queryByText("Claude")).toBeNull();
+  });
+});
+
+describe("opening and closing a project", () => {
+  it("offers Open when the project is not running", () => {
+    const onBootCli = vi.fn();
+    renderTabBar({ showBootButton: true, onBootCli });
+
+    // It used to say "Boot", which named the process rather than the thing
+    // the person is opening.
+    expect(screen.queryByRole("button", { name: "Boot" })).toBeNull();
+    const open = screen.getByRole("button", { name: "Open" });
+
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    fireEvent.click(open);
+    expect(onBootCli).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers Close in the same slot when the project is running", () => {
+    const onCloseProject = vi.fn();
+    renderTabBar({ showCloseProjectButton: true, onCloseProject });
+
+    expect(screen.queryByRole("button", { name: "Open" })).toBeNull();
+    const close = screen.getByRole("button", { name: "Close" });
+
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    fireEvent.click(close);
+    expect(onCloseProject).toHaveBeenCalledTimes(1);
+  });
+
+  it("says what closing costs, and does nothing when declined", () => {
+    const onCloseProject = vi.fn();
+    renderTabBar({ showCloseProjectButton: true, onCloseProject });
+
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+
+    // Closing stops every agent in the project — that has to be said before
+    // it happens, not discovered afterwards. Assert the call this test made:
+    // the spy accumulates across tests in this file.
+    expect(confirmSpy).toHaveBeenLastCalledWith(expect.stringContaining("agent"));
+    expect(onCloseProject).not.toHaveBeenCalled();
   });
 });

@@ -461,6 +461,7 @@ export function TabbedView({
   const startBot = useStore((s) => s.startBot);
   const stopBot = useStore((s) => s.stopBot);
   const startMachineProjectCli = useStore((s) => s.startMachineProjectCli);
+  const stopMachineProjectCli = useStore((s) => s.stopMachineProjectCli);
   const rebootCli = useStore((s) => s.rebootCli);
   const lifecycleInventory = useStore((s) =>
     s.sessionId ? s.cliLifecycleInventories[s.sessionId] : undefined,
@@ -966,6 +967,14 @@ export function TabbedView({
 
   const canBootCurrentProject = !isAttached && bootTarget != null && !bootTarget.isRunning;
 
+  // Closing is the same target as opening, in the other direction.
+  const canCloseCurrentProject = bootTarget != null && bootTarget.isRunning;
+
+  const handleCloseProject = useCallback(() => {
+    if (!bootTarget) return;
+    stopMachineProjectCli(bootTarget.machineId, bootTarget.projectId);
+  }, [bootTarget, stopMachineProjectCli]);
+
   const handleBootCli = useCallback(() => {
     if (!bootTarget) return;
     startMachineProjectCli(bootTarget.machineId, bootTarget.projectId);
@@ -1111,10 +1120,12 @@ export function TabbedView({
         onRenameTab={handleRenameTab}
         onReorderTabs={handleReorderTabs}
         onBootCli={handleBootCli}
+        onCloseProject={handleCloseProject}
         onRebootCli={rebootCli}
         lifecycleInventory={lifecycleInventory}
         lifecycleStatus={lifecycleStatus}
         showBootButton={canBootCurrentProject}
+        showCloseProjectButton={canCloseCurrentProject}
         showRebootButton={isAttached}
         showOverview={showOverview}
         paneStatuses={paneStatuses}
