@@ -1,9 +1,9 @@
 ## 1. Web surfaces
 
-- [ ] 1.1 Remove the overview team panels: goal bar, TODO panel, delegation board, scratchpad ticker, suggested workers, team setup, team-mode switch, autonomy toggles, and their tests
-- [ ] 1.2 Remove the store actions and state that fed them
-- [ ] 1.3 Leave the launch-policy card, pane grid and usage rollups intact — they are not team mode
-- [ ] 1.4 Web lint, type-check and tests clean
+- [x] 1.1 Remove the overview team panels: goal bar, TODO panel, delegation board, scratchpad ticker, suggested workers, team setup, team-mode switch, autonomy toggles, and their tests
+- [x] 1.2 Remove the store actions and state that fed them
+- [x] 1.3 Leave the launch-policy card, pane grid and usage rollups intact — they are not team mode
+- [x] 1.4 Web lint, type-check and tests clean
 
 ## 2. Project host
 

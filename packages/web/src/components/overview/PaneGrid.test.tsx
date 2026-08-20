@@ -29,17 +29,15 @@ function seedPaneGrid(paneConfigs: PaneConfig[], promotePaneToManaged = vi.fn())
     pausedPanes: [],
     paneMessages: {},
     paneDiffs: {},
-    promotePaneToManaged,
     updatePaneManualMode: vi.fn(),
     updatePaneModel,
   });
   return { promotePaneToManaged, updatePaneModel };
 }
 
-function renderPaneGrid(kind: "managed" | "unmanaged", onRemovePane = vi.fn(), onOpenPane = vi.fn()) {
+function renderPaneGrid(onRemovePane = vi.fn(), onOpenPane = vi.fn()) {
   const result = render(
     <PaneGrid
-      kind={kind}
       onOpenPane={onOpenPane}
       onOpenDiff={vi.fn()}
       onOpenRole={vi.fn()}
@@ -72,51 +70,13 @@ describe("PaneGrid empty states", () => {
     });
   });
 
-  it("points the empty managed-team copy at Start team and worker creation", () => {
-    seedPaneGrid([]);
-
-    renderPaneGrid("managed");
-
-    const emptyState = screen.getByText(/No team members yet/);
-    expect(emptyState.textContent).toContain("Start team");
-    expect(emptyState.textContent).toContain("add a worker");
-    expect(emptyState.textContent).not.toContain("+ Add Worker");
-  });
-});
-
-describe("PaneGrid removal controls", () => {
-  afterEach(() => {
-    vi.restoreAllMocks();
-    act(() => {
-      useStore.setState(initialStore, true);
-    });
-  });
-
-  it("hides Remove for managed coordinators but keeps managed workers removable", () => {
-    seedPaneGrid([
-      pane({ pane_id: 10, label: "Manager", role: "team manager", managed: true, mode: "interactive" }),
-      pane({ pane_id: 11, label: "Tech Lead", role: "tech lead", managed: true }),
-      pane({ pane_id: 12, label: "Developer", role: "developer", managed: true }),
-    ]);
-
-    const { onRemovePane } = renderPaneGrid("managed");
-
-    expect(within(card("Manager")).queryByText("Remove")).toBeNull();
-    expect(within(card("Tech Lead")).queryByText("Remove")).toBeNull();
-    expect(within(card("Developer")).getByText("Remove")).toBeTruthy();
-
-    fireEvent.click(within(card("Developer")).getByText("Remove"));
-
-    expect(onRemovePane).toHaveBeenCalledWith(12);
-  });
-
   it("shows Remove for unmanaged side chats with coordinator-like roles", () => {
     seedPaneGrid([
       pane({ pane_id: 20, label: "Side Manager", role: "manager", managed: false }),
       pane({ pane_id: 21, label: "Side Tech Lead", role: "tech lead", managed: false }),
     ]);
 
-    const { onRemovePane } = renderPaneGrid("unmanaged");
+    const { onRemovePane } = renderPaneGrid();
 
     expect(within(card("Side Manager")).getByText("Remove")).toBeTruthy();
     expect(within(card("Side Tech Lead")).getByText("Remove")).toBeTruthy();
@@ -143,7 +103,7 @@ describe("PaneGrid existing-pane selectors", () => {
       pane({ pane_id: 31, label: "Side Codex", role: "side chat", managed: false, provider: "codex" }),
     ]);
 
-    const managed = renderPaneGrid("managed");
+    const managed = renderPaneGrid();
     const managedSelect = agentSelect("Managed Claude");
 
     expect(optionLabels(managedSelect)).toEqual([
@@ -161,7 +121,7 @@ describe("PaneGrid existing-pane selectors", () => {
 
     managed.unmount();
 
-    const unmanaged = renderPaneGrid("unmanaged");
+    const unmanaged = renderPaneGrid();
     const unmanagedSelect = agentSelect("Side Codex");
 
     expect(optionLabels(unmanagedSelect)).toContain("Codex / Official");
@@ -177,7 +137,7 @@ describe("PaneGrid existing-pane selectors", () => {
       pane({ pane_id: 40, label: "Provider Worker", role: "developer", managed: true }),
     ]);
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
-    const { onOpenPane } = renderPaneGrid("managed");
+    const { onOpenPane } = renderPaneGrid();
 
     fireEvent.change(agentSelect("Provider Worker"), { target: { value: "codex/official" } });
 
@@ -191,7 +151,7 @@ describe("PaneGrid existing-pane selectors", () => {
       pane({ pane_id: 42, label: "DeepSeek Worker", role: "developer", managed: true }),
     ]);
     vi.spyOn(window, "confirm").mockReturnValue(true);
-    renderPaneGrid("managed");
+    renderPaneGrid();
 
     fireEvent.change(agentSelect("DeepSeek Worker"), { target: { value: "claude/deepseek" } });
 
@@ -203,7 +163,7 @@ describe("PaneGrid existing-pane selectors", () => {
       pane({ pane_id: 41, label: "Cancelled Worker", role: "developer", managed: true }),
     ]);
     vi.spyOn(window, "confirm").mockReturnValue(false);
-    renderPaneGrid("managed");
+    renderPaneGrid();
 
     fireEvent.change(agentSelect("Cancelled Worker"), { target: { value: "codex/official" } });
 
@@ -226,14 +186,14 @@ describe("PaneGrid existing-pane selectors", () => {
         model: "claude-fable-5",
       }),
     ]);
-    const managed = renderPaneGrid("managed");
+    const managed = renderPaneGrid();
 
     expect(within(card("Claude Sonnet")).queryByTitle(/Claude model/)).toBeNull();
     expect(within(card("Claude Sonnet")).getAllByRole("combobox")).toHaveLength(1);
     expect(agentSelect("Claude Sonnet").value).toBe("claude/official");
 
     managed.unmount();
-    renderPaneGrid("unmanaged");
+    renderPaneGrid();
 
     expect(within(card("Side Claude")).queryByTitle(/Claude model/)).toBeNull();
     expect(within(card("Side Claude")).getAllByRole("combobox")).toHaveLength(1);
@@ -258,7 +218,7 @@ describe("PaneGrid existing-pane selectors", () => {
         model: "glm-5.1",
       }),
     ]);
-    const { onRemovePane } = renderPaneGrid("unmanaged");
+    const { onRemovePane } = renderPaneGrid();
     const retiredCard = card("Historical Worker");
 
     expect(within(retiredCard).getByText("Unsupported provider")).toBeTruthy();

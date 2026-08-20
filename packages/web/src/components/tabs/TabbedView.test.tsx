@@ -116,8 +116,6 @@ function seedZeroPaneTabbedView(
       addPane,
       loadPaneMessagesIfNeeded: vi.fn(),
       loadMoreMessages: vi.fn(),
-      fetchTeamTodo: vi.fn(),
-      fetchSuggestedWorkers: vi.fn(),
       sendMessageToPane: vi.fn(() => ({ success: true })),
       showToast: vi.fn(),
     });
@@ -347,7 +345,7 @@ describe("TabbedView zero-pane projects", () => {
 
     render(<TabbedView />);
 
-    expect(await screen.findByText("Team Overview")).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: "Overview" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Overview" })).toBeTruthy();
     expect(screen.getByTitle("New tab")).toBeTruthy();
     expect(screen.queryByText("Waiting for activity...")).toBeNull();
@@ -358,7 +356,7 @@ describe("TabbedView zero-pane projects", () => {
     const { addPane } = seedZeroPaneTabbedView();
 
     render(<TabbedView />);
-    await screen.findByText("Team Overview");
+    await screen.findByRole("heading", { name: "Overview" });
 
     fireEvent.click(screen.getByTitle("New tab"));
     fireEvent.click(screen.getByText("Claude"));
@@ -380,7 +378,7 @@ describe("TabbedView zero-pane projects", () => {
     const { addPane } = seedZeroPaneTabbedView(["terminal:codex:official:default"]);
 
     render(<TabbedView />);
-    await screen.findByText("Team Overview");
+    await screen.findByRole("heading", { name: "Overview" });
     fireEvent.click(screen.getByTitle("New tab"));
 
     expect(screen.queryByText("Claude")).toBeNull();
@@ -394,7 +392,7 @@ describe("TabbedView zero-pane projects", () => {
     render(<TabbedView />);
 
     expect(screen.queryByRole("button", { name: "Overview" })).toBeNull();
-    expect(screen.queryByText("Team Overview")).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Overview" })).toBeNull();
     expect(screen.getByTitle("New tab")).toBeTruthy();
     expect(screen.queryByText("Waiting for activity...")).toBeNull();
   });
@@ -406,7 +404,7 @@ describe("TabbedView zero-pane projects", () => {
     expect(screen.getByText("Waiting for activity...")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Overview" })).toBeNull();
     expect(screen.queryByTitle("New tab")).toBeNull();
-    expect(screen.queryByText("Team Overview")).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Overview" })).toBeNull();
   });
 });
 
@@ -460,23 +458,13 @@ describe("botPromptForPane", () => {
     ).toBe("Keep doing the custom thing.");
   });
 
-  it("uses role metadata for managed team panes instead of the classic TODO loop", () => {
-    const prompt = botPromptForPane({
-      managed: true,
-      role: "developer",
-      goal: "Implement delegated team TODO leaves.",
-      backstory: "Stay inside the assigned worktree.",
-    });
-
-    expect(prompt).toContain("managed team worker");
-    expect(prompt).toContain("Role: developer");
-    expect(prompt).toContain("team-todo.md");
-    expect(prompt).toContain("Stay inside the assigned worktree.");
-    expect(prompt).not.toContain("Work on tasks defined in TODO.md");
-  });
-
-  it("keeps the classic TODO.md loop for unmanaged manual bot panes", () => {
+  it("uses the classic TODO.md loop for every pane", () => {
+    // The managed-team variant is gone with team mode, so a pane's role
+    // metadata no longer changes the loop it is given.
     expect(botPromptForPane({ managed: false })).toBe(CLASSIC_TODO_BOT_LOOP_PROMPT);
+    expect(botPromptForPane({ managed: true, role: "developer" })).toBe(
+      CLASSIC_TODO_BOT_LOOP_PROMPT,
+    );
     expect(CLASSIC_TODO_BOT_LOOP_PROMPT).toContain("TODO.md");
   });
 
@@ -487,8 +475,7 @@ describe("botPromptForPane", () => {
       role: "reviewer",
     });
 
-    expect(prompt).toContain("managed team worker");
-    expect(prompt).toContain("Role: reviewer");
+    expect(prompt).toBe(CLASSIC_TODO_BOT_LOOP_PROMPT);
     expect(prompt).not.toContain("Old saved prompt.");
   });
 });

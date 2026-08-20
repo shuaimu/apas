@@ -227,46 +227,6 @@ export interface SessionCacheEntry {
   /// reload (previously the user had to clear IndexedDB to see them).
   /// Per-pane watermarks fetch each pane's own tail, immune to both.
   paneLastCreatedAt?: Record<string, string>;
-  /// Latest `team-todo.md` snapshot for this session. Persisted so the
-  /// Overview's TODO panel renders the right content immediately on
-  /// refresh instead of going through the fetch round-trip (which can
-  /// silently fail when the CLI is briefly disconnected or slow).
-  teamTodoState?: TeamTodoState;
-  /// Latest `suggested-workers.md` snapshot for this session. Same
-  /// reasoning as `teamTodoState`.
-  suggestedWorkers?: SuggestedWorker[];
-}
-
-/// Wire shape of team-todo.md (mirrors shared::TeamTodoStateMsg).
-/// Statuses are kept as strings on the wire so the web doesn't have to
-/// re-derive the enum mapping.
-export interface TeamTodoState {
-  globals: TeamTodoGlobal[];
-  workers: TeamTodoWorker[];
-  /// Per-agent scratchpad cursor (RFC3339 timestamp of the last
-  /// scratchpad record they acted on). `null` means the cursor file
-  /// is missing — agent hasn't iterated yet (or was wiped).
-  tech_lead_cursor?: string | null;
-  reviewer_cursor?: string | null;
-}
-
-export interface TeamTodoGlobal {
-  id: string;
-  title: string;
-  /// proposed | approved | in_progress | under_review | pr_open | done | rejected | withdrawn
-  status: string;
-  /// user | tech-lead
-  origin: string;
-  /// One PR per contributing worker pane. Empty until any worker's
-  /// branch has been pushed and PR'd.
-  prs: TeamTodoPaneTodoPr[];
-  body: string;
-}
-
-export interface TeamTodoPaneTodoPr {
-  pane_id: number;
-  url: string;
-  annotation?: string;
 }
 
 /// Wire shape of one entry in suggested-workers.md. Manager pane writes
@@ -289,30 +249,6 @@ export interface PendingSend {
   createdAt: number;
   /// How many times we've sent this. >1 means a reconnect retransmit.
   attempts: number;
-}
-
-export interface SuggestedWorker {
-  id: string;
-  label: string;
-  role: string;
-  goal: string;
-  backstory: string;
-  needs_worktree: boolean;
-}
-
-export interface TeamTodoWorker {
-  pane_id: number;
-  role_hint?: string | null;
-  subtasks: TeamTodoSubtask[];
-}
-
-export interface TeamTodoSubtask {
-  id: string;
-  title: string;
-  /// pending | in_progress | done | reviewing | revising | approved
-  status: string;
-  parent: string;
-  body: string;
 }
 
 export type PaneType = "deadloop" | "interactive";
@@ -722,20 +658,7 @@ interface AppState {
   /// silently.
   pendingLabels: PendingLabel[];
 
-  /** Per-session snapshot of suggested-workers.md. Pushed by the CLI on
-   *  FetchSuggestedWorkers, after Dismiss mutations, and via the CLI's
-   *  mtime-gated poller. Keyed by session_id so switching projects shows
-   *  the right project's suggestions immediately (rather than the
-   *  previous project's data lingering until the new CLI replies). A
-   *  missing key = haven't fetched yet; `[]` = file empty / no
-   *  suggestions. */
-  suggestedWorkersBySession: Map<string, SuggestedWorker[]>;
 
-  /** Per-session snapshot of team-todo.md. Same shape + reasoning as
-   *  `suggestedWorkersBySession`. Pushed in response to fetchTeamTodo()
-   *  and after TodoApproval / AddTodo mutations, plus the CLI's mtime
-   *  poller. Missing key = not fetched yet. */
-  teamTodoStates: Map<string, TeamTodoState>;
 
   // Legacy compat (derived from dynamic state)
   deadloopMessages: Message[];
@@ -887,10 +810,6 @@ interface AppState {
   requestPaneDiff: (paneId: number) => void;
   paneDiffs: Record<number, PaneDiff>;
   createPanePr: (paneId: number) => void;
-  /** v3.1 — current project_goal.md content per session id, mirrored
-   *  from the CLI's mtime poller. Used by ProjectGoalBar to hydrate the
-   *  textbox when the user isn't editing. */
-  projectGoals: Record<string, string>;
   /** Per-session usage stats (prompts/tokens/cost) for the Overview panel,
    *  keyed by session_id. Pushed live and replayed on attach. */
   usageStats: Record<string, ProjectUsageStats>;
@@ -916,24 +835,12 @@ interface AppState {
    *  "Creating…" row — otherwise the click produces no visible effect at all
    *  until the ack lands. Cleared by `project_instance_created`. */
   pendingInstances: Record<string, PendingInstance>;
-  /** Manager v2 — overwrite project_goal.md at the project root. */
-  updateProjectGoal: (goal: string) => void;
   /** Push new Tech-Lead autonomy flags to the CLI. */
   updateProjectFlags: (flags: {
     autoApproveTodos: boolean;
     autoMergePrs: boolean;
     teamEnabled: boolean;
     disallowedTabTypes: string[];
-  }) => void;
-  /** Spawn the default team panes for any role that isn't already
-   *  present. Idempotent on the CLI side. Each role's `provider` /
-   *  `model` come from the Team setup card; null falls back to the
-   *  CLI default (Claude / unset). */
-  startTeam: (specs: {
-    manager: { provider: string; model: string | null };
-    techLead: { provider: string; model: string | null };
-    reviewer: { provider: string; model: string | null };
-    developer: { provider: string; model: string | null };
   }) => void;
   updatePaneRole: (paneId: number, role?: string, goal?: string, backstory?: string) => void;
   /** Scratchpad records keyed by server session id. `teamRecords` is the
@@ -946,10 +853,6 @@ interface AppState {
   /** v3.2 — flip a worker between autonomous and manual modes. */
   updatePaneManualMode: (paneId: number, manualMode: boolean) => void;
 
-  /** v3.5 — one-way promote: turn an unmanaged side-chat pane into
-   *  a team member the Tech Lead can delegate to. There's no demote. */
-  promotePaneToManaged: (paneId: number) => void;
-
   /** Terminal panes (PaneKind "terminal"). Frames themselves arrive via
    *  terminalBus, not through store state — see that module for why. */
   attachTerminal: (paneId: number) => void;
@@ -959,23 +862,6 @@ interface AppState {
   sendTerminalConversationMessage: (paneId: number, text: string) => { success: boolean; error?: string };
   sendTerminalResize: (paneId: number, cols: number, rows: number) => void;
 
-  /** Ask the server (which asks the CLI) for the current team-todo.md.
-   *  Reply lands in `teamTodoState` via the team_todo_state handler. */
-  fetchTeamTodo: () => void;
-  /** Approve a proposed Global TODO (state machine: proposed → approved). */
-  approveTodo: (todoId: string) => void;
-  /** Reject a proposed Global TODO (state machine: proposed → rejected). */
-  rejectTodo: (todoId: string) => void;
-  /** Add a new Global TODO (status: approved, origin: user). CLI assigns the id. */
-  addTodo: (title: string, body: string) => void;
-
-  /** Ask the CLI for the current suggested-workers.md snapshot. Reply
-   *  lands in `suggestedWorkers` via the suggested_workers_state handler. */
-  fetchSuggestedWorkers: () => void;
-  /** Spawn the suggested worker as a managed pane + drop the section. */
-  acceptSuggestion: (suggestion: SuggestedWorker) => void;
-  /** Drop the suggestion without spawning anything. */
-  dismissSuggestion: (suggestionId: string) => void;
 }
 
 export interface PaneDiff {
@@ -1153,7 +1039,6 @@ export const useStore = create<AppState>((set, get) => ({
   paneWorkSummaries: {},
   pausedPanes: [],
   paneDiffs: {},
-  projectGoals: {},
   usageStats: {},
   projectFlags: {},
   projectPolicies: {},
@@ -1172,8 +1057,6 @@ export const useStore = create<AppState>((set, get) => ({
   pendingSends: loadPendingSends(),
   pendingAnswers: loadPendingAnswers(),
   pendingLabels: loadPendingLabels(),
-  teamTodoStates: new Map(),
-  suggestedWorkersBySession: new Map(),
   loadingMorePane: null,
   // Legacy compat getters (populated from dynamic state)
   deadloopMessages: [],
@@ -1549,8 +1432,6 @@ export const useStore = create<AppState>((set, get) => ({
           paneLastCreatedAt: paneWatermarksToRecord(
             state.paneLastCreatedAt.get(currentSessionId),
           ),
-          teamTodoState: state.teamTodoStates.get(currentSessionId),
-          suggestedWorkers: state.suggestedWorkersBySession.get(currentSessionId),
         };
         sessionCache.set(currentSessionId, entry);
         // Mirror the snapshot to IndexedDB so it survives a reload —
@@ -1663,8 +1544,6 @@ export const useStore = create<AppState>((set, get) => ({
       );
       const sessionCache = new Map(state.sessionCache);
       const teamRecordsBySession = new Map(state.teamRecordsBySession);
-      const teamTodoStates = new Map(state.teamTodoStates);
-      const suggestedWorkersBySession = new Map(state.suggestedWorkersBySession);
       const paneWorkSummaries = Object.fromEntries(
         Object.entries(state.paneWorkSummaries).filter(
           ([key]) => ![...removedSessionIds].some((id) => key.startsWith(`${id}/`)),
@@ -1688,8 +1567,6 @@ export const useStore = create<AppState>((set, get) => ({
       for (const id of removedSessionIds) {
         sessionCache.delete(id);
         teamRecordsBySession.delete(id);
-        teamTodoStates.delete(id);
-        suggestedWorkersBySession.delete(id);
         void deleteSnapshotIdb(id);
       }
       const activeRemoved = Boolean(
@@ -1705,8 +1582,6 @@ export const useStore = create<AppState>((set, get) => ({
         ),
         sessionCache,
         teamRecordsBySession,
-        teamTodoStates,
-        suggestedWorkersBySession,
         paneWorkSummaries,
         cliLifecycleInventories,
         cliLifecycleOperations,
@@ -2561,15 +2436,6 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  updateProjectGoal: (goal: string) => {
-    const { ws, showToast } = get();
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "update_project_goal", session_id: get().sessionId, goal }));
-    } else {
-      showToast("Not connected — cannot save goal", "error");
-    }
-  },
-
   updateProjectFlags: (flags) => {
     const { ws, sessionId, showToast } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -2590,165 +2456,6 @@ export const useStore = create<AppState>((set, get) => ({
       set((state) => ({
         projectFlags: { ...state.projectFlags, [sessionId]: flags },
       }));
-    }
-  },
-
-  startTeam: (specs) => {
-    const { ws, showToast, sessionId, projectPolicies } = get();
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      showToast("Not connected — cannot start team", "error");
-      return;
-    }
-    const policy = sessionId ? projectPolicies[sessionId] : undefined;
-    const roles = [specs.manager, specs.techLead, specs.reviewer, specs.developer];
-    if (roles.some((role) => isRetiredProviderModel(role.provider, role.model))) {
-      showToast("MiniMax and GLM team roles are no longer supported", "error");
-      return;
-    }
-    if (!policy || policy.projectSuspended || !policy.teamAvailable || roles.some((role) =>
-      !policyAllowsLaunch(policy, "agent", role.provider as Provider, role.model)
-    )) {
-      showToast("This team configuration is unavailable under the current cluster policy", "error");
-      return;
-    }
-    const toSpec = (s: { provider: string; model: string | null }) => ({
-      provider: s.provider,
-      ...(s.model != null ? { model: s.model } : {}),
-    });
-    ws.send(
-      JSON.stringify({
-        type: "start_team",
-        session_id: get().sessionId,
-        manager: toSpec(specs.manager),
-        tech_lead: toSpec(specs.techLead),
-        reviewer: toSpec(specs.reviewer),
-        developer: toSpec(specs.developer),
-      }),
-    );
-    showToast("Spawning team panes…", "info");
-  },
-
-  fetchTeamTodo: () => {
-    const { ws, sessionId } = get();
-    if (!sessionId) return;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "fetch_team_todo", session_id: sessionId }));
-    }
-  },
-
-  approveTodo: (todoId: string) => {
-    const { ws, sessionId, showToast } = get();
-    if (!sessionId) return;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(
-        JSON.stringify({
-          type: "todo_approval",
-          session_id: sessionId,
-          todo_id: todoId,
-          action: "approve",
-        }),
-      );
-    } else {
-      showToast("Not connected — cannot approve", "error");
-    }
-  },
-
-  rejectTodo: (todoId: string) => {
-    const { ws, sessionId, showToast } = get();
-    if (!sessionId) return;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(
-        JSON.stringify({
-          type: "todo_approval",
-          session_id: sessionId,
-          todo_id: todoId,
-          action: "reject",
-        }),
-      );
-    } else {
-      showToast("Not connected — cannot reject", "error");
-    }
-  },
-
-  addTodo: (title: string, body: string) => {
-    const { ws, sessionId, showToast } = get();
-    if (!sessionId) return;
-    const t = title.trim();
-    if (!t) {
-      showToast("TODO title can't be empty", "error");
-      return;
-    }
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(
-        JSON.stringify({
-          type: "add_todo",
-          session_id: sessionId,
-          title: t,
-          body,
-        }),
-      );
-    } else {
-      showToast("Not connected — cannot add TODO", "error");
-    }
-  },
-
-  fetchSuggestedWorkers: () => {
-    const { ws, sessionId } = get();
-    if (!sessionId) return;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(
-        JSON.stringify({
-          type: "fetch_suggested_workers",
-          session_id: sessionId,
-        }),
-      );
-    }
-  },
-
-  acceptSuggestion: (suggestion: SuggestedWorker) => {
-    const { showToast, addPane, dismissSuggestion } = get();
-    // addPane handles the actual pane creation; we mark managed=true so
-    // it lands in the Team box. Worktree comes from needs_worktree.
-    const result = addPane(
-      "claude",
-      "interactive",
-      suggestion.label || suggestion.role || "New worker",
-      undefined,
-      undefined,
-      suggestion.needs_worktree,
-      {
-        role: suggestion.role || undefined,
-        goal: suggestion.goal || undefined,
-        backstory: suggestion.backstory || undefined,
-      },
-      true,
-    );
-    if (!result.success) {
-      showToast(result.error ?? "Failed to add worker", "error");
-      return;
-    }
-    // Drop the section from suggested-workers.md so it doesn't show
-    // again next render — the CLI republishes the trimmed list.
-    dismissSuggestion(suggestion.id);
-    showToast(
-      `Accepted ${suggestion.label || suggestion.role || "suggestion"} — added to the team`,
-      "info",
-    );
-  },
-
-  dismissSuggestion: (suggestionId: string) => {
-    const { ws, sessionId, showToast } = get();
-    if (!sessionId) return;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(
-        JSON.stringify({
-          type: "dismiss_suggestion",
-          session_id: sessionId,
-          suggestion_id: suggestionId,
-        }),
-      );
-    } else {
-      showToast("Not connected — cannot dismiss", "error");
     }
   },
 
@@ -2863,24 +2570,6 @@ export const useStore = create<AppState>((set, get) => ({
       cols,
       rows,
     }));
-  },
-
-  promotePaneToManaged: (paneId: number) => {
-    const { ws, sessionId, showToast, paneConfigs } = get();
-    if (!sessionId) return;
-    if (paneConfigs.find((pane) => pane.pane_id === paneId)?.kind === "terminal") {
-      showToast("Terminal panes cannot join a managed team", "error");
-      return;
-    }
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
-        type: "promote_pane_to_managed",
-        session_id: sessionId,
-        pane_id: paneId,
-      }));
-    } else {
-      showToast("Not connected — cannot promote", "error");
-    }
   },
 
   updatePaneLabel: (paneId: number, label: string) => {
@@ -3143,26 +2832,10 @@ if (typeof window !== "undefined") {
         }
         if (mergedPane.size > 0) seededPane.set(k, mergedPane);
       }
-      // Seed per-session file snapshots (team-todo, suggested-workers)
-      // so the Overview panels render immediately on refresh instead of
-      // going through a fetch round-trip (which silently does nothing
-      // when the CLI is briefly offline). In-memory wins on conflict.
-      const seededTodos = new Map(state.teamTodoStates);
-      const seededSuggested = new Map(state.suggestedWorkersBySession);
-      for (const [k, v] of diskCache) {
-        if (v.teamTodoState && !seededTodos.has(k)) {
-          seededTodos.set(k, v.teamTodoState);
-        }
-        if (v.suggestedWorkers && !seededSuggested.has(k)) {
-          seededSuggested.set(k, v.suggestedWorkers);
-        }
-      }
       return {
         sessionCache: merged,
         sessionLastCreatedAt: seededLast,
         paneLastCreatedAt: seededPane,
-        teamTodoStates: seededTodos,
-        suggestedWorkersBySession: seededSuggested,
       };
     });
     // Race fix: if `attachSession` already fired for the current
@@ -3251,17 +2924,12 @@ if (typeof window !== "undefined") {
       state.messages === prev.messages &&
       state.paneConfigs === prev.paneConfigs &&
       state.paneHasMore === prev.paneHasMore &&
-      state.paneModes === prev.paneModes &&
-      state.teamTodoStates === prev.teamTodoStates &&
-      state.suggestedWorkersBySession === prev.suggestedWorkersBySession
+      state.paneModes === prev.paneModes
     ) {
       return;
     }
     const hasAnyData =
-      state.messages.length > 0 ||
-      Object.keys(state.paneMessages).length > 0 ||
-      state.teamTodoStates.has(state.sessionId) ||
-      state.suggestedWorkersBySession.has(state.sessionId);
+      state.messages.length > 0 || Object.keys(state.paneMessages).length > 0;
     if (!hasAnyData) return;
     if (snapshotTimer) clearTimeout(snapshotTimer);
     snapshotTimer = setTimeout(() => {
@@ -3281,8 +2949,6 @@ if (typeof window !== "undefined") {
         cachedAt: Date.now(),
         lastCreatedAt: cur.sessionLastCreatedAt.get(sid),
         paneLastCreatedAt: paneWatermarksToRecord(cur.paneLastCreatedAt.get(sid)),
-        teamTodoState: cur.teamTodoStates.get(sid),
-        suggestedWorkers: cur.suggestedWorkersBySession.get(sid),
       };
       saveSnapshotIdb(sid, entry);
     }, 1_000);
@@ -4289,23 +3955,6 @@ export function handleServerMessage(
       break;
     }
 
-    case "team_record": {
-      const record = data.record as TeamRecord | undefined;
-      const sessionId = data.session_id as string | undefined;
-      if (sessionId && record && typeof record.ts === "string") {
-        set((state) => {
-          const records = [...(state.teamRecordsBySession.get(sessionId) ?? []), record];
-          const bySession = new Map(state.teamRecordsBySession);
-          bySession.set(sessionId, records);
-          return {
-            teamRecordsBySession: bySession,
-            teamRecords: state.sessionId === sessionId ? records : state.teamRecords,
-          };
-        });
-      }
-      break;
-    }
-
     // Terminal frames bypass the store entirely — see terminalBus. Putting
     // them in zustand would re-render every subscriber on each pty chunk.
     case "terminal_output": {
@@ -4440,17 +4089,6 @@ export function handleServerMessage(
       break;
     }
 
-    case "project_goal_changed": {
-      const sessionId = data.session_id as string | undefined;
-      const content = data.content as string | undefined;
-      if (sessionId && typeof content === "string") {
-        set((state) => ({
-          projectGoals: { ...state.projectGoals, [sessionId]: content },
-        }));
-      }
-      break;
-    }
-
     case "project_usage_stats": {
       const sessionId = data.session_id as string | undefined;
       const stats = data.stats as ProjectUsageStats | undefined;
@@ -4510,32 +4148,6 @@ export function handleServerMessage(
           get().showToast("This project is suspended by a cluster administrator", "error");
         }
       }
-      break;
-    }
-
-    case "team_todo_state": {
-      const responseSessionId = data.session_id as string | undefined;
-      if (!responseSessionId) break;
-      const todoState = data.state as TeamTodoState | undefined;
-      if (todoState) {
-        set((state) => {
-          const next = new Map(state.teamTodoStates);
-          next.set(responseSessionId, todoState);
-          return { teamTodoStates: next };
-        });
-      }
-      break;
-    }
-
-    case "suggested_workers_state": {
-      const responseSessionId = data.session_id as string | undefined;
-      if (!responseSessionId) break;
-      const suggestions = data.suggestions as SuggestedWorker[] | undefined;
-      set((state) => {
-        const next = new Map(state.suggestedWorkersBySession);
-        next.set(responseSessionId, suggestions ?? []);
-        return { suggestedWorkersBySession: next };
-      });
       break;
     }
 

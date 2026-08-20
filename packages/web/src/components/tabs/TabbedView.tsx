@@ -3,7 +3,6 @@
 import React, { useRef, useCallback, useEffect, useState, useMemo, memo } from "react";
 import dynamic from "next/dynamic";
 import { useStore, Message, PaneConfig, PaneCleanupAction, PaneKind, PlanReviewMode, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, paneKey, type SupportedProvider } from "@/lib/store";
-import { ROLE_TEMPLATES, TEMPLATE_COLOR_CLASSES } from "@/lib/roleTemplates";
 import { useTerminalViewModes, type TerminalViewMode } from "@/lib/terminalViewMode";
 import { OverviewView } from "../overview/OverviewView";
 import { UserMessage } from "../chat/UserMessage";
@@ -115,24 +114,13 @@ type BotPromptPaneConfig = Pick<
   "prompt" | "managed" | "role" | "goal" | "backstory"
 >;
 
-export function managedTeamBotPromptForPane(
-  config: BotPromptPaneConfig | undefined,
-): string | null {
-  if (config?.managed !== true) return null;
-  const role = config.role?.trim();
-  const goal = config.goal?.trim();
-  const backstory = config.backstory?.trim();
-  const roleLine = role ? `Role: ${role}` : "Role: managed team worker";
-  const goalLine = goal ? `Goal: ${goal}` : "Goal: Work only from delegated team tasks.";
-  const backstoryBlock = backstory ? `\n\nBackstory and constraints:\n${backstory}` : "";
-
-  return `You are this project's managed team worker.\n\n${roleLine}\n${goalLine}${backstoryBlock}\n\nUse the team-mode workflow: read project_goal.md, team-todo.md, and .apas-team.jsonl; act only on delegated work for this pane; publish diff/review/decision records on the team scratchpad as appropriate.`;
-}
-
 export function defaultBotPromptForPane(
-  config: BotPromptPaneConfig | undefined,
+  _config: BotPromptPaneConfig | undefined,
 ): string {
-  return managedTeamBotPromptForPane(config) ?? CLASSIC_TODO_BOT_LOOP_PROMPT;
+  // Every pane gets the same starting loop now. The managed-team variant is
+  // gone with team mode; a pane's role, goal and backstory still reach the
+  // agent through its own system prompt.
+  return CLASSIC_TODO_BOT_LOOP_PROMPT;
 }
 
 export function botPromptForPane(
@@ -1649,39 +1637,19 @@ function RoleModal({ open, pane, onClose, onSave }: RoleModalProps) {
           Appended to the agent&apos;s system prompt at next spawn (close + re-add the tab, or reboot the apas CLI to apply).
         </p>
         <div className="mb-4">
-          <p className="mb-2 text-[11px] uppercase tracking-wide text-zinc-500">Quick pick — apply a team-role template</p>
-          <div className="flex flex-wrap gap-2">
-            {ROLE_TEMPLATES.map((t) => (
-              <button
-                key={t.id}
-                type="button"
-                onClick={() => {
-                  setRole(t.role);
-                  setGoal(t.goal);
-                  setBackstory(t.backstory);
-                  setMode(t.planReviewMode);
-                }}
-                className={`rounded border px-2 py-1 text-xs font-medium transition-colors ${TEMPLATE_COLOR_CLASSES[t.color]}`}
-                title={`Apply ${t.label} template — populates role, goal, backstory, and plan review mode`}
-              >
-                <span className="mr-1">{t.glyph}</span>
-                {t.label}
-              </button>
-            ))}
-            <button
-              type="button"
-              onClick={() => {
-                setRole("");
-                setGoal("");
-                setBackstory("");
-                setMode("never");
-              }}
-              className="rounded border border-zinc-600 bg-zinc-800 px-2 py-1 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-700"
-              title="Clear all fields"
-            >
-              ✕ Clear
-            </button>
-          </div>
+          <button
+            type="button"
+            onClick={() => {
+              setRole("");
+              setGoal("");
+              setBackstory("");
+              setMode("never");
+            }}
+            className="rounded border border-zinc-600 bg-zinc-800 px-2 py-1 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-700"
+            title="Clear all fields"
+          >
+            ✕ Clear
+          </button>
         </div>
         <div className="flex flex-col gap-3">
           <label className="flex flex-col gap-1 text-xs">

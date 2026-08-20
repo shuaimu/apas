@@ -1,6 +1,5 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ROLE_TEMPLATES } from "@/lib/roleTemplates";
 import { paneKey, useStore, type PaneConfig, type PlanReviewMode } from "@/lib/store";
 import { TabbedView } from "./TabbedView";
 
@@ -159,33 +158,6 @@ describe("TabbedView role settings modal", () => {
       "Existing backstory",
     );
     expect(updatePaneReviewMode).toHaveBeenCalledWith(ACTIVE_PANE_ID, "risky_only");
-  });
-
-  it("applies a role template quick-pick before save", async () => {
-    const template = ROLE_TEMPLATES.find((item) => item.id === "developer");
-    expect(template).toBeTruthy();
-    const { updatePaneLabel, updatePaneRole, updatePaneReviewMode } = seedTabbedView();
-
-    await openRoleModal();
-
-    fireEvent.click(screen.getByRole("button", { name: /Developer/ }));
-
-    const fields = roleFields();
-    expect(fields.role.value).toBe(template?.role);
-    expect(fields.goal.value).toBe(template?.goal);
-    expect(fields.backstory.value).toBe(template?.backstory);
-    expect(fields.mode.value).toBe(template?.planReviewMode);
-
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-
-    expect(updatePaneLabel).not.toHaveBeenCalled();
-    expect(updatePaneRole).toHaveBeenCalledWith(
-      ACTIVE_PANE_ID,
-      template?.role,
-      template?.goal,
-      template?.backstory,
-    );
-    expect(updatePaneReviewMode).toHaveBeenCalledWith(ACTIVE_PANE_ID, template?.planReviewMode);
   });
 
   it("clears role fields and resets plan review mode", async () => {

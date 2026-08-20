@@ -31,9 +31,6 @@ interface PaneGridProps {
   onPausePane: (paneId: number) => void;
   onResumePane: (paneId: number) => void;
   onRemovePane: (paneId: number) => void;
-  /** "managed" shows team members; "unmanaged" shows ordinary terminal
-   *  panes plus any historical side chats. */
-  kind: "managed" | "unmanaged";
 }
 
 export function PaneGrid({
@@ -43,34 +40,24 @@ export function PaneGrid({
   onPausePane,
   onResumePane,
   onRemovePane,
-  kind,
 }: PaneGridProps) {
   const paneConfigs = useStore((s) => s.paneConfigs);
   const paneStatuses = useStore((s) => s.paneStatuses);
   const pausedPanes = useStore((s) => s.pausedPanes);
   const paneMessages = useStore((s) => s.paneMessages);
   const paneDiffs = useStore((s) => s.paneDiffs);
-  const promotePaneToManaged = useStore((s) => s.promotePaneToManaged);
-
+  // One grid: the managed/unmanaged split existed for team mode, and a pane
+  // still marked managed is now just a pane.
   const sorted = useMemo(() => {
-    const wantManaged = kind === "managed";
-    const arr = paneConfigs.filter((p) => (p.managed === true) === wantManaged);
+    const arr = [...paneConfigs];
     arr.sort((a, b) => a.pane_id - b.pane_id);
     return arr;
-  }, [paneConfigs, kind]);
+  }, [paneConfigs]);
 
   if (sorted.length === 0) {
-    if (kind === "managed") {
-      return (
-        <div className="rounded border border-dashed border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30 p-4 text-sm italic text-gray-500 dark:text-gray-400">
-          No team members yet. Use the Start team card above to launch the default
-          roles, or add a worker.
-        </div>
-      );
-    }
     return (
       <div className="rounded border border-dashed border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30 p-3 text-xs italic text-gray-500 dark:text-gray-400">
-        No terminal panes. Click <strong>+</strong> in the tab bar to start one.
+        No panes. Click <strong>+</strong> in the tab bar to start one.
       </div>
     );
   }
@@ -98,11 +85,6 @@ export function PaneGrid({
             onPause={() => onPausePane(pane.pane_id)}
             onResume={() => onResumePane(pane.pane_id)}
             onRemove={() => onRemovePane(pane.pane_id)}
-            onPromote={
-              kind === "unmanaged" && pane.kind !== "terminal"
-                ? () => promotePaneToManaged(pane.pane_id)
-                : undefined
-            }
           />
         );
       })}
