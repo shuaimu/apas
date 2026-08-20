@@ -7,12 +7,12 @@
 
 ## 2. Project host
 
-- [ ] 2.1 Delete the role prompts, TODO parsing, goal helpers, scratchpad and suggested workers
-- [ ] 2.2 Delete the delegation MCP server and its subcommand, whose every tool served the team protocol
-- [ ] 2.3 Remove the team runtime from the pane loop: starting and stopping a team, promoting a pane to managed, the role deadloops, and the team file watchers
-- [ ] 2.4 Stop reading and writing the team artefacts, leaving any existing files on disk untouched
-- [ ] 2.5 Treat a pane still marked managed as an ordinary pane rather than dispatching it
-- [ ] 2.6 Tests: a project with a stored managed pane loads and runs it as an ordinary pane
+- [x] 2.1 Delete the role prompts, TODO parsing, goal helpers, scratchpad and suggested workers
+- [x] 2.2 Delete the delegation MCP server and its subcommand, whose every tool served the team protocol
+- [x] 2.3 Remove the team runtime from the pane loop: starting and stopping a team, promoting a pane to managed, the role deadloops, and the team file watchers
+- [x] 2.4 Stop reading and writing the team artefacts, leaving any existing files on disk untouched
+- [x] 2.5 Treat a pane still marked managed as an ordinary pane rather than dispatching it
+- [x] 2.6 Tests: a project with a stored managed pane loads and runs it as an ordinary pane
 
 ## 3. Server and protocol
 

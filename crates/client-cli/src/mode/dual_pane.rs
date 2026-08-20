@@ -137,46 +137,18 @@ fn launch_allowed_by_server_policy(
 /// Whether an **existing** pane may be brought back — resumed, rebooted, or
 /// started.
 ///
-/// The launch-profile allowlist is deliberately not consulted. It decides which
-/// combinations may be brought into existence; a pane that exists is a decision
-/// already taken under whatever policy applied then. Applying the allowlist here
-/// never removed the pane it disapproved of — the pane kept running — it only
-/// made that pane impossible to bring back.
+/// Always, now. The launch-profile allowlist decides which combinations may be
+/// brought into existence, and a pane that exists is a decision already taken
+/// under whatever policy applied then; applying it here never removed the pane
+/// it disapproved of, it only made that pane impossible to bring back.
 ///
-/// Team availability still applies, because it is the switch that stops a
-/// running team rather than a catalogue entry: without it, a team an owner just
-/// disabled could be resurrected one pane at a time. Retired providers are
-/// refused separately, before this is reached, since their backend genuinely no
-/// longer exists.
-fn existing_pane_relaunch_allowed(policy_state: &ProjectPolicyState, managed: bool) -> bool {
-    if !managed {
-        return true;
-    }
-    policy_state
-        .lock()
-        .ok()
-        .and_then(|policy| policy.clone())
-        .is_some_and(|policy| policy.team_available)
-}
-
-fn team_allowed_by_server_policy(
-    policy_state: &ProjectPolicyState,
-    roles: &[&shared::TeamRoleSpec],
-) -> bool {
-    policy_state
-        .lock()
-        .ok()
-        .and_then(|policy| policy.clone())
-        .is_some_and(|policy| {
-            policy.team_available
-                && roles.iter().all(|role| {
-                    policy.allows(
-                        shared::PaneKind::Agent,
-                        role.provider.unwrap_or(Provider::Claude),
-                        role.model.as_deref(),
-                    )
-                })
-        })
+/// Team availability used to gate a managed pane, because it was the switch
+/// that stopped a running team. There is no team, so a pane marked managed by
+/// some older `.apas` is simply a pane. Retired providers are refused
+/// separately, before this is reached, since their backend genuinely no longer
+/// exists.
+fn existing_pane_relaunch_allowed() -> bool {
+    true
 }
 
 /// Tell the web about the current pane roster and persist it to `.apas`.
@@ -219,81 +191,6 @@ fn announce_and_persist_panes(
         pane_pauses,
         pane_stop_requests,
     );
-}
-
-/// Stop every managed pane, the way the web's "Stop team" button does:
-/// interrupt each pane's in-flight turn and pause the deadloop workers so they
-/// stay quiet instead of ticking again on the next file event.
-///
-/// Called when team mode is switched off. Leaving four autonomous panes running
-/// while the project says the team is off would be a lie, and those panes can
-/// open PRs.
-///
-/// Pauses *before* interrupting, where the web does the reverse: between an
-/// interrupt and the pause landing, a sibling pane's write can wake the loop
-/// for another iteration. Same end state, no gap.
-///
-/// Returns how many managed panes were stopped.
-fn stop_managed_team(pane_metas: &PaneMetas, pane_pauses: &PanePauses) -> usize {
-    struct Target {
-        pane_id: u32,
-        is_deadloop: bool,
-        soft_interrupt: Option<mpsc::Sender<()>>,
-        pid: Option<u32>,
-    }
-
-    // Snapshot without holding the meta lock across the interrupts — a worker
-    // thread may want that lock on its way out.
-    let targets: Vec<Target> = {
-        let Ok(metas) = pane_metas.lock() else {
-            return 0;
-        };
-        metas
-            .iter()
-            .filter(|(_, m)| m.managed)
-            .map(|(pane_id, m)| Target {
-                pane_id: *pane_id,
-                is_deadloop: matches!(m.mode, shared::PaneMode::Deadloop),
-                soft_interrupt: m
-                    .streaming_interrupt_tx
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.as_ref().cloned()),
-                pid: m
-                    .child_process
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.as_ref().map(|c| c.id())),
-            })
-            .collect()
-    };
-
-    for target in &targets {
-        if target.is_deadloop {
-            if let Ok(pauses) = pane_pauses.lock() {
-                if let Some(flag) = pauses.get(&target.pane_id) {
-                    flag.store(true, Ordering::SeqCst);
-                }
-            }
-        }
-        // Soft interrupt aborts the turn but keeps the long-lived process;
-        // SIGINT is the fallback for a pane whose streaming worker is gone.
-        let soft_delivered = target
-            .soft_interrupt
-            .as_ref()
-            .map(|tx| tx.send(()).is_ok())
-            .unwrap_or(false);
-        if !soft_delivered {
-            #[cfg(unix)]
-            if let Some(pid) = target.pid {
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGINT);
-                }
-            }
-        }
-    }
-
-    targets.len()
 }
 
 /// Stop only panes whose persisted provider/model identifies a retired
@@ -705,157 +602,6 @@ impl ClaudeWatchState {
     /// switched *to*. Never the epoch — see `started`.
     fn switch_floor(&self) -> std::time::SystemTime {
         self.mtime.unwrap_or(self.started)
-    }
-}
-
-/// Spawn whichever team panes (Manager, Tech Lead, Reviewer, Developer)
-/// are missing for this project. Idempotent: each role is gated on
-/// whether a managed pane with that role already exists in
-/// `pane_metas`, so a second invocation is a no-op (or only fills in
-/// roles the user explicitly removed since last call). Each role
-/// honors the provider / model the user picked in the Team setup
-/// card; empty fields fall back to the CLI defaults (Claude / unset).
-///
-/// Called from the StartTeam wire handler when the user clicks "Start
-/// team" on the Overview. Used to also run at CLI boot in v3.4 — the
-/// auto-spawn was reverted so the user opts in explicitly.
-fn spawn_missing_team_panes(
-    pane_metas: &PaneMetas,
-    event_tx: &std::sync::mpsc::Sender<TuiEvent>,
-    manager_spec: &shared::TeamRoleSpec,
-    tech_lead_spec: &shared::TeamRoleSpec,
-    reviewer_spec: &shared::TeamRoleSpec,
-    developer_spec: &shared::TeamRoleSpec,
-) {
-    let metas_guard = pane_metas.lock().unwrap();
-    // Only consider managed panes — a user's unmanaged side-chat pane
-    // with role "manager" or "reviewer" shouldn't suppress the team's
-    // orchestrator spawn.
-    let has_manager = metas_guard.values().any(|m| {
-        let lower = m.role.as_deref().unwrap_or("").to_ascii_lowercase();
-        m.managed
-            && lower.contains("manager")
-            && !lower.contains("tech lead")
-            && matches!(m.mode, shared::PaneMode::Interactive)
-    });
-    let has_tech_lead = metas_guard.values().any(|m| {
-        let lower = m.role.as_deref().unwrap_or("").to_ascii_lowercase();
-        m.managed && lower.contains("tech lead") && matches!(m.mode, shared::PaneMode::Deadloop)
-    });
-    let has_reviewer = metas_guard.values().any(|m| {
-        let lower = m.role.as_deref().unwrap_or("").to_ascii_lowercase();
-        m.managed && lower.contains("reviewer")
-    });
-    // Role-only match (no mode constraint) — both deadloop developers
-    // AND user-spawned interactive developers count, so a project with
-    // existing dev panes keeps them.
-    let has_developer = metas_guard.values().any(|m| {
-        let lower = m.role.as_deref().unwrap_or("").to_ascii_lowercase();
-        m.managed && lower.contains("developer")
-    });
-    drop(metas_guard);
-    // Helper: try_resume_first should be FALSE for any pane spawned
-    // with a brand-new Uuid::new_v4() — Codex/Cursor server-side
-    // sessions don't exist for an id we just minted, and `exec resume
-    // <fresh-id>` fails with "no rollout found". Claude streaming
-    // derives this from on-disk session jsonl existence and ignores
-    // the flag, so false is safe for Claude too.
-    let try_resume = false;
-    if !has_manager {
-        let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
-        let _ = event_tx.send(TuiEvent::AddTabWithConfig {
-            pane_id,
-            label: "Manager".to_string(),
-            claude_session_id: Uuid::new_v4(),
-            mode: shared::PaneMode::Interactive,
-            provider: manager_spec.provider.unwrap_or(shared::Provider::Claude),
-            prompt: None,
-            min_iteration_interval_minutes: None,
-            model: manager_spec.model.clone(),
-            effort: Some("max".to_string()),
-            worktree_path: None,
-            initial_input: None,
-            role: Some(crate::role::DEFAULT_MANAGER_ROLE.to_string()),
-            goal: Some(crate::role::DEFAULT_MANAGER_GOAL.to_string()),
-            backstory: Some(crate::role::DEFAULT_MANAGER_BACKSTORY.to_string()),
-            plan_review_mode: shared::PlanReviewMode::default(),
-            managed: true,
-            try_resume_first: try_resume,
-            kind: shared::PaneKind::Agent,
-        });
-        tracing::info!(pane_id, ?manager_spec.provider, ?manager_spec.model, "spawning Manager pane (Start team)");
-    }
-    if !has_tech_lead {
-        let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
-        let _ = event_tx.send(TuiEvent::AddTabWithConfig {
-            pane_id,
-            label: "Tech Lead".to_string(),
-            claude_session_id: Uuid::new_v4(),
-            mode: shared::PaneMode::Deadloop,
-            provider: tech_lead_spec.provider.unwrap_or(shared::Provider::Claude),
-            prompt: Some(crate::role::TECH_LEAD_DEADLOOP_PROMPT.to_string()),
-            min_iteration_interval_minutes: None,
-            model: tech_lead_spec.model.clone(),
-            effort: Some("max".to_string()),
-            worktree_path: None,
-            initial_input: None,
-            role: Some(crate::role::DEFAULT_TECH_LEAD_ROLE.to_string()),
-            goal: Some(crate::role::DEFAULT_TECH_LEAD_GOAL.to_string()),
-            backstory: Some(crate::role::DEFAULT_TECH_LEAD_BACKSTORY.to_string()),
-            plan_review_mode: shared::PlanReviewMode::default(),
-            managed: true,
-            try_resume_first: try_resume,
-            kind: shared::PaneKind::Agent,
-        });
-        tracing::info!(pane_id, ?tech_lead_spec.provider, ?tech_lead_spec.model, "spawning Tech Lead pane (Start team)");
-    }
-    if !has_reviewer {
-        let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
-        let _ = event_tx.send(TuiEvent::AddTabWithConfig {
-            pane_id,
-            label: "Reviewer".to_string(),
-            claude_session_id: Uuid::new_v4(),
-            mode: shared::PaneMode::Deadloop,
-            provider: reviewer_spec.provider.unwrap_or(shared::Provider::Claude),
-            prompt: Some(crate::role::REVIEWER_DEADLOOP_PROMPT.to_string()),
-            min_iteration_interval_minutes: None,
-            model: reviewer_spec.model.clone(),
-            effort: Some("max".to_string()),
-            worktree_path: None,
-            initial_input: None,
-            role: Some(crate::role::DEFAULT_REVIEWER_ROLE.to_string()),
-            goal: Some(crate::role::DEFAULT_REVIEWER_GOAL.to_string()),
-            backstory: Some(crate::role::DEFAULT_REVIEWER_BACKSTORY.to_string()),
-            plan_review_mode: shared::PlanReviewMode::default(),
-            managed: true,
-            try_resume_first: try_resume,
-            kind: shared::PaneKind::Agent,
-        });
-        tracing::info!(pane_id, ?reviewer_spec.provider, ?reviewer_spec.model, "spawning Reviewer pane (Start team)");
-    }
-    if !has_developer {
-        let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
-        let _ = event_tx.send(TuiEvent::AddTabWithConfig {
-            pane_id,
-            label: "Developer".to_string(),
-            claude_session_id: Uuid::new_v4(),
-            mode: shared::PaneMode::Deadloop,
-            provider: developer_spec.provider.unwrap_or(shared::Provider::Claude),
-            prompt: Some(crate::role::DEFAULT_DEVELOPER_DEADLOOP_PROMPT.to_string()),
-            min_iteration_interval_minutes: None,
-            model: developer_spec.model.clone(),
-            effort: None,
-            worktree_path: None,
-            initial_input: None,
-            role: Some(crate::role::DEFAULT_DEVELOPER_ROLE.to_string()),
-            goal: Some(crate::role::DEFAULT_DEVELOPER_GOAL.to_string()),
-            backstory: Some(crate::role::DEFAULT_DEVELOPER_BACKSTORY.to_string()),
-            plan_review_mode: shared::PlanReviewMode::default(),
-            managed: true,
-            try_resume_first: try_resume,
-            kind: shared::PaneKind::Agent,
-        });
-        tracing::info!(pane_id, ?developer_spec.provider, ?developer_spec.model, "spawning Developer pane (Start team)");
     }
 }
 
@@ -1761,87 +1507,6 @@ enum ManagedBuiltInPromptKind {
     DefaultDeveloper,
 }
 
-fn managed_builtin_prompt_kind(pane: &shared::PaneConfig) -> Option<ManagedBuiltInPromptKind> {
-    if !pane.managed {
-        return None;
-    }
-
-    let lower = pane.role.as_deref().unwrap_or("").to_ascii_lowercase();
-    if lower.contains("manager") && !lower.contains("tech lead") {
-        return Some(ManagedBuiltInPromptKind::Manager);
-    }
-    if lower.contains("tech lead") {
-        return Some(ManagedBuiltInPromptKind::TechLead);
-    }
-    if lower.contains("reviewer") {
-        return Some(ManagedBuiltInPromptKind::Reviewer);
-    }
-    if lower.contains("developer") && pane.worktree_path.is_none() {
-        return Some(ManagedBuiltInPromptKind::DefaultDeveloper);
-    }
-    None
-}
-
-fn current_managed_builtin_prompt(kind: ManagedBuiltInPromptKind) -> Option<&'static str> {
-    match kind {
-        // Manager panes are interactive and currently do not store a
-        // built-in prompt in PaneConfig.
-        ManagedBuiltInPromptKind::Manager => None,
-        ManagedBuiltInPromptKind::TechLead => Some(crate::role::TECH_LEAD_DEADLOOP_PROMPT),
-        ManagedBuiltInPromptKind::Reviewer => Some(crate::role::REVIEWER_DEADLOOP_PROMPT),
-        ManagedBuiltInPromptKind::DefaultDeveloper => {
-            Some(crate::role::DEFAULT_DEVELOPER_DEADLOOP_PROMPT)
-        }
-    }
-}
-
-fn prompt_matches_known_stale_builtin(kind: ManagedBuiltInPromptKind, prompt: &str) -> bool {
-    match kind {
-        ManagedBuiltInPromptKind::TechLead => {
-            prompt
-                .starts_with("You are this project's Tech Lead, running as an autonomous deadloop.")
-                && prompt.contains("Every iteration, in order:")
-                && prompt.contains("2. Walk the Global TODOs and act on each.")
-                && prompt.contains("`status: approved` with no subtasks under it")
-                && prompt.contains("expand: write per-worker subtask entries")
-                && !prompt.contains("backlog backpressure")
-                && !prompt.contains("one additional `pending` subtask")
-        }
-        ManagedBuiltInPromptKind::Manager
-        | ManagedBuiltInPromptKind::Reviewer
-        | ManagedBuiltInPromptKind::DefaultDeveloper => false,
-    }
-}
-
-fn refresh_stale_managed_builtin_prompts(panes: &mut [shared::PaneConfig]) -> usize {
-    let mut refreshed = 0;
-    for pane in panes {
-        let Some(kind) = managed_builtin_prompt_kind(pane) else {
-            continue;
-        };
-        let Some(current_prompt) = current_managed_builtin_prompt(kind) else {
-            continue;
-        };
-        let Some(saved_prompt) = pane.prompt.as_deref() else {
-            continue;
-        };
-        if saved_prompt == current_prompt {
-            continue;
-        }
-        if prompt_matches_known_stale_builtin(kind, saved_prompt) {
-            tracing::info!(
-                pane_id = pane.pane_id,
-                role = ?pane.role,
-                ?kind,
-                "refreshing stale managed built-in prompt"
-            );
-            pane.prompt = Some(current_prompt.to_string());
-            refreshed += 1;
-        }
-    }
-    refreshed
-}
-
 fn boot_restore_try_resume_first(provider: &Provider, model: Option<&str>) -> bool {
     matches!(provider, Provider::Claude)
         && !shared::is_retired_model(model)
@@ -2211,15 +1876,6 @@ async fn run_inner(
             pane.effort = Some("max".to_string());
         }
     }
-    // Refresh only prompts that match known stale built-in signatures.
-    // Unmatched prompts may be human customizations, so preserve them.
-    let refreshed_prompt_count = refresh_stale_managed_builtin_prompts(&mut metadata.panes);
-    if refreshed_prompt_count > 0 {
-        tracing::info!(
-            refreshed_prompt_count,
-            "refreshed stale managed built-in prompts on boot"
-        );
-    }
     save_project(working_dir, &metadata)?;
 
     let configured_terminal_panes = metadata
@@ -2235,55 +1891,6 @@ async fn run_inner(
         Err(error) => tracing::warn!(%error, "could not reconcile persistent pane-host registry"),
     }
 
-    // Orphan-cleanup sweep: drop `## pane:<id>` sections in team-todo.md
-    // for panes that no longer exist in .apas (typically: user removed
-    // them via the web while team-todo.md still had unfinished subtasks
-    // assigned). Mirrors the per-removal cleanup in the RemovePane
-    // handler — without this, the Tech Lead keeps trying to dispatch
-    // to ghost panes across reboots.
-    {
-        let live_pane_ids: std::collections::HashSet<u32> =
-            metadata.panes.iter().map(|p| p.pane_id).collect();
-        if let Ok(mut todo) = crate::team_todo::load(working_dir) {
-            let orphan_pane_ids: Vec<u32> = todo
-                .workers
-                .iter()
-                .map(|w| w.pane_id)
-                .filter(|id| !live_pane_ids.contains(id))
-                .collect();
-            if !orphan_pane_ids.is_empty() {
-                for orphan in orphan_pane_ids {
-                    tracing::info!(
-                        pane_id = orphan,
-                        "cleaning orphan team-todo section on boot (pane no longer in .apas)"
-                    );
-                    let orphaned_parents = todo.remove_pane_subtasks(orphan);
-                    for parent_id in &orphaned_parents {
-                        if let Some(g) = todo.find_global_mut(parent_id) {
-                            if matches!(
-                                g.status,
-                                crate::team_todo::GlobalStatus::InProgress
-                                    | crate::team_todo::GlobalStatus::UnderReview
-                            ) {
-                                tracing::info!(
-                                    todo = %parent_id,
-                                    old_status = ?g.status,
-                                    "resetting orphaned Global to approved on boot"
-                                );
-                                g.status = crate::team_todo::GlobalStatus::Approved;
-                            }
-                        }
-                    }
-                }
-                if let Err(e) = crate::team_todo::save(working_dir, &todo) {
-                    tracing::warn!(
-                        "Failed to save team-todo.md after boot orphan cleanup: {}",
-                        e
-                    );
-                }
-            }
-        }
-    }
 
     let default_prompt = DEFAULT_PROMPT.to_string();
 
@@ -2755,7 +2362,7 @@ async fn run_inner(
                     m.pending_questions.clone(),
                     m.effort_arc.clone(),
                     m.worktree_path.clone(),
-                    crate::role::compose_system_prompt(
+                    crate::pane_identity::compose_system_prompt(
                         m.role.as_deref(),
                         m.goal.as_deref(),
                         m.backstory.as_deref(),
@@ -2855,7 +2462,7 @@ async fn run_inner(
                     m.pending_questions.clone(),
                     m.effort_arc.clone(),
                     m.worktree_path.clone(),
-                    crate::role::compose_system_prompt(
+                    crate::pane_identity::compose_system_prompt(
                         m.role.as_deref(),
                         m.goal.as_deref(),
                         m.backstory.as_deref(),
@@ -2996,39 +2603,6 @@ async fn run_inner(
             }
         });
     }
-
-    // v3.1: project_goal.md poller. Re-sends the file's current content
-    // on every tick so server-side cache stays fresh after restarts and
-    // newly-attaching web clients always see something. File is tiny
-    // (~1-2 KB) and the message is at most one per 3s per active CLI,
-    // so the bandwidth cost is negligible.
-    //
-    // Previous implementation gated the send on mtime change with a
-    // first_tick override — which left a "cache empty + no recent file
-    // change" gap after every server restart (the in-memory cache is
-    // wiped but the CLI doesn't know to re-send). Sending always is
-    // the simplest robust fix.
-    {
-        let server_tx_for_goal = server_tx.clone();
-        let shutdown_for_goal = shutdown.clone();
-        let working_dir_for_goal = working_dir_str.clone();
-        thread::spawn(move || {
-            let project = std::path::PathBuf::from(working_dir_for_goal);
-            let path = crate::manager::goal_path(&project);
-            while !shutdown_for_goal.load(Ordering::SeqCst) {
-                if path.exists() {
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        let _ = server_tx_for_goal.blocking_send(CliToServer::ProjectGoalChanged {
-                            session_id,
-                            content,
-                        });
-                    }
-                }
-                thread::sleep(Duration::from_secs(3));
-            }
-        });
-    }
-
     // Project flag poller. Re-reads .apas every ~5s and pushes the
     // current `auto_approve_todos` / `auto_merge_prs` values upstream
     // so the web's Overview toggles hydrate on attach and survive a
@@ -3054,72 +2628,6 @@ async fn run_inner(
             }
         });
     }
-
-    // team-todo.md mtime-gated poller. Mirrors the suggested-workers
-    // poller below. Without this, the Overview's TeamTodoPanel only
-    // sees changes on FetchTeamTodo (initial mount) — Tech-Lead-driven
-    // edits (new proposed entries, status flips, PR-link appends)
-    // never reach the web until the user refreshes.
-    {
-        let server_tx_for_tt = server_tx.clone();
-        let shutdown_for_tt = shutdown.clone();
-        let working_dir_for_tt = working_dir_str.clone();
-        thread::spawn(move || {
-            let project = std::path::PathBuf::from(working_dir_for_tt);
-            let path = crate::team_todo::team_todo_path(&project);
-            let mut last_mtime: Option<std::time::SystemTime> = None;
-            let mut first_tick = true;
-            while !shutdown_for_tt.load(Ordering::SeqCst) {
-                let cur_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-                let changed = first_tick || cur_mtime != last_mtime;
-                if changed {
-                    let todo = crate::team_todo::load(&project).unwrap_or_default();
-                    let state_msg = crate::team_todo::to_wire_with_cursors(&todo, &project);
-                    let _ = server_tx_for_tt.blocking_send(CliToServer::TeamTodoState {
-                        session_id,
-                        state: state_msg,
-                    });
-                    last_mtime = cur_mtime;
-                    first_tick = false;
-                }
-                thread::sleep(Duration::from_secs(3));
-            }
-        });
-    }
-
-    // suggested-workers.md mtime-gated poller. Pushes a fresh
-    // SuggestedWorkersState whenever the file's mtime changes so the
-    // Overview's Suggested workers panel updates without the user
-    // having to refresh. Mtime gate keeps the wire quiet when the
-    // Manager hasn't touched the file. Fires once at startup (no
-    // baseline mtime) so a newly-attached web client gets the current
-    // state even if nothing has changed recently.
-    {
-        let server_tx_for_sw = server_tx.clone();
-        let shutdown_for_sw = shutdown.clone();
-        let working_dir_for_sw = working_dir_str.clone();
-        thread::spawn(move || {
-            let project = std::path::PathBuf::from(working_dir_for_sw);
-            let path = crate::suggested_workers::path(&project);
-            let mut last_mtime: Option<std::time::SystemTime> = None;
-            let mut first_tick = true;
-            while !shutdown_for_sw.load(Ordering::SeqCst) {
-                let cur_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-                let changed = first_tick || cur_mtime != last_mtime;
-                if changed {
-                    let sw = crate::suggested_workers::load(&project).unwrap_or_default();
-                    let _ = server_tx_for_sw.blocking_send(CliToServer::SuggestedWorkersState {
-                        session_id,
-                        suggestions: crate::suggested_workers::to_wire(&sw),
-                    });
-                    last_mtime = cur_mtime;
-                    first_tick = false;
-                }
-                thread::sleep(Duration::from_secs(3));
-            }
-        });
-    }
-
     // Phase 2.2b: team scratchpad watcher. Tails `.apas-team.jsonl` and
     // pushes new records to the server (which forwards to web). On
     // first tick we send the existing history so newly-attached web
@@ -3405,92 +2913,6 @@ async fn run_inner(
             }
         });
     }
-
-    // re-reads on growth.
-    {
-        let server_tx_for_pad = server_tx.clone();
-        let shutdown_for_pad = shutdown.clone();
-        let project_for_pad = std::path::PathBuf::from(working_dir_str.clone());
-        let input_channels_for_pad = input_channels.clone();
-        thread::spawn(move || {
-            let scratchpad_path = crate::scratchpad::scratchpad_path(&project_for_pad);
-            let mut last_size: u64 = 0;
-            let mut seen_count: usize = 0;
-            // Send existing history once on startup so attached web
-            // clients can backfill. We intentionally do NOT route
-            // delegate-to records from history into pane input queues
-            // — that would re-deliver every historical task on every
-            // CLI restart. Routing only applies to NEW records below.
-            if let Ok(records) = crate::scratchpad::read_all(&project_for_pad) {
-                for r in &records {
-                    let _ = server_tx_for_pad.blocking_send(CliToServer::TeamRecord {
-                        session_id,
-                        record: r.to_wire(),
-                    });
-                }
-                seen_count = records.len();
-            }
-            while !shutdown_for_pad.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_secs(2));
-                // Cheap change check: if file size hasn't grown since
-                // last tick, skip the re-read entirely. read_all()
-                // does its own malformed-line tolerance.
-                let size = std::fs::metadata(&scratchpad_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                if size == last_size {
-                    continue;
-                }
-                last_size = size;
-                match crate::scratchpad::read_all(&project_for_pad) {
-                    Ok(all) if all.len() > seen_count => {
-                        for r in &all[seen_count..] {
-                            let _ = server_tx_for_pad.blocking_send(CliToServer::TeamRecord {
-                                session_id,
-                                record: r.to_wire(),
-                            });
-                            // Phase 3.1a: route delegate-to:<id> records
-                            // into the target pane's input queue. Only
-                            // for NEW records — never replay history.
-                            if let Some(target_pane_id) = crate::scratchpad::delegate_target_pane(r)
-                            {
-                                let routed = {
-                                    let channels = input_channels_for_pad.lock().unwrap();
-                                    if let Some(tx) = channels.get(&target_pane_id) {
-                                        tx.send((r.body.clone(), false)).is_ok()
-                                    } else {
-                                        false
-                                    }
-                                };
-                                if !routed {
-                                    tracing::warn!(
-                                        target_pane_id,
-                                        from_pane = r.pane_id,
-                                        "delegate-to: target pane has no input channel; skipping route",
-                                    );
-                                } else {
-                                    tracing::info!(
-                                        target_pane_id,
-                                        from_pane = r.pane_id,
-                                        "delegate-to: routed scratchpad body into pane input",
-                                    );
-                                }
-                            }
-                        }
-                        seen_count = all.len();
-                    }
-                    Ok(all) => {
-                        // File shrunk (truncate / external rewrite). Reset state.
-                        seen_count = all.len();
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, "scratchpad watcher: read failed");
-                    }
-                }
-            }
-        });
-    }
-
     {
         // A worker's TUI channels used to be dropped because nobody read them.
         // They are now fanned out to attached controllers instead: the project
@@ -4041,7 +3463,7 @@ fn handle_tui_events(
                                 m.pending_questions.clone(),
                                 m.effort_arc.clone(),
                                 m.worktree_path.clone(),
-                                crate::role::compose_system_prompt(
+                                crate::pane_identity::compose_system_prompt(
                                     m.role.as_deref(),
                                     m.goal.as_deref(),
                                     m.backstory.as_deref(),
@@ -4138,7 +3560,7 @@ fn handle_tui_events(
                                 m.pending_questions.clone(),
                                 m.effort_arc.clone(),
                                 m.worktree_path.clone(),
-                                crate::role::compose_system_prompt(
+                                crate::pane_identity::compose_system_prompt(
                                     m.role.as_deref(),
                                     m.goal.as_deref(),
                                     m.backstory.as_deref(),
@@ -4351,7 +3773,7 @@ fn handle_tui_events(
                 // still is: it is the switch that stops a running team, and
                 // honouring it here is what stops a disabled team coming back
                 // one pane at a time.
-                if !existing_pane_relaunch_allowed(&project_policy, preserved_fields.managed) {
+                if !existing_pane_relaunch_allowed() {
                     let denied = shared::launch_profile_key(
                         existing_kind,
                         provider,
@@ -4501,7 +3923,7 @@ fn handle_tui_events(
                                 m.pending_questions.clone(),
                                 m.effort_arc.clone(),
                                 m.worktree_path.clone(),
-                                crate::role::compose_system_prompt(
+                                crate::pane_identity::compose_system_prompt(
                                     m.role.as_deref(),
                                     m.goal.as_deref(),
                                     m.backstory.as_deref(),
@@ -4979,7 +4401,7 @@ fn handle_tui_events(
                                 m.pending_questions.clone(),
                                 m.effort_arc.clone(),
                                 m.worktree_path.clone(),
-                                crate::role::compose_system_prompt(
+                                crate::pane_identity::compose_system_prompt(
                                     m.role.as_deref(),
                                     m.goal.as_deref(),
                                     m.backstory.as_deref(),
@@ -5139,72 +4561,6 @@ fn build_pane_list(
 
     panes.sort_by_key(|p| p.pane_id);
     panes
-}
-
-fn promote_pane_to_managed(pane_metas: &PaneMetas, promote_id: u32) -> bool {
-    let mut metas = pane_metas.lock().unwrap();
-    match metas.get_mut(&promote_id) {
-        Some(m) if !m.managed && m.kind == shared::PaneKind::Agent => {
-            m.managed = true;
-            // Bring promoted Claude panes up to the team's baseline (max
-            // effort). effort_arc is read by the streaming worker before
-            // each turn, so the next Claude restart picks it up.
-            // `ultracode` counts as an accepted baseline — don't clobber
-            // a user's explicit choice when promoting a side chat.
-            if matches!(m.provider, shared::Provider::Claude)
-                && !matches!(m.effort.as_deref(), Some("max") | Some("ultracode"))
-            {
-                m.effort = Some("max".to_string());
-                if let Ok(mut guard) = m.effort_arc.lock() {
-                    *guard = Some("max".to_string());
-                }
-            }
-            // Role inference: a pane labelled "Reviewer" / "Tech Lead" /
-            // "Developer" / "Manager" was almost certainly meant to be
-            // that team role, but earlier spawn paths (older Start-team
-            // before specs, "+"→rename, AddPane from web) didn't set the
-            // role/goal/backstory triple. Without those, the Tech Lead's
-            // delegation step (`role` contains "developer" etc.) can't
-            // see the pane as a delegation target. On promote, fill in
-            // the matching team defaults — but only when role is empty,
-            // so a user's custom role label is never clobbered.
-            if m.role.as_deref().map(|s| s.trim()).unwrap_or("").is_empty() {
-                let lower = m.label.to_ascii_lowercase();
-                let (role, goal, backstory) = if lower.contains("tech lead") {
-                    (
-                        crate::role::DEFAULT_TECH_LEAD_ROLE,
-                        crate::role::DEFAULT_TECH_LEAD_GOAL,
-                        crate::role::DEFAULT_TECH_LEAD_BACKSTORY,
-                    )
-                } else if lower.contains("manager") {
-                    (
-                        crate::role::DEFAULT_MANAGER_ROLE,
-                        crate::role::DEFAULT_MANAGER_GOAL,
-                        crate::role::DEFAULT_MANAGER_BACKSTORY,
-                    )
-                } else if lower.contains("reviewer") {
-                    (
-                        crate::role::DEFAULT_REVIEWER_ROLE,
-                        crate::role::DEFAULT_REVIEWER_GOAL,
-                        crate::role::DEFAULT_REVIEWER_BACKSTORY,
-                    )
-                } else if lower.contains("developer") {
-                    (
-                        crate::role::DEFAULT_DEVELOPER_ROLE,
-                        crate::role::DEFAULT_DEVELOPER_GOAL,
-                        crate::role::DEFAULT_DEVELOPER_BACKSTORY,
-                    )
-                } else {
-                    return true;
-                };
-                m.role = Some(role.to_string());
-                m.goal = Some(goal.to_string());
-                m.backstory = Some(backstory.to_string());
-            }
-            true
-        }
-        _ => false,
-    }
 }
 
 #[allow(deprecated)]
@@ -5853,7 +5209,6 @@ mod tests {
         build_pane_reboot_events, build_user_envelope_line, convert_opencode_to_claude,
         deadloop_wait_plan, evaluate_deadloop_watchdog, is_codex_stale_session_error,
         manual_create_pr_worktree_path, normalize_codex_effort, normalize_effort_level,
-        promote_pane_to_managed, refresh_stale_managed_builtin_prompts,
         reset_deadloop_codex_stale_session, resolve_pane_binary_path, resolve_terminal_binary,
         restored_pane_mode_and_pause, retired_launch_rejection_output, route_web_input_to_pane,
         run_deadloop_session_inner, save_pane_configs, should_recover_deadloop_stale_session,
@@ -5881,6 +5236,61 @@ mod tests {
         "Work on tasks defined in TODO.md.\n1. Analyze\n2. Implement\n3. Test";
     const WEB_PROVIDER_OPTIONS_TS: &str =
         include_str!("../../../../packages/web/src/lib/providerOptions.ts");
+
+    /// A project written while team mode existed still holds panes marked
+    /// managed, with roles and built-in prompts. Nothing dispatches them now,
+    /// so the only requirement is that the project loads and they come back as
+    /// ordinary panes rather than being dropped or refused.
+    #[test]
+    fn a_stored_managed_pane_loads_as_an_ordinary_pane() {
+        let dir = tempfile::tempdir().expect("temp project");
+        let mut metadata = get_or_create_project(dir.path()).expect("create project");
+        let mut managed = shared::PaneConfig {
+            pane_id: 178,
+            provider: Provider::Claude,
+            mode: shared::PaneMode::Deadloop,
+            kind: shared::PaneKind::Agent,
+            session_id: Uuid::new_v4(),
+            is_paused: false,
+            stop_requested: false,
+            prompt: Some("You are this project's Tech Lead...".to_string()),
+            min_iteration_interval_minutes: None,
+            label: Some("Tech Lead".to_string()),
+            model: None,
+            effort: None,
+            worktree_path: None,
+            role: Some("tech lead".to_string()),
+            goal: Some("Orchestrate the team.".to_string()),
+            backstory: None,
+            plan_review_mode: shared::PlanReviewMode::default(),
+            manual_mode: false,
+            managed: true,
+        };
+        managed.label = Some("Tech Lead".to_string());
+        metadata.panes.push(managed);
+        save_project(dir.path(), &metadata).expect("save project");
+
+        let reloaded = get_or_create_project(dir.path()).expect("reload project");
+        let pane = reloaded
+            .panes
+            .iter()
+            .find(|pane| pane.pane_id == 178)
+            .expect("the pane survives the load");
+        // Its role and prompt are ordinary pane metadata now.
+        assert_eq!(pane.role.as_deref(), Some("tech lead"));
+        assert!(super::existing_pane_relaunch_allowed());
+    }
+
+
+    /// A pane that exists relaunches, full stop. The allowlist governs what may
+    /// be created, and team availability — which used to gate a managed pane —
+    /// no longer governs anything, so a pane marked managed by an older `.apas`
+    /// is simply a pane.
+    #[test]
+    fn any_existing_pane_relaunches() {
+        assert!(super::existing_pane_relaunch_allowed());
+    }
+
 
     #[test]
     fn deadloop_wait_cursor_is_sampled_at_wait_entry() {
@@ -6266,157 +5676,6 @@ mod tests {
             panic!("Start team should emit AddTabWithConfig events");
         };
         label.as_str()
-    }
-
-    #[test]
-    fn start_team_empty_roster_spawns_default_managed_panes() {
-        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
-        let (event_tx, event_rx) = mpsc::channel();
-        let manager = team_role_spec(Provider::Codex, "gpt-5");
-        let tech_lead = team_role_spec(Provider::Claude, "claude-sonnet-4");
-        let reviewer = team_role_spec(Provider::CursorAgent, "cursor-default");
-        let developer = team_role_spec(Provider::Opencode, "opencode-default");
-
-        super::spawn_missing_team_panes(
-            &pane_metas,
-            &event_tx,
-            &manager,
-            &tech_lead,
-            &reviewer,
-            &developer,
-        );
-
-        let events = event_rx.try_iter().collect::<Vec<_>>();
-        assert_eq!(events.len(), 4);
-
-        assert_start_team_pane(
-            &events[0],
-            ExpectedTeamPane {
-                label: "Manager",
-                mode: shared::PaneMode::Interactive,
-                provider: Provider::Codex,
-                model: "gpt-5",
-                prompt: None,
-                effort: Some("max"),
-                role: crate::role::DEFAULT_MANAGER_ROLE,
-                goal: crate::role::DEFAULT_MANAGER_GOAL,
-                backstory: crate::role::DEFAULT_MANAGER_BACKSTORY,
-            },
-        );
-        assert_start_team_pane(
-            &events[1],
-            ExpectedTeamPane {
-                label: "Tech Lead",
-                mode: shared::PaneMode::Deadloop,
-                provider: Provider::Claude,
-                model: "claude-sonnet-4",
-                prompt: Some(crate::role::TECH_LEAD_DEADLOOP_PROMPT),
-                effort: Some("max"),
-                role: crate::role::DEFAULT_TECH_LEAD_ROLE,
-                goal: crate::role::DEFAULT_TECH_LEAD_GOAL,
-                backstory: crate::role::DEFAULT_TECH_LEAD_BACKSTORY,
-            },
-        );
-        assert_start_team_pane(
-            &events[2],
-            ExpectedTeamPane {
-                label: "Reviewer",
-                mode: shared::PaneMode::Deadloop,
-                provider: Provider::CursorAgent,
-                model: "cursor-default",
-                prompt: Some(crate::role::REVIEWER_DEADLOOP_PROMPT),
-                effort: Some("max"),
-                role: crate::role::DEFAULT_REVIEWER_ROLE,
-                goal: crate::role::DEFAULT_REVIEWER_GOAL,
-                backstory: crate::role::DEFAULT_REVIEWER_BACKSTORY,
-            },
-        );
-        assert_start_team_pane(
-            &events[3],
-            ExpectedTeamPane {
-                label: "Developer",
-                mode: shared::PaneMode::Deadloop,
-                provider: Provider::Opencode,
-                model: "opencode-default",
-                prompt: Some(crate::role::DEFAULT_DEVELOPER_DEADLOOP_PROMPT),
-                effort: None,
-                role: crate::role::DEFAULT_DEVELOPER_ROLE,
-                goal: crate::role::DEFAULT_DEVELOPER_GOAL,
-                backstory: crate::role::DEFAULT_DEVELOPER_BACKSTORY,
-            },
-        );
-    }
-
-    #[test]
-    fn start_team_existing_managed_roles_suppress_only_matching_spawn() {
-        let scenarios = [
-            ("Manager", "Project Manager", shared::PaneMode::Interactive),
-            ("Tech Lead", "Tech Lead", shared::PaneMode::Deadloop),
-            ("Reviewer", "Diff Reviewer", shared::PaneMode::Deadloop),
-            ("Developer", "Default Developer", shared::PaneMode::Deadloop),
-        ];
-
-        for (suppressed_label, role, mode) in scenarios {
-            let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
-            let (event_tx, event_rx) = mpsc::channel();
-
-            {
-                let mut metas = pane_metas.lock().unwrap();
-                metas.insert(10, test_team_pane_meta(suppressed_label, role, mode, true));
-                metas.insert(
-                    11,
-                    test_team_pane_meta(
-                        "Unmanaged Manager",
-                        "Manager",
-                        shared::PaneMode::Interactive,
-                        false,
-                    ),
-                );
-                metas.insert(
-                    12,
-                    test_team_pane_meta(
-                        "Unmanaged Reviewer",
-                        "Reviewer",
-                        shared::PaneMode::Deadloop,
-                        false,
-                    ),
-                );
-                metas.insert(
-                    13,
-                    test_team_pane_meta(
-                        "Unmanaged Developer",
-                        "Developer",
-                        shared::PaneMode::Deadloop,
-                        false,
-                    ),
-                );
-            }
-
-            super::spawn_missing_team_panes(
-                &pane_metas,
-                &event_tx,
-                &shared::TeamRoleSpec::default(),
-                &shared::TeamRoleSpec::default(),
-                &shared::TeamRoleSpec::default(),
-                &shared::TeamRoleSpec::default(),
-            );
-
-            let events = event_rx.try_iter().collect::<Vec<_>>();
-            let labels = events
-                .iter()
-                .map(start_team_event_label)
-                .collect::<HashSet<_>>();
-
-            assert_eq!(events.len(), 3, "scenario: {suppressed_label}");
-            assert!(!labels.contains(suppressed_label));
-            for label in ["Manager", "Tech Lead", "Reviewer", "Developer"] {
-                assert_eq!(
-                    labels.contains(label),
-                    label != suppressed_label,
-                    "scenario: {suppressed_label}, label: {label}",
-                );
-            }
-        }
     }
 
     fn seed_pending_question(meta: &PaneMeta, tool_use_id: &str, request_id: &str) {
@@ -7325,95 +6584,6 @@ mod tests {
     }
 
     #[test]
-    fn refresh_stale_managed_builtin_prompts_updates_only_known_stale_defaults() {
-        const STALE_TECH_LEAD_PROMPT: &str = "You are this project's Tech Lead, running as an autonomous deadloop.\n\n\
-Every iteration, in order:\n\n\
-1. Read `project_goal.md` and `team-todo.md` UNCONDITIONALLY every iteration.\n\
-2. Walk the Global TODOs and act on each.\n\
-   - `status: approved` with no subtasks under it - expand: write per-worker subtask entries into the appropriate `## pane:<id>` section.\n";
-        const CUSTOM_TECH_LEAD_PROMPT: &str =
-            "You are this project's Tech Lead, running as an autonomous deadloop.\n\
-Use a project-specific custom dispatch loop.";
-        const CUSTOM_REVIEWER_PROMPT: &str = "Reviewer custom loop";
-        const CUSTOM_MANAGER_PROMPT: &str = "Manager custom prompt";
-
-        let _config = crate::config::test_config::isolated_config_dir();
-        let dir = tempfile::tempdir().expect("temp project dir");
-        let mut metadata = get_or_create_project(dir.path()).expect("metadata should initialize");
-        metadata.panes = vec![
-            test_managed_role_pane(
-                10,
-                "tech lead",
-                shared::PaneMode::Deadloop,
-                Some(STALE_TECH_LEAD_PROMPT),
-                None,
-            ),
-            test_managed_role_pane(
-                11,
-                "tech lead",
-                shared::PaneMode::Deadloop,
-                Some(CUSTOM_TECH_LEAD_PROMPT),
-                None,
-            ),
-            test_managed_role_pane(
-                12,
-                "reviewer",
-                shared::PaneMode::Deadloop,
-                Some(CUSTOM_REVIEWER_PROMPT),
-                None,
-            ),
-            test_managed_role_pane(
-                13,
-                "team manager",
-                shared::PaneMode::Interactive,
-                Some(CUSTOM_MANAGER_PROMPT),
-                None,
-            ),
-            test_managed_role_pane(
-                14,
-                "developer",
-                shared::PaneMode::Deadloop,
-                Some("specialized developer custom loop"),
-                Some("/tmp/apas-specialist"),
-            ),
-        ];
-        let mut unmanaged_stale = test_managed_role_pane(
-            15,
-            "tech lead",
-            shared::PaneMode::Deadloop,
-            Some(STALE_TECH_LEAD_PROMPT),
-            None,
-        );
-        unmanaged_stale.managed = false;
-        metadata.panes.push(unmanaged_stale);
-        save_project(dir.path(), &metadata).expect("seed metadata");
-
-        let mut reloaded = get_or_create_project(dir.path()).expect("metadata should reload");
-        assert_eq!(
-            refresh_stale_managed_builtin_prompts(&mut reloaded.panes),
-            1
-        );
-        save_project(dir.path(), &reloaded).expect("persist refreshed metadata");
-
-        let persisted = get_or_create_project(dir.path()).expect("metadata should reload");
-        let prompt_for = |pane_id| {
-            persisted
-                .panes
-                .iter()
-                .find(|pane| pane.pane_id == pane_id)
-                .and_then(|pane| pane.prompt.as_deref())
-                .expect("pane prompt")
-        };
-        assert_eq!(prompt_for(10), crate::role::TECH_LEAD_DEADLOOP_PROMPT);
-        assert!(prompt_for(10).contains("backlog backpressure"));
-        assert_eq!(prompt_for(11), CUSTOM_TECH_LEAD_PROMPT);
-        assert_eq!(prompt_for(12), CUSTOM_REVIEWER_PROMPT);
-        assert_eq!(prompt_for(13), CUSTOM_MANAGER_PROMPT);
-        assert_eq!(prompt_for(14), "specialized developer custom loop");
-        assert_eq!(prompt_for(15), STALE_TECH_LEAD_PROMPT);
-    }
-
-    #[test]
     fn paused_deadloop_session_waits_without_spawning_child() {
         let dir = tempfile::tempdir().expect("temp project dir");
         let working_dir = dir.path().to_string_lossy().to_string();
@@ -7973,99 +7143,6 @@ Use a project-specific custom dispatch loop.";
         }
 
         assert_eq!(active_usage_providers(&pane_metas), (false, false, false));
-    }
-
-    #[test]
-    fn promote_pane_to_managed_marks_side_chat_and_pane_list_managed() {
-        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
-        let effort_arc = Arc::new(Mutex::new(Some("low".to_string())));
-        let pane_session = Uuid::new_v4();
-
-        {
-            pane_metas.lock().unwrap().insert(
-                42,
-                test_pane_meta(Provider::Claude, false, Some("low"), effort_arc.clone()),
-            );
-        }
-
-        assert!(promote_pane_to_managed(&pane_metas, 42));
-
-        {
-            let metas = pane_metas.lock().unwrap();
-            let promoted = metas.get(&42).expect("pane should still exist");
-            assert!(promoted.managed);
-            assert_eq!(promoted.role.as_deref(), Some("developer"));
-            assert_eq!(promoted.goal.as_deref(), Some("Ship the side quest"));
-            assert_eq!(
-                promoted.backstory.as_deref(),
-                Some("A manually added helper pane"),
-            );
-            assert_eq!(promoted.effort.as_deref(), Some("max"));
-        }
-        assert_eq!(effort_arc.lock().unwrap().as_deref(), Some("max"));
-
-        let input_channels: InputChannels = Arc::new(Mutex::new(HashMap::new()));
-        let pane_sessions = Arc::new(Mutex::new(HashMap::new()));
-        pane_sessions.lock().unwrap().insert(42, pane_session);
-        let pane_pauses: PanePauses = Arc::new(Mutex::new(HashMap::new()));
-        let pane_stop_requests: PaneStopRequests = Arc::new(Mutex::new(HashMap::new()));
-
-        let panes = build_pane_list(
-            &pane_metas,
-            &input_channels,
-            Uuid::new_v4(),
-            &pane_sessions,
-            &pane_pauses,
-            &pane_stop_requests,
-        );
-        let promoted = panes
-            .into_iter()
-            .find(|pane| pane.pane_id == 42)
-            .expect("promoted pane should appear in PaneList");
-
-        assert!(promoted.managed);
-        assert_eq!(promoted.session_id, pane_session);
-        assert_eq!(promoted.role.as_deref(), Some("developer"));
-        assert_eq!(promoted.goal.as_deref(), Some("Ship the side quest"));
-        assert_eq!(
-            promoted.backstory.as_deref(),
-            Some("A manually added helper pane"),
-        );
-        assert_eq!(promoted.effort.as_deref(), Some("max"));
-    }
-
-    #[test]
-    fn promote_pane_to_managed_noops_for_managed_or_missing_panes() {
-        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
-        let effort_arc = Arc::new(Mutex::new(Some("low".to_string())));
-
-        {
-            pane_metas.lock().unwrap().insert(
-                7,
-                test_pane_meta(Provider::Claude, true, Some("low"), effort_arc.clone()),
-            );
-        }
-
-        assert!(!promote_pane_to_managed(&pane_metas, 7));
-        assert!(!promote_pane_to_managed(&pane_metas, 999));
-
-        let metas = pane_metas.lock().unwrap();
-        let managed = metas.get(&7).expect("managed pane should remain");
-        assert!(managed.managed);
-        assert_eq!(managed.effort.as_deref(), Some("low"));
-        assert_eq!(effort_arc.lock().unwrap().as_deref(), Some("low"));
-    }
-
-    #[test]
-    fn promote_pane_to_managed_rejects_terminal_panes() {
-        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
-        let effort_arc = Arc::new(Mutex::new(None));
-        let mut terminal = test_pane_meta(Provider::Claude, false, None, effort_arc);
-        terminal.kind = shared::PaneKind::Terminal;
-        pane_metas.lock().unwrap().insert(8, terminal);
-
-        assert!(!promote_pane_to_managed(&pane_metas, 8));
-        assert!(!pane_metas.lock().unwrap().get(&8).unwrap().managed);
     }
 
     #[test]
@@ -8856,62 +7933,6 @@ Use a project-specific custom dispatch loop.";
 
     // --- team mode on/off ---------------------------------------------------
 
-    /// The allowlist decides what may be created. A pane that exists already
-    /// embodies a decision taken under whatever policy applied then, and
-    /// refusing to bring it back never removed it — it kept running, just
-    /// unrecoverable if it ever stopped.
-    #[test]
-    fn an_existing_pane_relaunches_even_outside_the_allowlist() {
-        let policy = Arc::new(Mutex::new(Some(shared::EffectiveProjectPolicy {
-            team_available: true,
-            // Deliberately allows nothing this pane could be.
-            allowed_launch_profiles: vec!["agent:codex:official:default".to_string()],
-            version: 9,
-            project_suspended: false,
-        })));
-
-        // An unmanaged pane relaunches regardless of the allowlist...
-        assert!(super::existing_pane_relaunch_allowed(&policy, false));
-        // ...and the allowlist still refuses to create that same profile.
-        assert!(!super::launch_allowed_by_server_policy(
-            &policy,
-            shared::PaneKind::Terminal,
-            Provider::Claude,
-            None,
-        ));
-    }
-
-    /// Team availability is the switch that stops a running team, not a
-    /// catalogue entry — without it a disabled team comes back a pane at a time.
-    #[test]
-    fn a_managed_pane_still_needs_team_mode_to_relaunch() {
-        let policy = Arc::new(Mutex::new(Some(shared::EffectiveProjectPolicy {
-            team_available: false,
-            allowed_launch_profiles: vec![],
-            version: 9,
-            project_suspended: false,
-        })));
-        assert!(!super::existing_pane_relaunch_allowed(&policy, true));
-        assert!(super::existing_pane_relaunch_allowed(&policy, false));
-
-        if let Ok(mut current) = policy.lock() {
-            if let Some(policy) = current.as_mut() {
-                policy.team_available = true;
-            }
-        }
-        assert!(super::existing_pane_relaunch_allowed(&policy, true));
-    }
-
-    /// Unlike creation, this does not fail closed. A policy that has not
-    /// arrived yet must not strand every existing pane; the pane is already
-    /// there either way.
-    #[test]
-    fn an_unmanaged_pane_relaunches_before_any_policy_arrives() {
-        let policy: super::ProjectPolicyState = Arc::new(Mutex::new(None));
-        assert!(super::existing_pane_relaunch_allowed(&policy, false));
-        assert!(!super::existing_pane_relaunch_allowed(&policy, true));
-    }
-
     /// The floor a fresh watch reports decides whether a pane can adopt a
     /// conversation that was already on disk. It used to be the epoch whenever
     /// the pane's own transcript did not exist yet — which is every new pane,
@@ -8961,44 +7982,6 @@ Use a project-specific custom dispatch loop.";
     }
 
     #[test]
-    fn server_policy_checks_fail_closed_and_validate_team_profiles() {
-        let policy = Arc::new(Mutex::new(None));
-        assert!(!super::launch_allowed_by_server_policy(
-            &policy,
-            shared::PaneKind::Agent,
-            Provider::Codex,
-            None,
-        ));
-
-        *policy.lock().unwrap() = Some(shared::EffectiveProjectPolicy {
-            team_available: true,
-            allowed_launch_profiles: vec!["agent:codex:official:default".to_string()],
-            version: 8,
-            project_suspended: false,
-        });
-        assert!(super::launch_allowed_by_server_policy(
-            &policy,
-            shared::PaneKind::Agent,
-            Provider::Codex,
-            None,
-        ));
-        assert!(!super::launch_allowed_by_server_policy(
-            &policy,
-            shared::PaneKind::Agent,
-            Provider::Claude,
-            None,
-        ));
-        let codex = shared::TeamRoleSpec {
-            provider: Some(Provider::Codex),
-            model: None,
-        };
-        assert!(super::team_allowed_by_server_policy(&policy, &[&codex]));
-
-        policy.lock().unwrap().as_mut().unwrap().team_available = false;
-        assert!(!super::team_allowed_by_server_policy(&policy, &[&codex]));
-    }
-
-    #[test]
     fn team_mode_is_off_for_a_project_whose_apas_predates_the_flag() {
         // The upgrade path. `.apas` files in the wild have no `team_enabled`,
         // and absent must read as off — team mode spawns autonomous panes that
@@ -9025,43 +8008,6 @@ Use a project-specific custom dispatch loop.";
         // defaulting rather than the whole file failing to parse.
         assert!(meta.auto_approve_todos);
         assert!(meta.auto_merge_prs);
-    }
-
-    #[test]
-    fn stopping_the_team_pauses_managed_deadloops_and_leaves_side_chats_alone() {
-        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
-        let pane_pauses: PanePauses = Arc::new(Mutex::new(HashMap::new()));
-        let panes = [
-            (11u32, "Tech Lead", shared::PaneMode::Deadloop, true),
-            (12, "Developer", shared::PaneMode::Deadloop, true),
-            (13, "Manager", shared::PaneMode::Interactive, true),
-            // A user's own side chat. Turning team mode off must not touch it.
-            (14, "Scratch", shared::PaneMode::Deadloop, false),
-        ];
-        {
-            let mut metas = pane_metas.lock().unwrap();
-            let mut pauses = pane_pauses.lock().unwrap();
-            for (id, label, mode, managed) in panes {
-                metas.insert(id, test_team_pane_meta(label, "role", mode, managed));
-                pauses.insert(id, Arc::new(AtomicBool::new(false)));
-            }
-        }
-
-        let stopped = super::stop_managed_team(&pane_metas, &pane_pauses);
-
-        assert_eq!(stopped, 3, "only the three managed panes count");
-        let pauses = pane_pauses.lock().unwrap();
-        let paused = |id: u32| pauses.get(&id).unwrap().load(Ordering::SeqCst);
-        assert!(paused(11), "managed deadloop must be paused");
-        assert!(paused(12), "managed deadloop must be paused");
-        assert!(
-            !paused(13),
-            "interactive panes have no loop to pause — interrupt only"
-        );
-        assert!(
-            !paused(14),
-            "an unmanaged side chat is not part of the team"
-        );
     }
 
     // --- closing a pane must not leave the agent's subtree running ---------
@@ -9523,7 +8469,7 @@ fn run_deadloop_session_inner(
             status: Some("Thinking...".to_string()),
         });
 
-        let (mut args, using_resume) = build_deadloop_agent_args(
+        let (args, using_resume) = build_deadloop_agent_args(
             provider,
             &claude_session_id,
             iteration_prompt,
@@ -9604,18 +8550,6 @@ fn run_deadloop_session_inner(
             }
         };
 
-        // Point this pane at its own `apas mcp-server` child so team-mode
-        // work goes through typed tools instead of hand-rolled JSONL + jq.
-        // NOTE: the server is given the PROJECT root, not `effective_dir` —
-        // a pane running in an isolated worktree still has to read and write
-        // the project's team-todo.md / .apas-team.jsonl, which do not exist
-        // inside the worktree.
-        args.extend(crate::mcp::mcp_server_flags(
-            provider,
-            &crate::update::resolve_preferred_apas_executable().to_string_lossy(),
-            working_dir,
-            pane_id,
-        ));
 
         let mut command = Command::new(binary_path);
         command
@@ -10783,18 +9717,6 @@ fn run_pane_session_streaming(
         // on one session would interleave writes to the .jsonl.
         kill_processes_using_session(&claude_session_id.to_string());
 
-        // Point this pane at its own `apas mcp-server` child so team-mode
-        // work goes through typed tools instead of hand-rolled JSONL + jq.
-        // NOTE: the server is given the PROJECT root, not `effective_dir` —
-        // a pane running in an isolated worktree still has to read and write
-        // the project's team-todo.md / .apas-team.jsonl, which do not exist
-        // inside the worktree.
-        args.extend(crate::mcp::mcp_server_flags(
-            provider,
-            &crate::update::resolve_preferred_apas_executable().to_string_lossy(),
-            working_dir,
-            pane_id,
-        ));
 
         let mut command = Command::new(binary_path);
         command
@@ -11883,7 +10805,7 @@ fn run_pane_session(
             });
         }
 
-        let (mut args, using_resume) = build_agent_args(
+        let (args, using_resume) = build_agent_args(
             provider,
             &claude_session_id,
             &prompt,
@@ -11929,18 +10851,6 @@ fn run_pane_session(
         // Mirrors the deadloop spawn path.
         kill_processes_using_session(&claude_session_id.to_string());
 
-        // Point this pane at its own `apas mcp-server` child so team-mode
-        // work goes through typed tools instead of hand-rolled JSONL + jq.
-        // NOTE: the server is given the PROJECT root, not `effective_dir` —
-        // a pane running in an isolated worktree still has to read and write
-        // the project's team-todo.md / .apas-team.jsonl, which do not exist
-        // inside the worktree.
-        args.extend(crate::mcp::mcp_server_flags(
-            provider,
-            &crate::update::resolve_preferred_apas_executable().to_string_lossy(),
-            working_dir,
-            pane_id,
-        ));
 
         let mut command = Command::new(binary_path);
         command
@@ -12917,29 +11827,6 @@ async fn run_server_connection(
                                                         pane_id: 0,
                                                     });
                                                 }
-                                                if !policy.team_available {
-                                                    let stopped = stop_managed_team(
-                                                        &pane_metas,
-                                                        &pane_pauses,
-                                                    );
-                                                    if stopped > 0 {
-                                                        save_pane_configs(
-                                                            working_dir,
-                                                            &pane_sessions,
-                                                            &pane_metas,
-                                                            &pane_pauses,
-                                                            &pane_stop_requests,
-                                                        );
-                                                        let _ = status_tx.send(PaneOutput {
-                                                            text: format!(
-                                                                "[Cluster policy v{} disabled team mode; interrupted and paused {} managed pane(s)]",
-                                                                policy.version,
-                                                                stopped,
-                                                            ),
-                                                            pane_id: 0,
-                                                        });
-                                                    }
-                                                }
                                                 // Deliberately not announced.
                                                 // The message existed to
                                                 // explain a restriction that no
@@ -13304,10 +12191,7 @@ async fn run_server_connection(
                                                     .ok()
                                                     .and_then(|panes| panes.get(&target_pane).cloned())
                                                     .is_some_and(|pane| {
-                                                        existing_pane_relaunch_allowed(
-                                                            &project_policy,
-                                                            pane.managed,
-                                                        )
+                                                        existing_pane_relaunch_allowed()
                                                     });
                                                 if !allowed {
                                                     let _ = status_tx.send(PaneOutput {
@@ -13534,10 +12418,7 @@ async fn run_server_connection(
                                                     .await;
                                                     continue;
                                                 }
-                                                if !existing_pane_relaunch_allowed(
-                                                    &project_policy,
-                                                    meta.managed,
-                                                ) {
+                                                if !existing_pane_relaunch_allowed() {
                                                     let _ = status_tx.send(PaneOutput {
                                                         text: "[Reboot refused by the current cluster policy]".to_string(),
                                                         pane_id: target,
@@ -13647,44 +12528,6 @@ async fn run_server_connection(
                                                 if let Some(handle) = removed_terminal {
                                                     tracing::info!(pane_id = remove_id, "shutting down terminal pane");
                                                     handle.shutdown();
-                                                }
-                                                // Reset team-todo for this pane: drop its `## pane:<id>`
-                                                // section and, for any Global TODO that's now orphaned
-                                                // (no remaining worker subtasks across any pane), reset
-                                                // its status from in_progress / under_review back to
-                                                // approved so the Tech Lead re-expands and reassigns
-                                                // to a different pane next iteration. Globals where
-                                                // other workers still have subtasks keep their status
-                                                // — the multi-worker workflow continues with the
-                                                // remaining panes.
-                                                {
-                                                    let project_dir = std::path::Path::new(&working_dir);
-                                                    if let Ok(mut todo) = crate::team_todo::load(project_dir) {
-                                                        let orphaned = todo.remove_pane_subtasks(remove_id);
-                                                        for parent_id in &orphaned {
-                                                            if let Some(g) = todo.find_global_mut(parent_id) {
-                                                                if matches!(
-                                                                    g.status,
-                                                                    crate::team_todo::GlobalStatus::InProgress
-                                                                        | crate::team_todo::GlobalStatus::UnderReview
-                                                                ) {
-                                                                    tracing::info!(
-                                                                        pane_id = remove_id,
-                                                                        todo = %parent_id,
-                                                                        old_status = ?g.status,
-                                                                        "resetting orphaned Global to approved after worker pane removal"
-                                                                    );
-                                                                    g.status = crate::team_todo::GlobalStatus::Approved;
-                                                                }
-                                                            }
-                                                        }
-                                                        if let Err(e) = crate::team_todo::save(project_dir, &todo) {
-                                                            tracing::warn!(
-                                                                "Failed to save team-todo.md after pane {} removal: {}",
-                                                                remove_id, e
-                                                            );
-                                                        }
-                                                    }
                                                 }
                                                 // Delegate to TUI event handler
                                                 let _ = tui_event_tx.send(TuiEvent::CloseTab {
@@ -14802,195 +13645,6 @@ async fn run_server_connection(
                                                     }
                                                 }
                                             }
-                                            ServerToCli::FetchTeamTodo { session_id: _ } => {
-                                                let project_dir = std::path::Path::new(&working_dir);
-                                                let todo = crate::team_todo::load(project_dir)
-                                                    .unwrap_or_default();
-                                                let state_msg = crate::team_todo::to_wire_with_cursors(&todo, project_dir);
-                                                let msg = CliToServer::TeamTodoState {
-                                                    session_id,
-                                                    state: state_msg,
-                                                };
-                                                if let Ok(text) = serde_json::to_string(&msg) {
-                                                    let _ = ws_sender
-                                                        .send(Message::Text(text.into()))
-                                                        .await;
-                                                }
-                                            }
-                                            ServerToCli::TodoApproval { session_id: _, todo_id, action } => {
-                                                let project_dir = std::path::Path::new(&working_dir);
-                                                match crate::team_todo::load(project_dir) {
-                                                    Ok(mut todo) => {
-                                                        match crate::team_todo::apply_todo_approval(
-                                                            &mut todo,
-                                                            &todo_id,
-                                                            &action,
-                                                        ) {
-                                                            Ok(Some(_)) => {
-                                                                if let Err(e) = crate::team_todo::save(project_dir, &todo) {
-                                                                    tracing::warn!(
-                                                                        "Failed to save team-todo.md after approval: {}",
-                                                                        e
-                                                                    );
-                                                                }
-                                                            }
-                                                            Ok(None) => {
-                                                                tracing::warn!(
-                                                                    "Approval for unknown TODO id: {}",
-                                                                    todo_id
-                                                                );
-                                                            }
-                                                            Err(e) => tracing::warn!(
-                                                                "Invalid todo approval for {}: {}",
-                                                                todo_id,
-                                                                e
-                                                            ),
-                                                        }
-                                                    }
-                                                    Err(e) => tracing::warn!(
-                                                        "Failed to load team-todo.md for approval: {}",
-                                                        e
-                                                    ),
-                                                }
-                                                // Republish fresh state regardless of success so the
-                                                // web sees the result (or the unchanged state if the
-                                                // action was rejected).
-                                                let todo = crate::team_todo::load(project_dir).unwrap_or_default();
-                                                let state_msg = crate::team_todo::to_wire_with_cursors(&todo, project_dir);
-                                                let msg = CliToServer::TeamTodoState {
-                                                    session_id,
-                                                    state: state_msg,
-                                                };
-                                                if let Ok(text) = serde_json::to_string(&msg) {
-                                                    let _ = ws_sender
-                                                        .send(Message::Text(text.into()))
-                                                        .await;
-                                                }
-                                            }
-                                            ServerToCli::AddTodo { session_id: _, title, body } => {
-                                                let project_dir = std::path::Path::new(&working_dir);
-                                                match crate::team_todo::load(project_dir) {
-                                                    Ok(mut todo) => {
-                                                        let added = crate::team_todo::add_user_todo(
-                                                            &mut todo,
-                                                            &title,
-                                                            body,
-                                                        );
-                                                        if added.is_some() {
-                                                            if let Err(e) = crate::team_todo::save(project_dir, &todo) {
-                                                                tracing::warn!("Failed to save team-todo.md after AddTodo: {}", e);
-                                                            }
-                                                        } else {
-                                                            tracing::warn!("AddTodo: empty title; skipping");
-                                                        }
-                                                    }
-                                                    Err(e) => tracing::warn!(
-                                                        "Failed to load team-todo.md for AddTodo: {}",
-                                                        e
-                                                    ),
-                                                }
-                                                // Always push fresh state so the
-                                                // web sees the result (or unchanged
-                                                // state on the empty/error path).
-                                                let todo = crate::team_todo::load(std::path::Path::new(&working_dir)).unwrap_or_default();
-                                                let state_msg = crate::team_todo::to_wire_with_cursors(&todo, project_dir);
-                                                let msg = CliToServer::TeamTodoState {
-                                                    session_id,
-                                                    state: state_msg,
-                                                };
-                                                if let Ok(text) = serde_json::to_string(&msg) {
-                                                    let _ = ws_sender
-                                                        .send(Message::Text(text.into()))
-                                                        .await;
-                                                }
-                                            }
-                                            ServerToCli::PromotePaneToManaged { session_id: _, pane_id: promote_id } => {
-                                                let changed = promote_pane_to_managed(&pane_metas, promote_id);
-                                                if changed {
-                                                    save_pane_configs(
-                                                        &working_dir,
-                                                        &pane_sessions,
-                                                        &pane_metas,
-                                                        &pane_pauses,
-                                                        &pane_stop_requests,
-                                                    );
-                                                    // Broadcast fresh PaneList so the Overview moves
-                                                    // this pane from Unmanaged → Managed without a
-                                                    // full reload.
-                                                    let pane_list_msg = CliToServer::PaneList {
-                                                        session_id,
-                                                        panes: build_pane_list(
-                                                            &pane_metas,
-                                                            &input_channels,
-                                                            session_id,
-                                                            &pane_sessions,
-                                                            &pane_pauses,
-                                                            &pane_stop_requests,
-                                                        ),
-                                                    };
-                                                    if let Ok(text) = serde_json::to_string(&pane_list_msg) {
-                                                        let _ = ws_sender
-                                                            .send(Message::Text(text.into()))
-                                                            .await;
-                                                    }
-                                                    let hint = format!(
-                                                        "[Pane {} added to the team. Tech Lead may now delegate to it.]",
-                                                        promote_id,
-                                                    );
-                                                    let msg = CliToServer::Output {
-                                                        session_id,
-                                                        data: hint,
-                                                        output_type: shared::OutputType::System,
-                                                        pane_type: None,
-                                                        pane_id: Some(promote_id),
-                                                    };
-                                                    if let Ok(text) = serde_json::to_string(&msg) {
-                                                        let _ = ws_sender
-                                                            .send(Message::Text(text.into()))
-                                                            .await;
-                                                    }
-                                                }
-                                            }
-                                            ServerToCli::FetchSuggestedWorkers { session_id: _ } => {
-                                                let project_dir = std::path::Path::new(&working_dir);
-                                                let sw = crate::suggested_workers::load(project_dir)
-                                                    .unwrap_or_default();
-                                                let msg = CliToServer::SuggestedWorkersState {
-                                                    session_id,
-                                                    suggestions: crate::suggested_workers::to_wire(&sw),
-                                                };
-                                                if let Ok(text) = serde_json::to_string(&msg) {
-                                                    let _ = ws_sender
-                                                        .send(Message::Text(text.into()))
-                                                        .await;
-                                                }
-                                            }
-                                            ServerToCli::DismissSuggestion { session_id: _, suggestion_id } => {
-                                                let project_dir = std::path::Path::new(&working_dir);
-                                                let sw = match crate::suggested_workers::dismiss(
-                                                    project_dir,
-                                                    &suggestion_id,
-                                                ) {
-                                                    Ok(sw) => sw,
-                                                    Err(e) => {
-                                                        tracing::warn!(
-                                                            "Failed to dismiss suggestion from suggested-workers.md: {}",
-                                                            e
-                                                        );
-                                                        crate::suggested_workers::load(project_dir)
-                                                            .unwrap_or_default()
-                                                    }
-                                                };
-                                                let msg = CliToServer::SuggestedWorkersState {
-                                                    session_id,
-                                                    suggestions: crate::suggested_workers::to_wire(&sw),
-                                                };
-                                                if let Ok(text) = serde_json::to_string(&msg) {
-                                                    let _ = ws_sender
-                                                        .send(Message::Text(text.into()))
-                                                        .await;
-                                                }
-                                            }
                                             ServerToCli::RequestPaneDiff { session_id: _, pane_id: diff_pane_id } => {
                                                 // Look up the pane's worktree path. If unset, return a polite error
                                                 // so the web UI can render guidance instead of nothing.
@@ -15025,61 +13679,6 @@ async fn run_server_connection(
                                                         .send(Message::Text(text.into()))
                                                         .await;
                                                 }
-                                            }
-                                            ServerToCli::UpdateProjectGoal { session_id: _, goal } => {
-                                                let project_dir = std::path::Path::new(&working_dir).to_path_buf();
-                                                match crate::manager::write_project_goal(&project_dir, &goal) {
-                                                    Ok(()) => tracing::info!("project_goal.md updated ({} bytes)", goal.len()),
-                                                    Err(e) => tracing::warn!("failed to write project_goal.md: {}", e),
-                                                }
-                                            }
-                                            ServerToCli::StartTeam {
-                                                session_id: _,
-                                                manager,
-                                                tech_lead,
-                                                reviewer,
-                                                developer,
-                                            } => {
-                                                if [&manager, &tech_lead, &reviewer, &developer]
-                                                    .iter()
-                                                    .any(|role| {
-                                                        shared::is_retired_launch(
-                                                            role.provider.unwrap_or(Provider::Claude),
-                                                            role.model.as_deref(),
-                                                        )
-                                                    })
-                                                {
-                                                    tracing::warn!("Start team refused for retired provider");
-                                                    report_retired_launch_rejection(
-                                                        &status_tx,
-                                                        &mut ws_sender,
-                                                        session_id,
-                                                        0,
-                                                        "[Start team refused — unsupported provider has been retired]",
-                                                    )
-                                                    .await;
-                                                    continue;
-                                                }
-                                                if !team_allowed_by_server_policy(
-                                                    &project_policy,
-                                                    &[&manager, &tech_lead, &reviewer, &developer],
-                                                ) {
-                                                    tracing::warn!("Start team refused by cluster policy");
-                                                    let _ = status_tx.send(PaneOutput {
-                                                        text: "[Start team refused — the current cluster policy does not allow this team configuration]".to_string(),
-                                                        pane_id: 0,
-                                                    });
-                                                    continue;
-                                                }
-                                                tracing::info!("Start team requested from web — spawning missing roles");
-                                                spawn_missing_team_panes(
-                                                    &pane_metas,
-                                                    &tui_event_tx,
-                                                    &manager,
-                                                    &tech_lead,
-                                                    &reviewer,
-                                                    &developer,
-                                                );
                                             }
                                             ServerToCli::UpdateProjectFlags {
                                                 session_id: _,
