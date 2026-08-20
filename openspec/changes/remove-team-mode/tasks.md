@@ -23,7 +23,7 @@
 
 ## 4. Documentation and verification
 
-- [ ] 4.1 Rewrite the team-mode sections of `CLAUDE.md`, including the pane-kind note that exists because managed panes needed the structured stream
-- [ ] 4.2 Sync the affected spec and remove the team requirement
-- [ ] 4.3 Workspace tests and clippy clean; web lint, type-check and tests clean
+- [x] 4.1 Rewrite the team-mode sections of `CLAUDE.md`, including the pane-kind note that exists because managed panes needed the structured stream
+- [x] 4.2 Sync the affected spec and remove the team requirement
+- [x] 4.3 Workspace tests and clippy clean; web lint, type-check and tests clean
 - [ ] 4.4 Live: open a project that holds a stored managed pane and confirm it behaves as an ordinary pane

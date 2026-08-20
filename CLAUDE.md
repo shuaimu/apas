@@ -1,24 +1,35 @@
 # APAS - Autonomous Programming Agent System
 
-> Canonical team-mode contributor/agent runbook. Keep architecture, local
-> development, and team-role workflow guidance here. `agent.md` is a generated
-> pointer to this file; `claude.md` and `AGENTS.md` are deployment-only notes.
+> Canonical contributor/agent runbook. Keep architecture, local development,
+> and workflow guidance here. `agent.md` is a generated pointer to this file;
+> `claude.md` and `AGENTS.md` are deployment-only notes.
 
-APAS runs a local autonomous programming team around a project. The CLI owns
-local panes and worktrees, the server brokers project/session state, and the
-web UI exposes the Overview, Manager chat, Team TODO queue, pane tabs, and
-diff/PR handoff surfaces.
+APAS runs coding agents against a project, from a browser or a phone. The CLI
+owns local panes and worktrees, the server brokers project/session state, and
+the web UI exposes the pane tabs, conversation and terminal views, the project
+overview, and diff/PR handoff surfaces.
 
-The current v3 operating model has four managed roles:
+A project is a directory with an `.apas` file; the work happens in **panes**,
+each hosting one agent. A pane is created, talked to, rebooted and closed by a
+person — there is no orchestration layer above it.
 
-- **Manager** chats with the human and keeps `project_goal.md` current.
-- **Tech Lead** converts the project goal into approved work in
-  `team-todo.md`, dispatches developers/reviewers through
-  `.apas-team.jsonl`, and tracks worker-opened PRs.
-- **Developer** panes implement approved subtasks in isolated worktrees,
-  publish `kind: "diff"` records, and open PRs after Reviewer approval.
-- **Reviewer** panes evaluate worker diffs and publish `approves:<pane>` or
-  `rejects:<pane>` review records.
+**Managed team mode was removed.** Four roles (Manager, Tech Lead, Developer,
+Reviewer) used to coordinate through `project_goal.md`, `team-todo.md` and
+`.apas-team.jsonl`, dispatching work to each other through an MCP server. It was
+the largest feature in the CLI and, at removal, had zero managed panes anywhere
+in the deployment. What it cost everything else was a second way to run a
+provider: a second spawn path, its own status and review plumbing, and a policy
+field carried at three levels. If you find a reference to a team role, the
+scratchpad, the TODO queue or `apas mcp-server`, it is stale — say so rather
+than reviving it.
+
+Two things that look like team mode and are not:
+
+- **`role` / `goal` / `backstory` on a pane** — identity metadata anyone can set
+  from the role modal, composed into the pane's system prompt by
+  `pane_identity::compose_system_prompt`.
+- **The "Start bot" deadloop** — a pane repeating a prompt on an interval. It
+  predates team mode and outlives it.
 
 ## Architecture
 
@@ -41,11 +52,10 @@ The current v3 operating model has four managed roles:
 └─────────────────────┘
 ```
 
-The CLI keeps project-local files such as `.apas`, `project_goal.md`,
-`team-todo.md`, `.apas-team.jsonl`, and optional worker worktrees. The server
-caches and broadcasts machine, session, TODO, suggestion, and project-goal
-state. The web UI lets the human manage goals, approve proposed TODOs,
-inspect panes, and review PR links/status.
+The CLI keeps project-local state in `.apas`, plus optional per-pane worktrees.
+The server caches and broadcasts machine, session and pane state. The web UI
+lets a person open panes, talk to them, inspect their diffs, and hand off to a
+PR.
 
 ## Project Structure
 
@@ -57,14 +67,13 @@ apas/
 │   │   │   ├── main.rs        # CLI entry point and config commands
 │   │   │   ├── config.rs      # User/machine config and supported backend settings
 │   │   │   ├── project.rs     # .apas project metadata
-│   │   │   ├── role.rs        # Built-in Manager/Tech Lead/Developer/Reviewer prompts
-│   │   │   ├── team_todo.rs   # team-todo.md parsing/state helpers
-│   │   │   ├── manager.rs     # project_goal.md read/write helpers
+│   │   │   ├── pane_identity.rs # A pane's role/goal/backstory as a system prompt
+│   │   │   ├── claude_session_hook.rs # SessionStart hook: which transcript a pane writes
 │   │   │   ├── worktree.rs    # Isolated worktree creation/diff/cleanup
 │   │   │   ├── claude.rs      # Claude process wrapper
 │   │   │   ├── terminal_pane.rs # Pty host for kind:"terminal" panes (portable-pty)
 │   │   │   └── mode/
-│   │   │       ├── dual_pane.rs # Default managed panes, deadloops, team files
+│   │   │       ├── dual_pane.rs # Pane runtime: panes, deadloops, watchers
 │   │   │       ├── hybrid.rs    # Legacy single-pane local CLI + streaming
 │   │   │       ├── local.rs     # Offline mode
 │   │   │       └── remote.rs    # Remote-only mode
@@ -78,14 +87,14 @@ apas/
 │   │   │   ├── db/          # SQLite database
 │   │   │   ├── session/     # Session manager
 │   │   │   └── routes/
-│   │   │       ├── ws_cli.rs  # CLI WebSocket handler, project-goal/TODO replay
+│   │   │       ├── ws_cli.rs  # CLI WebSocket handler, pane/session replay
 │   │   │       └── ws_web.rs  # Web WebSocket handler, Overview/machine actions
 │   │   └── Cargo.toml
 │   │
 │   └── shared/          # Shared types between CLI and server
 │       ├── src/
 │       │   ├── lib.rs
-│       │   └── messages.rs  # Shared WebSocket/team/machine message types
+│       │   └── messages.rs  # Shared WebSocket/machine message types
 │       └── Cargo.toml
 │
 ├── packages/
@@ -104,7 +113,7 @@ apas/
 │       │   └── lib/
 │       │       ├── store.ts          # Zustand state, WebSocket message handling
 │       │       ├── terminalBus.ts    # Pty frame fan-out (deliberately NOT zustand)
-│       │       └── roleTemplates.ts  # Web-spawned managed-role prompt templates
+│       │       └── mobileSelectedPane.ts # Which pane a session screen opens on
 │       └── package.json
 │
 ├── data/                # Runtime data (created at runtime)
@@ -187,29 +196,9 @@ pane state:
   "id": "uuid",
   "name": "project-name",
   "created_at": "2024-01-01T00:00:00Z",
-  "team_enabled": false,
   "auto_approve_todos": false,
   "auto_merge_prs": false,
   "panes": [
-    {
-      "pane_id": 151,
-      "role": "team manager",
-      "mode": "interactive",
-      "managed": true
-    },
-    {
-      "pane_id": 178,
-      "role": "tech lead",
-      "mode": "deadloop",
-      "managed": true
-    },
-    {
-      "pane_id": 568,
-      "role": "developer",
-      "mode": "deadloop",
-      "managed": true,
-      "worktree_path": null
-    },
     {
       "pane_id": 440,
       "role": null,
@@ -239,23 +228,25 @@ representable at all. It is now gated on the legacy `deadloop_claude_session_id`
 / `interactive_claude_session_id` fields actually being present, which is what
 distinguishes a pre-`panes` file from a new project.
 
-`team_enabled`, `auto_approve_todos`, `auto_merge_prs`, and
-`disallowed_tab_types` are project-level policy flags. `team_enabled` gates
-managed team mode entirely (see "Team mode is opt-in" below);
-`disallowed_tab_types` restricts which tab types users may create (see "Tab-type
-policy"); the other two are read by the Tech Lead loop. All are settable by the
-project owner or the operator of the cluster hosting it. Managed pane entries are restored as team roles; new unmanaged
-work is created as a terminal pane. `kind` defaults to `"agent"` when absent
-solely for compatibility, so `.apas` files written before terminal panes
-existed keep loading unchanged — see "Terminal panes" under Key Concepts.
+`auto_approve_todos`, `auto_merge_prs` and `disallowed_tab_types` are
+project-level policy flags, settable by the project owner or the operator of the
+cluster hosting it. `disallowed_tab_types` restricts which tab types users may
+create (see "Tab-type policy"); the other two were read by the team loop and are
+now inert, kept so an older `.apas` still parses.
+
+New work is created as a terminal pane. `kind` defaults to `"agent"` when absent
+solely for compatibility, so `.apas` files written before terminal panes existed
+keep loading unchanged — see "Terminal panes" under Key Concepts. A `.apas` may
+also still carry `team_enabled`, a `role` like `"team manager"`, or
+`managed: true`; all three are ignored, and such a pane loads as an ordinary
+pane.
 
 ## Message Types
 
 Key message types in `crates/shared/src/messages.rs`:
 
 - **CliToServer**: Register, SessionStart, StreamMessage, UserInput,
-  Heartbeat, ProjectGoalChanged, ProjectFlagsChanged, TeamTodoChanged,
-  SuggestedWorkersChanged, TerminalOutput, TerminalExited, machine
+  Heartbeat, ProjectFlagsChanged, TerminalOutput, TerminalExited, machine
   config/status updates.
 - **ServerToCli**: Registered, SessionAssigned, Input, Signal,
   UpdateProjectGoal, UpdateProjectFlags, TodoApproval, AddTodo,
@@ -265,17 +256,15 @@ Key message types in `crates/shared/src/messages.rs`:
   TerminalInput, TerminalResize, TerminalAttach, machine/provider config
   actions.
 - **ServerToWeb**: Authenticated, CliClients, SessionMessages, StreamMessage,
-  UserInput, ProjectGoalChanged, ProjectFlagsChanged, TeamTodoChanged,
-  SuggestedWorkersChanged, Machines, PaneDiff, TerminalOutput,
+  UserInput, ProjectFlagsChanged, Machines, PaneDiff, TerminalOutput,
   TerminalSnapshot, TerminalExited.
 
 The `Terminal*` family is the pty byte channel for `kind: "terminal"` panes and
 is deliberately separate from `Output` / `StreamMessage` — see "Terminal panes"
 under Key Concepts for why.
 
-`WebToServer::UpdateProjectFlags` carries the project policy flags
-(`team_enabled`, `auto_approve_todos`, `auto_merge_prs`) from the web to the
-server. The server **rejects the whole message from anyone who is neither the
+`WebToServer::UpdateProjectFlags` carries the project policy flags from the web
+to the server. The server **rejects the whole message from anyone who is neither the
 project owner nor the operator of the cluster hosting it**
 (`ws_web::can_manage_project_settings`) — this is the only authority gate in the
 WebSocket layer, everything else there authorizes on session *access* alone.
@@ -283,38 +272,18 @@ It then forwards `ServerToCli::UpdateProjectFlags` to the CLI for `.apas`
 persistence; the CLI emits `CliToServer::ProjectFlagsChanged`, and the server
 broadcasts `ServerToWeb::ProjectFlagsChanged`. The CLI also re-broadcasts the
 flags from `.apas` every 5s, so a web client attaching mid-session hydrates
-without asking. Behavioral safeguards for the autonomy flags are documented in
-the role prompts and README.
+without asking.
 
 ## Data Storage
 
 - **SQLite** (`data/apas.db`): Users, CLI clients, sessions metadata
 - **JSONL files** (`data/sessions/{id}/messages.jsonl`): Chat messages per session
-- **Project files** (`project_goal.md`, `team-todo.md`, `.apas-team.jsonl`):
-  team-mode goal, work queue, and append-only cross-pane scratchpad
-- **Worktrees** (`.apas-worktrees/pane-<id>/`): isolated branches for managed
-  Developer panes
+- **Worktrees** (`.apas-worktrees/pane-<id>/`): isolated branches for a pane
+  working in isolation
 
-## Team-mode Operations
-
-The v3 team loop is driven by project-local files:
-
-- `project_goal.md` is the high-level goal. The Manager updates it from human
-  chat, and the Tech Lead reads it before proposing work.
-- `team-todo.md` contains Global TODOs plus per-pane subtasks. Tech-Lead
-  proposals start as `status: proposed, origin: tech-lead`; the human
-  approves/rejects them in the Overview Team TODO panel.
-- `.apas-team.jsonl` is the append-only scratchpad. Tech Lead uses
-  `kind: "delegation"` with `delegate-to:<pane>` and `task:TODO-NNN` tags;
-  Developers publish `kind: "diff"`; Reviewers publish `kind: "review"` with
-  `approves:<pane>` or `rejects:<pane>`; Developers publish
-  `kind: "decision"` with `pr-opened` after opening a PR.
-- Worker PRs are opened by the Developer pane after Reviewer approval. The
-  human merges or closes the PR; Tech Lead tracks PR state and dispatches PR
-  comments back to the owning Developer.
-
-For contributor work, keep task scopes narrow. If a TODO says docs-only or
-names specific files, do not combine it with adjacent team-mode cleanup.
+A project that predates the team-mode removal may still hold `project_goal.md`,
+`team-todo.md` and `.apas-team.jsonl` on disk. Nothing reads or writes them —
+they are left alone rather than deleted, because they are the user's files.
 
 ## Development
 
@@ -486,22 +455,17 @@ vulnerable dependency graph; follow it with a corrected patched deployment.
 
 ## Key Concepts
 
-1. **Managed Team Mode** (opt-in, off by default): Manager, Tech Lead,
-   Developer, and Reviewer panes coordinate through `project_goal.md`,
-   `team-todo.md`, and `.apas-team.jsonl`. Gated on `team_enabled` — see
-   "Team mode is opt-in" below.
-2. **Dual-Pane Runtime**: The CLI restores panes from `.apas`, runs deadloop
-   or interactive processes, and can isolate Developer panes in git
-   worktrees.
-3. **Hybrid Mode** (legacy): Single pane with local terminal + streaming.
-4. **Project-based Sessions**: Sessions are identified by project directory
+1. **Pane Runtime**: The CLI restores panes from `.apas`, runs deadloop or
+   interactive processes, and can isolate a pane in a git worktree.
+2. **Hybrid Mode** (legacy): Single pane with local terminal + streaming.
+3. **Project-based Sessions**: Sessions are identified by project directory
    and `.apas` project metadata.
-5. **Stream-JSON**: Uses Claude CLI's `--output-format stream-json` for
+4. **Stream-JSON**: Uses Claude CLI's `--output-format stream-json` for
    structured Claude output; other providers are bridged through their own
    runtime paths.
-6. **Real-time Updates**: WebSocket connections broadcast live messages,
-   project-goal changes, Team TODO state, machine config, and pane diffs.
-7. **Pane kinds**: `PaneConfig.kind` picks how a pane hosts its agent, and
+5. **Real-time Updates**: WebSocket connections broadcast live messages,
+   machine config, and pane diffs.
+6. **Pane kinds**: `PaneConfig.kind` picks how a pane hosts its agent, and
    is orthogonal to `provider` (which binary) and `mode` (how autonomous).
    See "Terminal panes" below.
 
@@ -527,14 +491,10 @@ agree; a test in `shared` reads the TS file and asserts they do.
 
 Enforced in the CLI (`tab_type_allowed_for`), which re-reads `.apas` on every
 `AddPane` — the web only hides menu entries, and the same message can arrive
-from a stale browser tab whose menu predates the restriction. Unlike
-`team_enabled_for`, this fails **open** on an unreadable `.apas`: the worst case
+from a stale browser tab whose menu predates the restriction. It fails **open**
+on an unreadable `.apas`: the worst case
 is a tab an owner meant to block, whereas failing closed would lock everyone out
 of the project entirely.
-
-**Managed team panes are exempt.** The Tech Lead spawns those from role
-templates, and an owner restricting *user* tab types has not asked to break
-their own team.
 
 ## Virtual clusters and system administration
 
@@ -596,11 +556,11 @@ a widening write is rejected rather than silently clamped. It intersects over
 the foreign-owned projects on your machines; intersection is order-independent,
 so a multi-hosted project still has one answer.
 
-`team_available` is the exception and does **not** narrow: the lowest level
-that states a value wins. Its deployment default ships `false`, and team mode
-has always been switched on per project against that default — folding it with
-AND would have stripped team mode from every project that runs it today. Only
-the allowlist is a genuine ceiling, so only it is enforced as one.
+`team_available` is **vestigial**. It is still on the wire and in stored policy
+so web and mobile builds that predate the team-mode removal keep parsing what
+they are sent — the same reason `cluster_role` survives — and it decides
+nothing. Do not reintroduce a read of it; a test asserts a policy carrying it
+behaves exactly like one without it.
 
 **Audit carries an actor kind and a cluster.** `admin_audit_events` was rebuilt
 once (create-copy-drop-rename, guarded by `schema_migrations`) because
@@ -611,44 +571,6 @@ system-administrator membership change is attributed there to the project owner
 while the audit row records who actually did it. An operator's audit view also
 applies the live hosting predicate, so a project hosted in several clusters is
 visible to each of them and pre-attribution rows still land where they belong.
-
-## Team mode is opt-in (`team_enabled`)
-
-Managed team mode is **off for every project** until someone turns it on, and
-only a project's **owner** or the operator of the virtual cluster hosting it can
-turn it on or off. Users the project was shared with can work in it but cannot
-change this.
-
-Why off by default: enabling team mode spawns four autonomous panes that read
-the repo, write worktrees, and open PRs. That should never be something a
-project arrives with — it should be a decision someone made.
-
-The flag lives in `.apas` as `team_enabled` and is `#[serde(default)]`, so a
-`.apas` written before the field existed reads as **off**. Upgrading therefore
-switches team mode off on existing projects too; their panes are untouched but
-the team surfaces disappear until an owner opts back in. That is deliberate, not
-a migration gap.
-
-Three enforcement points, because each covers a different failure:
-
-- **Server** (`ws_web::can_manage_project_settings`) — the actual permission
-  check. Reuses `share::ProjectRole::can_manage_access` rather than re-deriving
-  the owner boundary, so the WS and HTTP paths cannot drift, then falls through
-  to `db::project_in_user_cluster` so the hosting cluster's operator qualifies
-  too. Fails closed on an unknown user or a failed lookup.
-- **CLI** (`team_enabled_for`) — refuses `ServerToCli::StartTeam` while the flag
-  is false, re-reading `.apas` at the point of use. `.apas` is the source of
-  truth, and a cached `true` would let a `StartTeam` that raced the toggle spawn
-  the panes an owner just disabled. Also fails closed on an unreadable `.apas`.
-- **Web** (`lib/projectRole.ts`) — decides what to render, nothing more. Hides
-  the team surfaces and renders the settings read-only for a plain user.
-
-Turning team mode **off stops a running team**: the CLI's `stop_managed_team`
-pauses every managed deadloop and interrupts every managed pane's in-flight
-turn, the same end state as the Overview's "Stop team" button. It pauses before
-interrupting, where the web does the reverse — between an interrupt and the
-pause landing, a sibling pane's write can wake the loop for one more iteration.
-Unmanaged side chats are never touched.
 
 ## Projects run inside the one instance
 
@@ -970,44 +892,6 @@ or web change at all. A turn carrying token counts emits a second `Result`
 message, because `ws_cli` reads usage only from `extra.usage` on that variant;
 `total_cost_usd` stays 0 because the transcript reports tokens, not price.
 
-## Team-mode MCP server (`apas mcp-server`)
-
-Phase 3.1 shipped delegation as `.apas-team.jsonl` tag conventions driven from
-bash (see `docs/dev/3.1-delegation-via-scratchpad.md`, which left the MCP path
-open as a follow-up). That follow-up is now in: `crates/client-cli/src/mcp.rs`
-exposes the same protocol as typed MCP tools.
-
-**The scratchpad file is still the source of truth.** Every tool writes through
-`scratchpad` / `team_todo` / `manager` and lands on disk in the shape it always
-had — so the CLI's watcher still *observes* writes rather than trusting agents
-to self-report, delegations stay visible in the Overview scratchpad, and team state
-survives a machine loss (after the 2026-08-02 NFS crash the scratchpad was the
-only durable artifact of it — the server persists none of this).
-
-Tools: `publish_record`, `delegate`, `read_records`, `read_team_todo`,
-`propose_todo`, `update_todo_status`, `read_project_goal`,
-`write_project_goal`, `list_panes`. Schemas are derived from Rust argument
-structs via `schemars`, so the advertised schema cannot drift from the code.
-
-**One server per pane.** The CLI spawns `apas mcp-server --project-dir <root>
---pane-id <n>` as a stdio child of each pane, so `pane_id` is stamped
-server-side: an agent can neither publish as another pane nor forget to
-identify itself. Note `--project-dir` is the **project root**, never a pane's
-worktree — worktrees contain no `team-todo.md` / `.apas-team.jsonl`.
-
-Provider wiring reuses existing channels: Claude and DeepSeek use
-`--mcp-config`; Codex uses `-c mcp_servers.apas.*`, the same `-c` override that
-already carries `model_reasoning_effort`. OpenCode/Cursor Agent get no flags —
-unverified, and a bad flag breaks the spawn outright.
-
-**Concurrency.** `team-todo.md` mutations are a load → mutate → save cycle, and
-every pane runs its own server process (rmcp also serves calls concurrently
-within one). Without a lock, two panes mutating at the same instant both read
-the old file and the second save silently discards the first — a lost update
-with no error either side, reproducible on the first concurrent call. All
-mutating tools therefore hold an advisory `flock` on `.apas-team.lock` for the
-whole cycle; it releases on fd close, so a killed pane cannot wedge the project.
-
 ## Terminal panes (`kind: "terminal"`)
 
 New user-created Claude, Codex, and OpenCode work uses `kind: "terminal"`. The structured
@@ -1036,15 +920,14 @@ explicit cluster/project allowlists remain opt-in and must add
 
 The desktop tab bar, mobile browser pane picker, native mobile task launcher,
 server authorization, and CLI local add-tab path all enforce this boundary.
-Existing unmanaged agent panes can still run, receive messages, switch models,
-and reboot; creating another one is rejected. Managed team panes continue to
-use `agent` because delegation, diffs, plan review, and status depend on its
-structured stream.
+Existing agent panes can still run, receive messages, switch models and reboot;
+creating another one is rejected. Nothing creates one any more — managed team
+roles were the last thing that did, and they are gone with team mode.
 
-**What terminal panes deliberately do not get.** Every other team-mode
-integration is built on stream-json events, so a terminal pane still has no
-pane status, no `PaneDiff`, and no plan review. It is never a Tech Lead
-delegation target and is forced `managed: false`.
+**What terminal panes do not get.** Pane status and plan review are built on
+stream-json events, so a terminal pane has neither. `PaneDiff` is *not* in that
+list despite the pane-kind boundary suggesting it should be: it is computed from
+git by `compute_pane_diff`, so it works for any pane with a worktree.
 
 **Conversation history and usage** are recovered by reading the provider's
 own transcript — see below.
