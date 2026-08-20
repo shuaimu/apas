@@ -1616,7 +1616,6 @@ type PaneMetas = Arc<Mutex<HashMap<u32, PaneMeta>>>;
 
 const ASK_USER_QUESTION_AUTO_CANCEL_STATUS: &str =
     "[Pending question auto-cancelled: new message replaces it]";
-const MANAGED_PANE_CREATE_PR_ERROR: &str = "Managed team panes open PRs through the Reviewer-approved Team TODO flow; manual PR creation is disabled for this pane.";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CancelledAskUserQuestion {
@@ -1700,7 +1699,6 @@ fn manual_create_pr_worktree_path(
 ) -> Result<Option<String>, String> {
     let metas = pane_metas.lock().unwrap();
     match metas.get(&target_pane) {
-        Some(meta) if meta.managed => Err(MANAGED_PANE_CREATE_PR_ERROR.to_string()),
         Some(meta) => Ok(meta.worktree_path.clone()),
         None => Ok(None),
     }
@@ -1780,102 +1778,6 @@ async fn run_inner(
     // and will be reported as noncompliant rather than terminated.
     let project_policy: ProjectPolicyState = Arc::new(Mutex::new(None));
 
-    // Deliberately no "ensure at least one pane" fallback. A project with no
-    // panes stays empty: the CLI connects, the daemon can manage it, and the
-    // user opens whatever they want from the web. Seeding a Claude pane here
-    // meant every newly launched project immediately spawned an agent process
-    // nobody had asked for.
-    // One-time migration: panes saved before the `managed` field existed
-    // deserialize as `managed: false`. Auto-promote orchestrator roles so
-    // existing Manager / Tech Lead / Reviewer panes appear in the Team box
-    // (and don't get duplicated by the auto-spawn check below).
-    for pane in metadata.panes.iter_mut() {
-        if !pane.managed {
-            let lower = pane.role.as_deref().unwrap_or("").to_ascii_lowercase();
-            if lower.contains("manager")
-                || lower.contains("tech lead")
-                || lower.contains("reviewer")
-            {
-                pane.managed = true;
-            }
-        }
-    }
-    // One-time dedup: an earlier version of the auto-spawn (before the
-    // managed-flag migration landed) could leave duplicate orchestrators
-    // — e.g. the legacy Manager came up `managed: false`, so the auto-
-    // spawn check fired and produced a second Manager. Now both have
-    // `managed: true` and the Overview's Team box shows two of each.
-    // Keep the lowest-pane_id instance per role (almost always the
-    // original) and demote the rest to `managed: false` so they land in
-    // Side chats — that way the user can review their state and remove
-    // them via the web UI rather than us silently deleting history.
-    {
-        let mut sorted: Vec<u32> = metadata.panes.iter().map(|p| p.pane_id).collect();
-        sorted.sort_unstable();
-        let mut kept_manager: Option<u32> = None;
-        let mut kept_tech_lead: Option<u32> = None;
-        let mut kept_reviewer: Option<u32> = None;
-        for pid in &sorted {
-            if let Some(p) = metadata.panes.iter().find(|p| p.pane_id == *pid) {
-                if !p.managed {
-                    continue;
-                }
-                let lower = p.role.as_deref().unwrap_or("").to_ascii_lowercase();
-                if lower.contains("tech lead") {
-                    kept_tech_lead.get_or_insert(p.pane_id);
-                } else if lower.contains("manager") {
-                    kept_manager.get_or_insert(p.pane_id);
-                } else if lower.contains("reviewer") {
-                    kept_reviewer.get_or_insert(p.pane_id);
-                }
-            }
-        }
-        for pane in metadata.panes.iter_mut() {
-            if !pane.managed {
-                continue;
-            }
-            let lower = pane.role.as_deref().unwrap_or("").to_ascii_lowercase();
-            let keep = if lower.contains("tech lead") {
-                kept_tech_lead == Some(pane.pane_id)
-            } else if lower.contains("manager") {
-                kept_manager == Some(pane.pane_id)
-            } else if lower.contains("reviewer") {
-                kept_reviewer == Some(pane.pane_id)
-            } else {
-                true
-            };
-            if !keep {
-                tracing::warn!(
-                    pane_id = pane.pane_id,
-                    role = ?pane.role,
-                    "demoting duplicate orchestrator to side chat (managed=false)"
-                );
-                pane.managed = false;
-            }
-        }
-    }
-    // Force max effort for every managed Claude pane on each boot. The
-    // user wants team members (Manager / Tech Lead / Reviewer / accepted
-    // suggested workers) to always think at the highest level when
-    // running official Claude. Re-asserting on every boot also recovers
-    // any pane that was downgraded by hand or by an older binary.
-    // `ultracode` is an accepted alternative baseline (xhigh + workflow
-    // prefix) — don't clobber an explicit user choice back to max.
-    // Non-Claude providers don't have an --effort knob so we leave them
-    // alone.
-    for pane in metadata.panes.iter_mut() {
-        if pane.managed
-            && matches!(pane.provider, shared::Provider::Claude)
-            && !matches!(pane.effort.as_deref(), Some("max") | Some("ultracode"))
-        {
-            tracing::info!(
-                pane_id = pane.pane_id,
-                old_effort = ?pane.effort,
-                "force-setting managed Claude pane to effort=max on boot"
-            );
-            pane.effort = Some("max".to_string());
-        }
-    }
     save_project(working_dir, &metadata)?;
 
     let configured_terminal_panes = metadata
@@ -3301,17 +3203,11 @@ fn handle_tui_events(
                 }
                 let label =
                     pane_label_or_default(Some(&requested_label), pane_id, model.as_deref());
-                // Managed Claude panes default to max effort — the team
-                // (Manager / Tech Lead / Reviewer / accepted suggested
-                // workers) should always think hard. Caller-supplied
-                // effort still wins if it was set explicitly.
-                let normalized_effort = match normalize_effort_level(effort.as_deref()) {
-                    Some(e) => Some(e),
-                    None if managed && matches!(provider, shared::Provider::Claude) => {
-                        Some("max".to_string())
-                    }
-                    None => None,
-                };
+                // Effort is whatever the caller asked for. Managed Claude
+                // panes used to default to max because a team should think
+                // hard; there is no team, and a pane an older `.apas` marked
+                // managed must not quietly cost more than the one beside it.
+                let normalized_effort = normalize_effort_level(effort.as_deref());
                 // Track claude session and metadata for this pane
                 {
                     let mut ps = pane_sessions.lock().unwrap();
@@ -5216,7 +5112,7 @@ mod tests {
         truncate_str_at_char_boundary, update_project_operations, DeadloopWatchdogDecision,
         DeadloopWatchdogState, InputChannels, PaneInputRouteResult, PaneMeta, PaneMetas,
         PanePauses, PaneStopRequests, PendingAskQuestion, ASK_USER_QUESTION_AUTO_CANCEL_STATUS,
-        DEEPSEEK_DEFAULT_MODEL, MANAGED_PANE_CREATE_PR_ERROR,
+        DEEPSEEK_DEFAULT_MODEL,
     };
     use crate::project::{get_or_create_project, save_project};
     use crate::terminal_pane::TerminalPanes;
@@ -5236,6 +5132,39 @@ mod tests {
         "Work on tasks defined in TODO.md.\n1. Analyze\n2. Implement\n3. Test";
     const WEB_PROVIDER_OPTIONS_TS: &str =
         include_str!("../../../../packages/web/src/lib/providerOptions.ts");
+
+    /// Loading a project must not *create* a managed pane. Two boot-time
+    /// migrations used to: one promoted any pane whose role mentioned
+    /// "manager", "tech lead" or "reviewer", and another demoted duplicates of
+    /// those roles. A person naming a pane "reviewer" in the role modal would
+    /// have had it silently marked managed.
+    #[test]
+    fn loading_a_project_never_marks_a_pane_managed() {
+        let dir = tempfile::tempdir().expect("temp project");
+        let mut metadata = get_or_create_project(dir.path()).expect("create project");
+        for (pane_id, role) in [(11, "reviewer"), (12, "tech lead"), (13, "team manager")] {
+            let mut pane = test_pane_config(
+                pane_id,
+                shared::PaneMode::Interactive,
+                false,
+                false,
+            );
+            pane.role = Some(role.to_string());
+            pane.managed = false;
+            metadata.panes.push(pane);
+        }
+        save_project(dir.path(), &metadata).expect("save project");
+
+        let reloaded = get_or_create_project(dir.path()).expect("reload project");
+        for pane in reloaded.panes.iter().filter(|p| p.pane_id >= 11) {
+            assert!(
+                !pane.managed,
+                "pane {} named {:?} must stay unmanaged",
+                pane.pane_id,
+                pane.role
+            );
+        }
+    }
 
     /// A project written while team mode existed still holds panes marked
     /// managed, with roles and built-in prompts. Nothing dispatches them now,
@@ -5643,17 +5572,21 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// A pane an older `.apas` marked managed used to be refused a PR, because
+    /// team workers opened their own after review. Nothing owns a pane on the
+    /// user's behalf now, so the flag decides nothing and the pane behaves like
+    /// any other.
     #[test]
-    fn manual_create_pr_rejects_managed_pane() {
+    fn manual_create_pr_treats_a_managed_pane_like_any_other() {
         let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
-        pane_metas.lock().unwrap().insert(
-            42,
-            test_pane_meta(Provider::Claude, true, None, Arc::new(Mutex::new(None))),
+        let mut meta = test_pane_meta(Provider::Claude, true, None, Arc::new(Mutex::new(None)));
+        meta.worktree_path = Some("/w/pane-42".to_string());
+        pane_metas.lock().unwrap().insert(42, meta);
+
+        assert_eq!(
+            manual_create_pr_worktree_path(&pane_metas, 42).unwrap(),
+            Some("/w/pane-42".to_string()),
         );
-
-        let err = manual_create_pr_worktree_path(&pane_metas, 42).unwrap_err();
-
-        assert_eq!(err, MANAGED_PANE_CREATE_PR_ERROR);
     }
 
     #[test]
@@ -12216,9 +12149,7 @@ async fn run_server_connection(
                                                     .await;
                                                     continue;
                                                 }
-                                                if !pane_config.managed
-                                                    && pane_config.kind == shared::PaneKind::Agent
-                                                {
+                                                if pane_config.kind == shared::PaneKind::Agent {
                                                     report_retired_launch_rejection(
                                                         &status_tx,
                                                         &mut ws_sender,
@@ -12865,12 +12796,11 @@ async fn run_server_connection(
                                                     .ok()
                                                     .and_then(|panes| panes.get(&target_pane).cloned())
                                                     .is_some_and(|pane| {
-                                                        (!pane.managed || project_policy
-                                                            .lock()
-                                                            .ok()
-                                                            .and_then(|policy| policy.clone())
-                                                            .is_some_and(|policy| policy.team_available))
-                                                            && launch_allowed_by_server_policy(
+                                                        // A model switch chooses a
+                                                        // profile, so the allowlist
+                                                        // governs it — and nothing
+                                                        // else does.
+                                                        launch_allowed_by_server_policy(
                                                             &project_policy,
                                                             pane.kind,
                                                             provider.unwrap_or(pane.provider),

@@ -234,6 +234,15 @@ cluster hosting it. `disallowed_tab_types` restricts which tab types users may
 create (see "Tab-type policy"); the other two were read by the team loop and are
 now inert, kept so an older `.apas` still parses.
 
+`managed: true` on a pane is likewise vestigial. It marked a pane as belonging
+to the managed team rather than to you, and it used to gate real behaviour:
+refusing PR creation, exempting the pane from the retired-agent-kind rule,
+forcing Claude panes to `effort: max`, and gating relaunch on team availability.
+Two boot-time migrations even *created* it, promoting any pane whose role
+mentioned "manager", "tech lead" or "reviewer" — so naming a pane "reviewer" in
+the role modal silently made it managed. None of that remains; a test asserts
+loading a project never marks a pane managed.
+
 New work is created as a terminal pane. `kind` defaults to `"agent"` when absent
 solely for compatibility, so `.apas` files written before terminal panes existed
 keep loading unchanged — see "Terminal panes" under Key Concepts. A `.apas` may
