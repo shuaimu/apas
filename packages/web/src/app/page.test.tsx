@@ -82,8 +82,17 @@ vi.mock("@/components/tabs/TabbedView", () => ({
 }));
 
 vi.mock("@/components/mobile/MobileCodeHome", () => ({
-  MobileCodeHome: ({ onOpenSession }: { onOpenSession: (sessionId: string, projectName: string) => void }) => (
-    <div data-testid="mobile-code-home">
+  MobileCodeHome: ({
+    selectedView,
+    onSelectedViewChange,
+    onOpenSession,
+  }: {
+    selectedView: "all" | "idle" | "machines";
+    onSelectedViewChange: (view: "all" | "idle" | "machines") => void;
+    onOpenSession: (sessionId: string, projectName: string) => void;
+  }) => (
+    <div data-testid="mobile-code-home" data-selected-view={selectedView}>
+      <button onClick={() => onSelectedViewChange("idle")}>Show idle sessions</button>
       <button onClick={() => onOpenSession("mobile-session", "mobile-project")}>Open mobile session</button>
     </div>
   ),
@@ -331,13 +340,17 @@ describe("Home responsive shell", () => {
     expect(screen.queryByTestId("sidebar")).toBeNull();
     expect(screen.queryByTestId("tabbed-view")).toBeNull();
 
+    expect(screen.getByTestId("mobile-code-home").getAttribute("data-selected-view")).toBe("all");
+    fireEvent.click(screen.getByText("Show idle sessions"));
+    expect(screen.getByTestId("mobile-code-home").getAttribute("data-selected-view")).toBe("idle");
+
     fireEvent.click(screen.getByText("Open mobile session"));
     expect(attachSession).toHaveBeenCalledWith("mobile-session");
     expect(await screen.findByTestId("mobile-session-activity")).toBeTruthy();
     expect(screen.queryByTestId("tabbed-view")).toBeNull();
 
     fireEvent.click(screen.getByText("Back to mobile home"));
-    expect(await screen.findByTestId("mobile-code-home")).toBeTruthy();
+    expect((await screen.findByTestId("mobile-code-home")).getAttribute("data-selected-view")).toBe("idle");
   });
 
   it("preserves the existing sidebar and pane view on desktop", async () => {

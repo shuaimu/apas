@@ -6,7 +6,7 @@ import { createPortal } from "react-dom";
 import { TabbedView } from "@/components/tabs/TabbedView";
 import { Sidebar } from "@/components/Sidebar";
 import { ResizeHandle } from "@/components/ResizeHandle";
-import { MobileCodeHome } from "@/components/mobile/MobileCodeHome";
+import { MobileCodeHome, type MobileHomeView } from "@/components/mobile/MobileCodeHome";
 import { MobileSessionActivity } from "@/components/mobile/MobileSessionActivity";
 import { useStore } from "@/lib/store";
 import { reloadWindow } from "@/lib/browserActions";
@@ -72,6 +72,7 @@ export default function Home() {
   const [isReconnecting, setIsReconnecting] = useState(false);
   const [clearCacheState, setClearCacheState] = useState<"idle" | "confirm" | "clearing">("idle");
   const [mobileScreen, setMobileScreen] = useState<"home" | "session">("home");
+  const [mobileHomeView, setMobileHomeView] = useState<MobileHomeView>("all");
   const reconnectConnectAttemptedRef = useRef(false);
 
   // Sidebar width state - per-project
@@ -232,6 +233,8 @@ export default function Home() {
               token={token}
               onAccount={() => setSettingsOpen(true)}
               onManageMachines={() => router.push("/machines")}
+              selectedView={mobileHomeView}
+              onSelectedViewChange={setMobileHomeView}
               onOpenSession={(targetSessionId) => {
                 attachSession(targetSessionId);
                 setMobileScreen("session");

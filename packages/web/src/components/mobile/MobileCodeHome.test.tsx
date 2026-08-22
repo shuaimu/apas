@@ -89,6 +89,17 @@ describe("MobileCodeHome", () => {
     expect(screen.queryByRole("button", { name: "Open alpha" })).toBeNull();
   });
 
+  it("reports a controlled list selection to the mounted mobile shell", () => {
+    const onSelectedViewChange = vi.fn();
+    const home = renderHomeWith({ selectedView: "all", onSelectedViewChange });
+
+    fireEvent.click(screen.getByRole("button", { name: "Idle sessions" }));
+    expect(onSelectedViewChange).toHaveBeenCalledWith("idle");
+
+    home.rerender({ ...home.props, selectedView: "idle" });
+    expect(screen.getByRole("button", { name: "Idle sessions" }).getAttribute("aria-pressed")).toBe("true");
+  });
+
   it("uses only working, idle, and offline session badges", () => {
     renderHome({
       legacySessions: [

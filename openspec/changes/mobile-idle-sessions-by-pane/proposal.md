@@ -21,6 +21,9 @@ that list is "which agent is waiting for me", and the answer is per pane.
   is the case the project-level view could not express.
 - **Opening a row lands on that pane**, not merely on its project, reusing the
   remembered-pane mechanism the session screen already reads on entry.
+- **Returning from a conversation restores its source list.** Opening an agent
+  from Idle sessions and going back returns to Idle sessions instead of
+  resetting the mobile home to All projects.
 - **The mobile payload gains a per-pane breakdown.** It currently carries one
   `is_working` per project, described as "at least one pane is working", which
   cannot answer a per-pane question.
@@ -44,7 +47,8 @@ that list is "which agent is waiting for me", and the answer is per pane.
   source the project-level flag is derived from, so the two cannot disagree.
 - `packages/web/src/components/mobile/MobileCodeHome.tsx`: the idle view renders
   ordinary panes first and provider-blocked panes in a Usage limited subsection;
-  tapping either remembers the pane before navigating.
+  tapping either remembers the pane before navigating, while the mobile shell
+  owns the selected home list across the conversation screen.
 - `packages/web/src/lib/`: the remembered-pane helpers move out of the session
   screen so the home can write what the session screen reads, rather than the
   storage key being spelled in two places.

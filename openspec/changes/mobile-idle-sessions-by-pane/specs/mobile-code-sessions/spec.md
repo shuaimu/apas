@@ -31,6 +31,12 @@ The application SHALL offer a list of the agents that are not currently working,
 - **WHEN** a user opens an entry
 - **THEN** the session opens with that agent selected, rather than whichever was last used
 
+#### Scenario: Returning to the idle list
+
+- **WHEN** a user opens an agent from Idle sessions and returns from its conversation
+- **THEN** Idle sessions remains selected
+- **AND** the user returns to the list they entered from rather than All projects
+
 #### Scenario: Nothing is idle
 
 - **WHEN** no agent is idle

@@ -30,7 +30,12 @@
 - [x] 5.2 Reuse the desktop recent-idle ordering so mobile lists known timestamps newest first and legacy panes afterward
 - [x] 5.3 Tests: transition timestamps, replay preservation, newest-first mobile ordering, and legacy fallback
 
-## 6. Verification
+## 6. Preserve the source list across a conversation
 
-- [x] 6.1 Workspace tests and clippy clean; web lint, type-check, and tests clean
-- [ ] 6.2 Live on the mobile browser against a project with a working pane and an idle one
+- [x] 6.1 Keep the selected mobile home list in the mounted page shell so opening and closing a conversation does not reset it
+- [x] 6.2 Regression test: enter a conversation from Idle sessions, go back, and remain on Idle sessions
+
+## 7. Verification
+
+- [x] 7.1 Workspace tests and clippy clean; web lint, type-check, and tests clean
+- [ ] 7.2 Live on the mobile browser against a project with a working pane and an idle one

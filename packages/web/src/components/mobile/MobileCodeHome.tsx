@@ -28,7 +28,7 @@ const EMPTY_USAGE_LIMITS = new Map<string, UsageLimitsByProvider>();
 
 // "machines" is a third selection rather than a screen: the home already
 // switches lists, and a handful of machine rows does not warrant navigation.
-type HomeView = "all" | "idle" | "machines";
+export type MobileHomeView = "all" | "idle" | "machines";
 
 interface MobileSessionSummary {
   id: string;
@@ -73,7 +73,7 @@ interface MobileBootstrapResponse {
   machines?: MobileMachineSummary[];
 }
 
-const FILTERS: { key: HomeView; label: string }[] = [
+const FILTERS: { key: MobileHomeView; label: string }[] = [
   { key: "all", label: "All projects" },
   { key: "idle", label: "Idle sessions" },
   { key: "machines", label: "Machines" },
@@ -176,6 +176,10 @@ export interface MobileCodeHomeProps {
   token: string | null;
   onAccount: () => void;
   onManageMachines: () => void;
+  /// Controlled by the mounted page shell so leaving this component for a
+  /// conversation does not discard the list the conversation was opened from.
+  selectedView?: MobileHomeView;
+  onSelectedViewChange?: (view: MobileHomeView) => void;
   onOpenSession: (sessionId: string, projectName: string) => void;
   /// Reboot the daemon on a machine. Targeted by machine id: a daemon is
   /// per-machine, so no project on it identifies the right one.
@@ -204,6 +208,8 @@ export function MobileCodeHome({
   token,
   onAccount,
   onManageMachines,
+  selectedView,
+  onSelectedViewChange,
   onOpenSession,
   onRebootDaemon,
   serverVersion,
@@ -212,7 +218,12 @@ export function MobileCodeHome({
   usageLimits = EMPTY_USAGE_LIMITS,
 }: MobileCodeHomeProps) {
   const [remoteSessions, setRemoteSessions] = useState<MobileSessionSummary[] | null>(null);
-  const [filter, setFilter] = useState<HomeView>("all");
+  const [localView, setLocalView] = useState<MobileHomeView>("all");
+  const filter = selectedView ?? localView;
+  const selectView = (nextView: MobileHomeView) => {
+    if (selectedView === undefined) setLocalView(nextView);
+    onSelectedViewChange?.(nextView);
+  };
   const [bootstrapMachines, setBootstrapMachines] = useState<MobileMachineSummary[]>([]);
   const [machineRebootTarget, setMachineRebootTarget] =
     useState<{ id: string; hostname: string; behind: boolean } | null>(null);
@@ -452,7 +463,7 @@ export function MobileCodeHome({
               key={item.key}
               type="button"
               aria-pressed={selected}
-              onClick={() => setFilter(item.key)}
+              onClick={() => selectView(item.key)}
               className={`shrink-0 rounded-full px-3.5 py-2 text-sm font-semibold ${
                 selected
                   ? "bg-[#6d5efc] text-white"
