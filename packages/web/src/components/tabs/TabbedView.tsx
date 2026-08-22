@@ -13,7 +13,13 @@ import { WorkerTaskBar } from "./WorkerTaskBar";
 import { UsageLimitsDisplay } from "../UsageLimits";
 import { CodeBlock } from "../code/CodeBlock";
 import { useIsLaunchProfileAllowed } from "@/lib/tabTypes";
-import { isRetiredProviderModel } from "@/lib/providerOptions";
+import {
+  canonicalDeepseekModel,
+  DEEPSEEK_FLASH_MODEL,
+  DEEPSEEK_PRO_MODEL,
+  isRetiredProviderModel,
+} from "@/lib/providerOptions";
+import { resolveMachineProjectTarget } from "@/lib/machineProjectTarget";
 
 // xterm.js touches `document` at import time, so it can't be part of the
 // server bundle. Loading it lazily also keeps the ~300 KB emulator out of
@@ -292,17 +298,6 @@ function persistInputDraft(sessionId: string | null, paneId: number, value: stri
   } else {
     localStorage.setItem(key, value);
   }
-}
-
-function normalizeComparablePath(path: string | undefined): string | null {
-  if (!path) return null;
-  const trimmed = path.trim();
-  if (!trimmed) return null;
-  let normalized = trimmed;
-  while (normalized.length > 1 && normalized.endsWith("/")) {
-    normalized = normalized.slice(0, -1);
-  }
-  return normalized;
 }
 
 function isDeepseekModel(model?: string): boolean {
@@ -729,13 +724,18 @@ export function TabbedView({
 
   const handleAddTab = useCallback((provider: string = "claude", model?: string, isolatedWorktree?: boolean, kind: PaneKind = "terminal") => {
     const isDeepseek = provider === "deepseek" || (provider === "claude" && isDeepseekModel(model));
+    const deepseekModel = canonicalDeepseekModel(model);
     const basePrefix = provider === "codex"
       ? "Codex"
       : provider === "cursor-agent"
         ? "Cursor"
         : provider === "opencode"
           ? "OpenCode"
-          : isDeepseek ? "DeepSeek" : "Claude";
+          : deepseekModel === DEEPSEEK_FLASH_MODEL
+            ? "DeepSeek Flash"
+            : deepseekModel === DEEPSEEK_PRO_MODEL
+              ? "DeepSeek Pro"
+              : isDeepseek ? "DeepSeek" : "Claude";
     const label = `${basePrefix} ${effectiveTabs.length + 1}`;
     const result = addPane(provider, "interactive", label, undefined, model, isolatedWorktree, undefined, false, kind);
     if (result.success) {
@@ -903,66 +903,7 @@ export function TabbedView({
   const bootTarget = useMemo(() => {
     if (!sessionId) return null;
     const session = sessions.find((item) => item.id === sessionId);
-    const sessionPath = normalizeComparablePath(session?.workingDir);
-    if (!sessionPath) return null;
-    const sessionHostname = session?.hostname?.trim().toLowerCase() || null;
-
-    type MachineProjectTarget = { machineId: string; projectId: string; isRunning: boolean };
-    const hostMatches: MachineProjectTarget[] = [];
-    const allMatches: MachineProjectTarget[] = [];
-
-    for (const machineWithProjects of machines) {
-      const machineHostname = machineWithProjects.machine.hostname.trim().toLowerCase();
-      for (const project of machineWithProjects.projects) {
-        const projectPath = normalizeComparablePath(project.path);
-        if (projectPath !== sessionPath) continue;
-        const target = {
-          machineId: machineWithProjects.machine.machineId,
-          projectId: project.projectId,
-          isRunning: project.isRunning,
-        };
-        allMatches.push(target);
-        if (sessionHostname && machineHostname === sessionHostname) {
-          hostMatches.push(target);
-        }
-      }
-    }
-
-    const chooseTarget = (matches: MachineProjectTarget[]): MachineProjectTarget | null => {
-      if (matches.length === 0) return null;
-
-      // Prefer exact project-id match first when available.
-      const exactMatches = matches.filter((target) => target.projectId === sessionId);
-      if (exactMatches.length === 1) return exactMatches[0];
-      if (exactMatches.length > 1) return null;
-
-      // Daemon may transiently report duplicate project IDs for the same machine/path.
-      // Collapse those duplicates so Boot does not disappear due to ambiguity.
-      const dedupedByMachine = new Map<string, MachineProjectTarget>();
-      for (const target of matches) {
-        const existing = dedupedByMachine.get(target.machineId);
-        if (!existing) {
-          dedupedByMachine.set(target.machineId, target);
-          continue;
-        }
-        if (target.projectId === sessionId) {
-          dedupedByMachine.set(target.machineId, target);
-        }
-      }
-
-      if (dedupedByMachine.size === 1) {
-        return Array.from(dedupedByMachine.values())[0];
-      }
-      return null;
-    };
-
-    if (sessionHostname) {
-      const hostTarget = chooseTarget(hostMatches);
-      if (hostTarget) return hostTarget;
-      if (hostMatches.length > 1) return null;
-    }
-
-    return chooseTarget(allMatches);
+    return resolveMachineProjectTarget(session, machines);
   }, [machines, sessionId, sessions]);
 
   const canBootCurrentProject = !isAttached && bootTarget != null && !bootTarget.isRunning;

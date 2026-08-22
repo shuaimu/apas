@@ -7,6 +7,7 @@ import {
   ArrowLeft,
   ChevronDown,
   ChevronUp,
+  FolderOpen,
   History,
   LoaderCircle,
   MoreVertical,
@@ -23,6 +24,10 @@ import {
 import { AskUserQuestionCard } from "@/components/tools/AskUserQuestionCard";
 import { readSelectedPane, writeSelectedPane } from "@/lib/mobileSelectedPane";
 import {
+  resolveMachineProjectTarget,
+  type MachineProjectTarget,
+} from "@/lib/machineProjectTarget";
+import {
   DELIVERY_GRACE_MS,
   pruneConfirmed,
   unconfirmedDeliveries,
@@ -30,6 +35,11 @@ import {
 } from "@/lib/terminalDelivery";
 import { MobileProjectManageSheet } from "./MobileProjectManageSheet";
 import { MobilePaneWorkSummarySheet } from "./MobilePaneWorkSummarySheet";
+import {
+  canonicalDeepseekModel,
+  DEEPSEEK_FLASH_MODEL,
+  DEEPSEEK_PRO_MODEL,
+} from "@/lib/providerOptions";
 import {
   paneKey,
   useStore,
@@ -176,21 +186,31 @@ function eventSurface(message: Message): string {
 function parseLaunchProfile(key: string): LaunchOption | null {
   const [rawKind, frontend, backend, ...modelParts] = key.split(":");
   if (rawKind !== "agent" && rawKind !== "terminal") return null;
-  const provider = (backend === "deepseek" ? "deepseek" : frontend) as Provider;
+  // Terminal panes always run the frontend binary (DeepSeek has no TUI);
+  // the deepseek backend is carried as the pane model instead. Agent panes
+  // keep the legacy direct Deepseek provider mapping.
+  const provider = (
+    backend === "deepseek" && rawKind !== "terminal" ? "deepseek" : frontend
+  ) as Provider;
   if (!["claude", "codex", "deepseek", "opencode", "cursor-agent"].includes(provider)) return null;
   const rawModel = modelParts.join(":");
   const model = rawModel && rawModel !== "default" ? rawModel : undefined;
-  const providerLabel = provider === "cursor-agent"
-    ? "Cursor"
-    : provider === "opencode"
-      ? "OpenCode"
-      : provider.charAt(0).toUpperCase() + provider.slice(1);
+  const deepseekModel = canonicalDeepseekModel(model);
+  const providerLabel = deepseekModel === DEEPSEEK_FLASH_MODEL
+    ? "DeepSeek Flash"
+    : deepseekModel === DEEPSEEK_PRO_MODEL
+      ? "DeepSeek Pro"
+      : provider === "cursor-agent"
+        ? "Cursor"
+        : provider === "opencode"
+          ? "OpenCode"
+          : provider.charAt(0).toUpperCase() + provider.slice(1);
   return {
     key,
     kind: rawKind,
     provider,
     model,
-    label: `${providerLabel}${rawKind === "terminal" ? " terminal" : " agent"}${model ? ` · ${model}` : ""}`,
+    label: `${providerLabel}${rawKind === "terminal" ? " terminal" : " agent"}`,
   };
 }
 
@@ -272,6 +292,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const answeredQuestions = useStore((state) => state.answeredQuestions);
   const planReviewPending = useStore((state) => state.planReviewPending);
   const projectPolicies = useStore((state) => state.projectPolicies);
+  const machines = useStore((state) => state.machines);
   const loadSessionActivity = useStore((state) => state.loadSessionActivity);
   const loadPaneMessagesIfNeeded = useStore((state) => state.loadPaneMessagesIfNeeded);
   const loadMoreMessages = useStore((state) => state.loadMoreMessages);
@@ -281,6 +302,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const reject = useStore((state) => state.reject);
   const answerPlanReview = useStore((state) => state.answerPlanReview);
   const addPane = useStore((state) => state.addPane);
+  const startMachineProjectCli = useStore((state) => state.startMachineProjectCli);
   const summarySupported = useStore((state) => state.negotiatedCapabilities.has("pane_work_summary_v1"));
 
   const [selectedPaneId, setSelectedPaneId] = useState<number | null>(null);
@@ -294,6 +316,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const [moreOpen, setMoreOpen] = useState(false);
   const [closeTarget, setCloseTarget] = useState<PaneConfig | null>(null);
   const [rebootTarget, setRebootTarget] = useState<PaneConfig | null>(null);
+  const [openProjectTarget, setOpenProjectTarget] = useState<MachineProjectTarget | null>(null);
   // Messages written into the pty that the provider has not recorded back.
   const [pendingDeliveries, setPendingDeliveries] = useState<PendingDelivery[]>([]);
   const [deliveryNow, setDeliveryNow] = useState(() => Date.now());
@@ -305,6 +328,10 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const saveScrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const session = sessions.find((item) => item.id === sessionId);
+  const machineProjectTarget = useMemo(
+    () => resolveMachineProjectTarget(session, machines),
+    [machines, session],
+  );
   const selectedPane = paneConfigs.find((pane) => pane.pane_id === selectedPaneId);
   const selectedStatus = selectedPaneId === null ? null : paneStatuses[paneKey(selectedPaneId)] || null;
 
@@ -558,6 +585,10 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const selectedIsTerminal = selectedPane?.kind === "terminal";
   const selectedIsBot = selectedPane?.mode === "deadloop";
   const sessionIsRunning = session.isActive ?? isAttached;
+  const canOpenProject = connected
+    && !sessionIsRunning
+    && machineProjectTarget !== null
+    && !machineProjectTarget.isRunning;
   const canCompose = selectedPaneId !== null && !selectedIsBot;
   const canSend = canCompose && connected && sessionIsRunning;
 
@@ -720,6 +751,28 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
               <button type="button" aria-label="Close actions" onClick={() => setMoreOpen(false)} className="rounded-lg p-2 hover:bg-[#efeff5] dark:hover:bg-[#25252d]"><X className="h-5 w-5" /></button>
             </div>
             <div className="mt-3 space-y-2">
+              {!sessionIsRunning && (
+                <button
+                  type="button"
+                  aria-label="Open project"
+                  disabled={!canOpenProject}
+                  title={!connected
+                    ? "Reconnect before opening this project"
+                    : !machineProjectTarget
+                      ? "No unambiguous machine was found for this project"
+                      : machineProjectTarget.isRunning
+                        ? "This project is already starting"
+                        : "Open this project"}
+                  onClick={() => {
+                    if (!canOpenProject || !machineProjectTarget) return;
+                    setMoreOpen(false);
+                    setOpenProjectTarget(machineProjectTarget);
+                  }}
+                  className="flex w-full items-center gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left font-bold disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"
+                >
+                  <FolderOpen className="h-5 w-5 shrink-0 text-[#6d5efc]" /> Open project
+                </button>
+              )}
               <button type="button" aria-label="Open raw terminal" disabled={!selectedIsTerminal} onClick={() => {
                 if (selectedPaneId === null) return;
                 setMoreOpen(false);
@@ -735,6 +788,25 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
                   live: project management is per-project, so there is no
                   session-independent screen to move it to. */}
               <button type="button" aria-label="Manage project" onClick={() => { setMoreOpen(false); setManageOpen(true); }} className="mt-1 flex w-full items-center gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left font-bold dark:border-[#383842] dark:bg-[#1b1b21]"><Settings2 className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Manage project</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {openProjectTarget && (
+        <div className="fixed inset-0 z-[96] flex items-end bg-black/45" onClick={() => setOpenProjectTarget(null)}>
+          <div role="dialog" aria-modal="true" aria-label={`Open ${projectName}`} onClick={(event) => event.stopPropagation()} className="w-full rounded-t-[1.4rem] border-t border-[#dedee7] bg-[#f7f7fa] p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-2xl dark:border-[#383842] dark:bg-[#111115]">
+            <h2 className="text-lg font-extrabold">Open {projectName}?</h2>
+            <p className="mt-1.5 text-sm leading-5 text-[#686873] dark:text-[#aaaab6]">
+              Its APAS process starts on {session.hostname || "the selected host"}, and its saved panes become available again.
+            </p>
+            <div className="mt-4 flex gap-2.5">
+              <button type="button" onClick={() => setOpenProjectTarget(null)} className="flex-1 rounded-xl border border-[#dedee7] px-4 py-2.5 text-sm font-bold dark:border-[#383842]">Cancel</button>
+              <button type="button" onClick={() => {
+                startMachineProjectCli(openProjectTarget.machineId, openProjectTarget.projectId);
+                setOpenProjectTarget(null);
+                setActionError(null);
+              }} className="flex-1 rounded-xl bg-[#6d5efc] px-4 py-2.5 text-sm font-bold text-white">Open project</button>
             </div>
           </div>
         </div>

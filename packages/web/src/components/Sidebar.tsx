@@ -7,6 +7,12 @@ import { CreateInstanceModal } from "./CreateInstanceModal";
 import Link from "next/link";
 import { useMemo, useState, useEffect } from "react";
 import { createPortal } from "react-dom";
+import {
+  paneUsageLimit,
+  usageLimitedLabel,
+  usageLimitResetLabel,
+} from "@/lib/usageLimitStatus";
+import { compareRecentlyIdle } from "@/lib/idlePaneOrdering";
 
 // Truncate path in the middle to preserve the folder name at the end
 // e.g., "/home/shuai/workspace/long-project" -> "/home/.../long-project"
@@ -54,7 +60,7 @@ type ProjectRole = "owner" | "user";
 
 // Group key + localStorage key for collapsed repo groups in the sidebar.
 const NO_REMOTE_KEY = "__no_remote__";
-type SidebarView = "projects" | "idle";
+type SidebarView = "projects" | "idle" | "limited";
 
 /// The same name the project list shows, so an agent row and its project agree.
 function projectNameFor(session: { workingDir?: string; projectId?: string; id: string }): string {
@@ -111,7 +117,7 @@ interface ShareListState {
 }
 
 export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
-  const { cliClients, sessions, machines, attachSession, openSessionPane, forgetProject, refreshCliClients, listSessions, sessionId, connected, token } = useStore();
+  const { cliClients, sessions, machines, usageLimits, attachSession, openSessionPane, forgetProject, refreshCliClients, listSessions, sessionId, connected, token } = useStore();
   // Which list the sidebar is showing. Projects answer "where do I want to go";
   // idle agents answer "who is waiting for me", which the project view cannot
   // express — a project with one busy pane reads as working, hiding the rest.
@@ -119,10 +125,15 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
   const unreadSessions = useStore((s) => s.unreadSessions);
   const [shareModalOpen, setShareModalOpen] = useState(false);
   const [mounted, setMounted] = useState(false);
+  const [availabilityNow, setAvailabilityNow] = useState(() => Date.now());
 
   // For portal - need to wait for client-side mount
   useEffect(() => {
     setMounted(true);
+  }, []);
+  useEffect(() => {
+    const timer = window.setInterval(() => setAvailabilityNow(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
   }, []);
   const [shareSessionId, setShareSessionId] = useState<string | null>(null);
   const [shareProjectId, setShareProjectId] = useState<string | null>(null);
@@ -240,17 +251,32 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
   // per group (including the "(no remote)" bucket). Named-repo groups keep the
   // activity/recency order inherited from `projects` (Array#sort is stable, so
   // returning 0 preserves first-seen order); the no-remote bucket sinks last.
-  const idleAgents = useMemo(
+  const waitingAgents = useMemo(
     () => sessions
       // A stopped project's agents are not idle, they are not running.
       .filter((session) => session.isActive)
       .flatMap((session) =>
         (session.panes ?? [])
           .filter((pane) => !pane.is_working)
-          .map((pane) => ({ session, pane })),
+          .map((pane) => ({
+            session,
+            pane,
+            usageLimit: paneUsageLimit(session, pane, usageLimits, availabilityNow),
+          })),
       ),
-    [sessions],
+    [availabilityNow, sessions, usageLimits],
   );
+  const idleAgents = useMemo(
+    () => waitingAgents
+      .filter((agent) => !agent.usageLimit)
+      .sort(compareRecentlyIdle),
+    [waitingAgents],
+  );
+  const limitedAgents = useMemo(
+    () => waitingAgents.filter((agent) => agent.usageLimit),
+    [waitingAgents],
+  );
+  const visibleAgents = view === "limited" ? limitedAgents : idleAgents;
 
   const repoGroups = useMemo(() => {
     const byKey = new Map<
@@ -656,6 +682,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
         {([
           ["projects", "All projects"],
           ["idle", "Idle sessions"],
+          ["limited", "Usage limited"],
         ] as const).map(([key, label]) => (
           <button
             key={key}
@@ -673,12 +700,13 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
         ))}
       </div>
 
-      {view === "idle" ? (
+      {view === "idle" || view === "limited" ? (
         <div className="flex-1 overflow-y-auto p-2">
-          {idleAgents.length > 0 ? (
+          {visibleAgents.length > 0 ? (
             <div className="space-y-1.5">
-              {idleAgents.map(({ session, pane }) => {
+              {visibleAgents.map(({ session, pane, usageLimit }) => {
                 const name = projectNameFor(session);
+                const resetLabel = usageLimit ? usageLimitResetLabel(usageLimit, availabilityNow) : null;
                 return (
                   <button
                     key={`${session.id}:${pane.pane_id}`}
@@ -701,11 +729,17 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                         <span aria-hidden="true" className="shrink-0 text-gray-400 dark:text-gray-600">/</span>
                         <span className="min-w-0 truncate font-semibold text-indigo-600 dark:text-indigo-400">{paneRowLabel(pane)}</span>
                       </span>
-                      <span className="shrink-0 rounded-full bg-gray-100 px-2 py-0.5 text-[0.65rem] font-semibold text-gray-600 dark:bg-gray-700 dark:text-gray-300">Idle</span>
+                      <span className={`shrink-0 rounded-full px-2 py-0.5 text-[0.65rem] font-semibold ${
+                        usageLimit
+                          ? "bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300"
+                          : "bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300"
+                      }`}>
+                        {usageLimit ? usageLimitedLabel(usageLimit) : "Idle"}
+                      </span>
                     </div>
-                    {session.hostname && (
+                    {(session.hostname || resetLabel) && (
                       <div className="mt-1 truncate text-xs text-gray-500 dark:text-gray-400">
-                        {session.hostname}
+                        {[session.hostname, resetLabel].filter(Boolean).join(" · ")}
                       </div>
                     )}
                   </button>
@@ -715,9 +749,13 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
           ) : (
             <div className="py-8 text-center text-sm text-gray-400">
               <FolderOpen className="mx-auto mb-2 h-8 w-8 opacity-50" />
-              <p>No idle sessions</p>
+              <p>{view === "limited" ? "No usage-limited sessions" : "No idle sessions"}</p>
               <p className="mt-1 text-xs">
-                {sessions.length ? "Every agent that reported in is working." : "Run `apas` in a directory to start"}
+                {sessions.length
+                  ? view === "limited"
+                    ? "No provider is currently blocking an agent."
+                    : "Every available agent that reported in is working."
+                  : "Run `apas` in a directory to start"}
               </p>
             </div>
           )}

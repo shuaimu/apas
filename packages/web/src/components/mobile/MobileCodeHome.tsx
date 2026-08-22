@@ -2,8 +2,19 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { AlertTriangle, ChevronRight, Plus, RotateCcw, WifiOff, X } from "lucide-react";
-import type { MachineWithProjects, SessionInfo } from "@/lib/store";
+import type {
+  MachineWithProjects,
+  SessionInfo,
+  SessionPaneSummary,
+  UsageLimitsByProvider,
+} from "@/lib/store";
 import { writeSelectedPane } from "@/lib/mobileSelectedPane";
+import { compareRecentlyIdle } from "@/lib/idlePaneOrdering";
+import {
+  paneUsageLimit,
+  usageLimitedLabel,
+  usageLimitResetLabel,
+} from "@/lib/usageLimitStatus";
 import {
   daemonVersionLabel,
   isMachineBehind,
@@ -13,14 +24,15 @@ import {
 } from "@/lib/daemonVersion";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://apas.mpaxos.com";
+const EMPTY_USAGE_LIMITS = new Map<string, UsageLimitsByProvider>();
 
 // "machines" is a third selection rather than a screen: the home already
 // switches lists, and a handful of machine rows does not warrant navigation.
-type HomeView = "all" | "idle" | "machines";
-type SessionFilter = "all" | "idle";
+type HomeView = "all" | "idle" | "limited" | "machines";
 
 interface MobileSessionSummary {
   id: string;
+  cli_client_id?: string | null;
   project_id?: string | null;
   project_name?: string | null;
   hostname?: string | null;
@@ -34,15 +46,7 @@ interface MobileSessionSummary {
   attention_count?: number;
   is_shared?: boolean;
   owner_email?: string | null;
-  panes?: MobilePaneSummary[];
-}
-
-interface MobilePaneSummary {
-  pane_id: number;
-  label?: string | null;
-  kind: string;
-  provider: string;
-  is_working?: boolean;
+  panes?: SessionPaneSummary[];
 }
 
 interface MobileMachineProject {
@@ -72,6 +76,7 @@ interface MobileBootstrapResponse {
 const FILTERS: { key: HomeView; label: string }[] = [
   { key: "all", label: "All projects" },
   { key: "idle", label: "Idle sessions" },
+  { key: "limited", label: "Usage limited" },
   { key: "machines", label: "Machines" },
 ];
 
@@ -114,6 +119,7 @@ function projectName(session: SessionInfo): string {
 function adaptSession(session: SessionInfo): MobileSessionSummary {
   return {
     id: session.id,
+    cli_client_id: session.cliClientId,
     project_id: session.projectId,
     project_name: projectName(session),
     hostname: session.hostname,
@@ -125,11 +131,8 @@ function adaptSession(session: SessionInfo): MobileSessionSummary {
     attention_count: 0,
     is_shared: session.isShared,
     owner_email: session.ownerEmail,
+    panes: session.panes,
   };
-}
-
-function matches(session: MobileSessionSummary, filter: SessionFilter): boolean {
-  return filter === "all" || statusLabel(session) === "Idle";
 }
 
 function timestamp(value?: string | null): number {
@@ -146,13 +149,14 @@ function compareSessionRecency(left: MobileSessionSummary, right: MobileSessionS
     || left.id.localeCompare(right.id);
 }
 
-function statusLabel(session: MobileSessionSummary): string {
+function statusLabel(session: MobileSessionSummary, allPanesUsageLimited = false): string {
   if (!session.is_active) return "Offline";
-  return session.is_working ? "Working" : "Idle";
+  if (session.is_working) return "Working";
+  return allPanesUsageLimited ? "Usage limited" : "Idle";
 }
 
 /// Same fallback the session screen uses, so one pane reads the same in both.
-function paneRowLabel(pane: MobilePaneSummary): string {
+function paneRowLabel(pane: SessionPaneSummary): string {
   return pane.label?.trim() || `${pane.kind === "terminal" ? "Terminal" : "Pane"} ${pane.pane_id}`;
 }
 
@@ -186,6 +190,8 @@ export interface MobileCodeHomeProps {
   /// Ask for a machine list now, so the first paint does not wait for the next
   /// heartbeat.
   onRefreshMachines?: () => void;
+  /// Live provider availability keyed by the CLI account hosting each session.
+  usageLimits?: Map<string, UsageLimitsByProvider>;
   /// The connected server's own version, so a fleet that is uniformly behind a
   /// newer deployment is still recognisable — nothing the machines report is
   /// newer than each other in that case.
@@ -204,6 +210,7 @@ export function MobileCodeHome({
   serverVersion,
   liveMachines,
   onRefreshMachines,
+  usageLimits = EMPTY_USAGE_LIMITS,
 }: MobileCodeHomeProps) {
   const [remoteSessions, setRemoteSessions] = useState<MobileSessionSummary[] | null>(null);
   const [filter, setFilter] = useState<HomeView>("all");
@@ -232,6 +239,12 @@ export function MobileCodeHome({
     [serverVersion, machines],
   );
   const [newTaskOpen, setNewTaskOpen] = useState(false);
+  const [availabilityNow, setAvailabilityNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setAvailabilityNow(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
     if (!active || !token) return;
@@ -276,18 +289,16 @@ export function MobileCodeHome({
         // authority. Do not preserve a stale REST `true` merely because an
         // older/mixed-version inventory omitted isWorking.
         is_working: Boolean(live.isWorking),
+        cli_client_id: live.cliClientId ?? session.cli_client_id,
         hostname: live.hostname ?? session.hostname,
         working_dir: live.workingDir ?? session.working_dir,
+        panes: live.panes ?? session.panes,
       };
     });
   }, [legacySessions, remoteSessions]);
 
   const filteredSessions = useMemo(
-    () => sessions
-      // The machines view lists no sessions; keep the session filter total
-      // over the two values it was written for.
-      .filter((session) => filter !== "machines" && matches(session, filter))
-      .sort(compareSessionRecency),
+    () => filter === "all" ? [...sessions].sort(compareSessionRecency) : [],
     [filter, sessions],
   );
   /// One row per idle agent, not per project: a project with one busy pane
@@ -295,7 +306,7 @@ export function MobileCodeHome({
   /// waiting for someone. A session reporting no pane detail contributes
   /// nothing, since an older server omits the field and "unknown" must not read
   /// as "idle".
-  const idlePanes = useMemo(
+  const waitingPanes = useMemo(
     () => sessions
       // A stopped project's agents are not idle, they are not running. Listing
       // them would bury the ones actually waiting.
@@ -303,10 +314,51 @@ export function MobileCodeHome({
       .flatMap((session) =>
         (session.panes ?? [])
           .filter((pane) => !pane.is_working)
-          .map((pane) => ({ session, pane })),
+          .map((pane) => ({
+            session,
+            pane,
+            usageLimit: paneUsageLimit(
+              { cliClientId: session.cli_client_id ?? undefined },
+              pane,
+              usageLimits,
+              availabilityNow,
+            ),
+          })),
       ),
-    [sessions],
+    [availabilityNow, sessions, usageLimits],
   );
+  const idlePanes = useMemo(
+    () => waitingPanes
+      .filter((entry) => !entry.usageLimit)
+      .sort(compareRecentlyIdle),
+    [waitingPanes],
+  );
+  const limitedPanes = useMemo(
+    () => waitingPanes.filter((entry) => entry.usageLimit),
+    [waitingPanes],
+  );
+  const fullyLimitedSessionIds = useMemo(
+    () => new Set(
+      sessions
+        .filter((session) =>
+          session.is_active
+          && !session.is_working
+          && (session.panes?.length ?? 0) > 0
+          && session.panes?.every((pane) =>
+            !pane.is_working
+            && paneUsageLimit(
+              { cliClientId: session.cli_client_id ?? undefined },
+              pane,
+              usageLimits,
+              availabilityNow,
+            ) !== null
+          )
+        )
+        .map((session) => session.id),
+    ),
+    [availabilityNow, sessions, usageLimits],
+  );
+  const visiblePanes = filter === "limited" ? limitedPanes : idlePanes;
 
   const activeSessions = useMemo(
     () => sessions.filter((session) => session.is_active).sort(compareSessionRecency),
@@ -432,11 +484,14 @@ export function MobileCodeHome({
               </p>
             </div>
           )
-        ) : filter === "idle" ? (
-          idlePanes.length > 0 ? (
+        ) : filter === "idle" || filter === "limited" ? (
+          visiblePanes.length > 0 ? (
             <div className="space-y-2.5">
-              {idlePanes.map(({ session, pane }) => {
+              {visiblePanes.map(({ session, pane, usageLimit }) => {
                 const name = session.project_name || "Coding session";
+                const resetLabel = usageLimit
+                  ? usageLimitResetLabel(usageLimit, availabilityNow)
+                  : null;
                 return (
                   <button
                     key={`${session.id}:${pane.pane_id}`}
@@ -460,10 +515,16 @@ export function MobileCodeHome({
                         <span aria-hidden="true" className="shrink-0 text-[#aaaab6] dark:text-[#686873]">/</span>
                         <span className="min-w-0 truncate font-bold text-[#6d5efc]">{paneRowLabel(pane)}</span>
                       </span>
-                      <span className="shrink-0 rounded-full bg-[#efeff5] px-2.5 py-1 text-[0.7rem] font-bold text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]">Idle</span>
+                      <span className={`shrink-0 rounded-full px-2.5 py-1 text-[0.7rem] font-bold ${
+                        usageLimit
+                          ? "bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300"
+                          : "bg-[#efeff5] text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]"
+                      }`}>
+                        {usageLimit ? usageLimitedLabel(usageLimit) : "Idle"}
+                      </span>
                     </div>
                     <p className="mt-2 truncate text-sm text-[#686873] dark:text-[#aaaab6]">
-                      {sessionTarget(session)}
+                      {[sessionTarget(session), resetLabel].filter(Boolean).join(" · ")}
                     </p>
                   </button>
                 );
@@ -474,10 +535,14 @@ export function MobileCodeHome({
               <div className="mb-3 rounded-2xl bg-[#efeff5] p-3 dark:bg-[#25252d]">
                 <AlertTriangle className="h-6 w-6 text-[#686873] dark:text-[#aaaab6]" />
               </div>
-              <h2 className="text-lg font-extrabold">No idle sessions</h2>
+              <h2 className="text-lg font-extrabold">
+                {filter === "limited" ? "No usage-limited sessions" : "No idle sessions"}
+              </h2>
               <p className="mt-1.5 max-w-sm text-sm leading-5 text-[#686873] dark:text-[#aaaab6]">
                 {sessions.length
-                  ? "Every agent that reported in is currently working."
+                  ? filter === "limited"
+                    ? "No provider is currently blocking an agent."
+                    : "Every available agent that reported in is currently working."
                   : "Start APAS in a project, then follow its coding activity here."}
               </p>
             </div>
@@ -504,7 +569,7 @@ export function MobileCodeHome({
                           ? "bg-[#efeff5] text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]"
                           : "bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300"
                     }`}>
-                      {statusLabel(session)}
+                      {statusLabel(session, fullyLimitedSessionIds.has(session.id))}
                     </span>
                   </div>
                   <p className="mt-2 truncate text-sm text-[#686873] dark:text-[#aaaab6]">{sessionTarget(session)}</p>

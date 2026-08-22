@@ -1,7 +1,12 @@
 "use client";
 
 import { useStore, UsageLimits as UsageLimitsType } from "@/lib/store";
-import { useMemo } from "react";
+import {
+  activeUsageLimit,
+  usageLimitedLabel,
+  usageLimitResetLabel,
+} from "@/lib/usageLimitStatus";
+import { useEffect, useMemo, useState } from "react";
 
 function formatTimeUntilReset(resetsAt: string | undefined): string {
   if (!resetsAt) return "";
@@ -149,11 +154,31 @@ interface CompactUsageWindow {
 }
 
 export function UsageLimitsDisplay({ limits, compact = false }: UsageLimitsDisplayProps) {
-  if (!limits.fiveHour && !limits.sevenDay) {
+  const [availabilityNow, setAvailabilityNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setAvailabilityNow(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const limited = activeUsageLimit(limits, availabilityNow);
+
+  if (!limits.fiveHour && !limits.sevenDay && !limited) {
     return null;
   }
 
   if (compact) {
+    if (limited) {
+      const resetLabel = usageLimitResetLabel(limited, availabilityNow);
+      return (
+        <div className="flex items-center gap-1 text-xs font-semibold text-red-600 dark:text-red-400">
+          <div className="h-2 w-2 rounded-full bg-red-500" />
+          <span>{usageLimitedLabel(limited)}</span>
+          {resetLabel && (
+            <span className="font-normal text-gray-500 dark:text-gray-400">· {resetLabel}</span>
+          )}
+        </div>
+      );
+    }
+
     // In compact mode, prefer weekly usage whenever available.
     const primary: CompactUsageWindow | null = limits.sevenDay
       ? {
@@ -197,8 +222,22 @@ export function UsageLimitsDisplay({ limits, compact = false }: UsageLimitsDispl
     );
   }
 
+  const resetLabel = limited
+    ? usageLimitResetLabel(limited, availabilityNow)
+    : null;
+
   return (
     <div className="space-y-2 p-2 bg-gray-50 dark:bg-gray-800/50 rounded-lg">
+      {limited && (
+        <div className="rounded-md bg-red-50 px-2 py-1.5 text-xs font-semibold text-red-700 dark:bg-red-950/50 dark:text-red-300">
+          {usageLimitedLabel(limited)}
+          {resetLabel && (
+            <span className="ml-1 font-normal">
+              · {resetLabel}
+            </span>
+          )}
+        </div>
+      )}
       {limits.sevenDay && (
         <UsageBar
           label="Weekly"

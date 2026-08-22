@@ -204,6 +204,25 @@ describe("UsageLimitsDisplay", () => {
     expect(container.textContent).toContain("10%");
     expect(container.textContent).toContain("resetting...");
   });
+
+  it("renders provider availability as usage limited instead of only a red meter", () => {
+    const { container } = renderUsage(
+      {
+        sevenDay: {
+          utilization: 1,
+          resetsAt: "2026-06-23T15:00:00Z",
+        },
+        usageLimited: {
+          window: "weekly",
+          resetsAt: "2026-06-23T15:00:00Z",
+        },
+      },
+      true,
+    );
+
+    expect(container.textContent).toContain("Weekly usage limited");
+    expect(container.textContent).toContain("Resets in");
+  });
 });
 
 describe("AllProvidersUsage", () => {

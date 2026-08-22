@@ -11,6 +11,8 @@ import {
 } from "@/lib/store";
 import { useIsLaunchProfileAllowed } from "@/lib/tabTypes";
 import {
+  DEEPSEEK_FLASH_MODEL,
+  DEEPSEEK_PRO_MODEL,
   isDeepseekModel,
   isRetiredProviderModel,
 } from "@/lib/providerOptions";
@@ -593,8 +595,8 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
   // isolatedWorktree stays toggled while the menu is open so the user's
   // choice persists across submenu navigation, but resets after each
   // tab creation so a second tab doesn't silently get a new worktree.
-  const handlePick = (provider: string) => {
-    onAddTab(provider, undefined, isolatedWorktree || undefined, "terminal");
+  const handlePick = (provider: string, model?: string) => {
+    onAddTab(provider, model, isolatedWorktree || undefined, "terminal");
     setIsolatedWorktree(false);
     setShowMenu(false);
   };
@@ -637,14 +639,16 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
             </div>
             {[
               { provider: "claude", label: "Claude" },
+              { provider: "claude", label: "Claude / DeepSeek Pro", model: DEEPSEEK_PRO_MODEL },
+              { provider: "claude", label: "Claude / DeepSeek Flash", model: DEEPSEEK_FLASH_MODEL },
               { provider: "codex", label: "Codex" },
               { provider: "opencode", label: "OpenCode" },
             ]
-              .filter((entry) => isAllowed("terminal", entry.provider))
+              .filter((entry) => isAllowed("terminal", entry.provider, entry.model))
               .map((entry) => (
               <button
-                key={entry.provider}
-                onClick={() => handlePick(entry.provider)}
+                key={entry.model ? `${entry.provider}/${entry.model}` : entry.provider}
+                onClick={() => handlePick(entry.provider, entry.model)}
                 className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
               >
                 <span className="flex-shrink-0 text-gray-500 dark:text-gray-400">

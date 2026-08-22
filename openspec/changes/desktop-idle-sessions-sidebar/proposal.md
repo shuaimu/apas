@@ -9,8 +9,8 @@ desktop is where most of this work happens.
 
 ## What Changes
 
-- **The sidebar gains a two-way switch**, "All projects" and "Idle sessions",
-  the same pair mobile offers.
+- **The sidebar gains separate views** for "All projects", "Idle sessions",
+  and "Usage limited" sessions, matching the same distinction on mobile.
 - **The idle view lists one row per agent**, naming its project and host, and
   includes agents inside projects that are otherwise working.
 - **Opening a row opens that agent**, not merely its project. The remembered tab
@@ -22,6 +22,11 @@ desktop is where most of this work happens.
   attached project, and useless for a list spanning all of them.
 - Both surfaces now derive the list from one server helper, so a pane cannot
   read as idle in one place and working in the other.
+- Provider quota state remains separate from transient pane work. A pane whose
+  provider is actively blocking requests is listed as usage limited rather
+  than idle, with its limiting window and reset time when known.
+- Idle agents are ordered by when they most recently became idle, newest first,
+  so the agent that just finished work or started waiting is easiest to find.
 
 ## Capabilities
 
@@ -39,5 +44,7 @@ desktop is where most of this work happens.
 - `packages/web/src/lib/store.ts`: `panes` on the session type, plus a pending
   pane selection an entry point can set before attaching.
 - `packages/web/src/components/Sidebar.tsx`: the switch and the agent list.
+- `crates/client-cli/src/usage.rs`: preserve the provider's active-limit and
+  extra-usage result instead of inferring a block from a rounded meter.
 - `packages/web/src/components/tabs/TabbedView.tsx`: honours a named agent over
   the remembered tab.

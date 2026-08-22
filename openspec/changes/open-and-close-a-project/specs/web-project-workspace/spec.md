@@ -10,6 +10,12 @@ The workspace SHALL offer, in one place, opening a project that is not running a
 - **THEN** it offers to open the project
 - **AND** does not offer to close it
 
+#### Scenario: Opening from a mobile project workspace
+
+- **WHEN** a user views a project that is not running in the mobile session view
+- **THEN** its pane-actions menu offers to open the project
+- **AND** confirmation starts it on the machine that hosts that session
+
 #### Scenario: A project that is running
 
 - **WHEN** a user views the workspace of a running project

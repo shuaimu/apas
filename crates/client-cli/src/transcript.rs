@@ -23,12 +23,11 @@
 //! * **claude** — `--session-id <uuid>` pins the id at spawn, and APAS already
 //!   mints one per pane, so the path is exact:
 //!   `~/.claude/projects/<cwd with / as ->/<session-id>.jsonl`. No guessing.
-//! * **codex** — has no equivalent flag. Its rollout files record `cwd` and a
-//!   start `timestamp` in `session_meta`, so a pane is matched to the newest
-//!   rollout in its own directory that started at or after the pane did. That
-//!   is a heuristic: two codex panes started in the same directory within the
-//!   same second could in principle be confused. Bounded by requiring the cwd
-//!   to match exactly.
+//! * **codex** — has no equivalent flag. On Linux, APAS identifies the pane's
+//!   provider process group and follows the user rollout that process group
+//!   actually has open. This remains exact when several codex panes share a
+//!   cwd and when one of them resumes an older session. Other platforms fall
+//!   back to the newest user rollout whose `session_meta.cwd` matches exactly.
 //! * **opencode** — session IDs are generated as `ses_*`, so APAS cannot pin
 //!   its UUID at creation. The newest session whose exported `directory`
 //!   exactly matches the pane cwd is selected, then exported by ID. This has
@@ -629,7 +628,7 @@ fn read_codex_rollout_meta(path: &Path) -> Option<CodexRolloutMeta> {
 /// when someone restarts codex in the same directory.
 pub fn find_codex_rollout(home: &Path, cwd: &Path) -> Option<PathBuf> {
     let root = home.join(".codex").join("sessions");
-    let mut best: Option<(String, PathBuf)> = None;
+    let mut candidates = Vec::new();
     let mut stack = vec![root];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -644,27 +643,97 @@ pub fn find_codex_rollout(home: &Path, cwd: &Path) -> Option<PathBuf> {
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            let Some(meta) = read_codex_rollout_meta(&path) else {
+            candidates.push(path);
+        }
+    }
+    select_codex_rollout(candidates, cwd)
+}
+
+/// Newest user rollout for `cwd` among a bounded set of candidate files.
+///
+/// The stable start timestamp and path tie-break keep selection independent of
+/// append mtimes. That matters both for the directory fallback and for a codex
+/// process group that still has old resumed sessions or subagent rollouts open.
+fn select_codex_rollout(
+    candidates: impl IntoIterator<Item = PathBuf>,
+    cwd: &Path,
+) -> Option<PathBuf> {
+    let expected_cwd = cwd.to_string_lossy();
+    let mut best: Option<(String, PathBuf)> = None;
+    for path in candidates {
+        let Some(meta) = read_codex_rollout_meta(&path) else {
+            continue;
+        };
+        if meta.cwd != expected_cwd || meta.is_subagent() {
+            continue;
+        }
+        let key = meta.started_at;
+        let better = match best.as_ref() {
+            None => true,
+            Some((best_key, best_path)) => (&key, &path) > (best_key, best_path),
+        };
+        if better {
+            best = Some((key, path));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// User rollout currently owned by one terminal's provider process group.
+///
+/// Codex keeps its active rollout open while the TUI is alive. Linux exposes
+/// those descriptors through `/proc/<pid>/fd`, and portable-pty puts the node
+/// launcher plus the native codex process in one process group. Restricting
+/// candidates to that group is the missing pane identity when two codex panes
+/// run in the same checkout.
+#[cfg(target_os = "linux")]
+pub fn find_codex_rollout_for_process_group(
+    home: &Path,
+    cwd: &Path,
+    process_group_id: i32,
+) -> Option<PathBuf> {
+    let sessions_root = home.join(".codex").join("sessions");
+    let mut candidates = HashSet::new();
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        // `comm` is parenthesized and may contain spaces. Fields after its
+        // closing ')' begin with state, ppid, then pgrp (proc_pid_stat(5)).
+        let Some(group) = stat
+            .rfind(')')
+            .and_then(|end| stat.get(end + 1..))
+            .and_then(|tail| tail.split_whitespace().nth(2))
+            .and_then(|value| value.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if group != process_group_id {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+            continue;
+        };
+        for fd in fds.filter_map(|fd| fd.ok()) {
+            let Ok(path) = std::fs::read_link(fd.path()) else {
                 continue;
             };
-            if meta.cwd != cwd.to_string_lossy() || meta.is_subagent() {
-                continue;
-            }
-            // Tie-break on path so two rollouts sharing a start timestamp
-            // still resolve to the same file on every poll.
-            let key = meta.started_at;
-            let better = match best.as_ref() {
-                None => true,
-                Some((best_key, best_path)) => {
-                    (&key, &path) > (best_key, best_path)
-                }
-            };
-            if better {
-                best = Some((key, path));
+            if path.starts_with(&sessions_root)
+                && path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
+            {
+                candidates.insert(path);
             }
         }
     }
-    best.map(|(_, p)| p)
+    select_codex_rollout(candidates, cwd)
 }
 
 /// Read a transcript and stamp every turn with the pane it belongs to.
@@ -1140,6 +1209,47 @@ mod tests {
         );
 
         assert!(find_codex_rollout(home.path(), Path::new("/repo")).is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn codex_process_group_lookup_does_not_adopt_a_newer_sibling_panes_rollout() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join(".codex/sessions/2026/08/22");
+        std::fs::create_dir_all(&sessions).unwrap();
+        write_rollout(
+            &sessions,
+            "rollout-owned.jsonl",
+            "/repo",
+            "2026-08-22T01:00:00Z",
+            Some("user"),
+        );
+        write_rollout(
+            &sessions,
+            "rollout-newer-sibling.jsonl",
+            "/repo",
+            "2026-08-22T02:00:00Z",
+            Some("user"),
+        );
+
+        // Holding this descriptor open models the live codex TUI. The newer
+        // sibling file exists in the same cwd but belongs to another pane and
+        // therefore is not open in this terminal's process group.
+        let owned = std::fs::File::open(sessions.join("rollout-owned.jsonl")).unwrap();
+        let found = find_codex_rollout_for_process_group(
+            home.path(),
+            Path::new("/repo"),
+            unsafe { libc::getpgrp() },
+        );
+        drop(owned);
+
+        assert_eq!(
+            found
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str()),
+            Some("rollout-owned.jsonl")
+        );
     }
 
     fn claude_projects_dir(home: &Path, cwd: &str) -> PathBuf {

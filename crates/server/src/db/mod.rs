@@ -5909,6 +5909,34 @@ mod cluster_administration_tests {
     }
 
     #[tokio::test]
+    async fn deepseek_flash_is_seeded_fresh_without_widening_persisted_policy() {
+        let db = database("deepseek-flash-policy-defaults").await;
+        db.run_migrations().await.unwrap();
+
+        let fresh = db.get_deployment_default_policy().await.unwrap();
+        assert!(fresh
+            .allowed_launch_profiles
+            .contains(&"agent:claude:deepseek:deepseek-v4-pro".to_string()));
+        assert!(fresh
+            .allowed_launch_profiles
+            .contains(&"agent:claude:deepseek:deepseek-v4-flash".to_string()));
+
+        let pro_only = vec!["agent:claude:deepseek:deepseek-v4-pro".to_string()];
+        sqlx::query(
+            "UPDATE cluster_settings SET allowed_launch_profiles = ?, version = 9 WHERE id = 1",
+        )
+        .bind(serde_json::to_string(&pro_only).unwrap())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        db.run_migrations().await.unwrap();
+        let persisted = db.get_deployment_default_policy().await.unwrap();
+        assert_eq!(persisted.allowed_launch_profiles, pro_only);
+        assert_eq!(persisted.version, 9);
+    }
+
+    #[tokio::test]
     async fn canonical_membership_controls_all_instances_and_suspension() {
         let db = database("access-matrix").await;
         db.run_migrations().await.unwrap();

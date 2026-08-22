@@ -2,7 +2,11 @@ import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PaneGrid } from "./PaneGrid";
 import { useStore, type PaneConfig } from "@/lib/store";
-import { DEEPSEEK_DEFAULT_MODEL } from "@/lib/providerOptions";
+import {
+  DEEPSEEK_DEFAULT_MODEL,
+  DEEPSEEK_FLASH_MODEL,
+  DEEPSEEK_PRO_MODEL,
+} from "@/lib/providerOptions";
 
 const initialStore = useStore.getState();
 
@@ -108,10 +112,11 @@ describe("PaneGrid existing-pane selectors", () => {
 
     expect(optionLabels(managedSelect)).toEqual([
       "Claude / Official",
-      "Claude / DeepSeek",
+      "Claude / DeepSeek Pro",
+      "Claude / DeepSeek Flash",
       "Codex / Official",
-      "OpenCode / Official",
-      "Cursor / Official",
+      "OpenCode",
+      "Cursor",
     ]);
     expect(managedSelect.value).toBe("claude/official");
 
@@ -156,6 +161,53 @@ describe("PaneGrid existing-pane selectors", () => {
     fireEvent.change(agentSelect("DeepSeek Worker"), { target: { value: "claude/deepseek" } });
 
     expect(updatePaneModel).toHaveBeenCalledWith(42, DEEPSEEK_DEFAULT_MODEL, "claude");
+  });
+
+  it("shows the active DeepSeek variant and emits the Flash model after confirmation", () => {
+    const { updatePaneModel } = seedPaneGrid([
+      pane({
+        pane_id: 43,
+        label: "DeepSeek Pro Worker",
+        role: "developer",
+        managed: false,
+        model: DEEPSEEK_PRO_MODEL,
+      }),
+    ]);
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderPaneGrid();
+
+    expect(agentSelect("DeepSeek Pro Worker").value).toBe("claude/deepseek");
+    fireEvent.change(agentSelect("DeepSeek Pro Worker"), {
+      target: { value: "claude/deepseek-flash" },
+    });
+
+    expect(confirm).toHaveBeenCalledWith(expect.stringMatching(
+      /current turn will be interrupted.*fresh prompt context.*history stays visible/i,
+    ));
+    expect(updatePaneModel).toHaveBeenCalledWith(43, DEEPSEEK_FLASH_MODEL, "claude");
+  });
+
+  it("filters Pro and Flash through independent launch-profile policy", () => {
+    seedPaneGrid([
+      pane({ pane_id: 44, label: "Policy Worker", role: "side chat", managed: false }),
+    ]);
+    useStore.setState({
+      sessionId: "policy-session",
+      projectPolicies: {
+        "policy-session": {
+          teamAvailable: false,
+          allowedLaunchProfiles: ["agent:claude:deepseek:deepseek-v4-flash"],
+          version: 3,
+          projectSuspended: false,
+          noncompliantPaneIds: [],
+        },
+      },
+    });
+    renderPaneGrid();
+
+    const select = agentSelect("Policy Worker");
+    expect(optionLabels(select)).toContain("Claude / DeepSeek Flash");
+    expect(optionLabels(select)).not.toContain("Claude / DeepSeek Pro");
   });
 
   it("does not change provider when confirmation is cancelled", () => {

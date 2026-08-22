@@ -285,6 +285,10 @@ pub struct SessionState {
     /// re-attaching web clients — otherwise the indicator vanishes on tab
     /// switch until the CLI next reports status.
     pub pane_statuses: HashMap<u32, (PaneType, String)>,
+    /// When each currently idle pane most recently transitioned out of a
+    /// working status. Kept separately because an absent pane status means
+    /// idle, while the timestamp is needed to rank idle panes by recency.
+    pub pane_idle_since: HashMap<u32, String>,
     /// Cached project_goal.md content (last `ProjectGoalChanged` from CLI).
     /// Replayed to newly-attaching web clients so a hard-refresh doesn't
     /// leave the Project goal textbox empty until the next file change.
@@ -1718,6 +1722,7 @@ impl SessionManager {
             is_paused: false,
             panes: Vec::new(),
             pane_statuses: HashMap::new(),
+            pane_idle_since: HashMap::new(),
             project_goal: None,
             working_dir: None,
             hostname: None,
@@ -1784,6 +1789,7 @@ impl SessionManager {
                 is_paused: false,
                 panes: Vec::new(),
                 pane_statuses: HashMap::new(),
+                pane_idle_since: HashMap::new(),
                 project_goal: None,
                 working_dir,
                 hostname,
@@ -1872,6 +1878,7 @@ impl SessionManager {
             is_paused: false,
             panes: Vec::new(),
             pane_statuses: HashMap::new(),
+            pane_idle_since: HashMap::new(),
             project_goal: None,
             working_dir: None,
             hostname: None,
@@ -1926,6 +1933,7 @@ impl SessionManager {
             is_paused: s.is_paused,
             panes: s.panes.clone(),
             pane_statuses: s.pane_statuses.clone(),
+            pane_idle_since: s.pane_idle_since.clone(),
             project_goal: s.project_goal.clone(),
             working_dir: s.working_dir.clone(),
             hostname: s.hostname.clone(),
@@ -1974,6 +1982,22 @@ impl SessionManager {
     /// Cache pane configurations for a session (from CLI PaneList)
     pub fn set_session_panes(&self, session_id: &Uuid, panes: Vec<PaneConfig>) {
         if let Some(mut session) = self.sessions.get_mut(session_id) {
+            let observed_at = chrono::Utc::now().to_rfc3339();
+            let pane_ids = panes
+                .iter()
+                .map(|pane| pane.pane_id)
+                .collect::<HashSet<_>>();
+            session
+                .pane_idle_since
+                .retain(|pane_id, _| pane_ids.contains(pane_id));
+            for pane in &panes {
+                if !session.pane_statuses.contains_key(&pane.pane_id) {
+                    session
+                        .pane_idle_since
+                        .entry(pane.pane_id)
+                        .or_insert_with(|| observed_at.clone());
+                }
+            }
             session.panes = panes;
         }
     }
@@ -1999,9 +2023,15 @@ impl SessionManager {
             match status {
                 Some(s) => {
                     session.pane_statuses.insert(pane_id, (pane_type, s));
+                    session.pane_idle_since.remove(&pane_id);
                 }
                 None => {
-                    session.pane_statuses.remove(&pane_id);
+                    let was_working = session.pane_statuses.remove(&pane_id).is_some();
+                    if was_working || !session.pane_idle_since.contains_key(&pane_id) {
+                        session
+                            .pane_idle_since
+                            .insert(pane_id, chrono::Utc::now().to_rfc3339());
+                    }
                 }
             }
         }
@@ -2017,6 +2047,14 @@ impl SessionManager {
                     .map(|(pane_id, (pane_type, status))| (*pane_type, *pane_id, status.clone()))
                     .collect()
             })
+            .unwrap_or_default()
+    }
+
+    /// Get idle-transition timestamps for session-list ranking.
+    pub fn get_pane_idle_since(&self, session_id: &Uuid) -> HashMap<u32, String> {
+        self.sessions
+            .get(session_id)
+            .map(|session| session.pane_idle_since.clone())
             .unwrap_or_default()
     }
 
@@ -2378,10 +2416,33 @@ mod tests {
 
         mgr.set_pane_status(&sid, PaneType::Interactive, 11, None);
 
+        let first_idle_since = mgr
+            .get_pane_idle_since(&sid)
+            .get(&11)
+            .cloned()
+            .expect("working-to-idle transition records its time");
+        mgr.set_pane_status(&sid, PaneType::Interactive, 11, None);
+        assert_eq!(
+            mgr.get_pane_idle_since(&sid).get(&11),
+            Some(&first_idle_since),
+            "replaying idle must not make an already-idle pane look newer"
+        );
+
         assert_eq!(
             sorted_pane_statuses(&mgr, &sid),
             vec![(PaneType::Interactive, 22, "Waiting for input".to_string())],
             "None status clears only the matching pane entry"
+        );
+
+        mgr.set_pane_status(
+            &sid,
+            PaneType::Interactive,
+            11,
+            Some("Working again".to_string()),
+        );
+        assert!(
+            !mgr.get_pane_idle_since(&sid).contains_key(&11),
+            "a new working interval clears the previous idle transition"
         );
     }
 

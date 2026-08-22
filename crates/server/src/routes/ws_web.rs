@@ -731,16 +731,50 @@ pub(crate) fn pane_summaries(
     is_active: bool,
 ) -> Vec<shared::MobilePaneSummary> {
     let working = state.sessions.get_pane_statuses(session_id);
+    let idle_since = state.sessions.get_pane_idle_since(session_id);
+    let cli_client_id = state
+        .sessions
+        .get_session(session_id)
+        .and_then(|session| session.cli_client_id);
     state
         .sessions
         .get_session_panes(session_id)
         .into_iter()
-        .map(|pane| shared::MobilePaneSummary {
-            pane_id: pane.pane_id,
-            label: pane.label,
-            kind: pane.kind,
-            provider: pane.provider,
-            is_working: is_active && working.iter().any(|(_, id, _)| *id == pane.pane_id),
+        .map(|pane| {
+            let is_working = is_active && working.iter().any(|(_, id, _)| *id == pane.pane_id);
+            let usage_provider =
+                match pane.provider {
+                    shared::Provider::Claude
+                        if pane.model.as_deref().is_some_and(|model| {
+                            model.to_ascii_lowercase().contains("deepseek")
+                        }) || pane.label.as_deref().is_some_and(|label| {
+                            label.to_ascii_lowercase().contains("deepseek")
+                        }) =>
+                    {
+                        Some(shared::Provider::Deepseek)
+                    }
+                    shared::Provider::Claude
+                    | shared::Provider::Codex
+                    | shared::Provider::Deepseek => Some(pane.provider),
+                    _ => None,
+                };
+            let usage_limited = cli_client_id
+                .zip(usage_provider)
+                .and_then(|(cli_id, provider)| state.sessions.get_usage_limits(&cli_id, provider))
+                .and_then(|limits| limits.usage_limited);
+
+            shared::MobilePaneSummary {
+                pane_id: pane.pane_id,
+                label: pane.label,
+                kind: pane.kind,
+                provider: pane.provider,
+                model: pane.model,
+                is_working,
+                idle_since: (is_active && !is_working)
+                    .then(|| idle_since.get(&pane.pane_id).cloned())
+                    .flatten(),
+                usage_limited,
+            }
         })
         .collect()
 }
@@ -1210,6 +1244,47 @@ mod retired_launch_authorization_tests {
             .await
         );
         assert!(web_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn deepseek_variants_are_authorized_exactly_and_unknown_ids_are_rejected() {
+        let (state, connection_id, session_id, mut web_rx, _cli_rx, _cli_id) = policy_state().await;
+
+        for model in [
+            shared::DEEPSEEK_PRO_MODEL,
+            shared::DEEPSEEK_FLASH_MODEL,
+        ] {
+            assert!(
+                authorize_profile_launch(
+                    &state,
+                    &connection_id,
+                    &session_id,
+                    shared::PaneKind::Agent,
+                    shared::Provider::Claude,
+                    Some(model),
+                    false,
+                )
+                .await
+            );
+        }
+        assert!(web_rx.try_recv().is_err());
+
+        assert!(
+            !authorize_profile_launch(
+                &state,
+                &connection_id,
+                &session_id,
+                shared::PaneKind::Agent,
+                shared::Provider::Claude,
+                Some("deepseek-chat"),
+                false,
+            )
+            .await
+        );
+        let ServerToWeb::Error { message } = web_rx.try_recv().expect("explicit web error") else {
+            panic!("expected policy error")
+        };
+        assert!(message.contains("deepseek-chat"), "{message}");
     }
 
     #[tokio::test]

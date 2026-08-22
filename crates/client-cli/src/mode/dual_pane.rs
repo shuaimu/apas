@@ -694,7 +694,56 @@ fn provider_config_key(provider: &Provider, model: Option<&str>) -> &'static str
 const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com/anthropic";
 // Keep in sync with packages/web/src/lib/providerOptions.ts; the
 // `deepseek_default_model_matches_web_provider_options` test guards drift.
-const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-v4-pro";
+const DEEPSEEK_DEFAULT_MODEL: &str = shared::DEEPSEEK_DEFAULT_MODEL;
+const DEEPSEEK_PRO_RUNTIME_MODEL: &str = "deepseek-v4-pro[1m]";
+
+fn selected_deepseek_model(
+    provider: &Provider,
+    model: Option<&str>,
+) -> Result<Option<&'static str>, String> {
+    let model = model.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(model) = model {
+        if let Some(canonical) = shared::canonical_deepseek_model(model) {
+            return Ok(Some(canonical));
+        }
+        if matches!(provider, Provider::Deepseek) || is_deepseek_model(Some(model)) {
+            return Err(format!(
+                "Unsupported DeepSeek model '{model}'. Supported models are {} and {}.",
+                shared::DEEPSEEK_PRO_MODEL,
+                shared::DEEPSEEK_FLASH_MODEL,
+            ));
+        }
+    } else if matches!(provider, Provider::Deepseek) {
+        return Ok(Some(shared::DEEPSEEK_DEFAULT_MODEL));
+    }
+    Ok(None)
+}
+
+fn canonicalize_requested_model(model: Option<&str>) -> Option<String> {
+    model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(|model| {
+            shared::canonical_deepseek_model(model)
+                .unwrap_or(model)
+                .to_string()
+        })
+}
+
+fn model_switch_can_use_fast_path(
+    current_provider: Provider,
+    current_model: Option<&str>,
+    requested_provider: Provider,
+    requested_model: Option<&str>,
+) -> bool {
+    matches!(current_provider, Provider::Claude)
+        && matches!(requested_provider, Provider::Claude)
+        && !is_deepseek_model(current_model)
+        && !is_deepseek_model(requested_model)
+        && !shared::is_retired_model(current_model)
+        && !shared::is_retired_model(requested_model)
+        && requested_model.is_some()
+}
 
 fn trim_to_option(raw: Option<String>) -> Option<String> {
     raw.and_then(|value| {
@@ -993,49 +1042,43 @@ fn build_pane_env_overrides_from_keys(
     if !matches!(provider, Provider::Claude | Provider::Deepseek) {
         return Ok(Vec::new());
     }
-    let is_deepseek = matches!(provider, Provider::Deepseek) || is_deepseek_model(model);
-    if !is_deepseek {
+    let Some(primary_model) = selected_deepseek_model(provider, model)? else {
         return Ok(Vec::new());
-    }
+    };
 
     let api_base_url = DEEPSEEK_API_BASE_URL.to_string();
     let api_key = deepseek_api_key;
     let missing_key_message = "DeepSeek backend is not configured (missing deepseek_api_key). Update it on the Machines page or run: apas config set deepseek_api_key <key>.".to_string();
     let api_key = api_key.ok_or(missing_key_message)?;
 
-    let mut env = vec![
+    let primary_runtime_model = if primary_model == shared::DEEPSEEK_PRO_MODEL {
+        DEEPSEEK_PRO_RUNTIME_MODEL
+    } else {
+        shared::DEEPSEEK_FLASH_MODEL
+    };
+    let env = vec![
         ("ANTHROPIC_BASE_URL".to_string(), api_base_url),
         // Keep both names for compatibility across Claude CLI versions/wrappers.
         ("ANTHROPIC_AUTH_TOKEN".to_string(), api_key.clone()),
         ("ANTHROPIC_API_KEY".to_string(), api_key),
-    ];
-    if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
-        // Claude CLI's pre-flight model check rejects non-Claude names set
-        // via ANTHROPIC_MODEL before the request reaches the DeepSeek bridge.
-        for variable in [
-            "ANTHROPIC_DEFAULT_SONNET_MODEL",
-            "ANTHROPIC_DEFAULT_OPUS_MODEL",
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-        ] {
-            env.push((variable.to_string(), model.to_string()));
-        }
-    } else {
-        // No explicit model — pin the alias mapping to the default
-        // chat model so Claude CLI's pre-flight check sees valid
-        // sonnet/opus/haiku targets.
-        env.push((
+        ("ANTHROPIC_MODEL".to_string(), primary_runtime_model.to_string()),
+        (
             "ANTHROPIC_DEFAULT_SONNET_MODEL".to_string(),
-            DEEPSEEK_DEFAULT_MODEL.to_string(),
-        ));
-        env.push((
+            DEEPSEEK_PRO_RUNTIME_MODEL.to_string(),
+        ),
+        (
             "ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(),
-            DEEPSEEK_DEFAULT_MODEL.to_string(),
-        ));
-        env.push((
+            DEEPSEEK_PRO_RUNTIME_MODEL.to_string(),
+        ),
+        (
             "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
-            DEEPSEEK_DEFAULT_MODEL.to_string(),
-        ));
-    }
+            shared::DEEPSEEK_FLASH_MODEL.to_string(),
+        ),
+        (
+            "CLAUDE_CODE_SUBAGENT_MODEL".to_string(),
+            shared::DEEPSEEK_FLASH_MODEL.to_string(),
+        ),
+    ];
     Ok(env)
 }
 
@@ -1133,6 +1176,7 @@ fn spawn_terminal_pane(
     // path exact instead of guessed.
     claude_session_id: Uuid,
     provider: &Provider,
+    model: Option<&str>,
     binary_path: &str,
     working_dir: &str,
     worktree_path: Option<&str>,
@@ -1143,12 +1187,12 @@ fn spawn_terminal_pane(
     terminal_binary_for(provider).ok_or_else(|| {
         format!(
             "[{} cannot host a terminal pane; only claude, codex, and opencode are supported]",
-            provider_display_name(provider, None)
+            provider_display_name(provider, model)
         )
     })?;
     let binary_path = resolve_terminal_binary(provider, binary_path)?;
     let cwd = worktree_path.unwrap_or(working_dir);
-    let env = build_pane_env_overrides(provider, None)?;
+    let env = build_pane_env_overrides(provider, model)?;
 
     let handle = TerminalRuntimeHandle::spawn(
         pane_id,
@@ -1927,8 +1971,9 @@ async fn run_inner(
         mpsc::Receiver<PaneInput>,
         Arc<Mutex<Option<std::process::Child>>>,
     )> = Vec::new();
-    // (pane_id, provider, worktree_path) for pty-hosted terminal panes.
-    let mut terminal_startups: Vec<(u32, Provider, Uuid, Option<String>)> = Vec::new();
+    // (pane_id, provider, model, pane_session_id, worktree_path) for pty-hosted terminal panes.
+    let mut terminal_startups: Vec<(u32, Provider, Option<String>, Uuid, Option<String>)> =
+        Vec::new();
     {
         let mut pauses = pane_pauses.lock().unwrap();
         let mut stop_requests = pane_stop_requests.lock().unwrap();
@@ -2007,6 +2052,7 @@ async fn run_inner(
                 terminal_startups.push((
                     *pane_id,
                     *provider,
+                    tab_model.clone(),
                     *pane_session_id,
                     tab_worktree.clone(),
                 ));
@@ -2057,10 +2103,10 @@ async fn run_inner(
     // survive the restart, so re-exec the provider and resume its conversation
     // (claude `--resume <pane session id>` / codex `resume` / opencode
     // `--continue`).
-    for (pane_id, provider, pane_session_id, worktree) in &terminal_startups {
+    for (pane_id, provider, model, pane_session_id, worktree) in &terminal_startups {
         let binary_path = resolve_pane_binary_path(
             *provider,
-            None,
+            model.as_deref(),
             &claude_path,
             &codex_path,
             &opencode_path,
@@ -2072,6 +2118,7 @@ async fn run_inner(
             session_id,
             *pane_session_id,
             provider,
+            model.as_deref(),
             &binary_path,
             &working_dir_str,
             worktree.as_deref(),
@@ -2550,6 +2597,8 @@ async fn run_inner(
         let project_for_turns = std::path::PathBuf::from(working_dir_str.clone());
         let metas_for_turns = pane_metas.clone();
         let sessions_for_turns = pane_sessions.clone();
+        #[cfg(target_os = "linux")]
+        let terminal_panes_for_turns = terminal_panes.clone();
         let opencode_for_turns = opencode_path.clone();
         // Only panes restored above should suppress their existing history.
         // A pane created after this snapshot must capture from turn zero even
@@ -2571,6 +2620,10 @@ async fn run_inner(
             // change from applying an old file's cursor to a new transcript.
             let mut seen: HashMap<u32, (String, usize)> = HashMap::new();
             let mut seen_completions: HashMap<u32, usize> = HashMap::new();
+            // Once a process-owned codex rollout is found, keep following it
+            // through brief descriptor gaps. A newly observed open user
+            // rollout replaces it when the TUI resumes or forks a session.
+            let mut codex_paths: HashMap<u32, std::path::PathBuf> = HashMap::new();
             // Per-pane claude transcript watch state (growth + idle tracking
             // for in-TUI session-switch detection).
             let mut claude_watch: HashMap<u32, ClaudeWatchState> = HashMap::new();
@@ -2578,23 +2631,38 @@ async fn run_inner(
                 thread::sleep(Duration::from_secs(3));
 
                 // Snapshot terminal panes: (pane_id, provider, conversation
-                // id, actual terminal cwd override).
-                let panes: Vec<(u32, Provider, Uuid, Option<String>)> = {
+                // id, actual terminal cwd override, provider process group).
+                let panes: Vec<(u32, Provider, Uuid, Option<String>, Option<i32>)> = {
                     let Ok(metas) = metas_for_turns.lock() else {
                         continue;
                     };
                     let sessions = sessions_for_turns.lock().ok();
+                    #[cfg(target_os = "linux")]
+                    let runtimes = terminal_panes_for_turns.lock().ok();
                     metas
                         .iter()
                         .filter(|(_, m)| m.kind.is_terminal())
                         .filter_map(|(id, m)| {
                             let sid = sessions.as_ref()?.get(id).copied()?;
-                            Some((*id, m.provider.clone(), sid, m.worktree_path.clone()))
+                            #[cfg(target_os = "linux")]
+                            let process_group_id = runtimes
+                                .as_ref()
+                                .and_then(|runtimes| runtimes.get(id))
+                                .and_then(TerminalRuntimeHandle::process_group_id);
+                            #[cfg(not(target_os = "linux"))]
+                            let process_group_id = None;
+                            Some((
+                                *id,
+                                m.provider.clone(),
+                                sid,
+                                m.worktree_path.clone(),
+                                process_group_id,
+                            ))
                         })
                         .collect()
                 };
 
-                for (pane_id, provider, conv_id, worktree_path) in panes {
+                for (pane_id, provider, conv_id, worktree_path, process_group_id) in panes {
                     let transcript_cwd =
                         terminal_transcript_cwd(&project_for_turns, worktree_path.as_deref());
                     let (source, turns) = match provider {
@@ -2602,11 +2670,44 @@ async fn run_inner(
                             let Some(home) = home.as_deref() else {
                                 continue;
                             };
-                            // No flag pins a codex session id, so match on cwd.
-                            let Some(path) =
-                                crate::transcript::find_codex_rollout(home, &transcript_cwd)
-                            else {
-                                continue;
+                            #[cfg(target_os = "linux")]
+                            let process_path = process_group_id.and_then(|group| {
+                                crate::transcript::find_codex_rollout_for_process_group(
+                                    home,
+                                    &transcript_cwd,
+                                    group,
+                                )
+                            });
+                            #[cfg(not(target_os = "linux"))]
+                            let process_path: Option<std::path::PathBuf> = {
+                                let _ = process_group_id;
+                                None
+                            };
+
+                            let path = if let Some(path) = process_path {
+                                codex_paths.insert(pane_id, path.clone());
+                                path
+                            } else if let Some(path) = codex_paths.get(&pane_id) {
+                                path.clone()
+                            } else {
+                                #[cfg(target_os = "linux")]
+                                {
+                                    // Wait for codex to open this process's
+                                    // rollout. Falling back to cwd here is the
+                                    // cross-pane mismatch this path prevents.
+                                    continue;
+                                }
+                                #[cfg(not(target_os = "linux"))]
+                                {
+                                    let Some(path) = crate::transcript::find_codex_rollout(
+                                        home,
+                                        &transcript_cwd,
+                                    ) else {
+                                        continue;
+                                    };
+                                    codex_paths.insert(pane_id, path.clone());
+                                    path
+                                }
                             };
                             let Ok(turns) = crate::transcript::read_turns(&path, pane_id, true)
                             else {
@@ -3279,6 +3380,7 @@ fn handle_tui_events(
                         session_id,
                         claude_session_id,
                         &provider,
+                        model.as_deref(),
                         &binary_path,
                         working_dir,
                         worktree_path.as_deref(),
@@ -5102,17 +5204,19 @@ mod tests {
         active_usage_providers, auto_cancel_pending_questions_for_new_input,
         boot_restore_try_resume_first, build_agent_args, build_agent_switch_respawn_event,
         build_deadloop_agent_args, build_pane_env_overrides_from_keys, build_pane_list,
-        build_pane_reboot_events, build_user_envelope_line, convert_opencode_to_claude,
+        build_pane_reboot_events, build_user_envelope_line, canonicalize_requested_model,
+        convert_opencode_to_claude,
         deadloop_wait_plan, evaluate_deadloop_watchdog, is_codex_stale_session_error,
-        manual_create_pr_worktree_path, normalize_codex_effort, normalize_effort_level,
-        reset_deadloop_codex_stale_session, resolve_pane_binary_path, resolve_terminal_binary,
+        manual_create_pr_worktree_path, model_switch_can_use_fast_path, normalize_codex_effort,
+        normalize_effort_level, reset_deadloop_codex_stale_session, resolve_pane_binary_path,
+        resolve_terminal_binary,
         restored_pane_mode_and_pause, retired_launch_rejection_output, route_web_input_to_pane,
         run_deadloop_session_inner, save_pane_configs, should_recover_deadloop_stale_session,
         start_bot_preserved_fields, stop_retired_panes, terminal_state_reports,
         truncate_str_at_char_boundary, update_project_operations, DeadloopWatchdogDecision,
         DeadloopWatchdogState, InputChannels, PaneInputRouteResult, PaneMeta, PaneMetas,
         PanePauses, PaneStopRequests, PendingAskQuestion, ASK_USER_QUESTION_AUTO_CANCEL_STATUS,
-        DEEPSEEK_DEFAULT_MODEL,
+        DEEPSEEK_DEFAULT_MODEL, DEEPSEEK_PRO_RUNTIME_MODEL,
     };
     use crate::project::{get_or_create_project, save_project};
     use crate::terminal_pane::TerminalPanes;
@@ -5251,8 +5355,14 @@ mod tests {
         let web_default =
             extract_ts_string_const(WEB_PROVIDER_OPTIONS_TS, "DEEPSEEK_DEFAULT_MODEL")
                 .expect("web providerOptions.ts exports DEEPSEEK_DEFAULT_MODEL");
+        let web_pro = extract_ts_string_const(WEB_PROVIDER_OPTIONS_TS, "DEEPSEEK_PRO_MODEL")
+            .expect("web providerOptions.ts exports DEEPSEEK_PRO_MODEL");
+        let web_flash = extract_ts_string_const(WEB_PROVIDER_OPTIONS_TS, "DEEPSEEK_FLASH_MODEL")
+            .expect("web providerOptions.ts exports DEEPSEEK_FLASH_MODEL");
 
         assert_eq!(DEEPSEEK_DEFAULT_MODEL, web_default);
+        assert_eq!(shared::DEEPSEEK_PRO_MODEL, web_pro);
+        assert_eq!(shared::DEEPSEEK_FLASH_MODEL, web_flash);
     }
 
     #[test]
@@ -5919,19 +6029,20 @@ mod tests {
     }
 
     #[test]
-    fn provider_switch_respawn_event_uses_fresh_session_and_disables_resume() {
+    fn deepseek_model_switch_respawns_with_canonical_model_and_fresh_session() {
         let previous_session = Uuid::from_u128(1);
         let fresh_session = Uuid::from_u128(2);
+        let canonical_model = canonicalize_requested_model(Some("DeepSeek-V4-Flash"));
 
         let event = build_agent_switch_respawn_event(
             42,
             "Developer".to_string(),
             fresh_session,
             shared::PaneMode::Deadloop,
-            Provider::Codex,
+            Provider::Claude,
             Some("keep going".to_string()),
             Some(3),
-            Some("gpt-5-codex".to_string()),
+            canonical_model,
             None,
             Some("/tmp/apas-dev".to_string()),
             Some("developer".to_string()),
@@ -5955,8 +6066,8 @@ mod tests {
 
         assert_ne!(claude_session_id, previous_session);
         assert_eq!(claude_session_id, fresh_session);
-        assert_eq!(provider, Provider::Codex);
-        assert_eq!(model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(provider, Provider::Claude);
+        assert_eq!(model.as_deref(), Some(shared::DEEPSEEK_FLASH_MODEL));
         assert!(initial_input.is_none());
         assert!(!try_resume_first);
 
@@ -5970,9 +6081,32 @@ mod tests {
             try_resume_first,
         );
         assert!(!using_resume);
-        assert_eq!(args.get(0).map(String::as_str), Some("exec"));
-        assert_ne!(args.get(1).map(String::as_str), Some("resume"));
-        assert!(!args.iter().any(|arg| arg == &fresh_session.to_string()));
+        assert!(!args.iter().any(|arg| arg == "--resume"));
+        assert!(args.iter().any(|arg| arg == "--session-id"));
+        assert!(args.iter().any(|arg| arg == &fresh_session.to_string()));
+        assert!(!args.iter().any(|arg| arg == &previous_session.to_string()));
+    }
+
+    #[test]
+    fn deepseek_pro_flash_switch_cannot_use_live_model_path() {
+        assert!(!model_switch_can_use_fast_path(
+            Provider::Claude,
+            Some(shared::DEEPSEEK_PRO_MODEL),
+            Provider::Claude,
+            Some(shared::DEEPSEEK_FLASH_MODEL),
+        ));
+        assert!(!model_switch_can_use_fast_path(
+            Provider::Claude,
+            Some(shared::DEEPSEEK_FLASH_MODEL),
+            Provider::Claude,
+            Some(shared::DEEPSEEK_PRO_MODEL),
+        ));
+        assert!(model_switch_can_use_fast_path(
+            Provider::Claude,
+            Some("claude-sonnet-4-6"),
+            Provider::Claude,
+            Some("claude-opus-4-6"),
+        ));
     }
 
     #[test]
@@ -6597,7 +6731,7 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_env_overrides_use_claude_runtime_bridge_defaults() {
+    fn deepseek_pro_env_pins_primary_and_routes_small_work_to_flash() {
         let env = build_pane_env_overrides_from_keys(
             &Provider::Deepseek,
             None,
@@ -6615,23 +6749,30 @@ mod tests {
         );
         assert_eq!(get("ANTHROPIC_API_KEY"), Some("sk-deepseek"));
         assert_eq!(get("ANTHROPIC_AUTH_TOKEN"), Some("sk-deepseek"));
+        assert_eq!(get("ANTHROPIC_MODEL"), Some(DEEPSEEK_PRO_RUNTIME_MODEL));
         assert_eq!(
             get("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-            Some("deepseek-v4-pro")
+            Some(DEEPSEEK_PRO_RUNTIME_MODEL)
         );
-        assert_eq!(get("ANTHROPIC_DEFAULT_OPUS_MODEL"), Some("deepseek-v4-pro"));
+        assert_eq!(
+            get("ANTHROPIC_DEFAULT_OPUS_MODEL"),
+            Some(DEEPSEEK_PRO_RUNTIME_MODEL)
+        );
         assert_eq!(
             get("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-            Some("deepseek-v4-pro")
+            Some(shared::DEEPSEEK_FLASH_MODEL)
         );
-        assert_eq!(get("ANTHROPIC_MODEL"), None);
+        assert_eq!(
+            get("CLAUDE_CODE_SUBAGENT_MODEL"),
+            Some(shared::DEEPSEEK_FLASH_MODEL)
+        );
     }
 
     #[test]
-    fn deepseek_model_hint_on_claude_provider_uses_deepseek_env() {
+    fn deepseek_flash_env_pins_flash_primary_with_shared_credentials() {
         let env = build_pane_env_overrides_from_keys(
             &Provider::Claude,
-            Some("deepseek-chat"),
+            Some(shared::DEEPSEEK_FLASH_MODEL),
             Some("sk-deepseek".to_string()),
         )
         .unwrap();
@@ -6645,10 +6786,39 @@ mod tests {
             Some("https://api.deepseek.com/anthropic")
         );
         assert_eq!(get("ANTHROPIC_API_KEY"), Some("sk-deepseek"));
-        assert_eq!(get("ANTHROPIC_DEFAULT_SONNET_MODEL"), Some("deepseek-chat"));
-        assert_eq!(get("ANTHROPIC_DEFAULT_OPUS_MODEL"), Some("deepseek-chat"));
-        assert_eq!(get("ANTHROPIC_DEFAULT_HAIKU_MODEL"), Some("deepseek-chat"));
-        assert_eq!(get("ANTHROPIC_MODEL"), None);
+        assert_eq!(get("ANTHROPIC_MODEL"), Some(shared::DEEPSEEK_FLASH_MODEL));
+        assert_eq!(
+            get("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+            Some(DEEPSEEK_PRO_RUNTIME_MODEL)
+        );
+        assert_eq!(
+            get("ANTHROPIC_DEFAULT_OPUS_MODEL"),
+            Some(DEEPSEEK_PRO_RUNTIME_MODEL)
+        );
+        assert_eq!(
+            get("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+            Some(shared::DEEPSEEK_FLASH_MODEL)
+        );
+        assert_eq!(
+            get("CLAUDE_CODE_SUBAGENT_MODEL"),
+            Some(shared::DEEPSEEK_FLASH_MODEL)
+        );
+    }
+
+    #[test]
+    fn deepseek_env_rejects_unknown_models_before_upstream_fallback() {
+        for (provider, model) in [
+            (Provider::Claude, "deepseek-chat"),
+            (Provider::Deepseek, "sonnet"),
+        ] {
+            let err = build_pane_env_overrides_from_keys(
+                &provider,
+                Some(model),
+                Some("sk-deepseek".to_string()),
+            )
+            .unwrap_err();
+            assert!(err.contains("Unsupported DeepSeek model"), "{err}");
+        }
     }
 
     #[test]
@@ -12760,11 +12930,9 @@ async fn run_server_connection(
                                                 //        swaps. Chat history stays visible on the
                                                 //        client but is not in the new agent's
                                                 //        prompt.
-                                                let trimmed = model
-                                                    .as_deref()
-                                                    .map(str::trim)
-                                                    .filter(|s| !s.is_empty())
-                                                    .map(str::to_string);
+                                                let trimmed = canonicalize_requested_model(
+                                                    model.as_deref(),
+                                                );
 
                                                 let retired = pane_metas
                                                     .lock()
@@ -12822,24 +12990,17 @@ async fn run_server_connection(
                                                         Some(m) => m,
                                                         None => break 'fast false,
                                                     };
-                                                    let will_stay_claude = matches!(
-                                                        provider.unwrap_or(meta.provider),
-                                                        shared::Provider::Claude,
-                                                    ) && matches!(meta.provider, shared::Provider::Claude);
-                                                    let old_backend_swap = is_deepseek_model(meta.model.as_deref())
-                                                        || shared::is_retired_model(meta.model.as_deref());
-                                                    let new_backend_swap = is_deepseek_model(trimmed.as_deref())
-                                                        || shared::is_retired_model(trimmed.as_deref());
                                                     // Only attempt live swap when the pane stays on
                                                     // provider=Claude, neither side is a backend
                                                     // swap, and the user picked an explicit new
                                                     // model (clearing to default has no clean
                                                     // apply_flag_settings verb, so respawn instead).
-                                                    if !(will_stay_claude
-                                                        && !old_backend_swap
-                                                        && !new_backend_swap
-                                                        && trimmed.is_some())
-                                                    {
+                                                    if !model_switch_can_use_fast_path(
+                                                        meta.provider,
+                                                        meta.model.as_deref(),
+                                                        provider.unwrap_or(meta.provider),
+                                                        trimmed.as_deref(),
+                                                    ) {
                                                         break 'fast false;
                                                     }
                                                     let control_tx = meta

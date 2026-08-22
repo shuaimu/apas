@@ -11,6 +11,7 @@ use shared::{Provider, TerminalLifecycle};
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
+use std::net::Shutdown;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -890,7 +891,14 @@ fn serve_controller(
     }
 
     stream.set_read_timeout(None)?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    // The controller deliberately applies backpressure while its bounded
+    // server queue is full (most visibly while apas-server is restarting).
+    // A write timeout here mistakes that healthy-but-stalled controller for a
+    // dead one, drops the lease, and eventually kills the provider. Leave the
+    // output side blocking: HostedProcess drains the PTY on its own thread and
+    // retains a bounded ring, while the command reader below remains able to
+    // accept input, resize, detach, and shutdown frames.
+    stream.set_write_timeout(None)?;
     let connected = Arc::new(AtomicBool::new(true));
     let reboot = Arc::new(AtomicBool::new(reboot_detach));
     let mut reader = stream.try_clone()?;
@@ -931,6 +939,11 @@ fn serve_controller(
             }
         }
         connected_for_reader.store(false, Ordering::SeqCst);
+        // With an intentionally unbounded output write, a detach/shutdown (or
+        // a controller crash noticed by this reader) must wake the writer in
+        // `serve_controller`. Shutting down either clone affects the shared
+        // socket and makes the blocked write return immediately.
+        let _ = reader.shutdown(Shutdown::Both);
     });
 
     let mut sent_state = (lifecycle, status);
@@ -1384,6 +1397,73 @@ mod tests {
     }
 
     #[test]
+    fn slow_controller_does_not_forfeit_the_provider_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let (runtime_dir, descriptor, credential) = test_runtime(&root, 23);
+        let provider = root.path().join("chatty-provider.sh");
+        fs::write(
+            &provider,
+            b"#!/bin/sh\nhead -c 2097152 /dev/zero\nprintf '\\nready\\n'\nwhile IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+        let host_dir = runtime_dir.clone();
+        let host = thread::spawn(move || {
+            run_host_with_grace(host_dir, Duration::from_secs(15), Duration::from_secs(2)).unwrap()
+        });
+
+        let mut stream =
+            connect_with_retry(&descriptor.socket_path, Duration::from_secs(3)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        assert!(matches!(
+            create_test_process(&mut stream, &descriptor, &credential, &provider),
+            HostToController::Adopted { .. }
+        ));
+
+        // A server restart can stop the controller from draining terminal
+        // frames while its bounded outbound queue fills. Two MiB is well over
+        // a Unix socket's send buffer; the old five-second write timeout
+        // therefore detached this otherwise-live controller and started the
+        // provider's lease-expiry clock.
+        thread::sleep(Duration::from_millis(5_500));
+        write_frame(
+            &mut stream,
+            &ControllerToHost::Input {
+                data: b"still-alive\n".to_vec(),
+            },
+        )
+        .expect("a slow reader must remain the active controller");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut echoed = false;
+        while Instant::now() < deadline {
+            match read_frame::<HostToController>(&mut stream) {
+                Ok(HostToController::Output { data, .. })
+                    if data
+                        .windows(b"echo:still-alive".len())
+                        .any(|window| window == b"echo:still-alive") =>
+                {
+                    echoed = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(
+            echoed,
+            "provider stopped responding after controller backpressure"
+        );
+
+        write_frame(&mut stream, &ControllerToHost::Shutdown).unwrap();
+        drop(stream);
+        host.join().unwrap();
+        assert!(!runtime_dir.exists());
+    }
+
+    #[test]
     fn detached_lease_expiry_kills_the_complete_provider_process_group() {
         let root = tempfile::tempdir().unwrap();
         let (runtime_dir, descriptor, credential) = test_runtime(&root, 22);
@@ -1493,7 +1573,10 @@ mod tests {
         // One pane closing must not take the project directory with it — its
         // sibling is still hosted there.
         terminate_tmux_host(&desc(&first, 1)).unwrap();
-        assert!(!first.dir.exists(), "closed pane's directory should be gone");
+        assert!(
+            !first.dir.exists(),
+            "closed pane's directory should be gone"
+        );
         assert!(
             project_dir.exists(),
             "project directory must survive while another pane is hosted"

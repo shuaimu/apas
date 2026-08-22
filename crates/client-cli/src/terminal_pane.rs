@@ -14,10 +14,11 @@
 //! approval prompt, and agent panes already launch with the same bypass. See
 //! [`permission_bypass_flag_for`].
 //!
-//! The cost is that a terminal pane has none of the structured
-//! integrations: no usage counters, no pane status, no diffs, no plan
-//! review, no scratchpad publishing, and it is never a Tech Lead
-//! delegation target. See the `PaneKind` docs in `shared`.
+//! Provider output still has none of the headless path's structured events.
+//! APAS reconstructs conversation, usage, and coarse working/idle state from
+//! provider transcripts, while git supplies diffs independently. Fine-grained
+//! tool status and plan review remain unavailable. See the `PaneKind` docs in
+//! `shared`.
 //!
 //! Lifetime: the pty is a child of the CLI process, so a terminal pane
 //! dies when `apas` restarts. [`TerminalHandle::spawn`] therefore re-execs the
@@ -140,6 +141,18 @@ impl TerminalRuntimeHandle {
         }
     }
 
+    /// Process group that owns this pane's provider TUI.
+    ///
+    /// On Linux the transcript watcher uses this to identify the exact codex
+    /// rollout among several panes running in the same working directory.
+    #[cfg(target_os = "linux")]
+    pub fn process_group_id(&self) -> Option<i32> {
+        match self {
+            Self::Direct(handle) => handle.process_group_id(),
+            Self::Hosted(handle) => handle.process_group_id(),
+        }
+    }
+
     pub fn state_message(&self, session_id: Uuid) -> CliToServer {
         match self {
             Self::Direct(handle) => handle.state_message(session_id),
@@ -186,6 +199,7 @@ impl TerminalRuntimeHandle {
 pub struct HostedTerminalHandle {
     pane_id: u32,
     instance_id: Uuid,
+    process_group_id: Option<i32>,
     descriptor: crate::pane_host::RuntimeDescriptor,
     stream: Arc<Mutex<UnixStream>>,
     lifecycle: Arc<Mutex<(TerminalLifecycle, Option<String>)>>,
@@ -317,6 +331,7 @@ impl HostedTerminalHandle {
             protocol_version,
             runtime_id,
             instance_id,
+            process_group_id,
             lifecycle,
             status,
             oldest_seq,
@@ -349,6 +364,7 @@ impl HostedTerminalHandle {
         let handle = Self {
             pane_id: descriptor.pane_id,
             instance_id,
+            process_group_id,
             descriptor,
             stream: Arc::new(Mutex::new(stream)),
             lifecycle: lifecycle_state,
@@ -448,6 +464,36 @@ impl HostedTerminalHandle {
                     Err(error) => {
                         if !shutting_down.load(Ordering::Relaxed) {
                             tracing::info!(pane_id, %error, "pane-host controller detached");
+                            let status =
+                                Some(format!("pane-host controller disconnected: {error}"));
+                            let should_report = lifecycle
+                                .lock()
+                                .map(|mut state| {
+                                    if state.0 == TerminalLifecycle::Exited {
+                                        false
+                                    } else {
+                                        *state = (TerminalLifecycle::Disconnected, status.clone());
+                                        true
+                                    }
+                                })
+                                .unwrap_or(true);
+                            if should_report {
+                                let metadata = runtime.lock().map(|value| value.clone()).ok();
+                                // The host socket is already gone, so waiting
+                                // for the server channel cannot backpressure
+                                // the host. Retaining this state in the channel
+                                // also makes a reconnect report the pane as
+                                // disconnected rather than silently leaving
+                                // its last Running/idle view.
+                                let _ = server_tx.blocking_send(CliToServer::TerminalState {
+                                    session_id,
+                                    pane_id,
+                                    instance_id: Some(instance_id),
+                                    lifecycle: TerminalLifecycle::Disconnected,
+                                    status,
+                                    runtime: metadata,
+                                });
+                            }
                         }
                         break;
                     }
@@ -483,6 +529,11 @@ impl HostedTerminalHandle {
 
     pub fn runtime_id(&self) -> Uuid {
         self.descriptor.runtime_id
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn process_group_id(&self) -> Option<i32> {
+        self.process_group_id
     }
 
     pub fn state_message(&self, session_id: Uuid) -> CliToServer {
@@ -906,9 +957,13 @@ impl TerminalHandle {
         self.instance_id
     }
 
-    #[cfg(test)]
-    pub fn provider_pid(&self) -> Option<u32> {
+    pub(crate) fn provider_pid(&self) -> Option<u32> {
         self.child.lock().ok().and_then(|child| child.process_id())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn process_group_id(&self) -> Option<i32> {
+        self.provider_pid().and_then(|pid| i32::try_from(pid).ok())
     }
 
     /// Reconcile the child before reporting cached lifecycle. Usually the
@@ -1245,6 +1300,95 @@ mod tests {
             assert_ne!(first_id, second.instance_id());
             first.shutdown();
             second.shutdown();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hosted_controller_disconnect_is_retained_and_reported() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (controller, peer) = UnixStream::pair().unwrap();
+            let reader = controller.try_clone().unwrap();
+            let session_id = Uuid::new_v4();
+            let instance_id = Uuid::new_v4();
+            let runtime_id = Uuid::new_v4();
+            let descriptor = crate::pane_host::RuntimeDescriptor {
+                protocol_version: crate::pane_host::HOST_PROTOCOL_VERSION,
+                project_id: session_id,
+                pane_id: 41,
+                runtime_id,
+                instance_id,
+                owner_uid: unsafe { libc::getuid() },
+                controller_generation: 1,
+                controller_id: Some(Uuid::new_v4()),
+                session_name: "missing-test-host".to_string(),
+                socket_path: root.path().join("c.sock"),
+                credential_path: root.path().join("credential"),
+                created_at_unix_ms: 1,
+            };
+            let lifecycle = Arc::new(Mutex::new((TerminalLifecycle::Running, None)));
+            let handle = HostedTerminalHandle {
+                pane_id: 41,
+                instance_id,
+                process_group_id: None,
+                descriptor,
+                stream: Arc::new(Mutex::new(controller)),
+                lifecycle: lifecycle.clone(),
+                runtime: Arc::new(Mutex::new(shared::TerminalRuntimeReconciliation {
+                    runtime_id: Some(runtime_id),
+                    ..Default::default()
+                })),
+                shutting_down: Arc::new(AtomicBool::new(false)),
+            };
+            let (tx, mut rx) = tokio_mpsc::channel(4);
+            handle.start_reader(session_id, reader, tx);
+            drop(peer);
+
+            let mut disconnected = None;
+            for _ in 0..2 {
+                let message = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("hosted reader did not report disconnect")
+                    .expect("terminal state channel closed");
+                if let CliToServer::TerminalState {
+                    pane_id,
+                    instance_id: reported_instance,
+                    lifecycle: TerminalLifecycle::Disconnected,
+                    status,
+                    runtime,
+                    ..
+                } = message
+                {
+                    disconnected = Some((pane_id, reported_instance, status, runtime));
+                }
+            }
+
+            let (pane_id, reported_instance, status, runtime) =
+                disconnected.expect("disconnect remained indistinguishable from idle");
+            assert_eq!(pane_id, 41);
+            assert_eq!(reported_instance, Some(instance_id));
+            assert!(status
+                .as_deref()
+                .is_some_and(|status| status.contains("controller disconnected")));
+            assert_eq!(
+                runtime.and_then(|runtime| runtime.runtime_id),
+                Some(runtime_id)
+            );
+            assert!(lifecycle
+                .lock()
+                .is_ok_and(|state| state.0 == TerminalLifecycle::Disconnected));
+            assert!(matches!(
+                handle.state_message(session_id),
+                CliToServer::TerminalState {
+                    lifecycle: TerminalLifecycle::Disconnected,
+                    ..
+                }
+            ));
         });
     }
 

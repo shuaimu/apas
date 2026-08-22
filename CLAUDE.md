@@ -817,10 +817,12 @@ otherwise have had to volunteer.
   chosen by the agent. Never substitute `--continue`: it can select another
   pane's most recent cwd conversation and silently disconnect terminal output
   from APAS's transcript watcher.
-- **codex** — has no equivalent flag. Its rollout files record `cwd` and a
-  start timestamp in `session_meta`, so a pane is matched to the newest rollout
-  in its own directory. That is a heuristic; two codex panes in the same
-  directory could in principle be confused.
+- **codex** — has no equivalent flag. On Linux, APAS uses the terminal's
+  process group to find the user rollout that its codex process actually has
+  open, so multiple panes can share one cwd without sharing status or history.
+  The selected path is retained across brief descriptor gaps and changes when
+  that process opens a newer user rollout through resume/fork. Other platforms
+  fall back to the newest user rollout whose `session_meta.cwd` matches.
 - **opencode** — OpenCode owns its `ses_*` identifiers, so APAS asks
   `opencode session list --format json` for the newest session whose directory
   exactly matches the pane cwd, then reads it with `opencode export <id>`.
@@ -933,10 +935,12 @@ Existing agent panes can still run, receive messages, switch models and reboot;
 creating another one is rejected. Nothing creates one any more — managed team
 roles were the last thing that did, and they are gone with team mode.
 
-**What terminal panes do not get.** Pane status and plan review are built on
-stream-json events, so a terminal pane has neither. `PaneDiff` is *not* in that
-list despite the pane-kind boundary suggesting it should be: it is computed from
-git by `compute_pane_diff`, so it works for any pane with a worktree.
+**What terminal panes do not get directly.** Fine-grained tool status and plan
+review are built on stream-json events, so a terminal pane has neither. Coarse
+working/idle state is reconstructed from user turns and provider-confirmed
+completion markers in the transcript. `PaneDiff` is *not* in the unavailable
+list despite the pane-kind boundary suggesting it should be: it is computed
+from git by `compute_pane_diff`, so it works for any pane with a worktree.
 
 **Conversation history and usage** are recovered by reading the provider's
 own transcript — see below.

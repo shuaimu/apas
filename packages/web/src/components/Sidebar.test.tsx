@@ -6,6 +6,7 @@ import {
   type CliClient,
   type MachineWithProjects,
   type SessionInfo,
+  type UsageLimitsByProvider,
 } from "@/lib/store";
 import { Sidebar } from "./Sidebar";
 
@@ -60,6 +61,7 @@ function seedSidebarState({
   attachSession = vi.fn(),
   forgetProject = vi.fn(),
   openSessionPane = vi.fn(),
+  usageLimits = new Map(),
 }: {
   sessions: SessionInfo[];
   cliClients?: CliClient[];
@@ -67,6 +69,7 @@ function seedSidebarState({
   attachSession?: StoreState["attachSession"];
   forgetProject?: StoreState["forgetProject"];
   openSessionPane?: StoreState["openSessionPane"];
+  usageLimits?: Map<string, UsageLimitsByProvider>;
 }) {
   act(() => {
     useStore.setState({
@@ -82,6 +85,7 @@ function seedSidebarState({
       sessions,
       token: "test-token",
       unreadSessions: new Set(),
+      usageLimits,
       userId: null,
     });
   });
@@ -446,6 +450,95 @@ describe("Sidebar project list", () => {
     expect(text.indexOf("mako")).toBeGreaterThanOrEqual(0);
     expect(text.indexOf("mako")).toBeLessThan(text.indexOf("Claude terminal 3"));
     expect(screen.queryByRole("button", { name: /Codex terminal 2/ })).toBeNull();
+  });
+
+  it("ranks the most recently idle agent first and keeps legacy panes afterward", () => {
+    seedSidebarState({
+      sessions: [
+        makeSession({
+          id: "session-old",
+          workingDir: "/repo/older",
+          isActive: true,
+          panes: [{
+            pane_id: 1,
+            label: "Older agent",
+            kind: "terminal",
+            provider: "claude",
+            is_working: false,
+            idle_since: "2026-08-20T12:00:00Z",
+          }],
+        }),
+        makeSession({
+          id: "session-legacy",
+          workingDir: "/repo/legacy",
+          isActive: true,
+          panes: [{
+            pane_id: 2,
+            label: "Legacy agent",
+            kind: "terminal",
+            provider: "claude",
+            is_working: false,
+          }],
+        }),
+        makeSession({
+          id: "session-new",
+          workingDir: "/repo/newer",
+          isActive: true,
+          panes: [{
+            pane_id: 3,
+            label: "Newest agent",
+            kind: "terminal",
+            provider: "codex",
+            is_working: false,
+            idle_since: "2026-08-20T13:00:00Z",
+          }],
+        }),
+      ],
+    });
+
+    render(<Sidebar />);
+    fireEvent.click(screen.getByRole("button", { name: "Idle sessions" }));
+
+    const rows = screen.getAllByRole("button")
+      .map((button) => button.getAttribute("aria-label"))
+      .filter((label): label is string => Boolean(label?.startsWith("Open ")));
+    expect(rows).toEqual([
+      "Open Newest agent in newer",
+      "Open Older agent in older",
+      "Open Legacy agent in legacy",
+    ]);
+  });
+
+  it("keeps a provider-blocked agent out of idle and gives it a usage-limited status", () => {
+    seedSidebarState({
+      sessions: [makeSession({
+        id: "session-a",
+        cliClientId: "cli-a",
+        workingDir: "/repo/mako",
+        hostname: "zoo-005",
+        isActive: true,
+        panes: [
+          { pane_id: 197, label: "Claude 4", kind: "terminal", provider: "claude", is_working: false },
+        ],
+      })],
+      usageLimits: new Map([
+        ["cli-a", {
+          claude: {
+            sevenDay: { utilization: 1 },
+            usageLimited: { window: "weekly", resetsAt: "2099-08-23T13:00:00Z" },
+          },
+        }],
+      ]),
+    });
+
+    render(<Sidebar />);
+    fireEvent.click(screen.getByRole("button", { name: "Idle sessions" }));
+    expect(screen.queryByRole("button", { name: "Open Claude 4 in mako" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Usage limited" }));
+    const row = screen.getByRole("button", { name: "Open Claude 4 in mako" });
+    expect(row.textContent).toContain("Weekly usage limited");
+    expect(row.textContent).toContain("Resets in");
   });
 
   it("opens the agent that was named, not just its project", () => {

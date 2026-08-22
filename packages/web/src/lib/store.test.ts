@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { handleServerMessage, storeDebugLog, useStore, paneWatermarksToRecord, type Message, type CliClient, type TeamRecord, type SessionCacheEntry } from './store';
+import { handleServerMessage, launchProfileKey, storeDebugLog, useStore, paneWatermarksToRecord, type Message, type CliClient, type TeamRecord, type SessionCacheEntry } from './store';
 
 describe('useStore', () => {
   beforeEach(() => {
@@ -123,6 +123,61 @@ describe('useStore', () => {
         isActive: false,
         isWorking: false,
       });
+    });
+
+    it('records a working-to-idle transition without refreshing it on idle replay', () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date('2026-08-20T12:00:00Z'));
+        useStore.setState({
+          sessionId: 'current-session',
+          sessions: [{
+            id: 'current-session',
+            status: 'connected',
+            isActive: true,
+            isWorking: true,
+            panes: [{
+              pane_id: 7,
+              kind: 'terminal',
+              provider: 'claude',
+              is_working: true,
+            }],
+          }],
+          workingPanesBySession: new Map([['current-session', new Set([7])]]),
+        });
+
+        handleServerMessage({
+          type: 'pane_status',
+          session_id: 'current-session',
+          pane_id: 7,
+          pane_type: 'interactive',
+          status: null,
+        }, useStore.setState, useStore.getState);
+        expect(useStore.getState().sessions[0]?.panes?.[0]?.idle_since)
+          .toBe('2026-08-20T12:00:00.000Z');
+
+        vi.setSystemTime(new Date('2026-08-20T13:00:00Z'));
+        handleServerMessage({
+          type: 'pane_status',
+          session_id: 'current-session',
+          pane_id: 7,
+          pane_type: 'interactive',
+          status: null,
+        }, useStore.setState, useStore.getState);
+        expect(useStore.getState().sessions[0]?.panes?.[0]?.idle_since)
+          .toBe('2026-08-20T12:00:00.000Z');
+
+        handleServerMessage({
+          type: 'pane_status',
+          session_id: 'current-session',
+          pane_id: 7,
+          pane_type: 'interactive',
+          status: 'Working…',
+        }, useStore.setState, useStore.getState);
+        expect(useStore.getState().sessions[0]?.panes?.[0]?.idle_since).toBeUndefined();
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('uses an explicit terminal completion as a redundant working-state clear', () => {
@@ -959,6 +1014,26 @@ describe('retired provider web guards', () => {
   });
 });
 
+describe('DeepSeek launch profiles', () => {
+  it('keeps direct-provider default and canonical variants aligned with Rust policy keys', () => {
+    expect(launchProfileKey('agent', 'deepseek', null))
+      .toBe('agent:claude:deepseek:deepseek-v4-pro');
+    expect(launchProfileKey('agent', 'claude', 'DeepSeek-V4-Flash'))
+      .toBe('agent:claude:deepseek:deepseek-v4-flash');
+    expect(launchProfileKey('agent', 'claude', 'deepseek-chat'))
+      .toBe('agent:claude:deepseek:deepseek-chat');
+  });
+
+  it('derives terminal DeepSeek profiles from the claude frontend', () => {
+    expect(launchProfileKey('terminal', 'claude', 'deepseek-v4-pro'))
+      .toBe('terminal:claude:deepseek:deepseek-v4-pro');
+    expect(launchProfileKey('terminal', 'claude', 'DeepSeek-V4-Flash'))
+      .toBe('terminal:claude:deepseek:deepseek-v4-flash');
+    expect(launchProfileKey('terminal', 'claude', undefined))
+      .toBe('terminal:claude:official:default');
+  });
+});
+
 describe('DeepSeek machine config', () => {
   function makeOpenWs() {
     return {
@@ -1061,6 +1136,25 @@ describe('DeepSeek machine config', () => {
     });
     expect(entry.machine).not.toHaveProperty('minimaxBackend');
     expect(entry.machine).not.toHaveProperty('glmBackend');
+  });
+
+  it('preserves explicit usage-limited availability and reset metadata', () => {
+    useStore.setState({ usageLimits: new Map() });
+
+    handleServerMessage({
+      type: 'usage_limits',
+      cli_client_id: 'cli-1',
+      provider: 'claude',
+      limits: {
+        seven_day: { utilization: 1, resets_at: '2026-08-23T13:00:00Z' },
+        usage_limited: { window: 'weekly', resets_at: '2026-08-23T13:00:00Z' },
+      },
+    }, useStore.setState, useStore.getState);
+
+    expect(useStore.getState().usageLimits.get('cli-1')?.claude?.usageLimited).toEqual({
+      window: 'weekly',
+      resetsAt: '2026-08-23T13:00:00Z',
+    });
   });
 
   it('ignores retired usage messages from a mixed-version server', async () => {

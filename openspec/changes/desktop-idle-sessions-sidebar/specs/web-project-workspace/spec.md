@@ -45,3 +45,44 @@ Opening an entry that names an agent SHALL open its session with that agent sele
 
 - **WHEN** the named agent does not exist in the attached session
 - **THEN** the selection falls back to the ordinary behaviour
+
+### Requirement: Usage-limited agents are not idle
+
+The workspace SHALL distinguish an agent waiting for input from an agent whose provider is actively refusing work because a usage limit is in effect. It SHALL NOT encode usage limitation as pane work, and SHALL show the limiting window and reset time when the provider reports them.
+
+#### Scenario: An inactive turn has an active provider limit
+
+- **WHEN** an agent is not working and its provider reports an active usage limit
+- **THEN** the agent does not appear in Idle sessions
+- **AND** it appears in the separate Usage limited view
+- **AND** it is labelled usage limited rather than idle
+
+#### Scenario: Included usage is exhausted but extra usage remains available
+
+- **WHEN** an included usage meter reaches 100 percent but the provider reports that paid extra usage remains available
+- **THEN** the agent is not classified as usage limited from utilization alone
+
+#### Scenario: A reset time has passed
+
+- **WHEN** a previously reported usage limit has a reset time that is no longer in the future
+- **THEN** the agent is no longer presented as usage limited
+
+### Requirement: The most recently idle agent is first
+
+The workspace SHALL record when each pane transitions from working to idle and SHALL order Idle sessions from the most recent such transition to the oldest. Repeated idle observations SHALL NOT make an already-idle pane look newer. Panes from an older payload without an idle timestamp SHALL remain usable and SHALL sort after panes with a known timestamp.
+
+#### Scenario: Two agents became idle at different times
+
+- **WHEN** two idle agents report different idle-transition times
+- **THEN** the agent with the later transition appears first
+
+#### Scenario: An idle state is observed again
+
+- **WHEN** an already-idle agent reports idle again
+- **THEN** its original idle-transition time is preserved
+
+#### Scenario: An older payload has no idle timestamp
+
+- **WHEN** one idle agent has a transition timestamp and another does not
+- **THEN** the timestamped agent appears first
+- **AND** the older payload remains visible

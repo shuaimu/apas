@@ -18,7 +18,19 @@
 - [x] 3.2 Remember the tapped pane before navigating, and confirm the session screen honours it
 - [x] 3.3 Tests: tapping a row records that pane for that session and opens the session
 
-## 4. Verification
+## 4. Distinguish usage-limited agents
 
-- [x] 4.1 Workspace tests and clippy clean; web lint, type-check, and tests clean
-- [ ] 4.2 Live on the mobile browser against a project with a working pane and an idle one
+- [x] 4.1 Carry an explicit usage-limited result and reset metadata without treating a 100 percent included meter as blocking when extra usage remains available
+- [x] 4.2 Exclude usage-limited panes from Idle sessions and render them in a separate Usage limited view
+- [x] 4.3 Tests: limited panes are absent from idle, present with reset metadata in the limited view, and become non-limited after reset
+
+## 5. Rank idle agents by recency
+
+- [x] 5.1 Add the pane idle-transition timestamp to the shared/mobile summary with backward-compatible defaults
+- [x] 5.2 Reuse the desktop recent-idle ordering so mobile lists known timestamps newest first and legacy panes afterward
+- [x] 5.3 Tests: transition timestamps, replay preservation, newest-first mobile ordering, and legacy fallback
+
+## 6. Verification
+
+- [ ] 6.1 Workspace tests and clippy clean; web lint, type-check, and tests clean
+- [ ] 6.2 Live on the mobile browser against a project with a working pane and an idle one

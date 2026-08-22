@@ -64,6 +64,7 @@ function seedStore(overrides: Record<string, unknown> = {}) {
   const refreshPaneWorkSummary = vi.fn(() => true);
   const removePane = vi.fn();
   const rebootPane = vi.fn();
+  const startMachineProjectCli = vi.fn();
 
   act(() => {
     useStore.setState({
@@ -112,6 +113,7 @@ function seedStore(overrides: Record<string, unknown> = {}) {
       refreshPaneWorkSummary,
       removePane,
       rebootPane,
+      startMachineProjectCli,
       ...overrides,
     });
   });
@@ -133,6 +135,7 @@ function seedStore(overrides: Record<string, unknown> = {}) {
     sendMessageToPane,
     sendTerminalConversationMessage,
     sendTerminalInput,
+    startMachineProjectCli,
   };
 }
 
@@ -437,6 +440,39 @@ describe("MobileSessionActivity", () => {
     );
   });
 
+  it("creates a DeepSeek terminal pane as the claude frontend with the model override", async () => {
+    const actions = seedStore({
+      projectPolicies: {
+        "session-a": {
+          teamAvailable: true,
+          allowedLaunchProfiles: [
+            "terminal:codex:official:default",
+            "terminal:claude:deepseek:deepseek-v4-pro",
+            "terminal:claude:deepseek:deepseek-v4-flash",
+          ],
+          version: 2,
+          projectSuspended: false,
+          noncompliantPaneIds: [],
+        },
+      },
+    });
+    renderActivity();
+    fireEvent.click(screen.getByRole("button", { name: "Create pane" }));
+
+    fireEvent.click(screen.getByRole("button", { name: /DeepSeek Pro terminal/ }));
+    expect(actions.addPane).toHaveBeenCalledWith(
+      "claude",
+      "interactive",
+      "DeepSeek Pro terminal 2",
+      undefined,
+      "deepseek-v4-pro",
+      false,
+      undefined,
+      false,
+      "terminal",
+    );
+  });
+
   it("puts the pane list in the top row, beside the back control", () => {
     seedStore({ paneConfigs: [pane({ pane_id: 3 }), pane({ pane_id: 4, label: "Reviewer" })] });
     renderActivity();
@@ -582,6 +618,49 @@ describe("MobileSessionActivity", () => {
     expect(screen.getByRole("button", { name: "Manage project" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Reboot this pane" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Close this pane" })).toBeTruthy();
+  });
+
+  it("opens an offline project from its pane actions on the matching host", () => {
+    const actions = seedStore({
+      sessions: [{
+        id: "session-a",
+        projectId: "project-a",
+        workingDir: "/workspace/alpha",
+        hostname: "builder-b",
+        status: "offline",
+        isActive: false,
+      }],
+      isAttached: false,
+      machines: [
+        {
+          machine: { machineId: "machine-a", hostname: "builder-a", os: "linux", arch: "x86_64" },
+          projects: [{ projectId: "project-a", path: "/workspace/alpha", isRunning: false }],
+        },
+        {
+          machine: { machineId: "machine-b", hostname: "builder-b", os: "linux", arch: "x86_64" },
+          projects: [{ projectId: "project-a", path: "/workspace/alpha/", isRunning: false }],
+        },
+      ],
+    });
+    renderActivity();
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open project" }));
+    expect(actions.startMachineProjectCli).not.toHaveBeenCalled();
+
+    const dialog = screen.getByRole("dialog", { name: "Open alpha" });
+    expect(within(dialog).getByText(/saved panes become available again/)).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Open project" }));
+
+    expect(actions.startMachineProjectCli).toHaveBeenCalledWith("machine-b", "project-a");
+  });
+
+  it("does not offer Open project while the project is running", () => {
+    seedStore();
+    renderActivity();
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    expect(screen.queryByRole("button", { name: "Open project" })).toBeNull();
   });
 
   it("confirms before rebooting, and says the conversation survives", () => {

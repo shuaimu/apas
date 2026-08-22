@@ -1,7 +1,7 @@
-import { createEvent, fireEvent, render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, createEvent, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TabBar } from "./TabBar";
-import type { CliLifecycleInventory, CliLifecycleStatus, PaneConfig } from "@/lib/store";
+import { useStore, type CliLifecycleInventory, type CliLifecycleStatus, type PaneConfig } from "@/lib/store";
 
 function pane(overrides: Partial<PaneConfig> & Pick<PaneConfig, "pane_id" | "label" | "role">): PaneConfig {
   return {
@@ -169,6 +169,8 @@ describe("TabBar coordinator close controls", () => {
     fireEvent.click(screen.getByTitle("New tab"));
 
     expect(screen.getByText("Claude")).toBeTruthy();
+    expect(screen.getByText("Claude / DeepSeek Pro")).toBeTruthy();
+    expect(screen.getByText("Claude / DeepSeek Flash")).toBeTruthy();
     expect(screen.getByText("Codex")).toBeTruthy();
     expect(screen.getByText("OpenCode")).toBeTruthy();
     expect(screen.queryByText("Cursor")).toBeNull();
@@ -176,6 +178,14 @@ describe("TabBar coordinator close controls", () => {
 
     fireEvent.click(screen.getByText("Claude"));
     expect(onAddTab).toHaveBeenCalledWith("claude", undefined, undefined, "terminal");
+
+    fireEvent.click(screen.getByTitle("New tab"));
+    fireEvent.click(screen.getByText("Claude / DeepSeek Pro"));
+    expect(onAddTab).toHaveBeenCalledWith("claude", "deepseek-v4-pro", undefined, "terminal");
+
+    fireEvent.click(screen.getByTitle("New tab"));
+    fireEvent.click(screen.getByText("Claude / DeepSeek Flash"));
+    expect(onAddTab).toHaveBeenCalledWith("claude", "deepseek-v4-flash", undefined, "terminal");
   });
 
   it("keeps full-process reboot behind the desktop lifecycle menu", () => {
@@ -369,6 +379,12 @@ describe("TabBar add-tab worktree controls", () => {
     Element.prototype.scrollIntoView = vi.fn();
   });
 
+  afterEach(() => {
+    act(() => {
+      useStore.setState({ sessionId: null, projectPolicies: {} });
+    });
+  });
+
   it("passes undefined isolated-worktree mode for an untouched default provider pick", () => {
     const onAddTab = vi.fn();
     renderTabBar({ onAddTab });
@@ -407,7 +423,8 @@ describe("TabBar add-tab worktree controls", () => {
   });
 
   it("does not offer a terminal tab for providers a pty can't host", () => {
-    // Mirrors `terminal_binary_for` in the CLI.
+    // Mirrors `terminal_binary_for` in the CLI: DeepSeek has no TUI of its
+    // own, so it only appears as a backend variant of the Claude terminal.
     renderTabBar();
     openNewTabMenu();
 
@@ -417,6 +434,29 @@ describe("TabBar add-tab worktree controls", () => {
     for (const label of ["MiniMax", "GLM", "DeepSeek", "Cursor"]) {
       expect(screen.queryByText(label)).toBeNull();
     }
+  });
+
+  it("filters DeepSeek terminal variants through their own launch profiles", () => {
+    const onAddTab = vi.fn();
+    act(() => useStore.setState({
+      sessionId: "tabbar-session",
+      projectPolicies: {
+        "tabbar-session": {
+          teamAvailable: false,
+          allowedLaunchProfiles: ["terminal:claude:official:default", "terminal:claude:deepseek:deepseek-v4-pro"],
+          version: 2,
+          projectSuspended: false,
+          noncompliantPaneIds: [],
+        },
+      },
+    }));
+    renderTabBar({ onAddTab });
+    openNewTabMenu();
+
+    expect(screen.getByText("Claude")).toBeTruthy();
+    expect(screen.getByText("Claude / DeepSeek Pro")).toBeTruthy();
+    expect(screen.queryByText("Claude / DeepSeek Flash")).toBeNull();
+    expect(screen.queryByText("Codex")).toBeNull();
   });
 
   it("marks a historical retired tab unsupported without branding it", () => {

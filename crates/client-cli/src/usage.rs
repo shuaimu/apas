@@ -9,7 +9,7 @@ use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use shared::{UsageLimitWindow, UsageLimits};
+use shared::{UsageLimitWindow, UsageLimited, UsageLimits};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -194,12 +194,118 @@ struct OAuthToken {
 struct UsageApiResponse {
     five_hour: Option<UsageWindow>,
     seven_day: Option<UsageWindow>,
+    #[serde(default)]
+    limits: Vec<ClaudeUsageLimit>,
+    #[serde(default)]
+    extra_usage: Option<ClaudeExtraUsage>,
 }
 
 #[derive(Debug, Deserialize)]
 struct UsageWindow {
     utilization: f64,
     resets_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeUsageLimit {
+    kind: String,
+    #[serde(default)]
+    group: Option<String>,
+    percent: f64,
+    #[serde(default)]
+    resets_at: Option<String>,
+    #[serde(default)]
+    is_active: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeExtraUsage {
+    #[serde(default)]
+    is_enabled: bool,
+    #[serde(default)]
+    spend_limit_reached: bool,
+}
+
+fn claude_limit_window(limit: &ClaudeUsageLimit) -> String {
+    match limit.group.as_deref().unwrap_or(limit.kind.as_str()) {
+        "session" | "five_hour" => "5-hour".to_string(),
+        "weekly" | "weekly_all" | "weekly_scoped" => "weekly".to_string(),
+        "monthly" | "monthly_spend" => "monthly".to_string(),
+        other => other.replace('_', " "),
+    }
+}
+
+fn map_claude_usage_response(api_response: UsageApiResponse, now: DateTime<Utc>) -> UsageLimits {
+    let extra_usage_available = api_response
+        .extra_usage
+        .as_ref()
+        .is_some_and(|extra| extra.is_enabled && !extra.spend_limit_reached);
+    let spend_limit_reached = api_response
+        .extra_usage
+        .as_ref()
+        .is_some_and(|extra| extra.spend_limit_reached);
+
+    let active_limit = api_response
+        .limits
+        .iter()
+        .filter(|limit| limit.is_active && limit.percent >= 100.0)
+        .max_by(|left, right| left.resets_at.cmp(&right.resets_at));
+
+    let usage_limited = if spend_limit_reached {
+        Some(UsageLimited {
+            window: "monthly spend".to_string(),
+            resets_at: None,
+        })
+    } else if extra_usage_available {
+        None
+    } else if let Some(limit) = active_limit {
+        Some(UsageLimited {
+            window: claude_limit_window(limit),
+            resets_at: limit.resets_at.clone(),
+        })
+    } else if api_response.limits.is_empty()
+        && api_response
+            .extra_usage
+            .as_ref()
+            .is_some_and(|extra| !extra.is_enabled)
+    {
+        // Compatibility with a provider payload that has extra-usage state but
+        // predates the explicit `limits` collection.
+        api_response
+            .seven_day
+            .as_ref()
+            .filter(|window| window.utilization >= 100.0)
+            .map(|window| UsageLimited {
+                window: "weekly".to_string(),
+                resets_at: window.resets_at.clone(),
+            })
+            .or_else(|| {
+                api_response
+                    .five_hour
+                    .as_ref()
+                    .filter(|window| window.utilization >= 100.0)
+                    .map(|window| UsageLimited {
+                        window: "5-hour".to_string(),
+                        resets_at: window.resets_at.clone(),
+                    })
+            })
+    } else {
+        None
+    };
+
+    UsageLimits {
+        // API returns utilization as percentage (0-100), convert to fraction (0-1)
+        five_hour: api_response.five_hour.map(|window| UsageLimitWindow {
+            utilization: window.utilization / 100.0,
+            resets_at: window.resets_at,
+        }),
+        seven_day: api_response.seven_day.map(|window| UsageLimitWindow {
+            utilization: window.utilization / 100.0,
+            resets_at: window.resets_at,
+        }),
+        fetched_at: Some(now.to_rfc3339()),
+        usage_limited,
+    }
 }
 
 /// Get the path to Claude's credentials file
@@ -290,20 +396,7 @@ async fn fetch_claude_usage_limits_remote() -> Result<UsageLimits> {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to parse usage response: {}", e))?;
 
-    let now = chrono::Utc::now().to_rfc3339();
-
-    Ok(UsageLimits {
-        // API returns utilization as percentage (0-100), convert to fraction (0-1)
-        five_hour: api_response.five_hour.map(|w| UsageLimitWindow {
-            utilization: w.utilization / 100.0,
-            resets_at: w.resets_at,
-        }),
-        seven_day: api_response.seven_day.map(|w| UsageLimitWindow {
-            utilization: w.utilization / 100.0,
-            resets_at: w.resets_at,
-        }),
-        fetched_at: Some(now),
-    })
+    Ok(map_claude_usage_response(api_response, Utc::now()))
 }
 
 // ----------------------- Codex usage limits -----------------------
@@ -404,7 +497,7 @@ fn unix_seconds_to_rfc3339(unix_seconds: i64) -> Option<String> {
     DateTime::<Utc>::from_timestamp(unix_seconds, 0).map(|dt| dt.to_rfc3339())
 }
 
-fn map_codex_window(window: CodexRateLimitWindow, now: &DateTime<Utc>) -> UsageLimitWindow {
+fn map_codex_window(window: &CodexRateLimitWindow, now: &DateTime<Utc>) -> UsageLimitWindow {
     let resets_at = window
         .reset_at
         .and_then(unix_seconds_to_rfc3339)
@@ -484,10 +577,14 @@ async fn fetch_codex_usage_limits_remote() -> Result<UsageLimits> {
         .ok_or_else(|| anyhow::anyhow!("Codex usage response missing rate_limit"))?;
 
     let now = Utc::now();
-    let five_hour = rate_limit.primary_window.map(|w| map_codex_window(w, &now));
+    let five_hour = rate_limit
+        .primary_window
+        .as_ref()
+        .map(|window| map_codex_window(window, &now));
     let seven_day = rate_limit
         .secondary_window
-        .map(|w| map_codex_window(w, &now));
+        .as_ref()
+        .map(|window| map_codex_window(window, &now));
 
     if five_hour.is_none() && seven_day.is_none() {
         return Err(anyhow::anyhow!(
@@ -495,10 +592,33 @@ async fn fetch_codex_usage_limits_remote() -> Result<UsageLimits> {
         ));
     }
 
+    let usage_limited = [
+        rate_limit
+            .primary_window
+            .as_ref()
+            .filter(|window| window.used_percent >= 100.0)
+            .map(|window| UsageLimited {
+                window: "5-hour".to_string(),
+                resets_at: map_codex_window(window, &now).resets_at,
+            }),
+        rate_limit
+            .secondary_window
+            .as_ref()
+            .filter(|window| window.used_percent >= 100.0)
+            .map(|window| UsageLimited {
+                window: "weekly".to_string(),
+                resets_at: map_codex_window(window, &now).resets_at,
+            }),
+    ]
+    .into_iter()
+    .flatten()
+    .max_by(|left, right| left.resets_at.cmp(&right.resets_at));
+
     Ok(UsageLimits {
         five_hour,
         seven_day,
         fetched_at: Some(now.to_rfc3339()),
+        usage_limited,
     })
 }
 
@@ -518,6 +638,7 @@ mod tests {
                 resets_at: Some("2026-06-25T12:00:00Z".to_string()),
             }),
             fetched_at: Some(Utc::now().to_rfc3339()),
+            usage_limited: None,
         }
     }
 
@@ -534,11 +655,98 @@ mod tests {
     }
 
     #[test]
+    fn claude_active_weekly_limit_is_preserved_as_provider_availability() {
+        let response: UsageApiResponse = serde_json::from_value(serde_json::json!({
+            "five_hour": {
+                "utilization": 34.0,
+                "resets_at": "2026-08-20T22:00:00Z"
+            },
+            "seven_day": {
+                "utilization": 100.0,
+                "resets_at": "2026-08-23T13:00:00Z"
+            },
+            "limits": [{
+                "kind": "weekly_all",
+                "group": "weekly",
+                "percent": 100.0,
+                "resets_at": "2026-08-23T13:00:00Z",
+                "is_active": true
+            }],
+            "extra_usage": {
+                "is_enabled": false,
+                "spend_limit_reached": false
+            }
+        }))
+        .expect("Claude usage response parses");
+
+        let mapped = map_claude_usage_response(response, Utc::now());
+        assert_eq!(
+            mapped.usage_limited,
+            Some(UsageLimited {
+                window: "weekly".to_string(),
+                resets_at: Some("2026-08-23T13:00:00Z".to_string()),
+            })
+        );
+        assert_eq!(mapped.seven_day.map(|window| window.utilization), Some(1.0));
+    }
+
+    #[test]
+    fn claude_full_included_meter_is_not_blocking_when_extra_usage_is_available() {
+        let response: UsageApiResponse = serde_json::from_value(serde_json::json!({
+            "five_hour": null,
+            "seven_day": {
+                "utilization": 100.0,
+                "resets_at": "2026-08-23T13:00:00Z"
+            },
+            "limits": [{
+                "kind": "weekly_all",
+                "group": "weekly",
+                "percent": 100.0,
+                "resets_at": "2026-08-23T13:00:00Z",
+                "is_active": true
+            }],
+            "extra_usage": {
+                "is_enabled": true,
+                "spend_limit_reached": false
+            }
+        }))
+        .expect("Claude usage response parses");
+
+        let mapped = map_claude_usage_response(response, Utc::now());
+        assert_eq!(mapped.seven_day.map(|window| window.utilization), Some(1.0));
+        assert_eq!(mapped.usage_limited, None);
+    }
+
+    #[test]
+    fn claude_extra_usage_spend_cap_is_a_distinct_active_limit() {
+        let response: UsageApiResponse = serde_json::from_value(serde_json::json!({
+            "five_hour": null,
+            "seven_day": null,
+            "limits": [],
+            "extra_usage": {
+                "is_enabled": true,
+                "spend_limit_reached": true
+            }
+        }))
+        .expect("Claude usage response parses");
+
+        let mapped = map_claude_usage_response(response, Utc::now());
+        assert_eq!(
+            mapped.usage_limited,
+            Some(UsageLimited {
+                window: "monthly spend".to_string(),
+                resets_at: None,
+            })
+        );
+    }
+
+    #[test]
     fn cache_freshness_checks_fetched_at() {
         let fresh = UsageLimits {
             five_hour: None,
             seven_day: None,
             fetched_at: Some(Utc::now().to_rfc3339()),
+            usage_limited: None,
         };
         assert!(is_cache_fresh(&fresh, Duration::minutes(45)));
         assert!(!is_cache_fresh(&fresh, Duration::seconds(-1)));
@@ -547,6 +755,7 @@ mod tests {
             five_hour: None,
             seven_day: None,
             fetched_at: Some((Utc::now() - Duration::hours(3)).to_rfc3339()),
+            usage_limited: None,
         };
         assert!(!is_cache_fresh(&stale, Duration::minutes(45)));
 
@@ -554,6 +763,7 @@ mod tests {
             five_hour: None,
             seven_day: None,
             fetched_at: None,
+            usage_limited: None,
         };
         assert!(!is_cache_fresh(&unknown, Duration::minutes(45)));
     }

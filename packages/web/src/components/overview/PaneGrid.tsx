@@ -17,9 +17,10 @@ import {
   PANE_ID_INTERACTIVE,
 } from "@/lib/store";
 import {
-  DEEPSEEK_DEFAULT_MODEL,
   isDeepseekModel,
   isRetiredProviderModel,
+  providerModelValue,
+  PROVIDER_MODEL_OPTIONS,
 } from "@/lib/providerOptions";
 import { ActivitySparkline } from "./ActivitySparkline";
 import { useIsLaunchProfileAllowed } from "@/lib/tabTypes";
@@ -32,6 +33,19 @@ interface PaneGridProps {
   onResumePane: (paneId: number) => void;
   onRemovePane: (paneId: number) => void;
 }
+
+const OVERVIEW_AGENT_OPTION_VALUES = new Set([
+  "claude/official",
+  "claude/deepseek",
+  "claude/deepseek-flash",
+  "codex/official",
+  "opencode/official",
+  "cursor-agent/official",
+]);
+
+const AGENT_OPTS = PROVIDER_MODEL_OPTIONS
+  .filter((option) => OVERVIEW_AGENT_OPTION_VALUES.has(option.value))
+  .map((option) => ({ ...option, model: option.model ?? null }));
 
 export function PaneGrid({
   onOpenPane,
@@ -126,7 +140,14 @@ function PaneCard({
 }: PaneCardProps) {
   const isBot = pane.mode === "deadloop";
   const isTerminal = pane.kind === "terminal";
-  const isUnsupported = isRetiredProviderModel(pane.provider, pane.model);
+  const mappedAgentValue = providerModelValue(pane.provider, pane.model);
+  // Fable remains an official-Claude model on this combined backend control;
+  // this change only adds the two explicit DeepSeek variants.
+  const currentAgentValue = mappedAgentValue === "claude/fable"
+    ? "claude/official"
+    : mappedAgentValue;
+  const isUnsupported = isRetiredProviderModel(pane.provider, pane.model)
+    || currentAgentValue === "unsupported";
   const isThinking = !!status && !isPaused;
   const modeIndicator = isUnsupported
     ? { icon: "!", label: "unsupported provider" }
@@ -153,37 +174,8 @@ function PaneCard({
   // agent-frontend × API-backend combo (e.g. "Claude / DeepSeek" =
   // claude CLI talking to deepseek's anthropic-compatible endpoint
   // via the env-override path).
-  const AGENT_OPTS: ReadonlyArray<{
-    value: string;
-    label: string;
-    /// Provider sent on the wire.
-    provider: string;
-    /// Model override for backend-swap agents; null clears the override.
-    model: string | null;
-  }> = [
-    { value: "claude/official", label: "Claude / Official", provider: "claude", model: null },
-    { value: "claude/deepseek", label: "Claude / DeepSeek", provider: "claude", model: DEEPSEEK_DEFAULT_MODEL },
-    { value: "codex/official", label: "Codex / Official", provider: "codex", model: null },
-    { value: "opencode/official", label: "OpenCode / Official", provider: "opencode", model: null },
-    { value: "cursor-agent/official", label: "Cursor / Official", provider: "cursor-agent", model: null },
-  ];
   // Reverse mapping from (provider, model) → agent option value, so the
   // dropdown reflects whichever combo the pane is actually running.
-  // Claude with a backend-specific model classifies into the matching
-  // sub-option even if the user typed a variant string.
-  const currentAgentValue = ((): string => {
-    const provider = pane.provider;
-    if (isUnsupported) return "unsupported";
-    if (provider === "claude") {
-      if (isDeepseekModel(pane.model)) return "claude/deepseek";
-      return "claude/official";
-    }
-    if (provider === "codex") return "codex/official";
-    if (provider === "opencode") return "opencode/official";
-    if (provider === "cursor-agent") return "cursor-agent/official";
-    if (provider === "deepseek") return "claude/deepseek";
-    return "unsupported";
-  })();
   const visibleAgentOptions = AGENT_OPTS.filter(
     (option) =>
       option.value === currentAgentValue
@@ -247,11 +239,14 @@ function PaneCard({
                 !isBackendSwap(pane.model) &&
                 !isBackendSwap(picked.model) &&
                 picked.model != null;
+              const isDeepseekVariantSwitch =
+                isDeepseekModel(pane.model) && isDeepseekModel(picked.model);
+              const confirmation = isDeepseekVariantSwitch
+                ? `Switch agent to ${picked.label}? The current turn will be interrupted and Claude restarts with fresh prompt context. Chat history stays visible in APAS but is NOT part of the new agent's prompt.`
+                : `Switch agent to ${picked.label}? The current turn will be interrupted and the agent respawns with a fresh context — chat history stays visible but is NOT in the new agent's prompt. Make sure the host running this pane has the required CLI installed + authenticated.`;
               if (
                 !canLiveSwap &&
-                !confirm(
-                  `Switch agent to ${picked.label}? The current turn will be interrupted and the agent respawns with a fresh context — chat history stays visible but is NOT in the new agent's prompt. Make sure the host running this pane has the required CLI installed + authenticated.`,
-                )
+                !confirm(confirmation)
               ) {
                 return;
               }

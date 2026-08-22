@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   CLAUDE_FABLE_MODEL,
+  DEEPSEEK_DEFAULT_MODEL,
+  DEEPSEEK_FLASH_MODEL,
+  DEEPSEEK_PRO_MODEL,
   findProviderModelOption,
   isFableModel,
   isRetiredLaunchProfileKey,
@@ -30,6 +33,33 @@ describe("providerOptions", () => {
     expect(isFableModel("Fable")).toBe(true);
     expect(providerModelValue("claude", CLAUDE_FABLE_MODEL)).toBe("claude/fable");
     expect(providerModelValue("claude", "Fable")).toBe("claude/fable");
+  });
+
+  it("exposes Pro and Flash as variants of one Claude DeepSeek backend", () => {
+    expect(DEEPSEEK_DEFAULT_MODEL).toBe(DEEPSEEK_PRO_MODEL);
+    expect(findProviderModelOption("claude/deepseek")).toEqual(
+      expect.objectContaining({
+        label: "Claude / DeepSeek Pro",
+        provider: "claude",
+        model: DEEPSEEK_PRO_MODEL,
+      }),
+    );
+    expect(findProviderModelOption("claude/deepseek-flash")).toEqual(
+      expect.objectContaining({
+        label: "Claude / DeepSeek Flash",
+        provider: "claude",
+        model: DEEPSEEK_FLASH_MODEL,
+      }),
+    );
+  });
+
+  it("reverse maps canonical DeepSeek variants and fails closed for unknown IDs", () => {
+    expect(providerModelValue("claude", DEEPSEEK_PRO_MODEL)).toBe("claude/deepseek");
+    expect(providerModelValue("claude", DEEPSEEK_FLASH_MODEL)).toBe("claude/deepseek-flash");
+    expect(providerModelValue("deepseek", null)).toBe("claude/deepseek");
+    expect(providerModelValue("deepseek", DEEPSEEK_FLASH_MODEL)).toBe("claude/deepseek-flash");
+    expect(providerModelValue("claude", "deepseek-chat")).toBe("unsupported");
+    expect(providerModelValue("deepseek", "deepseek-chat")).toBe("unsupported");
   });
 
   it("excludes retired providers and classifies historical values as unsupported", () => {

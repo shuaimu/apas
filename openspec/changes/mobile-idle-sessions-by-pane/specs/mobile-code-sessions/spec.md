@@ -55,3 +55,42 @@ The system SHALL report, for each session a mobile client can reach, the agents 
 - **WHEN** the per-agent detail is absent from a response
 - **THEN** the client still functions
 - **AND** does not present those agents as idle
+
+### Requirement: Mobile distinguishes usage-limited agents from idle agents
+
+The application SHALL treat provider availability as separate from whether a pane is currently working. A pane whose provider reports an active usage limit SHALL NOT appear in Idle sessions and SHALL appear in a separate Usage limited view with the limiting window and reset time when known.
+
+#### Scenario: A non-working pane is usage limited
+
+- **WHEN** a pane is not working and its provider reports an active usage limit
+- **THEN** it does not appear in Idle sessions
+- **AND** it appears in Usage limited with a usage-limited label rather than an idle label
+
+#### Scenario: The provider permits extra usage
+
+- **WHEN** included utilization reaches 100 percent and the provider reports that extra usage is enabled and available
+- **THEN** the pane is not classified as usage limited from utilization alone
+
+#### Scenario: The reported reset passes
+
+- **WHEN** the usage limit's reset time passes before a refreshed payload arrives
+- **THEN** the client stops presenting the pane as usage limited
+
+### Requirement: Mobile ranks recently idle agents first
+
+The application SHALL record when each pane transitions from working to idle and SHALL order Idle sessions from the most recent transition to the oldest. Repeated idle observations SHALL preserve the existing transition time. A client receiving an older pane summary without that timestamp SHALL still show it after timestamped idle panes.
+
+#### Scenario: A pane becomes idle after another pane
+
+- **WHEN** two idle panes have different idle-transition times
+- **THEN** the pane that became idle later appears first
+
+#### Scenario: The same idle state is replayed
+
+- **WHEN** an idle pane receives another idle observation without working in between
+- **THEN** its idle-transition time does not change
+
+#### Scenario: An older server omits idle recency
+
+- **WHEN** an idle pane has no idle-transition timestamp
+- **THEN** it remains in the list after timestamped idle panes

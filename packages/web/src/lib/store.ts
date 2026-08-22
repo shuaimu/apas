@@ -10,7 +10,11 @@ import {
   loadAllSnapshots as loadAllSnapshotsIdb,
   saveSnapshot as saveSnapshotIdb,
 } from "./sessionCacheDb";
-import { isRetiredProviderModel } from "./providerOptions";
+import {
+  canonicalDeepseekModel,
+  DEEPSEEK_DEFAULT_MODEL,
+  isRetiredProviderModel,
+} from "./providerOptions";
 
 // UUID generator with fallback for environments without crypto.randomUUID
 function generateId(): string {
@@ -112,7 +116,10 @@ export interface SessionPaneSummary {
   label?: string | null;
   kind: string;
   provider: string;
+  model?: string | null;
   is_working?: boolean;
+  idle_since?: string | null;
+  usage_limited?: UsageLimitedStatus & { resets_at?: string };
 }
 
 /** A `create_project_instance` still in flight. */
@@ -134,6 +141,12 @@ export interface UsageLimits {
   fiveHour?: UsageLimitWindow;
   sevenDay?: UsageLimitWindow;
   fetchedAt?: string;
+  usageLimited?: UsageLimitedStatus;
+}
+
+export interface UsageLimitedStatus {
+  window: string;
+  resetsAt?: string;
 }
 
 export type Provider = "claude" | "codex" | "minimax" | "glm" | "deepseek" | "opencode" | "cursor-agent";
@@ -294,8 +307,13 @@ export function launchProfileKey(
   provider: Provider,
   model?: string | null,
 ): string {
-  const normalized = model?.trim().toLowerCase() || "default";
+  let normalized = model?.trim().toLowerCase() || "default";
   if (isRetiredProviderModel(provider, model)) return "unsupported:retired";
+  if (provider === "deepseek" && normalized === "default") {
+    normalized = DEEPSEEK_DEFAULT_MODEL;
+  } else {
+    normalized = canonicalDeepseekModel(normalized) ?? normalized;
+  }
   const frontend = provider === "deepseek"
     ? "claude"
     : provider;
@@ -4209,6 +4227,7 @@ export function handleServerMessage(
       const paneId = normalizePaneId(paneType, data.pane_id as number | undefined);
       const status = data.status as string | null;
       const modeHint = normalizePaneModeHint(paneType);
+      const observedAt = new Date().toISOString();
 
       if (paneId) {
         if (msgSessionId) {
@@ -4222,7 +4241,22 @@ export function handleServerMessage(
             return {
               workingPanesBySession,
               sessions: state.sessions.map((session) => session.id === msgSessionId
-                ? { ...session, isWorking: workingPanes.size > 0 }
+                ? {
+                    ...session,
+                    isWorking: workingPanes.size > 0,
+                    panes: session.panes?.map((pane) => {
+                      if (pane.pane_id !== paneId) return pane;
+                      return {
+                        ...pane,
+                        is_working: Boolean(status),
+                        idle_since: status
+                          ? undefined
+                          : pane.is_working || !pane.idle_since
+                            ? observedAt
+                            : pane.idle_since,
+                      };
+                    }),
+                  }
                 : session),
             };
           });
@@ -5273,6 +5307,21 @@ export function handleServerMessage(
           fetchedAt:
             (typeof limits.fetched_at === "string" ? limits.fetched_at : undefined) ??
             (typeof limits.fetchedAt === "string" ? limits.fetchedAt : undefined),
+          usageLimited: (() => {
+            const raw = limits.usage_limited ?? limits.usageLimited;
+            if (!raw || typeof raw !== "object") return undefined;
+            const limited = raw as Record<string, unknown>;
+            if (typeof limited.window !== "string" || !limited.window.trim()) return undefined;
+            const resetRaw =
+              limited.resets_at ??
+              limited.reset_at ??
+              limited.resetsAt ??
+              limited.resetAt;
+            return {
+              window: limited.window,
+              resetsAt: typeof resetRaw === "string" ? resetRaw : undefined,
+            };
+          })(),
         };
         set((state) => {
           const newMap = new Map(state.usageLimits);

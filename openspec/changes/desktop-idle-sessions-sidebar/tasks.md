@@ -18,7 +18,19 @@
 - [x] 3.2 Honour it once the session is attached and the agent exists, then clear it
 - [x] 3.3 Tests: opening a row asks for that session and that agent
 
-## 4. Verification
+## 4. Distinguish unavailable providers from idle agents
 
-- [x] 4.1 Workspace tests and clippy clean; web lint, type-check, and tests clean
-- [ ] 4.2 Live on the desktop against a project with a working agent and an idle one
+- [x] 4.1 Preserve an explicit provider usage-limited result, limiting window, and reset time while respecting enabled extra usage
+- [x] 4.2 Exclude usage-limited agents from Idle sessions and list them in a separate Usage limited view
+- [x] 4.3 Show a reset-aware usage-limited label on the affected pane and add focused provider, selector, and desktop tests
+
+## 5. Rank idle agents by recency
+
+- [x] 5.1 Record and transport the pane's idle-transition timestamp, preserving it across repeated idle observations and defaulting it for older payloads
+- [x] 5.2 Sort Idle sessions by the shared recent-idle ordering, with known timestamps first and deterministic legacy fallback
+- [x] 5.3 Tests: working-to-idle transition, repeated idle, newest-first desktop ordering, and missing timestamps
+
+## 6. Verification
+
+- [ ] 6.1 Workspace tests and clippy clean; web lint, type-check, and tests clean
+- [ ] 6.2 Live on the desktop against a project with a working agent and an idle one

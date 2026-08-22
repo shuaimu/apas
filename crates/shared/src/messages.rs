@@ -2055,10 +2055,22 @@ pub struct MobilePaneSummary {
     pub label: Option<String>,
     pub kind: PaneKind,
     pub provider: Provider,
+    /// Model/backend override used to associate provider-scoped availability
+    /// with the same usage account the pane actually consumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// True while this pane is reporting work, from the same pane statuses the
     /// session-level flag is derived from.
     #[serde(default)]
     pub is_working: bool,
+    /// Most recent working-to-idle transition observed by the server. Older
+    /// servers omit it; clients keep those panes visible after timestamped ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_since: Option<String>,
+    /// Provider availability is not pane activity. Carry the latest explicit
+    /// block separately so shared/mobile snapshots do not turn it into idle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_limited: Option<UsageLimited>,
 }
 
 /// Aggregated usage counters for a pane or project over one time window.
@@ -2335,6 +2347,31 @@ pub struct LaunchProfile {
     pub model: Option<String>,
 }
 
+/// Canonical model identities for Claude Code running through DeepSeek's
+/// Anthropic-compatible endpoint. Pane state and policy keys use these base
+/// IDs; runtime-only selectors such as `[1m]` must not leak into either.
+pub const DEEPSEEK_PRO_MODEL: &str = "deepseek-v4-pro";
+pub const DEEPSEEK_FLASH_MODEL: &str = "deepseek-v4-flash";
+pub const DEEPSEEK_DEFAULT_MODEL: &str = DEEPSEEK_PRO_MODEL;
+
+/// Whether a model is one of the DeepSeek identities APAS explicitly supports.
+pub fn is_supported_deepseek_model(model: &str) -> bool {
+    canonical_deepseek_model(model).is_some()
+}
+
+/// Resolve a supported, possibly differently-cased DeepSeek identity to the
+/// exact value APAS persists and places in policy keys.
+pub fn canonical_deepseek_model(model: &str) -> Option<&'static str> {
+    let normalized = model.trim();
+    if normalized.eq_ignore_ascii_case(DEEPSEEK_PRO_MODEL) {
+        Some(DEEPSEEK_PRO_MODEL)
+    } else if normalized.eq_ignore_ascii_case(DEEPSEEK_FLASH_MODEL) {
+        Some(DEEPSEEK_FLASH_MODEL)
+    } else {
+        None
+    }
+}
+
 fn launch_profile(
     key: &str,
     label: &str,
@@ -2375,11 +2412,19 @@ pub fn supported_launch_profiles() -> Vec<LaunchProfile> {
         ),
         launch_profile(
             "agent:claude:deepseek:deepseek-v4-pro",
-            "Claude / DeepSeek",
+            "Claude / DeepSeek Pro",
             PaneKind::Agent,
             Provider::Claude,
             "deepseek",
-            Some("deepseek-v4-pro"),
+            Some(DEEPSEEK_PRO_MODEL),
+        ),
+        launch_profile(
+            "agent:claude:deepseek:deepseek-v4-flash",
+            "Claude / DeepSeek Flash",
+            PaneKind::Agent,
+            Provider::Claude,
+            "deepseek",
+            Some(DEEPSEEK_FLASH_MODEL),
         ),
         launch_profile(
             "agent:codex:official:default",
@@ -2428,6 +2473,22 @@ pub fn supported_launch_profiles() -> Vec<LaunchProfile> {
             Provider::Opencode,
             "official",
             None,
+        ),
+        launch_profile(
+            "terminal:claude:deepseek:deepseek-v4-pro",
+            "Claude / DeepSeek Pro Terminal",
+            PaneKind::Terminal,
+            Provider::Claude,
+            "deepseek",
+            Some(DEEPSEEK_PRO_MODEL),
+        ),
+        launch_profile(
+            "terminal:claude:deepseek:deepseek-v4-flash",
+            "Claude / DeepSeek Flash Terminal",
+            PaneKind::Terminal,
+            Provider::Claude,
+            "deepseek",
+            Some(DEEPSEEK_FLASH_MODEL),
         ),
     ]
 }
@@ -2509,7 +2570,12 @@ pub fn launch_profile_key(kind: PaneKind, provider: Provider, model: Option<&str
         Provider::CursorAgent => "cursor-agent",
         Provider::Minimax | Provider::Glm => "unsupported",
     };
-    let normalized = normalized_model(model);
+    let mut normalized = normalized_model(model);
+    if provider == Provider::Deepseek && normalized == "default" {
+        normalized = DEEPSEEK_DEFAULT_MODEL.to_string();
+    } else if let Some(canonical) = canonical_deepseek_model(&normalized) {
+        normalized = canonical.to_string();
+    }
     let backend = if normalized.contains("deepseek") || provider == Provider::Deepseek {
         "deepseek"
     } else {
@@ -2751,6 +2817,26 @@ pub struct UsageLimitWindow {
     pub resets_at: Option<String>,
 }
 
+/// A provider-confirmed usage limit that is currently preventing work.
+///
+/// This is deliberately separate from utilization: included usage may reach
+/// 100% while paid extra usage remains available, in which case the provider
+/// is not blocking requests and this field stays absent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct UsageLimited {
+    /// Human-readable limiting window, such as "weekly" or "5-hour".
+    pub window: String,
+    /// When the provider expects work to become available again.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "reset_at",
+        alias = "resetAt",
+        alias = "resetsAt"
+    )]
+    pub resets_at: Option<String>,
+}
+
 /// Usage limits from the provider API/logs
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct UsageLimits {
@@ -2763,6 +2849,14 @@ pub struct UsageLimits {
     /// When the usage was last fetched (ISO 8601 timestamp)
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "fetchedAt")]
     pub fetched_at: Option<String>,
+    /// Present only when the provider says a usage limit is actively blocking
+    /// requests. A full utilization meter alone is not sufficient.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "usageLimited"
+    )]
+    pub usage_limited: Option<UsageLimited>,
 }
 
 // ============================================================================
@@ -4308,6 +4402,7 @@ mod tests {
         for supported in [
             "agent:claude:official:default",
             "agent:claude:deepseek:deepseek-v4-pro",
+            "agent:claude:deepseek:deepseek-v4-flash",
             "agent:codex:official:o3",
         ] {
             assert!(
@@ -4334,12 +4429,15 @@ mod tests {
         for expected in [
             "agent:claude:official:default",
             "agent:claude:deepseek:deepseek-v4-pro",
+            "agent:claude:deepseek:deepseek-v4-flash",
             "agent:codex:official:default",
             "agent:opencode:official:default",
             "agent:cursor-agent:official:default",
             "terminal:claude:official:default",
             "terminal:codex:official:default",
             "terminal:opencode:official:default",
+            "terminal:claude:deepseek:deepseek-v4-pro",
+            "terminal:claude:deepseek:deepseek-v4-flash",
         ] {
             assert!(policy
                 .allowed_launch_profiles
@@ -4357,8 +4455,69 @@ mod tests {
         };
         assert!(policy.allows(PaneKind::Agent, Provider::Codex, None));
         assert!(!policy.allows(PaneKind::Agent, Provider::Claude, Some("future-model")));
+        assert!(!policy.allows(PaneKind::Agent, Provider::Claude, Some("deepseek-chat")));
         policy.project_suspended = true;
         assert!(!policy.allows(PaneKind::Agent, Provider::Codex, None));
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn deepseek_profiles_are_independent_and_direct_default_is_pro() {
+        assert_eq!(
+            launch_profile_key(PaneKind::Agent, Provider::Deepseek, None),
+            "agent:claude:deepseek:deepseek-v4-pro"
+        );
+
+        let pro_only = EffectiveProjectPolicy {
+            team_available: false,
+            allowed_launch_profiles: vec!["agent:claude:deepseek:deepseek-v4-pro".to_string()],
+            version: 1,
+            project_suspended: false,
+        };
+        assert!(pro_only.allows(PaneKind::Agent, Provider::Deepseek, None));
+        assert!(pro_only.allows(PaneKind::Agent, Provider::Claude, Some(DEEPSEEK_PRO_MODEL)));
+        assert!(!pro_only.allows(
+            PaneKind::Agent,
+            Provider::Claude,
+            Some(DEEPSEEK_FLASH_MODEL)
+        ));
+
+        let flash_only = EffectiveProjectPolicy {
+            allowed_launch_profiles: vec!["agent:claude:deepseek:deepseek-v4-flash".to_string()],
+            ..pro_only
+        };
+        assert!(flash_only.allows(
+            PaneKind::Agent,
+            Provider::Claude,
+            Some(DEEPSEEK_FLASH_MODEL)
+        ));
+        assert!(!flash_only.allows(PaneKind::Agent, Provider::Claude, Some(DEEPSEEK_PRO_MODEL)));
+    }
+
+    #[test]
+    fn deepseek_terminal_profiles_derive_and_authorize_independently() {
+        assert_eq!(
+            launch_profile_key(PaneKind::Terminal, Provider::Claude, Some(DEEPSEEK_PRO_MODEL)),
+            "terminal:claude:deepseek:deepseek-v4-pro"
+        );
+        assert_eq!(
+            launch_profile_key(PaneKind::Terminal, Provider::Claude, Some(DEEPSEEK_FLASH_MODEL)),
+            "terminal:claude:deepseek:deepseek-v4-flash"
+        );
+
+        let policy = EffectiveProjectPolicy {
+            team_available: false,
+            allowed_launch_profiles: vec![
+                "terminal:claude:official:default".to_string(),
+                "terminal:claude:deepseek:deepseek-v4-pro".to_string(),
+            ],
+            version: 1,
+            project_suspended: false,
+        };
+        assert!(policy.allows(PaneKind::Terminal, Provider::Claude, None));
+        assert!(policy.allows(PaneKind::Terminal, Provider::Claude, Some(DEEPSEEK_PRO_MODEL)));
+        assert!(!policy.allows(PaneKind::Terminal, Provider::Claude, Some(DEEPSEEK_FLASH_MODEL)));
+        assert!(!policy.allows(PaneKind::Agent, Provider::Claude, Some(DEEPSEEK_PRO_MODEL)));
     }
 }
 

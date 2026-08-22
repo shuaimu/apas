@@ -575,6 +575,8 @@ mod tests {
                 "terminal:claude:official:default",
                 "terminal:codex:official:default",
                 "terminal:opencode:official:default",
+                "terminal:claude:deepseek:deepseek-v4-pro",
+                "terminal:claude:deepseek:deepseek-v4-flash",
             ]
         );
         assert!(profiles
@@ -685,6 +687,22 @@ mod tests {
             3,
             Some("Working…".to_string()),
         );
+        state.sessions.update_usage_limits(
+            cli_id,
+            shared::Provider::Claude,
+            shared::UsageLimits {
+                five_hour: None,
+                seven_day: Some(shared::UsageLimitWindow {
+                    utilization: 1.0,
+                    resets_at: Some("2026-08-23T13:00:00Z".to_string()),
+                }),
+                fetched_at: Some("2026-08-20T20:00:00Z".to_string()),
+                usage_limited: Some(shared::UsageLimited {
+                    window: "weekly".to_string(),
+                    resets_at: Some("2026-08-23T13:00:00Z".to_string()),
+                }),
+            },
+        );
         let Json(response) = bootstrap(State(state.clone()), headers(&state, &owner_id))
             .await
             .unwrap();
@@ -708,6 +726,17 @@ mod tests {
         assert!(busy.is_working);
         assert!(!idle.is_working);
         assert_eq!(idle.label.as_deref(), Some("Idle one"));
+        assert!(
+            idle.idle_since.is_some(),
+            "idle panes carry ranking recency"
+        );
+        assert_eq!(
+            idle.usage_limited
+                .as_ref()
+                .map(|limited| limited.window.as_str()),
+            Some("weekly"),
+            "provider availability is reported separately from pane work"
+        );
         // The two views agree, because they read the same statuses.
         assert!(panes.iter().any(|pane| pane.is_working));
         assert!(!response.sessions[1].session.is_active);

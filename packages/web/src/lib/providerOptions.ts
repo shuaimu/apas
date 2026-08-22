@@ -1,6 +1,8 @@
 // Keep in sync with crates/client-cli/src/mode/dual_pane.rs; the apas
 // cargo test `deepseek_default_model_matches_web_provider_options` guards drift.
 export const DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-pro";
+export const DEEPSEEK_PRO_MODEL = "deepseek-v4-pro";
+export const DEEPSEEK_FLASH_MODEL = "deepseek-v4-flash";
 export const CLAUDE_FABLE_MODEL = "claude-fable-5";
 
 export interface ProviderModelOption {
@@ -36,9 +38,15 @@ export const PROVIDER_MODEL_GROUPS: ProviderModelGroup[] = [
       },
       {
         value: "claude/deepseek",
-        label: "DeepSeek",
+        label: "DeepSeek Pro",
         provider: "claude",
         model: DEEPSEEK_DEFAULT_MODEL,
+      },
+      {
+        value: "claude/deepseek-flash",
+        label: "DeepSeek Flash",
+        provider: "claude",
+        model: DEEPSEEK_FLASH_MODEL,
       },
     ],
   },
@@ -126,6 +134,13 @@ export function isDeepseekModel(model?: string | null): boolean {
   return normalized.includes("deepseek");
 }
 
+export function canonicalDeepseekModel(model?: string | null): string | null {
+  const normalized = model?.trim().toLowerCase();
+  if (normalized === DEEPSEEK_PRO_MODEL) return DEEPSEEK_PRO_MODEL;
+  if (normalized === DEEPSEEK_FLASH_MODEL) return DEEPSEEK_FLASH_MODEL;
+  return null;
+}
+
 export function isFableModel(model?: string | null): boolean {
   if (typeof model !== "string") return false;
   const normalized = model.trim().toLowerCase();
@@ -139,13 +154,24 @@ export function providerModelValue(
   if (isRetiredProviderModel(provider, model)) return UNSUPPORTED_PROVIDER_MODEL_OPTION.value;
   if (provider === "claude") {
     if (isFableModel(model)) return "claude/fable";
-    if (isDeepseekModel(model)) return "claude/deepseek";
+    const deepseekModel = canonicalDeepseekModel(model);
+    if (deepseekModel === DEEPSEEK_FLASH_MODEL) return "claude/deepseek-flash";
+    if (deepseekModel === DEEPSEEK_PRO_MODEL) return "claude/deepseek";
+    if (isDeepseekModel(model)) return UNSUPPORTED_PROVIDER_MODEL_OPTION.value;
     return "claude/official";
   }
   if (provider === "codex") return "codex/official";
   if (provider === "opencode") return "opencode/official";
   if (provider === "cursor-agent") return "cursor-agent/official";
-  if (provider === "deepseek") return "claude/deepseek";
+  if (provider === "deepseek") {
+    if (!model || canonicalDeepseekModel(model) === DEEPSEEK_PRO_MODEL) {
+      return "claude/deepseek";
+    }
+    if (canonicalDeepseekModel(model) === DEEPSEEK_FLASH_MODEL) {
+      return "claude/deepseek-flash";
+    }
+    return UNSUPPORTED_PROVIDER_MODEL_OPTION.value;
+  }
   if (provider === "fable") return "claude/fable";
   return UNSUPPORTED_PROVIDER_MODEL_OPTION.value;
 }
