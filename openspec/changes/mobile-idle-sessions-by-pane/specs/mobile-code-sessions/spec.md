@@ -56,15 +56,15 @@ The system SHALL report, for each session a mobile client can reach, the agents 
 - **THEN** the client still functions
 - **AND** does not present those agents as idle
 
-### Requirement: Mobile distinguishes usage-limited agents from idle agents
+### Requirement: Mobile groups usage-limited agents beneath idle agents
 
-The application SHALL treat provider availability as separate from whether a pane is currently working. A pane whose provider reports an active usage limit SHALL NOT appear in Idle sessions and SHALL appear in a separate Usage limited view with the limiting window and reset time when known.
+The application SHALL treat provider availability as separate from whether a pane is currently working. The Idle sessions view SHALL show ordinary idle panes first and provider-blocked panes in a labelled Usage limited subsection beneath them, with the limiting window and reset time when known.
 
 #### Scenario: A non-working pane is usage limited
 
 - **WHEN** a pane is not working and its provider reports an active usage limit
-- **THEN** it does not appear in Idle sessions
-- **AND** it appears in Usage limited with a usage-limited label rather than an idle label
+- **THEN** it does not appear among the ordinary idle rows
+- **AND** it appears in the Usage limited subsection with a usage-limited label rather than an idle label
 
 #### Scenario: The provider permits extra usage
 

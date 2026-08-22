@@ -60,7 +60,7 @@ type ProjectRole = "owner" | "user";
 
 // Group key + localStorage key for collapsed repo groups in the sidebar.
 const NO_REMOTE_KEY = "__no_remote__";
-type SidebarView = "projects" | "idle" | "limited";
+type SidebarView = "projects" | "idle";
 
 /// The same name the project list shows, so an agent row and its project agree.
 function projectNameFor(session: { workingDir?: string; projectId?: string; id: string }): string {
@@ -273,10 +273,59 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
     [waitingAgents],
   );
   const limitedAgents = useMemo(
-    () => waitingAgents.filter((agent) => agent.usageLimit),
+    () => waitingAgents
+      .filter((agent) => agent.usageLimit)
+      .sort(compareRecentlyIdle),
     [waitingAgents],
   );
-  const visibleAgents = view === "limited" ? limitedAgents : idleAgents;
+
+  const renderWaitingAgent = ({
+    session,
+    pane,
+    usageLimit,
+  }: (typeof waitingAgents)[number]) => {
+    const name = projectNameFor(session);
+    const resetLabel = usageLimit
+      ? usageLimitResetLabel(usageLimit, availabilityNow)
+      : null;
+    return (
+      <button
+        key={`${session.id}:${pane.pane_id}`}
+        type="button"
+        aria-label={`Open ${paneRowLabel(pane)} in ${name}`}
+        onClick={() => {
+          // Names an agent, so it opens that agent rather than whichever tab
+          // the project was last left on.
+          openSessionPane(session.id, pane.pane_id);
+          onClose?.();
+        }}
+        className="w-full rounded-lg border border-gray-200 bg-white p-2.5 text-left hover:border-gray-300 dark:border-gray-800 dark:bg-gray-800/60 dark:hover:border-gray-700"
+      >
+        {/* Project first, then the agent, both emphasised: the project places
+            the row and the agent is what you are opening. The host is the
+            only detail that can be quiet. */}
+        <div className="flex items-center justify-between gap-2">
+          <span className="flex min-w-0 flex-1 items-baseline gap-1 truncate text-sm">
+            <span className="shrink-0 truncate font-semibold">{name}</span>
+            <span aria-hidden="true" className="shrink-0 text-gray-400 dark:text-gray-600">/</span>
+            <span className="min-w-0 truncate font-semibold text-indigo-600 dark:text-indigo-400">{paneRowLabel(pane)}</span>
+          </span>
+          <span className={`shrink-0 rounded-full px-2 py-0.5 text-[0.65rem] font-semibold ${
+            usageLimit
+              ? "bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300"
+              : "bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300"
+          }`}>
+            {usageLimit ? usageLimitedLabel(usageLimit) : "Idle"}
+          </span>
+        </div>
+        {(session.hostname || resetLabel) && (
+          <div className="mt-1 truncate text-xs text-gray-500 dark:text-gray-400">
+            {[session.hostname, resetLabel].filter(Boolean).join(" · ")}
+          </div>
+        )}
+      </button>
+    );
+  };
 
   const repoGroups = useMemo(() => {
     const byKey = new Map<
@@ -682,7 +731,6 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
         {([
           ["projects", "All projects"],
           ["idle", "Idle sessions"],
-          ["limited", "Usage limited"],
         ] as const).map(([key, label]) => (
           <button
             key={key}
@@ -700,61 +748,39 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
         ))}
       </div>
 
-      {view === "idle" || view === "limited" ? (
+      {view === "idle" ? (
         <div className="flex-1 overflow-y-auto p-2">
-          {visibleAgents.length > 0 ? (
-            <div className="space-y-1.5">
-              {visibleAgents.map(({ session, pane, usageLimit }) => {
-                const name = projectNameFor(session);
-                const resetLabel = usageLimit ? usageLimitResetLabel(usageLimit, availabilityNow) : null;
-                return (
-                  <button
-                    key={`${session.id}:${pane.pane_id}`}
-                    type="button"
-                    aria-label={`Open ${paneRowLabel(pane)} in ${name}`}
-                    onClick={() => {
-                      // Names an agent, so it opens that agent rather than
-                      // whichever tab the project was last left on.
-                      openSessionPane(session.id, pane.pane_id);
-                      onClose?.();
-                    }}
-                    className="w-full rounded-lg border border-gray-200 bg-white p-2.5 text-left hover:border-gray-300 dark:border-gray-800 dark:bg-gray-800/60 dark:hover:border-gray-700"
+          {idleAgents.length > 0 || limitedAgents.length > 0 ? (
+            <>
+              {idleAgents.length > 0 && (
+                <div className="space-y-1.5">
+                  {idleAgents.map(renderWaitingAgent)}
+                </div>
+              )}
+              {limitedAgents.length > 0 && (
+                <section
+                  aria-labelledby="sidebar-usage-limited-heading"
+                  className={idleAgents.length > 0 ? "mt-4 border-t border-gray-200 pt-3 dark:border-gray-800" : ""}
+                >
+                  <h3
+                    id="sidebar-usage-limited-heading"
+                    className="mb-2 px-1 text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400"
                   >
-                    {/* Project first, then the agent, both emphasised: the
-                        project places the row and the agent is what you are
-                        opening. The host is the only detail that can be quiet. */}
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="flex min-w-0 flex-1 items-baseline gap-1 truncate text-sm">
-                        <span className="shrink-0 truncate font-semibold">{name}</span>
-                        <span aria-hidden="true" className="shrink-0 text-gray-400 dark:text-gray-600">/</span>
-                        <span className="min-w-0 truncate font-semibold text-indigo-600 dark:text-indigo-400">{paneRowLabel(pane)}</span>
-                      </span>
-                      <span className={`shrink-0 rounded-full px-2 py-0.5 text-[0.65rem] font-semibold ${
-                        usageLimit
-                          ? "bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300"
-                          : "bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300"
-                      }`}>
-                        {usageLimit ? usageLimitedLabel(usageLimit) : "Idle"}
-                      </span>
-                    </div>
-                    {(session.hostname || resetLabel) && (
-                      <div className="mt-1 truncate text-xs text-gray-500 dark:text-gray-400">
-                        {[session.hostname, resetLabel].filter(Boolean).join(" · ")}
-                      </div>
-                    )}
-                  </button>
-                );
-              })}
-            </div>
+                    Usage limited
+                  </h3>
+                  <div className="space-y-1.5">
+                    {limitedAgents.map(renderWaitingAgent)}
+                  </div>
+                </section>
+              )}
+            </>
           ) : (
             <div className="py-8 text-center text-sm text-gray-400">
               <FolderOpen className="mx-auto mb-2 h-8 w-8 opacity-50" />
-              <p>{view === "limited" ? "No usage-limited sessions" : "No idle sessions"}</p>
+              <p>No idle sessions</p>
               <p className="mt-1 text-xs">
                 {sessions.length
-                  ? view === "limited"
-                    ? "No provider is currently blocking an agent."
-                    : "Every available agent that reported in is working."
+                  ? "Every available agent that reported in is working."
                   : "Run `apas` in a directory to start"}
               </p>
             </div>

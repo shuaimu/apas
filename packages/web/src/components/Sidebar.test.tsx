@@ -509,7 +509,7 @@ describe("Sidebar project list", () => {
     ]);
   });
 
-  it("keeps a provider-blocked agent out of idle and gives it a usage-limited status", () => {
+  it("puts provider-blocked agents below idle agents in the merged view", () => {
     seedSidebarState({
       sessions: [makeSession({
         id: "session-a",
@@ -519,6 +519,7 @@ describe("Sidebar project list", () => {
         isActive: true,
         panes: [
           { pane_id: 197, label: "Claude 4", kind: "terminal", provider: "claude", is_working: false },
+          { pane_id: 198, label: "Codex 4", kind: "terminal", provider: "codex", is_working: false },
         ],
       })],
       usageLimits: new Map([
@@ -533,12 +534,13 @@ describe("Sidebar project list", () => {
 
     render(<Sidebar />);
     fireEvent.click(screen.getByRole("button", { name: "Idle sessions" }));
-    expect(screen.queryByRole("button", { name: "Open Claude 4 in mako" })).toBeNull();
-
-    fireEvent.click(screen.getByRole("button", { name: "Usage limited" }));
-    const row = screen.getByRole("button", { name: "Open Claude 4 in mako" });
-    expect(row.textContent).toContain("Weekly usage limited");
-    expect(row.textContent).toContain("Resets in");
+    expect(screen.queryByRole("button", { name: "Usage limited" })).toBeNull();
+    expect(screen.getByRole("heading", { name: "Usage limited" })).toBeTruthy();
+    const idleRow = screen.getByRole("button", { name: "Open Codex 4 in mako" });
+    const limitedRow = screen.getByRole("button", { name: "Open Claude 4 in mako" });
+    expect(limitedRow.textContent).toContain("Weekly usage limited");
+    expect(limitedRow.textContent).toContain("Resets in");
+    expect(idleRow.compareDocumentPosition(limitedRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it("opens the agent that was named, not just its project", () => {

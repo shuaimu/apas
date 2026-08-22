@@ -28,7 +28,7 @@ const EMPTY_USAGE_LIMITS = new Map<string, UsageLimitsByProvider>();
 
 // "machines" is a third selection rather than a screen: the home already
 // switches lists, and a handful of machine rows does not warrant navigation.
-type HomeView = "all" | "idle" | "limited" | "machines";
+type HomeView = "all" | "idle" | "machines";
 
 interface MobileSessionSummary {
   id: string;
@@ -76,7 +76,6 @@ interface MobileBootstrapResponse {
 const FILTERS: { key: HomeView; label: string }[] = [
   { key: "all", label: "All projects" },
   { key: "idle", label: "Idle sessions" },
-  { key: "limited", label: "Usage limited" },
   { key: "machines", label: "Machines" },
 ];
 
@@ -334,7 +333,9 @@ export function MobileCodeHome({
     [waitingPanes],
   );
   const limitedPanes = useMemo(
-    () => waitingPanes.filter((entry) => entry.usageLimit),
+    () => waitingPanes
+      .filter((entry) => entry.usageLimit)
+      .sort(compareRecentlyIdle),
     [waitingPanes],
   );
   const fullyLimitedSessionIds = useMemo(
@@ -358,7 +359,51 @@ export function MobileCodeHome({
     ),
     [availabilityNow, sessions, usageLimits],
   );
-  const visiblePanes = filter === "limited" ? limitedPanes : idlePanes;
+  const renderWaitingPane = ({
+    session,
+    pane,
+    usageLimit,
+  }: (typeof waitingPanes)[number]) => {
+    const name = session.project_name || "Coding session";
+    const resetLabel = usageLimit
+      ? usageLimitResetLabel(usageLimit, availabilityNow)
+      : null;
+    return (
+      <button
+        key={`${session.id}:${pane.pane_id}`}
+        type="button"
+        aria-label={`Open ${paneRowLabel(pane)} in ${name}`}
+        onClick={() => {
+          // The session screen reads this on entry, so the row lands on the
+          // agent it names rather than the last one used in that project.
+          writeSelectedPane(session.id, pane.pane_id);
+          onOpenSession(session.id, name);
+        }}
+        className="w-full rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left shadow-sm transition hover:border-[#bdbdc9] active:opacity-75 dark:border-[#383842] dark:bg-[#1b1b21] dark:hover:border-[#50505c]"
+      >
+        {/* Project first, then the agent: the project is what places the row,
+            and both matter, so neither is demoted to the muted line. The host
+            stays there instead. */}
+        <div className="flex items-center justify-between gap-2.5">
+          <span className="flex min-w-0 flex-1 items-baseline gap-1.5 truncate text-base">
+            <span className="shrink-0 truncate font-bold">{name}</span>
+            <span aria-hidden="true" className="shrink-0 text-[#aaaab6] dark:text-[#686873]">/</span>
+            <span className="min-w-0 truncate font-bold text-[#6d5efc]">{paneRowLabel(pane)}</span>
+          </span>
+          <span className={`shrink-0 rounded-full px-2.5 py-1 text-[0.7rem] font-bold ${
+            usageLimit
+              ? "bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300"
+              : "bg-[#efeff5] text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]"
+          }`}>
+            {usageLimit ? usageLimitedLabel(usageLimit) : "Idle"}
+          </span>
+        </div>
+        <p className="mt-2 truncate text-sm text-[#686873] dark:text-[#aaaab6]">
+          {[sessionTarget(session), resetLabel].filter(Boolean).join(" · ")}
+        </p>
+      </button>
+    );
+  };
 
   const activeSessions = useMemo(
     () => sessions.filter((session) => session.is_active).sort(compareSessionRecency),
@@ -484,65 +529,40 @@ export function MobileCodeHome({
               </p>
             </div>
           )
-        ) : filter === "idle" || filter === "limited" ? (
-          visiblePanes.length > 0 ? (
-            <div className="space-y-2.5">
-              {visiblePanes.map(({ session, pane, usageLimit }) => {
-                const name = session.project_name || "Coding session";
-                const resetLabel = usageLimit
-                  ? usageLimitResetLabel(usageLimit, availabilityNow)
-                  : null;
-                return (
-                  <button
-                    key={`${session.id}:${pane.pane_id}`}
-                    type="button"
-                    aria-label={`Open ${paneRowLabel(pane)} in ${name}`}
-                    onClick={() => {
-                      // The session screen reads this on entry, so the row
-                      // lands on the agent it names rather than the last one
-                      // used in that project.
-                      writeSelectedPane(session.id, pane.pane_id);
-                      onOpenSession(session.id, name);
-                    }}
-                    className="w-full rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left shadow-sm transition hover:border-[#bdbdc9] active:opacity-75 dark:border-[#383842] dark:bg-[#1b1b21] dark:hover:border-[#50505c]"
+        ) : filter === "idle" ? (
+          idlePanes.length > 0 || limitedPanes.length > 0 ? (
+            <>
+              {idlePanes.length > 0 && (
+                <div className="space-y-2.5">
+                  {idlePanes.map(renderWaitingPane)}
+                </div>
+              )}
+              {limitedPanes.length > 0 && (
+                <section
+                  aria-labelledby="mobile-usage-limited-heading"
+                  className={idlePanes.length > 0 ? "mt-5 border-t border-[#dedee7] pt-4 dark:border-[#383842]" : ""}
+                >
+                  <h2
+                    id="mobile-usage-limited-heading"
+                    className="mb-2.5 text-sm font-extrabold uppercase tracking-wide text-[#686873] dark:text-[#aaaab6]"
                   >
-                    {/* Project first, then the agent: the project is what
-                        places the row, and both matter, so neither is demoted
-                        to the muted line. The host stays there instead. */}
-                    <div className="flex items-center justify-between gap-2.5">
-                      <span className="flex min-w-0 flex-1 items-baseline gap-1.5 truncate text-base">
-                        <span className="shrink-0 truncate font-bold">{name}</span>
-                        <span aria-hidden="true" className="shrink-0 text-[#aaaab6] dark:text-[#686873]">/</span>
-                        <span className="min-w-0 truncate font-bold text-[#6d5efc]">{paneRowLabel(pane)}</span>
-                      </span>
-                      <span className={`shrink-0 rounded-full px-2.5 py-1 text-[0.7rem] font-bold ${
-                        usageLimit
-                          ? "bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300"
-                          : "bg-[#efeff5] text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]"
-                      }`}>
-                        {usageLimit ? usageLimitedLabel(usageLimit) : "Idle"}
-                      </span>
-                    </div>
-                    <p className="mt-2 truncate text-sm text-[#686873] dark:text-[#aaaab6]">
-                      {[sessionTarget(session), resetLabel].filter(Boolean).join(" · ")}
-                    </p>
-                  </button>
-                );
-              })}
-            </div>
+                    Usage limited
+                  </h2>
+                  <div className="space-y-2.5">
+                    {limitedPanes.map(renderWaitingPane)}
+                  </div>
+                </section>
+              )}
+            </>
           ) : (
             <div className="flex h-full min-h-52 flex-col items-center justify-center px-5 text-center">
               <div className="mb-3 rounded-2xl bg-[#efeff5] p-3 dark:bg-[#25252d]">
                 <AlertTriangle className="h-6 w-6 text-[#686873] dark:text-[#aaaab6]" />
               </div>
-              <h2 className="text-lg font-extrabold">
-                {filter === "limited" ? "No usage-limited sessions" : "No idle sessions"}
-              </h2>
+              <h2 className="text-lg font-extrabold">No idle sessions</h2>
               <p className="mt-1.5 max-w-sm text-sm leading-5 text-[#686873] dark:text-[#aaaab6]">
                 {sessions.length
-                  ? filter === "limited"
-                    ? "No provider is currently blocking an agent."
-                    : "Every available agent that reported in is currently working."
+                  ? "Every available agent that reported in is currently working."
                   : "Start APAS in a project, then follow its coding activity here."}
               </p>
             </div>

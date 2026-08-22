@@ -21,8 +21,8 @@
 ## 4. Distinguish usage-limited agents
 
 - [x] 4.1 Carry an explicit usage-limited result and reset metadata without treating a 100 percent included meter as blocking when extra usage remains available
-- [x] 4.2 Exclude usage-limited panes from Idle sessions and render them in a separate Usage limited view
-- [x] 4.3 Tests: limited panes are absent from idle, present with reset metadata in the limited view, and become non-limited after reset
+- [x] 4.2 Keep usage-limited panes out of ordinary idle rows and render them in a Usage limited subsection beneath Idle sessions
+- [x] 4.3 Tests: limited panes follow idle rows with reset metadata and become non-limited after reset
 
 ## 5. Rank idle agents by recency
 
@@ -32,5 +32,5 @@
 
 ## 6. Verification
 
-- [ ] 6.1 Workspace tests and clippy clean; web lint, type-check, and tests clean
+- [x] 6.1 Workspace tests and clippy clean; web lint, type-check, and tests clean
 - [ ] 6.2 Live on the mobile browser against a project with a working pane and an idle one

@@ -9,8 +9,9 @@ desktop is where most of this work happens.
 
 ## What Changes
 
-- **The sidebar gains separate views** for "All projects", "Idle sessions",
-  and "Usage limited" sessions, matching the same distinction on mobile.
+- **The sidebar gains views** for "All projects" and "Idle sessions". Provider-
+  blocked agents remain distinct in a "Usage limited" subsection beneath the
+  ordinary idle rows instead of consuming a third top-level view.
 - **The idle view lists one row per agent**, naming its project and host, and
   includes agents inside projects that are otherwise working.
 - **Opening a row opens that agent**, not merely its project. The remembered tab
@@ -23,8 +24,8 @@ desktop is where most of this work happens.
 - Both surfaces now derive the list from one server helper, so a pane cannot
   read as idle in one place and working in the other.
 - Provider quota state remains separate from transient pane work. A pane whose
-  provider is actively blocking requests is listed as usage limited rather
-  than idle, with its limiting window and reset time when known.
+  provider is actively blocking requests is grouped below the idle agents and
+  labelled usage limited, with its limiting window and reset time when known.
 - Idle agents are ordered by when they most recently became idle, newest first,
   so the agent that just finished work or started waiting is easiest to find.
 

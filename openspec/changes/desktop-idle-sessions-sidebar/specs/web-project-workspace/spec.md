@@ -46,15 +46,15 @@ Opening an entry that names an agent SHALL open its session with that agent sele
 - **WHEN** the named agent does not exist in the attached session
 - **THEN** the selection falls back to the ordinary behaviour
 
-### Requirement: Usage-limited agents are not idle
+### Requirement: Usage-limited agents are grouped beneath idle agents
 
-The workspace SHALL distinguish an agent waiting for input from an agent whose provider is actively refusing work because a usage limit is in effect. It SHALL NOT encode usage limitation as pane work, and SHALL show the limiting window and reset time when the provider reports them.
+The workspace SHALL distinguish an agent waiting for input from an agent whose provider is actively refusing work because a usage limit is in effect. It SHALL NOT encode usage limitation as pane work. The Idle sessions view SHALL show ordinary idle agents first and a labelled Usage limited subsection beneath them, including the limiting window and reset time when the provider reports them.
 
 #### Scenario: An inactive turn has an active provider limit
 
 - **WHEN** an agent is not working and its provider reports an active usage limit
-- **THEN** the agent does not appear in Idle sessions
-- **AND** it appears in the separate Usage limited view
+- **THEN** the agent does not appear among the ordinary idle rows
+- **AND** it appears in the Usage limited subsection beneath them
 - **AND** it is labelled usage limited rather than idle
 
 #### Scenario: Included usage is exhausted but extra usage remains available

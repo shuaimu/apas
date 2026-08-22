@@ -12,9 +12,9 @@ that list is "which agent is waiting for me", and the answer is per pane.
 
 - **The list becomes "Idle sessions", one row per agent pane** rather than one
   per project. A pane names its project and host so it is placeable.
-- **Usage-limited panes have their own view and status.** They are unavailable,
-  not waiting for input, so they are excluded from Idle sessions and carry the
-  provider's limiting window and reset time when known.
+- **Usage-limited panes have their own subsection and status.** They are
+  unavailable, not waiting for input, so they are grouped beneath ordinary
+  idle panes and carry the provider's limiting window and reset time when known.
 - **The most recently idle pane appears first.** The idle list follows the pane's
   latest working-to-idle transition rather than project or roster order.
 - **Panes from a working project appear** when they are themselves idle, which
@@ -43,7 +43,7 @@ that list is "which agent is waiting for me", and the answer is per pane.
   manager already holds and the pane statuses it already tracks — the same
   source the project-level flag is derived from, so the two cannot disagree.
 - `packages/web/src/components/mobile/MobileCodeHome.tsx`: the idle view renders
-  panes, while a separate usage-limited view renders provider-blocked panes;
+  ordinary panes first and provider-blocked panes in a Usage limited subsection;
   tapping either remembers the pane before navigating.
 - `packages/web/src/lib/`: the remembered-pane helpers move out of the session
   screen so the home can write what the session screen reads, rather than the

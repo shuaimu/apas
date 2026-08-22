@@ -21,8 +21,8 @@
 ## 4. Distinguish unavailable providers from idle agents
 
 - [x] 4.1 Preserve an explicit provider usage-limited result, limiting window, and reset time while respecting enabled extra usage
-- [x] 4.2 Exclude usage-limited agents from Idle sessions and list them in a separate Usage limited view
-- [x] 4.3 Show a reset-aware usage-limited label on the affected pane and add focused provider, selector, and desktop tests
+- [x] 4.2 Keep usage-limited agents out of the ordinary idle rows and list them in a Usage limited subsection beneath Idle sessions
+- [x] 4.3 Show a reset-aware usage-limited label on the affected pane and test that ordinary idle rows precede the subsection
 
 ## 5. Rank idle agents by recency
 
@@ -32,5 +32,5 @@
 
 ## 6. Verification
 
-- [ ] 6.1 Workspace tests and clippy clean; web lint, type-check, and tests clean
+- [x] 6.1 Workspace tests and clippy clean; web lint, type-check, and tests clean
 - [ ] 6.2 Live on the desktop against a project with a working agent and an idle one

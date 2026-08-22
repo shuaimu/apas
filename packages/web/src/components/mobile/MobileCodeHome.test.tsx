@@ -66,7 +66,7 @@ afterEach(() => {
 });
 
 describe("MobileCodeHome", () => {
-  it("renders project, idle, usage-limited, and machine categories", () => {
+  it("renders project, idle, and machine categories", () => {
     renderHome();
 
     expect(screen.getByRole("heading", { name: "Coding sessions" })).toBeTruthy();
@@ -74,7 +74,7 @@ describe("MobileCodeHome", () => {
     expect(screen.getByRole("button", { name: /New task/ })).toBeTruthy();
     expect(screen.getByRole("button", { name: "All projects" }).getAttribute("aria-pressed")).toBe("true");
     expect(screen.getByRole("button", { name: "Idle sessions" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Usage limited" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Usage limited" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Active" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Attention" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Completed" })).toBeNull();
@@ -387,7 +387,7 @@ describe("MobileCodeHome", () => {
     ]);
   });
 
-  it("separates a provider-blocked pane from idle and shows its reset status", async () => {
+  it("puts a provider-blocked pane below idle panes and shows its reset status", async () => {
     stubBootstrap({
       sessions: [
         {
@@ -399,6 +399,7 @@ describe("MobileCodeHome", () => {
           is_active: true,
           panes: [
             { pane_id: 197, label: "Claude 4", kind: "terminal", provider: "claude", is_working: false },
+            { pane_id: 198, label: "Codex 4", kind: "terminal", provider: "codex", is_working: false },
           ],
         },
       ],
@@ -418,15 +419,16 @@ describe("MobileCodeHome", () => {
     });
 
     const projectRow = await screen.findByRole("button", { name: "Open mako" });
-    expect(projectRow.textContent).toContain("Usage limited");
+    expect(projectRow.textContent).toContain("Idle");
 
     fireEvent.click(await screen.findByRole("button", { name: "Idle sessions" }));
-    expect(screen.queryByRole("button", { name: "Open Claude 4 in mako" })).toBeNull();
-
-    fireEvent.click(screen.getByRole("button", { name: "Usage limited" }));
-    const row = await screen.findByRole("button", { name: "Open Claude 4 in mako" });
-    expect(row.textContent).toContain("Weekly usage limited");
-    expect(row.textContent).toContain("Resets in");
+    expect(screen.queryByRole("button", { name: "Usage limited" })).toBeNull();
+    expect(screen.getByRole("heading", { name: "Usage limited" })).toBeTruthy();
+    const idleRow = await screen.findByRole("button", { name: "Open Codex 4 in mako" });
+    const limitedRow = await screen.findByRole("button", { name: "Open Claude 4 in mako" });
+    expect(limitedRow.textContent).toContain("Weekly usage limited");
+    expect(limitedRow.textContent).toContain("Resets in");
+    expect(idleRow.compareDocumentPosition(limitedRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it("remembers the tapped agent so the session opens on it", async () => {
