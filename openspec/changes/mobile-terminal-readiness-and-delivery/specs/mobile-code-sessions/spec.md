@@ -44,3 +44,52 @@ Where a message is delivered to an agent as keystrokes, the system SHALL NOT tre
 
 - **WHEN** the agent's own output contains the text but the user's message was never recorded
 - **THEN** the message is still reported as not recorded
+
+### Requirement: Provider prompts are operable from a mobile terminal
+
+The mobile raw-terminal view SHALL provide touch controls for terminal keys
+that ordinary phone keyboards omit. The controls SHALL send terminal input to
+the selected pane through the same byte-preserving path as xterm input and
+SHALL remain generic to the provider's TUI rather than recognizing a particular
+startup screen.
+
+#### Scenario: Navigate a resume picker without arrow keys
+
+- **WHEN** a mobile user opens a terminal pane at a provider selection prompt
+- **THEN** the user can send Up and Down arrow keys and Enter from touch controls
+
+#### Scenario: Dismiss or interrupt a terminal prompt
+
+- **WHEN** a mobile user needs to dismiss a prompt or interrupt the running command
+- **THEN** the user can send Escape or Ctrl-C from touch controls
+
+#### Scenario: Terminal input is disconnected
+
+- **WHEN** the browser is not connected to the pane transport
+- **THEN** the terminal key controls are disabled
+
+### Requirement: A Codex terminal pane resumes its exact known conversation
+
+APAS SHALL associate a Codex terminal pane with the actual user-session id from
+the process-owned rollout it already uses for transcript recovery. Once known,
+the id SHALL be persisted in the pane configuration and supplied to Codex on a
+future restore. APAS SHALL NOT select the most recent cwd conversation as an
+identity substitute.
+
+#### Scenario: Restore after Codex identity was captured
+
+- **WHEN** a Codex terminal pane is restored after APAS captured its session id
+- **THEN** APAS launches `codex resume` with that exact id
+- **AND** Codex does not require the user to choose among unrelated conversations
+
+#### Scenario: Restore a legacy pane without a captured identity
+
+- **WHEN** a Codex terminal pane has no verified Codex session id
+- **THEN** APAS launches the ordinary Codex resume picker
+- **AND** the mobile terminal controls make that picker operable
+
+#### Scenario: Several Codex panes share a working directory
+
+- **WHEN** multiple Codex conversations exist in the same working directory
+- **THEN** APAS never uses `--last` to restore a pane
+- **AND** only a session id attributed to that pane's provider process is persisted

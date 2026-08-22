@@ -400,7 +400,23 @@ describe("MobileSessionActivity", () => {
     fireEvent.click(screen.getByRole("button", { name: "More actions" }));
     fireEvent.click(screen.getByRole("button", { name: "Open raw terminal" }));
     expect(await screen.findByRole("region", { name: "Mobile terminal" })).toBeTruthy();
+    expect(screen.getByRole("toolbar", { name: "Terminal keys" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Send Arrow Down" }));
+    expect(actions.sendTerminalInput).toHaveBeenCalledWith(9, "\x1b[B");
     expect(screen.queryByRole("region", { name: "Mobile session activity" })).toBeNull();
+  });
+
+  it("disables raw-terminal keys while the mobile transport is disconnected", async () => {
+    seedStore({
+      isAttached: false,
+      paneConfigs: [pane({ pane_id: 9, kind: "terminal", label: "Codex TTY" })],
+      paneMessages: { "9": [] },
+    });
+    renderActivity({ connected: false });
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open raw terminal" }));
+    expect(await screen.findByRole("button", { name: "Send Arrow Down" })).toHaveProperty("disabled", true);
   });
 
   it("keeps the conversation field writable while offline so a message can be drafted", async () => {

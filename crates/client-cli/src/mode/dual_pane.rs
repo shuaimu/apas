@@ -151,6 +151,31 @@ fn existing_pane_relaunch_allowed() -> bool {
     true
 }
 
+/// Replace the provisional pane UUID with a provider identity only if the pane
+/// still has the identity observed when its rollout was selected.
+///
+/// Transcript polling races pane removal, provider switching, and reboot. The
+/// compare-before-replace prevents a late Codex poll from overwriting a newer
+/// identity chosen by any of those paths.
+fn remember_verified_codex_session(
+    pane_sessions: &Arc<Mutex<HashMap<u32, Uuid>>>,
+    pane_id: u32,
+    observed_session_id: Uuid,
+    verified_session_id: Uuid,
+) -> bool {
+    let Ok(mut sessions) = pane_sessions.lock() else {
+        return false;
+    };
+    let Some(current) = sessions.get_mut(&pane_id) else {
+        return false;
+    };
+    if *current != observed_session_id || *current == verified_session_id {
+        return false;
+    }
+    *current = verified_session_id;
+    true
+}
+
 /// Tell the web about the current pane roster and persist it to `.apas`.
 ///
 /// Every path that creates or removes a pane owes both halves. There is no
@@ -2595,8 +2620,12 @@ async fn run_inner(
         let terminal_questions_for_turns = terminal_questions.clone();
         let shutdown_for_turns = shutdown.clone();
         let project_for_turns = std::path::PathBuf::from(working_dir_str.clone());
+        let working_dir_for_turns = working_dir_str.clone();
         let metas_for_turns = pane_metas.clone();
         let sessions_for_turns = pane_sessions.clone();
+        let input_channels_for_turns = input_channels.clone();
+        let pauses_for_turns = pane_pauses.clone();
+        let stop_requests_for_turns = pane_stop_requests.clone();
         #[cfg(target_os = "linux")]
         let terminal_panes_for_turns = terminal_panes.clone();
         let opencode_for_turns = opencode_path.clone();
@@ -2662,10 +2691,10 @@ async fn run_inner(
                         .collect()
                 };
 
-                for (pane_id, provider, conv_id, worktree_path, process_group_id) in panes {
+                for (pane_id, provider, mut conv_id, worktree_path, process_group_id) in panes {
                     let transcript_cwd =
                         terminal_transcript_cwd(&project_for_turns, worktree_path.as_deref());
-                    let (source, turns) = match provider {
+                    let (source, turns, verified_codex_session_id) = match provider {
                         Provider::Codex => {
                             let Some(home) = home.as_deref() else {
                                 continue;
@@ -2679,16 +2708,20 @@ async fn run_inner(
                                 )
                             });
                             #[cfg(not(target_os = "linux"))]
-                            let process_path: Option<std::path::PathBuf> = {
+                            let process_path = {
                                 let _ = process_group_id;
-                                None
+                                None::<std::path::PathBuf>
                             };
 
-                            let path = if let Some(path) = process_path {
+                            let (path, process_owned) = if let Some(path) = process_path {
                                 codex_paths.insert(pane_id, path.clone());
-                                path
+                                (path, true)
                             } else if let Some(path) = codex_paths.get(&pane_id) {
-                                path.clone()
+                                // Every cached Linux path entered through the
+                                // process-group branch above, so retaining it
+                                // across a brief descriptor gap retains the
+                                // same ownership proof.
+                                (path.clone(), cfg!(target_os = "linux"))
                             } else {
                                 #[cfg(target_os = "linux")]
                                 {
@@ -2706,14 +2739,21 @@ async fn run_inner(
                                         continue;
                                     };
                                     codex_paths.insert(pane_id, path.clone());
-                                    path
+                                    (path, false)
                                 }
                             };
+                            let verified_session_id = process_owned
+                                .then(|| crate::transcript::codex_rollout_session_id(&path))
+                                .flatten();
                             let Ok(turns) = crate::transcript::read_turns(&path, pane_id, true)
                             else {
                                 continue;
                             };
-                            (format!("codex:{}", path.display()), turns)
+                            (
+                                format!("codex:{}", path.display()),
+                                turns,
+                                verified_session_id,
+                            )
                         }
                         Provider::Opencode => {
                             let Ok(Some(opencode_session_id)) =
@@ -2732,7 +2772,7 @@ async fn run_inner(
                             ) else {
                                 continue;
                             };
-                            (format!("opencode:{opencode_session_id}"), turns)
+                            (format!("opencode:{opencode_session_id}"), turns, None)
                         }
                         Provider::Claude => {
                             let Some(home) = home.as_deref() else {
@@ -2825,10 +2865,37 @@ async fn run_inner(
                             else {
                                 continue;
                             };
-                            (format!("claude:{}", path.display()), turns)
+                            (format!("claude:{}", path.display()), turns, None)
                         }
                         _ => continue,
                     };
+
+                    if let Some(verified_session_id) = verified_codex_session_id {
+                        if remember_verified_codex_session(
+                            &sessions_for_turns,
+                            pane_id,
+                            conv_id,
+                            verified_session_id,
+                        ) {
+                            tracing::info!(
+                                pane_id,
+                                previous_session_id = %conv_id,
+                                codex_session_id = %verified_session_id,
+                                "captured exact Codex terminal session identity"
+                            );
+                            conv_id = verified_session_id;
+                            announce_and_persist_panes(
+                                &server_tx_for_turns,
+                                session_id,
+                                &working_dir_for_turns,
+                                &metas_for_turns,
+                                &input_channels_for_turns,
+                                &sessions_for_turns,
+                                &pauses_for_turns,
+                                &stop_requests_for_turns,
+                            );
+                        }
+                    }
 
                     let completion_count = turns.iter().filter(|turn| turn.completes_work).count();
                     let restored_at_start = startup_terminal_panes.contains(&pane_id);
@@ -5201,15 +5268,15 @@ fn parse_agent_output(
 #[allow(deprecated)]
 mod tests {
     use super::{
-        active_usage_providers, auto_cancel_pending_questions_for_new_input,
-        boot_restore_try_resume_first, build_agent_args, build_agent_switch_respawn_event,
-        build_deadloop_agent_args, build_pane_env_overrides_from_keys, build_pane_list,
-        build_pane_reboot_events, build_user_envelope_line, canonicalize_requested_model,
-        convert_opencode_to_claude,
+        active_usage_providers, announce_and_persist_panes,
+        auto_cancel_pending_questions_for_new_input, boot_restore_try_resume_first,
+        build_agent_args, build_agent_switch_respawn_event, build_deadloop_agent_args,
+        build_pane_env_overrides_from_keys, build_pane_list, build_pane_reboot_events,
+        build_user_envelope_line, canonicalize_requested_model, convert_opencode_to_claude,
         deadloop_wait_plan, evaluate_deadloop_watchdog, is_codex_stale_session_error,
         manual_create_pr_worktree_path, model_switch_can_use_fast_path, normalize_codex_effort,
-        normalize_effort_level, reset_deadloop_codex_stale_session, resolve_pane_binary_path,
-        resolve_terminal_binary,
+        normalize_effort_level, remember_verified_codex_session,
+        reset_deadloop_codex_stale_session, resolve_pane_binary_path, resolve_terminal_binary,
         restored_pane_mode_and_pause, retired_launch_rejection_output, route_web_input_to_pane,
         run_deadloop_session_inner, save_pane_configs, should_recover_deadloop_stale_session,
         start_bot_preserved_fields, stop_retired_panes, terminal_state_reports,
@@ -6453,6 +6520,62 @@ mod tests {
         let metadata = get_or_create_project(dir.path()).expect("metadata should reload");
         assert!(!metadata.is_paused);
         assert!(metadata.panes.iter().all(|pane| !pane.is_paused));
+    }
+
+    #[test]
+    fn verified_codex_identity_is_compared_persisted_and_announced() {
+        let _config = crate::config::test_config::isolated_config_dir();
+        let dir = tempfile::tempdir().expect("temp project dir");
+        let working_dir = dir.path().to_string_lossy().to_string();
+        let project_id = get_or_create_project(dir.path()).unwrap().id;
+        let pane_id = 42;
+        let provisional = Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap();
+        let verified = Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").unwrap();
+        let stale = Uuid::parse_str("99999999-8888-4777-8666-555555555555").unwrap();
+
+        let mut meta = test_pane_meta(Provider::Codex, false, None, Arc::new(Mutex::new(None)));
+        meta.kind = shared::PaneKind::Terminal;
+        meta.mode = shared::PaneMode::Interactive;
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::from([(pane_id, meta)])));
+        let pane_sessions = Arc::new(Mutex::new(HashMap::from([(pane_id, provisional)])));
+        let input_channels: InputChannels = Arc::new(Mutex::new(HashMap::new()));
+        let pane_pauses: PanePauses = Arc::new(Mutex::new(HashMap::new()));
+        let pane_stop_requests: PaneStopRequests = Arc::new(Mutex::new(HashMap::new()));
+
+        assert!(remember_verified_codex_session(
+            &pane_sessions,
+            pane_id,
+            provisional,
+            verified,
+        ));
+        assert!(
+            !remember_verified_codex_session(&pane_sessions, pane_id, provisional, stale),
+            "a late poll must not overwrite a newer pane identity",
+        );
+
+        let (server_tx, mut server_rx) = tokio_mpsc::channel(1);
+        announce_and_persist_panes(
+            &server_tx,
+            project_id,
+            &working_dir,
+            &pane_metas,
+            &input_channels,
+            &pane_sessions,
+            &pane_pauses,
+            &pane_stop_requests,
+        );
+
+        match server_rx.blocking_recv().expect("pane list announcement") {
+            CliToServer::PaneList { session_id, panes } => {
+                assert_eq!(session_id, project_id);
+                assert_eq!(panes.len(), 1);
+                assert_eq!(panes[0].session_id, verified);
+            }
+            other => panic!("expected pane list, got {other:?}"),
+        }
+        let saved = get_or_create_project(dir.path()).expect("saved pane roster");
+        assert_eq!(saved.panes.len(), 1);
+        assert_eq!(saved.panes[0].session_id, verified);
     }
 
     #[test]

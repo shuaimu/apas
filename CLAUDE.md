@@ -817,12 +817,18 @@ otherwise have had to volunteer.
   chosen by the agent. Never substitute `--continue`: it can select another
   pane's most recent cwd conversation and silently disconnect terminal output
   from APAS's transcript watcher.
-- **codex** — has no equivalent flag. On Linux, APAS uses the terminal's
+- **codex** — cannot be given an APAS-chosen id at creation. On Linux, APAS uses the terminal's
   process group to find the user rollout that its codex process actually has
   open, so multiple panes can share one cwd without sharing status or history.
   The selected path is retained across brief descriptor gaps and changes when
-  that process opens a newer user rollout through resume/fork. Other platforms
-  fall back to the newest user rollout whose `session_meta.cwd` matches.
+  that process opens a newer user rollout through resume/fork. Its
+  `session_meta.id` is then the first verified Codex identity APAS has for the
+  pane, so it replaces the provisional pane UUID in `.apas` and future restores
+  use `codex resume <id>` directly. A pane written by an older APAS keeps the
+  picker until the process-owned rollout reveals its id; `--last` is never used
+  because it can select a sibling pane in the same cwd. Other platforms fall
+  back to the newest user rollout whose `session_meta.cwd` matches, but that
+  ambiguous fallback is not persisted as pane identity.
 - **opencode** — OpenCode owns its `ses_*` identifiers, so APAS asks
   `opencode session list --format json` for the newest session whose directory
   exactly matches the pane cwd, then reads it with `opencode export <id>`.

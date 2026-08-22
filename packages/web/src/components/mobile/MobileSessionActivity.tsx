@@ -35,6 +35,7 @@ import {
 } from "@/lib/terminalDelivery";
 import { MobileProjectManageSheet } from "./MobileProjectManageSheet";
 import { MobilePaneWorkSummarySheet } from "./MobilePaneWorkSummarySheet";
+import { MobileTerminalKeyBar } from "./MobileTerminalKeyBar";
 import {
   canonicalDeepseekModel,
   DEEPSEEK_FLASH_MODEL,
@@ -567,6 +568,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
           <span className="truncate px-2 text-xs text-neutral-400">{selectedPane ? paneLabel(selectedPane) : `Pane ${terminalPaneId}`}</span>
         </div>
         <div className="flex min-h-0 flex-1 flex-col"><TerminalPane paneId={terminalPaneId} /></div>
+        <MobileTerminalKeyBar paneId={terminalPaneId} connected={connected} />
       </section>
     );
   }

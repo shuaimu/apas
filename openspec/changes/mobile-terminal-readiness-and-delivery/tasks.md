@@ -13,7 +13,22 @@
 - [x] 2.4 Withdraw the report when the agent records the message
 - [x] 2.5 Tests: both states render, the plain empty state survives, and the report appears only after the grace period
 
-## 3. Verification
+## 3. Mobile terminal controls
 
-- [x] 3.1 Web lint, type-check, and tests clean
-- [ ] 3.2 Live on the mobile browser against a pane sitting at a provider startup prompt
+- [x] 3.1 Add a touch key accessory that emits byte-exact Escape, arrow, Enter, Tab, and Ctrl-C input
+- [x] 3.2 Show the accessory in the mobile raw-terminal view and disable it while disconnected
+- [x] 3.3 Test every emitted key sequence and the mobile integration
+
+## 4. Exact Codex terminal resume
+
+- [x] 4.1 Read the Codex session id from the process-owned rollout metadata already selected for the pane
+- [x] 4.2 Persist a verified Codex session id into the pane roster and publish the updated pane list
+- [x] 4.3 Restore Codex with the exact captured id, retaining the picker for unknown legacy ids and never using `--last`
+- [x] 4.4 Test metadata parsing, identity persistence, exact resume arguments, and legacy fallback
+
+## 5. Verification
+
+- [x] 5.1 Earlier delivery-confirmation web lint, type-check, and tests clean
+- [x] 5.2 New focused web and Rust tests clean
+- [x] 5.3 Full web lint/type-check/test and relevant Rust crate tests clean
+- [ ] 5.4 Live on the mobile browser against a pane sitting at a provider startup prompt

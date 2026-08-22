@@ -23,11 +23,13 @@
 //! * **claude** — `--session-id <uuid>` pins the id at spawn, and APAS already
 //!   mints one per pane, so the path is exact:
 //!   `~/.claude/projects/<cwd with / as ->/<session-id>.jsonl`. No guessing.
-//! * **codex** — has no equivalent flag. On Linux, APAS identifies the pane's
-//!   provider process group and follows the user rollout that process group
-//!   actually has open. This remains exact when several codex panes share a
-//!   cwd and when one of them resumes an older session. Other platforms fall
-//!   back to the newest user rollout whose `session_meta.cwd` matches exactly.
+//! * **codex** — cannot be given an APAS-chosen id at creation. On Linux, APAS
+//!   identifies the pane's provider process group and follows the user rollout
+//!   that process group actually has open. This remains exact when several
+//!   codex panes share a cwd and when one of them resumes an older session. The
+//!   rollout's real id is then persisted for exact future resume. Other
+//!   platforms fall back to the newest user rollout whose `session_meta.cwd`
+//!   matches exactly, but never persist that ambiguous identity.
 //! * **opencode** — session IDs are generated as `ses_*`, so APAS cannot pin
 //!   its UUID at creation. The newest session whose exported `directory`
 //!   exactly matches the pane cwd is selected, then exported by ID. This has
@@ -38,6 +40,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use uuid::Uuid;
 
 use crate::conversation::TurnRecord;
 
@@ -554,10 +557,15 @@ pub fn read_opencode_turns(
 
 /// Newest codex rollout whose `session_meta.cwd` matches `cwd`.
 ///
-/// Heuristic by necessity — codex has no flag to pin a session id. Requiring an
-/// exact cwd match keeps the ambiguity to panes sharing a directory.
+/// Heuristic by necessity — Codex can resume an id but cannot be told which id
+/// to mint for a fresh TUI. Requiring an exact cwd match keeps the portable
+/// fallback ambiguity to panes sharing a directory.
 /// The identifying header of a codex rollout, taken from its `session_meta`.
 struct CodexRolloutMeta {
+    /// Codex's actual resumable conversation identity. APAS cannot choose this
+    /// id when it starts a fresh interactive TUI; it learns it from the
+    /// process-owned rollout after Codex creates the session.
+    session_id: Option<Uuid>,
     cwd: String,
     /// Immutable session start. Selection keys on this rather than mtime
     /// precisely because it cannot change while the file is being appended to.
@@ -595,6 +603,10 @@ fn read_codex_rollout_meta(path: &Path) -> Option<CodexRolloutMeta> {
     let d: Value = serde_json::from_str(first.trim()).ok()?;
     let meta = d.get("payload").unwrap_or(&d);
     Some(CodexRolloutMeta {
+        session_id: meta
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|id| Uuid::parse_str(id).ok()),
         cwd: meta.get("cwd").and_then(Value::as_str)?.to_string(),
         started_at: meta
             .get("timestamp")
@@ -606,6 +618,47 @@ fn read_codex_rollout_meta(path: &Path) -> Option<CodexRolloutMeta> {
             .get("thread_source")
             .and_then(Value::as_str)
             .map(str::to_string),
+    })
+}
+
+/// The resumable Codex id recorded in one rollout's `session_meta` header.
+///
+/// Callers must establish ownership of `path` first. A UUID read from the
+/// newest file in a shared cwd is valid Codex data but not necessarily this
+/// pane's conversation.
+pub(crate) fn codex_rollout_session_id(path: &Path) -> Option<Uuid> {
+    read_codex_rollout_meta(path)?.session_id
+}
+
+fn codex_rollout_paths(home: &Path) -> Vec<PathBuf> {
+    let root = home.join(".codex").join("sessions");
+    let mut candidates = Vec::new();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
+                candidates.push(path);
+            }
+        }
+    }
+    candidates
+}
+
+/// Whether a persisted UUID still names a local, user-owned Codex session.
+///
+/// This is also the legacy discriminator: older APAS versions stored a random
+/// pane UUID in the same field. Only a UUID that appears in a real rollout is
+/// safe to pass to `codex resume <id>`; an unknown UUID must retain the picker.
+pub(crate) fn codex_user_session_exists(home: &Path, session_id: Uuid) -> bool {
+    codex_rollout_paths(home).into_iter().any(|path| {
+        read_codex_rollout_meta(&path)
+            .is_some_and(|meta| meta.session_id == Some(session_id) && !meta.is_subagent())
     })
 }
 
@@ -627,26 +680,7 @@ fn read_codex_rollout_meta(path: &Path) -> Option<CodexRolloutMeta> {
 /// limit. A newer *user* session still wins, which is the intended behaviour
 /// when someone restarts codex in the same directory.
 pub fn find_codex_rollout(home: &Path, cwd: &Path) -> Option<PathBuf> {
-    let root = home.join(".codex").join("sessions");
-    let mut candidates = Vec::new();
-    let mut stack = vec![root];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            candidates.push(path);
-        }
-    }
-    select_codex_rollout(candidates, cwd)
+    select_codex_rollout(codex_rollout_paths(home), cwd)
 }
 
 /// Newest user rollout for `cwd` among a bounded set of candidate files.
@@ -1091,6 +1125,43 @@ mod tests {
             Some("rollout-b.jsonl")
         );
         assert!(find_codex_rollout(home.path(), Path::new("/nothing-here")).is_none());
+    }
+
+    #[test]
+    fn codex_rollout_identity_is_read_and_found_without_trusting_random_pane_ids() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join(".codex/sessions/2026/08/22");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let actual = Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap();
+        let rollout = sessions.join("rollout-user.jsonl");
+        std::fs::write(
+            &rollout,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"cwd":"/repo","id":"{actual}","thread_source":"user"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(codex_rollout_session_id(&rollout), Some(actual));
+        assert!(codex_user_session_exists(home.path(), actual));
+        assert!(!codex_user_session_exists(home.path(), Uuid::new_v4()));
+    }
+
+    #[test]
+    fn a_subagent_rollout_is_not_a_resumable_pane_identity() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join(".codex/sessions/2026/08/22");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let subagent = Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").unwrap();
+        std::fs::write(
+            sessions.join("rollout-subagent.jsonl"),
+            format!(
+                r#"{{"type":"session_meta","payload":{{"cwd":"/repo","id":"{subagent}","thread_source":"subagent"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        assert!(!codex_user_session_exists(home.path(), subagent));
     }
 
     /// Write a rollout header; `source` of `None` mimics a codex old enough to

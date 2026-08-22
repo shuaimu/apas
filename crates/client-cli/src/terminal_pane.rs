@@ -23,8 +23,9 @@
 //! Lifetime: the pty is a child of the CLI process, so a terminal pane
 //! dies when `apas` restarts. [`TerminalHandle::spawn`] therefore re-execs the
 //! provider and asks it to resume the pane's conversation. Claude can resume
-//! the exact pinned session id; Codex and OpenCode expose their own resume
-//! mechanisms instead.
+//! the exact pinned session id; Codex resumes the exact id APAS learned from
+//! its process-owned rollout (or shows its picker for an older unknown pane),
+//! while OpenCode exposes its own cwd-scoped resume mechanism.
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -599,12 +600,25 @@ pub fn terminal_binary_for(provider: &Provider) -> Option<&'static str> {
 /// equivalent: it selects the most recent conversation for the cwd, which can
 /// belong to another pane while APAS continues watching this pane's pinned
 /// transcript. Codex's `resume` remains a subcommand and therefore must be
-/// appended before its permission flag. OpenCode's `--continue` selects the
-/// newest session for the pane's working directory.
-fn resume_args_for(provider: &Provider, conversation_id: Uuid) -> Vec<String> {
+/// appended before its permission flag. Its exact id is included only after
+/// that UUID has been found in a real local user rollout; older APAS versions
+/// stored a random pane UUID here, and passing that would replace a usable
+/// picker with a failed resume. OpenCode's `--continue` selects the newest
+/// session for the pane's working directory.
+fn resume_args_for(
+    provider: &Provider,
+    conversation_id: Uuid,
+    verified_codex_session_id: Option<Uuid>,
+) -> Vec<String> {
     match provider {
         Provider::Claude => vec!["--resume".to_string(), conversation_id.to_string()],
-        Provider::Codex => vec!["resume".to_string()],
+        Provider::Codex => {
+            let mut args = vec!["resume".to_string()];
+            if let Some(session_id) = verified_codex_session_id {
+                args.push(session_id.to_string());
+            }
+            args
+        }
         Provider::Opencode => vec!["--continue".to_string()],
         _ => Vec::new(),
     }
@@ -652,7 +666,18 @@ pub(crate) fn terminal_args_for(
         }
     }
     if resume {
-        args.extend(resume_args_for(provider, conversation_id));
+        let verified_codex_session_id = if matches!(provider, Provider::Codex) {
+            dirs::home_dir()
+                .filter(|home| crate::transcript::codex_user_session_exists(home, conversation_id))
+                .map(|_| conversation_id)
+        } else {
+            None
+        };
+        args.extend(resume_args_for(
+            provider,
+            conversation_id,
+            verified_codex_session_id,
+        ));
     }
     if let Some(flag) = permission_bypass_flag_for(provider) {
         args.push(flag.to_string());
@@ -1074,7 +1099,7 @@ mod tests {
             Provider::CursorAgent,
         ] {
             assert_eq!(permission_bypass_flag_for(&p), None, "{p:?}");
-            assert!(resume_args_for(&p, Uuid::nil()).is_empty(), "{p:?}");
+            assert!(resume_args_for(&p, Uuid::nil(), None).is_empty(), "{p:?}");
         }
     }
 
@@ -1087,15 +1112,25 @@ mod tests {
         // spawn builds them in sequence and a swap only fails at runtime.
         let conversation_id = Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap();
         assert_eq!(
-            resume_args_for(&Provider::Codex, conversation_id),
+            resume_args_for(&Provider::Codex, conversation_id, None),
             vec!["resume".to_string()]
+        );
+        assert_eq!(
+            resume_args_for(&Provider::Codex, conversation_id, Some(conversation_id)),
+            vec!["resume".to_string(), conversation_id.to_string()],
+        );
+        assert!(
+            !resume_args_for(&Provider::Codex, conversation_id, Some(conversation_id))
+                .iter()
+                .any(|arg| arg == "--last"),
+            "shared-cwd panes must never guess at the most recent Codex session",
         );
         assert_eq!(
             permission_bypass_flag_for(&Provider::Codex),
             Some("--dangerously-bypass-approvals-and-sandbox")
         );
         assert_eq!(
-            resume_args_for(&Provider::Claude, conversation_id),
+            resume_args_for(&Provider::Claude, conversation_id, None),
             vec!["--resume".to_string(), conversation_id.to_string()]
         );
         assert_eq!(
