@@ -559,6 +559,25 @@ fn initial_terminal_transcript_cursor(restored_at_watcher_start: bool, turn_coun
     }
 }
 
+/// Return a provider-confirmed working-state transition worth publishing.
+///
+/// An active state is published on first observation so a CLI reconnect can
+/// restore a turn already in progress. Initial idle stays silent because idle
+/// is the server default, and clearing here could race fresh web input before
+/// Codex has written its task_started event.
+fn observe_codex_working_state(
+    states: &mut HashMap<u32, bool>,
+    pane_id: u32,
+    observed: Option<bool>,
+) -> Option<bool> {
+    let observed = observed?;
+    match states.insert(pane_id, observed) {
+        None if observed => Some(true),
+        Some(previous) if previous != observed => Some(observed),
+        _ => None,
+    }
+}
+
 /// Consecutive unchanged polls of the tracked claude transcript before an
 /// in-TUI session switch is considered. Two polls ≈ six seconds of idleness,
 /// which keeps a streaming turn (whose file grows continuously) from ever
@@ -2653,6 +2672,10 @@ async fn run_inner(
             // through brief descriptor gaps. A newly observed open user
             // rollout replaces it when the TUI resumes or forks a session.
             let mut codex_paths: HashMap<u32, std::path::PathBuf> = HashMap::new();
+            // Explicit task lifecycle is tracked independently from the turn
+            // cursor so reconnect can restore an in-flight pane without
+            // replaying its existing conversation.
+            let mut codex_working: HashMap<u32, bool> = HashMap::new();
             // Per-pane claude transcript watch state (growth + idle tracking
             // for in-TUI session-switch detection).
             let mut claude_watch: HashMap<u32, ClaudeWatchState> = HashMap::new();
@@ -2694,6 +2717,7 @@ async fn run_inner(
                 for (pane_id, provider, mut conv_id, worktree_path, process_group_id) in panes {
                     let transcript_cwd =
                         terminal_transcript_cwd(&project_for_turns, worktree_path.as_deref());
+                    let mut provider_working = None;
                     let (source, turns, verified_codex_session_id) = match provider {
                         Provider::Codex => {
                             let Some(home) = home.as_deref() else {
@@ -2745,10 +2769,12 @@ async fn run_inner(
                             let verified_session_id = process_owned
                                 .then(|| crate::transcript::codex_rollout_session_id(&path))
                                 .flatten();
-                            let Ok(turns) = crate::transcript::read_turns(&path, pane_id, true)
+                            let Ok((turns, working)) =
+                                crate::transcript::read_codex_snapshot(&path, pane_id)
                             else {
                                 continue;
                             };
+                            provider_working = working;
                             (
                                 format!("codex:{}", path.display()),
                                 turns,
@@ -2979,6 +3005,19 @@ async fn run_inner(
                         });
                     }
                     *completed = completion_count;
+
+                    if let Some(working) = observe_codex_working_state(
+                        &mut codex_working,
+                        pane_id,
+                        provider_working,
+                    ) {
+                        let _ = server_tx_for_turns.blocking_send(CliToServer::PaneStatus {
+                            session_id,
+                            pane_type: PaneType::Interactive,
+                            pane_id: Some(pane_id),
+                            status: working.then(|| "Working...".to_string()),
+                        });
+                    }
                 }
             }
         });
@@ -7666,6 +7705,47 @@ mod tests {
             super::initial_terminal_transcript_cursor(false, 8),
             0,
             "a newly-created pane's fast first turn must not be skipped"
+        );
+    }
+
+    #[test]
+    fn an_active_codex_turn_is_republished_after_reconnect() {
+        let mut states = HashMap::new();
+
+        assert_eq!(
+            super::observe_codex_working_state(&mut states, 293, Some(true)),
+            Some(true),
+            "an already-active restored pane must repopulate server status"
+        );
+        assert_eq!(
+            super::observe_codex_working_state(&mut states, 293, Some(true)),
+            None,
+            "unchanged transcript polls must not resend status"
+        );
+        assert_eq!(
+            super::observe_codex_working_state(&mut states, 293, Some(false)),
+            Some(false),
+            "the provider completion must clear the recovered status"
+        );
+    }
+
+    #[test]
+    fn an_initial_idle_codex_observation_cannot_clear_fresh_web_input() {
+        let mut states = HashMap::new();
+
+        assert_eq!(
+            super::observe_codex_working_state(&mut states, 293, Some(false)),
+            None,
+            "idle is already the server default and should stay silent"
+        );
+        assert_eq!(
+            super::observe_codex_working_state(&mut states, 293, None),
+            None,
+            "legacy transcripts without lifecycle events stay compatible"
+        );
+        assert_eq!(
+            super::observe_codex_working_state(&mut states, 293, Some(true)),
+            Some(true)
         );
     }
 

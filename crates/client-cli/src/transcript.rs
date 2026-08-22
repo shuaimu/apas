@@ -573,6 +573,9 @@ struct CodexRolloutMeta {
     /// `user` for a session a person drives, `subagent` for a thread codex
     /// spawned itself. Absent on rollouts written by older codex versions.
     thread_source: Option<String>,
+    /// Newer Codex versions use `source: { "subagent": ... }` and an
+    /// `agent_path` instead of the flat `thread_source` discriminator.
+    modern_subagent: bool,
 }
 
 impl CodexRolloutMeta {
@@ -582,9 +585,11 @@ impl CodexRolloutMeta {
     /// codex versions predating `thread_source` omit the field entirely, and
     /// treating those as subagents would leave their panes with no transcript.
     fn is_subagent(&self) -> bool {
-        self.thread_source
-            .as_deref()
-            .is_some_and(|source| !source.eq_ignore_ascii_case("user"))
+        self.modern_subagent
+            || self
+                .thread_source
+                .as_deref()
+                .is_some_and(|source| !source.eq_ignore_ascii_case("user"))
     }
 }
 
@@ -618,6 +623,14 @@ fn read_codex_rollout_meta(path: &Path) -> Option<CodexRolloutMeta> {
             .get("thread_source")
             .and_then(Value::as_str)
             .map(str::to_string),
+        modern_subagent: meta
+            .get("source")
+            .and_then(Value::as_object)
+            .is_some_and(|source| source.contains_key("subagent"))
+            || meta
+                .get("agent_path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| !path.is_empty()),
     })
 }
 
@@ -786,6 +799,51 @@ pub fn read_turns(path: &Path, pane_id: u32, is_codex: bool) -> Result<Vec<TurnR
         t.pane_id = pane_id;
     }
     Ok(turns)
+}
+
+/// A Codex transcript plus its provider-confirmed current task state.
+///
+/// A restored pane suppresses old turns so they are not republished, but an
+/// unmatched `task_started` still has to restore Working after a reconnect.
+pub(crate) fn read_codex_snapshot(
+    path: &Path,
+    pane_id: u32,
+) -> Result<(Vec<TurnRecord>, Option<bool>)> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), None));
+        }
+        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    };
+    let mut turns = parse_codex(&raw);
+    for turn in &mut turns {
+        turn.pane_id = pane_id;
+    }
+    Ok((turns, codex_working_state(&raw)))
+}
+
+/// Latest explicit task lifecycle recorded by Codex. File order is
+/// authoritative because a TUI runs one root task at a time.
+fn codex_working_state(raw: &str) -> Option<bool> {
+    for line in raw.lines().rev().filter(|line| !line.trim().is_empty()) {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if record.get("type").and_then(Value::as_str) != Some("event_msg") {
+            continue;
+        }
+        match record
+            .get("payload")
+            .and_then(|payload| payload.get("type"))
+            .and_then(Value::as_str)
+        {
+            Some("task_started") => return Some(true),
+            Some("task_complete" | "turn_aborted") => return Some(false),
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1001,6 +1059,31 @@ mod tests {
     }
 
     #[test]
+    fn codex_task_lifecycle_reconstructs_an_in_flight_turn() {
+        let active = r#"
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"still working"}]}}
+"#;
+        assert_eq!(codex_working_state(active), Some(true));
+
+        let complete = format!(
+            "{active}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"turn-1\"}}}}"
+        );
+        assert_eq!(codex_working_state(&complete), Some(false));
+
+        let restarted = format!(
+            "{complete}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"turn-2\"}}}}"
+        );
+        assert_eq!(codex_working_state(&restarted), Some(true));
+
+        let aborted = format!(
+            "{restarted}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"turn_aborted\",\"turn_id\":\"turn-2\"}}}}"
+        );
+        assert_eq!(codex_working_state(&aborted), Some(false));
+        assert_eq!(codex_working_state("{\"type\":\"session_meta\"}"), None);
+    }
+
+    #[test]
     fn opencode_export_keeps_only_real_completed_conversation() {
         let raw = r#"{
           "info":{"id":"ses_1","directory":"/work"},
@@ -1162,6 +1245,18 @@ mod tests {
         .unwrap();
 
         assert!(!codex_user_session_exists(home.path(), subagent));
+
+        let modern_subagent =
+            Uuid::parse_str("bbbbbbbb-cccc-4ddd-8eee-ffffffffffff").unwrap();
+        std::fs::write(
+            sessions.join("rollout-modern-subagent.jsonl"),
+            format!(
+                r#"{{"type":"session_meta","payload":{{"cwd":"/repo","id":"{modern_subagent}","source":{{"subagent":{{"thread_spawn":{{"parent_thread_id":"parent"}}}}}},"agent_path":"/root/audit"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        assert!(!codex_user_session_exists(home.path(), modern_subagent));
     }
 
     /// Write a rollout header; `source` of `None` mimics a codex old enough to
@@ -1211,6 +1306,11 @@ mod tests {
             "2026-08-14T00:33:34Z",
             Some("subagent"),
         );
+        std::fs::write(
+            sessions.join("rollout-modern-sub.jsonl"),
+            r#"{"type":"session_meta","payload":{"cwd":"/repo","timestamp":"2026-08-15T00:00:00Z","source":{"subagent":{"thread_spawn":{"parent_thread_id":"root"}}},"agent_path":"/root/audit"}}"#,
+        )
+        .unwrap();
 
         assert_eq!(
             find_codex_rollout(home.path(), Path::new("/repo"))
@@ -1302,17 +1402,27 @@ mod tests {
             "2026-08-22T02:00:00Z",
             Some("user"),
         );
+        std::fs::write(
+            sessions.join("rollout-owned-modern-subagent.jsonl"),
+            r#"{"type":"session_meta","payload":{"cwd":"/repo","timestamp":"2026-08-22T03:00:00Z","source":{"subagent":{"thread_spawn":{"parent_thread_id":"root"}}},"agent_path":"/root/audit"}}"#,
+        )
+        .unwrap();
 
         // Holding this descriptor open models the live codex TUI. The newer
         // sibling file exists in the same cwd but belongs to another pane and
         // therefore is not open in this terminal's process group.
         let owned = std::fs::File::open(sessions.join("rollout-owned.jsonl")).unwrap();
+        // Subagents share the root TUI's process group and keep their rollout
+        // open too, so process ownership alone is not sufficient.
+        let modern_subagent =
+            std::fs::File::open(sessions.join("rollout-owned-modern-subagent.jsonl")).unwrap();
         let found = find_codex_rollout_for_process_group(
             home.path(),
             Path::new("/repo"),
             unsafe { libc::getpgrp() },
         );
         drop(owned);
+        drop(modern_subagent);
 
         assert_eq!(
             found
