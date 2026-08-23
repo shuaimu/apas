@@ -56,6 +56,13 @@ The system SHALL report, for each session a mobile client can reach, the agents 
 - **WHEN** a session reports that it is working
 - **THEN** at least one of its agents is reported as working
 
+#### Scenario: An authoritative idle snapshot follows a missed clear
+
+- **WHEN** the client retains an earlier working indicator for an agent
+- **AND** a refreshed session snapshot reports that agent as idle
+- **THEN** the conversation clears the stale working indicator
+- **AND** reopening the same session does not restore it
+
 #### Scenario: An older server omits the detail
 
 - **WHEN** the per-agent detail is absent from a response

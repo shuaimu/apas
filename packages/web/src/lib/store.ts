@@ -1535,6 +1535,13 @@ export const useStore = create<AppState>((set, get) => ({
         isAttached: hasActiveClient,
         cliClientId: newCliClientId,
         teamRecords: state.teamRecordsBySession.get(sessionId) ?? [],
+        // Re-attaching is a fresh live-status snapshot even when the user is
+        // reopening the session they just left. The server replays every
+        // active status but represents idle panes by absence, so retaining a
+        // previous positive value here can leave a false Working pill forever.
+        paneStatuses: {},
+        interactiveStatus: null,
+        deadloopStatus: null,
       }));
     }
 
@@ -4417,6 +4424,24 @@ export function handleServerMessage(
         if (state.sessionId) {
           const activeClient = state.cliClients.find((c) => c.activeSession === state.sessionId);
           const currentSession = parsedSessions.find((s) => s.id === state.sessionId);
+          if (currentSession?.isWorking === false) {
+            // The list snapshot and pane pills describe the same server-side
+            // status cache. Heal a missed idle-clear frame instead of letting
+            // the authoritative list say Idle while the conversation keeps a
+            // stale Working pill.
+            next.paneStatuses = {};
+          } else if (currentSession?.panes) {
+            const idlePaneIds = new Set(
+              currentSession.panes
+                .filter((pane) => pane.is_working === false)
+                .map((pane) => pane.pane_id),
+            );
+            if (idlePaneIds.size > 0) {
+              const paneStatuses = { ...state.paneStatuses };
+              for (const paneId of idlePaneIds) delete paneStatuses[paneKey(paneId)];
+              next.paneStatuses = paneStatuses;
+            }
+          }
           if (currentSession?.isActive != null) {
             // Keep attachment status aligned with server truth for this session.
             // This prevents stale "attached" UI state after a CLI crashes.

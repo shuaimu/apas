@@ -17,6 +17,7 @@ describe('useStore', () => {
       cliLifecycleLatestBySession: {},
       sessions: [],
       workingPanesBySession: new Map(),
+      paneStatuses: {},
       messages: [],
       machines: [],
       projectFlags: {},
@@ -216,6 +217,73 @@ describe('useStore', () => {
       expect(useStore.getState().sessions[0]?.isWorking).toBe(false);
       expect(useStore.getState().workingPanesBySession.has('current-session')).toBe(false);
       expect(useStore.getState().paneStatuses['7']).toBeNull();
+    });
+
+    it('clears stale foreground pane pills from an authoritative idle snapshot', () => {
+      useStore.setState({
+        sessionId: 'current-session',
+        sessions: [
+          { id: 'current-session', status: 'connected', isActive: true, isWorking: true },
+        ],
+        workingPanesBySession: new Map([['current-session', new Set([7, 8])]]),
+        paneStatuses: { '7': 'Working...', '8': 'Still working...' },
+      });
+
+      handleServerMessage({
+        type: 'sessions',
+        sessions: [{
+          id: 'current-session',
+          status: 'connected',
+          is_active: true,
+          is_working: true,
+          panes: [
+            { pane_id: 7, kind: 'terminal', provider: 'codex', is_working: false },
+            { pane_id: 8, kind: 'terminal', provider: 'codex', is_working: true },
+          ],
+        }],
+      }, useStore.setState, useStore.getState);
+
+      expect(useStore.getState().paneStatuses).toEqual({ '8': 'Still working...' });
+
+      handleServerMessage({
+        type: 'sessions',
+        sessions: [{
+          id: 'current-session',
+          status: 'connected',
+          is_active: true,
+          is_working: false,
+          panes: [
+            { pane_id: 7, kind: 'terminal', provider: 'codex', is_working: false },
+            { pane_id: 8, kind: 'terminal', provider: 'codex', is_working: false },
+          ],
+        }],
+      }, useStore.setState, useStore.getState);
+
+      expect(useStore.getState().paneStatuses).toEqual({});
+    });
+
+    it('clears stale foreground pane pills before reattaching the same session', () => {
+      const send = vi.fn();
+      useStore.setState({
+        ws: { readyState: WebSocket.OPEN, send } as unknown as WebSocket,
+        sessionId: 'current-session',
+        sessions: [
+          { id: 'current-session', status: 'connected', isActive: true, isWorking: false },
+        ],
+        paneStatuses: { '7': 'Working...' },
+        interactiveStatus: 'Working...',
+        deadloopStatus: 'Working...',
+      });
+
+      useStore.getState().attachSession('current-session');
+
+      expect(useStore.getState().paneStatuses).toEqual({});
+      expect(useStore.getState().interactiveStatus).toBeNull();
+      expect(useStore.getState().deadloopStatus).toBeNull();
+      expect(send).toHaveBeenCalledWith(JSON.stringify({
+        type: 'attach_session',
+        session_id: 'current-session',
+      }));
     });
   });
 

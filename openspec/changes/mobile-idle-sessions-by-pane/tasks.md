@@ -34,6 +34,8 @@
 
 - [x] 6.1 Keep the selected mobile home list in the mounted page shell so opening and closing a conversation does not reset it
 - [x] 6.2 Regression test: enter a conversation from Idle sessions, go back, and remain on Idle sessions
+- [x] 6.3 Reconcile the conversation's working indicator with authoritative idle snapshots and reset live status before same-session reattachment
+- [x] 6.4 Regression tests: a refreshed idle snapshot and same-session reattachment both clear a stale working indicator
 
 ## 7. Verification
 
