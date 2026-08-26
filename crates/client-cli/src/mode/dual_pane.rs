@@ -309,6 +309,47 @@ struct TerminalQuestion {
 
 type TerminalQuestions = Arc<Mutex<HashMap<String, TerminalQuestion>>>;
 
+/// Rebuild one pane's unanswered-question set from the provider transcript.
+/// This runs over the full transcript so a restored pane can repopulate both
+/// answer routing and its Pending answer status without replaying old chat
+/// messages. Delivery flags survive ordinary polls, keeping retries safe.
+fn reconcile_terminal_questions_for_pane(
+    pending: &mut HashMap<String, TerminalQuestion>,
+    pane_id: u32,
+    turns: &[crate::conversation::TurnRecord],
+) -> bool {
+    let mut unresolved = HashMap::new();
+    for turn in turns.iter().filter(|turn| turn.pane_id == pane_id) {
+        if let Some(question) = &turn.question {
+            unresolved.insert(
+                question.tool_use_id.clone(),
+                question_options(&question.input),
+            );
+        }
+        if let Some(answer) = &turn.answer {
+            unresolved.remove(&answer.tool_use_id);
+        }
+    }
+
+    pending.retain(|tool_use_id, question| {
+        question.pane_id != pane_id || unresolved.contains_key(tool_use_id)
+    });
+    for (tool_use_id, options) in &unresolved {
+        pending
+            .entry(tool_use_id.clone())
+            .and_modify(|question| {
+                question.pane_id = pane_id;
+                question.options.clone_from(options);
+            })
+            .or_insert_with(|| TerminalQuestion {
+                pane_id,
+                options: options.clone(),
+                delivered: false,
+            });
+    }
+    !unresolved.is_empty()
+}
+
 /// The option labels a question offers, in order, from the tool call's input.
 fn question_options(input: &serde_json::Value) -> Vec<(String, Vec<String>)> {
     input
@@ -594,9 +635,7 @@ fn newest_transcript_mtime(dir: Option<&std::path::Path>) -> Option<std::time::S
     let entries = std::fs::read_dir(dir?).ok()?;
     entries
         .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl")
-        })
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
         .filter_map(|entry| entry.metadata().ok()?.modified().ok())
         .max()
 }
@@ -1105,7 +1144,10 @@ fn build_pane_env_overrides_from_keys(
         // Keep both names for compatibility across Claude CLI versions/wrappers.
         ("ANTHROPIC_AUTH_TOKEN".to_string(), api_key.clone()),
         ("ANTHROPIC_API_KEY".to_string(), api_key),
-        ("ANTHROPIC_MODEL".to_string(), primary_runtime_model.to_string()),
+        (
+            "ANTHROPIC_MODEL".to_string(),
+            primary_runtime_model.to_string(),
+        ),
         (
             "ANTHROPIC_DEFAULT_SONNET_MODEL".to_string(),
             DEEPSEEK_PRO_RUNTIME_MODEL.to_string(),
@@ -1823,7 +1865,13 @@ pub async fn run_headless(
     token: &str,
     working_dir: &Path,
 ) -> Result<ProjectOutcome> {
-    run_inner(server_url, token, working_dir, Arc::new(AtomicBool::new(false))).await
+    run_inner(
+        server_url,
+        token,
+        working_dir,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
 }
 
 /// Run one project, stoppable by the caller.
@@ -1848,7 +1896,6 @@ async fn run_inner(
     working_dir: &Path,
     shutdown: Arc<AtomicBool>,
 ) -> Result<ProjectOutcome> {
-
     let config = crate::config::Config::load().unwrap_or_default();
     // Resolve binary paths to absolute paths at startup (while PATH is correct).
     // Systemd-run environments may have a minimal PATH that misses nvm/cargo bins.
@@ -1880,7 +1927,6 @@ async fn run_inner(
         Ok(_) => {}
         Err(error) => tracing::warn!(%error, "could not reconcile persistent pane-host registry"),
     }
-
 
     let default_prompt = DEFAULT_PROMPT.to_string();
 
@@ -2959,28 +3005,14 @@ async fn run_inner(
                         *completed = completion_count;
                     }
                     let previous_cursor = *cursor;
+                    let awaiting_answer = terminal_questions_for_turns
+                        .lock()
+                        .map(|mut pending| {
+                            reconcile_terminal_questions_for_pane(&mut pending, pane_id, &turns)
+                        })
+                        .unwrap_or(false);
                     if turns.len() > previous_cursor {
                         for turn in &turns[previous_cursor..] {
-                            // Pending state is derived from the transcript, so
-                            // it survives a CLI restart and cannot disagree
-                            // with what the conversation view is showing.
-                            if let Some(question) = &turn.question {
-                                if let Ok(mut pending) = terminal_questions_for_turns.lock() {
-                                    pending.insert(
-                                        question.tool_use_id.clone(),
-                                        TerminalQuestion {
-                                            pane_id: turn.pane_id,
-                                            options: question_options(&question.input),
-                                            delivered: false,
-                                        },
-                                    );
-                                }
-                            }
-                            if let Some(answer) = &turn.answer {
-                                if let Ok(mut pending) = terminal_questions_for_turns.lock() {
-                                    pending.remove(&answer.tool_use_id);
-                                }
-                            }
                             for msg in
                                 conversation_turn_to_stream_messages(turn, session_id, conv_id)
                             {
@@ -2988,6 +3020,17 @@ async fn run_inner(
                             }
                         }
                         *cursor = turns.len();
+                    }
+                    if awaiting_answer {
+                        // Repeated while unresolved so a server reconnect can
+                        // recover the actionable state even though old chat
+                        // turns are deliberately not replayed.
+                        let _ = server_tx_for_turns.blocking_send(CliToServer::PaneStatus {
+                            session_id,
+                            pane_type: PaneType::Interactive,
+                            pane_id: Some(pane_id),
+                            status: Some(shared::PANE_STATUS_PENDING_ANSWER.to_string()),
+                        });
                     }
                     // Codex writes task_complete after its assistant message.
                     // If the prior poll already advanced the turn cursor, no
@@ -3006,11 +3049,9 @@ async fn run_inner(
                     }
                     *completed = completion_count;
 
-                    if let Some(working) = observe_codex_working_state(
-                        &mut codex_working,
-                        pane_id,
-                        provider_working,
-                    ) {
+                    if let Some(working) =
+                        observe_codex_working_state(&mut codex_working, pane_id, provider_working)
+                    {
                         let _ = server_tx_for_turns.blocking_send(CliToServer::PaneStatus {
                             session_id,
                             pane_type: PaneType::Interactive,
@@ -3061,11 +3102,7 @@ async fn run_inner(
                             snapshot,
                         ) {
                             Ok(()) => {
-                                crate::attach::forward_channels(
-                                    attachments,
-                                    output_rx,
-                                    command_rx,
-                                );
+                                crate::attach::forward_channels(attachments, output_rx, command_rx);
                             }
                             Err(err) => {
                                 // Not fatal: a project that cannot be attached
@@ -5314,16 +5351,18 @@ mod tests {
         build_user_envelope_line, canonicalize_requested_model, convert_opencode_to_claude,
         deadloop_wait_plan, evaluate_deadloop_watchdog, is_codex_stale_session_error,
         manual_create_pr_worktree_path, model_switch_can_use_fast_path, normalize_codex_effort,
-        normalize_effort_level, remember_verified_codex_session,
-        reset_deadloop_codex_stale_session, resolve_pane_binary_path, resolve_terminal_binary,
-        restored_pane_mode_and_pause, retired_launch_rejection_output, route_web_input_to_pane,
-        run_deadloop_session_inner, save_pane_configs, should_recover_deadloop_stale_session,
-        start_bot_preserved_fields, stop_retired_panes, terminal_state_reports,
-        truncate_str_at_char_boundary, update_project_operations, DeadloopWatchdogDecision,
-        DeadloopWatchdogState, InputChannels, PaneInputRouteResult, PaneMeta, PaneMetas,
-        PanePauses, PaneStopRequests, PendingAskQuestion, ASK_USER_QUESTION_AUTO_CANCEL_STATUS,
-        DEEPSEEK_DEFAULT_MODEL, DEEPSEEK_PRO_RUNTIME_MODEL,
+        normalize_effort_level, reconcile_terminal_questions_for_pane,
+        remember_verified_codex_session, reset_deadloop_codex_stale_session,
+        resolve_pane_binary_path, resolve_terminal_binary, restored_pane_mode_and_pause,
+        retired_launch_rejection_output, route_web_input_to_pane, run_deadloop_session_inner,
+        save_pane_configs, should_recover_deadloop_stale_session, start_bot_preserved_fields,
+        stop_retired_panes, terminal_state_reports, truncate_str_at_char_boundary,
+        update_project_operations, DeadloopWatchdogDecision, DeadloopWatchdogState, InputChannels,
+        PaneInputRouteResult, PaneMeta, PaneMetas, PanePauses, PaneStopRequests,
+        PendingAskQuestion, ASK_USER_QUESTION_AUTO_CANCEL_STATUS, DEEPSEEK_DEFAULT_MODEL,
+        DEEPSEEK_PRO_RUNTIME_MODEL,
     };
+    use crate::conversation::{TurnAnswer, TurnQuestion, TurnRecord};
     use crate::project::{get_or_create_project, save_project};
     use crate::terminal_pane::TerminalPanes;
     use crate::tui::{PaneOutput, TuiEvent};
@@ -5353,12 +5392,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp project");
         let mut metadata = get_or_create_project(dir.path()).expect("create project");
         for (pane_id, role) in [(11, "reviewer"), (12, "tech lead"), (13, "team manager")] {
-            let mut pane = test_pane_config(
-                pane_id,
-                shared::PaneMode::Interactive,
-                false,
-                false,
-            );
+            let mut pane = test_pane_config(pane_id, shared::PaneMode::Interactive, false, false);
             pane.role = Some(role.to_string());
             pane.managed = false;
             metadata.panes.push(pane);
@@ -5370,8 +5404,7 @@ mod tests {
             assert!(
                 !pane.managed,
                 "pane {} named {:?} must stay unmanaged",
-                pane.pane_id,
-                pane.role
+                pane.pane_id, pane.role
             );
         }
     }
@@ -5420,7 +5453,6 @@ mod tests {
         assert!(super::existing_pane_relaunch_allowed());
     }
 
-
     /// A pane that exists relaunches, full stop. The allowlist governs what may
     /// be created, and team availability — which used to gate a managed pane —
     /// no longer governs anything, so a pane marked managed by an older `.apas`
@@ -5429,7 +5461,6 @@ mod tests {
     fn any_existing_pane_relaunches() {
         assert!(super::existing_pane_relaunch_allowed());
     }
-
 
     #[test]
     fn deadloop_wait_cursor_is_sampled_at_wait_entry() {
@@ -5748,9 +5779,6 @@ mod tests {
             managed,
         }
     }
-
-
-
 
     fn start_team_event_label(event: &TuiEvent) -> &str {
         let TuiEvent::AddTabWithConfig { label, .. } = event else {
@@ -7709,6 +7737,73 @@ mod tests {
     }
 
     #[test]
+    fn restored_terminal_questions_repopulate_pending_state_without_resetting_delivery() {
+        let question = TurnRecord {
+            ts: "1".to_string(),
+            pane_id: 7,
+            role: "assistant".to_string(),
+            text: String::new(),
+            model: None,
+            input_tokens: None,
+            output_tokens: None,
+            completes_work: false,
+            question: Some(TurnQuestion {
+                tool_use_id: "question-7".to_string(),
+                tool_name: "AskUserQuestion".to_string(),
+                input: serde_json::json!({
+                    "questions": [{
+                        "question": "Choose",
+                        "options": [{"label": "A"}, {"label": "B"}]
+                    }]
+                }),
+            }),
+            answer: None,
+        };
+        let mut pending = HashMap::new();
+
+        assert!(reconcile_terminal_questions_for_pane(
+            &mut pending,
+            7,
+            std::slice::from_ref(&question),
+        ));
+        assert_eq!(pending["question-7"].pane_id, 7);
+        assert_eq!(pending["question-7"].options[0].1, vec!["A", "B"]);
+
+        pending.get_mut("question-7").unwrap().delivered = true;
+        assert!(reconcile_terminal_questions_for_pane(
+            &mut pending,
+            7,
+            std::slice::from_ref(&question),
+        ));
+        assert!(
+            pending["question-7"].delivered,
+            "ordinary transcript polls must not make a delivered answer writable twice"
+        );
+
+        let answer = TurnRecord {
+            ts: "2".to_string(),
+            pane_id: 7,
+            role: "user".to_string(),
+            text: String::new(),
+            model: None,
+            input_tokens: None,
+            output_tokens: None,
+            completes_work: false,
+            question: None,
+            answer: Some(TurnAnswer {
+                tool_use_id: "question-7".to_string(),
+                recorded: "A".to_string(),
+            }),
+        };
+        assert!(!reconcile_terminal_questions_for_pane(
+            &mut pending,
+            7,
+            &[question, answer],
+        ));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
     fn an_active_codex_turn_is_republished_after_reconnect() {
         let mut states = HashMap::new();
 
@@ -7881,7 +7976,11 @@ mod tests {
     fn fruit_options() -> Vec<(String, Vec<String>)> {
         vec![(
             "Pick a fruit".to_string(),
-            vec!["Apple".to_string(), "Banana".to_string(), "Cherry".to_string()],
+            vec![
+                "Apple".to_string(),
+                "Banana".to_string(),
+                "Cherry".to_string(),
+            ],
         )]
     }
 
@@ -8791,7 +8890,6 @@ fn run_deadloop_session_inner(
                 continue;
             }
         };
-
 
         let mut command = Command::new(binary_path);
         command
@@ -9959,7 +10057,6 @@ fn run_pane_session_streaming(
         // on one session would interleave writes to the .jsonl.
         kill_processes_using_session(&claude_session_id.to_string());
 
-
         let mut command = Command::new(binary_path);
         command
             .args(&args)
@@ -11092,7 +11189,6 @@ fn run_pane_session(
         // on the same session would interleave writes to its .jsonl.
         // Mirrors the deadloop spawn path.
         kill_processes_using_session(&claude_session_id.to_string());
-
 
         let mut command = Command::new(binary_path);
         command

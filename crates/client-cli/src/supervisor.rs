@@ -234,7 +234,10 @@ mod tests {
             path: PathBuf::from("/work/project"),
         };
         let raw = serde_json::to_string(&ensure).unwrap();
-        assert_eq!(serde_json::from_str::<ControllerToSupervisor>(&raw).unwrap(), ensure);
+        assert_eq!(
+            serde_json::from_str::<ControllerToSupervisor>(&raw).unwrap(),
+            ensure
+        );
 
         let project_id = Uuid::new_v4();
         let running = SupervisorToController::ProjectRunning {
@@ -244,7 +247,10 @@ mod tests {
             started: false,
         };
         let raw = serde_json::to_string(&running).unwrap();
-        assert_eq!(serde_json::from_str::<SupervisorToController>(&raw).unwrap(), running);
+        assert_eq!(
+            serde_json::from_str::<SupervisorToController>(&raw).unwrap(),
+            running
+        );
     }
 
     #[test]

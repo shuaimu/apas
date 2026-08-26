@@ -58,3 +58,30 @@ Once an answer has been recorded for a question, the system SHALL refuse further
 
 - **WHEN** an answer for a pending question is submitted more than once
 - **THEN** the agent receives the selection at most once
+
+### Requirement: A pane waiting on a question has a distinct status
+
+The application SHALL report an unresolved agent question as Pending answer rather than Working or Idle. The status SHALL remain pending while delivery is unconfirmed, and SHALL return to Working when the provider records the answer and continues the turn. Project lists, waiting-agent lists, pane selectors, and conversation status surfaces SHALL preserve this distinction. Pending answer SHALL take presentation precedence over provider availability because it names the action the human can take now.
+
+#### Scenario: Agent blocks on a question
+
+- **WHEN** a pane publishes an `AskUserQuestion` without a matching recorded answer
+- **THEN** the pane and its project are presented as Pending answer
+- **AND** the pane is not presented as actively working or ordinarily idle
+
+#### Scenario: Submitted answer is not yet recorded
+
+- **WHEN** an answer has been routed to the pane but no matching tool result has been recorded
+- **THEN** the pane remains Pending answer
+
+#### Scenario: Provider records the answer
+
+- **WHEN** the matching tool result is recorded
+- **THEN** the Pending answer state clears
+- **AND** the pane is presented as Working until the provider completes the resumed turn
+
+#### Scenario: Pending pane is visible among waiting agents
+
+- **WHEN** a running project has a pane awaiting an answer
+- **THEN** that pane appears ahead of ordinary idle and usage-limited panes in the waiting-agent list
+- **AND** its badge reads Pending answer

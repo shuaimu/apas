@@ -23,6 +23,7 @@ import {
   PROVIDER_MODEL_OPTIONS,
 } from "@/lib/providerOptions";
 import { ActivitySparkline } from "./ActivitySparkline";
+import { paneIsAwaitingAnswerStatus } from "@/lib/paneStatus";
 import { useIsLaunchProfileAllowed } from "@/lib/tabTypes";
 
 interface PaneGridProps {
@@ -148,9 +149,12 @@ function PaneCard({
     : mappedAgentValue;
   const isUnsupported = isRetiredProviderModel(pane.provider, pane.model)
     || currentAgentValue === "unsupported";
-  const isThinking = !!status && !isPaused;
+  const isAwaitingAnswer = paneIsAwaitingAnswerStatus(status) && !isPaused;
+  const isThinking = !!status && !isPaused && !isAwaitingAnswer;
   const modeIndicator = isUnsupported
     ? { icon: "!", label: "unsupported provider" }
+    : isAwaitingAnswer
+    ? { icon: "?", label: "pending answer" }
     : isBot
     ? isPaused
       ? { icon: "⏸", label: "paused" }
@@ -160,6 +164,8 @@ function PaneCard({
       : { icon: "•", label: "idle" };
   const modeColor = isUnsupported
     ? "text-red-500"
+    : isAwaitingAnswer
+    ? "text-amber-500"
     : isBot
     ? isPaused
       ? "text-amber-500"

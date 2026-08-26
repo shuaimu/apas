@@ -13,6 +13,7 @@ See proposal.md — Why. What already exists matters more than what is missing:
 **Goals:**
 
 - A pending question is visible and answerable from the conversation view, on a phone, without touching the xterm view.
+- A pane blocked on that question is visibly Pending answer everywhere pane activity is shown, rather than being collapsed into Working or Idle.
 - Reuse the existing card, queue, retransmit, and wire messages; the only genuinely new mechanism is keystroke delivery.
 - Never report an answer as delivered on the strength of having written bytes at a pty.
 
@@ -43,6 +44,8 @@ See proposal.md — Why. What already exists matters more than what is missing:
 
 6. **One answer, one delivery.** The pane sends keystrokes for a `tool_use_id` at most once. Combined with decision 4 this makes the web's existing retransmit safe: a retransmitted answer for a still-pending question is refused as already delivered, and one for an answered question is refused as settled.
 
+7. **Pending answer is an additive pane-status classification.** The existing status string continues to carry detailed working text and now uses one canonical Pending answer value for a blocked question. Session summaries add a defaulted `awaiting_answer` flag per pane; `is_working` excludes that value, and idle recency excludes it too. This keeps rolling compatibility while letting list snapshots heal missed live frames. The server sets Pending answer when it receives the question and returns the pane to Working only when the matching transcript `tool_result` arrives—not merely when answer bytes are queued. Web surfaces give Pending answer visual and ordering precedence over ordinary idle and usage-limited states.
+
 ## Risks / Trade-offs
 
 - [The write is blind: nothing proves the pane is sitting on the question when the keys land] → Decision 4 narrows the window to "the transcript says this question is unanswered", decision 6 stops repeats, and decision 3 reports what was actually recorded. What remains is a genuine race — the human answering in the terminal at the same instant — whose worst outcome is one stray keystroke, and which the recorded-answer display makes visible rather than silent.
@@ -53,4 +56,4 @@ See proposal.md — Why. What already exists matters more than what is missing:
 
 ## Migration Plan
 
-Behavior-only, no schema and no wire change. The CLI ships last as usual: an older CLI simply never publishes a question, which is today's behavior. A newer CLI against an older web publishes a `ToolUse` block the card already knows how to render, since that path predates terminal panes. Rollback is a binary swap.
+The original answer path remains behavior-only. Pending-answer presentation adds a defaulted summary field and a canonical status value, so older clients ignore the field and continue treating the non-empty status as activity during a rolling upgrade. Deploy server/shared first, then web, then CLI if CLI changes are needed. A newer web against an older server simply lacks the pending flag and retains today's Working display. Rollback is a binary swap.

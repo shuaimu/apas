@@ -53,7 +53,11 @@ async fn require_cluster_operator(
     project_id: &str,
 ) -> Result<User, AppError> {
     let user = require_active_user(headers, state).await?;
-    if !state.db.project_in_user_cluster(project_id, &user.id).await? {
+    if !state
+        .db
+        .project_in_user_cluster(project_id, &user.id)
+        .await?
+    {
         return Err(AppError::Forbidden(
             "That project is not in your cluster".to_string(),
         ));
@@ -307,7 +311,11 @@ pub async fn update_default_policy(
     // A cluster default changes the effective policy of every project hosted
     // here, including projects other accounts own, so recalculate before
     // fanning out to live peers.
-    for project in state.db.list_cluster_projects(&user.id, None, 200, 0).await? {
+    for project in state
+        .db
+        .list_cluster_projects(&user.id, None, 200, 0)
+        .await?
+    {
         let effective = state.db.get_effective_project_policy(&project.id).await?;
         state
             .sessions

@@ -10,6 +10,7 @@ import {
   paneKey,
 } from "@/lib/store";
 import { useIsLaunchProfileAllowed } from "@/lib/tabTypes";
+import { paneIsAwaitingAnswerStatus, paneIsWorkingStatus } from "@/lib/paneStatus";
 import {
   DEEPSEEK_FLASH_MODEL,
   DEEPSEEK_PRO_MODEL,
@@ -342,7 +343,8 @@ export function TabBar({
           const isUnsupported = isRetiredProviderModel(tab.provider, tab.model);
           const isPaused = pausedPanes.includes(tab.pane_id);
           const status = paneStatuses[paneKey(tab.pane_id)];
-          const hasActivity = !!status;
+          const hasActivity = paneIsWorkingStatus(status);
+          const isAwaitingAnswer = paneIsAwaitingAnswerStatus(status);
           const label = tab.label || `Tab ${index + 1}`;
           const isRenaming = renamingPaneId === tab.pane_id;
 
@@ -400,6 +402,9 @@ export function TabBar({
                 <ProviderIcon provider={tab.provider} model={tab.model} label={tab.label} />
                 {hasActivity && !isPaused && (
                   <span className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse" />
+                )}
+                {isAwaitingAnswer && !isPaused && (
+                  <span className="absolute -top-0.5 -right-0.5 h-1.5 w-1.5 rounded-full bg-amber-500" />
                 )}
                 {isPaused && (
                   <span className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 rounded-full bg-amber-500" />

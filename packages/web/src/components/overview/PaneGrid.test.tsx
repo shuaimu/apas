@@ -25,11 +25,15 @@ function pane(overrides: Partial<PaneConfig> & Pick<PaneConfig, "pane_id" | "lab
   };
 }
 
-function seedPaneGrid(paneConfigs: PaneConfig[], promotePaneToManaged = vi.fn()) {
+function seedPaneGrid(
+  paneConfigs: PaneConfig[],
+  promotePaneToManaged = vi.fn(),
+  paneStatuses: Record<string, string | null> = {},
+) {
   const updatePaneModel = vi.fn();
   useStore.setState({
     paneConfigs,
-    paneStatuses: {},
+    paneStatuses,
     pausedPanes: [],
     paneMessages: {},
     paneDiffs: {},
@@ -90,6 +94,18 @@ describe("PaneGrid empty states", () => {
 
     expect(onRemovePane).toHaveBeenCalledWith(20);
     expect(onRemovePane).toHaveBeenCalledWith(21);
+  });
+
+  it("labels a blocked pane as pending answer rather than thinking", () => {
+    seedPaneGrid(
+      [pane({ pane_id: 22, label: "Needs answer", role: "developer", managed: false })],
+      vi.fn(),
+      { "22": "Pending answer" },
+    );
+
+    renderPaneGrid();
+    expect(within(card("Needs answer")).getByLabelText("pending answer")).toBeTruthy();
+    expect(within(card("Needs answer")).queryByLabelText("thinking")).toBeNull();
   });
 });
 

@@ -127,7 +127,7 @@ function adaptSession(session: SessionInfo): MobileSessionSummary {
     is_active: session.isActive,
     is_working: session.isWorking,
     latest_update_at: session.createdAt,
-    attention_count: 0,
+    attention_count: session.panes?.filter((pane) => pane.awaiting_answer).length ?? 0,
     is_shared: session.isShared,
     owner_email: session.ownerEmail,
     panes: session.panes,
@@ -150,6 +150,7 @@ function compareSessionRecency(left: MobileSessionSummary, right: MobileSessionS
 
 function statusLabel(session: MobileSessionSummary, allPanesUsageLimited = false): string {
   if (!session.is_active) return "Offline";
+  if (session.panes?.some((pane) => pane.awaiting_answer)) return "Pending answer";
   if (session.is_working) return "Working";
   return allPanesUsageLimited ? "Usage limited" : "Idle";
 }
@@ -327,6 +328,7 @@ export function MobileCodeHome({
           .map((pane) => ({
             session,
             pane,
+            awaitingAnswer: pane.awaiting_answer === true,
             usageLimit: paneUsageLimit(
               { cliClientId: session.cli_client_id ?? undefined },
               pane,
@@ -337,15 +339,19 @@ export function MobileCodeHome({
       ),
     [availabilityNow, sessions, usageLimits],
   );
+  const pendingPanes = useMemo(
+    () => waitingPanes.filter((entry) => entry.awaitingAnswer),
+    [waitingPanes],
+  );
   const idlePanes = useMemo(
     () => waitingPanes
-      .filter((entry) => !entry.usageLimit)
+      .filter((entry) => !entry.awaitingAnswer && !entry.usageLimit)
       .sort(compareRecentlyIdle),
     [waitingPanes],
   );
   const limitedPanes = useMemo(
     () => waitingPanes
-      .filter((entry) => entry.usageLimit)
+      .filter((entry) => !entry.awaitingAnswer && entry.usageLimit)
       .sort(compareRecentlyIdle),
     [waitingPanes],
   );
@@ -358,6 +364,7 @@ export function MobileCodeHome({
           && (session.panes?.length ?? 0) > 0
           && session.panes?.every((pane) =>
             !pane.is_working
+            && !pane.awaiting_answer
             && paneUsageLimit(
               { cliClientId: session.cli_client_id ?? undefined },
               pane,
@@ -373,10 +380,11 @@ export function MobileCodeHome({
   const renderWaitingPane = ({
     session,
     pane,
+    awaitingAnswer,
     usageLimit,
   }: (typeof waitingPanes)[number]) => {
     const name = session.project_name || "Coding session";
-    const resetLabel = usageLimit
+    const resetLabel = !awaitingAnswer && usageLimit
       ? usageLimitResetLabel(usageLimit, availabilityNow)
       : null;
     return (
@@ -402,11 +410,13 @@ export function MobileCodeHome({
             <span className="min-w-0 truncate font-bold text-[#6d5efc]">{paneRowLabel(pane)}</span>
           </span>
           <span className={`shrink-0 rounded-full px-2.5 py-1 text-[0.7rem] font-bold ${
-            usageLimit
+            awaitingAnswer
+              ? "bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-200"
+              : usageLimit
               ? "bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300"
               : "bg-[#efeff5] text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]"
           }`}>
-            {usageLimit ? usageLimitedLabel(usageLimit) : "Idle"}
+            {awaitingAnswer ? "Pending answer" : usageLimit ? usageLimitedLabel(usageLimit) : "Idle"}
           </span>
         </div>
         <p className="mt-2 truncate text-sm text-[#686873] dark:text-[#aaaab6]">
@@ -541,17 +551,27 @@ export function MobileCodeHome({
             </div>
           )
         ) : filter === "idle" ? (
-          idlePanes.length > 0 || limitedPanes.length > 0 ? (
+          pendingPanes.length > 0 || idlePanes.length > 0 || limitedPanes.length > 0 ? (
             <>
+              {pendingPanes.length > 0 && (
+                <section aria-labelledby="mobile-pending-answer-heading">
+                  <h2 id="mobile-pending-answer-heading" className="mb-2.5 text-sm font-extrabold uppercase tracking-wide text-amber-700 dark:text-amber-300">
+                    Pending answer
+                  </h2>
+                  <div className="space-y-2.5">
+                    {pendingPanes.map(renderWaitingPane)}
+                  </div>
+                </section>
+              )}
               {idlePanes.length > 0 && (
-                <div className="space-y-2.5">
+                <div className={`space-y-2.5 ${pendingPanes.length > 0 ? "mt-5 border-t border-[#dedee7] pt-4 dark:border-[#383842]" : ""}`}>
                   {idlePanes.map(renderWaitingPane)}
                 </div>
               )}
               {limitedPanes.length > 0 && (
                 <section
                   aria-labelledby="mobile-usage-limited-heading"
-                  className={idlePanes.length > 0 ? "mt-5 border-t border-[#dedee7] pt-4 dark:border-[#383842]" : ""}
+                  className={pendingPanes.length > 0 || idlePanes.length > 0 ? "mt-5 border-t border-[#dedee7] pt-4 dark:border-[#383842]" : ""}
                 >
                   <h2
                     id="mobile-usage-limited-heading"
@@ -594,7 +614,9 @@ export function MobileCodeHome({
                   <div className="flex items-center justify-between gap-2.5">
                     <span className="min-w-0 flex-1 truncate text-base font-bold">{name}</span>
                     <span className={`shrink-0 rounded-full px-2.5 py-1 text-[0.7rem] font-bold ${
-                      session.is_working
+                      session.panes?.some((pane) => pane.awaiting_answer)
+                        ? "bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-200"
+                        : session.is_working
                         ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300"
                         : session.is_active
                           ? "bg-[#efeff5] text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]"

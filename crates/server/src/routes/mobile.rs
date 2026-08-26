@@ -51,7 +51,10 @@ fn session_info(
         owner_email,
         share_role: Some(if shared { "user" } else { "owner" }.to_string()),
         is_active,
-        is_working: is_active && !working.is_empty(),
+        is_working: is_active
+            && working
+                .iter()
+                .any(|(_, _, status)| shared::pane_status_is_working(status)),
         // Same map the flag above is derived from, so "this session is working"
         // and "these panes are working" cannot disagree — and the same helper
         // the web list uses, so the two surfaces cannot either.
@@ -86,12 +89,17 @@ async fn accessible_sessions(
             .clone()
             .or_else(|| session.created_at.clone());
         let info = session_info(state, session, false, None);
+        let attention_count = info
+            .panes
+            .iter()
+            .filter(|pane| pane.awaiting_answer)
+            .count() as u32;
         summaries.push(MobileSessionSummary {
             project_name: project_name(&info),
             latest_update_at,
             last_user_input_at,
             latest_summary: None,
-            attention_count: 0,
+            attention_count,
             session: info,
         });
     }
@@ -102,12 +110,17 @@ async fn accessible_sessions(
             .clone()
             .or_else(|| session.created_at.clone());
         let info = session_info(state, session, true, Some(owner_email));
+        let attention_count = info
+            .panes
+            .iter()
+            .filter(|pane| pane.awaiting_answer)
+            .count() as u32;
         summaries.push(MobileSessionSummary {
             project_name: project_name(&info),
             latest_update_at,
             last_user_input_at,
             latest_summary: None,
-            attention_count: 0,
+            attention_count,
             session: info,
         });
     }
@@ -675,17 +688,28 @@ mod tests {
         state
             .sessions
             .create_cli_session(session_id, cli_id, None, None);
-        // A project with one pane working and one idle: the case the
-        // session-level flag cannot express, since it reads as simply working.
+        // A project with working, idle, and human-blocked panes: the case the
+        // old binary flag could not express without calling the pending pane
+        // working too.
         state.sessions.set_session_panes(
             &session_id,
-            vec![test_pane(3, "Busy one"), test_pane(4, "Idle one")],
+            vec![
+                test_pane(3, "Busy one"),
+                test_pane(4, "Idle one"),
+                test_pane(5, "Needs answer"),
+            ],
         );
         state.sessions.set_pane_status(
             &session_id,
             shared::PaneType::Interactive,
             3,
             Some("Working…".to_string()),
+        );
+        state.sessions.set_pane_status(
+            &session_id,
+            shared::PaneType::Interactive,
+            5,
+            Some(shared::PANE_STATUS_PENDING_ANSWER.to_string()),
         );
         state.sessions.update_usage_limits(
             cli_id,
@@ -720,11 +744,19 @@ mod tests {
         assert!(response.sessions[0].session.is_working);
         // Per pane, so an idle agent inside a working project is findable.
         let panes = &response.sessions[0].session.panes;
-        assert_eq!(panes.len(), 2, "both panes are reported");
+        assert_eq!(panes.len(), 3, "every pane state is reported");
         let busy = panes.iter().find(|pane| pane.pane_id == 3).unwrap();
         let idle = panes.iter().find(|pane| pane.pane_id == 4).unwrap();
+        let pending = panes.iter().find(|pane| pane.pane_id == 5).unwrap();
         assert!(busy.is_working);
         assert!(!idle.is_working);
+        assert!(!pending.is_working);
+        assert!(pending.awaiting_answer);
+        assert!(
+            pending.idle_since.is_none(),
+            "waiting for a human is not an idle transition"
+        );
+        assert_eq!(response.sessions[0].attention_count, 1);
         assert_eq!(idle.label.as_deref(), Some("Idle one"));
         assert!(
             idle.idle_since.is_some(),
@@ -739,6 +771,20 @@ mod tests {
         );
         // The two views agree, because they read the same statuses.
         assert!(panes.iter().any(|pane| pane.is_working));
+
+        state
+            .sessions
+            .set_pane_status(&session_id, shared::PaneType::Interactive, 3, None);
+        let pending_only = accessible_sessions(&state, &owner_id).await.unwrap();
+        let recent = pending_only
+            .iter()
+            .find(|summary| summary.session.id == session_id)
+            .unwrap();
+        assert!(
+            !recent.session.is_working,
+            "a session with only an unanswered question is not working"
+        );
+        assert_eq!(recent.attention_count, 1);
         assert!(!response.sessions[1].session.is_active);
         assert!(!response.sessions[1].session.is_working);
         assert!(

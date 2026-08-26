@@ -11,6 +11,8 @@ import {
   type ServerToWeb,
 } from "@apas/protocol";
 
+import { paneStatusIsWorking } from "./paneStatus";
+
 export type ConnectionPhase = "offline" | "connecting" | "authenticating" | "synchronizing" | "ready";
 export const PANE_WORK_SUMMARY_CAPABILITY = "pane_work_summary_v1";
 
@@ -189,7 +191,7 @@ export const useMobileStore = create<MobileState>((set) => ({
       else delete sessionStatuses[String(paneId)];
       return {
         sessions: state.sessions.map((session) => session.id === sessionId
-          ? { ...session, is_working: Object.values(sessionStatuses).some(Boolean) }
+          ? { ...session, is_working: Object.values(sessionStatuses).some(paneStatusIsWorking) }
           : session),
         paneStatusesBySession: {
           ...state.paneStatusesBySession,

@@ -722,28 +722,6 @@
       ]
     },
     {
-      "description": "One team scratchpad record forwarded from the CLI. Phase 2.2b.",
-      "type": "object",
-      "properties": {
-        "record": {
-          "$ref": "#/$defs/TeamScratchpadRecord"
-        },
-        "session_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "type": {
-          "type": "string",
-          "const": "team_record"
-        }
-      },
-      "required": [
-        "type",
-        "session_id",
-        "record"
-      ]
-    },
-    {
       "description": "Plan-review request forwarded from CLI. Phase 3.2b2.",
       "type": "object",
       "properties": {
@@ -859,28 +837,6 @@
         "type",
         "session_id",
         "pane_id"
-      ]
-    },
-    {
-      "description": "Forwarded from `CliToServer::ProjectGoalChanged`. The web caches\nthis per-session and refreshes the Project goal textbox when the\nuser isn't actively editing.",
-      "type": "object",
-      "properties": {
-        "content": {
-          "type": "string"
-        },
-        "session_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "type": {
-          "type": "string",
-          "const": "project_goal_changed"
-        }
-      },
-      "required": [
-        "type",
-        "session_id",
-        "content"
       ]
     },
     {
@@ -1009,53 +965,6 @@
         "type",
         "session_id",
         "policy"
-      ]
-    },
-    {
-      "description": "Snapshot of the project's team-todo.md state. Sent in reply to\n`WebToServer::FetchTeamTodo` and after every CLI-side mutation\ntriggered by `WebToServer::TodoApproval`. See\n`docs/todo-driven-workflow.md`.",
-      "type": "object",
-      "properties": {
-        "session_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "state": {
-          "$ref": "#/$defs/TeamTodoStateMsg"
-        },
-        "type": {
-          "type": "string",
-          "const": "team_todo_state"
-        }
-      },
-      "required": [
-        "type",
-        "session_id",
-        "state"
-      ]
-    },
-    {
-      "description": "Snapshot of the project's suggested-workers.md state. Sent in\nreply to `WebToServer::FetchSuggestedWorkers` and after every\nCLI-side mutation triggered by `WebToServer::DismissSuggestion`.",
-      "type": "object",
-      "properties": {
-        "session_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "suggestions": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/SuggestedWorkerMsg"
-          }
-        },
-        "type": {
-          "type": "string",
-          "const": "suggested_workers_state"
-        }
-      },
-      "required": [
-        "type",
-        "session_id",
-        "suggestions"
       ]
     },
     {
@@ -1875,6 +1784,70 @@
         "message_type"
       ]
     },
+    "MobilePaneSummary": {
+      "description": "One agent pane, as mobile needs to list it.",
+      "type": "object",
+      "properties": {
+        "awaiting_answer": {
+          "description": "True while this pane is blocked on an unresolved agent question. This\nis neither active work nor idle time and takes presentation precedence\nover provider availability.",
+          "type": "boolean",
+          "default": false
+        },
+        "idle_since": {
+          "description": "Most recent working-to-idle transition observed by the server. Older\nservers omit it; clients keep those panes visible after timestamped ones.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "is_working": {
+          "description": "True while this pane is reporting work, from the same pane statuses the\nsession-level flag is derived from.",
+          "type": "boolean",
+          "default": false
+        },
+        "kind": {
+          "$ref": "#/$defs/PaneKind"
+        },
+        "label": {
+          "description": "The pane's own label when it has one; the client falls back to its kind\nand id, exactly as the session screen does.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "Model/backend override used to associate provider-scoped availability\nwith the same usage account the pane actually consumes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "provider": {
+          "$ref": "#/$defs/Provider"
+        },
+        "usage_limited": {
+          "description": "Provider availability is not pane activity. Carry the latest explicit\nblock separately so shared/mobile snapshots do not turn it into idle.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsageLimited"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "pane_id",
+        "kind",
+        "provider"
+      ]
+    },
     "MutationKind": {
       "type": "string",
       "enum": [
@@ -2155,29 +2128,6 @@
         "live_adoptable",
         "restart_required_on_cli_reboot",
         "structured_pane_may_resume"
-      ]
-    },
-    "PaneTodoPrMsg": {
-      "type": "object",
-      "properties": {
-        "annotation": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "pane_id": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
-        },
-        "url": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "pane_id",
-        "url"
       ]
     },
     "PaneType": {
@@ -2592,6 +2542,13 @@
             "null"
           ]
         },
+        "panes": {
+          "description": "The panes in this session and whether each is working.\n\n`is_working` above answers \"is anything happening here\", which cannot\nanswer \"which agent is waiting for me\": a project with one busy pane\nreads as working, hiding every idle pane in it. Both are derived from\nthe same pane statuses, so they cannot disagree.\n\nDefaulted: an older server omits it, and a client must read that as \"no\npane detail\" rather than as a session with no panes.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MobilePaneSummary"
+          }
+        },
         "project_id": {
           "description": "Stable project identity from `.apas`. Web UI groups by this.\nFalls back to `id` for legacy rows that pre-date the column.",
           "type": [
@@ -2645,199 +2602,6 @@
           "type": "string",
           "const": "ended"
         }
-      ]
-    },
-    "SuggestedWorkerMsg": {
-      "description": "One row in the suggested-workers queue. The Manager pane appends\nthese as `## SUG-NNN — label` sections to `suggested-workers.md`;\nthe Overview renders each as a card with Accept / Dismiss buttons.",
-      "type": "object",
-      "properties": {
-        "backstory": {
-          "type": "string"
-        },
-        "goal": {
-          "type": "string"
-        },
-        "id": {
-          "type": "string"
-        },
-        "label": {
-          "type": "string"
-        },
-        "needs_worktree": {
-          "type": "boolean",
-          "default": false
-        },
-        "role": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "id",
-        "label",
-        "role",
-        "goal",
-        "backstory"
-      ]
-    },
-    "TeamScratchpadRecord": {
-      "description": "One published artifact in the team scratchpad (`.apas-team.jsonl`),\nmirroring the CLI's `crate::scratchpad::TeamRecord`. Separate type\nhere so the wire shape is stable across CLI/server/web even if the\nCLI's internal helper grows extra columns. Phase 2.2b.",
-      "type": "object",
-      "properties": {
-        "body": {
-          "type": "string"
-        },
-        "kind": {
-          "type": "string"
-        },
-        "pane_id": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0
-        },
-        "tags": {
-          "type": "array",
-          "default": [],
-          "items": {
-            "type": "string"
-          }
-        },
-        "ts": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "ts",
-        "kind",
-        "body"
-      ]
-    },
-    "TeamTodoGlobalMsg": {
-      "type": "object",
-      "properties": {
-        "body": {
-          "type": "string"
-        },
-        "id": {
-          "type": "string"
-        },
-        "origin": {
-          "description": "user | tech-lead",
-          "type": "string"
-        },
-        "prs": {
-          "description": "One PR per contributing worker. Empty until any worker's branch\nhas been pushed and PR'd.",
-          "type": "array",
-          "default": [],
-          "items": {
-            "$ref": "#/$defs/PaneTodoPrMsg"
-          }
-        },
-        "status": {
-          "description": "proposed | approved | in_progress | under_review | pr_open | done | rejected",
-          "type": "string"
-        },
-        "title": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "id",
-        "title",
-        "status",
-        "origin",
-        "body"
-      ]
-    },
-    "TeamTodoStateMsg": {
-      "description": "Wire format for a snapshot of `team-todo.md`. Mirrors the CLI's\n`team_todo::TeamTodo` but with status fields kept as strings so we\ndon't have to ship the enum definitions across crate / language\nboundaries. The web parses these into UI state.",
-      "type": "object",
-      "properties": {
-        "globals": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/TeamTodoGlobalMsg"
-          }
-        },
-        "reviewer_cursor": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "tech_lead_cursor": {
-          "description": "Per-agent scratchpad cursor (RFC3339 timestamp of the last\nrecord acted on). `None` means the cursor file is missing —\neither the agent hasn't iterated yet, or it was wiped.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "workers": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/TeamTodoWorkerMsg"
-          }
-        }
-      },
-      "required": [
-        "globals",
-        "workers"
-      ]
-    },
-    "TeamTodoSubtaskMsg": {
-      "type": "object",
-      "properties": {
-        "body": {
-          "type": "string"
-        },
-        "id": {
-          "type": "string"
-        },
-        "parent": {
-          "type": "string"
-        },
-        "status": {
-          "description": "pending | in_progress | done | reviewing | revising | approved",
-          "type": "string"
-        },
-        "title": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "id",
-        "title",
-        "status",
-        "parent",
-        "body"
-      ]
-    },
-    "TeamTodoWorkerMsg": {
-      "type": "object",
-      "properties": {
-        "pane_id": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
-        },
-        "role_hint": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "subtasks": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/TeamTodoSubtaskMsg"
-          }
-        }
-      },
-      "required": [
-        "pane_id",
-        "subtasks"
       ]
     },
     "TerminalLifecycle": {
@@ -2952,6 +2716,26 @@
         "utilization"
       ]
     },
+    "UsageLimited": {
+      "description": "A provider-confirmed usage limit that is currently preventing work.\n\nThis is deliberately separate from utilization: included usage may reach\n100% while paid extra usage remains available, in which case the provider\nis not blocking requests and this field stays absent.",
+      "type": "object",
+      "properties": {
+        "resets_at": {
+          "description": "When the provider expects work to become available again.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "window": {
+          "description": "Human-readable limiting window, such as \"weekly\" or \"5-hour\".",
+          "type": "string"
+        }
+      },
+      "required": [
+        "window"
+      ]
+    },
     "UsageLimits": {
       "description": "Usage limits from the provider API/logs",
       "type": "object",
@@ -2979,6 +2763,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/UsageLimitWindow"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "usage_limited": {
+          "description": "Present only when the provider says a usage limit is actively blocking\nrequests. A full utilization meter alone is not sufficient.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsageLimited"
             },
             {
               "type": "null"

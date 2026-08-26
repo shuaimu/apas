@@ -983,6 +983,70 @@
         }
       }
     },
+    "MobilePaneSummary": {
+      "description": "One agent pane, as mobile needs to list it.",
+      "type": "object",
+      "properties": {
+        "awaiting_answer": {
+          "description": "True while this pane is blocked on an unresolved agent question. This\nis neither active work nor idle time and takes presentation precedence\nover provider availability.",
+          "type": "boolean",
+          "default": false
+        },
+        "idle_since": {
+          "description": "Most recent working-to-idle transition observed by the server. Older\nservers omit it; clients keep those panes visible after timestamped ones.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "is_working": {
+          "description": "True while this pane is reporting work, from the same pane statuses the\nsession-level flag is derived from.",
+          "type": "boolean",
+          "default": false
+        },
+        "kind": {
+          "$ref": "#/$defs/PaneKind"
+        },
+        "label": {
+          "description": "The pane's own label when it has one; the client falls back to its kind\nand id, exactly as the session screen does.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "Model/backend override used to associate provider-scoped availability\nwith the same usage account the pane actually consumes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "provider": {
+          "$ref": "#/$defs/Provider"
+        },
+        "usage_limited": {
+          "description": "Provider availability is not pane activity. Carry the latest explicit\nblock separately so shared/mobile snapshots do not turn it into idle.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsageLimited"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "pane_id",
+        "kind",
+        "provider"
+      ]
+    },
     "MobilePlatform": {
       "type": "string",
       "enum": [
@@ -1110,6 +1174,13 @@
             "string",
             "null"
           ]
+        },
+        "panes": {
+          "description": "The panes in this session and whether each is working.\n\n`is_working` above answers \"is anything happening here\", which cannot\nanswer \"which agent is waiting for me\": a project with one busy pane\nreads as working, hiding every idle pane in it. Both are derived from\nthe same pane statuses, so they cannot disagree.\n\nDefaulted: an older server omits it, and a client must read that as \"no\npane detail\" rather than as a session with no panes.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MobilePaneSummary"
+          }
         },
         "project_id": {
           "description": "Stable project identity from `.apas`. Web UI groups by this.\nFalls back to `id` for legacy rows that pre-date the column.",
@@ -1514,29 +1585,6 @@
         "live_adoptable",
         "restart_required_on_cli_reboot",
         "structured_pane_may_resume"
-      ]
-    },
-    "PaneTodoPrMsg": {
-      "type": "object",
-      "properties": {
-        "annotation": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "pane_id": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
-        },
-        "url": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "pane_id",
-        "url"
       ]
     },
     "PaneType": {
@@ -2610,28 +2658,6 @@
           ]
         },
         {
-          "description": "One team scratchpad record forwarded from the CLI. Phase 2.2b.",
-          "type": "object",
-          "properties": {
-            "record": {
-              "$ref": "#/$defs/TeamScratchpadRecord"
-            },
-            "session_id": {
-              "type": "string",
-              "format": "uuid"
-            },
-            "type": {
-              "type": "string",
-              "const": "team_record"
-            }
-          },
-          "required": [
-            "type",
-            "session_id",
-            "record"
-          ]
-        },
-        {
           "description": "Plan-review request forwarded from CLI. Phase 3.2b2.",
           "type": "object",
           "properties": {
@@ -2747,28 +2773,6 @@
             "type",
             "session_id",
             "pane_id"
-          ]
-        },
-        {
-          "description": "Forwarded from `CliToServer::ProjectGoalChanged`. The web caches\nthis per-session and refreshes the Project goal textbox when the\nuser isn't actively editing.",
-          "type": "object",
-          "properties": {
-            "content": {
-              "type": "string"
-            },
-            "session_id": {
-              "type": "string",
-              "format": "uuid"
-            },
-            "type": {
-              "type": "string",
-              "const": "project_goal_changed"
-            }
-          },
-          "required": [
-            "type",
-            "session_id",
-            "content"
           ]
         },
         {
@@ -2897,53 +2901,6 @@
             "type",
             "session_id",
             "policy"
-          ]
-        },
-        {
-          "description": "Snapshot of the project's team-todo.md state. Sent in reply to\n`WebToServer::FetchTeamTodo` and after every CLI-side mutation\ntriggered by `WebToServer::TodoApproval`. See\n`docs/todo-driven-workflow.md`.",
-          "type": "object",
-          "properties": {
-            "session_id": {
-              "type": "string",
-              "format": "uuid"
-            },
-            "state": {
-              "$ref": "#/$defs/TeamTodoStateMsg"
-            },
-            "type": {
-              "type": "string",
-              "const": "team_todo_state"
-            }
-          },
-          "required": [
-            "type",
-            "session_id",
-            "state"
-          ]
-        },
-        {
-          "description": "Snapshot of the project's suggested-workers.md state. Sent in\nreply to `WebToServer::FetchSuggestedWorkers` and after every\nCLI-side mutation triggered by `WebToServer::DismissSuggestion`.",
-          "type": "object",
-          "properties": {
-            "session_id": {
-              "type": "string",
-              "format": "uuid"
-            },
-            "suggestions": {
-              "type": "array",
-              "items": {
-                "$ref": "#/$defs/SuggestedWorkerMsg"
-              }
-            },
-            "type": {
-              "type": "string",
-              "const": "suggested_workers_state"
-            }
-          },
-          "required": [
-            "type",
-            "session_id",
-            "suggestions"
           ]
         },
         {
@@ -3285,6 +3242,13 @@
             "null"
           ]
         },
+        "panes": {
+          "description": "The panes in this session and whether each is working.\n\n`is_working` above answers \"is anything happening here\", which cannot\nanswer \"which agent is waiting for me\": a project with one busy pane\nreads as working, hiding every idle pane in it. Both are derived from\nthe same pane statuses, so they cannot disagree.\n\nDefaulted: an older server omits it, and a client must read that as \"no\npane detail\" rather than as a session with no panes.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MobilePaneSummary"
+          }
+        },
         "project_id": {
           "description": "Stable project identity from `.apas`. Web UI groups by this.\nFalls back to `id` for legacy rows that pre-date the column.",
           "type": [
@@ -3338,221 +3302,6 @@
           "type": "string",
           "const": "ended"
         }
-      ]
-    },
-    "SuggestedWorkerMsg": {
-      "description": "One row in the suggested-workers queue. The Manager pane appends\nthese as `## SUG-NNN — label` sections to `suggested-workers.md`;\nthe Overview renders each as a card with Accept / Dismiss buttons.",
-      "type": "object",
-      "properties": {
-        "backstory": {
-          "type": "string"
-        },
-        "goal": {
-          "type": "string"
-        },
-        "id": {
-          "type": "string"
-        },
-        "label": {
-          "type": "string"
-        },
-        "needs_worktree": {
-          "type": "boolean",
-          "default": false
-        },
-        "role": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "id",
-        "label",
-        "role",
-        "goal",
-        "backstory"
-      ]
-    },
-    "TeamRoleSpec": {
-      "description": "Per-role provider/model pair the user picks in the \"Team setup\"\ncard before clicking Start team. Empty fields fall back to the\nCLI's defaults (Claude / unset model).",
-      "type": "object",
-      "properties": {
-        "model": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "provider": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Provider"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      }
-    },
-    "TeamScratchpadRecord": {
-      "description": "One published artifact in the team scratchpad (`.apas-team.jsonl`),\nmirroring the CLI's `crate::scratchpad::TeamRecord`. Separate type\nhere so the wire shape is stable across CLI/server/web even if the\nCLI's internal helper grows extra columns. Phase 2.2b.",
-      "type": "object",
-      "properties": {
-        "body": {
-          "type": "string"
-        },
-        "kind": {
-          "type": "string"
-        },
-        "pane_id": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0
-        },
-        "tags": {
-          "type": "array",
-          "default": [],
-          "items": {
-            "type": "string"
-          }
-        },
-        "ts": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "ts",
-        "kind",
-        "body"
-      ]
-    },
-    "TeamTodoGlobalMsg": {
-      "type": "object",
-      "properties": {
-        "body": {
-          "type": "string"
-        },
-        "id": {
-          "type": "string"
-        },
-        "origin": {
-          "description": "user | tech-lead",
-          "type": "string"
-        },
-        "prs": {
-          "description": "One PR per contributing worker. Empty until any worker's branch\nhas been pushed and PR'd.",
-          "type": "array",
-          "default": [],
-          "items": {
-            "$ref": "#/$defs/PaneTodoPrMsg"
-          }
-        },
-        "status": {
-          "description": "proposed | approved | in_progress | under_review | pr_open | done | rejected",
-          "type": "string"
-        },
-        "title": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "id",
-        "title",
-        "status",
-        "origin",
-        "body"
-      ]
-    },
-    "TeamTodoStateMsg": {
-      "description": "Wire format for a snapshot of `team-todo.md`. Mirrors the CLI's\n`team_todo::TeamTodo` but with status fields kept as strings so we\ndon't have to ship the enum definitions across crate / language\nboundaries. The web parses these into UI state.",
-      "type": "object",
-      "properties": {
-        "globals": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/TeamTodoGlobalMsg"
-          }
-        },
-        "reviewer_cursor": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "tech_lead_cursor": {
-          "description": "Per-agent scratchpad cursor (RFC3339 timestamp of the last\nrecord acted on). `None` means the cursor file is missing —\neither the agent hasn't iterated yet, or it was wiped.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "workers": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/TeamTodoWorkerMsg"
-          }
-        }
-      },
-      "required": [
-        "globals",
-        "workers"
-      ]
-    },
-    "TeamTodoSubtaskMsg": {
-      "type": "object",
-      "properties": {
-        "body": {
-          "type": "string"
-        },
-        "id": {
-          "type": "string"
-        },
-        "parent": {
-          "type": "string"
-        },
-        "status": {
-          "description": "pending | in_progress | done | reviewing | revising | approved",
-          "type": "string"
-        },
-        "title": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "id",
-        "title",
-        "status",
-        "parent",
-        "body"
-      ]
-    },
-    "TeamTodoWorkerMsg": {
-      "type": "object",
-      "properties": {
-        "pane_id": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
-        },
-        "role_hint": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "subtasks": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/TeamTodoSubtaskMsg"
-          }
-        }
-      },
-      "required": [
-        "pane_id",
-        "subtasks"
       ]
     },
     "TerminalLifecycle": {
@@ -3667,6 +3416,26 @@
         "utilization"
       ]
     },
+    "UsageLimited": {
+      "description": "A provider-confirmed usage limit that is currently preventing work.\n\nThis is deliberately separate from utilization: included usage may reach\n100% while paid extra usage remains available, in which case the provider\nis not blocking requests and this field stays absent.",
+      "type": "object",
+      "properties": {
+        "resets_at": {
+          "description": "When the provider expects work to become available again.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "window": {
+          "description": "Human-readable limiting window, such as \"weekly\" or \"5-hour\".",
+          "type": "string"
+        }
+      },
+      "required": [
+        "window"
+      ]
+    },
     "UsageLimits": {
       "description": "Usage limits from the provider API/logs",
       "type": "object",
@@ -3694,6 +3463,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/UsageLimitWindow"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "usage_limited": {
+          "description": "Present only when the provider says a usage limit is actively blocking\nrequests. A full utilization meter alone is not sufficient.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsageLimited"
             },
             {
               "type": "null"
@@ -4676,6 +4456,24 @@
           ]
         },
         {
+          "description": "Restart the daemon on one machine, applying an available update first.\n\nTargeted by machine rather than by a project on it: a daemon is\nper-machine, and a machine running nothing has no project to route\nthrough. Restarting a daemon does not disturb the projects, panes, or\nagents on that host — the daemon owns no long-lived children.",
+          "type": "object",
+          "properties": {
+            "machine_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "type": {
+              "type": "string",
+              "const": "reboot_daemon"
+            }
+          },
+          "required": [
+            "type",
+            "machine_id"
+          ]
+        },
+        {
           "description": "Create a brand-new project instance under a repo on a chosen machine:\nthe daemon clones `clone_url` into `~/apas_projects/<instance_name>`\n(auto-suffixed on collision), checks out a fresh `branch`, registers a\n`.apas`, and starts it. `git_remote` is the canonical key (for the\ndaemon's sibling-URL fallback + naming); `clone_url` is the real URL.",
           "type": "object",
           "properties": {
@@ -4927,30 +4725,6 @@
           ]
         },
         {
-          "description": "Manager v2 — overwrite the project_goal.md file at the project\nroot with `goal`. The deadloop manager re-reads this file on\nevery iteration so a goal change takes effect at the next loop\nboundary, not mid-iteration.",
-          "type": "object",
-          "properties": {
-            "goal": {
-              "type": "string"
-            },
-            "session_id": {
-              "type": [
-                "string",
-                "null"
-              ],
-              "format": "uuid"
-            },
-            "type": {
-              "type": "string",
-              "const": "update_project_goal"
-            }
-          },
-          "required": [
-            "type",
-            "goal"
-          ]
-        },
-        {
           "description": "Set Tech-Lead autonomy flags. CLI writes both into `.apas` and\nthen echoes `CliToServer::ProjectFlagsChanged` so peer web\nclients stay in sync.",
           "type": "object",
           "properties": {
@@ -5016,42 +4790,6 @@
             "type",
             "auto_approve_todos",
             "auto_merge_prs"
-          ]
-        },
-        {
-          "description": "Spawn the four default team panes for any role that isn't\nalready present. Triggered by the Overview \"Start team\" button.\nCLI runs `spawn_missing_team_panes`. Idempotent. Per-role\n`*_spec` fields carry the provider/model the user picked in\nthe Team setup card.",
-          "type": "object",
-          "properties": {
-            "developer": {
-              "$ref": "#/$defs/TeamRoleSpec",
-              "default": {}
-            },
-            "manager": {
-              "$ref": "#/$defs/TeamRoleSpec",
-              "default": {}
-            },
-            "reviewer": {
-              "$ref": "#/$defs/TeamRoleSpec",
-              "default": {}
-            },
-            "session_id": {
-              "type": [
-                "string",
-                "null"
-              ],
-              "format": "uuid"
-            },
-            "tech_lead": {
-              "$ref": "#/$defs/TeamRoleSpec",
-              "default": {}
-            },
-            "type": {
-              "type": "string",
-              "const": "start_team"
-            }
-          },
-          "required": [
-            "type"
           ]
         },
         {
@@ -5198,140 +4936,6 @@
             "type",
             "pane_id",
             "manual_mode"
-          ]
-        },
-        {
-          "description": "Ask the server to fetch the current `team-todo.md` for this\nsession's project. Forwarded as `ServerToCli::FetchTeamTodo`;\nCLI replies with `CliToServer::TeamTodoState` which the server\nhands back to web as `ServerToWeb::TeamTodoState`.",
-          "type": "object",
-          "properties": {
-            "session_id": {
-              "type": "string",
-              "format": "uuid"
-            },
-            "type": {
-              "type": "string",
-              "const": "fetch_team_todo"
-            }
-          },
-          "required": [
-            "type",
-            "session_id"
-          ]
-        },
-        {
-          "description": "User approves or rejects a Tech-Lead-proposed Global TODO from\nthe web Overview tab. action: \"approve\" | \"reject\".",
-          "type": "object",
-          "properties": {
-            "action": {
-              "type": "string"
-            },
-            "session_id": {
-              "type": "string",
-              "format": "uuid"
-            },
-            "todo_id": {
-              "type": "string"
-            },
-            "type": {
-              "type": "string",
-              "const": "todo_approval"
-            }
-          },
-          "required": [
-            "type",
-            "session_id",
-            "todo_id",
-            "action"
-          ]
-        },
-        {
-          "description": "User adds a new Global TODO from the Overview's + Add TODO\nform. CLI assigns the next id (TODO-NNN), writes status=approved,\norigin=user, then publishes a fresh TeamTodoState.",
-          "type": "object",
-          "properties": {
-            "body": {
-              "type": "string",
-              "default": ""
-            },
-            "session_id": {
-              "type": "string",
-              "format": "uuid"
-            },
-            "title": {
-              "type": "string"
-            },
-            "type": {
-              "type": "string",
-              "const": "add_todo"
-            }
-          },
-          "required": [
-            "type",
-            "session_id",
-            "title"
-          ]
-        },
-        {
-          "description": "Web requests a fresh snapshot of `suggested-workers.md`.\nForwarded as `ServerToCli::FetchSuggestedWorkers`; CLI replies\nwith `CliToServer::SuggestedWorkersState` which the server hands\nback to web as `ServerToWeb::SuggestedWorkersState`.",
-          "type": "object",
-          "properties": {
-            "session_id": {
-              "type": "string",
-              "format": "uuid"
-            },
-            "type": {
-              "type": "string",
-              "const": "fetch_suggested_workers"
-            }
-          },
-          "required": [
-            "type",
-            "session_id"
-          ]
-        },
-        {
-          "description": "User dismissed a suggested worker. Forwarded as\n`ServerToCli::DismissSuggestion`; CLI removes the entry and\nrepublishes the state.",
-          "type": "object",
-          "properties": {
-            "session_id": {
-              "type": "string",
-              "format": "uuid"
-            },
-            "suggestion_id": {
-              "type": "string"
-            },
-            "type": {
-              "type": "string",
-              "const": "dismiss_suggestion"
-            }
-          },
-          "required": [
-            "type",
-            "session_id",
-            "suggestion_id"
-          ]
-        },
-        {
-          "description": "One-way promote: flip an unmanaged side-chat pane to a managed\nteam member. CLI sets PaneMeta.managed = true and re-broadcasts\nthe PaneList. There's no demote — keep it simple.",
-          "type": "object",
-          "properties": {
-            "pane_id": {
-              "type": "integer",
-              "format": "uint32",
-              "minimum": 0
-            },
-            "session_id": {
-              "type": "string",
-              "format": "uuid"
-            },
-            "type": {
-              "type": "string",
-              "const": "promote_pane_to_managed"
-            }
-          },
-          "required": [
-            "type",
-            "session_id",
-            "pane_id"
           ]
         },
         {

@@ -64,6 +64,13 @@ function seedStore(overrides: Record<string, unknown> = {}) {
   const refreshPaneWorkSummary = vi.fn(() => true);
   const removePane = vi.fn();
   const rebootPane = vi.fn();
+  const updatePaneLabel = vi.fn((paneId: number, label: string) => {
+    useStore.setState((state) => ({
+      paneConfigs: state.paneConfigs.map((candidate) =>
+        candidate.pane_id === paneId ? { ...candidate, label } : candidate,
+      ),
+    }));
+  });
   const startMachineProjectCli = vi.fn();
 
   act(() => {
@@ -113,6 +120,7 @@ function seedStore(overrides: Record<string, unknown> = {}) {
       refreshPaneWorkSummary,
       removePane,
       rebootPane,
+      updatePaneLabel,
       startMachineProjectCli,
       ...overrides,
     });
@@ -136,6 +144,7 @@ function seedStore(overrides: Record<string, unknown> = {}) {
     sendTerminalConversationMessage,
     sendTerminalInput,
     startMachineProjectCli,
+    updatePaneLabel,
   };
 }
 
@@ -187,6 +196,17 @@ describe("MobileSessionActivity", () => {
 
     expect(screen.getByRole("status").textContent).toBe("Editing src/session.ts…");
     expect(screen.getByRole("button", { name: "Codex 3 · working" })).toBeTruthy();
+  });
+
+  it("shows a pending answer without a working spinner", () => {
+    seedStore({ paneStatuses: { "3": "Pending answer" } });
+    renderActivity();
+
+    const status = screen.getByRole("status");
+    expect(status.textContent).toBe("Pending answer");
+    expect(status.querySelector(".animate-spin")).toBeNull();
+    expect(screen.getByRole("button", { name: "Codex 3 · pending answer" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Codex 3 · working" })).toBeNull();
   });
 
   it("opens a new conversation at the newest activity", () => {
@@ -404,6 +424,121 @@ describe("MobileSessionActivity", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send Arrow Down" }));
     expect(actions.sendTerminalInput).toHaveBeenCalledWith(9, "\x1b[B");
     expect(screen.queryByRole("region", { name: "Mobile session activity" })).toBeNull();
+  });
+
+  it("renames the selected conversation with a trimmed label and closes the editor", async () => {
+    const actions = seedStore({
+      paneConfigs: [
+        pane({ pane_id: 3, label: "Implementer" }),
+        pane({ pane_id: 4, label: "Reviewer" }),
+      ],
+    });
+    renderActivity();
+
+    fireEvent.click(screen.getByRole("button", { name: "Reviewer" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Reviewer" }).getAttribute("aria-pressed")).toBe("true"));
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Rename conversation" }));
+
+    const input = screen.getByLabelText("Conversation name") as HTMLInputElement;
+    expect(input.value).toBe("Reviewer");
+    expect(document.activeElement).toBe(input);
+    fireEvent.change(input, { target: { value: "  Release reviewer  " } });
+    fireEvent.click(screen.getByRole("button", { name: "Save conversation name" }));
+
+    expect(actions.updatePaneLabel).toHaveBeenCalledWith(4, "Release reviewer");
+    expect(screen.queryByRole("dialog", { name: /Rename Reviewer/ })).toBeNull();
+    expect(screen.getByRole("button", { name: "Release reviewer" })).toBeTruthy();
+  });
+
+  it("cancels and backdrop-dismisses renames without changing the pane", () => {
+    const actions = seedStore({ paneConfigs: [pane({ pane_id: 3, label: "Implementer" })] });
+    renderActivity();
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Rename conversation" }));
+    fireEvent.change(screen.getByLabelText("Conversation name"), { target: { value: "Discard me" } });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(actions.updatePaneLabel).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Rename conversation" }));
+    const dialog = screen.getByRole("dialog", { name: "Rename Implementer" });
+    fireEvent.change(screen.getByLabelText("Conversation name"), { target: { value: "Discard this too" } });
+    fireEvent.click(dialog.parentElement!);
+
+    expect(actions.updatePaneLabel).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "Rename Implementer" })).toBeNull();
+  });
+
+  it("rejects an empty conversation name", () => {
+    const actions = seedStore({ paneConfigs: [pane({ pane_id: 3, label: "Implementer" })] });
+    renderActivity();
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Rename conversation" }));
+    fireEvent.change(screen.getByLabelText("Conversation name"), { target: { value: "   " } });
+    const save = screen.getByRole("button", { name: "Save conversation name" });
+
+    expect(save).toHaveProperty("disabled", true);
+    fireEvent.click(save);
+    expect(actions.updatePaneLabel).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "Rename Implementer" })).toBeTruthy();
+  });
+
+  it("disables rename without connectivity, a running project, or a selected pane", () => {
+    seedStore();
+    renderActivity({ connected: false });
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    expect(screen.getByRole("button", { name: "Rename conversation" })).toHaveProperty("disabled", true);
+
+    cleanup();
+    seedStore({
+      sessions: [{
+        id: "session-a",
+        projectId: "project-a",
+        workingDir: "/workspace/alpha",
+        hostname: "builder",
+        status: "offline",
+        isActive: false,
+      }],
+      isAttached: false,
+    });
+    renderActivity();
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    expect(screen.getByRole("button", { name: "Rename conversation" })).toHaveProperty("disabled", true);
+
+    cleanup();
+    seedStore({ paneConfigs: [], paneMessages: {} });
+    renderActivity();
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    expect(screen.getByRole("button", { name: "Rename conversation" })).toHaveProperty("disabled", true);
+  });
+
+  it("keeps the captured rename target and dismisses if that pane disappears", async () => {
+    const actions = seedStore({
+      paneConfigs: [
+        pane({ pane_id: 3, label: "Implementer" }),
+        pane({ pane_id: 4, label: "Reviewer" }),
+      ],
+    });
+    renderActivity();
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Rename conversation" }));
+    // Programmatically changing the selection behind the modal must not
+    // retarget the edit that already names Implementer.
+    fireEvent.click(screen.getByRole("button", { name: "Reviewer" }));
+    fireEvent.change(screen.getByLabelText("Conversation name"), { target: { value: "Primary implementer" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save conversation name" }));
+    expect(actions.updatePaneLabel).toHaveBeenCalledWith(3, "Primary implementer");
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Rename conversation" }));
+    act(() => useStore.setState({ paneConfigs: [pane({ pane_id: 3, label: "Primary implementer" })] }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Rename Reviewer" })).toBeNull());
+    expect(actions.updatePaneLabel).toHaveBeenCalledTimes(1);
   });
 
   it("disables raw-terminal keys while the mobile transport is disconnected", async () => {

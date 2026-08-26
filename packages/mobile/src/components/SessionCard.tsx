@@ -3,15 +3,21 @@ import type { MobileSessionSummary } from "@apas/protocol";
 
 import { StatusBadge } from "@/components/ui";
 import { useTheme } from "@/design/tokens";
+import { paneStatusIsPendingAnswer, paneStatusIsWorking } from "@/state/paneStatus";
 
-export type MobileSessionActivityStatus = "working" | "idle" | "offline";
+export type MobileSessionActivityStatus = "pending" | "working" | "idle" | "offline";
 
 export function sessionActivityStatus(
   session: MobileSessionSummary,
   paneStatuses?: Record<string, string>,
 ): MobileSessionActivityStatus {
   if (!session.is_active) return "offline";
-  if (Object.values(paneStatuses ?? {}).some(Boolean) || session.is_working) return "working";
+  const liveStatuses = Object.values(paneStatuses ?? {});
+  if (
+    liveStatuses.some(paneStatusIsPendingAnswer)
+    || session.panes?.some((pane) => pane.awaiting_answer)
+  ) return "pending";
+  if (liveStatuses.some(paneStatusIsWorking) || session.is_working) return "working";
   return "idle";
 }
 
@@ -26,7 +32,16 @@ export function SessionCard({
 }) {
   const theme = useTheme();
   const activity = sessionActivityStatus(session, paneStatuses);
-  const tone = activity === "working" ? "success" : activity === "idle" ? "neutral" : "danger";
+  const tone = activity === "working"
+    ? "success"
+    : activity === "pending"
+      ? "warning"
+      : activity === "idle"
+        ? "neutral"
+        : "danger";
+  const label = activity === "pending"
+    ? "Pending answer"
+    : activity[0].toUpperCase() + activity.slice(1);
   return (
     <Pressable
       accessibilityRole="button"
@@ -36,7 +51,7 @@ export function SessionCard({
     >
       <View style={styles.row}>
         <Text numberOfLines={1} style={[styles.title, { color: theme.text }]}>{session.project_name ?? "Coding session"}</Text>
-        <StatusBadge label={activity[0].toUpperCase() + activity.slice(1)} tone={tone} />
+        <StatusBadge label={label} tone={tone} />
       </View>
       <Text numberOfLines={1} style={{ color: theme.textMuted }}>{session.hostname ?? session.working_dir ?? "Unknown target"}</Text>
       {session.latest_summary ? <Text numberOfLines={2} style={[styles.summary, { color: theme.text }]}>{session.latest_summary}</Text> : null}

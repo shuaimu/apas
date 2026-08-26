@@ -316,7 +316,11 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert_eq!(attachments.count(), 2, "both are attached, neither is a copy");
+        assert_eq!(
+            attachments.count(),
+            2,
+            "both are attached, neither is a copy"
+        );
 
         attachments.broadcast(&WorkerToController::Command(TuiCommand::RemoveTab {
             pane_id: 7,

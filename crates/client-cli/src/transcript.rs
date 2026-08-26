@@ -896,7 +896,10 @@ mod tests {
         let other = claude_projects_dir(home.path(), "/elsewhere");
         std::fs::write(other.join(format!("{session}.jsonl")), "{}").unwrap();
 
-        assert_eq!(locate_claude_transcript(home.path(), cwd, session), expected);
+        assert_eq!(
+            locate_claude_transcript(home.path(), cwd, session),
+            expected
+        );
     }
 
     #[test]
@@ -1246,8 +1249,7 @@ mod tests {
 
         assert!(!codex_user_session_exists(home.path(), subagent));
 
-        let modern_subagent =
-            Uuid::parse_str("bbbbbbbb-cccc-4ddd-8eee-ffffffffffff").unwrap();
+        let modern_subagent = Uuid::parse_str("bbbbbbbb-cccc-4ddd-8eee-ffffffffffff").unwrap();
         std::fs::write(
             sessions.join("rollout-modern-subagent.jsonl"),
             format!(
@@ -1353,7 +1355,10 @@ mod tests {
         .unwrap();
         let second = find_codex_rollout(home.path(), Path::new("/repo"));
 
-        assert_eq!(first, second, "selection flapped after a sibling was written");
+        assert_eq!(
+            first, second,
+            "selection flapped after a sibling was written"
+        );
         assert_eq!(
             first
                 .as_ref()
@@ -1416,11 +1421,9 @@ mod tests {
         // open too, so process ownership alone is not sufficient.
         let modern_subagent =
             std::fs::File::open(sessions.join("rollout-owned-modern-subagent.jsonl")).unwrap();
-        let found = find_codex_rollout_for_process_group(
-            home.path(),
-            Path::new("/repo"),
-            unsafe { libc::getpgrp() },
-        );
+        let found = find_codex_rollout_for_process_group(home.path(), Path::new("/repo"), unsafe {
+            libc::getpgrp()
+        });
         drop(owned);
         drop(modern_subagent);
 
@@ -1475,26 +1478,17 @@ mod tests {
         assert!(!pinned.exists(), "the pane has not had a turn yet");
 
         assert!(
-            find_claude_switch_candidate(
-            &pinned,
-                pane_started,
-                &HashSet::new(),
-            )
-            .is_none(),
+            find_claude_switch_candidate(&pinned, pane_started, &HashSet::new(),).is_none(),
             "a pane must not adopt a conversation that predates it"
         );
 
         // A genuine in-TUI switch after the pane started is still followed.
         write_session(&dir, "switched-to.jsonl");
         assert_eq!(
-            find_claude_switch_candidate(
-            &pinned,
-                pane_started,
-                &HashSet::new(),
-            )
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str()),
+            find_claude_switch_candidate(&pinned, pane_started, &HashSet::new(),)
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
             Some("switched-to.jsonl"),
         );
     }
@@ -1506,23 +1500,19 @@ mod tests {
         write_session(&dir, "stale-unpinned.jsonl");
         write_session(&dir, "pinned.jsonl");
         let pinned = dir.join("pinned.jsonl");
-        let last_growth = std::fs::metadata(&pinned)
-            .unwrap()
-            .modified()
-            .unwrap();
+        let last_growth = std::fs::metadata(&pinned).unwrap().modified().unwrap();
         // Another pane's pinned session: newer, but excluded.
         write_session(&dir, "other-pane.jsonl");
         write_session(&dir, "switch.jsonl");
         write_session(&dir, "newest.jsonl");
 
         let excluded: HashSet<String> = ["other-pane".to_string()].into_iter().collect();
-        let found = find_claude_switch_candidate(
-            &pinned,
-            last_growth,
-            &excluded,
-        );
+        let found = find_claude_switch_candidate(&pinned, last_growth, &excluded);
         assert_eq!(
-            found.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()),
+            found
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
             Some("newest.jsonl"),
             "the newest unpinned session wins; other panes' pins are ignored"
         );
@@ -1534,20 +1524,12 @@ mod tests {
         let dir = claude_projects_dir(home.path(), "/wanted");
         write_session(&dir, "pinned.jsonl");
         let pinned = dir.join("pinned.jsonl");
-        let last_growth = std::fs::metadata(&pinned)
-            .unwrap()
-            .modified()
-            .unwrap();
+        let last_growth = std::fs::metadata(&pinned).unwrap().modified().unwrap();
         // Excluded ids stay excluded even when newer.
         write_session(&dir, "other-pane.jsonl");
 
         let excluded: HashSet<String> = ["other-pane".to_string()].into_iter().collect();
-        assert!(find_claude_switch_candidate(
-            &pinned,
-            last_growth,
-            &excluded,
-        )
-        .is_none());
+        assert!(find_claude_switch_candidate(&pinned, last_growth, &excluded,).is_none());
     }
 
     #[test]
@@ -1557,23 +1539,19 @@ mod tests {
         write_session(&dir, "pinned.jsonl");
         write_session(&dir, "switched-away.jsonl");
         let current = dir.join("switched-away.jsonl");
-        let last_growth = std::fs::metadata(&current)
-            .unwrap()
-            .modified()
-            .unwrap();
+        let last_growth = std::fs::metadata(&current).unwrap().modified().unwrap();
         // The user resumes the pinned session again after the switch.
         write_session(&dir, "pinned.jsonl");
 
         // Only OTHER panes' pins are excluded; the pane's own pinned file is
         // eligible, so the switch back is followed.
         let excluded: HashSet<String> = ["other-pane".to_string()].into_iter().collect();
-        let found = find_claude_switch_candidate(
-            &current,
-            last_growth,
-            &excluded,
-        );
+        let found = find_claude_switch_candidate(&current, last_growth, &excluded);
         assert_eq!(
-            found.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()),
+            found
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
             Some("pinned.jsonl")
         );
     }
@@ -1584,16 +1562,8 @@ mod tests {
         let dir = claude_projects_dir(home.path(), "/wanted");
         write_session(&dir, "pinned.jsonl");
         let pinned = dir.join("pinned.jsonl");
-        let last_growth = std::fs::metadata(&pinned)
-            .unwrap()
-            .modified()
-            .unwrap();
+        let last_growth = std::fs::metadata(&pinned).unwrap().modified().unwrap();
         let excluded: HashSet<String> = HashSet::new();
-        assert!(find_claude_switch_candidate(
-            &pinned,
-            last_growth,
-            &excluded,
-        )
-        .is_none());
+        assert!(find_claude_switch_candidate(&pinned, last_growth, &excluded,).is_none());
     }
 }

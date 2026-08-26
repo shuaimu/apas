@@ -206,7 +206,6 @@ impl App {
         }
     }
 
-
     /// Set the working directory shown in the header. Called from the
     /// dual_pane setup where the resolved `working_dir` is in scope.
     pub fn with_project_dir(mut self, dir: impl Into<String>) -> Self {

@@ -206,9 +206,22 @@ describe("mobile code screens", () => {
     expect(sessionList?.props.data.map((item: MobileSessionSummary) => item.id)).toEqual([newer.id, older.id]);
   });
 
-  it("uses only working, idle, and offline session badges", () => {
+  it("uses pending answer, working, idle, and offline session badges", () => {
     useMobileStore.setState({
       sessions: [
+        {
+          ...session,
+          id: "pending",
+          project_name: "pending",
+          is_working: false,
+          panes: [{
+            pane_id: 3,
+            kind: "agent",
+            provider: "claude",
+            is_working: false,
+            awaiting_answer: true,
+          }],
+        },
         { ...session, id: "working", project_name: "working", is_working: true },
         { ...session, id: "idle", project_name: "idle", is_working: false },
         { ...session, id: "offline", project_name: "offline", is_active: false, is_working: false },
@@ -217,12 +230,25 @@ describe("mobile code screens", () => {
     });
     const view = render(<CodeHomeScreen />);
 
+    expect(view.getByText("Pending answer")).toBeTruthy();
     expect(view.getByText("Working")).toBeTruthy();
     expect(view.getByText("Idle")).toBeTruthy();
     expect(view.getByText("Offline")).toBeTruthy();
-    for (const name of ["working", "idle", "offline"]) {
+    for (const name of ["pending", "working", "idle", "offline"]) {
       expect(view.getByLabelText(`Open ${name}`).findAllByProps({ children: "Active" })).toHaveLength(0);
     }
+  });
+
+  it("keeps pending-answer sessions in the idle-project list", () => {
+    useMobileStore.setState({
+      sessions: [{ ...session, project_name: "needs-answer", is_working: false }],
+      paneStatusesBySession: { [session.id]: { "3": "Pending answer" } },
+    });
+    const view = render(<CodeHomeScreen />);
+
+    fireEvent.press(view.getByText("Idle projects"));
+    expect(view.getByLabelText("Open needs-answer")).toBeTruthy();
+    expect(view.getByText("Pending answer")).toBeTruthy();
   });
 
   it("updates user-message recency from the acknowledged instruction event", () => {

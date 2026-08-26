@@ -15,6 +15,11 @@ import {
   DEEPSEEK_DEFAULT_MODEL,
   isRetiredProviderModel,
 } from "./providerOptions";
+import {
+  PANE_STATUS_PENDING_ANSWER,
+  paneIsAwaitingAnswerStatus,
+  paneIsWorkingStatus,
+} from "./paneStatus";
 
 // UUID generator with fallback for environments without crypto.randomUUID
 function generateId(): string {
@@ -118,6 +123,7 @@ export interface SessionPaneSummary {
   provider: string;
   model?: string | null;
   is_working?: boolean;
+  awaiting_answer?: boolean;
   idle_since?: string | null;
   usage_limited?: UsageLimitedStatus & { resets_at?: string };
 }
@@ -4233,6 +4239,8 @@ export function handleServerMessage(
       const paneType = data.pane_type as string | undefined;
       const paneId = normalizePaneId(paneType, data.pane_id as number | undefined);
       const status = data.status as string | null;
+      const awaitingAnswer = paneIsAwaitingAnswerStatus(status);
+      const isWorking = paneIsWorkingStatus(status);
       const modeHint = normalizePaneModeHint(paneType);
       const observedAt = new Date().toISOString();
 
@@ -4241,7 +4249,7 @@ export function handleServerMessage(
           set((state) => {
             const workingPanesBySession = new Map(state.workingPanesBySession);
             const workingPanes = new Set(workingPanesBySession.get(msgSessionId) ?? []);
-            if (status) workingPanes.add(paneId);
+            if (isWorking) workingPanes.add(paneId);
             else workingPanes.delete(paneId);
             if (workingPanes.size > 0) workingPanesBySession.set(msgSessionId, workingPanes);
             else workingPanesBySession.delete(msgSessionId);
@@ -4255,7 +4263,8 @@ export function handleServerMessage(
                       if (pane.pane_id !== paneId) return pane;
                       return {
                         ...pane,
-                        is_working: Boolean(status),
+                        is_working: isWorking,
+                        awaiting_answer: awaitingAnswer,
                         idle_since: status
                           ? undefined
                           : pane.is_working || !pane.idle_since
@@ -4414,7 +4423,20 @@ export function handleServerMessage(
       set((state) => {
         const workingPanesBySession = new Map(state.workingPanesBySession);
         for (const session of parsedSessions) {
-          if (!session.isWorking) workingPanesBySession.delete(session.id);
+          if (session.panes) {
+            const workingPaneIds = new Set(
+              session.panes
+                .filter((pane) => pane.is_working === true)
+                .map((pane) => pane.pane_id),
+            );
+            if (workingPaneIds.size > 0) {
+              workingPanesBySession.set(session.id, workingPaneIds);
+            } else {
+              workingPanesBySession.delete(session.id);
+            }
+          } else if (!session.isWorking) {
+            workingPanesBySession.delete(session.id);
+          }
         }
         const allowedSessionIds = new Set(parsedSessions.map((session) => session.id));
         for (const sessionId of workingPanesBySession.keys()) {
@@ -4424,23 +4446,22 @@ export function handleServerMessage(
         if (state.sessionId) {
           const activeClient = state.cliClients.find((c) => c.activeSession === state.sessionId);
           const currentSession = parsedSessions.find((s) => s.id === state.sessionId);
-          if (currentSession?.isWorking === false) {
+          if (currentSession?.panes) {
+            const paneStatuses = { ...state.paneStatuses };
+            for (const pane of currentSession.panes) {
+              if (pane.awaiting_answer) {
+                paneStatuses[paneKey(pane.pane_id)] = PANE_STATUS_PENDING_ANSWER;
+              } else if (pane.is_working === false) {
+                delete paneStatuses[paneKey(pane.pane_id)];
+              }
+            }
+            next.paneStatuses = paneStatuses;
+          } else if (currentSession?.isWorking === false) {
             // The list snapshot and pane pills describe the same server-side
             // status cache. Heal a missed idle-clear frame instead of letting
             // the authoritative list say Idle while the conversation keeps a
             // stale Working pill.
             next.paneStatuses = {};
-          } else if (currentSession?.panes) {
-            const idlePaneIds = new Set(
-              currentSession.panes
-                .filter((pane) => pane.is_working === false)
-                .map((pane) => pane.pane_id),
-            );
-            if (idlePaneIds.size > 0) {
-              const paneStatuses = { ...state.paneStatuses };
-              for (const paneId of idlePaneIds) delete paneStatuses[paneKey(paneId)];
-              next.paneStatuses = paneStatuses;
-            }
           }
           if (currentSession?.isActive != null) {
             // Keep attachment status aligned with server truth for this session.

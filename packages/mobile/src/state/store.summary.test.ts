@@ -86,6 +86,10 @@ describe("native pane work summary state", () => {
     useMobileStore.getState().setPaneStatus(sessionId, 3, "Working…");
     expect(useMobileStore.getState().sessions[0]).toMatchObject({ is_active: true, is_working: true });
 
+    useMobileStore.getState().setPaneStatus(sessionId, 3, "Pending answer");
+    expect(useMobileStore.getState().sessions[0]).toMatchObject({ is_active: true, is_working: false });
+    expect(useMobileStore.getState().paneStatusesBySession[sessionId]).toEqual({ "3": "Pending answer" });
+
     useMobileStore.getState().setPaneStatus(sessionId, 3, null);
     expect(useMobileStore.getState().sessions[0]).toMatchObject({ is_active: true, is_working: false });
 

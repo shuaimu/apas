@@ -875,6 +875,15 @@ its `tool_use` has no `tool_result` — which is what makes a blind write safe:
 a stale tab, a retransmit, or a question already answered in the terminal all
 send nothing.
 
+**A pane blocked on that question is Pending answer, not Working or Idle.**
+The server caches one canonical pane status when `AskUserQuestion` arrives and
+reports it separately in pane/session summaries, so project lists, waiting-agent
+lists, pane selectors and conversation status bars all agree. Pending answer
+does not advance idle recency and takes presentation precedence over a cached
+provider usage limit: it names the action the human can take now. Merely routing
+answer bytes does not clear it; the matching transcript `tool_result` is the
+proof that moves the pane back to Working until the resumed turn completes.
+
 **The conversation view is writable, and that is the point on mobile.** An
 xterm TUI on a phone is close to unusable — no modifier keys, tiny hit targets,
 scrolling that fights the page — so the conversation view plus its text box is

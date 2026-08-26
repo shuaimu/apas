@@ -22,6 +22,15 @@ pub const CLI_LIFECYCLE_CAPABILITY: &str = "cli_lifecycle_v1";
 /// project controller process and adopt them after a reboot.
 pub const PERSISTENT_TERMINAL_HOST_CAPABILITY: &str = "persistent_terminal_host_v1";
 pub const PANE_HOST_CLEANUP_ACK_CAPABILITY: &str = "pane_host_cleanup_ack_v1";
+/// Canonical non-working pane status used while an agent is blocked on a
+/// question only the human can answer. Keep the wire value stable: older web
+/// clients safely render it as an ordinary non-empty status, while newer ones
+/// classify it separately from active work.
+pub const PANE_STATUS_PENDING_ANSWER: &str = "Pending answer";
+
+pub fn pane_status_is_working(status: &str) -> bool {
+    status != PANE_STATUS_PENDING_ANSWER
+}
 
 fn default_true() -> bool {
     true
@@ -317,7 +326,6 @@ pub enum CliToServer {
         limits: UsageLimits,
     },
 
-
     /// Phase 3.2b2: CLI requests user approval for a held tool_use.
     /// Fired when the pane's `plan_review_mode` says "hold this tool"
     /// per `crate::plan_review::should_hold_tool`. The web UI shows
@@ -369,7 +377,6 @@ pub enum CliToServer {
         error: Option<String>,
     },
 
-
     /// Tech-Lead autonomy flags. `auto_approve_todos` lets the Tech
     /// Lead flip Global TODOs from `proposed` → `approved` without a
     /// human click. `auto_merge_prs` lets it `gh pr merge` (or close
@@ -405,8 +412,6 @@ pub enum CliToServer {
         #[serde(default)]
         disallowed_tab_types: Vec<String>,
     },
-
-
 
     /// Raw pty bytes from a [`PaneKind::Terminal`] pane.
     ///
@@ -530,12 +535,6 @@ pub enum ServerToCli {
 
     /// Heartbeat response
     Heartbeat,
-
-
-
-
-
-
 
     /// Pause the deadloop (legacy - use PausePane for new code)
     PauseDeadloop { session_id: Uuid },
@@ -681,7 +680,6 @@ pub enum ServerToCli {
     /// `CliToServer::PrCreated`.
     CreatePr { session_id: Uuid, pane_id: u32 },
 
-
     /// Toggle the Tech-Lead autonomy flags. Persisted into `.apas` so
     /// they survive a CLI reboot; the Tech Lead re-reads `.apas` each
     /// iteration and unlocks the matching capability when the flag is
@@ -717,7 +715,6 @@ pub enum ServerToCli {
         session_id: Uuid,
         policy: EffectiveProjectPolicy,
     },
-
 
     /// Set role/goal/backstory on the named pane and persist to .apas.
     /// Phase 2.1c.
@@ -1382,7 +1379,6 @@ pub enum WebToServer {
         pane_id: u32,
     },
 
-
     /// Set Tech-Lead autonomy flags. CLI writes both into `.apas` and
     /// then echoes `CliToServer::ProjectFlagsChanged` so peer web
     /// clients stay in sync.
@@ -1411,7 +1407,6 @@ pub enum WebToServer {
         auto_approve_todos: bool,
         auto_merge_prs: bool,
     },
-
 
     /// Update a pane's role/goal/backstory triple (Phase 2.1c). All three
     /// fields are optional — sending null for any of them clears that
@@ -1462,12 +1457,6 @@ pub enum WebToServer {
         pane_id: u32,
         manual_mode: bool,
     },
-
-
-
-
-
-
 
     /// Keystrokes typed into a terminal pane's xterm.js view. Server
     /// resolves the target session and forwards as
@@ -1748,7 +1737,6 @@ pub enum ServerToWeb {
         limits: UsageLimits,
     },
 
-
     /// Plan-review request forwarded from CLI. Phase 3.2b2.
     PlanReviewRequest {
         session_id: Uuid,
@@ -1783,7 +1771,6 @@ pub enum ServerToWeb {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
-
 
     /// Per-project and per-pane usage stats (prompt/token/cost counts) for
     /// the Overview. Pushed after each turn is recorded and replayed on
@@ -1833,8 +1820,6 @@ pub enum ServerToWeb {
         #[serde(default)]
         noncompliant_pane_ids: Vec<u32>,
     },
-
-
 
     /// Live pty bytes for a terminal pane, fanned out to every web
     /// client attached to the session.
@@ -2063,6 +2048,11 @@ pub struct MobilePaneSummary {
     /// session-level flag is derived from.
     #[serde(default)]
     pub is_working: bool,
+    /// True while this pane is blocked on an unresolved agent question. This
+    /// is neither active work nor idle time and takes presentation precedence
+    /// over provider availability.
+    #[serde(default)]
+    pub awaiting_answer: bool,
     /// Most recent working-to-idle transition observed by the server. Older
     /// servers omit it; clients keep those panes visible after timestamped ones.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4245,7 +4235,7 @@ mod tests {
         }"#;
         match serde_json::from_str::<CliToServer>(json).unwrap() {
             CliToServer::CliLifecycleInventory { inventory, .. } => {
-                        assert!(!inventory.persistent_terminal_hosting);
+                assert!(!inventory.persistent_terminal_hosting);
                 assert!(inventory.panes.is_empty());
             }
             other => panic!("unexpected variant: {other:?}"),
@@ -4497,11 +4487,19 @@ mod tests {
     #[test]
     fn deepseek_terminal_profiles_derive_and_authorize_independently() {
         assert_eq!(
-            launch_profile_key(PaneKind::Terminal, Provider::Claude, Some(DEEPSEEK_PRO_MODEL)),
+            launch_profile_key(
+                PaneKind::Terminal,
+                Provider::Claude,
+                Some(DEEPSEEK_PRO_MODEL)
+            ),
             "terminal:claude:deepseek:deepseek-v4-pro"
         );
         assert_eq!(
-            launch_profile_key(PaneKind::Terminal, Provider::Claude, Some(DEEPSEEK_FLASH_MODEL)),
+            launch_profile_key(
+                PaneKind::Terminal,
+                Provider::Claude,
+                Some(DEEPSEEK_FLASH_MODEL)
+            ),
             "terminal:claude:deepseek:deepseek-v4-flash"
         );
 
@@ -4515,8 +4513,16 @@ mod tests {
             project_suspended: false,
         };
         assert!(policy.allows(PaneKind::Terminal, Provider::Claude, None));
-        assert!(policy.allows(PaneKind::Terminal, Provider::Claude, Some(DEEPSEEK_PRO_MODEL)));
-        assert!(!policy.allows(PaneKind::Terminal, Provider::Claude, Some(DEEPSEEK_FLASH_MODEL)));
+        assert!(policy.allows(
+            PaneKind::Terminal,
+            Provider::Claude,
+            Some(DEEPSEEK_PRO_MODEL)
+        ));
+        assert!(!policy.allows(
+            PaneKind::Terminal,
+            Provider::Claude,
+            Some(DEEPSEEK_FLASH_MODEL)
+        ));
         assert!(!policy.allows(PaneKind::Agent, Provider::Claude, Some(DEEPSEEK_PRO_MODEL)));
     }
 }

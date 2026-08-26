@@ -442,6 +442,49 @@ describe("MobileCodeHome", () => {
     expect(idleRow.compareDocumentPosition(limitedRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
+  it("shows pending answers ahead of idle and usage-limited panes", async () => {
+    stubBootstrap({
+      sessions: [{
+        id: "session-a",
+        cli_client_id: "cli-a",
+        project_name: "mako-cloud",
+        hostname: "zoo-005",
+        status: "active",
+        is_active: true,
+        is_working: false,
+        attention_count: 1,
+        panes: [
+          { pane_id: 305, label: "Claude 3", kind: "terminal", provider: "claude", is_working: false, awaiting_answer: true },
+          { pane_id: 306, label: "Idle helper", kind: "terminal", provider: "codex", is_working: false },
+          { pane_id: 307, label: "Limited helper", kind: "terminal", provider: "claude", is_working: false },
+        ],
+      }],
+      machines: [],
+    });
+    renderHome({
+      active: true,
+      legacySessions: [],
+      usageLimits: new Map([["cli-a", {
+        claude: {
+          sevenDay: { utilization: 1 },
+          usageLimited: { window: "weekly", resetsAt: "2099-08-23T13:00:00Z" },
+        },
+      }]]),
+    });
+
+    const projectRow = await screen.findByRole("button", { name: "Open mako-cloud" });
+    expect(projectRow.textContent).toContain("Pending answer");
+    expect(projectRow.textContent).not.toContain("Working");
+
+    fireEvent.click(screen.getByRole("button", { name: "Idle sessions" }));
+    const pending = screen.getByRole("button", { name: "Open Claude 3 in mako-cloud" });
+    const idle = screen.getByRole("button", { name: "Open Idle helper in mako-cloud" });
+    const limited = screen.getByRole("button", { name: "Open Limited helper in mako-cloud" });
+    expect(pending.textContent).toContain("Pending answer");
+    expect(pending.compareDocumentPosition(idle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(idle.compareDocumentPosition(limited) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it("remembers the tapped agent so the session opens on it", async () => {
     stubBootstrap({
       sessions: [

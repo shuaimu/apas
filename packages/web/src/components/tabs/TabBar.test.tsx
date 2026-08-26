@@ -33,6 +33,7 @@ function renderTabBar(
     onReorderTabs?: ReturnType<typeof vi.fn>;
     showRebootButton?: boolean;
     showOverview?: boolean;
+    paneStatuses?: Record<string, string | null>;
     tabs?: PaneConfig[];
   } = {},
 ) {
@@ -66,7 +67,7 @@ function renderTabBar(
       lifecycleStatus={overrides.lifecycleStatus}
       showRebootButton={overrides.showRebootButton}
       showOverview={overrides.showOverview}
-      paneStatuses={{}}
+      paneStatuses={overrides.paneStatuses ?? {}}
       pausedPanes={[]}
     />,
   );
@@ -148,6 +149,18 @@ describe("TabBar coordinator close controls", () => {
     fireEvent.click(closeButton(container, 12) as Element);
 
     expect(onCloseTab).toHaveBeenCalledWith(12);
+  });
+
+  it("uses a static amber marker for a pane awaiting an answer", () => {
+    const { container } = renderTabBar({
+      tabs: [pane({ pane_id: 7, label: "Needs answer", role: "developer" })],
+      activeTabId: 7,
+      paneStatuses: { "7": "Pending answer" },
+    });
+
+    const tab = tabButton(container, 7);
+    expect(tab.querySelector(".bg-amber-500")).toBeTruthy();
+    expect(tab.querySelector(".animate-pulse")).toBeNull();
   });
 
   it("keeps context-menu close hidden only for managed coordinators", () => {

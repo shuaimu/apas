@@ -723,8 +723,6 @@ mod tests {
         ))
     }
 
-
-
     fn metadata_with_id(id: Uuid, name: &str) -> ProjectMetadata {
         let mut metadata = ProjectMetadata::with_name(name.to_string());
         metadata.id = id;

@@ -695,9 +695,11 @@ impl Database {
             sqlx::query("ALTER TABLE admin_audit_events_v2 RENAME TO admin_audit_events")
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query("INSERT INTO schema_migrations (name) VALUES ('audit_actor_kind_cluster_v1')")
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "INSERT INTO schema_migrations (name) VALUES ('audit_actor_kind_cluster_v1')",
+            )
+            .execute(&mut *tx)
+            .await?;
             tx.commit().await?;
         }
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_admin_audit_created ON admin_audit_events(created_at DESC, id DESC)")
@@ -3487,14 +3489,16 @@ impl Database {
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(team_available, profiles, version)| ClusterDefaultPolicy {
-            user_id: user_id.to_string(),
-            team_available: team_available.map(|value| value != 0),
-            allowed_launch_profiles: profiles
-                .as_deref()
-                .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok()),
-            version,
-        }))
+        Ok(
+            row.map(|(team_available, profiles, version)| ClusterDefaultPolicy {
+                user_id: user_id.to_string(),
+                team_available: team_available.map(|value| value != 0),
+                allowed_launch_profiles: profiles
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok()),
+                version,
+            }),
+        )
     }
 
     pub async fn set_cluster_default_policy(
@@ -3666,11 +3670,9 @@ impl Database {
             .unwrap_or_else(|_| shared::EffectiveProjectPolicy::default().allowed_launch_profiles);
         let mut version: i64 = row.get("default_version");
 
-        for (cluster_team, cluster_profiles, cluster_version) in sqlx::query_as::<
-            _,
-            (Option<i64>, Option<String>, i64),
-        >(
-            r#"
+        for (cluster_team, cluster_profiles, cluster_version) in
+            sqlx::query_as::<_, (Option<i64>, Option<String>, i64)>(
+                r#"
             SELECT team_available, allowed_launch_profiles, version
             FROM cluster_default_policies
             WHERE user_id IN (
@@ -3679,11 +3681,11 @@ impl Database {
                 SELECT DISTINCT user_id FROM sessions WHERE COALESCE(project_id, id) = ?
             )
             "#,
-        )
-        .bind(project_id)
-        .bind(project_id)
-        .fetch_all(&self.pool)
-        .await?
+            )
+            .bind(project_id)
+            .bind(project_id)
+            .fetch_all(&self.pool)
+            .await?
         {
             // Lowest stated value wins for team availability; profiles
             // intersect. A project hosted in several clusters therefore takes
@@ -3701,7 +3703,10 @@ impl Database {
             version = version.max(cluster_version);
         }
 
-        if let Some(override_team) = row.try_get::<Option<i64>, _>("override_team").unwrap_or(None) {
+        if let Some(override_team) = row
+            .try_get::<Option<i64>, _>("override_team")
+            .unwrap_or(None)
+        {
             team_available = override_team != 0;
         }
         if let Some(profiles) = row
@@ -5645,7 +5650,11 @@ mod cluster_administration_tests {
 
         // It is not an account: no users row exists for it, and suspending
         // every account cannot strand the deployment.
-        assert!(db.get_user_by_id(SYSTEM_ADMIN_ACTOR).await.unwrap().is_none());
+        assert!(db
+            .get_user_by_id(SYSTEM_ADMIN_ACTOR)
+            .await
+            .unwrap()
+            .is_none());
         db.create_user(&user("u1", "first@test", "user"))
             .await
             .unwrap();
@@ -6779,7 +6788,11 @@ mod cluster_administration_tests {
         let baseline = db.get_effective_project_policy("project-a").await.unwrap();
         assert!(baseline.team_available);
         assert_eq!(baseline.allowed_launch_profiles.len(), 2);
-        assert!(db.get_cluster_default_policy("owner").await.unwrap().is_none());
+        assert!(db
+            .get_cluster_default_policy("owner")
+            .await
+            .unwrap()
+            .is_none());
 
         // A hosting account's cluster default narrows the project even though
         // another account owns it.
@@ -6922,10 +6935,7 @@ mod cluster_administration_tests {
         .await
         .unwrap();
 
-        let hosted = db
-            .list_cluster_projects("host", None, 50, 0)
-            .await
-            .unwrap();
+        let hosted = db.list_cluster_projects("host", None, 50, 0).await.unwrap();
         assert_eq!(hosted.len(), 1);
         assert_eq!(hosted[0].id, "project-a");
         assert_eq!(hosted[0].owner_email, "owner@test");

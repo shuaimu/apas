@@ -136,7 +136,11 @@ fn record_failure(state: &AppState, key: &str) {
     let expired = Utc::now().signed_duration_since(entry.1).num_seconds()
         >= config.lockout_seconds as i64
         && entry.0 >= config.max_failed_attempts;
-    entry.0 = if expired { 1 } else { entry.0.saturating_add(1) };
+    entry.0 = if expired {
+        1
+    } else {
+        entry.0.saturating_add(1)
+    };
     entry.1 = Utc::now();
 }
 
@@ -231,7 +235,12 @@ pub async fn change_password(
     let next_version = state.db.rotate_system_admin_password(&hash).await?;
     state
         .db
-        .record_system_admin_audit("system.credential_rotated", "system_admin", "credential", None)
+        .record_system_admin_audit(
+            "system.credential_rotated",
+            "system_admin",
+            "credential",
+            None,
+        )
         .await?;
 
     // Every token issued against the previous secret is now invalid, this

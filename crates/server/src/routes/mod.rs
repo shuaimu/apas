@@ -241,7 +241,12 @@ mod cluster_authorization_tests {
     }
 
     async fn system_admin_headers(state: &AppState) -> HeaderMap {
-        let credential = state.db.get_system_admin_credential().await.unwrap().unwrap();
+        let credential = state
+            .db
+            .get_system_admin_credential()
+            .await
+            .unwrap()
+            .unwrap();
         let token = encode(
             &Header::default(),
             &auth::Claims {
@@ -298,7 +303,11 @@ mod cluster_authorization_tests {
         .await
         .unwrap()
         .0;
-        assert_eq!(inventory.items.len(), 2, "every cluster is in the inventory");
+        assert_eq!(
+            inventory.items.len(),
+            2,
+            "every cluster is in the inventory"
+        );
         let json = serde_json::to_value(&inventory.items[0]).unwrap();
         for content_field in ["messages", "files", "diff", "terminal", "conversation"] {
             assert!(json.get(content_field).is_none());
@@ -591,7 +600,9 @@ mod cluster_authorization_tests {
         .unwrap()
         .0;
         assert!(!rotated.bootstrap_pending);
-        assert!(system_admin::me(State(state.clone()), bearer).await.is_err());
+        assert!(system_admin::me(State(state.clone()), bearer)
+            .await
+            .is_err());
 
         let mut fresh = HeaderMap::new();
         fresh.insert(

@@ -169,8 +169,6 @@ export function normalizeServerMessage(
     case "terminal_state":
     case "terminal_exited":
       return [makeEvent(message.session_id, message.pane_id, at, context.sequence, message.type === "terminal_exited" ? "completed" : "terminal", message.type === "terminal_exited" ? `Terminal exited${message.status ? `: ${message.status}` : ""}` : `Terminal ${message.lifecycle ?? "unknown"}`, message)];
-    case "team_todo_state":
-      return [makeEvent(message.session_id, undefined, at, context.sequence, "todo", "Team task list updated", message.state)];
     case "pane_status": {
       const interrupted = message.status?.toLowerCase().includes("interrupt") ?? false;
       // Pane status is transient UI state, not a conversation turn. Keeping

@@ -261,20 +261,25 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
           .map((pane) => ({
             session,
             pane,
+            awaitingAnswer: pane.awaiting_answer === true,
             usageLimit: paneUsageLimit(session, pane, usageLimits, availabilityNow),
           })),
       ),
     [availabilityNow, sessions, usageLimits],
   );
+  const pendingAgents = useMemo(
+    () => waitingAgents.filter((agent) => agent.awaitingAnswer),
+    [waitingAgents],
+  );
   const idleAgents = useMemo(
     () => waitingAgents
-      .filter((agent) => !agent.usageLimit)
+      .filter((agent) => !agent.awaitingAnswer && !agent.usageLimit)
       .sort(compareRecentlyIdle),
     [waitingAgents],
   );
   const limitedAgents = useMemo(
     () => waitingAgents
-      .filter((agent) => agent.usageLimit)
+      .filter((agent) => !agent.awaitingAnswer && agent.usageLimit)
       .sort(compareRecentlyIdle),
     [waitingAgents],
   );
@@ -282,10 +287,11 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
   const renderWaitingAgent = ({
     session,
     pane,
+    awaitingAnswer,
     usageLimit,
   }: (typeof waitingAgents)[number]) => {
     const name = projectNameFor(session);
-    const resetLabel = usageLimit
+    const resetLabel = !awaitingAnswer && usageLimit
       ? usageLimitResetLabel(usageLimit, availabilityNow)
       : null;
     return (
@@ -311,11 +317,13 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
             <span className="min-w-0 truncate font-semibold text-indigo-600 dark:text-indigo-400">{paneRowLabel(pane)}</span>
           </span>
           <span className={`shrink-0 rounded-full px-2 py-0.5 text-[0.65rem] font-semibold ${
-            usageLimit
+            awaitingAnswer
+              ? "bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-200"
+              : usageLimit
               ? "bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300"
               : "bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300"
           }`}>
-            {usageLimit ? usageLimitedLabel(usageLimit) : "Idle"}
+            {awaitingAnswer ? "Pending answer" : usageLimit ? usageLimitedLabel(usageLimit) : "Idle"}
           </span>
         </div>
         {(session.hostname || resetLabel) && (
@@ -750,17 +758,27 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
 
       {view === "idle" ? (
         <div className="flex-1 overflow-y-auto p-2">
-          {idleAgents.length > 0 || limitedAgents.length > 0 ? (
+          {pendingAgents.length > 0 || idleAgents.length > 0 || limitedAgents.length > 0 ? (
             <>
+              {pendingAgents.length > 0 && (
+                <section aria-labelledby="sidebar-pending-answer-heading">
+                  <h3 id="sidebar-pending-answer-heading" className="mb-2 px-1 text-xs font-semibold uppercase tracking-wide text-amber-700 dark:text-amber-300">
+                    Pending answer
+                  </h3>
+                  <div className="space-y-1.5">
+                    {pendingAgents.map(renderWaitingAgent)}
+                  </div>
+                </section>
+              )}
               {idleAgents.length > 0 && (
-                <div className="space-y-1.5">
+                <div className={`space-y-1.5 ${pendingAgents.length > 0 ? "mt-4 border-t border-gray-200 pt-3 dark:border-gray-800" : ""}`}>
                   {idleAgents.map(renderWaitingAgent)}
                 </div>
               )}
               {limitedAgents.length > 0 && (
                 <section
                   aria-labelledby="sidebar-usage-limited-heading"
-                  className={idleAgents.length > 0 ? "mt-4 border-t border-gray-200 pt-3 dark:border-gray-800" : ""}
+                  className={pendingAgents.length > 0 || idleAgents.length > 0 ? "mt-4 border-t border-gray-200 pt-3 dark:border-gray-800" : ""}
                 >
                   <h3
                     id="sidebar-usage-limited-heading"

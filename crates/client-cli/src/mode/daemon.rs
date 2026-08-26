@@ -55,7 +55,6 @@ fn resolve_user_shell_path() -> Option<String> {
     }
 }
 
-
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
     value.and_then(|raw| {
         let trimmed = raw.trim();
@@ -167,7 +166,6 @@ fn read_process_rss_kb(pid: u32) -> Option<u64> {
     }
     None
 }
-
 
 fn sanitize_for_unit(project_id: &str) -> String {
     project_id
@@ -724,13 +722,8 @@ impl DaemonState {
             // used to separate them for free.
             let span = tracing::info_span!("project", id = %id_for_task);
             let _entered = span.enter();
-            match crate::mode::dual_pane::run_project(
-                &server,
-                &token,
-                &project_path,
-                task_shutdown,
-            )
-            .await
+            match crate::mode::dual_pane::run_project(&server, &token, &project_path, task_shutdown)
+                .await
             {
                 Ok(crate::mode::dual_pane::ProjectOutcome::Completed) => {
                     tracing::info!("project stopped");
@@ -1440,7 +1433,10 @@ mod attribution_tests {
         });
 
         let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
-        let lines: Vec<&str> = output.lines().filter(|l| l.contains("pane failed")).collect();
+        let lines: Vec<&str> = output
+            .lines()
+            .filter(|l| l.contains("pane failed"))
+            .collect();
         assert_eq!(lines.len(), 2, "both records were emitted: {output}");
         assert!(
             lines[0].contains("alpha"),

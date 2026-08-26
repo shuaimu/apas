@@ -778,8 +778,8 @@ impl PaneWorkSummaryService {
             // A window at or before the truncation boundary is missing its
             // oldest records, so its source is both incomplete and — since it
             // filled the read budget — far larger than the cap allows.
-            let partial = partial_window_through
-                .is_some_and(|boundary| window.window_start <= boundary);
+            let partial =
+                partial_window_through.is_some_and(|boundary| window.window_start <= boundary);
             if partial || source_bytes > self.config.max_source_bytes || manifest.overflowed {
                 if let Some(summary) = document.summaries.iter_mut().find(|summary| {
                     summary.pane_id == window.pane_id && summary.window_start == window.window_start
@@ -1707,10 +1707,7 @@ mod service_tests {
             .await
             .unwrap();
 
-        let document = storage
-            .load_pane_work_summaries(&session_id)
-            .await
-            .unwrap();
+        let document = storage.load_pane_work_summaries(&session_id).await.unwrap();
         let partial = document
             .summaries
             .iter()

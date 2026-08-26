@@ -20,6 +20,7 @@ import {
   isRetiredProviderModel,
 } from "@/lib/providerOptions";
 import { resolveMachineProjectTarget } from "@/lib/machineProjectTarget";
+import { paneIsAwaitingAnswerStatus } from "@/lib/paneStatus";
 
 // xterm.js touches `document` at import time, so it can't be part of the
 // server bundle. Loading it lazily also keeps the ~300 KB emulator out of
@@ -821,6 +822,7 @@ export function TabbedView({
   const activeHasMore = activeTabId === PANE_ID_MAIN ? hasMoreMessages : (activeTabId != null ? paneHasMore[paneKey(activeTabId)] || false : false);
   const activeIsLoading = activeTabId === PANE_ID_MAIN ? isLoadingMore : loadingMorePane === activeTabId;
   const activeStatus = activeTabId != null ? paneStatuses[paneKey(activeTabId)] || null : null;
+  const activeIsAwaitingAnswer = paneIsAwaitingAnswerStatus(activeStatus);
   const activeIsPaused = activeTabId != null ? pausedPanes.includes(activeTabId) : false;
   const activeIsBot = activeConfig?.mode === "deadloop";
   // Terminal panes take keystrokes directly in xterm.js. Showing the chat
@@ -1183,7 +1185,7 @@ export function TabbedView({
                   ))}
                 </select>
               )}
-              {activeStatus && activeTabId != null && (
+              {activeStatus && !activeIsAwaitingAnswer && activeTabId != null && (
                 <button
                   onClick={() => {
                     if (activeTabId == null) return;
@@ -1383,9 +1385,9 @@ export function TabbedView({
 
       {/* Status bar — never shown on the Overview pseudo-tab */}
       {activeStatus && activeTabId !== OVERVIEW_PANE_ID && (
-        <div className="px-3 py-2 border-t border-gray-200 dark:border-gray-700 bg-blue-50 dark:bg-blue-900/20 flex-shrink-0">
-          <div className="flex items-center gap-2 text-sm text-blue-700 dark:text-blue-300">
-            <div className="animate-pulse">●</div>
+        <div className={`flex-shrink-0 border-t px-3 py-2 ${activeIsAwaitingAnswer ? "border-amber-200 bg-amber-50 dark:border-amber-900 dark:bg-amber-950/30" : "border-gray-200 bg-blue-50 dark:border-gray-700 dark:bg-blue-900/20"}`}>
+          <div className={`flex items-center gap-2 text-sm ${activeIsAwaitingAnswer ? "text-amber-800 dark:text-amber-200" : "text-blue-700 dark:text-blue-300"}`}>
+            <div className={activeIsAwaitingAnswer ? "" : "animate-pulse"}>●</div>
             <span>{activeStatus}</span>
           </div>
         </div>

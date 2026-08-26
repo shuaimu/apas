@@ -263,7 +263,8 @@ impl FileStorage {
 
         // Enforce the size ceiling while we still hold the session lock, so a
         // concurrent append cannot interleave with the rewrite.
-        self.enforce_session_size_cap(session_id, &file_path).await?;
+        self.enforce_session_size_cap(session_id, &file_path)
+            .await?;
 
         Ok(())
     }
@@ -1630,7 +1631,9 @@ mod gc_tests {
                 .unwrap();
         }
 
-        let size = std::fs::metadata(storage.messages_file(&sid)).unwrap().len();
+        let size = std::fs::metadata(storage.messages_file(&sid))
+            .unwrap()
+            .len();
         assert!(
             size <= 8 * 1024,
             "log stayed over its cap after appends: {size} bytes"

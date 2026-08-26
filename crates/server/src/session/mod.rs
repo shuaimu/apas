@@ -1943,7 +1943,6 @@ impl SessionManager {
     /// Cache the latest `project_goal.md` content for this session so we can
     /// replay it to newly-attaching web clients. Called from the CLI's
 
-
     /// Check if a session has an active CLI client connected
     pub fn is_session_active(&self, session_id: &Uuid) -> bool {
         // Check if any connected CLI client has this session as their active session
@@ -2280,7 +2279,6 @@ impl SessionManager {
 #[cfg(test)]
 mod project_goal_tests {
     use super::*;
-
 }
 
 impl Default for SessionManager {

@@ -974,6 +974,24 @@
       ]
     },
     {
+      "description": "Restart the daemon on one machine, applying an available update first.\n\nTargeted by machine rather than by a project on it: a daemon is\nper-machine, and a machine running nothing has no project to route\nthrough. Restarting a daemon does not disturb the projects, panes, or\nagents on that host — the daemon owns no long-lived children.",
+      "type": "object",
+      "properties": {
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "reboot_daemon"
+        }
+      },
+      "required": [
+        "type",
+        "machine_id"
+      ]
+    },
+    {
       "description": "Create a brand-new project instance under a repo on a chosen machine:\nthe daemon clones `clone_url` into `~/apas_projects/<instance_name>`\n(auto-suffixed on collision), checks out a fresh `branch`, registers a\n`.apas`, and starts it. `git_remote` is the canonical key (for the\ndaemon's sibling-URL fallback + naming); `clone_url` is the real URL.",
       "type": "object",
       "properties": {
@@ -1225,30 +1243,6 @@
       ]
     },
     {
-      "description": "Manager v2 — overwrite the project_goal.md file at the project\nroot with `goal`. The deadloop manager re-reads this file on\nevery iteration so a goal change takes effect at the next loop\nboundary, not mid-iteration.",
-      "type": "object",
-      "properties": {
-        "goal": {
-          "type": "string"
-        },
-        "session_id": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "format": "uuid"
-        },
-        "type": {
-          "type": "string",
-          "const": "update_project_goal"
-        }
-      },
-      "required": [
-        "type",
-        "goal"
-      ]
-    },
-    {
       "description": "Set Tech-Lead autonomy flags. CLI writes both into `.apas` and\nthen echoes `CliToServer::ProjectFlagsChanged` so peer web\nclients stay in sync.",
       "type": "object",
       "properties": {
@@ -1314,42 +1308,6 @@
         "type",
         "auto_approve_todos",
         "auto_merge_prs"
-      ]
-    },
-    {
-      "description": "Spawn the four default team panes for any role that isn't\nalready present. Triggered by the Overview \"Start team\" button.\nCLI runs `spawn_missing_team_panes`. Idempotent. Per-role\n`*_spec` fields carry the provider/model the user picked in\nthe Team setup card.",
-      "type": "object",
-      "properties": {
-        "developer": {
-          "$ref": "#/$defs/TeamRoleSpec",
-          "default": {}
-        },
-        "manager": {
-          "$ref": "#/$defs/TeamRoleSpec",
-          "default": {}
-        },
-        "reviewer": {
-          "$ref": "#/$defs/TeamRoleSpec",
-          "default": {}
-        },
-        "session_id": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "format": "uuid"
-        },
-        "tech_lead": {
-          "$ref": "#/$defs/TeamRoleSpec",
-          "default": {}
-        },
-        "type": {
-          "type": "string",
-          "const": "start_team"
-        }
-      },
-      "required": [
-        "type"
       ]
     },
     {
@@ -1496,140 +1454,6 @@
         "type",
         "pane_id",
         "manual_mode"
-      ]
-    },
-    {
-      "description": "Ask the server to fetch the current `team-todo.md` for this\nsession's project. Forwarded as `ServerToCli::FetchTeamTodo`;\nCLI replies with `CliToServer::TeamTodoState` which the server\nhands back to web as `ServerToWeb::TeamTodoState`.",
-      "type": "object",
-      "properties": {
-        "session_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "type": {
-          "type": "string",
-          "const": "fetch_team_todo"
-        }
-      },
-      "required": [
-        "type",
-        "session_id"
-      ]
-    },
-    {
-      "description": "User approves or rejects a Tech-Lead-proposed Global TODO from\nthe web Overview tab. action: \"approve\" | \"reject\".",
-      "type": "object",
-      "properties": {
-        "action": {
-          "type": "string"
-        },
-        "session_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "todo_id": {
-          "type": "string"
-        },
-        "type": {
-          "type": "string",
-          "const": "todo_approval"
-        }
-      },
-      "required": [
-        "type",
-        "session_id",
-        "todo_id",
-        "action"
-      ]
-    },
-    {
-      "description": "User adds a new Global TODO from the Overview's + Add TODO\nform. CLI assigns the next id (TODO-NNN), writes status=approved,\norigin=user, then publishes a fresh TeamTodoState.",
-      "type": "object",
-      "properties": {
-        "body": {
-          "type": "string",
-          "default": ""
-        },
-        "session_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "title": {
-          "type": "string"
-        },
-        "type": {
-          "type": "string",
-          "const": "add_todo"
-        }
-      },
-      "required": [
-        "type",
-        "session_id",
-        "title"
-      ]
-    },
-    {
-      "description": "Web requests a fresh snapshot of `suggested-workers.md`.\nForwarded as `ServerToCli::FetchSuggestedWorkers`; CLI replies\nwith `CliToServer::SuggestedWorkersState` which the server hands\nback to web as `ServerToWeb::SuggestedWorkersState`.",
-      "type": "object",
-      "properties": {
-        "session_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "type": {
-          "type": "string",
-          "const": "fetch_suggested_workers"
-        }
-      },
-      "required": [
-        "type",
-        "session_id"
-      ]
-    },
-    {
-      "description": "User dismissed a suggested worker. Forwarded as\n`ServerToCli::DismissSuggestion`; CLI removes the entry and\nrepublishes the state.",
-      "type": "object",
-      "properties": {
-        "session_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "suggestion_id": {
-          "type": "string"
-        },
-        "type": {
-          "type": "string",
-          "const": "dismiss_suggestion"
-        }
-      },
-      "required": [
-        "type",
-        "session_id",
-        "suggestion_id"
-      ]
-    },
-    {
-      "description": "One-way promote: flip an unmanaged side-chat pane to a managed\nteam member. CLI sets PaneMeta.managed = true and re-broadcasts\nthe PaneList. There's no demote — keep it simple.",
-      "type": "object",
-      "properties": {
-        "pane_id": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
-        },
-        "session_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "type": {
-          "type": "string",
-          "const": "promote_pane_to_managed"
-        }
-      },
-      "required": [
-        "type",
-        "session_id",
-        "pane_id"
       ]
     },
     {
@@ -1937,28 +1761,6 @@
           "deprecated": true
         }
       ]
-    },
-    "TeamRoleSpec": {
-      "description": "Per-role provider/model pair the user picks in the \"Team setup\"\ncard before clicking Start team. Empty fields fall back to the\nCLI's defaults (Claude / unset model).",
-      "type": "object",
-      "properties": {
-        "model": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "provider": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Provider"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      }
     }
   }
 }

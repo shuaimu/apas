@@ -11,6 +11,7 @@ import {
   History,
   LoaderCircle,
   MoreVertical,
+  Pencil,
   Plus,
   RotateCcw,
   Settings2,
@@ -50,6 +51,7 @@ import {
   type PaneKind,
   type Provider,
 } from "@/lib/store";
+import { paneIsAwaitingAnswerStatus } from "@/lib/paneStatus";
 
 const TerminalPane = dynamic(
   () => import("@/components/tabs/TerminalPane").then((module) => module.TerminalPane),
@@ -285,6 +287,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const paneConfigs = useStore((state) => state.paneConfigs);
   const removePane = useStore((state) => state.removePane);
   const rebootPane = useStore((state) => state.rebootPane);
+  const updatePaneLabel = useStore((state) => state.updatePaneLabel);
   const messages = useStore((state) => state.messages);
   const paneMessages = useStore((state) => state.paneMessages);
   const paneStatuses = useStore((state) => state.paneStatuses);
@@ -315,6 +318,8 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const [summaryOpen, setSummaryOpen] = useState(false);
   const [manageOpen, setManageOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
+  const [renameTarget, setRenameTarget] = useState<PaneConfig | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
   const [closeTarget, setCloseTarget] = useState<PaneConfig | null>(null);
   const [rebootTarget, setRebootTarget] = useState<PaneConfig | null>(null);
   const [openProjectTarget, setOpenProjectTarget] = useState<MachineProjectTarget | null>(null);
@@ -335,6 +340,10 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   );
   const selectedPane = paneConfigs.find((pane) => pane.pane_id === selectedPaneId);
   const selectedStatus = selectedPaneId === null ? null : paneStatuses[paneKey(selectedPaneId)] || null;
+  const selectedIsAwaitingAnswer = paneIsAwaitingAnswerStatus(selectedStatus);
+  const sessionIsRunning = session?.isActive ?? isAttached;
+  const renameTargetExists = renameTarget !== null
+    && paneConfigs.some((pane) => pane.pane_id === renameTarget.pane_id);
 
   useEffect(() => {
     if (sessionId) loadSessionActivity(sessionId);
@@ -357,6 +366,12 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   useEffect(() => {
     if (selectedPaneId !== null) loadPaneMessagesIfNeeded(selectedPaneId);
   }, [loadPaneMessagesIfNeeded, selectedPaneId]);
+
+  useEffect(() => {
+    if (!renameTarget || renameTargetExists) return;
+    setRenameTarget(null);
+    setRenameDraft("");
+  }, [renameTarget, renameTargetExists]);
 
   const activity = useMemo(() => {
     const items: ActivityItem[] = messages.map((message) => ({ key: `0:${message.id}`, message, paneId: MAIN_PANE_ID }));
@@ -558,6 +573,27 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
     setNewPaneOpen(false);
   };
 
+  const dismissRename = () => {
+    setRenameTarget(null);
+    setRenameDraft("");
+  };
+
+  const saveRename = () => {
+    const trimmed = renameDraft.trim();
+    if (
+      !renameTarget
+      || !renameTargetExists
+      || !connected
+      || !sessionIsRunning
+      || !trimmed
+    ) {
+      if (!renameTargetExists) dismissRename();
+      return;
+    }
+    updatePaneLabel(renameTarget.pane_id, trimmed);
+    dismissRename();
+  };
+
   if (terminalPaneId !== null) {
     return (
       <section aria-label="Mobile terminal" className="flex h-full min-h-0 flex-col bg-[#0a0a0a] text-white">
@@ -586,7 +622,6 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const projectName = displayProjectName(session.workingDir, session.gitRemote);
   const selectedIsTerminal = selectedPane?.kind === "terminal";
   const selectedIsBot = selectedPane?.mode === "deadloop";
-  const sessionIsRunning = session.isActive ?? isAttached;
   const canOpenProject = connected
     && !sessionIsRunning
     && machineProjectTarget !== null
@@ -612,9 +647,15 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
           <div className="no-scrollbar flex min-w-0 flex-1 items-center gap-2 overflow-x-auto">
             {paneConfigs.length > 0 ? paneConfigs.map((pane) => {
               const selected = pane.pane_id === selectedPaneId;
+              const paneStatus = paneStatuses[paneKey(pane.pane_id)];
+              const statusSuffix = paneIsAwaitingAnswerStatus(paneStatus)
+                ? " · pending answer"
+                : paneStatus
+                  ? " · working"
+                  : "";
               return (
                 <button key={pane.pane_id} type="button" aria-pressed={selected} onClick={() => selectPane(pane.pane_id)} className={`shrink-0 rounded-full border px-3 py-1.5 text-xs font-bold ${selected ? "border-[#6d5efc] text-[#6d5efc]" : "border-[#dedee7] text-[#686873] dark:border-[#383842] dark:text-[#aaaab6]"}`}>
-                  {paneLabel(pane)}{paneStatuses[paneKey(pane.pane_id)] ? " · working" : ""}
+                  {paneLabel(pane)}{statusSuffix}
                 </button>
               );
             }) : (
@@ -724,7 +765,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
             </span>
           </div>
         )}
-        {connected && selectedStatus && <div role="status" aria-live="polite" className="mb-1.5 flex w-fit max-w-full items-center gap-1.5 rounded-full bg-[#eeecff] px-2.5 py-1 text-xs font-bold text-[#5b4de0] dark:bg-[#292452] dark:text-[#c8c1ff]"><LoaderCircle aria-hidden="true" className="h-3.5 w-3.5 shrink-0 animate-spin" /><span className="truncate">{selectedStatus}</span></div>}
+        {connected && selectedStatus && <div role="status" aria-live="polite" className={`mb-1.5 flex w-fit max-w-full items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-bold ${selectedIsAwaitingAnswer ? "bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-200" : "bg-[#eeecff] text-[#5b4de0] dark:bg-[#292452] dark:text-[#c8c1ff]"}`}>{selectedIsAwaitingAnswer ? <AlertTriangle aria-hidden="true" className="h-3.5 w-3.5 shrink-0" /> : <LoaderCircle aria-hidden="true" className="h-3.5 w-3.5 shrink-0 animate-spin" />}<span className="truncate">{selectedStatus}</span></div>}
         {!connected && canCompose && <p className="mb-1.5 text-[11px] text-amber-700 dark:text-amber-300">You can keep drafting while offline. Reconnect to send.</p>}
         {connected && !sessionIsRunning && canCompose && <p className="mb-1.5 text-[11px] text-amber-700 dark:text-amber-300">You can draft a message, but this project must be running before it can be sent.</p>}
         <div className="flex items-end gap-2">
@@ -784,6 +825,27 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
               {summarySupported && (
                 <button type="button" aria-label="Open work summary" disabled={selectedPaneId === null} onClick={() => { setMoreOpen(false); setSummaryOpen(true); }} className="flex w-full items-center gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left font-bold disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"><History className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Work summary</button>
               )}
+              <button
+                type="button"
+                aria-label="Rename conversation"
+                disabled={!selectedPane || !connected || !sessionIsRunning}
+                title={!selectedPane
+                  ? "Select a pane to rename its conversation"
+                  : !connected
+                    ? "Reconnect before renaming this conversation"
+                    : !sessionIsRunning
+                      ? "Open this project before renaming its conversation"
+                      : "Rename this conversation"}
+                onClick={() => {
+                  if (!selectedPane || !connected || !sessionIsRunning) return;
+                  setMoreOpen(false);
+                  setRenameTarget(selectedPane);
+                  setRenameDraft(paneLabel(selectedPane));
+                }}
+                className="flex w-full items-center gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left font-bold disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"
+              >
+                <Pencil className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Rename conversation
+              </button>
               <button type="button" aria-label="Reboot this pane" disabled={!selectedPane} onClick={() => { setMoreOpen(false); setRebootTarget(selectedPane ?? null); }} className="flex w-full items-center gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left font-bold disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"><RotateCcw className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Reboot this pane</button>
               <button type="button" aria-label="Close this pane" disabled={!selectedPane} onClick={() => { setMoreOpen(false); setCloseTarget(selectedPane ?? null); }} className="flex w-full items-center gap-3 rounded-2xl border border-red-200 bg-white p-3.5 text-left font-bold text-red-700 disabled:opacity-40 dark:border-red-900 dark:bg-[#1b1b21] dark:text-red-300"><Trash2 className="h-5 w-5 shrink-0" /> Close this pane</button>
               {/* Different scope from the four above, and the only place it can
@@ -792,6 +854,50 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
               <button type="button" aria-label="Manage project" onClick={() => { setMoreOpen(false); setManageOpen(true); }} className="mt-1 flex w-full items-center gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left font-bold dark:border-[#383842] dark:bg-[#1b1b21]"><Settings2 className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Manage project</button>
             </div>
           </div>
+        </div>
+      )}
+
+      {renameTarget && (
+        <div className="fixed inset-0 z-[96] flex items-end bg-black/45" onClick={dismissRename}>
+          <form
+            role="dialog"
+            aria-modal="true"
+            aria-label={`Rename ${paneLabel(renameTarget)}`}
+            onClick={(event) => event.stopPropagation()}
+            onSubmit={(event) => {
+              event.preventDefault();
+              saveRename();
+            }}
+            className="w-full rounded-t-[1.4rem] border-t border-[#dedee7] bg-[#f7f7fa] p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-2xl dark:border-[#383842] dark:bg-[#111115]"
+          >
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-extrabold">Rename conversation</h2>
+                <p className="mt-1 text-sm text-[#686873] dark:text-[#aaaab6]">This changes the selected pane&apos;s name everywhere.</p>
+              </div>
+              <button type="button" aria-label="Close rename conversation" onClick={dismissRename} className="rounded-lg p-2 hover:bg-[#efeff5] dark:hover:bg-[#25252d]"><X className="h-5 w-5" /></button>
+            </div>
+            <label htmlFor="mobile-conversation-name" className="mt-4 block text-sm font-bold">Conversation name</label>
+            <input
+              id="mobile-conversation-name"
+              value={renameDraft}
+              onChange={(event) => setRenameDraft(event.target.value)}
+              autoFocus
+              onFocus={(event) => event.currentTarget.select()}
+              className="mt-2 w-full rounded-xl border border-[#dedee7] bg-white px-3 py-2.5 text-base outline-none focus:border-[#6d5efc] dark:border-[#383842] dark:bg-[#1b1b21]"
+            />
+            <div className="mt-4 flex gap-2.5">
+              <button type="button" onClick={dismissRename} className="flex-1 rounded-xl border border-[#dedee7] px-4 py-2.5 text-sm font-bold dark:border-[#383842]">Cancel</button>
+              <button
+                type="submit"
+                aria-label="Save conversation name"
+                disabled={!renameDraft.trim() || !connected || !sessionIsRunning || !renameTargetExists}
+                className="flex-1 rounded-xl bg-[#6d5efc] px-4 py-2.5 text-sm font-bold text-white disabled:opacity-40"
+              >
+                Save
+              </button>
+            </div>
+          </form>
         </div>
       )}
 

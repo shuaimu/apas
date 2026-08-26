@@ -39,3 +39,11 @@
 - [x] 6.2 `cargo test` for the workspace and `cargo clippy` clean
 - [x] 6.3 `npm run lint` and `npm test` clean in `packages/web`
 - [ ] 6.4 End-to-end against a real pane: ask a question from a Claude terminal pane, answer it from the conversation view, confirm the agent proceeds with that answer and the card shows what was recorded
+
+## 7. Report pending questions as human attention
+
+- [x] 7.1 Add a canonical Pending answer pane status, report it separately from `is_working` and idle recency in server/mobile session summaries, and retain it until a matching recorded tool result arrives
+- [x] 7.2 Teach the web store to reconcile live and snapshot Pending answer state without restoring stale Working indicators
+- [x] 7.3 Render Pending answer in project lists, waiting-agent lists, pane selectors, pane overview cards, and conversation status bars, ahead of ordinary idle and usage-limited panes
+- [x] 7.4 Add Rust and web regression coverage for question → pending → recorded answer → working transitions and list/status presentation
+- [x] 7.5 Update the terminal-pane documentation and run focused Rust/web tests, formatting, lint, and full relevant suites

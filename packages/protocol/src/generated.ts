@@ -253,12 +253,6 @@ export type ServerToWeb =
       [k: string]: unknown;
     }
   | {
-      record: TeamScratchpadRecord;
-      session_id: string;
-      type: "team_record";
-      [k: string]: unknown;
-    }
-  | {
       input: unknown;
       pane_id: number;
       session_id: string;
@@ -283,12 +277,6 @@ export type ServerToWeb =
       session_id: string;
       type: "pr_created";
       url?: string | null;
-      [k: string]: unknown;
-    }
-  | {
-      content: string;
-      session_id: string;
-      type: "project_goal_changed";
       [k: string]: unknown;
     }
   | {
@@ -330,18 +318,6 @@ export type ServerToWeb =
       policy: EffectiveProjectPolicy;
       session_id: string;
       type: "project_policy_changed";
-      [k: string]: unknown;
-    }
-  | {
-      session_id: string;
-      state: TeamTodoStateMsg;
-      type: "team_todo_state";
-      [k: string]: unknown;
-    }
-  | {
-      session_id: string;
-      suggestions: SuggestedWorkerMsg[];
-      type: "suggested_workers_state";
       [k: string]: unknown;
     }
   | {
@@ -790,6 +766,11 @@ export type WebToServer =
       [k: string]: unknown;
     }
   | {
+      machine_id: string;
+      type: "reboot_daemon";
+      [k: string]: unknown;
+    }
+  | {
       base_path?: string | null;
       branch: string;
       clone_url?: string | null;
@@ -860,12 +841,6 @@ export type WebToServer =
       [k: string]: unknown;
     }
   | {
-      goal: string;
-      session_id?: string | null;
-      type: "update_project_goal";
-      [k: string]: unknown;
-    }
-  | {
       auto_approve_todos: boolean;
       auto_merge_prs: boolean;
       /**
@@ -891,15 +866,6 @@ export type WebToServer =
       auto_merge_prs: boolean;
       session_id?: string | null;
       type: "update_project_operations";
-      [k: string]: unknown;
-    }
-  | {
-      developer?: TeamRoleSpec;
-      manager?: TeamRoleSpec1;
-      reviewer?: TeamRoleSpec2;
-      session_id?: string | null;
-      tech_lead?: TeamRoleSpec3;
-      type: "start_team";
       [k: string]: unknown;
     }
   | {
@@ -932,42 +898,6 @@ export type WebToServer =
       pane_id: number;
       session_id?: string | null;
       type: "update_pane_manual_mode";
-      [k: string]: unknown;
-    }
-  | {
-      session_id: string;
-      type: "fetch_team_todo";
-      [k: string]: unknown;
-    }
-  | {
-      action: string;
-      session_id: string;
-      todo_id: string;
-      type: "todo_approval";
-      [k: string]: unknown;
-    }
-  | {
-      body?: string;
-      session_id: string;
-      title: string;
-      type: "add_todo";
-      [k: string]: unknown;
-    }
-  | {
-      session_id: string;
-      type: "fetch_suggested_workers";
-      [k: string]: unknown;
-    }
-  | {
-      session_id: string;
-      suggestion_id: string;
-      type: "dismiss_suggestion";
-      [k: string]: unknown;
-    }
-  | {
-      pane_id: number;
-      session_id: string;
-      type: "promote_pane_to_managed";
       [k: string]: unknown;
     }
   | {
@@ -1191,6 +1121,18 @@ export interface MobileSessionSummary {
    */
   owner_email?: string | null;
   /**
+   * The panes in this session and whether each is working.
+   *
+   * `is_working` above answers "is anything happening here", which cannot
+   * answer "which agent is waiting for me": a project with one busy pane
+   * reads as working, hiding every idle pane in it. Both are derived from
+   * the same pane statuses, so they cannot disagree.
+   *
+   * Defaulted: an older server omits it, and a client must read that as "no
+   * pane detail" rather than as a session with no panes.
+   */
+  panes?: MobilePaneSummary[];
+  /**
    * Stable project identity from `.apas`. Web UI groups by this.
    * Falls back to `id` for legacy rows that pre-date the column.
    */
@@ -1202,6 +1144,64 @@ export interface MobileSessionSummary {
   share_role?: string | null;
   status: string;
   working_dir?: string | null;
+  [k: string]: unknown;
+}
+/**
+ * One agent pane, as mobile needs to list it.
+ */
+export interface MobilePaneSummary {
+  /**
+   * True while this pane is blocked on an unresolved agent question. This
+   * is neither active work nor idle time and takes presentation precedence
+   * over provider availability.
+   */
+  awaiting_answer?: boolean;
+  /**
+   * Most recent working-to-idle transition observed by the server. Older
+   * servers omit it; clients keep those panes visible after timestamped ones.
+   */
+  idle_since?: string | null;
+  /**
+   * True while this pane is reporting work, from the same pane statuses the
+   * session-level flag is derived from.
+   */
+  is_working?: boolean;
+  kind: PaneKind;
+  /**
+   * The pane's own label when it has one; the client falls back to its kind
+   * and id, exactly as the session screen does.
+   */
+  label?: string | null;
+  /**
+   * Model/backend override used to associate provider-scoped availability
+   * with the same usage account the pane actually consumes.
+   */
+  model?: string | null;
+  pane_id: number;
+  provider: Provider;
+  /**
+   * Provider availability is not pane activity. Carry the latest explicit
+   * block separately so shared/mobile snapshots do not turn it into idle.
+   */
+  usage_limited?: UsageLimited | null;
+  [k: string]: unknown;
+}
+/**
+ * A provider-confirmed usage limit that is currently preventing work.
+ *
+ * This is deliberately separate from utilization: included usage may reach
+ * 100% while paid extra usage remains available, in which case the provider
+ * is not blocking requests and this field stays absent.
+ */
+export interface UsageLimited {
+  /**
+   * When the provider expects work to become available again.
+   */
+  resets_at?: string | null;
+  /**
+   * Human-readable limiting window, such as "weekly" or "5-hour".
+   */
+  window: string;
   [k: string]: unknown;
 }
 export interface CodeEvent {
@@ -1351,6 +1351,18 @@ export interface SessionInfo {
    */
   owner_email?: string | null;
   /**
+   * The panes in this session and whether each is working.
+   *
+   * `is_working` above answers "is anything happening here", which cannot
+   * answer "which agent is waiting for me": a project with one busy pane
+   * reads as working, hiding every idle pane in it. Both are derived from
+   * the same pane statuses, so they cannot disagree.
+   *
+   * Defaulted: an older server omits it, and a client must read that as "no
+   * pane detail" rather than as a session with no panes.
+   */
+  panes?: MobilePaneSummary[];
+  /**
    * Stable project identity from `.apas`. Web UI groups by this.
    * Falls back to `id` for legacy rows that pre-date the column.
    */
@@ -1484,6 +1496,11 @@ export interface UsageLimits {
    * 7-day (weekly) rolling window usage
    */
   seven_day?: UsageLimitWindow | null;
+  /**
+   * Present only when the provider says a usage limit is actively blocking
+   * requests. A full utilization meter alone is not sufficient.
+   */
+  usage_limited?: UsageLimited | null;
   [k: string]: unknown;
 }
 /**
@@ -1498,20 +1515,6 @@ export interface UsageLimitWindow {
    * Utilization as a fraction (0.0 to 1.0+)
    */
   utilization: number;
-  [k: string]: unknown;
-}
-/**
- * One published artifact in the team scratchpad (`.apas-team.jsonl`),
- * mirroring the CLI's `crate::scratchpad::TeamRecord`. Separate type
- * here so the wire shape is stable across CLI/server/web even if the
- * CLI's internal helper grows extra columns. Phase 2.2b.
- */
-export interface TeamScratchpadRecord {
-  body: string;
-  kind: string;
-  pane_id?: number | null;
-  tags?: string[];
-  ts: string;
   [k: string]: unknown;
 }
 /**
@@ -1663,80 +1666,6 @@ export interface EffectiveProjectPolicy {
   [k: string]: unknown;
 }
 /**
- * Wire format for a snapshot of `team-todo.md`. Mirrors the CLI's
- * `team_todo::TeamTodo` but with status fields kept as strings so we
- * don't have to ship the enum definitions across crate / language
- * boundaries. The web parses these into UI state.
- */
-export interface TeamTodoStateMsg {
-  globals: TeamTodoGlobalMsg[];
-  reviewer_cursor?: string | null;
-  /**
-   * Per-agent scratchpad cursor (RFC3339 timestamp of the last
-   * record acted on). `None` means the cursor file is missing —
-   * either the agent hasn't iterated yet, or it was wiped.
-   */
-  tech_lead_cursor?: string | null;
-  workers: TeamTodoWorkerMsg[];
-  [k: string]: unknown;
-}
-export interface TeamTodoGlobalMsg {
-  body: string;
-  id: string;
-  /**
-   * user | tech-lead
-   */
-  origin: string;
-  /**
-   * One PR per contributing worker. Empty until any worker's branch
-   * has been pushed and PR'd.
-   */
-  prs?: PaneTodoPrMsg[];
-  /**
-   * proposed | approved | in_progress | under_review | pr_open | done | rejected
-   */
-  status: string;
-  title: string;
-  [k: string]: unknown;
-}
-export interface PaneTodoPrMsg {
-  annotation?: string | null;
-  pane_id: number;
-  url: string;
-  [k: string]: unknown;
-}
-export interface TeamTodoWorkerMsg {
-  pane_id: number;
-  role_hint?: string | null;
-  subtasks: TeamTodoSubtaskMsg[];
-  [k: string]: unknown;
-}
-export interface TeamTodoSubtaskMsg {
-  body: string;
-  id: string;
-  parent: string;
-  /**
-   * pending | in_progress | done | reviewing | revising | approved
-   */
-  status: string;
-  title: string;
-  [k: string]: unknown;
-}
-/**
- * One row in the suggested-workers queue. The Manager pane appends
- * these as `## SUG-NNN — label` sections to `suggested-workers.md`;
- * the Overview renders each as a card with Accept / Dismiss buttons.
- */
-export interface SuggestedWorkerMsg {
-  backstory: string;
-  goal: string;
-  id: string;
-  label: string;
-  needs_worktree?: boolean;
-  role: string;
-  [k: string]: unknown;
-}
-/**
  * Host-owned terminal continuity metadata reported during reconciliation.
  */
 export interface TerminalRuntimeReconciliation {
@@ -1791,45 +1720,5 @@ export interface MobileTaskLaunchResponse {
   request_id: string;
   session_id: string;
   status: string;
-  [k: string]: unknown;
-}
-/**
- * Per-role provider/model pair the user picks in the "Team setup"
- * card before clicking Start team. Empty fields fall back to the
- * CLI's defaults (Claude / unset model).
- */
-export interface TeamRoleSpec {
-  model?: string | null;
-  provider?: Provider | null;
-  [k: string]: unknown;
-}
-/**
- * Per-role provider/model pair the user picks in the "Team setup"
- * card before clicking Start team. Empty fields fall back to the
- * CLI's defaults (Claude / unset model).
- */
-export interface TeamRoleSpec1 {
-  model?: string | null;
-  provider?: Provider | null;
-  [k: string]: unknown;
-}
-/**
- * Per-role provider/model pair the user picks in the "Team setup"
- * card before clicking Start team. Empty fields fall back to the
- * CLI's defaults (Claude / unset model).
- */
-export interface TeamRoleSpec2 {
-  model?: string | null;
-  provider?: Provider | null;
-  [k: string]: unknown;
-}
-/**
- * Per-role provider/model pair the user picks in the "Team setup"
- * card before clicking Start team. Empty fields fall back to the
- * CLI's defaults (Claude / unset model).
- */
-export interface TeamRoleSpec3 {
-  model?: string | null;
-  provider?: Provider | null;
   [k: string]: unknown;
 }

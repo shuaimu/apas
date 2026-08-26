@@ -108,6 +108,36 @@ fn terminal_assistant_completes_work(
     }
 }
 
+fn ask_user_question_id(message: &shared::ClaudeStreamMessage) -> Option<String> {
+    match message {
+        shared::ClaudeStreamMessage::Assistant { message, .. } => {
+            message.content.iter().find_map(|block| match block {
+                shared::ClaudeContentBlock::ToolUse { id, name, .. }
+                    if name.eq_ignore_ascii_case("AskUserQuestion") =>
+                {
+                    Some(id.clone())
+                }
+                _ => None,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn recorded_tool_result_id(message: &shared::ClaudeStreamMessage) -> Option<String> {
+    match message {
+        shared::ClaudeStreamMessage::User { message, .. } => {
+            message.content.iter().find_map(|block| match block {
+                shared::ClaudeContentBlock::ToolResult { tool_use_id, .. } => {
+                    Some(tool_use_id.clone())
+                }
+                _ => None,
+            })
+        }
+        _ => None,
+    }
+}
+
 pub(crate) async fn set_and_broadcast_pane_status(
     state: &AppState,
     session_id: Uuid,
@@ -813,20 +843,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 };
                                 tracing::info!("Received StreamMessage for session {} with pane_id {:?}", session_id, pane_id);
 
-                                let pending_question = match &message {
-                                    shared::ClaudeStreamMessage::Assistant { message, .. } => message
-                                        .content
-                                        .iter()
-                                        .find_map(|block| match block {
-                                            shared::ClaudeContentBlock::ToolUse { id, name, .. }
-                                                if name.eq_ignore_ascii_case("AskUserQuestion") =>
-                                            {
-                                                Some(id.clone())
-                                            }
-                                            _ => None,
-                                        }),
-                                    _ => None,
-                                };
+                                let pending_question = ask_user_question_id(&message);
+                                let recorded_answer = recorded_tool_result_id(&message);
                                 let notification = match &message {
                                     shared::ClaudeStreamMessage::Result {
                                         subtype,
@@ -859,10 +877,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     &state.sessions.get_session_panes(&session_id),
                                     effective_pane_id,
                                 );
-                                if let Some(tool_use_id) = pending_question {
+                                if let Some(tool_use_id) = pending_question.as_ref() {
                                     state.sessions.register_pending_decision(
                                         session_id,
-                                        tool_use_id,
+                                        tool_use_id.clone(),
                                         effective_pane_id,
                                         shared::MutationKind::Question,
                                     );
@@ -927,7 +945,40 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     .await;
                                 tracing::info!("StreamMessage routed to web: {}", routed);
 
-                                if terminal_assistant_reply {
+                                if pending_question.is_some() {
+                                    if let Some(pane_id) = effective_pane_id {
+                                        set_and_broadcast_pane_status(
+                                            &state,
+                                            session_id,
+                                            PaneType::Interactive,
+                                            pane_id,
+                                            Some(shared::PANE_STATUS_PENDING_ANSWER.to_string()),
+                                        )
+                                        .await;
+                                    }
+                                } else if let Some(tool_use_id) = recorded_answer {
+                                    // The transcript is the acknowledgement for a
+                                    // terminal answer. Keep Pending answer while
+                                    // bytes are merely queued; only the recorded
+                                    // tool result proves the picker settled and
+                                    // the agent can resume work.
+                                    let _ = state.sessions.claim_pending_decision(
+                                        session_id,
+                                        &tool_use_id,
+                                        effective_pane_id,
+                                        shared::MutationKind::Question,
+                                    );
+                                    if let Some(pane_id) = effective_pane_id {
+                                        set_and_broadcast_pane_status(
+                                            &state,
+                                            session_id,
+                                            PaneType::Interactive,
+                                            pane_id,
+                                            Some("Working...".to_string()),
+                                        )
+                                        .await;
+                                    }
+                                } else if terminal_assistant_reply {
                                     if let Some(pane_id) = effective_pane_id {
                                         // Updated terminal clients only mark the
                                         // provider's real completion boundary. Older
@@ -1863,9 +1914,13 @@ fn stream_message_to_stored(
 
 #[cfg(test)]
 mod pane_status_tests {
-    use super::{is_terminal_pane, terminal_assistant_completes_work};
+    use super::{
+        ask_user_question_id, is_terminal_pane, recorded_tool_result_id,
+        terminal_assistant_completes_work,
+    };
     use shared::{
-        ClaudeAssistantMessage, ClaudeContentBlock, ClaudeStreamMessage, PaneConfig, PaneKind,
+        ClaudeAssistantMessage, ClaudeContentBlock, ClaudeStreamMessage, ClaudeUserMessage,
+        PaneConfig, PaneKind,
     };
 
     fn assistant(extra: serde_json::Value) -> ClaudeStreamMessage {
@@ -1940,5 +1995,46 @@ mod pane_status_tests {
             &panes,
             None,
         ));
+    }
+
+    #[test]
+    fn question_and_recorded_answer_events_are_identified_by_tool_id() {
+        let question = ClaudeStreamMessage::Assistant {
+            message: ClaudeAssistantMessage {
+                content: vec![ClaudeContentBlock::ToolUse {
+                    id: "question-7".to_string(),
+                    name: "AskUserQuestion".to_string(),
+                    input: serde_json::json!({"questions": []}),
+                }],
+                model: String::new(),
+                extra: serde_json::Value::Null,
+            },
+            session_id: "provider-session".to_string(),
+            extra: serde_json::json!({"terminal_turn_complete": false}),
+        };
+        let answer = ClaudeStreamMessage::User {
+            message: ClaudeUserMessage {
+                content: vec![ClaudeContentBlock::ToolResult {
+                    tool_use_id: "question-7".to_string(),
+                    content: "recorded answer".to_string(),
+                    is_error: false,
+                }],
+                role: "user".to_string(),
+            },
+            session_id: "provider-session".to_string(),
+            tool_use_result: None,
+            extra: serde_json::Value::Null,
+        };
+
+        assert_eq!(
+            ask_user_question_id(&question).as_deref(),
+            Some("question-7")
+        );
+        assert_eq!(
+            recorded_tool_result_id(&answer).as_deref(),
+            Some("question-7")
+        );
+        assert!(recorded_tool_result_id(&question).is_none());
+        assert!(ask_user_question_id(&answer).is_none());
     }
 }

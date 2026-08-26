@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
+mod attach;
 mod auth;
 mod claude;
 mod claude_session_hook;
@@ -15,14 +16,13 @@ mod conversation;
 mod daemon_registry;
 mod file_watcher;
 mod mode;
-mod attach;
 mod pane_host;
 mod pane_identity;
-mod supervisor;
 mod pane_status;
 mod plan_review;
 mod project;
 mod summary_runner;
+mod supervisor;
 mod terminal_pane;
 mod transcript;
 mod tui;
@@ -523,9 +523,7 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
                 AttachOutcome::NotRunning => {
-                    eprintln!(
-                        "\x1b[33mNo project is running here to attach to.\x1b[0m"
-                    );
+                    eprintln!("\x1b[33mNo project is running here to attach to.\x1b[0m");
                     eprintln!("   Start it from {WEB_UI_URL}");
                     return Ok(());
                 }
@@ -641,11 +639,9 @@ fn attach_to_running_project(working_dir: &std::path::Path) -> AttachOutcome {
         Ok((attachment, tabs)) => {
             eprintln!("\x1b[36m📎 Attached to the running project on this host.\x1b[0m");
             eprintln!("   Closing this window leaves it running.");
-            if let Err(err) = attach::run_attached_tui(
-                attachment,
-                tabs,
-                working_dir.display().to_string(),
-            ) {
+            if let Err(err) =
+                attach::run_attached_tui(attachment, tabs, working_dir.display().to_string())
+            {
                 tracing::error!(%err, "attached session ended with an error");
             }
             AttachOutcome::Attached
@@ -943,9 +939,8 @@ fn parse_bool_config(key: &str, value: &str) -> Result<bool> {
 mod tests {
     use super::{
         detect_running_daemon_with_process_check, get_config_value, plan_launch_daemon,
-        read_daemon_state,
-        read_legacy_daemon_pid, set_config_value, should_restart_for_version, write_daemon_state,
-        DaemonStateFile, DaemonStateGuard,
+        read_daemon_state, read_legacy_daemon_pid, set_config_value, should_restart_for_version,
+        write_daemon_state, DaemonStateFile, DaemonStateGuard,
     };
     use crate::config;
     use std::fs;
@@ -1210,7 +1205,9 @@ mod tests {
             // The second launch is not a new project: same id, one entry.
             assert_eq!(first, second);
             assert_eq!(
-                crate::project::list_registered_projects().expect("registry").len(),
+                crate::project::list_registered_projects()
+                    .expect("registry")
+                    .len(),
                 1
             );
         });

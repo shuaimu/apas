@@ -122,7 +122,6 @@ fn to_message_info(message: crate::storage::StoredMessage) -> MessageInfo {
     }
 }
 
-
 #[cfg(test)]
 mod transit_truncation_tests {
     use super::*;
@@ -741,7 +740,13 @@ pub(crate) fn pane_summaries(
         .get_session_panes(session_id)
         .into_iter()
         .map(|pane| {
-            let is_working = is_active && working.iter().any(|(_, id, _)| *id == pane.pane_id);
+            let status = working
+                .iter()
+                .find(|(_, id, _)| *id == pane.pane_id)
+                .map(|(_, _, status)| status.as_str());
+            let awaiting_answer = is_active
+                && status.is_some_and(|status| status == shared::PANE_STATUS_PENDING_ANSWER);
+            let is_working = is_active && status.is_some_and(shared::pane_status_is_working);
             let usage_provider =
                 match pane.provider {
                     shared::Provider::Claude
@@ -770,7 +775,8 @@ pub(crate) fn pane_summaries(
                 provider: pane.provider,
                 model: pane.model,
                 is_working,
-                idle_since: (is_active && !is_working)
+                awaiting_answer,
+                idle_since: (is_active && !is_working && !awaiting_answer)
                     .then(|| idle_since.get(&pane.pane_id).cloned())
                     .flatten(),
                 usage_limited,
@@ -1109,8 +1115,7 @@ mod retired_launch_authorization_tests {
     /// carries it has to behave exactly like one that does not.
     #[tokio::test]
     async fn the_retained_team_field_decides_nothing() {
-        let (state, connection_id, session_id, mut web_rx, _cli_rx, _cli_id) =
-            policy_state().await;
+        let (state, connection_id, session_id, mut web_rx, _cli_rx, _cli_id) = policy_state().await;
         state
             .sessions
             .set_session_panes(&session_id, vec![pane(7, shared::Provider::Claude, true)]);
@@ -1143,12 +1148,10 @@ mod retired_launch_authorization_tests {
 
     #[tokio::test]
     async fn an_existing_pane_relaunches_outside_the_allowlist() {
-        let (state, connection_id, session_id, mut web_rx, _cli_rx, _cli_id) =
-            policy_state().await;
-        state.sessions.set_session_panes(
-            &session_id,
-            vec![pane(7, shared::Provider::Claude, false)],
-        );
+        let (state, connection_id, session_id, mut web_rx, _cli_rx, _cli_id) = policy_state().await;
+        state
+            .sessions
+            .set_session_panes(&session_id, vec![pane(7, shared::Provider::Claude, false)]);
 
         assert!(authorize_existing_pane_launch(&state, &connection_id, &session_id, 7).await);
         assert!(
@@ -1173,8 +1176,7 @@ mod retired_launch_authorization_tests {
 
     #[tokio::test]
     async fn an_existing_pane_with_a_retired_backend_is_still_refused() {
-        let (state, connection_id, session_id, mut web_rx, _cli_rx, _cli_id) =
-            policy_state().await;
+        let (state, connection_id, session_id, mut web_rx, _cli_rx, _cli_id) = policy_state().await;
         let mut retired = pane(8, shared::Provider::Claude, false);
         retired.model = Some("MiniMax-M2.7".to_string());
         state.sessions.set_session_panes(&session_id, vec![retired]);
@@ -1188,8 +1190,7 @@ mod retired_launch_authorization_tests {
 
     #[tokio::test]
     async fn a_missing_pane_is_still_refused() {
-        let (state, connection_id, session_id, mut web_rx, _cli_rx, _cli_id) =
-            policy_state().await;
+        let (state, connection_id, session_id, mut web_rx, _cli_rx, _cli_id) = policy_state().await;
         state.sessions.set_session_panes(&session_id, vec![]);
 
         assert!(!authorize_existing_pane_launch(&state, &connection_id, &session_id, 99).await);
@@ -1250,10 +1251,7 @@ mod retired_launch_authorization_tests {
     async fn deepseek_variants_are_authorized_exactly_and_unknown_ids_are_rejected() {
         let (state, connection_id, session_id, mut web_rx, _cli_rx, _cli_id) = policy_state().await;
 
-        for model in [
-            shared::DEEPSEEK_PRO_MODEL,
-            shared::DEEPSEEK_FLASH_MODEL,
-        ] {
+        for model in [shared::DEEPSEEK_PRO_MODEL, shared::DEEPSEEK_FLASH_MODEL] {
             assert!(
                 authorize_profile_launch(
                     &state,
@@ -3241,7 +3239,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .is_none()
                         {
                             continue;
-                        }                        tracing::info!("Rebooting CLI for session {}", sid);
+                        }
+                        tracing::info!("Rebooting CLI for session {}", sid);
                         let routed = state
                             .sessions
                             .route_to_cli(&sid, reboot_cli_message(sid))
@@ -3456,13 +3455,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         project_id
                     );
                     let allowed = state
-                            .sessions
-                            .get_machines_for_user(&uid)
-                            .into_iter()
-                            .any(|m| {
-                                m.machine.machine_id == machine_id
-                                    && m.projects.iter().any(|p| p.project_id == project_id)
-                            })
+                        .sessions
+                        .get_machines_for_user(&uid)
+                        .into_iter()
+                        .any(|m| {
+                            m.machine.machine_id == machine_id
+                                && m.projects.iter().any(|p| p.project_id == project_id)
+                        })
                         || {
                             let (host_path_refs, wildcard_paths) =
                                 get_shared_project_access_refs(&state, &uid).await;
@@ -3589,13 +3588,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     };
 
                     let allowed = state
-                            .sessions
-                            .get_machines_for_user(&uid)
-                            .into_iter()
-                            .any(|m| {
-                                m.machine.machine_id == machine_id
-                                    && m.projects.iter().any(|p| p.project_id == project_id)
-                            })
+                        .sessions
+                        .get_machines_for_user(&uid)
+                        .into_iter()
+                        .any(|m| {
+                            m.machine.machine_id == machine_id
+                                && m.projects.iter().any(|p| p.project_id == project_id)
+                        })
                         || {
                             let (host_path_refs, wildcard_paths) =
                                 get_shared_project_access_refs(&state, &uid).await;
@@ -5289,8 +5288,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         .map(|s| {
                             let session_id = Uuid::parse_str(&s.id).unwrap_or_default();
                             let is_active = state.sessions.is_session_active(&session_id);
-                            let is_working = is_active
-                                && !state.sessions.get_pane_statuses(&session_id).is_empty();
+                            let is_working =
+                                is_active
+                                    && state.sessions.get_pane_statuses(&session_id).iter().any(
+                                        |(_, _, status)| shared::pane_status_is_working(status),
+                                    );
                             let project_id = s
                                 .project_id
                                 .as_deref()
@@ -5322,8 +5324,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     for (s, owner_email, share_role) in shared_sessions {
                         let session_id = Uuid::parse_str(&s.id).unwrap_or_default();
                         let is_active = state.sessions.is_session_active(&session_id);
-                        let is_working =
-                            is_active && !state.sessions.get_pane_statuses(&session_id).is_empty();
+                        let is_working = is_active
+                            && state
+                                .sessions
+                                .get_pane_statuses(&session_id)
+                                .iter()
+                                .any(|(_, _, status)| shared::pane_status_is_working(status));
                         let project_id = s
                             .project_id
                             .as_deref()

@@ -12,6 +12,7 @@ import { EmptyState, ErrorNotice, FormField, OfflineBanner, PrimaryButton, Scree
 import { connectionSupervisor } from "@/connection/runtime";
 import { useTheme } from "@/design/tokens";
 import { readCachedSnapshot, readConversationPosition, readSelectedConversationPane, saveConversationPosition, saveSelectedConversationPane, type ConversationPosition } from "@/storage/cache";
+import { paneStatusIsPendingAnswer } from "@/state/paneStatus";
 import { mutationsAllowed, useMobileStore } from "@/state/store";
 
 const EMPTY_EVENTS: CodeEvent[] = [];
@@ -83,7 +84,11 @@ export default function SessionActivityScreen() {
   const selectedPane = panes.find((pane) => pane.id === activePaneId);
   const selectedIsTerminal = selectedPane?.kind === "terminal";
   const selectedStatus = activePaneId === null ? null : paneStatuses?.[String(activePaneId)] ?? null;
+  const selectedAwaitingAnswer = paneStatusIsPendingAnswer(selectedStatus);
   const sessionActivity = session ? sessionActivityStatus(session, paneStatuses) : "offline";
+  const sessionActivityLabel = sessionActivity === "pending"
+    ? "Pending answer"
+    : sessionActivity[0].toUpperCase() + sessionActivity.slice(1);
   const conversationEvents = useMemo(
     () => activePaneId === null ? [] : events.filter((event) => event.pane_id === activePaneId),
     [activePaneId, events],
@@ -301,13 +306,13 @@ export default function SessionActivityScreen() {
       <OfflineBanner />
       {actionError ? <View style={styles.error}><ErrorNotice message={actionError} /></View> : null}
       <View style={[styles.summary, { borderColor: theme.border }]}> 
-        <View style={styles.row}><View style={{ flex: 1 }}><Text style={[styles.title, { color: theme.text }]}>{session.project_name ?? "Coding session"}</Text><Text style={{ color: theme.textMuted }}>{session.hostname ?? session.working_dir}</Text></View><StatusBadge label={sessionActivity[0].toUpperCase() + sessionActivity.slice(1)} tone={sessionActivity === "working" ? "success" : sessionActivity === "offline" ? "danger" : "neutral"} /></View>
+        <View style={styles.row}><View style={{ flex: 1 }}><Text style={[styles.title, { color: theme.text }]}>{session.project_name ?? "Coding session"}</Text><Text style={{ color: theme.textMuted }}>{session.hostname ?? session.working_dir}</Text></View><StatusBadge label={sessionActivityLabel} tone={sessionActivity === "working" ? "success" : sessionActivity === "pending" ? "warning" : sessionActivity === "offline" ? "danger" : "neutral"} /></View>
         <View style={styles.actions}>
           {summarySupported ? <SecondaryButton disabled={activePaneId === null} onPress={() => setSummaryOpen(true)}>Summary</SecondaryButton> : null}
           <SecondaryButton disabled={!selectedIsTerminal || !terminalEnabled} onPress={() => { if (!selectedIsTerminal || activePaneId === null) return; persistTimelinePosition(); router.push({ pathname: "/(code)/session/[sessionId]/terminal", params: { sessionId, paneId: String(activePaneId) } }); }}>Raw terminal</SecondaryButton>
         </View>
       </View>
-      {panes.length > 0 ? <View style={styles.panes}><Text style={{ color: theme.textMuted }}>Conversation:</Text>{panes.map((pane) => <SecondaryButton key={pane.id} onPress={() => selectConversationPane(pane.id)}>{`${activePaneId === pane.id ? "✓ " : ""}${pane.label}${paneStatuses?.[String(pane.id)] ? " · working" : ""}`}</SecondaryButton>)}</View> : null}
+      {panes.length > 0 ? <View style={styles.panes}><Text style={{ color: theme.textMuted }}>Conversation:</Text>{panes.map((pane) => <SecondaryButton key={pane.id} onPress={() => selectConversationPane(pane.id)}>{`${activePaneId === pane.id ? "✓ " : ""}${pane.label}${paneStatuses?.[String(pane.id)] ? paneStatusIsPendingAnswer(paneStatuses[String(pane.id)]) ? " · pending answer" : " · working" : ""}`}</SecondaryButton>)}</View> : null}
       <FlatList
         ref={timeline}
         data={conversationEvents}
@@ -331,7 +336,7 @@ export default function SessionActivityScreen() {
         ListEmptyComponent={<EmptyState title={connection === "ready" ? "No activity yet" : "No cached activity"} body={connection === "ready" ? "Agent instructions and tool activity for this pane will appear here." : "Reconnect to retrieve this pane's activity."} />}
       />
       <View style={[styles.composer, { borderColor: theme.border, backgroundColor: theme.background }]}> 
-        {connection === "ready" && selectedStatus ? <View testID="pane-working-status" accessibilityLiveRegion="polite" style={[styles.workingStatus, { backgroundColor: theme.surface }]}><ActivityIndicator size="small" color={theme.accent} /><Text numberOfLines={1} style={[styles.workingText, { color: theme.accent }]}>{selectedStatus}</Text></View> : null}
+        {connection === "ready" && selectedStatus ? <View testID="pane-working-status" accessibilityLiveRegion="polite" style={[styles.workingStatus, { backgroundColor: theme.surface }]}>{selectedAwaitingAnswer ? <Text style={[styles.pendingIcon, { color: theme.warning }]}>?</Text> : <ActivityIndicator size="small" color={theme.accent} />}<Text numberOfLines={1} style={[styles.workingText, { color: selectedAwaitingAnswer ? theme.warning : theme.accent }]}>{selectedStatus}</Text></View> : null}
         <FormField label="Message" value={followUp} onChangeText={(value) => { setFollowUp(value); setFollowUpRequestId(null); }} placeholder={selectedIsTerminal ? "Message this terminal conversation" : "Steer this exact session and pane"} multiline />
         <PrimaryButton disabled={!mutationsAllowed() || activePaneId === null || !followUp.trim() || (selectedIsTerminal && !terminalEnabled)} onPress={() => void steer()}>{followUpRequestId ? "Retry message safely" : "Send message"}</PrimaryButton>
       </View>
@@ -361,4 +366,5 @@ const styles = StyleSheet.create({
   composer: { borderTopWidth: 1, padding: 12, gap: 8 },
   workingStatus: { alignSelf: "flex-start", flexDirection: "row", alignItems: "center", gap: 6, borderRadius: 999, paddingHorizontal: 9, paddingVertical: 4 },
   workingText: { maxWidth: 260, fontSize: 12, fontWeight: "700" },
+  pendingIcon: { fontSize: 14, fontWeight: "900" },
 });

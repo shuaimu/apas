@@ -121,7 +121,9 @@ pub fn prepare(
         .ok()?;
     let executable = crate::update::resolve_preferred_apas_executable();
     let settings = write_settings(&runtime_dir, &executable)
-        .map_err(|err| tracing::warn!(%err, pane_id, "could not write the claude session hook settings"))
+        .map_err(
+            |err| tracing::warn!(%err, pane_id, "could not write the claude session hook settings"),
+        )
         .ok()?;
     env.push((
         PANE_RUNTIME_ENV.to_string(),
@@ -134,7 +136,10 @@ pub fn prepare(
 pub fn reported_transcript(project_id: Uuid, pane_id: u32) -> Option<PathBuf> {
     let dir = pane_runtime_dir(project_id, pane_id).ok()?;
     let report = read_report(&dir)?;
-    report.transcript_path.is_file().then_some(report.transcript_path)
+    report
+        .transcript_path
+        .is_file()
+        .then_some(report.transcript_path)
 }
 
 /// Read what the pane's Claude last reported, if anything.
@@ -148,7 +153,10 @@ pub fn read_report(runtime_dir: &Path) -> Option<ClaudeSessionReport> {
 /// A payload without a transcript path is not an error worth failing a hook
 /// over — the provider ran, it simply told us nothing usable — so it becomes
 /// `None` and the caller writes nothing.
-pub fn report_from_payload(payload: &serde_json::Value, now_unix_ms: u128) -> Option<ClaudeSessionReport> {
+pub fn report_from_payload(
+    payload: &serde_json::Value,
+    now_unix_ms: u128,
+) -> Option<ClaudeSessionReport> {
     let transcript_path = payload.get("transcript_path")?.as_str()?.trim();
     if transcript_path.is_empty() {
         return None;
@@ -240,7 +248,8 @@ mod tests {
 
     #[test]
     fn a_payload_becomes_a_report() {
-        let report = report_from_payload(&payload("/home/u/.claude/projects/-x/s.jsonl"), 7).unwrap();
+        let report =
+            report_from_payload(&payload("/home/u/.claude/projects/-x/s.jsonl"), 7).unwrap();
         assert_eq!(
             report.transcript_path,
             PathBuf::from("/home/u/.claude/projects/-x/s.jsonl")
@@ -278,8 +287,11 @@ mod tests {
         assert!(read_report(dir.path()).is_none(), "nothing reported yet");
 
         let report = report_from_payload(&payload("/t/s.jsonl"), 11).unwrap();
-        write_private_atomic(&report_path(dir.path()), &serde_json::to_vec(&report).unwrap())
-            .unwrap();
+        write_private_atomic(
+            &report_path(dir.path()),
+            &serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
 
         let read = read_report(dir.path()).unwrap();
         assert_eq!(read.transcript_path, PathBuf::from("/t/s.jsonl"));

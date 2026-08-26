@@ -19,7 +19,8 @@ function matches(
   paneStatuses: Record<string, string> | undefined,
   filter: Filter,
 ): boolean {
-  return filter === "all" || sessionActivityStatus(session, paneStatuses) === "idle";
+  const activity = sessionActivityStatus(session, paneStatuses);
+  return filter === "all" || activity === "idle" || activity === "pending";
 }
 
 function timestamp(value?: string | null): number {

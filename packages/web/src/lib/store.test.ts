@@ -181,6 +181,74 @@ describe('useStore', () => {
       }
     });
 
+    it('keeps a pending answer distinct from working and idle across live and snapshot updates', () => {
+      useStore.setState({
+        sessionId: 'current-session',
+        sessions: [{
+          id: 'current-session',
+          status: 'connected',
+          isActive: true,
+          isWorking: true,
+          panes: [{ pane_id: 7, kind: 'terminal', provider: 'claude', is_working: true }],
+        }],
+        workingPanesBySession: new Map([['current-session', new Set([7])]]),
+        paneStatuses: { '7': 'Working...' },
+      });
+
+      handleServerMessage({
+        type: 'pane_status',
+        session_id: 'current-session',
+        pane_id: 7,
+        pane_type: 'interactive',
+        status: 'Pending answer',
+      }, useStore.setState, useStore.getState);
+
+      let state = useStore.getState();
+      expect(state.sessions[0]?.isWorking).toBe(false);
+      expect(state.sessions[0]?.panes?.[0]).toMatchObject({
+        is_working: false,
+        awaiting_answer: true,
+      });
+      expect(state.sessions[0]?.panes?.[0]?.idle_since).toBeUndefined();
+      expect(state.workingPanesBySession.has('current-session')).toBe(false);
+      expect(state.paneStatuses['7']).toBe('Pending answer');
+
+      // A list refresh must restore the actionable state rather than clearing
+      // it as though the pane were idle.
+      useStore.setState({ paneStatuses: { '7': 'Stale working text' } });
+      handleServerMessage({
+        type: 'sessions',
+        sessions: [{
+          id: 'current-session',
+          status: 'connected',
+          is_active: true,
+          is_working: false,
+          panes: [{
+            pane_id: 7,
+            kind: 'terminal',
+            provider: 'claude',
+            is_working: false,
+            awaiting_answer: true,
+          }],
+        }],
+      }, useStore.setState, useStore.getState);
+      expect(useStore.getState().paneStatuses['7']).toBe('Pending answer');
+
+      handleServerMessage({
+        type: 'pane_status',
+        session_id: 'current-session',
+        pane_id: 7,
+        pane_type: 'interactive',
+        status: 'Working...',
+      }, useStore.setState, useStore.getState);
+      state = useStore.getState();
+      expect(state.sessions[0]?.isWorking).toBe(true);
+      expect(state.sessions[0]?.panes?.[0]).toMatchObject({
+        is_working: true,
+        awaiting_answer: false,
+      });
+    });
+
     it('uses an explicit terminal completion as a redundant working-state clear', () => {
       useStore.setState({
         sessionId: 'current-session',
