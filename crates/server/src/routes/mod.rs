@@ -110,6 +110,46 @@ pub fn create_router(state: AppState) -> Router {
         // Virtual-cluster self-service: every active account administers the
         // machines it registered and the projects hosted on them.
         .route("/cluster/overview", get(cluster::overview))
+        .route("/clusters", get(cluster::list_clusters))
+        .route(
+            "/cluster/invitations",
+            get(cluster::list_invitations).post(cluster::create_invitation),
+        )
+        .route(
+            "/cluster/invitations/:invitation_id",
+            delete(cluster::revoke_invitation),
+        )
+        .route("/cluster/members", get(cluster::list_members))
+        .route("/cluster/members/:user_id", delete(cluster::revoke_member))
+        .route(
+            "/cluster-invitations/:token",
+            get(cluster::inspect_invitation),
+        )
+        .route(
+            "/cluster-invitations/:token/accept",
+            post(cluster::accept_invitation),
+        )
+        .route(
+            "/clusters/:cluster_owner_user_id/overview",
+            get(cluster::context_overview),
+        )
+        .route(
+            "/clusters/:cluster_owner_user_id/projects",
+            get(cluster::context_list_projects),
+        )
+        .route(
+            "/clusters/:cluster_owner_user_id/projects/:project_id",
+            get(cluster::context_get_project),
+        )
+        .route(
+            "/clusters/:cluster_owner_user_id/policy/default",
+            get(cluster::context_get_default_policy),
+        )
+        .route(
+            "/clusters/:cluster_owner_user_id/usage",
+            get(cluster::cluster_usage),
+        )
+        .route("/cluster/usage", get(cluster::own_cluster_usage))
         .route("/cluster/projects", get(cluster::list_projects))
         .route("/cluster/projects/:project_id", get(cluster::get_project))
         .route(
@@ -159,6 +199,7 @@ pub fn create_router(state: AppState) -> Router {
             "/projects/:project_id/deletion",
             get(projects::deletion_status),
         )
+        .route("/projects/:project_id/usage", get(cluster::project_usage))
         // Session sharing routes
         .route("/share/generate", post(share::generate_code))
         .route("/share/redeem", post(share::redeem_code))
@@ -388,6 +429,11 @@ mod cluster_authorization_tests {
             })
             .await
             .unwrap();
+        state
+            .db
+            .add_project_cluster_placement("project-a", "host", "host", "test")
+            .await
+            .unwrap();
 
         // The hosting account administers a project another account owns,
         // without being a member of it.
@@ -503,7 +549,7 @@ mod cluster_authorization_tests {
             "a rejected control-plane mutation is not a successful audit event",
         );
 
-        cluster::update_policy(
+        let _ = cluster::update_policy(
             State(state.clone()),
             headers(&state, "owner"),
             Path("project-a".to_string()),
@@ -614,6 +660,163 @@ mod cluster_authorization_tests {
             .is_ok());
         // And it is still not an account credential.
         assert!(authz::require_active_user(&fresh, &state).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn shared_cluster_routes_separate_membership_from_project_and_owner_authority() {
+        let state = state().await;
+        for user in ["owner", "member", "other", "suspended"] {
+            add_user(
+                &state,
+                user,
+                "user",
+                if user == "suspended" {
+                    "suspended"
+                } else {
+                    "active"
+                },
+            )
+            .await;
+        }
+
+        let create = cluster::CreateSharedClusterInvitationRequest {
+            email: "member@test".to_string(),
+            trust_confirmed: true,
+            expires_in_hours: Some(24),
+        };
+        let response = cluster::create_invitation(
+            State(state.clone()),
+            headers(&state, "owner"),
+            Json(create),
+        )
+        .await
+        .unwrap()
+        .0;
+        let serialized = serde_json::to_value(&response).unwrap();
+        assert!(serialized.get("token_hash").is_none());
+        assert!(serialized["invitation"].get("token_hash").is_none());
+
+        assert!(cluster::inspect_invitation(
+            State(state.clone()),
+            headers(&state, "other"),
+            Path(response.token.clone()),
+        )
+        .await
+        .is_err());
+        assert!(cluster::accept_invitation(
+            State(state.clone()),
+            headers(&state, "member"),
+            Path(response.token.clone()),
+            Json(cluster::AcceptSharedClusterInvitationRequest {
+                trust_confirmed: false,
+            }),
+        )
+        .await
+        .is_err());
+        let _ = cluster::accept_invitation(
+            State(state.clone()),
+            headers(&state, "member"),
+            Path(response.token.clone()),
+            Json(cluster::AcceptSharedClusterInvitationRequest {
+                trust_confirmed: true,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(cluster::accept_invitation(
+            State(state.clone()),
+            headers(&state, "member"),
+            Path(response.token),
+            Json(cluster::AcceptSharedClusterInvitationRequest {
+                trust_confirmed: true,
+            }),
+        )
+        .await
+        .is_err());
+
+        for (project, project_owner) in [
+            ("member-project", "member"),
+            ("owner-project", "owner"),
+            ("unrelated-project", "other"),
+        ] {
+            state
+                .db
+                .authorize_project_registration(project, project_owner)
+                .await
+                .unwrap();
+            state
+                .db
+                .add_project_cluster_placement(project, "owner", "owner", "test")
+                .await
+                .unwrap();
+        }
+
+        let member_projects = cluster::context_list_projects(
+            State(state.clone()),
+            headers(&state, "member"),
+            Path("owner".to_string()),
+            Query(admin::PageQuery::default()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(member_projects.items.len(), 1);
+        assert_eq!(member_projects.items[0].project.id, "member-project");
+
+        let owner_projects = cluster::context_list_projects(
+            State(state.clone()),
+            headers(&state, "owner"),
+            Path("owner".to_string()),
+            Query(admin::PageQuery::default()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(owner_projects.items.len(), 3);
+        assert!(cluster::cluster_usage(
+            State(state.clone()),
+            headers(&state, "member"),
+            Path("owner".to_string()),
+            Query(admin::PageQuery::default()),
+        )
+        .await
+        .is_err());
+        let _ = cluster::project_usage(
+            State(state.clone()),
+            headers(&state, "member"),
+            Path("member-project".to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(cluster::project_usage(
+            State(state.clone()),
+            headers(&state, "member"),
+            Path("unrelated-project".to_string()),
+        )
+        .await
+        .is_err());
+
+        let _ = cluster::revoke_member(
+            State(state.clone()),
+            headers(&state, "owner"),
+            Path("member".to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(cluster::context_overview(
+            State(state.clone()),
+            headers(&state, "member"),
+            Path("owner".to_string()),
+        )
+        .await
+        .is_err());
+        assert!(cluster::context_overview(
+            State(state.clone()),
+            headers(&state, "suspended"),
+            Path("owner".to_string()),
+        )
+        .await
+        .is_err());
     }
 }
 
@@ -919,6 +1122,24 @@ mod mobile_websocket_load_tests {
             .unwrap();
         db.add_project_member(&owner_id.to_string(), project_id, &member_id.to_string())
             .await
+            .unwrap();
+        // Runtime use on another account's host now requires both ordinary
+        // project access and current membership in that hosting cluster.
+        let cluster_invitation_hash = uuid::Uuid::new_v4().to_string();
+        db.create_shared_cluster_invitation(
+            &uuid::Uuid::new_v4().to_string(),
+            &cluster_invitation_hash,
+            &owner_id.to_string(),
+            "mutation-mobile@example.test",
+            &(chrono::Utc::now() + chrono::Duration::hours(1))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string(),
+        )
+        .await
+        .unwrap();
+        db.accept_shared_cluster_invitation(&cluster_invitation_hash, &member_id.to_string())
+            .await
+            .unwrap()
             .unwrap();
         let cli_id = uuid::Uuid::new_v4();
         let session_id = uuid::Uuid::new_v4();

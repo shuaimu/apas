@@ -396,6 +396,92 @@ describe("MachinesPage cluster administration", () => {
     expect(await screen.findByText("project.runtime_stopped")).toBeTruthy();
   });
 
+  it("refreshes owner membership state after revocation", async () => {
+    let memberActive = true;
+    fetchMock.mockImplementation(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (init?.method === "DELETE" && url.endsWith("/cluster/members/member-1")) {
+        memberActive = false;
+        return apiResponse({ success: true });
+      }
+      if (url.endsWith("/clusters")) return apiResponse([
+        { owner_user_id: "me", owner_email: "me@example.com", access: "owner" },
+      ]);
+      if (url.includes("/cluster/projects?")) return apiResponse({ items: [], limit: 200, offset: 0 });
+      if (url.endsWith("/cluster/policy/default")) return apiResponse({ cluster: null, deployment: policy });
+      if (url.endsWith("/cluster/launch-profiles")) return apiResponse([]);
+      if (url.includes("/cluster/audit")) return apiResponse({ items: [], limit: 25, offset: 0 });
+      if (url.endsWith("/cluster/invitations")) return apiResponse([{
+        id: "invite-1",
+        invitee_email: "pending@example.com",
+        expires_at: "2026-09-01T00:00:00Z",
+        status: "pending",
+      }]);
+      if (url.endsWith("/cluster/members")) return apiResponse(memberActive ? [{
+        user_id: "member-1",
+        user_email: "member@example.com",
+        status: "active",
+      }] : []);
+      if (url.includes("/cluster/usage")) return apiResponse({ success: true });
+      return apiResponse({ success: true });
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    seedMachines();
+    render(<MachinesPage />);
+
+    expect(await screen.findByText("pending@example.com")).toBeTruthy();
+    expect(await screen.findByText("member@example.com")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Revoke access" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "https://apas.mpaxos.com/cluster/members/member-1",
+      expect.objectContaining({ method: "DELETE" }),
+    ));
+    expect(await screen.findByText("No one has joined this cluster.")).toBeTruthy();
+    expect(screen.queryByText("member@example.com")).toBeNull();
+  });
+
+  it("renders usage windows and distinguishes unavailable cost from zero", async () => {
+    const counters = {
+      prompts: 2,
+      responses: 2,
+      input_tokens: 10,
+      output_tokens: 5,
+      cost_usd: 0,
+      cost_usd_reported: false,
+    };
+    fetchMock.mockImplementation(async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith("/clusters")) return apiResponse([
+        { owner_user_id: "me", owner_email: "me@example.com", access: "owner" },
+      ]);
+      if (url.includes("/cluster/projects?")) return apiResponse({ items: [], limit: 200, offset: 0 });
+      if (url.endsWith("/cluster/policy/default")) return apiResponse({ cluster: null, deployment: policy });
+      if (url.endsWith("/cluster/launch-profiles")) return apiResponse([]);
+      if (url.includes("/cluster/audit")) return apiResponse({ items: [], limit: 25, offset: 0 });
+      if (url.endsWith("/cluster/invitations") || url.endsWith("/cluster/members")) return apiResponse([]);
+      if (url.includes("/cluster/usage")) return apiResponse({
+        lifetime: counters,
+        last_7d: counters,
+        today: counters,
+        projects: [{
+          project_id: "member-project",
+          project_name: "Member project",
+          owner_email: "member@example.com",
+          usage: { lifetime: counters, last_7d: counters, today: counters },
+        }],
+      });
+      return apiResponse({ success: true });
+    });
+    seedMachines();
+    render(<MachinesPage />);
+
+    expect(await screen.findByText("Cluster usage")).toBeTruthy();
+    expect(await screen.findByText("Member project")).toBeTruthy();
+    expect(screen.getAllByText("Unavailable").length).toBeGreaterThan(0);
+    fireEvent.change(screen.getByLabelText("Usage window"), { target: { value: "today" } });
+    expect((screen.getByLabelText("Usage window") as HTMLSelectElement).value).toBe("today");
+  });
+
   it("surfaces the server's refusal for a project outside this cluster", async () => {
     seedMachines();
     installClusterApi({ projectDenied: true });
@@ -404,5 +490,36 @@ describe("MachinesPage cluster administration", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Manage mako-soumojit" }));
     expect(await screen.findByText("That project is not in your cluster")).toBeTruthy();
     expect(screen.queryByText("Members")).toBeNull();
+  });
+
+  it("renders a shared cluster without owner-only controls or secrets", async () => {
+    fetchMock.mockImplementation(async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith("/clusters")) return apiResponse([
+        { owner_user_id: "me", owner_email: "me@example.com", access: "owner" },
+        { owner_user_id: "host", owner_email: "host@example.com", access: "member" },
+      ]);
+      if (url.includes("/clusters/host/projects?")) return apiResponse({ items: [], limit: 200, offset: 0 });
+      if (url.endsWith("/clusters/host/policy/default")) return apiResponse({ cluster: null, deployment: policy });
+      if (url.endsWith("/cluster/launch-profiles")) return apiResponse([]);
+      if (url.includes("/cluster/projects?")) return apiResponse({ items: [], limit: 200, offset: 0 });
+      if (url.endsWith("/cluster/policy/default")) return apiResponse({ cluster: null, deployment: policy });
+      if (url.includes("/cluster/audit")) return apiResponse({ items: [], limit: 25, offset: 0 });
+      return apiResponse({ success: true });
+    });
+    const shared = machineAt("shared-machine", "host-box", "26.08.74");
+    shared.clusterOwnerUserId = "host";
+    shared.clusterAccess = "member";
+    shared.sharedProvisioningAvailable = true;
+    seedMachines([shared]);
+    render(<MachinesPage />);
+
+    const selector = await screen.findByLabelText("Selected cluster");
+    fireEvent.change(selector, { target: { value: "host" } });
+    expect(await screen.findByText("Trusted compute boundary")).toBeTruthy();
+    expect(screen.queryByText("DeepSeek Backend (Claude Runtime)")).toBeNull();
+    expect(screen.queryByText("Cluster default policy")).toBeNull();
+    expect(screen.queryByText("Cluster activity")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Restart daemon on host-box/ })).toBeNull();
   });
 });

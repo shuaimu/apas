@@ -187,6 +187,90 @@ pub struct ProjectMember {
     pub created_at: Option<String>,
 }
 
+/// A user's accepted relationship to another account-owned virtual cluster.
+/// The owner is implicit and never receives a membership row.
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct ClusterMembership {
+    pub cluster_owner_user_id: String,
+    pub cluster_owner_email: String,
+    pub user_id: String,
+    pub user_email: String,
+    pub status: String,
+    pub invited_at: Option<String>,
+    pub accepted_at: Option<String>,
+    pub revoked_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct SharedClusterInvitation {
+    pub id: String,
+    pub cluster_owner_user_id: String,
+    pub cluster_owner_email: String,
+    pub invitee_user_id: String,
+    pub invitee_email: String,
+    pub expires_at: String,
+    pub accepted_at: Option<String>,
+    pub revoked_at: Option<String>,
+    pub created_at: Option<String>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct ProjectClusterPlacement {
+    pub project_id: String,
+    pub cluster_owner_user_id: String,
+    pub created_by_user_id: String,
+    pub source: String,
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct ClusterReference {
+    pub owner_user_id: String,
+    pub owner_email: String,
+    pub access: String,
+    pub accepted_at: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct ProjectProvisioningRequest {
+    pub request_id: String,
+    pub requester_user_id: String,
+    pub cluster_owner_user_id: String,
+    pub machine_id: String,
+    pub request_fingerprint: String,
+    pub git_remote: String,
+    pub clone_url: String,
+    pub instance_name: String,
+    pub branch: String,
+    pub project_id: String,
+    pub status: String,
+    pub result_path: Option<String>,
+    pub error_message: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterProjectUsage {
+    pub project_id: String,
+    pub project_name: Option<String>,
+    pub owner_user_id: String,
+    pub owner_email: String,
+    pub usage: shared::ProjectUsageStats,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ClusterUsageReport {
+    pub cluster_owner_user_id: String,
+    pub projects: Vec<ClusterProjectUsage>,
+    pub lifetime: shared::UsageCounters,
+    pub last_7d: shared::UsageCounters,
+    pub today: shared::UsageCounters,
+    pub last_active: Option<String>,
+}
+
 #[derive(Debug, Clone, FromRow)]
 pub struct ClusterInvitation {
     pub code: String,
@@ -374,6 +458,8 @@ pub struct PaneUsageDayRow {
     pub cache_creation_tokens: i64,
     #[sqlx(default)]
     pub total_cost_usd: f64,
+    #[sqlx(default)]
+    pub cost_reported_count: i64,
     #[sqlx(default)]
     pub num_responses: i64,
     #[sqlx(default)]

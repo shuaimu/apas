@@ -1,7 +1,9 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
 use shared::{
-    DaemonToServer, DeepseekBackendInfo, MachineInfo, MachineProjectInfo, ServerToDaemon,
+    DaemonToServer, DeepseekBackendInfo, MachineInfo, MachineProjectInfo, ProjectProvisioningMode,
+    ServerToDaemon,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -28,6 +30,13 @@ const USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const VERSION: &str = env!("APAS_VERSION");
 const TMUX_SESSION_PREFIX: &str = "apas";
 const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com/anthropic";
+const PROVISIONING_RECEIPT: &str = ".apas-provisioning.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ProvisioningReceipt {
+    request_id: String,
+    project_id: String,
+}
 
 fn resolve_user_shell_path() -> Option<String> {
     let shell = std::env::var("SHELL")
@@ -820,15 +829,35 @@ impl DaemonState {
         base_path: Option<&str>,
         server_url: &str,
         token: &str,
+        request_id: Option<&str>,
+        reserved_project_id: Option<&str>,
+        provisioning_mode: ProjectProvisioningMode,
     ) -> Result<(String, String)> {
         // Projects root: an explicit base_path (with leading ~ expanded against
         // THIS machine's $HOME), else ~/apas_projects.
-        let root = match base_path {
-            Some(p) if !p.trim().is_empty() => expand_tilde(p.trim()),
-            _ => dirs::home_dir()
-                .ok_or_else(|| anyhow::anyhow!("could not resolve home directory"))?
-                .join("apas_projects"),
+        let managed_root = dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("could not resolve home directory"))?
+            .join("apas_projects");
+        let root = if provisioning_mode == ProjectProvisioningMode::PublicGithub {
+            managed_root
+        } else {
+            match base_path {
+                Some(p) if !p.trim().is_empty() => expand_tilde(p.trim()),
+                _ => managed_root,
+            }
         };
+
+        if provisioning_mode == ProjectProvisioningMode::PublicGithub {
+            let request_id = request_id.context("shared provisioning request id is required")?;
+            let project_id = reserved_project_id.context("reserved project id is required")?;
+            Uuid::parse_str(project_id).context("reserved project id is invalid")?;
+            if let Some(existing) = find_provisioning_receipt(&root, request_id, project_id)? {
+                return Ok((
+                    project_id.to_string(),
+                    existing.to_string_lossy().to_string(),
+                ));
+            }
+        }
         let name = crate::worktree::sanitize_instance_name(instance_name);
         let dest = crate::worktree::unique_dir(&root.join(&name));
 
@@ -837,14 +866,23 @@ impl DaemonState {
             std::fs::create_dir_all(parent)?;
         }
 
-        let url = self.resolve_clone_url(git_remote, clone_url);
+        let url = if provisioning_mode == ProjectProvisioningMode::PublicGithub {
+            let submitted = clone_url.context("public GitHub clone URL is required")?;
+            shared::parse_public_github_repository(submitted)?.clone_url()
+        } else {
+            self.resolve_clone_url(git_remote, clone_url)
+        };
 
         // Clone + branch + register. If any of these PRE-registration steps
         // fail, remove the partial clone so retries don't accumulate orphan
         // directories (unique_dir would otherwise auto-suffix forever).
         let safe_branch = crate::worktree::sanitize_branch_name(branch);
         let metadata = match (|| {
-            crate::worktree::clone_repo(&url, &dest)?;
+            if provisioning_mode == ProjectProvisioningMode::PublicGithub {
+                crate::worktree::clone_public_repo(&url, &dest)?;
+            } else {
+                crate::worktree::clone_repo(&url, &dest)?;
+            }
             let created_branch = crate::worktree::checkout_unique_branch(&dest, &safe_branch)?;
             tracing::info!(
                 "Cloned {} into {} on branch {}",
@@ -852,7 +890,29 @@ impl DaemonState {
                 dest.display(),
                 created_branch
             );
-            crate::project::get_or_create_project(&dest)
+            if provisioning_mode == ProjectProvisioningMode::PublicGithub {
+                let request_id = request_id.expect("validated shared request id");
+                let project_id =
+                    Uuid::parse_str(reserved_project_id.expect("validated shared project id"))?;
+                let receipt = ProvisioningReceipt {
+                    request_id: request_id.to_string(),
+                    project_id: project_id.to_string(),
+                };
+                std::fs::write(
+                    dest.join(PROVISIONING_RECEIPT),
+                    serde_json::to_vec_pretty(&receipt)?,
+                )?;
+                let metadata = crate::project::ProjectMetadata::with_id_and_name(
+                    project_id,
+                    dest.file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_string),
+                );
+                crate::project::save_project(&dest, &metadata)?;
+                Ok(metadata)
+            } else {
+                crate::project::get_or_create_project(&dest)
+            }
         })() {
             Ok(metadata) => metadata,
             Err(err) => {
@@ -861,21 +921,43 @@ impl DaemonState {
             }
         };
 
-        // The instance now exists and is registered. A start failure is NOT a
+        // The instance now exists and is registered. Shared provisioning is
+        // deliberately split: the server first commits project ownership and
+        // placement, then sends StartProjectCli as a separate command.
         // create failure — surface it as a warning (the project shows on the
         // machines page with last_error and can be started there) so the user
         // doesn't get a "failed" toast for an instance that was created.
         let project_id = metadata.id.to_string();
         self.refresh_projects();
-        if let Err(err) = self.start_project(&project_id, server_url, token, restart_tx) {
-            tracing::warn!(
-                "Created instance {} but failed to auto-start it: {}",
-                project_id,
-                err
-            );
+        if provisioning_mode == ProjectProvisioningMode::TrustedOwner {
+            if let Err(err) = self.start_project(&project_id, server_url, token, restart_tx) {
+                tracing::warn!(
+                    "Created instance {} but failed to auto-start it: {}",
+                    project_id,
+                    err
+                );
+            }
         }
 
         Ok((project_id, dest.to_string_lossy().to_string()))
+    }
+
+    fn discard_project_provisioning(&mut self, request_id: &str, project_id: &str) -> Result<bool> {
+        let root = dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("could not resolve home directory"))?
+            .join("apas_projects");
+        let Some(path) = find_provisioning_receipt(&root, request_id, project_id)? else {
+            return Ok(false);
+        };
+        let parsed_project_id = Uuid::parse_str(project_id)?;
+        anyhow::ensure!(
+            crate::project::read_project_id(&path) == Some(parsed_project_id),
+            "provisioning metadata does not match"
+        );
+        let _ = crate::project::unregister_project(&path, parsed_project_id)?;
+        std::fs::remove_dir_all(&path)?;
+        self.refresh_projects();
+        Ok(true)
     }
 
     /// Resolve a cloneable URL for the canonical `git_remote` (host/owner/repo):
@@ -899,6 +981,43 @@ impl DaemonState {
         }
         format!("https://{}.git", git_remote.trim_matches('/'))
     }
+}
+
+fn find_provisioning_receipt(
+    root: &Path,
+    request_id: &str,
+    project_id: &str,
+) -> Result<Option<PathBuf>> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Ok(None);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(path.join(PROVISIONING_RECEIPT)) else {
+            continue;
+        };
+        let Ok(receipt) = serde_json::from_slice::<ProvisioningReceipt>(&raw) else {
+            continue;
+        };
+        if receipt.request_id == request_id && receipt.project_id == project_id {
+            let canonical_root = std::fs::canonicalize(root)?;
+            let canonical_path = std::fs::canonicalize(&path)?;
+            anyhow::ensure!(
+                canonical_path.parent() == Some(canonical_root.as_path()),
+                "provisioning checkout escaped managed root"
+            );
+            anyhow::ensure!(
+                crate::project::read_project_id(&canonical_path)
+                    .is_some_and(|id| id.to_string() == project_id),
+                "provisioning receipt metadata does not match"
+            );
+            return Ok(Some(canonical_path));
+        }
+    }
+    Ok(None)
 }
 
 /// Expand a leading `~` / `~/` in `p` against this machine's $HOME.
@@ -1086,6 +1205,7 @@ async fn run_connection(
         capabilities: vec![
             shared::PROJECT_POLICY_CAPABILITY.to_string(),
             shared::PANE_HOST_CLEANUP_ACK_CAPABILITY.to_string(),
+            shared::SHARED_PROJECT_PROVISIONING_CAPABILITY.to_string(),
         ],
     };
     ws_sender
@@ -1245,6 +1365,8 @@ async fn run_connection(
                                 clone_url,
                                 base_path,
                                 request_id,
+                                project_id,
+                                provisioning_mode,
                             } => {
                                 // NOTE: clone runs inline on the message loop; a
                                 // very large clone briefly delays heartbeats.
@@ -1258,6 +1380,9 @@ async fn run_connection(
                                     base_path.as_deref(),
                                     server_url,
                                     token,
+                                    request_id.as_deref(),
+                                    project_id.as_deref(),
+                                    provisioning_mode,
                                 ) {
                                     Ok((project_id, path)) => {
                                         tracing::info!(
@@ -1278,7 +1403,13 @@ async fn run_connection(
                                             request_id,
                                             project_id: None,
                                             path: None,
-                                            error: Some(err.to_string()),
+                                            error: Some(if provisioning_mode
+                                                == ProjectProvisioningMode::PublicGithub
+                                            {
+                                                shared::scrub_shared_clone_error(&err).to_string()
+                                            } else {
+                                                err.to_string()
+                                            }),
                                         }
                                     }
                                 };
@@ -1290,6 +1421,36 @@ async fn run_connection(
                                 };
                                 ws_sender
                                     .send(Message::Text(serde_json::to_string(&update)?.into()))
+                                    .await?;
+                            }
+                            ServerToDaemon::DiscardProjectProvisioning {
+                                request_id,
+                                project_id,
+                            } => {
+                                let result =
+                                    state.discard_project_provisioning(&request_id, &project_id);
+                                let ack = match result {
+                                    Ok(discarded) => DaemonToServer::ProjectProvisioningDiscarded {
+                                        request_id,
+                                        project_id,
+                                        discarded,
+                                        error: None,
+                                    },
+                                    Err(error) => {
+                                        tracing::warn!(%error, "provisioning cleanup failed");
+                                        DaemonToServer::ProjectProvisioningDiscarded {
+                                            request_id,
+                                            project_id,
+                                            discarded: false,
+                                            error: Some(
+                                                "Provisioning cleanup could not be completed"
+                                                    .to_string(),
+                                            ),
+                                        }
+                                    }
+                                };
+                                ws_sender
+                                    .send(Message::Text(serde_json::to_string(&ack)?.into()))
                                     .await?;
                             }
                             ServerToDaemon::RebootDaemon => {
@@ -1388,6 +1549,50 @@ async fn refresh_usage_limits_cache() {
     match crate::usage::refresh_codex_usage_limits().await {
         Ok(_) => tracing::debug!("Refreshed Codex usage limits cache"),
         Err(err) => tracing::debug!("Failed to refresh Codex usage limits cache: {}", err),
+    }
+}
+
+#[cfg(test)]
+mod shared_provisioning_tests {
+    use super::*;
+
+    #[test]
+    fn provisioning_receipts_are_idempotent_and_bound_to_both_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout = root.path().join("repo");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let project_id = Uuid::new_v4();
+        let metadata =
+            crate::project::ProjectMetadata::with_id_and_name(project_id, Some("repo".to_string()));
+        std::fs::write(
+            checkout.join(".apas"),
+            serde_json::to_vec_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            checkout.join(PROVISIONING_RECEIPT),
+            serde_json::to_vec_pretty(&ProvisioningReceipt {
+                request_id: "request-a".to_string(),
+                project_id: project_id.to_string(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            find_provisioning_receipt(root.path(), "request-a", &project_id.to_string()).unwrap(),
+            Some(std::fs::canonicalize(&checkout).unwrap())
+        );
+        assert!(
+            find_provisioning_receipt(root.path(), "request-b", &project_id.to_string())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            find_provisioning_receipt(root.path(), "request-a", &Uuid::new_v4().to_string())
+                .unwrap()
+                .is_none()
+        );
     }
 }
 

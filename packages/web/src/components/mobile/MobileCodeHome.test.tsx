@@ -61,6 +61,7 @@ function renderHome(overrides: Partial<MobileCodeHomeProps> = {}) {
 
 afterEach(() => {
   cleanup();
+  window.localStorage.removeItem("apas_mobile_cluster_owner");
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
@@ -697,6 +698,68 @@ describe("MobileCodeHome", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Machines" }));
     expect(await screen.findByText("No machines yet")).toBeTruthy();
+  });
+
+  it("labels shared compute and never exposes its owner-only reboot control", async () => {
+    stubBootstrap({
+      sessions: [],
+      machines: [{
+        machine: { machine_id: "shared-machine", hostname: "owner-host", last_seen: new Date().toISOString() },
+        projects: [],
+        cluster_owner_user_id: "owner-id",
+        cluster_access: "member",
+        shared_provisioning_available: true,
+      }],
+    });
+    renderHome({ active: true });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Machines" }));
+    expect(await screen.findByText(/Shared projects run on the owner/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Reboot the daemon on owner-host/ })).toBeNull();
+    expect(screen.getByRole("button", { name: /Create project from GitHub/ })).toBeTruthy();
+  });
+
+  it("retains the selected shared cluster after mobile navigation remounts the home", async () => {
+    const bootstrap = {
+      sessions: [],
+      machines: [
+        {
+          machine: { machine_id: "owned-machine", hostname: "mine", last_seen: new Date().toISOString() },
+          projects: [],
+          cluster_access: "owner",
+        },
+        {
+          machine: { machine_id: "shared-machine", hostname: "shared", last_seen: new Date().toISOString() },
+          projects: [],
+          cluster_owner_user_id: "owner-id",
+          cluster_access: "member",
+          shared_provisioning_available: true,
+        },
+      ],
+    };
+    stubBootstrap(bootstrap);
+    const props: MobileCodeHomeProps = {
+      active: true,
+      connected: true,
+      legacySessions: [],
+      token: "token",
+      onAccount: vi.fn(),
+      onManageMachines: vi.fn(),
+      onOpenSession: vi.fn(),
+      onRebootDaemon: vi.fn(),
+    };
+    const first = render(<MobileCodeHome {...props} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Machines" }));
+    fireEvent.change(screen.getByLabelText("Mobile selected cluster"), { target: { value: "owner-id" } });
+    expect(await screen.findByText("shared")).toBeTruthy();
+    first.unmount();
+
+    render(<MobileCodeHome {...props} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Machines" }));
+    expect((screen.getByLabelText("Mobile selected cluster") as HTMLSelectElement).value).toBe("owner-id");
+    expect(await screen.findByText("shared")).toBeTruthy();
+    expect(screen.queryByText("mine")).toBeNull();
   });
 
   it("keeps Account and machine management reachable without permanent bars", () => {

@@ -109,6 +109,11 @@ pub struct SessionManager {
     /// only return owner machines and shared entries (like a teammate's
     /// daemon) would visibly disappear between user-initiated refreshes.
     shared_project_refs: DashMap<Uuid, (HashSet<(String, String)>, HashSet<String>)>,
+    /// Last DB-authorized shared-cluster projection per viewer. Values map a
+    /// cluster-owner machine to the exact project IDs visible to that member;
+    /// an empty set still exposes the redacted machine as a provisioning
+    /// target. HTTP revocation clears this cache immediately.
+    shared_cluster_machine_access: DashMap<Uuid, HashMap<Uuid, HashSet<String>>>,
     /// Recently stored web-input ids per session: (client_msg_id, created_at).
     /// Idempotency guard — the web client retransmits unacked inputs (3s
     /// retry + reconnect replay), and without this each retransmit was
@@ -320,6 +325,7 @@ impl SessionManager {
             machine_infos: DashMap::new(),
             machine_projects: DashMap::new(),
             shared_project_refs: DashMap::new(),
+            shared_cluster_machine_access: DashMap::new(),
             recent_input_ids: DashMap::new(),
             pending_terminal_transcript_echoes: DashMap::new(),
             pending_decisions: DashMap::new(),
@@ -654,6 +660,22 @@ impl SessionManager {
             self.shared_project_refs
                 .insert(user_id, (host_path_refs, wildcard_paths));
         }
+    }
+
+    pub fn set_shared_cluster_machine_access(
+        &self,
+        user_id: Uuid,
+        access: HashMap<Uuid, HashSet<String>>,
+    ) {
+        if access.is_empty() {
+            self.shared_cluster_machine_access.remove(&user_id);
+        } else {
+            self.shared_cluster_machine_access.insert(user_id, access);
+        }
+    }
+
+    pub fn clear_shared_cluster_machine_access(&self, user_id: &Uuid) {
+        self.shared_cluster_machine_access.remove(user_id);
     }
 
     #[cfg(test)]
@@ -1045,6 +1067,7 @@ impl SessionManager {
             self.unregister_cli(&cli_id);
         }
         self.shared_project_refs.remove(user_id);
+        self.shared_cluster_machine_access.remove(user_id);
         self.notify_project_access_changed(user_id, project_id, ProjectAccessChange::Revoked, None);
         affected
     }
@@ -1512,6 +1535,29 @@ impl SessionManager {
         }
     }
 
+    pub fn relay_project_instance_created_to_user(
+        &self,
+        user_id: &Uuid,
+        machine_id: &Uuid,
+        request_id: Option<String>,
+        project_id: Option<String>,
+        error: Option<String>,
+    ) {
+        let msg = ServerToWeb::ProjectInstanceCreated {
+            machine_id: *machine_id,
+            request_id,
+            project_id,
+            error,
+        };
+        for web_entry in self.web_users.iter() {
+            if *web_entry.value() == *user_id {
+                if let Some(sender) = self.web_senders.get(web_entry.key()) {
+                    let _ = sender.try_send(msg.clone());
+                }
+            }
+        }
+    }
+
     pub fn get_machines_for_user(&self, user_id: &Uuid) -> Vec<MachineWithProjects> {
         self.machine_infos
             .iter()
@@ -1523,6 +1569,12 @@ impl SessionManager {
             })
             .map(|entry| self.build_machine_with_projects(*entry.key(), entry.value()))
             .collect()
+    }
+
+    /// Authenticated account that owns a connected daemon. Callers must still
+    /// apply persisted cluster membership and project-placement checks.
+    pub fn daemon_owner(&self, machine_id: &Uuid) -> Option<Uuid> {
+        self.daemon_users.get(machine_id).map(|owner| *owner)
     }
 
     fn build_machine_with_projects(
@@ -1561,6 +1613,14 @@ impl SessionManager {
         MachineWithProjects {
             machine: machine.clone(),
             projects,
+            cluster_owner_user_id: self
+                .daemon_owner(&machine_id)
+                .map(|owner| owner.to_string()),
+            cluster_access: shared::MachineClusterAccess::Owner,
+            shared_provisioning_available: self.daemon_supports_capability(
+                &machine_id,
+                shared::SHARED_PROJECT_PROVISIONING_CAPABILITY,
+            ),
         }
     }
 
@@ -1593,7 +1653,10 @@ impl SessionManager {
             .iter()
             .filter_map(|entry| {
                 let machine_id = *entry.key();
-                let machine = entry.value().clone();
+                let mut machine = entry.value().clone();
+                // Project-share viewers do not gain machine-owner provider
+                // configuration or credential visibility.
+                machine.deepseek_backend = None;
                 let host_key = normalize_machine_hostname(&machine.hostname);
 
                 let mut projects = self
@@ -1622,8 +1685,47 @@ impl SessionManager {
                 if projects.is_empty() {
                     None
                 } else {
-                    Some(MachineWithProjects { machine, projects })
+                    Some(MachineWithProjects {
+                        machine,
+                        projects,
+                        cluster_owner_user_id: self
+                            .daemon_owner(&machine_id)
+                            .map(|owner| owner.to_string()),
+                        cluster_access: shared::MachineClusterAccess::Member,
+                        shared_provisioning_available: false,
+                    })
                 }
+            })
+            .collect()
+    }
+
+    fn get_redacted_shared_cluster_machines(
+        &self,
+        access: &HashMap<Uuid, HashSet<String>>,
+    ) -> Vec<MachineWithProjects> {
+        access
+            .iter()
+            .filter_map(|(machine_id, project_ids)| {
+                let mut machine = self.machine_infos.get(machine_id)?.clone();
+                machine.deepseek_backend = None;
+                let mut projects = self
+                    .machine_projects
+                    .get(machine_id)
+                    .map(|projects| projects.clone())
+                    .unwrap_or_default();
+                projects.retain(|project| project_ids.contains(&project.project_id));
+                Some(MachineWithProjects {
+                    machine,
+                    projects,
+                    cluster_owner_user_id: self
+                        .daemon_owner(machine_id)
+                        .map(|owner| owner.to_string()),
+                    cluster_access: shared::MachineClusterAccess::Member,
+                    shared_provisioning_available: self.daemon_supports_capability(
+                        machine_id,
+                        shared::SHARED_PROJECT_PROVISIONING_CAPABILITY,
+                    ),
+                })
             })
             .collect()
     }
@@ -1651,7 +1753,7 @@ impl SessionManager {
         wildcard_paths.contains(&path_key) || host_path_refs.contains(&(host_key, path_key))
     }
 
-    fn broadcast_machines_update_for_user(&self, user_id: &Uuid) {
+    pub(crate) fn broadcast_machines_update_for_user(&self, user_id: &Uuid) {
         let mut machines = self.get_machines_for_user(user_id);
         // Union with shared-project-access machines so pushed broadcasts match
         // what `list_accessible_machines_for_user` returns on explicit refresh;
@@ -1666,6 +1768,17 @@ impl SessionManager {
                     if !owner_ids.contains(&machine.machine.machine_id) {
                         machines.push(machine);
                     }
+                }
+            }
+        }
+        if let Some(access) = self.shared_cluster_machine_access.get(user_id) {
+            let existing: HashSet<Uuid> = machines
+                .iter()
+                .map(|machine| machine.machine.machine_id)
+                .collect();
+            for machine in self.get_redacted_shared_cluster_machines(access.value()) {
+                if !existing.contains(&machine.machine.machine_id) {
+                    machines.push(machine);
                 }
             }
         }

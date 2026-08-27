@@ -7,6 +7,7 @@ use axum::{
 };
 use base64::Engine as _;
 use futures::{SinkExt, StreamExt};
+use sha2::{Digest, Sha256};
 use shared::{
     MessageInfo, ServerToCli, ServerToDaemon, ServerToWeb, SessionInfo, SessionStatus,
     TerminalLifecycle, WebToServer,
@@ -337,6 +338,56 @@ pub(crate) async fn list_accessible_machines_for_user(
     // deployment-wide branch here any more: an account sees its own cluster,
     // plus machines reachable through projects shared with it.
     let mut machines = state.sessions.get_machines_for_user(user_id);
+    let mut shared_cluster_access = std::collections::HashMap::new();
+    if let Ok(clusters) = state
+        .db
+        .list_accessible_clusters(&user_id.to_string())
+        .await
+    {
+        for cluster in clusters
+            .into_iter()
+            .filter(|cluster| cluster.access == "member")
+        {
+            let Ok(owner_id) = Uuid::parse_str(&cluster.owner_user_id) else {
+                continue;
+            };
+            for mut machine in state.sessions.get_machines_for_user(&owner_id) {
+                let mut project_ids = HashSet::new();
+                for project in &machine.projects {
+                    let placed = state
+                        .db
+                        .project_is_placed_in_cluster(&project.project_id, &cluster.owner_user_id)
+                        .await
+                        .unwrap_or(false);
+                    let project_access = state
+                        .db
+                        .get_project_role_for_user(&project.project_id, &user_id.to_string())
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some();
+                    if placed && project_access {
+                        project_ids.insert(project.project_id.clone());
+                    }
+                }
+                machine
+                    .projects
+                    .retain(|project| project_ids.contains(&project.project_id));
+                machine.machine.deepseek_backend = None;
+                machine.cluster_owner_user_id = Some(cluster.owner_user_id.clone());
+                machine.cluster_access = shared::MachineClusterAccess::Member;
+                machine.shared_provisioning_available = state.sessions.daemon_supports_capability(
+                    &machine.machine.machine_id,
+                    shared::SHARED_PROJECT_PROVISIONING_CAPABILITY,
+                );
+                shared_cluster_access.insert(machine.machine.machine_id, project_ids);
+                machines.push(machine);
+            }
+        }
+    }
+    state
+        .sessions
+        .set_shared_cluster_machine_access(*user_id, shared_cluster_access);
     let (host_path_refs, wildcard_paths) = get_shared_project_access_refs(state, user_id).await;
     // Cache the refs so heartbeat-driven `broadcast_machines_update_for_user`
     // can include shared machines too; without this, pushed updates between
@@ -365,11 +416,94 @@ pub(crate) async fn list_accessible_machines_for_user(
     machines
 }
 
+pub(crate) async fn has_machine_project_runtime_access(
+    state: &AppState,
+    user_id: &Uuid,
+    machine_id: &Uuid,
+    project_id: &str,
+) -> bool {
+    let Some(machine_owner) = state.sessions.daemon_owner(machine_id) else {
+        return false;
+    };
+    let machine_reports_project = state
+        .sessions
+        .get_machines_for_user(&machine_owner)
+        .into_iter()
+        .any(|machine| {
+            machine.machine.machine_id == *machine_id
+                && machine
+                    .projects
+                    .iter()
+                    .any(|project| project.project_id == project_id)
+        });
+    if !machine_reports_project
+        || !state
+            .db
+            .project_is_placed_in_cluster(project_id, &machine_owner.to_string())
+            .await
+            .unwrap_or(false)
+    {
+        return false;
+    }
+    if machine_owner == *user_id {
+        return true;
+    }
+    state
+        .db
+        .is_active_cluster_member(&machine_owner.to_string(), &user_id.to_string())
+        .await
+        .unwrap_or(false)
+        && state
+            .db
+            .get_project_role_for_user(project_id, &user_id.to_string())
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+}
+
+async fn resolve_project_creation_target(
+    state: &AppState,
+    requester: &Uuid,
+    machine_id: &Uuid,
+    selected_cluster_owner: Option<&str>,
+) -> Result<(Uuid, String, bool), &'static str> {
+    let machine_owner = state
+        .sessions
+        .daemon_owner(machine_id)
+        .ok_or("Machine not found")?;
+    let requested_cluster = selected_cluster_owner
+        .map(str::to_string)
+        .unwrap_or_else(|| machine_owner.to_string());
+    if requested_cluster != machine_owner.to_string() {
+        return Err("Machine does not belong to the selected cluster");
+    }
+    let shared_request = machine_owner != *requester;
+    if shared_request
+        && !state
+            .db
+            .is_active_cluster_member(&requested_cluster, &requester.to_string())
+            .await
+            .unwrap_or(false)
+    {
+        return Err("Active shared-cluster membership is required");
+    }
+    if shared_request
+        && !state
+            .sessions
+            .daemon_supports_capability(machine_id, shared::SHARED_PROJECT_PROVISIONING_CAPABILITY)
+    {
+        return Err("This machine must update APAS before members can create projects");
+    }
+    Ok((machine_owner, requested_cluster, shared_request))
+}
+
 #[cfg(test)]
 mod machine_access_tests {
     use super::*;
     use crate::config::Config;
     use crate::db::{Database, Session, User};
+    use chrono::{Duration, Utc};
 
     fn test_machine(machine_id: Uuid, hostname: &str) -> shared::MachineInfo {
         shared::MachineInfo {
@@ -437,6 +571,181 @@ mod machine_access_tests {
         let mut config = Config::default();
         config.database.path = db_path;
         AppState::new(db, config)
+    }
+
+    async fn join_cluster(state: &AppState, owner: Uuid, member: Uuid, email: &str) {
+        let token_hash = Uuid::new_v4().to_string();
+        state
+            .db
+            .create_shared_cluster_invitation(
+                &Uuid::new_v4().to_string(),
+                &token_hash,
+                &owner.to_string(),
+                email,
+                &(Utc::now() + Duration::hours(1))
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .accept_shared_cluster_invitation(&token_hash, &member.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    async fn provision_member_project(
+        state: &AppState,
+        owner: Uuid,
+        member: Uuid,
+        machine_id: Uuid,
+        project_id: &str,
+    ) {
+        let request_id = Uuid::new_v4().to_string();
+        state
+            .db
+            .claim_project_provisioning(
+                &request_id,
+                &member.to_string(),
+                &owner.to_string(),
+                &machine_id.to_string(),
+                "fingerprint",
+                "github.com/openai/codex",
+                "https://github.com/openai/codex.git",
+                "codex",
+                "apas/codex",
+                project_id,
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .mark_project_provisioning_cloned(&request_id, project_id, "/managed/codex")
+            .await
+            .unwrap();
+        state
+            .db
+            .finalize_project_provisioning(&request_id, &member.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_creation_rejects_forged_cluster_and_old_daemon() {
+        let state = test_state().await;
+        let owner = Uuid::new_v4();
+        let member = Uuid::new_v4();
+        state
+            .db
+            .create_user(&test_user(owner, "owner@example.test"))
+            .await
+            .unwrap();
+        state
+            .db
+            .create_user(&test_user(member, "member@example.test"))
+            .await
+            .unwrap();
+        join_cluster(&state, owner, member, "member@example.test").await;
+        let machine_id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel(1);
+        state.sessions.register_daemon(
+            machine_id,
+            owner,
+            tx,
+            test_machine(machine_id, "shared-host"),
+            Vec::new(),
+        );
+
+        assert_eq!(
+            resolve_project_creation_target(
+                &state,
+                &member,
+                &machine_id,
+                Some(&Uuid::new_v4().to_string()),
+            )
+            .await
+            .unwrap_err(),
+            "Machine does not belong to the selected cluster"
+        );
+        assert_eq!(
+            resolve_project_creation_target(
+                &state,
+                &member,
+                &machine_id,
+                Some(&owner.to_string()),
+            )
+            .await
+            .unwrap_err(),
+            "This machine must update APAS before members can create projects"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_cluster_projection_redacts_secrets_and_unrelated_projects_on_refresh_and_push()
+    {
+        let state = test_state().await;
+        let owner = Uuid::new_v4();
+        let member = Uuid::new_v4();
+        state
+            .db
+            .create_user(&test_user(owner, "owner@example.test"))
+            .await
+            .unwrap();
+        state
+            .db
+            .create_user(&test_user(member, "member@example.test"))
+            .await
+            .unwrap();
+        join_cluster(&state, owner, member, "member@example.test").await;
+        let machine_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4().to_string();
+        provision_member_project(&state, owner, member, machine_id, &project_id).await;
+        let mut machine = test_machine(machine_id, "shared-host");
+        machine.deepseek_backend = Some(shared::DeepseekBackendInfo {
+            api_base_url: Some("https://api.deepseek.com/anthropic".to_string()),
+            api_key: Some("must-not-leak".to_string()),
+            api_key_configured: true,
+        });
+        let (tx, _rx) = mpsc::channel(1);
+        state.sessions.register_daemon(
+            machine_id,
+            owner,
+            tx,
+            machine,
+            vec![
+                test_project(&project_id, "/managed/codex"),
+                test_project("unrelated", "/private/owner"),
+            ],
+        );
+
+        let refreshed = list_accessible_machines_for_user(&state, &member).await;
+        let shared = refreshed
+            .iter()
+            .find(|entry| entry.machine.machine_id == machine_id)
+            .unwrap();
+        assert!(shared.machine.deepseek_backend.is_none());
+        assert_eq!(shared.projects.len(), 1);
+        assert_eq!(shared.projects[0].project_id, project_id);
+        assert!(!shared.shared_provisioning_available);
+
+        let web_id = Uuid::new_v4();
+        let (web_tx, mut web_rx) = mpsc::channel(1);
+        state.sessions.register_web(web_id, web_tx);
+        state.sessions.set_web_user(web_id, member);
+        state.sessions.broadcast_machines_update_for_user(&member);
+        let ServerToWeb::Machines { machines } = web_rx.try_recv().unwrap() else {
+            panic!("expected cached machine projection")
+        };
+        let pushed = machines
+            .iter()
+            .find(|entry| entry.machine.machine_id == machine_id)
+            .unwrap();
+        assert!(pushed.machine.deepseek_backend.is_none());
+        assert_eq!(pushed.projects.len(), 1);
+        assert_eq!(pushed.projects[0].project_id, project_id);
     }
 
     #[tokio::test]
@@ -1418,7 +1727,7 @@ async fn resolve_target_session(
             let still_authorized = match state.sessions.get_web_user(connection_id) {
                 Some(user_id) => state
                     .db
-                    .check_session_access(&sid.to_string(), &user_id.to_string())
+                    .check_session_runtime_access(&sid.to_string(), &user_id.to_string())
                     .await
                     .unwrap_or(false),
                 None => false,
@@ -1463,7 +1772,7 @@ async fn resolve_target_session(
         if let Some(uid) = state.sessions.get_web_user(connection_id) {
             let has_access = state
                 .db
-                .check_session_access(&sid.to_string(), &uid.to_string())
+                .check_session_runtime_access(&sid.to_string(), &uid.to_string())
                 .await
                 .unwrap_or(false);
             if has_access {
@@ -1512,7 +1821,7 @@ async fn resolve_target_session(
         let still_authorized = match state.sessions.get_web_user(connection_id) {
             Some(user_id) => state
                 .db
-                .check_session_access(&sid.to_string(), &user_id.to_string())
+                .check_session_runtime_access(&sid.to_string(), &user_id.to_string())
                 .await
                 .unwrap_or(false),
             None => false,
@@ -3454,24 +3763,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         machine_id,
                         project_id
                     );
-                    let allowed = state
-                        .sessions
-                        .get_machines_for_user(&uid)
-                        .into_iter()
-                        .any(|m| {
-                            m.machine.machine_id == machine_id
-                                && m.projects.iter().any(|p| p.project_id == project_id)
-                        })
-                        || {
-                            let (host_path_refs, wildcard_paths) =
-                                get_shared_project_access_refs(&state, &uid).await;
-                            state.sessions.machine_project_matches_refs(
-                                &machine_id,
-                                &project_id,
-                                &host_path_refs,
-                                &wildcard_paths,
-                            )
-                        };
+                    let allowed =
+                        has_machine_project_runtime_access(&state, &uid, &machine_id, &project_id)
+                            .await;
 
                     if !allowed {
                         state
@@ -3587,24 +3881,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         continue;
                     };
 
-                    let allowed = state
-                        .sessions
-                        .get_machines_for_user(&uid)
-                        .into_iter()
-                        .any(|m| {
-                            m.machine.machine_id == machine_id
-                                && m.projects.iter().any(|p| p.project_id == project_id)
-                        })
-                        || {
-                            let (host_path_refs, wildcard_paths) =
-                                get_shared_project_access_refs(&state, &uid).await;
-                            state.sessions.machine_project_matches_refs(
-                                &machine_id,
-                                &project_id,
-                                &host_path_refs,
-                                &wildcard_paths,
-                            )
-                        };
+                    let allowed =
+                        has_machine_project_runtime_access(&state, &uid, &machine_id, &project_id)
+                            .await;
 
                     if !allowed {
                         state
@@ -3696,6 +3975,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 }
                 Ok(WebToServer::CreateProjectInstance {
                     machine_id,
+                    cluster_owner_user_id,
                     git_remote,
                     instance_name,
                     branch,
@@ -3716,25 +3996,29 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         continue;
                     };
 
-                    // A brand-new instance has no project_id yet, so authorize by
-                    // machine OWNERSHIP only (the daemon must belong to this user).
-                    let owns_machine = state
-                        .sessions
-                        .get_machines_for_user(&uid)
-                        .into_iter()
-                        .any(|m| m.machine.machine_id == machine_id);
-                    if !owns_machine {
-                        state
-                            .sessions
-                            .send_to_web(
-                                &connection_id,
-                                ServerToWeb::Error {
-                                    message: "Machine not found".to_string(),
-                                },
-                            )
-                            .await;
-                        continue;
-                    }
+                    let (_machine_owner, requested_cluster, shared_request) =
+                        match resolve_project_creation_target(
+                            &state,
+                            &uid,
+                            &machine_id,
+                            cluster_owner_user_id.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(target) => target,
+                            Err(message) => {
+                                state
+                                    .sessions
+                                    .send_to_web(
+                                        &connection_id,
+                                        ServerToWeb::Error {
+                                            message: message.to_string(),
+                                        },
+                                    )
+                                    .await;
+                                continue;
+                            }
+                        };
 
                     tracing::info!(
                         "CreateProjectInstance: user={} machine={} repo={} name={}",
@@ -3744,10 +4028,125 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         instance_name
                     );
 
-                    if !state
-                        .sessions
-                        .send_to_daemon(
-                            &machine_id,
+                    let (daemon_message, shared_provisioning) = if shared_request {
+                        let Some(submitted_url) = clone_url.as_deref() else {
+                            state
+                                .sessions
+                                .send_to_web(
+                                    &connection_id,
+                                    ServerToWeb::Error {
+                                        message: "Shared machines accept a public GitHub HTTPS URL"
+                                            .to_string(),
+                                    },
+                                )
+                                .await;
+                            continue;
+                        };
+                        let repository = match shared::parse_public_github_repository(submitted_url)
+                        {
+                            Ok(repository) => repository,
+                            Err(error) => {
+                                state
+                                    .sessions
+                                    .send_to_web(
+                                        &connection_id,
+                                        ServerToWeb::Error {
+                                            message: error.to_string(),
+                                        },
+                                    )
+                                    .await;
+                                continue;
+                            }
+                        };
+                        let request_id = request_id
+                            .filter(|value| !value.trim().is_empty() && value.len() <= 128)
+                            .unwrap_or_else(|| Uuid::new_v4().to_string());
+                        let canonical_remote = repository.git_remote();
+                        let canonical_url = repository.clone_url();
+                        let fingerprint = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                            Sha256::digest(
+                                format!(
+                                    "{}\0{}\0{}\0{}\0{}",
+                                    requested_cluster,
+                                    machine_id,
+                                    canonical_remote,
+                                    instance_name.trim(),
+                                    branch.trim()
+                                )
+                                .as_bytes(),
+                            ),
+                        );
+                        let reserved_project_id = Uuid::new_v4().to_string();
+                        let provisioning = match state
+                            .db
+                            .claim_project_provisioning(
+                                &request_id,
+                                &uid.to_string(),
+                                &requested_cluster,
+                                &machine_id.to_string(),
+                                &fingerprint,
+                                &canonical_remote,
+                                &canonical_url,
+                                instance_name.trim(),
+                                branch.trim(),
+                                &reserved_project_id,
+                            )
+                            .await
+                        {
+                            Ok(request) => request,
+                            Err(error) => {
+                                state
+                                    .sessions
+                                    .send_to_web(
+                                        &connection_id,
+                                        ServerToWeb::Error {
+                                            message: error.to_string(),
+                                        },
+                                    )
+                                    .await;
+                                continue;
+                            }
+                        };
+                        if provisioning.status == "completed" {
+                            state.sessions.relay_project_instance_created_to_user(
+                                &uid,
+                                &machine_id,
+                                Some(request_id),
+                                Some(provisioning.project_id),
+                                None,
+                            );
+                            continue;
+                        }
+                        if !matches!(provisioning.status.as_str(), "pending" | "cloned") {
+                            state
+                                .sessions
+                                .send_to_web(
+                                    &connection_id,
+                                    ServerToWeb::Error {
+                                        message: provisioning.error_message.unwrap_or_else(|| {
+                                            "Project provisioning is no longer active".to_string()
+                                        }),
+                                    },
+                                )
+                                .await;
+                            continue;
+                        }
+                        let provisioning_request = provisioning.request_id.clone();
+                        (
+                            ServerToDaemon::CreateProjectInstance {
+                                git_remote: provisioning.git_remote,
+                                instance_name: provisioning.instance_name,
+                                branch: provisioning.branch,
+                                clone_url: Some(provisioning.clone_url),
+                                base_path: None,
+                                request_id: Some(provisioning.request_id),
+                                project_id: Some(provisioning.project_id),
+                                provisioning_mode: shared::ProjectProvisioningMode::PublicGithub,
+                            },
+                            Some(provisioning_request),
+                        )
+                    } else {
+                        (
                             ServerToDaemon::CreateProjectInstance {
                                 git_remote,
                                 instance_name,
@@ -3755,10 +4154,28 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 clone_url,
                                 base_path,
                                 request_id,
+                                project_id: None,
+                                provisioning_mode: shared::ProjectProvisioningMode::TrustedOwner,
                             },
+                            None,
                         )
+                    };
+
+                    if !state
+                        .sessions
+                        .send_to_daemon(&machine_id, daemon_message)
                         .await
                     {
+                        if let Some(request_id) = shared_provisioning {
+                            let _ = state
+                                .db
+                                .fail_project_provisioning(
+                                    &request_id,
+                                    &uid.to_string(),
+                                    "The selected machine is offline; retry after it reconnects",
+                                )
+                                .await;
+                        }
                         state
                             .sessions
                             .send_to_web(
@@ -4934,10 +5351,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         continue;
                     };
 
-                    // Check access (owner or shared)
+                    // Attaching subscribes the browser to a live runtime, so
+                    // it requires current hosting-cluster authority in
+                    // addition to durable project content access.
                     let has_access = match state
                         .db
-                        .check_session_access(&sid.to_string(), &uid.to_string())
+                        .check_session_runtime_access(&sid.to_string(), &uid.to_string())
                         .await
                     {
                         Ok(access) => access,

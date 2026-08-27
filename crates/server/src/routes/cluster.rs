@@ -1,33 +1,276 @@
 //! Virtual-cluster self-service.
 //!
-//! Every active account operates exactly one virtual cluster: the machines its
-//! clients registered, plus the projects hosted in it. A project is hosted in
-//! an account's cluster when the account owns it or when at least one of its
-//! sessions was created under that account — so a project owned by someone
-//! else can still be administered here, and belonging to a project is not
-//! enough to administer it.
+//! Every active account owns one virtual cluster and may accept invitations to
+//! other accounts' clusters. Projects are hosted according to durable cluster
+//! placements; historical session rows are not treated as authorization.
 //!
-//! These routes carry no role check. The gate is `project_in_user_cluster`,
-//! evaluated per request, and the same DB operations back the
-//! system-administration surface so the two cannot drift.
+//! Every route resolves the active account, cluster role, project placement,
+//! and project role independently as needed. Deployment-wide administration
+//! stays on its separate system-credential surface.
 
 use axum::{
     extract::{Path, Query, State},
     http::HeaderMap,
     Json,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use chrono::{Duration, NaiveDateTime, Utc};
+use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::admin::{
     AddProjectMemberRequest, AdminProjectDetail, AdminProjectInventory, LifecycleRequest, Page,
     PageQuery, TransferOwnerRequest, UpdatePolicyRequest,
 };
-use super::authz::require_active_user;
+use super::authz::{
+    require_active_user, require_cluster_access, require_cluster_owner,
+    require_cluster_project_runtime_access, ClusterAccess,
+};
 use crate::{
-    db::{ClusterDefaultPolicy, ProjectLifecycle, User},
+    db::{
+        ClusterDefaultPolicy, ClusterMembership, ClusterReference, ClusterUsageReport,
+        ProjectLifecycle, SharedClusterInvitation, User,
+    },
     error::AppError,
     state::AppState,
 };
+
+pub const SHARED_CLUSTER_TRUST_WARNING: &str = "Projects run on the cluster owner's machines. The cluster owner can access files, processes, terminal output, and credentials exposed to those processes. Only join a cluster whose owner you trust.";
+
+#[derive(Debug, Serialize)]
+pub struct InvitationView {
+    pub id: String,
+    pub cluster_owner_user_id: String,
+    pub cluster_owner_email: String,
+    pub invitee_user_id: String,
+    pub invitee_email: String,
+    pub expires_at: String,
+    pub status: String,
+    pub created_at: Option<String>,
+}
+
+impl From<SharedClusterInvitation> for InvitationView {
+    fn from(invitation: SharedClusterInvitation) -> Self {
+        let expired = NaiveDateTime::parse_from_str(&invitation.expires_at, "%Y-%m-%d %H:%M:%S")
+            .map(|expires| expires.and_utc() <= Utc::now())
+            .unwrap_or(false);
+        let status = if invitation.revoked_at.is_some() {
+            "revoked"
+        } else if invitation.accepted_at.is_some() {
+            "accepted"
+        } else if expired {
+            "expired"
+        } else {
+            "pending"
+        };
+        Self {
+            id: invitation.id,
+            cluster_owner_user_id: invitation.cluster_owner_user_id,
+            cluster_owner_email: invitation.cluster_owner_email,
+            invitee_user_id: invitation.invitee_user_id,
+            invitee_email: invitation.invitee_email,
+            expires_at: invitation.expires_at,
+            status: status.to_string(),
+            created_at: invitation.created_at,
+        }
+    }
+}
+
+fn invitation_token_hash(token: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateSharedClusterInvitationRequest {
+    pub email: String,
+    #[serde(default)]
+    pub trust_confirmed: bool,
+    pub expires_in_hours: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateSharedClusterInvitationResponse {
+    pub invitation: InvitationView,
+    /// Returned only at creation time. The database retains only its digest.
+    pub token: String,
+    pub trust_warning: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InvitationInspectionResponse {
+    pub invitation: InvitationView,
+    pub trust_warning: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AcceptSharedClusterInvitationRequest {
+    #[serde(default)]
+    pub trust_confirmed: bool,
+}
+
+fn require_trust_confirmation(confirmed: bool) -> Result<(), AppError> {
+    if !confirmed {
+        return Err(AppError::BadRequest(
+            "Confirm the shared-cluster trust warning before continuing".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub async fn list_clusters(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ClusterReference>>, AppError> {
+    let user = require_active_user(&headers, &state).await?;
+    Ok(Json(state.db.list_accessible_clusters(&user.id).await?))
+}
+
+pub async fn create_invitation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateSharedClusterInvitationRequest>,
+) -> Result<Json<CreateSharedClusterInvitationResponse>, AppError> {
+    let owner = require_active_user(&headers, &state).await?;
+    require_cluster_owner(&headers, &state, &owner.id).await?;
+    require_trust_confirmation(request.trust_confirmed)?;
+    let email = request.email.trim().to_ascii_lowercase();
+    if email.is_empty() || !email.contains('@') {
+        return Err(AppError::BadRequest(
+            "A valid account email is required".to_string(),
+        ));
+    }
+    let expires_in_hours = request.expires_in_hours.unwrap_or(168).clamp(1, 720);
+    let expires_at = (Utc::now() + Duration::hours(expires_in_hours))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let mut token_bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut token_bytes);
+    let token = URL_SAFE_NO_PAD.encode(token_bytes);
+    let invitation = state
+        .db
+        .create_shared_cluster_invitation(
+            &uuid::Uuid::new_v4().to_string(),
+            &invitation_token_hash(&token),
+            &owner.id,
+            &email,
+            &expires_at,
+        )
+        .await
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    Ok(Json(CreateSharedClusterInvitationResponse {
+        invitation: invitation.into(),
+        token,
+        trust_warning: SHARED_CLUSTER_TRUST_WARNING,
+    }))
+}
+
+pub async fn list_invitations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<InvitationView>>, AppError> {
+    let owner = require_active_user(&headers, &state).await?;
+    require_cluster_owner(&headers, &state, &owner.id).await?;
+    Ok(Json(
+        state
+            .db
+            .list_shared_cluster_invitations(&owner.id)
+            .await?
+            .into_iter()
+            .map(InvitationView::from)
+            .collect(),
+    ))
+}
+
+pub async fn revoke_invitation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(invitation_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let owner = require_active_user(&headers, &state).await?;
+    require_cluster_owner(&headers, &state, &owner.id).await?;
+    let success = state
+        .db
+        .revoke_shared_cluster_invitation(&owner.id, &invitation_id)
+        .await?;
+    Ok(Json(serde_json::json!({ "success": success })))
+}
+
+pub async fn inspect_invitation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+) -> Result<Json<InvitationInspectionResponse>, AppError> {
+    let user = require_active_user(&headers, &state).await?;
+    let invitation = state
+        .db
+        .get_shared_cluster_invitation_by_hash(&invitation_token_hash(&token))
+        .await?
+        .filter(|invitation| invitation.invitee_user_id == user.id)
+        .ok_or_else(|| AppError::NotFound("Invitation not found".to_string()))?;
+    let owner_active = state
+        .db
+        .get_user_by_id(&invitation.cluster_owner_user_id)
+        .await?
+        .is_some_and(|owner| owner.is_active());
+    if !owner_active {
+        return Err(AppError::NotFound("Invitation not found".to_string()));
+    }
+    Ok(Json(InvitationInspectionResponse {
+        invitation: invitation.into(),
+        trust_warning: SHARED_CLUSTER_TRUST_WARNING,
+    }))
+}
+
+pub async fn accept_invitation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+    Json(request): Json<AcceptSharedClusterInvitationRequest>,
+) -> Result<Json<ClusterMembership>, AppError> {
+    require_trust_confirmation(request.trust_confirmed)?;
+    let user = require_active_user(&headers, &state).await?;
+    let membership = state
+        .db
+        .accept_shared_cluster_invitation(&invitation_token_hash(&token), &user.id)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound("Invitation is invalid or no longer available".to_string())
+        })?;
+    Ok(Json(membership))
+}
+
+pub async fn list_members(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ClusterMembership>>, AppError> {
+    let owner = require_active_user(&headers, &state).await?;
+    require_cluster_owner(&headers, &state, &owner.id).await?;
+    Ok(Json(state.db.list_cluster_memberships(&owner.id).await?))
+}
+
+pub async fn revoke_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let owner = require_active_user(&headers, &state).await?;
+    require_cluster_owner(&headers, &state, &owner.id).await?;
+    let success = state
+        .db
+        .revoke_cluster_membership(&owner.id, &user_id)
+        .await
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    if let Ok(member_id) = uuid::Uuid::parse_str(&user_id) {
+        state
+            .sessions
+            .clear_shared_cluster_machine_access(&member_id);
+        state
+            .sessions
+            .broadcast_machines_update_for_user(&member_id);
+    }
+    Ok(Json(serde_json::json!({ "success": success })))
+}
 
 #[derive(Debug, Serialize)]
 pub struct ClusterOverview {
@@ -41,6 +284,242 @@ pub struct ClusterOverview {
     /// inside. Shown so an operator can see why a profile is unavailable.
     pub deployment_policy: shared::EffectiveProjectPolicy,
     pub cluster_policy: Option<ClusterDefaultPolicy>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClusterContextOverview {
+    pub cluster: ClusterReference,
+    pub hosted_project_count: i64,
+    pub visible_project_count: i64,
+    pub active_session_count: i64,
+    pub connected_project_count: i64,
+    pub deployment_policy: shared::EffectiveProjectPolicy,
+    pub cluster_policy: Option<ClusterDefaultPolicy>,
+    pub trust_warning: Option<&'static str>,
+}
+
+async fn context_projects(
+    state: &AppState,
+    cluster_owner_user_id: &str,
+    user: &User,
+    access: ClusterAccess,
+    search: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<crate::db::AdminProjectSummary>, AppError> {
+    if access == ClusterAccess::Owner {
+        Ok(state
+            .db
+            .list_cluster_projects(cluster_owner_user_id, search, limit, offset)
+            .await?)
+    } else {
+        Ok(state
+            .db
+            .list_cluster_projects_for_member(
+                cluster_owner_user_id,
+                &user.id,
+                search,
+                limit,
+                offset,
+            )
+            .await?)
+    }
+}
+
+pub async fn context_overview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(cluster_owner_user_id): Path<String>,
+) -> Result<Json<ClusterContextOverview>, AppError> {
+    let (user, access) = require_cluster_access(&headers, &state, &cluster_owner_user_id).await?;
+    let visible =
+        context_projects(&state, &cluster_owner_user_id, &user, access, None, 200, 0).await?;
+    // Do not reveal the number of unrelated projects in a shared cluster.
+    let hosted_project_count = visible.len() as i64;
+    let owner = state
+        .db
+        .get_user_by_id(&cluster_owner_user_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Cluster not found".to_string()))?;
+    Ok(Json(ClusterContextOverview {
+        cluster: ClusterReference {
+            owner_user_id: owner.id,
+            owner_email: owner.email,
+            access: if access == ClusterAccess::Owner {
+                "owner".to_string()
+            } else {
+                "member".to_string()
+            },
+            accepted_at: if access == ClusterAccess::Member {
+                state
+                    .db
+                    .get_cluster_membership(&cluster_owner_user_id, &user.id)
+                    .await?
+                    .and_then(|membership| membership.accepted_at)
+            } else {
+                None
+            },
+        },
+        hosted_project_count,
+        visible_project_count: visible.len() as i64,
+        active_session_count: visible
+            .iter()
+            .map(|project| project.active_session_count)
+            .sum(),
+        connected_project_count: visible
+            .iter()
+            .filter(|project| state.sessions.is_project_connected(&project.id))
+            .count() as i64,
+        deployment_policy: state.db.get_deployment_default_policy().await?,
+        cluster_policy: state
+            .db
+            .get_cluster_default_policy(&cluster_owner_user_id)
+            .await?,
+        trust_warning: (access == ClusterAccess::Member).then_some(SHARED_CLUSTER_TRUST_WARNING),
+    }))
+}
+
+pub async fn context_list_projects(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(cluster_owner_user_id): Path<String>,
+    Query(query): Query<PageQuery>,
+) -> Result<Json<Page<AdminProjectInventory>>, AppError> {
+    let (user, access) = require_cluster_access(&headers, &state, &cluster_owner_user_id).await?;
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let offset = query.offset.unwrap_or(0).max(0);
+    let summaries = context_projects(
+        &state,
+        &cluster_owner_user_id,
+        &user,
+        access,
+        query.search.as_deref(),
+        limit,
+        offset,
+    )
+    .await?;
+    let mut items = Vec::with_capacity(summaries.len());
+    for project in summaries {
+        let effective_policy = state.db.get_effective_project_policy(&project.id).await?;
+        let connected = state.sessions.is_project_connected(&project.id);
+        items.push(AdminProjectInventory {
+            project,
+            effective_policy,
+            connected,
+        });
+    }
+    Ok(Json(Page {
+        items,
+        limit,
+        offset,
+    }))
+}
+
+pub async fn context_get_project(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((cluster_owner_user_id, project_id)): Path<(String, String)>,
+) -> Result<Json<AdminProjectDetail>, AppError> {
+    let (user, access) = require_cluster_project_runtime_access(
+        &headers,
+        &state,
+        &cluster_owner_user_id,
+        &project_id,
+    )
+    .await?;
+    let project = context_projects(
+        &state,
+        &cluster_owner_user_id,
+        &user,
+        access,
+        Some(&project_id),
+        200,
+        0,
+    )
+    .await?
+    .into_iter()
+    .find(|project| project.id == project_id)
+    .ok_or_else(|| AppError::NotFound("Project not found".to_string()))?;
+    Ok(Json(AdminProjectDetail {
+        members: state.db.list_project_members(&project_id).await?,
+        policy: state.db.get_effective_project_policy(&project_id).await?,
+        policy_override: state.db.get_project_policy_override(&project_id).await?,
+        project,
+    }))
+}
+
+pub async fn context_get_default_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(cluster_owner_user_id): Path<String>,
+) -> Result<Json<ClusterPolicyResponse>, AppError> {
+    require_cluster_access(&headers, &state, &cluster_owner_user_id).await?;
+    Ok(Json(ClusterPolicyResponse {
+        cluster: state
+            .db
+            .get_cluster_default_policy(&cluster_owner_user_id)
+            .await?,
+        deployment: state.db.get_deployment_default_policy().await?,
+    }))
+}
+
+pub async fn cluster_usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(cluster_owner_user_id): Path<String>,
+    Query(query): Query<PageQuery>,
+) -> Result<Json<ClusterUsageReport>, AppError> {
+    require_cluster_owner(&headers, &state, &cluster_owner_user_id).await?;
+    Ok(Json(
+        state
+            .db
+            .get_cluster_usage_report(
+                &cluster_owner_user_id,
+                query.limit.unwrap_or(50).clamp(1, 200),
+                query.offset.unwrap_or(0).max(0),
+            )
+            .await?,
+    ))
+}
+
+pub async fn own_cluster_usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<PageQuery>,
+) -> Result<Json<ClusterUsageReport>, AppError> {
+    let owner = require_active_user(&headers, &state).await?;
+    require_cluster_owner(&headers, &state, &owner.id).await?;
+    Ok(Json(
+        state
+            .db
+            .get_cluster_usage_report(
+                &owner.id,
+                query.limit.unwrap_or(50).clamp(1, 200),
+                query.offset.unwrap_or(0).max(0),
+            )
+            .await?,
+    ))
+}
+
+pub async fn project_usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<shared::ProjectUsageStats>, AppError> {
+    let user = require_active_user(&headers, &state).await?;
+    if !state
+        .db
+        .has_project_content_access(&project_id, &user.id)
+        .await?
+    {
+        return Err(AppError::Forbidden("Project access required".to_string()));
+    }
+    Ok(Json(
+        state
+            .db
+            .get_project_usage_stats_by_project(&project_id)
+            .await?,
+    ))
 }
 
 /// Authorize the caller as the operator of the cluster hosting `project_id`.

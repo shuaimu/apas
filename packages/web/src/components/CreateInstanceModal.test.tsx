@@ -75,4 +75,35 @@ describe("CreateInstanceModal", () => {
     expect(screen.getByText(/No machines are running the apas daemon/i)).toBeTruthy();
     expect((screen.getByText("Create & start") as HTMLButtonElement).disabled).toBe(true);
   });
+
+  it("uses the credential-isolated shared-cluster request shape", () => {
+    const shared = machine("shared-1", "owner-host");
+    shared.clusterOwnerUserId = "cluster-owner";
+    shared.clusterAccess = "member";
+    shared.sharedProvisioningAvailable = true;
+    const create = seed([shared]);
+
+    render(
+      <CreateInstanceModal
+        open
+        onClose={vi.fn()}
+        gitRemote="github.com/openai/codex"
+        cloneUrl="https://github.com/openai/codex"
+        clusterOwnerUserId="cluster-owner"
+      />,
+    );
+
+    expect(screen.getByText(/Shared machines accept only public/)).toBeTruthy();
+    expect(screen.queryByText("Projects root (optional)")).toBeNull();
+    fireEvent.click(screen.getByText("Create & start"));
+    expect(create).toHaveBeenCalledWith(
+      "shared-1",
+      "github.com/openai/codex",
+      "codex",
+      "apas/codex",
+      "https://github.com/openai/codex",
+      undefined,
+      "cluster-owner",
+    );
+  });
 });

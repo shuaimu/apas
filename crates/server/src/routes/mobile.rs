@@ -291,11 +291,18 @@ pub async fn launch_task(
             )
         })?;
     let _launch_guard = state.mobile_task_launch_guard(request.request_id).await;
-    state
-        .db
-        .authorize_project_registration(&request.project_id, &user.id)
-        .await
-        .map_err(|error| AppError::Forbidden(error.to_string()))?;
+    if !super::ws_web::has_machine_project_runtime_access(
+        &state,
+        &user_id,
+        &request.machine_id,
+        &request.project_id,
+    )
+    .await
+    {
+        return Err(AppError::Forbidden(
+            "The selected project is no longer runnable on that machine".to_string(),
+        ));
+    }
 
     let fingerprint = launch_fingerprint(&request, instruction, &state.config.auth.jwt_secret)?;
     let record = state

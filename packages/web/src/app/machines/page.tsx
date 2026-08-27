@@ -13,8 +13,9 @@
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, FolderOpen, Play, RefreshCw, RotateCcw, Square } from "lucide-react";
+import { ArrowLeft, Copy, FolderOpen, Play, Plus, RefreshCw, RotateCcw, Square } from "lucide-react";
 import { useStore } from "@/lib/store";
+import { CreateInstanceModal } from "@/components/CreateInstanceModal";
 import { AllProvidersUsage } from "@/components/UsageLimits";
 import { EffectivePolicy, LaunchProfile, PolicyEditor } from "@/components/PolicyEditor";
 import { isRetiredLaunchProfileKey } from "@/lib/providerOptions";
@@ -28,6 +29,7 @@ import {
 
 const DEEPSEEK_API_BASE_URL = "https://api.deepseek.com/anthropic";
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://apas.mpaxos.com";
+const MOBILE_CLUSTER_STORAGE_KEY = "apas_mobile_cluster_owner";
 
 interface Page<T> { items: T[]; limit: number; offset: number }
 interface ClusterProject {
@@ -69,6 +71,45 @@ interface AuditEvent {
   details?: string;
   created_at?: string;
 }
+interface ClusterReference {
+  owner_user_id: string;
+  owner_email: string;
+  access: "owner" | "member";
+  accepted_at?: string | null;
+}
+interface ClusterInvitation {
+  id: string;
+  invitee_email: string;
+  expires_at: string;
+  status: "pending" | "accepted" | "expired" | "revoked";
+}
+interface ClusterMembership {
+  user_id: string;
+  user_email: string;
+  status: string;
+  accepted_at?: string | null;
+}
+interface UsageCounters {
+  prompts: number;
+  responses: number;
+  input_tokens: number;
+  output_tokens: number;
+  cost_usd: number;
+  cost_usd_reported: boolean;
+}
+interface ClusterUsageReport {
+  lifetime: UsageCounters;
+  last_7d: UsageCounters;
+  today: UsageCounters;
+  projects: Array<{
+    project_id: string;
+    project_name?: string | null;
+    owner_email: string;
+    usage: { lifetime: UsageCounters; last_7d: UsageCounters; today: UsageCounters };
+  }>;
+}
+
+const TRUST_WARNING = "Projects run on the cluster owner's machines. The owner can access files, processes, terminal output, and credentials exposed to those processes. Join only a cluster owner you trust.";
 
 function formatMemory(memoryKb?: number): string {
   if (memoryKb == null) return "";
@@ -91,11 +132,14 @@ export default function MachinesPage() {
     pendingInstances,
     rebootDaemon,
     serverVersion,
+    userId,
+    userEmail,
   } = useStore();
   const [deepseekDrafts, setDeepseekDrafts] = useState<Record<string, string>>({});
   const [deepseekSaved, setDeepseekSaved] = useState<Record<string, boolean>>({});
   const [clusterProjects, setClusterProjects] = useState<ClusterProject[]>([]);
   const [selected, setSelected] = useState<ClusterProjectDetail | null>(null);
+  const [selectedUsage, setSelectedUsage] = useState<{ lifetime: UsageCounters; last_7d: UsageCounters; today: UsageCounters } | null>(null);
   const [clusterPolicy, setClusterPolicy] = useState<ClusterPolicy | null>(null);
   const [profiles, setProfiles] = useState<LaunchProfile[]>([]);
   const [audit, setAudit] = useState<AuditEvent[]>([]);
@@ -104,6 +148,27 @@ export default function MachinesPage() {
     useState<{ id: string; hostname: string; behind: boolean } | null>(null);
   const [memberUserId, setMemberUserId] = useState("");
   const [ownerUserId, setOwnerUserId] = useState("");
+  const [clusters, setClusters] = useState<ClusterReference[]>([]);
+  const [selectedClusterId, setSelectedClusterId] = useState("");
+  const [invitations, setInvitations] = useState<ClusterInvitation[]>([]);
+  const [clusterMembers, setClusterMembers] = useState<ClusterMembership[]>([]);
+  const [usage, setUsage] = useState<ClusterUsageReport | null>(null);
+  const [usageWindow, setUsageWindow] = useState<"today" | "last_7d" | "lifetime">("last_7d");
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [trustConfirmed, setTrustConfirmed] = useState(false);
+  const [createdInviteLink, setCreatedInviteLink] = useState("");
+  const [createOpen, setCreateOpen] = useState(false);
+
+  const selectedCluster = clusters.find((cluster) => cluster.owner_user_id === selectedClusterId);
+  const sharedView = selectedCluster?.access === "member";
+  const visibleMachines = useMemo(
+    () => machines.filter((entry) => {
+      if (!selectedClusterId) return entry.clusterAccess !== "member";
+      if (entry.clusterOwnerUserId) return entry.clusterOwnerUserId === selectedClusterId;
+      return !sharedView;
+    }),
+    [machines, selectedClusterId, sharedView],
+  );
 
   // Both sources, for the same reason the mobile list uses both: the server
   // catches a fleet uniformly behind a newer deployment, the machines catch a
@@ -112,9 +177,9 @@ export default function MachinesPage() {
     () =>
       latestSeenVersion([
         serverVersion,
-        ...machines.map(({ machine }) => machine.daemonVersion),
+        ...visibleMachines.map(({ machine }) => machine.daemonVersion),
       ]),
-    [serverVersion, machines],
+    [serverVersion, visibleMachines],
   );
 
   useEffect(() => {
@@ -144,28 +209,74 @@ export default function MachinesPage() {
     });
     if (!response.ok) {
       const body = await response.json().catch(() => null);
-      throw new Error(body?.message || `Request failed (${response.status})`);
+      throw new Error(body?.error || body?.message || `Request failed (${response.status})`);
     }
     return response.json() as Promise<T>;
   }, [token]);
 
+  const loadClusters = useCallback(async () => {
+    try {
+      const result = await api<unknown>("/clusters");
+      if (!Array.isArray(result)) return;
+      const next = result as ClusterReference[];
+      setClusters(next);
+      setSelectedClusterId((current) => {
+        const stored = typeof window === "undefined" ? null : localStorage.getItem(MOBILE_CLUSTER_STORAGE_KEY);
+        return current
+          || next.find((cluster) => cluster.owner_user_id === stored)?.owner_user_id
+          || next.find((cluster) => cluster.access === "owner")?.owner_user_id
+          || next[0]?.owner_user_id
+          || "";
+      });
+    } catch {
+      // Compatibility with a server rolling out before explicit discovery.
+      if (userId) {
+        setClusters([{ owner_user_id: userId, owner_email: userEmail || "My cluster", access: "owner" }]);
+        setSelectedClusterId((current) => current || userId);
+      }
+    }
+  }, [api, userEmail, userId]);
+
+  useEffect(() => { void loadClusters(); }, [loadClusters]);
+
   const loadCluster = useCallback(async () => {
     setClusterError(null);
     try {
-      const [projectPage, policy, launchProfiles, auditPage] = await Promise.all([
-        api<Page<ClusterProject>>("/cluster/projects?limit=200"),
-        api<ClusterPolicy>("/cluster/policy/default"),
+      const projectPath = sharedView && selectedClusterId
+        ? `/clusters/${encodeURIComponent(selectedClusterId)}/projects?limit=200`
+        : "/cluster/projects?limit=200";
+      const policyPath = sharedView && selectedClusterId
+        ? `/clusters/${encodeURIComponent(selectedClusterId)}/policy/default`
+        : "/cluster/policy/default";
+      const [projectPage, policy, launchProfiles] = await Promise.all([
+        api<Page<ClusterProject>>(projectPath),
+        api<ClusterPolicy>(policyPath),
         api<LaunchProfile[]>("/cluster/launch-profiles"),
-        api<Page<AuditEvent>>("/cluster/audit?limit=25"),
       ]);
       setClusterProjects(projectPage.items);
       setClusterPolicy(policy);
       setProfiles(launchProfiles.filter((profile) => !isRetiredLaunchProfileKey(profile.key)));
-      setAudit(auditPage.items);
+      if (sharedView) {
+        setAudit([]);
+        setInvitations([]);
+        setClusterMembers([]);
+        setUsage(null);
+      } else {
+        const [auditPage, invitationRows, memberRows, usageReport] = await Promise.all([
+          api<Page<AuditEvent>>("/cluster/audit?limit=25"),
+          api<unknown>("/cluster/invitations"),
+          api<unknown>("/cluster/members"),
+          api<ClusterUsageReport>("/cluster/usage?limit=200"),
+        ]);
+        setAudit(auditPage.items || []);
+        setInvitations(Array.isArray(invitationRows) ? invitationRows as ClusterInvitation[] : []);
+        setClusterMembers(Array.isArray(memberRows) ? memberRows as ClusterMembership[] : []);
+        setUsage(usageReport?.projects ? usageReport : null);
+      }
     } catch (cause) {
       setClusterError(cause instanceof Error ? cause.message : "Request failed");
     }
-  }, [api]);
+  }, [api, selectedClusterId, sharedView]);
 
   useEffect(() => { void loadCluster(); }, [loadCluster]);
 
@@ -175,14 +286,22 @@ export default function MachinesPage() {
   const loadProject = useCallback(async (projectId: string) => {
     setClusterError(null);
     try {
-      const detail = await api<ClusterProjectDetail>(`/cluster/projects/${encodeURIComponent(projectId)}`);
+      const path = sharedView && selectedClusterId
+        ? `/clusters/${encodeURIComponent(selectedClusterId)}/projects/${encodeURIComponent(projectId)}`
+        : `/cluster/projects/${encodeURIComponent(projectId)}`;
+      const [detail, projectUsage] = await Promise.all([
+        api<ClusterProjectDetail>(path),
+        api<{ lifetime: UsageCounters; last_7d: UsageCounters; today: UsageCounters }>(`/projects/${encodeURIComponent(projectId)}/usage`),
+      ]);
       setSelected(detail);
+      setSelectedUsage(projectUsage);
       setOwnerUserId(detail.project.owner_user_id);
     } catch (cause) {
       setSelected(null);
+      setSelectedUsage(null);
       setClusterError(cause instanceof Error ? cause.message : "Request failed");
     }
-  }, [api]);
+  }, [api, selectedClusterId, sharedView]);
 
   async function mutate(path: string, init: RequestInit, after?: () => Promise<void>) {
     setClusterError(null);
@@ -204,27 +323,66 @@ export default function MachinesPage() {
               <ArrowLeft className="h-4 w-4" /> Back
             </Link>
             <div>
-              <h1 className="text-xl font-semibold">My Cluster</h1>
-              <p className="text-xs text-gray-500">Your machines and the projects hosted on them</p>
+              <h1 className="text-xl font-semibold">{sharedView ? "Shared Cluster" : "My Cluster"}</h1>
+              <p className="text-xs text-gray-500">
+                {sharedView ? `Owned by ${selectedCluster?.owner_email}` : "Your machines and the projects hosted on them"}
+              </p>
             </div>
           </div>
-          <button aria-label="Refresh machines" onClick={() => { listMachines(); void loadCluster(); }} className="inline-flex items-center gap-1 rounded border border-gray-300 px-3 py-1.5 text-sm hover:bg-gray-100 dark:border-gray-700 dark:hover:bg-gray-800">
-            <RefreshCw className="h-4 w-4" /> Refresh
+          <div className="flex items-center gap-2">
+            {clusters.length > 1 && (
+              <select
+                aria-label="Selected cluster"
+                value={selectedClusterId}
+                onChange={(event) => {
+                  setSelected(null);
+                  setSelectedClusterId(event.target.value);
+                  localStorage.setItem(MOBILE_CLUSTER_STORAGE_KEY, event.target.value);
+                }}
+                className="max-w-56 rounded border border-gray-300 bg-white px-2 py-1.5 text-sm dark:border-gray-700 dark:bg-gray-900"
+              >
+                {clusters.map((cluster) => (
+                  <option key={cluster.owner_user_id} value={cluster.owner_user_id}>
+                    {cluster.access === "owner" ? "My cluster" : cluster.owner_email}
+                  </option>
+                ))}
+              </select>
+            )}
+            <button aria-label="Refresh machines" onClick={() => { listMachines(); void loadClusters(); void loadCluster(); }} className="inline-flex items-center gap-1 rounded border border-gray-300 px-3 py-1.5 text-sm hover:bg-gray-100 dark:border-gray-700 dark:hover:bg-gray-800">
+              <RefreshCw className="h-4 w-4" /> Refresh
+            </button>
+          </div>
+        </div>
+
+        {sharedView && (
+          <div className="rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-100">
+            <div className="font-semibold">Trusted compute boundary</div>
+            <p className="mt-1">{TRUST_WARNING}</p>
+          </div>
+        )}
+
+        <div className="flex justify-end">
+          <button
+            onClick={() => setCreateOpen(true)}
+            disabled={sharedView && !visibleMachines.some((machine) => machine.sharedProvisioningAvailable)}
+            className="inline-flex items-center gap-1 rounded bg-emerald-600 px-3 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <Plus className="h-4 w-4" /> Create project from GitHub
           </button>
         </div>
 
-        {machines.length === 0 && (
+        {visibleMachines.length === 0 && (
           <div className="rounded border border-dashed border-gray-300 bg-white p-6 text-sm text-gray-600 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-300">
             No machines reported yet. Start `apas daemon` on a machine first.
           </div>
         )}
 
-        <section className="rounded-lg border border-gray-200 bg-white p-4 shadow-sm dark:border-gray-800 dark:bg-gray-900">
+        {!sharedView && <section className="rounded-lg border border-gray-200 bg-white p-4 shadow-sm dark:border-gray-800 dark:bg-gray-900">
           <h2 className="mb-3 text-sm font-semibold text-gray-700 dark:text-gray-300">Usage</h2>
           <AllProvidersUsage />
-        </section>
+        </section>}
 
-        {machines.map(({ machine, projects }) => {
+        {visibleMachines.map(({ machine, projects, clusterAccess }) => {
           const behind = isMachineBehind(machine.daemonVersion, latestVersion);
           return (
           <section key={machine.machineId} className="rounded-lg border border-gray-200 bg-white shadow-sm dark:border-gray-800 dark:bg-gray-900">
@@ -240,16 +398,16 @@ export default function MachinesPage() {
               </div>
               {/* A daemon is per-machine, so the restart is targeted by machine
                   rather than through any project running on it. */}
-              <button
+              {clusterAccess !== "member" && <button
                 aria-label={rebootActionLabelFor(behind, machine.hostname)}
                 onClick={() => setRebootTarget({ id: machine.machineId, hostname: machine.hostname, behind })}
                 className="inline-flex shrink-0 items-center gap-1 rounded border border-gray-300 px-3 py-1.5 text-sm hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-gray-800"
               >
                 <RotateCcw className="h-4 w-4" /> {rebootLabelFor(behind)}
-              </button>
+              </button>}
             </div>
 
-            <div className="border-b border-gray-200 px-4 py-3 dark:border-gray-800">
+            {clusterAccess !== "member" && <div className="border-b border-gray-200 px-4 py-3 dark:border-gray-800">
               <div className="mb-2 text-sm font-medium">DeepSeek Backend (Claude Runtime)</div>
               <div className="mb-2 text-xs text-gray-500">Backend URL: <span className="font-mono">{DEEPSEEK_API_BASE_URL}</span></div>
               <div className="grid gap-2 md:grid-cols-[1fr_auto_auto]">
@@ -289,7 +447,7 @@ export default function MachinesPage() {
               <div className="mt-2 text-xs text-gray-500">
                 {machine.deepseekBackend?.apiKeyConfigured ? "API key configured" : "API key not configured"}
               </div>
-            </div>
+            </div>}
 
             <div className="divide-y divide-gray-200 dark:divide-gray-800">
               {Object.values(pendingInstances).filter((pending) => pending.machineId === machine.machineId).map((pending) => (
@@ -375,6 +533,82 @@ export default function MachinesPage() {
           </div>
         )}
 
+        {!sharedView && (
+          <section className="rounded-lg border border-gray-200 bg-white shadow-sm dark:border-gray-800 dark:bg-gray-900">
+            <div className="border-b border-gray-200 px-4 py-3 dark:border-gray-800">
+              <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-300">Share this cluster</h2>
+              <p className="mt-1 text-xs text-gray-500">Invite an existing APAS account. Members can run their own public GitHub projects on eligible machines.</p>
+            </div>
+            <div className="grid gap-5 p-4 lg:grid-cols-2">
+              <div>
+                <form
+                  className="space-y-3"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    void (async () => {
+                      try {
+                        const response = await api<{ token: string }>("/cluster/invitations", {
+                          method: "POST",
+                          body: JSON.stringify({ email: inviteEmail, trust_confirmed: trustConfirmed }),
+                        });
+                        const link = `${window.location.origin}/cluster-invitations/${response.token}`;
+                        setCreatedInviteLink(link);
+                        setInviteEmail("");
+                        await loadCluster();
+                      } catch (cause) {
+                        setClusterError(cause instanceof Error ? cause.message : "Invitation failed");
+                      }
+                    })();
+                  }}
+                >
+                  <input aria-label="Invitee account email" type="email" required value={inviteEmail} onChange={(event) => setInviteEmail(event.target.value)} placeholder="person@example.com" className="w-full rounded border border-gray-300 bg-transparent px-3 py-2 text-sm dark:border-gray-700" />
+                  <label className="flex items-start gap-2 text-xs text-gray-600 dark:text-gray-300">
+                    <input type="checkbox" checked={trustConfirmed} onChange={(event) => setTrustConfirmed(event.target.checked)} className="mt-0.5" />
+                    <span>{TRUST_WARNING}</span>
+                  </label>
+                  <button disabled={!trustConfirmed || !inviteEmail.trim()} className="rounded bg-blue-600 px-3 py-2 text-sm text-white disabled:opacity-50">Create invitation</button>
+                </form>
+                {createdInviteLink && (
+                  <div className="mt-3 flex items-center gap-2 rounded bg-gray-50 p-2 dark:bg-gray-800">
+                    <span className="min-w-0 flex-1 truncate font-mono text-xs">{createdInviteLink}</span>
+                    <button aria-label="Copy invitation link" onClick={() => void navigator.clipboard.writeText(createdInviteLink)} className="rounded border p-1.5"><Copy className="h-4 w-4" /></button>
+                  </div>
+                )}
+                <div className="mt-4 space-y-2">
+                  {invitations.map((invitation) => (
+                    <div key={invitation.id} className="flex items-center justify-between rounded border border-gray-200 p-2 text-sm dark:border-gray-800">
+                      <div><div>{invitation.invitee_email}</div><div className="text-xs capitalize text-gray-500">{invitation.status} · expires {new Date(invitation.expires_at).toLocaleString()}</div></div>
+                      {invitation.status === "pending" && <button onClick={() => void mutate(`/cluster/invitations/${invitation.id}`, { method: "DELETE" })} className="text-xs text-red-600">Revoke</button>}
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <h3 className="mb-2 text-sm font-semibold">Cluster members</h3>
+                {clusterMembers.length === 0 ? <p className="text-sm text-gray-500">No one has joined this cluster.</p> : clusterMembers.map((member) => (
+                  <div key={member.user_id} className="flex items-center justify-between border-b border-gray-100 py-2 text-sm dark:border-gray-800">
+                    <div><div>{member.user_email}</div><div className="text-xs capitalize text-gray-500">{member.status}</div></div>
+                    {member.status === "active" && <button onClick={() => { if (window.confirm(`Revoke ${member.user_email}'s compute access?`)) void mutate(`/cluster/members/${member.user_id}`, { method: "DELETE" }); }} className="text-xs text-red-600">Revoke access</button>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </section>
+        )}
+
+        {!sharedView && usage && (
+          <section className="rounded-lg border border-gray-200 bg-white p-4 shadow-sm dark:border-gray-800 dark:bg-gray-900">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <div><h2 className="text-sm font-semibold">Cluster usage</h2><p className="text-xs text-gray-500">Informational totals; use policy, suspension, or membership revocation to manage consumption.</p></div>
+              <select aria-label="Usage window" value={usageWindow} onChange={(event) => setUsageWindow(event.target.value as typeof usageWindow)} className="rounded border border-gray-300 bg-transparent px-2 py-1 text-sm dark:border-gray-700">
+                <option value="today">Today (UTC)</option><option value="last_7d">Last 7 days</option><option value="lifetime">Lifetime</option>
+              </select>
+            </div>
+            <UsageSummary counters={usage[usageWindow]} />
+            <div className="mt-4 overflow-x-auto"><table className="w-full text-left text-sm"><thead><tr><th className="pb-2">Project</th><th className="pb-2">Owner</th><th className="pb-2">Tokens</th><th className="pb-2">Cost</th></tr></thead><tbody>{usage.projects.map((project) => { const counters = project.usage[usageWindow]; return <tr key={project.project_id} className="border-t border-gray-100 dark:border-gray-800"><td className="py-2">{project.project_name || project.project_id}</td><td>{project.owner_email}</td><td>{(counters.input_tokens + counters.output_tokens).toLocaleString()}</td><td>{counters.cost_usd_reported ? `$${counters.cost_usd.toFixed(2)}` : "Unavailable"}</td></tr>; })}</tbody></table></div>
+          </section>
+        )}
+
         <section className="rounded-lg border border-gray-200 bg-white shadow-sm dark:border-gray-800 dark:bg-gray-900">
           <div className="border-b border-gray-200 px-4 py-3 dark:border-gray-800">
             <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-300">Projects in this cluster</h2>
@@ -409,6 +643,14 @@ export default function MachinesPage() {
               </div>
               {selected ? (
                 <div className="space-y-4">
+                  {sharedView && (
+                    <div className="rounded-lg border border-gray-200 p-4 dark:border-gray-800">
+                      <h3 className="text-sm font-semibold">{selected.project.project_name || selected.project.id}</h3>
+                      <p className="mt-1 text-xs text-gray-500">Owned by {selected.project.owner_email}. Cluster membership does not expose any other hosted projects.</p>
+                      {selectedUsage && <div className="mt-4"><UsageSummary counters={selectedUsage[usageWindow]} /></div>}
+                    </div>
+                  )}
+                  {!sharedView && (
                   <div className="rounded-lg border border-gray-200 p-4 dark:border-gray-800">
                     <h3 className="mb-2 text-sm font-semibold">{selected.project.project_name || selected.project.id}</h3>
                     <div className="mb-3 break-all font-mono text-xs text-gray-500">{selected.project.id}</div>
@@ -452,7 +694,9 @@ export default function MachinesPage() {
                       <button className="rounded bg-gray-900 px-3 py-1 text-sm text-white dark:bg-gray-100 dark:text-gray-900">Transfer</button>
                     </form>
                   </div>
+                  )}
 
+                  {!sharedView && (
                   <div className="rounded-lg border border-gray-200 p-4 dark:border-gray-800">
                     <h3 className="mb-2 text-sm font-semibold">Members</h3>
                     {selected.members.map((member) => (
@@ -482,7 +726,9 @@ export default function MachinesPage() {
                       <button className="rounded bg-blue-600 px-3 py-1 text-sm text-white">Add</button>
                     </form>
                   </div>
+                  )}
 
+                  {!sharedView && (
                   <PolicyEditor
                     title="Project policy"
                     policy={selected.policy}
@@ -491,6 +737,7 @@ export default function MachinesPage() {
                     onSave={(policy) => mutate(`/cluster/projects/${selected.project.id}/policy`, { method: "PATCH", body: JSON.stringify(policy) }, () => loadProject(selected.project.id))}
                     onInherit={() => mutate(`/cluster/projects/${selected.project.id}/policy`, { method: "PATCH", body: JSON.stringify({ team_available: null, allowed_launch_profiles: null }) }, () => loadProject(selected.project.id))}
                   />
+                  )}
                 </div>
               ) : (
                 <div className="rounded-lg border border-dashed border-gray-300 p-8 text-center text-sm text-gray-500 dark:border-gray-700">
@@ -501,7 +748,7 @@ export default function MachinesPage() {
           )}
         </section>
 
-        {clusterPolicy && (
+        {clusterPolicy && !sharedView && (
           <PolicyEditor
             title="Cluster default policy"
             description="Applies to every project hosted in your cluster, including projects other accounts own. You can narrow what the deployment allows, never widen it."
@@ -519,7 +766,7 @@ export default function MachinesPage() {
           />
         )}
 
-        <section className="rounded-lg border border-gray-200 bg-white shadow-sm dark:border-gray-800 dark:bg-gray-900">
+        {!sharedView && <section className="rounded-lg border border-gray-200 bg-white shadow-sm dark:border-gray-800 dark:bg-gray-900">
           <div className="border-b border-gray-200 px-4 py-3 dark:border-gray-800">
             <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-300">Cluster activity</h2>
           </div>
@@ -543,8 +790,27 @@ export default function MachinesPage() {
               </table>
             </div>
           )}
-        </section>
+        </section>}
+
+        <CreateInstanceModal
+          open={createOpen}
+          onClose={() => setCreateOpen(false)}
+          gitRemote="github.com/owner/repository"
+          cloneUrl="https://github.com/owner/repository"
+          clusterOwnerUserId={selectedClusterId || undefined}
+        />
       </div>
     </main>
+  );
+}
+
+function UsageSummary({ counters }: { counters: UsageCounters }) {
+  return (
+    <div className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
+      <div><div className="text-xs text-gray-500">Prompts</div><div className="font-semibold">{counters.prompts.toLocaleString()}</div></div>
+      <div><div className="text-xs text-gray-500">Responses</div><div className="font-semibold">{counters.responses.toLocaleString()}</div></div>
+      <div><div className="text-xs text-gray-500">Tokens</div><div className="font-semibold">{(counters.input_tokens + counters.output_tokens).toLocaleString()}</div></div>
+      <div><div className="text-xs text-gray-500">Cost</div><div className="font-semibold">{counters.cost_usd_reported ? `$${counters.cost_usd.toFixed(2)}` : "Unavailable"}</div></div>
+    </div>
   );
 }

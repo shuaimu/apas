@@ -194,6 +194,9 @@ export interface MachineProject {
 export interface MachineWithProjects {
   machine: MachineInfo;
   projects: MachineProject[];
+  clusterOwnerUserId?: string;
+  clusterAccess?: "owner" | "member";
+  sharedProvisioningAvailable?: boolean;
 }
 
 // Map tool_use_id (e.g. "toolu_01Xwe...") to human-readable tool name (e.g. "Read", "Bash")
@@ -746,6 +749,7 @@ interface AppState {
     branch: string,
     cloneUrl?: string,
     basePath?: string,
+    clusterOwnerUserId?: string,
   ) => boolean;
   setMachineDeepseekConfig: (
     machineId: string,
@@ -1689,6 +1693,7 @@ export const useStore = create<AppState>((set, get) => ({
     branch: string,
     cloneUrl?: string,
     basePath?: string,
+    clusterOwnerUserId?: string,
   ): boolean => {
     const { ws, showToast } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -1707,6 +1712,7 @@ export const useStore = create<AppState>((set, get) => ({
       branch,
       clone_url: cloneUrl || undefined,
       base_path: basePath || undefined,
+      cluster_owner_user_id: clusterOwnerUserId || undefined,
       request_id: requestId,
     }));
     // Feedback now, not when the daemon finishes. It clones the repo before
@@ -3877,6 +3883,9 @@ export function handleServerMessage(
             memoryKb: project.memory_kb as number | undefined,
             lastError: project.last_error as string | undefined,
           })),
+          clusterOwnerUserId: item.cluster_owner_user_id as string | undefined,
+          clusterAccess: (item.cluster_access as "owner" | "member" | undefined) || "owner",
+          sharedProvisioningAvailable: Boolean(item.shared_provisioning_available),
         };
       });
 
@@ -3889,6 +3898,7 @@ export function handleServerMessage(
           const deepseekBackend = entry.machine.deepseekBackend;
           const previousDeepseekKey = previous?.machine.deepseekBackend?.apiKey;
           const mergedDeepseek =
+            entry.clusterAccess === "owner" &&
             deepseekBackend &&
             deepseekBackend.apiKey === undefined &&
             deepseekBackend.apiKeyConfigured &&

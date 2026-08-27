@@ -915,6 +915,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         // regardless of subtype; only count a *completed*
                                         // response on success.
                                         total_cost_usd: *total_cost_usd,
+                                        cost_reported: true,
                                         num_responses: if success { 1 } else { 0 },
                                     })
                                 } else {

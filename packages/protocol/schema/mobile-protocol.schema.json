@@ -512,6 +512,13 @@
         "version"
       ]
     },
+    "MachineClusterAccess": {
+      "type": "string",
+      "enum": [
+        "owner",
+        "member"
+      ]
+    },
     "MachineInfo": {
       "description": "Information about a machine reported by a daemon",
       "type": "object",
@@ -612,6 +619,16 @@
       "description": "Machine with its project list",
       "type": "object",
       "properties": {
+        "cluster_access": {
+          "$ref": "#/$defs/MachineClusterAccess",
+          "default": "owner"
+        },
+        "cluster_owner_user_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "machine": {
           "$ref": "#/$defs/MachineInfo"
         },
@@ -620,6 +637,10 @@
           "items": {
             "$ref": "#/$defs/MachineProjectInfo"
           }
+        },
+        "shared_provisioning_available": {
+          "type": "boolean",
+          "default": false
         }
       },
       "required": [
@@ -1612,6 +1633,7 @@
             "cache_creation_tokens": 0,
             "cache_read_tokens": 0,
             "cost_usd": 0.0,
+            "cost_usd_reported": false,
             "input_tokens": 0,
             "output_tokens": 0,
             "prompts": 0,
@@ -1631,6 +1653,7 @@
             "cache_creation_tokens": 0,
             "cache_read_tokens": 0,
             "cost_usd": 0.0,
+            "cost_usd_reported": false,
             "input_tokens": 0,
             "output_tokens": 0,
             "prompts": 0,
@@ -1648,6 +1671,7 @@
             "cache_creation_tokens": 0,
             "cache_read_tokens": 0,
             "cost_usd": 0.0,
+            "cost_usd_reported": false,
             "input_tokens": 0,
             "output_tokens": 0,
             "prompts": 0,
@@ -1860,6 +1884,7 @@
             "cache_creation_tokens": 0,
             "cache_read_tokens": 0,
             "cost_usd": 0.0,
+            "cost_usd_reported": false,
             "input_tokens": 0,
             "output_tokens": 0,
             "prompts": 0,
@@ -1878,6 +1903,7 @@
             "cache_creation_tokens": 0,
             "cache_read_tokens": 0,
             "cost_usd": 0.0,
+            "cost_usd_reported": false,
             "input_tokens": 0,
             "output_tokens": 0,
             "prompts": 0,
@@ -1897,6 +1923,7 @@
             "cache_creation_tokens": 0,
             "cache_read_tokens": 0,
             "cost_usd": 0.0,
+            "cost_usd_reported": false,
             "input_tokens": 0,
             "output_tokens": 0,
             "prompts": 0,
@@ -3364,10 +3391,15 @@
           "minimum": 0
         },
         "cost_usd": {
-          "description": "Real cost in USD (only Claude transport reports it; 0 otherwise).",
+          "description": "Sum of provider-reported cost in USD. A zero is meaningful only when\n`cost_usd_reported` is true.",
           "type": "number",
           "format": "double",
           "default": 0.0
+        },
+        "cost_usd_reported": {
+          "description": "Whether at least one event in this window supplied an authoritative\ncost value. Older peers omit this and therefore read as unknown.",
+          "type": "boolean",
+          "default": false
         },
         "input_tokens": {
           "type": "integer",
@@ -4487,6 +4519,13 @@
               "type": "string"
             },
             "clone_url": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "cluster_owner_user_id": {
+              "description": "Explicit cluster context for shared targets. Omitted by legacy\nclients and for compatibility owner flows.",
               "type": [
                 "string",
                 "null"

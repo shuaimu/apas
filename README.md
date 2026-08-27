@@ -114,6 +114,11 @@ native app when the isolated CLI feature is enabled. See
 [docs/pane-work-summaries.md](docs/pane-work-summaries.md) for scope, privacy,
 retention, enablement, and rollback guidance.
 
+Trusted collaborators can also create and run their own public-GitHub projects
+on a cluster shared by another account. See
+[docs/shared-clusters.md](docs/shared-clusters.md) for the trust boundary, role
+matrix, usage semantics, rollout order, and rollback restriction.
+
 ## Architecture
 
 ```

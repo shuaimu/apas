@@ -12,6 +12,8 @@ interface CreateInstanceModalProps {
   gitRemote: string;
   /** Raw cloneable origin URL captured from an existing checkout, if known. */
   cloneUrl?: string;
+  /** Limit targets to one owned/shared cluster context. */
+  clusterOwnerUserId?: string;
 }
 
 function repoBasename(gitRemote: string): string {
@@ -26,7 +28,7 @@ function repoLabel(gitRemote: string): string {
     : gitRemote;
 }
 
-export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl }: CreateInstanceModalProps) {
+export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, clusterOwnerUserId }: CreateInstanceModalProps) {
   const machines = useStore((s) => s.machines);
   const createProjectInstance = useStore((s) => s.createProjectInstance);
 
@@ -37,33 +39,47 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl }: Crea
   const [basePath, setBasePath] = useState("");
   const [machineId, setMachineId] = useState("");
   const [mounted, setMounted] = useState(false);
+  const availableMachines = useMemo(
+    () => clusterOwnerUserId
+      ? machines.filter((machine) => machine.clusterOwnerUserId === clusterOwnerUserId)
+      : machines,
+    [clusterOwnerUserId, machines],
+  );
+  const selectedMachine = availableMachines.find((entry) => entry.machine.machineId === machineId);
+  const sharedTarget = selectedMachine?.clusterAccess === "member";
 
   useEffect(() => setMounted(true), []);
 
   // Default the machine picker to the only machine (or first) when opened.
   useEffect(() => {
-    if (open && !machineId && machines.length > 0) {
-      setMachineId(machines[0].machine.machineId);
+    if (open && (!machineId || !availableMachines.some((entry) => entry.machine.machineId === machineId))) {
+      setMachineId(availableMachines[0]?.machine.machineId ?? "");
     }
-  }, [open, machines, machineId]);
+  }, [open, availableMachines, machineId]);
 
   const canSubmit = useMemo(
-    () => instanceName.trim().length > 0 && url.trim().length > 0 && machineId.length > 0,
-    [instanceName, url, machineId],
+    () => instanceName.trim().length > 0
+      && url.trim().length > 0
+      && machineId.length > 0
+      && !(sharedTarget && !selectedMachine?.sharedProvisioningAvailable),
+    [instanceName, url, machineId, selectedMachine?.sharedProvisioningAvailable, sharedTarget],
   );
 
   if (!open || !mounted) return null;
 
   const submit = () => {
     if (!canSubmit) return;
-    const sent = createProjectInstance(
+    const common: [string, string, string, string, string | undefined, string | undefined] = [
       machineId,
       gitRemote,
       instanceName.trim(),
       branch.trim() || `apas/${instanceName.trim()}`,
       url.trim() || undefined,
-      basePath.trim() || undefined,
-    );
+      sharedTarget ? undefined : basePath.trim() || undefined,
+    ];
+    const sent = selectedMachine?.clusterOwnerUserId
+      ? createProjectInstance(...common, selectedMachine.clusterOwnerUserId)
+      : createProjectInstance(...common);
     // Keep the modal (and the entered values) open if the send was dropped
     // (e.g. the socket is reconnecting); the store shows an error toast.
     if (sent) onClose();
@@ -99,7 +115,7 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl }: Crea
             new project on a chosen machine and check out a fresh branch.
           </p>
 
-          {machines.length === 0 ? (
+          {availableMachines.length === 0 ? (
             <div className="rounded border border-amber-300 bg-amber-50 p-3 text-sm text-amber-700 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-300">
               No machines are running the apas daemon. Run <code>apas daemon</code> on a machine to create instances.
             </div>
@@ -111,9 +127,14 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl }: Crea
                   onChange={(e) => setMachineId(e.target.value)}
                   className="w-full rounded border border-gray-300 bg-white px-3 py-2 text-sm dark:border-gray-600 dark:bg-gray-700"
                 >
-                  {machines.map((m) => (
-                    <option key={m.machine.machineId} value={m.machine.machineId}>
-                      {m.machine.hostname}
+                  {availableMachines.map((m) => (
+                    <option
+                      key={m.machine.machineId}
+                      value={m.machine.machineId}
+                      disabled={m.clusterAccess === "member" && !m.sharedProvisioningAvailable}
+                    >
+                      {m.machine.hostname} · {m.clusterAccess === "member" ? "Shared cluster" : "My cluster"}
+                      {m.clusterAccess === "member" && !m.sharedProvisioningAvailable ? " (update required)" : ""}
                     </option>
                   ))}
                 </select>
@@ -148,18 +169,24 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl }: Crea
                 />
               </Field>
 
-              <Field label="Projects root (optional)">
-                <input
-                  type="text"
-                  value={basePath}
-                  onChange={(e) => setBasePath(e.target.value)}
-                  placeholder="~/apas_projects"
-                  className="w-full rounded border border-gray-300 bg-white px-3 py-2 font-mono text-xs dark:border-gray-600 dark:bg-gray-700"
-                />
-              </Field>
+              {sharedTarget ? (
+                <div className="rounded border border-amber-300 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-200">
+                  Shared machines accept only public <span className="font-mono">https://github.com/owner/repository</span> URLs. The checkout uses the owner&apos;s managed projects directory and cannot use private credentials.
+                </div>
+              ) : (
+                <Field label="Projects root (optional)">
+                  <input
+                    type="text"
+                    value={basePath}
+                    onChange={(e) => setBasePath(e.target.value)}
+                    placeholder="~/apas_projects"
+                    className="w-full rounded border border-gray-300 bg-white px-3 py-2 font-mono text-xs dark:border-gray-600 dark:bg-gray-700"
+                  />
+                </Field>
+              )}
 
               <p className="text-xs text-gray-400">
-                Clones into <span className="font-mono">{previewPath}</span> (auto-suffixed if it exists).
+                Clones into <span className="font-mono">{sharedTarget ? `~/apas_projects/${instanceName.trim() || base}` : previewPath}</span> (auto-suffixed if it exists).
               </p>
             </>
           )}

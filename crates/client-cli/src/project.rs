@@ -130,6 +130,15 @@ impl ProjectMetadata {
         }
     }
 
+    /// Construct metadata with an identity already reserved by the server.
+    /// Used only by authenticated two-phase shared provisioning.
+    pub fn with_id_and_name(id: Uuid, name: Option<String>) -> Self {
+        let mut metadata = Self::new();
+        metadata.id = id;
+        metadata.name = name;
+        metadata
+    }
+
     /// Migrate legacy fields to panes list if needed
     pub fn migrate_legacy(&mut self) {
         // Only migrate when there is legacy state to migrate. This used to fire
@@ -288,6 +297,24 @@ pub fn register_project(dir: &Path, metadata: &ProjectMetadata) -> Result<()> {
     registry.projects.sort_by(|a, b| a.path.cmp(&b.path));
 
     write_project_registry(&path, &registry)
+}
+
+/// Remove exactly one project/path pair from the local registry. This is used
+/// by marker-bound provisioning cleanup before the checkout is deleted.
+pub fn unregister_project(dir: &Path, project_id: Uuid) -> Result<bool> {
+    let path = project_registry_path()?;
+    let mut registry = read_existing_project_registry(&path)?;
+    let normalized_dir = normalize_project_path(dir);
+    let before = registry.projects.len();
+    registry.projects.retain(|entry| {
+        !(entry.project_id == project_id.to_string()
+            && normalize_project_path(Path::new(&entry.path)) == normalized_dir)
+    });
+    if registry.projects.len() == before {
+        return Ok(false);
+    }
+    write_project_registry(&path, &registry)?;
+    Ok(true)
 }
 
 fn read_project_registry(path: &Path) -> Result<ProjectRegistry> {

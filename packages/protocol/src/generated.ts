@@ -774,6 +774,11 @@ export type WebToServer =
       base_path?: string | null;
       branch: string;
       clone_url?: string | null;
+      /**
+       * Explicit cluster context for shared targets. Omitted by legacy
+       * clients and for compatibility owner flows.
+       */
+      cluster_owner_user_id?: string | null;
       git_remote: string;
       instance_name: string;
       machine_id: string;
@@ -1036,8 +1041,11 @@ export interface MobileLaunchProfile {
  * Machine with its project list
  */
 export interface MachineWithProjects {
+  cluster_access?: "owner" | "member";
+  cluster_owner_user_id?: string | null;
   machine: MachineInfo;
   projects: MachineProjectInfo[];
+  shared_provisioning_available?: boolean;
   [k: string]: unknown;
 }
 /**
@@ -1539,9 +1547,15 @@ export interface UsageCounters {
   cache_creation_tokens?: number;
   cache_read_tokens?: number;
   /**
-   * Real cost in USD (only Claude transport reports it; 0 otherwise).
+   * Sum of provider-reported cost in USD. A zero is meaningful only when
+   * `cost_usd_reported` is true.
    */
   cost_usd?: number;
+  /**
+   * Whether at least one event in this window supplied an authoritative
+   * cost value. Older peers omit this and therefore read as unknown.
+   */
+  cost_usd_reported?: boolean;
   input_tokens?: number;
   output_tokens?: number;
   prompts?: number;
@@ -1558,9 +1572,15 @@ export interface UsageCounters1 {
   cache_creation_tokens?: number;
   cache_read_tokens?: number;
   /**
-   * Real cost in USD (only Claude transport reports it; 0 otherwise).
+   * Sum of provider-reported cost in USD. A zero is meaningful only when
+   * `cost_usd_reported` is true.
    */
   cost_usd?: number;
+  /**
+   * Whether at least one event in this window supplied an authoritative
+   * cost value. Older peers omit this and therefore read as unknown.
+   */
+  cost_usd_reported?: boolean;
   input_tokens?: number;
   output_tokens?: number;
   prompts?: number;
@@ -1592,9 +1612,15 @@ export interface UsageCounters2 {
   cache_creation_tokens?: number;
   cache_read_tokens?: number;
   /**
-   * Real cost in USD (only Claude transport reports it; 0 otherwise).
+   * Sum of provider-reported cost in USD. A zero is meaningful only when
+   * `cost_usd_reported` is true.
    */
   cost_usd?: number;
+  /**
+   * Whether at least one event in this window supplied an authoritative
+   * cost value. Older peers omit this and therefore read as unknown.
+   */
+  cost_usd_reported?: boolean;
   input_tokens?: number;
   output_tokens?: number;
   prompts?: number;
@@ -1611,9 +1637,15 @@ export interface UsageCounters3 {
   cache_creation_tokens?: number;
   cache_read_tokens?: number;
   /**
-   * Real cost in USD (only Claude transport reports it; 0 otherwise).
+   * Sum of provider-reported cost in USD. A zero is meaningful only when
+   * `cost_usd_reported` is true.
    */
   cost_usd?: number;
+  /**
+   * Whether at least one event in this window supplied an authoritative
+   * cost value. Older peers omit this and therefore read as unknown.
+   */
+  cost_usd_reported?: boolean;
   input_tokens?: number;
   output_tokens?: number;
   prompts?: number;
@@ -1630,9 +1662,15 @@ export interface UsageCounters4 {
   cache_creation_tokens?: number;
   cache_read_tokens?: number;
   /**
-   * Real cost in USD (only Claude transport reports it; 0 otherwise).
+   * Sum of provider-reported cost in USD. A zero is meaningful only when
+   * `cost_usd_reported` is true.
    */
   cost_usd?: number;
+  /**
+   * Whether at least one event in this window supplied an authoritative
+   * cost value. Older peers omit this and therefore read as unknown.
+   */
+  cost_usd_reported?: boolean;
   input_tokens?: number;
   output_tokens?: number;
   prompts?: number;
@@ -1649,9 +1687,15 @@ export interface UsageCounters5 {
   cache_creation_tokens?: number;
   cache_read_tokens?: number;
   /**
-   * Real cost in USD (only Claude transport reports it; 0 otherwise).
+   * Sum of provider-reported cost in USD. A zero is meaningful only when
+   * `cost_usd_reported` is true.
    */
   cost_usd?: number;
+  /**
+   * Whether at least one event in this window supplied an authoritative
+   * cost value. Older peers omit this and therefore read as unknown.
+   */
+  cost_usd_reported?: boolean;
   input_tokens?: number;
   output_tokens?: number;
   prompts?: number;

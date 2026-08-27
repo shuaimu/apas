@@ -22,6 +22,10 @@ pub const CLI_LIFECYCLE_CAPABILITY: &str = "cli_lifecycle_v1";
 /// project controller process and adopt them after a reboot.
 pub const PERSISTENT_TERMINAL_HOST_CAPABILITY: &str = "persistent_terminal_host_v1";
 pub const PANE_HOST_CLEANUP_ACK_CAPABILITY: &str = "pane_host_cleanup_ack_v1";
+/// The daemon implements two-phase, marker-bound, credential-isolated shared
+/// project provisioning. Servers must never downgrade a member request when
+/// this capability is absent.
+pub const SHARED_PROJECT_PROVISIONING_CAPABILITY: &str = "shared_project_provisioning_v1";
 /// Canonical non-working pane status used while an agent is blocked on a
 /// question only the human can answer. Keep the wire value stable: older web
 /// clients safely render it as an ordinary non-empty status, while newer ones
@@ -815,6 +819,16 @@ pub enum DaemonToServer {
         error: Option<String>,
     },
 
+    /// Result of a marker-bound discard requested after server-side
+    /// authorization disappeared during two-phase provisioning.
+    ProjectProvisioningDiscarded {
+        request_id: String,
+        project_id: String,
+        discarded: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
     /// Completion of an intentional project-runtime stop. New servers wait
     /// for this before final project deletion so detached pane hosts cannot
     /// outlive the project record that authorized them.
@@ -870,6 +884,19 @@ pub enum ServerToDaemon {
         base_path: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
+        /// Present for two-phase provisioning. The daemon must use this ID in
+        /// local metadata instead of minting an identity of its own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<String>,
+        #[serde(default)]
+        provisioning_mode: ProjectProvisioningMode,
+    },
+
+    /// Remove a not-yet-finalized checkout only when its local receipt matches
+    /// both opaque IDs. No caller-supplied filesystem path is accepted.
+    DiscardProjectProvisioning {
+        request_id: String,
+        project_id: String,
     },
 
     /// Replace this daemon, applying an available update first.
@@ -1290,6 +1317,10 @@ pub enum WebToServer {
     /// daemon's sibling-URL fallback + naming); `clone_url` is the real URL.
     CreateProjectInstance {
         machine_id: Uuid,
+        /// Explicit cluster context for shared targets. Omitted by legacy
+        /// clients and for compatibility owner flows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cluster_owner_user_id: Option<String>,
         git_remote: String,
         instance_name: String,
         branch: String,
@@ -2081,9 +2112,14 @@ pub struct UsageCounters {
     pub cache_read_tokens: u64,
     #[serde(default)]
     pub cache_creation_tokens: u64,
-    /// Real cost in USD (only Claude transport reports it; 0 otherwise).
+    /// Sum of provider-reported cost in USD. A zero is meaningful only when
+    /// `cost_usd_reported` is true.
     #[serde(default)]
     pub cost_usd: f64,
+    /// Whether at least one event in this window supplied an authoritative
+    /// cost value. Older peers omit this and therefore read as unknown.
+    #[serde(default)]
+    pub cost_usd_reported: bool,
 }
 
 /// Per-pane usage broken down by time window (cumulative lifetime plus the
@@ -2182,11 +2218,37 @@ pub struct MachineProjectInfo {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectProvisioningMode {
+    /// Compatibility behavior for a cluster owner's own machine. This may use
+    /// owner-selected paths and credentials already configured on that host.
+    #[default]
+    TrustedOwner,
+    /// Member behavior: canonical public GitHub HTTPS only, managed root only,
+    /// no credential helpers, and no automatic runtime start.
+    PublicGithub,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MachineClusterAccess {
+    #[default]
+    Owner,
+    Member,
+}
+
 /// Machine with its project list
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MachineWithProjects {
     pub machine: MachineInfo,
     pub projects: Vec<MachineProjectInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_owner_user_id: Option<String>,
+    #[serde(default)]
+    pub cluster_access: MachineClusterAccess,
+    #[serde(default)]
+    pub shared_provisioning_available: bool,
 }
 
 /// Pane type for dual-pane mode (legacy - kept for backward compatibility)
@@ -3441,6 +3503,7 @@ mod tests {
                     cache_read_tokens: 10,
                     cache_creation_tokens: 5,
                     cost_usd: 0.25,
+                    cost_usd_reported: true,
                 },
                 today: UsageCounters {
                     prompts: 1,

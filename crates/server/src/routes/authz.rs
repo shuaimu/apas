@@ -1,5 +1,3 @@
-use axum::http::{header, HeaderMap};
-
 use crate::{
     db::{SystemAdminCredential, User},
     error::AppError,
@@ -7,6 +5,7 @@ use crate::{
     routes::system_admin::{claims_are_system_admin, parse_bearer, SYSTEM_ADMIN_TOKEN_KIND},
     state::AppState,
 };
+use axum::http::{header, HeaderMap};
 
 pub(crate) async fn require_active_user(
     headers: &HeaderMap,
@@ -59,24 +58,7 @@ pub(crate) async fn require_system_admin(
     Ok(credential)
 }
 
-pub(crate) async fn require_project_owner(
-    headers: &HeaderMap,
-    state: &AppState,
-    project_id: &str,
-) -> Result<User, AppError> {
-    let user = require_active_user(headers, state).await?;
-    let role = state
-        .db
-        .get_project_role_for_user(project_id, &user.id)
-        .await?;
-    if role.as_deref() != Some("owner") {
-        return Err(AppError::Forbidden(
-            "Project owner access required".to_string(),
-        ));
-    }
-    Ok(user)
-}
-
+#[cfg(test)]
 pub(crate) async fn require_project_member(
     headers: &HeaderMap,
     state: &AppState,
@@ -94,4 +76,73 @@ pub(crate) async fn require_project_member(
         ));
     }
     Ok(user)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClusterAccess {
+    Owner,
+    Member,
+}
+
+pub(crate) async fn require_cluster_access(
+    headers: &HeaderMap,
+    state: &AppState,
+    cluster_owner_user_id: &str,
+) -> Result<(User, ClusterAccess), AppError> {
+    let user = require_active_user(headers, state).await?;
+    if user.id == cluster_owner_user_id {
+        return Ok((user, ClusterAccess::Owner));
+    }
+    if state
+        .db
+        .is_active_cluster_member(cluster_owner_user_id, &user.id)
+        .await?
+    {
+        return Ok((user, ClusterAccess::Member));
+    }
+    Err(AppError::Forbidden("Cluster access required".to_string()))
+}
+
+pub(crate) async fn require_cluster_owner(
+    headers: &HeaderMap,
+    state: &AppState,
+    cluster_owner_user_id: &str,
+) -> Result<User, AppError> {
+    let (user, access) = require_cluster_access(headers, state, cluster_owner_user_id).await?;
+    if access != ClusterAccess::Owner {
+        return Err(AppError::Forbidden(
+            "Cluster owner access required".to_string(),
+        ));
+    }
+    Ok(user)
+}
+
+pub(crate) async fn require_cluster_project_runtime_access(
+    headers: &HeaderMap,
+    state: &AppState,
+    cluster_owner_user_id: &str,
+    project_id: &str,
+) -> Result<(User, ClusterAccess), AppError> {
+    let (user, access) = require_cluster_access(headers, state, cluster_owner_user_id).await?;
+    if !state
+        .db
+        .project_is_placed_in_cluster(project_id, cluster_owner_user_id)
+        .await?
+    {
+        return Err(AppError::Forbidden(
+            "That project is not hosted in this cluster".to_string(),
+        ));
+    }
+    if access == ClusterAccess::Member
+        && state
+            .db
+            .get_project_role_for_user(project_id, &user.id)
+            .await?
+            .is_none()
+    {
+        return Err(AppError::Forbidden(
+            "Project membership required on this shared cluster".to_string(),
+        ));
+    }
+    Ok((user, access))
 }

@@ -22,9 +22,11 @@ import {
   rebootActionLabelFor,
   rebootLabelFor,
 } from "@/lib/daemonVersion";
+import { CreateInstanceModal } from "@/components/CreateInstanceModal";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://apas.mpaxos.com";
 const EMPTY_USAGE_LIMITS = new Map<string, UsageLimitsByProvider>();
+const MOBILE_CLUSTER_STORAGE_KEY = "apas_mobile_cluster_owner";
 
 // "machines" is a third selection rather than a screen: the home already
 // switches lists, and a handful of machine rows does not warrant navigation.
@@ -64,6 +66,9 @@ interface MobileMachineSummary {
     last_seen?: string | null;
   };
   projects?: MobileMachineProject[];
+  cluster_owner_user_id?: string;
+  cluster_access?: "owner" | "member";
+  shared_provisioning_available?: boolean;
 }
 
 interface MobileBootstrapResponse {
@@ -99,6 +104,9 @@ function adaptMachine(entry: MachineWithProjects): MobileMachineSummary {
       project_id: project.projectId,
       is_running: project.isRunning,
     })),
+    cluster_owner_user_id: entry.clusterOwnerUserId,
+    cluster_access: entry.clusterAccess,
+    shared_provisioning_available: entry.sharedProvisioningAvailable,
   };
 }
 
@@ -250,7 +258,32 @@ export function MobileCodeHome({
     [serverVersion, machines],
   );
   const [newTaskOpen, setNewTaskOpen] = useState(false);
+  const [createProjectOpen, setCreateProjectOpen] = useState(false);
+  const [selectedClusterOwner, setSelectedClusterOwner] = useState(() =>
+    typeof window === "undefined" ? "" : localStorage.getItem(MOBILE_CLUSTER_STORAGE_KEY) || "",
+  );
   const [availabilityNow, setAvailabilityNow] = useState(() => Date.now());
+  const clusterOptions = useMemo(() => {
+    const options = new Map<string, "owner" | "member">();
+    for (const entry of machines) {
+      const id = entry.cluster_owner_user_id || "owned";
+      options.set(id, entry.cluster_access || "owner");
+    }
+    return Array.from(options, ([id, access]) => ({ id, access }));
+  }, [machines]);
+  useEffect(() => {
+    if (clusterOptions.length > 0 && (!selectedClusterOwner || !clusterOptions.some((option) => option.id === selectedClusterOwner))) {
+      setSelectedClusterOwner(clusterOptions.find((option) => option.access === "owner")?.id || clusterOptions[0]?.id || "");
+    }
+  }, [clusterOptions, selectedClusterOwner]);
+  useEffect(() => {
+    if (selectedClusterOwner) localStorage.setItem(MOBILE_CLUSTER_STORAGE_KEY, selectedClusterOwner);
+  }, [selectedClusterOwner]);
+  const selectedClusterAccess = clusterOptions.find((option) => option.id === selectedClusterOwner)?.access;
+  const visibleMachines = useMemo(
+    () => machines.filter((entry) => (entry.cluster_owner_user_id || "owned") === selectedClusterOwner),
+    [machines, selectedClusterOwner],
+  );
 
   useEffect(() => {
     const timer = window.setInterval(() => setAvailabilityNow(Date.now()), 60_000);
@@ -494,9 +527,25 @@ export function MobileCodeHome({
 
       <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
         {filter === "machines" ? (
-          machines.length > 0 ? (
+          visibleMachines.length > 0 ? (
             <div className="space-y-2.5">
-              {machines.map((entry) => {
+              {clusterOptions.length > 1 && (
+                <select aria-label="Mobile selected cluster" value={selectedClusterOwner} onChange={(event) => {
+                  setSelectedClusterOwner(event.target.value);
+                  localStorage.setItem(MOBILE_CLUSTER_STORAGE_KEY, event.target.value);
+                }} className="w-full rounded-xl border border-[#dedee7] bg-white px-3 py-2.5 text-sm font-semibold dark:border-[#383842] dark:bg-[#1b1b21]">
+                  {clusterOptions.map((option) => <option key={option.id} value={option.id}>{option.access === "owner" ? "My cluster" : `Shared cluster · ${option.id.slice(0, 8)}`}</option>)}
+                </select>
+              )}
+              {selectedClusterAccess === "member" && (
+                <div className="rounded-xl border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-100">
+                  Shared projects run on the owner&apos;s machines. The owner can access files, processes, terminal output, and credentials exposed to them.
+                </div>
+              )}
+              <button type="button" onClick={() => setCreateProjectOpen(true)} disabled={selectedClusterAccess === "member" && !visibleMachines.some((entry) => entry.shared_provisioning_available)} className="flex w-full items-center justify-center gap-1.5 rounded-xl bg-[#6d5efc] px-3 py-2.5 text-sm font-bold text-white disabled:opacity-50">
+                <Plus className="h-4 w-4" /> Create project from GitHub
+              </button>
+              {visibleMachines.map((entry) => {
                 const hostname = entry.machine.hostname || "Unknown machine";
                 const connected = machineConnected(entry);
                 const running = (entry.projects ?? []).filter((project) => project.is_running).length;
@@ -523,7 +572,7 @@ export function MobileCodeHome({
                       {" · "}
                       {daemonVersionLabel(entry.machine.daemon_version)}
                     </p>
-                    <div className="mt-2.5 flex items-center justify-end">
+                    {entry.cluster_access !== "member" && <div className="mt-2.5 flex items-center justify-end">
                       <button
                         type="button"
                         aria-label={rebootActionLabelFor(behind, hostname)}
@@ -534,7 +583,7 @@ export function MobileCodeHome({
                       >
                         <RotateCcw className="h-4 w-4" /> {rebootLabelFor(behind)}
                       </button>
-                    </div>
+                    </div>}
                   </div>
                 );
               })}
@@ -748,7 +797,10 @@ export function MobileCodeHome({
             </div>
             <button
               type="button"
-              onClick={onManageMachines}
+              onClick={() => {
+                if (selectedClusterOwner) localStorage.setItem(MOBILE_CLUSTER_STORAGE_KEY, selectedClusterOwner);
+                onManageMachines();
+              }}
               className="mt-4 w-full rounded-xl border border-[#dedee7] bg-white px-4 py-3 text-sm font-bold dark:border-[#383842] dark:bg-[#1b1b21]"
             >
               Manage machines and projects
@@ -756,6 +808,13 @@ export function MobileCodeHome({
           </div>
         </div>
       )}
+      <CreateInstanceModal
+        open={createProjectOpen}
+        onClose={() => setCreateProjectOpen(false)}
+        gitRemote="github.com/owner/repository"
+        cloneUrl="https://github.com/owner/repository"
+        clusterOwnerUserId={selectedClusterOwner && selectedClusterOwner !== "owned" ? selectedClusterOwner : undefined}
+      />
     </section>
   );
 }

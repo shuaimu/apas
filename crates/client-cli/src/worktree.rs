@@ -489,6 +489,31 @@ pub fn clone_repo(url: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Clone a public HTTPS repository without consulting the machine owner's Git
+/// credential helpers, askpass programs, or SSH agent/configuration.
+pub fn clone_public_repo(url: &str, dest: &Path) -> Result<()> {
+    let out = Command::new("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env_remove("GIT_ASKPASS")
+        .env_remove("SSH_ASKPASS")
+        .env_remove("SSH_AUTH_SOCK")
+        .env_remove("GIT_SSH")
+        .env_remove("GIT_SSH_COMMAND")
+        .args(["-c", "credential.helper=", "-c", "core.askPass="])
+        .arg("clone")
+        .arg(url)
+        .arg(dest)
+        .output()
+        .with_context(|| format!("running isolated `git clone` into {}", dest.display()))?;
+    if !out.status.success() {
+        anyhow::bail!("public clone failed")
+    }
+    Ok(())
+}
+
 /// Create and switch to a fresh branch in the freshly-cloned repo at `dest`,
 /// auto-suffixing (`-2`, `-3`…) when the desired name already exists (e.g. the
 /// user picked the repo's default branch). Returns the branch actually created.

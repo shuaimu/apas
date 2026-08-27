@@ -9,6 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 mod models;
+mod shared_cluster;
 
 pub use models::*;
 
@@ -30,6 +31,7 @@ enum OwnershipTransferPolicy {
 }
 
 const LEGACY_PROJECT_ACCESS_MIGRATION: &str = "legacy_project_access_v1";
+const LEGACY_PROJECT_PLACEMENTS_MIGRATION: &str = "legacy_project_placements_v1";
 
 fn admin_project_name(working_dir: Option<&str>, git_remote: Option<&str>) -> Option<String> {
     working_dir
@@ -334,6 +336,7 @@ impl Database {
                 cache_read_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
                 total_cost_usd REAL NOT NULL DEFAULT 0,
+                cost_reported_count INTEGER NOT NULL DEFAULT 0,
                 num_responses INTEGER NOT NULL DEFAULT 0,
                 updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (session_id, pane_id, day)
@@ -342,6 +345,11 @@ impl Database {
         )
         .execute(&self.pool)
         .await?;
+        let _ = sqlx::query(
+            "ALTER TABLE pane_usage_stats ADD COLUMN cost_reported_count INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await;
         let _ = sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_pane_usage_stats_session ON pane_usage_stats(session_id)",
         )
@@ -459,6 +467,134 @@ impl Database {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_project_members_user ON project_members(user_id, project_id)")
             .execute(&self.pool)
             .await?;
+
+        // Cluster sharing is deliberately separate from project membership.
+        // The account in `cluster_owner_user_id` remains the sole operator;
+        // rows here grant only the narrower shared-compute capabilities.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS cluster_memberships (
+                cluster_owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
+                invited_at DATETIME,
+                accepted_at DATETIME,
+                revoked_at DATETIME,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (cluster_owner_user_id, user_id),
+                CHECK (cluster_owner_user_id != user_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_cluster_memberships_user_status ON cluster_memberships(user_id, status, cluster_owner_user_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_cluster_memberships_owner_status ON cluster_memberships(cluster_owner_user_id, status, user_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // This table is unrelated to the legacy `cluster_invitations` table,
+        // whose misleading name is retained for deployment account signup.
+        // Shared-cluster invitation bearer tokens are stored only as hashes.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS shared_cluster_invitations (
+                id TEXT PRIMARY KEY,
+                token_hash TEXT NOT NULL UNIQUE,
+                cluster_owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                invitee_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                email TEXT NOT NULL,
+                expires_at DATETIME NOT NULL,
+                accepted_at DATETIME,
+                revoked_at DATETIME,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CHECK (cluster_owner_user_id != invitee_user_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_shared_cluster_invites_owner_created ON shared_cluster_invitations(cluster_owner_user_id, created_at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_shared_cluster_invites_invitee ON shared_cluster_invitations(invitee_user_id, accepted_at, revoked_at, expires_at)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_shared_cluster_invites_one_pending
+               ON shared_cluster_invitations(cluster_owner_user_id, invitee_user_id)
+               WHERE accepted_at IS NULL AND revoked_at IS NULL"#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Durable placement is the sole hosting/cluster-administration source
+        // after the one-time backfill below. It intentionally does not imply
+        // project membership.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS project_cluster_placements (
+                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                cluster_owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                created_by_user_id TEXT NOT NULL REFERENCES users(id),
+                source TEXT NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (project_id, cluster_owner_user_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_project_cluster_placements_cluster ON project_cluster_placements(cluster_owner_user_id, project_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS project_provisioning_requests (
+                request_id TEXT PRIMARY KEY,
+                requester_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                cluster_owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                machine_id TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                git_remote TEXT NOT NULL,
+                clone_url TEXT NOT NULL,
+                instance_name TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                project_id TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'cloned', 'completed', 'failed', 'cancelled')),
+                result_path TEXT,
+                error_message TEXT,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_project_provisioning_requester_created ON project_provisioning_requests(requester_user_id, created_at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_project_provisioning_cluster_status ON project_provisioning_requests(cluster_owner_user_id, status, created_at)",
+        )
+        .execute(&self.pool)
+        .await?;
 
         sqlx::query(
             r#"
@@ -870,6 +1006,8 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        self.migrate_legacy_project_placements_once().await?;
+
         // Make conflicting historical owners visible to administrators. The
         // access import itself is versioned below so runtime history cannot
         // keep acting as an authorization source after the initial upgrade.
@@ -1086,6 +1224,69 @@ impl Database {
         Ok(true)
     }
 
+    /// Freeze the pre-sharing owner/session-derived hosting relation exactly
+    /// once. Future session history is not an authorization source; explicit
+    /// project registration/provisioning creates placement rows instead.
+    async fn migrate_legacy_project_placements_once(&self) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let should_run = sqlx::query("INSERT OR IGNORE INTO schema_migrations (name) VALUES (?)")
+            .bind(LEGACY_PROJECT_PLACEMENTS_MIGRATION)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+            > 0;
+
+        if !should_run {
+            tx.commit().await?;
+            return Ok(false);
+        }
+
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO project_cluster_placements
+                (project_id, cluster_owner_user_id, created_by_user_id, source, created_at)
+            SELECT id, owner_user_id, owner_user_id, 'legacy_owner', created_at
+            FROM projects
+            "#,
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO project_cluster_placements
+                (project_id, cluster_owner_user_id, created_by_user_id, source, created_at)
+            SELECT DISTINCT COALESCE(s.project_id, s.id), s.user_id, s.user_id,
+                   'legacy_session', COALESCE(s.created_at, CURRENT_TIMESTAMP)
+            FROM sessions s
+            JOIN projects p ON p.id = COALESCE(s.project_id, s.id)
+            JOIN users u ON u.id = s.user_id
+            "#,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        let missing = sqlx::query_scalar::<_, i64>(
+            r#"SELECT COUNT(*) FROM projects p
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM project_cluster_placements pcp
+                   WHERE pcp.project_id = p.id
+               )"#,
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        anyhow::ensure!(
+            missing == 0,
+            "project placement migration left {missing} projects unplaced"
+        );
+
+        tx.commit().await?;
+        tracing::info!(
+            migration = LEGACY_PROJECT_PLACEMENTS_MIGRATION,
+            "completed one-time project placement migration"
+        );
+        Ok(true)
+    }
+
     /// Remove decode-only provider profiles from persisted policy without
     /// changing the meaning or order of any remaining entry. Each changed row
     /// receives a distinct cluster-monotonic version; already-clean rows are
@@ -1201,13 +1402,9 @@ impl Database {
 
     /// Whether `project_id` is hosted in `user_id`'s virtual cluster.
     ///
-    /// A project is hosted in an account's cluster when the account owns it or
-    /// when at least one of its sessions was created under that account — the
-    /// durable evidence that the project runs on that account's machines.
+    /// Placement is independent of ownership, membership, and session history.
     /// Plain project membership deliberately does not count: hosting is what
-    /// confers administration, and letting a member suspend or re-own a
-    /// project they merely joined would be an escalation, not a convenience.
-    /// Suspended accounts host nothing.
+    /// confers administration. Suspended cluster owners host nothing.
     pub async fn project_in_user_cluster(&self, project_id: &str, user_id: &str) -> Result<bool> {
         let hosted = sqlx::query_scalar::<_, i64>(
             r#"
@@ -1215,37 +1412,29 @@ impl Database {
             FROM users u
             WHERE u.id = ?
               AND u.account_status = 'active'
-              AND (
-                  EXISTS (
-                      SELECT 1 FROM projects p
-                      WHERE p.id = ? AND p.owner_user_id = u.id
-                  )
-                  OR EXISTS (
-                      SELECT 1 FROM sessions s
-                      WHERE COALESCE(s.project_id, s.id) = ? AND s.user_id = u.id
-                  )
+              AND EXISTS (
+                  SELECT 1 FROM project_cluster_placements pcp
+                  WHERE pcp.project_id = ? AND pcp.cluster_owner_user_id = u.id
               )
             "#,
         )
         .bind(user_id)
-        .bind(project_id)
         .bind(project_id)
         .fetch_one(&self.pool)
         .await?;
         Ok(hosted > 0)
     }
 
-    /// The accounts whose virtual clusters host `project_id`, i.e. the owner
-    /// plus every account that has created a session for it.
+    /// The accounts whose virtual clusters durably host `project_id`.
     pub async fn project_cluster_user_ids(&self, project_id: &str) -> Result<Vec<String>> {
         Ok(sqlx::query_scalar::<_, String>(
             r#"
-            SELECT owner_user_id FROM projects WHERE id = ?
-            UNION
-            SELECT DISTINCT user_id FROM sessions WHERE COALESCE(project_id, id) = ?
+            SELECT cluster_owner_user_id
+            FROM project_cluster_placements
+            WHERE project_id = ?
+            ORDER BY cluster_owner_user_id
             "#,
         )
-        .bind(project_id)
         .bind(project_id)
         .fetch_all(&self.pool)
         .await?)
@@ -2364,32 +2553,45 @@ impl Database {
                 .and_then(serde_json::Value::as_str)
                 .map(ToString::to_string)
         };
-        // Attribute the record to the cluster on whose behalf the action was
-        // taken: the actor's own cluster when the actor hosts the project (or
-        // the action is that cluster's own), otherwise none. Reads also apply
-        // the live hosting predicate, so a project hosted in several clusters
-        // stays visible to every one of them.
+        // Attribute the record to the durable cluster on whose behalf the
+        // action was taken. A member may accept an invitation whose cluster
+        // target differs from the actor, so cluster targets use `target_id`.
         let system_admin = actor_user_id == SYSTEM_ADMIN_ACTOR;
         let cluster_user_id = if system_admin {
             // The system administrator acts deployment-wide, never on behalf
             // of a cluster.
             None
-        } else if target_type == "cluster" && target_id == actor_user_id {
-            Some(actor_user_id.to_string())
+        } else if target_type == "cluster" {
+            sqlx::query_scalar::<_, String>("SELECT id FROM users WHERE id = ?")
+                .bind(target_id)
+                .fetch_optional(&mut **tx)
+                .await?
+        } else if let Some(explicit_cluster) = details
+            .as_ref()
+            .and_then(|value| value.get("cluster_user_id"))
+            .and_then(serde_json::Value::as_str)
+        {
+            let valid = if let Some(project) = project_id.as_deref() {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM project_cluster_placements WHERE project_id = ? AND cluster_owner_user_id = ?",
+                )
+                .bind(project)
+                .bind(explicit_cluster)
+                .fetch_one(&mut **tx)
+                .await?
+                    > 0
+            } else {
+                false
+            };
+            valid.then(|| explicit_cluster.to_string())
         } else if let Some(project) = project_id.as_deref() {
             let hosts = sqlx::query_scalar::<_, i64>(
                 r#"
-                SELECT COUNT(*) FROM projects p
-                WHERE p.id = ?
-                  AND (p.owner_user_id = ?
-                       OR EXISTS (
-                           SELECT 1 FROM sessions s
-                           WHERE COALESCE(s.project_id, s.id) = p.id AND s.user_id = ?
-                       ))
+                SELECT COUNT(*) FROM project_cluster_placements
+                WHERE project_id = ? AND cluster_owner_user_id = ?
                 "#,
             )
             .bind(project)
-            .bind(actor_user_id)
             .bind(actor_user_id)
             .fetch_one(&mut **tx)
             .await?;
@@ -2478,19 +2680,14 @@ impl Database {
             WHERE a.cluster_user_id = ?
                OR (a.actor_kind = 'user' AND a.actor_user_id = ?)
                OR (a.project_id IS NOT NULL AND EXISTS (
-                       SELECT 1 FROM projects p
-                       WHERE p.id = a.project_id
-                         AND (p.owner_user_id = ?
-                              OR EXISTS (
-                                  SELECT 1 FROM sessions s
-                                  WHERE COALESCE(s.project_id, s.id) = p.id AND s.user_id = ?
-                              ))
+                       SELECT 1 FROM project_cluster_placements pcp
+                       WHERE pcp.project_id = a.project_id
+                         AND pcp.cluster_owner_user_id = ?
                    ))
             ORDER BY a.id DESC
             LIMIT ? OFFSET ?
             "#,
         )
-        .bind(cluster_user_id)
         .bind(cluster_user_id)
         .bind(cluster_user_id)
         .bind(cluster_user_id)
@@ -2555,13 +2752,28 @@ impl Database {
             .project_id
             .clone()
             .unwrap_or_else(|| session.id.clone());
-        sqlx::query(
+        let project_created = sqlx::query(
             "INSERT OR IGNORE INTO projects (id, owner_user_id, lifecycle_status) VALUES (?, ?, 'active')",
         )
         .bind(&project_id)
         .bind(&session.user_id)
         .execute(&self.pool)
-        .await?;
+        .await?
+        .rows_affected()
+            > 0;
+        // `create_session` is also used by compatibility paths that predate
+        // the explicit registration call. Treat an authenticated local
+        // registration as an explicit placement, never session history as a
+        // read-time hosting heuristic.
+        if project_created {
+            self.add_project_cluster_placement(
+                &project_id,
+                &session.user_id,
+                &session.user_id,
+                "direct_registration",
+            )
+            .await?;
+        }
         sqlx::query(
             r#"
             INSERT INTO sessions (id, user_id, cli_client_id, working_dir, hostname, status, project_id, git_remote, git_remote_url)
@@ -2681,11 +2893,8 @@ impl Database {
             ProjectLifecycle::Suspended => anyhow::bail!("project is suspended"),
             ProjectLifecycle::Deleting => anyhow::bail!("project deletion is in progress"),
         }
-        // Every account operates its own virtual cluster: a project it has a
-        // session for is openable even when another account owns it, because
-        // that session is the evidence the project runs on this account's
-        // machines. Projects that exist only in other accounts' clusters keep
-        // their owner/member gating.
+        // Cluster-owner access comes from the placement just established (or
+        // an earlier provisioning placement), not from historical sessions.
         let has_access = project.owner_user_id == user_id
             || sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM project_members WHERE project_id = ? AND user_id = ?",
@@ -2697,6 +2906,8 @@ impl Database {
                 > 0
             || self.project_in_user_cluster(project_id, user_id).await?;
         anyhow::ensure!(has_access, "user is not a member of this project");
+        self.add_project_cluster_placement(project_id, user_id, user_id, "direct_registration")
+            .await?;
         Ok(project)
     }
 
@@ -3271,7 +3482,8 @@ impl Database {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<AdminProjectSummary>> {
-        self.list_projects_scoped(None, search, limit, offset).await
+        self.list_projects_scoped(None, None, search, limit, offset)
+            .await
     }
 
     /// The projects hosted in one account's virtual cluster, in the same shape
@@ -3283,13 +3495,34 @@ impl Database {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<AdminProjectSummary>> {
-        self.list_projects_scoped(Some(cluster_user_id), search, limit, offset)
+        self.list_projects_scoped(Some(cluster_user_id), None, search, limit, offset)
             .await
+    }
+
+    /// Projects placed in a shared cluster that the member independently owns
+    /// or belongs to. Cluster membership alone never broadens project content.
+    pub async fn list_cluster_projects_for_member(
+        &self,
+        cluster_user_id: &str,
+        member_user_id: &str,
+        search: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AdminProjectSummary>> {
+        self.list_projects_scoped(
+            Some(cluster_user_id),
+            Some(member_user_id),
+            search,
+            limit,
+            offset,
+        )
+        .await
     }
 
     async fn list_projects_scoped(
         &self,
         cluster_user_id: Option<&str>,
+        member_user_id: Option<&str>,
         search: Option<&str>,
         limit: i64,
         offset: i64,
@@ -3313,8 +3546,9 @@ impl Database {
                    (SELECT COUNT(*) FROM sessions s WHERE COALESCE(s.project_id, s.id) = p.id AND s.status = 'active') AS active_session_count,
                    (SELECT MAX(s.updated_at) FROM sessions s WHERE COALESCE(s.project_id, s.id) = p.id) AS last_activity,
                    (SELECT GROUP_CONCAT(DISTINCT hu.email)
-                      FROM sessions hs JOIN users hu ON hu.id = hs.user_id
-                     WHERE COALESCE(hs.project_id, hs.id) = p.id) AS hosting_emails,
+                      FROM project_cluster_placements hp
+                      JOIN users hu ON hu.id = hp.cluster_owner_user_id
+                     WHERE hp.project_id = p.id) AS hosting_emails,
                    p.created_at, rs.working_dir, rs.hostname, rs.git_remote
             FROM projects p
             JOIN users u ON u.id = p.owner_user_id
@@ -3325,11 +3559,13 @@ impl Database {
                    OR lower(u.email) LIKE lower(?)
                    OR lower(COALESCE(rs.working_dir, '')) LIKE lower(?)
                    OR lower(COALESCE(rs.hostname, '')) LIKE lower(?))
-              AND (? IS NULL
-                   OR p.owner_user_id = ?
-                   OR EXISTS (
-                       SELECT 1 FROM sessions cs
-                       WHERE COALESCE(cs.project_id, cs.id) = p.id AND cs.user_id = ?
+              AND (? IS NULL OR EXISTS (
+                       SELECT 1 FROM project_cluster_placements pcp
+                       WHERE pcp.project_id = p.id AND pcp.cluster_owner_user_id = ?
+                   ))
+              AND (? IS NULL OR p.owner_user_id = ? OR EXISTS (
+                       SELECT 1 FROM project_members visible_pm
+                       WHERE visible_pm.project_id = p.id AND visible_pm.user_id = ?
                    ))
             ORDER BY COALESCE(last_activity, p.created_at) DESC
             LIMIT ? OFFSET ?
@@ -3342,7 +3578,9 @@ impl Database {
         .bind(&pattern)
         .bind(cluster_user_id)
         .bind(cluster_user_id)
-        .bind(cluster_user_id)
+        .bind(member_user_id)
+        .bind(member_user_id)
+        .bind(member_user_id)
         .bind(limit.clamp(1, 200))
         .bind(offset.max(0))
         .fetch_all(&self.pool)
@@ -3367,12 +3605,14 @@ impl Database {
                     hosting_emails: row
                         .get::<Option<String>, _>("hosting_emails")
                         .map(|joined| {
-                            joined
+                            let mut emails = joined
                                 .split(',')
                                 .map(str::trim)
                                 .filter(|email| !email.is_empty())
                                 .map(str::to_string)
-                                .collect()
+                                .collect::<Vec<_>>();
+                            emails.sort();
+                            emails
                         })
                         .unwrap_or_default(),
                 }
@@ -3388,12 +3628,8 @@ impl Database {
         let rows = sqlx::query(
             r#"
             SELECT u.id AS user_id, u.email, u.account_status,
-                   (SELECT COUNT(*) FROM projects p
-                     WHERE p.owner_user_id = u.id
-                        OR EXISTS (
-                            SELECT 1 FROM sessions hs
-                            WHERE COALESCE(hs.project_id, hs.id) = p.id AND hs.user_id = u.id
-                        )) AS hosted_project_count,
+                   (SELECT COUNT(*) FROM project_cluster_placements pcp
+                     WHERE pcp.cluster_owner_user_id = u.id) AS hosted_project_count,
                    (SELECT COUNT(*) FROM projects p WHERE p.owner_user_id = u.id) AS owned_project_count,
                    (SELECT COUNT(*) FROM sessions s
                      WHERE s.user_id = u.id AND s.status = 'active') AS active_session_count,
@@ -3670,29 +3906,27 @@ impl Database {
             .unwrap_or_else(|_| shared::EffectiveProjectPolicy::default().allowed_launch_profiles);
         let mut version: i64 = row.get("default_version");
 
+        let mut placed_cluster_team: Option<bool> = None;
         for (cluster_team, cluster_profiles, cluster_version) in
             sqlx::query_as::<_, (Option<i64>, Option<String>, i64)>(
                 r#"
             SELECT team_available, allowed_launch_profiles, version
             FROM cluster_default_policies
             WHERE user_id IN (
-                SELECT owner_user_id FROM projects WHERE id = ?
-                UNION
-                SELECT DISTINCT user_id FROM sessions WHERE COALESCE(project_id, id) = ?
+                SELECT cluster_owner_user_id FROM project_cluster_placements
+                WHERE project_id = ?
             )
             "#,
             )
             .bind(project_id)
-            .bind(project_id)
             .fetch_all(&self.pool)
             .await?
         {
-            // Lowest stated value wins for team availability; profiles
-            // intersect. A project hosted in several clusters therefore takes
-            // the most restrictive profile set of all of them, and the team
-            // setting of whichever cluster states one.
+            // Cluster peers are unordered, so their explicit team defaults
+            // combine conservatively. A project override below them still
+            // retains the historical ability to state its own team default.
             if let Some(value) = cluster_team {
-                team_available = value != 0;
+                placed_cluster_team = Some(placed_cluster_team.unwrap_or(true) && value != 0);
             }
             if let Some(profiles) = cluster_profiles
                 .as_deref()
@@ -3701,6 +3935,9 @@ impl Database {
                 allowed.retain(|profile| profiles.contains(profile));
             }
             version = version.max(cluster_version);
+        }
+        if let Some(value) = placed_cluster_team {
+            team_available = value;
         }
 
         if let Some(override_team) = row
@@ -3738,25 +3975,24 @@ impl Database {
         project_id: &str,
     ) -> Result<shared::EffectiveProjectPolicy> {
         let mut bound = self.get_deployment_default_policy().await?;
+        let mut placed_cluster_team: Option<bool> = None;
         for (cluster_team, cluster_profiles, _) in
             sqlx::query_as::<_, (Option<i64>, Option<String>, i64)>(
                 r#"
             SELECT team_available, allowed_launch_profiles, version
             FROM cluster_default_policies
             WHERE user_id IN (
-                SELECT owner_user_id FROM projects WHERE id = ?
-                UNION
-                SELECT DISTINCT user_id FROM sessions WHERE COALESCE(project_id, id) = ?
+                SELECT cluster_owner_user_id FROM project_cluster_placements
+                WHERE project_id = ?
             )
             "#,
             )
-            .bind(project_id)
             .bind(project_id)
             .fetch_all(&self.pool)
             .await?
         {
             if let Some(value) = cluster_team {
-                bound.team_available = value != 0;
+                placed_cluster_team = Some(placed_cluster_team.unwrap_or(true) && value != 0);
             }
             if let Some(profiles) = cluster_profiles
                 .as_deref()
@@ -3766,6 +4002,9 @@ impl Database {
                     .allowed_launch_profiles
                     .retain(|profile| profiles.contains(profile));
             }
+        }
+        if let Some(value) = placed_cluster_team {
+            bound.team_available = value;
         }
         Ok(bound)
     }
@@ -4075,10 +4314,9 @@ impl Database {
     }
 
     pub async fn get_sessions_for_user(&self, user_id: &str) -> Result<Vec<Session>> {
-        // An account's own list is its virtual cluster: projects it owns plus
-        // projects with a session created under it. Projects it merely belongs
-        // to arrive through get_shared_sessions_for_user, which excludes this
-        // set so the web's union cannot double-list one project.
+        // An account's own list is its durably placed cluster inventory.
+        // Projects it merely belongs to arrive through the shared list, which
+        // excludes placements so the web's union cannot double-list one.
         let sessions = sqlx::query_as::<_, Session>(
             r#"
             SELECT s.id, p.owner_user_id AS user_id, s.cli_client_id, s.working_dir,
@@ -4088,16 +4326,14 @@ impl Database {
                    s.git_remote, s.git_remote_url
             FROM sessions s
             JOIN projects p ON p.id = COALESCE(s.project_id, s.id)
-            WHERE p.owner_user_id = ?
-               OR EXISTS (
-                   SELECT 1 FROM sessions hs
-                   WHERE COALESCE(hs.project_id, hs.id) = p.id AND hs.user_id = ?
-               )
+            WHERE EXISTS (
+                SELECT 1 FROM project_cluster_placements pcp
+                WHERE pcp.project_id = p.id AND pcp.cluster_owner_user_id = ?
+            )
             ORDER BY s.created_at DESC
             LIMIT 50
             "#,
         )
-        .bind(user_id)
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
@@ -4332,8 +4568,8 @@ impl Database {
             WHERE pm.user_id = ?
               AND p.owner_user_id <> ?
               AND NOT EXISTS (
-                  SELECT 1 FROM sessions hs
-                  WHERE COALESCE(hs.project_id, hs.id) = p.id AND hs.user_id = ?
+                  SELECT 1 FROM project_cluster_placements pcp
+                  WHERE pcp.project_id = p.id AND pcp.cluster_owner_user_id = ?
               )
             ORDER BY s.created_at DESC
             LIMIT 50
@@ -4414,10 +4650,9 @@ impl Database {
     }
 
     pub async fn check_session_access(&self, session_id: &str, user_id: &str) -> Result<bool> {
-        // Content access is owner, member, or host: an account that runs any
-        // session of a project on its own machines can open that project's
-        // sessions. Suspended accounts are excluded here rather than relying
-        // on each caller having checked.
+        // Content access is owner, member, or durable hosting-cluster owner.
+        // Suspended accounts are excluded here rather than relying on each
+        // caller having checked.
         let result = sqlx::query_scalar::<_, i64>(
             r#"
             SELECT COUNT(*)
@@ -4434,8 +4669,8 @@ impl Database {
                       SELECT 1 FROM project_members pm
                       WHERE pm.project_id = p.id AND pm.user_id = ?
                   ) OR EXISTS (
-                      SELECT 1 FROM sessions hs
-                      WHERE COALESCE(hs.project_id, hs.id) = p.id AND hs.user_id = ?
+                      SELECT 1 FROM project_cluster_placements pcp
+                      WHERE pcp.project_id = p.id AND pcp.cluster_owner_user_id = ?
                   )
               )
             "#,
@@ -4448,6 +4683,32 @@ impl Database {
         .fetch_one(&self.pool)
         .await?;
         Ok(result > 0)
+    }
+
+    /// Content access plus current authority to mutate the runtime that hosts
+    /// this session. A project owner keeps their data after shared-cluster
+    /// revocation, but cannot keep sending work to the former host's compute.
+    pub async fn check_session_runtime_access(
+        &self,
+        session_id: &str,
+        user_id: &str,
+    ) -> Result<bool> {
+        if !self.check_session_access(session_id, user_id).await? {
+            return Ok(false);
+        }
+        let hosting_user_id =
+            sqlx::query_scalar::<_, String>("SELECT user_id FROM sessions WHERE id = ?")
+                .bind(session_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some(hosting_user_id) = hosting_user_id else {
+            return Ok(false);
+        };
+        if hosting_user_id == user_id {
+            return Ok(true);
+        }
+        self.is_active_cluster_member(&hosting_user_id, user_id)
+            .await
     }
 
     pub async fn delete_session_share(&self, session_id: &str, user_id: &str) -> Result<bool> {
@@ -4666,8 +4927,9 @@ impl Database {
             r#"
             INSERT INTO pane_usage_stats
                 (session_id, pane_id, day, prompt_count, input_tokens, output_tokens,
-                 cache_read_tokens, cache_creation_tokens, total_cost_usd, num_responses, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                 cache_read_tokens, cache_creation_tokens, total_cost_usd,
+                 cost_reported_count, num_responses, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(session_id, pane_id, day) DO UPDATE SET
                 prompt_count = prompt_count + excluded.prompt_count,
                 input_tokens = input_tokens + excluded.input_tokens,
@@ -4675,6 +4937,7 @@ impl Database {
                 cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
                 cache_creation_tokens = cache_creation_tokens + excluded.cache_creation_tokens,
                 total_cost_usd = total_cost_usd + excluded.total_cost_usd,
+                cost_reported_count = cost_reported_count + excluded.cost_reported_count,
                 num_responses = num_responses + excluded.num_responses,
                 updated_at = CURRENT_TIMESTAMP
             "#,
@@ -4688,6 +4951,7 @@ impl Database {
         .bind(delta.cache_read_tokens)
         .bind(delta.cache_creation_tokens)
         .bind(delta.total_cost_usd)
+        .bind(i64::from(delta.cost_reported))
         .bind(delta.num_responses)
         .execute(&self.pool)
         .await?;
@@ -4701,72 +4965,71 @@ impl Database {
         &self,
         session_id: &str,
     ) -> Result<shared::ProjectUsageStats> {
+        let project_id = sqlx::query_scalar::<_, String>(
+            "SELECT COALESCE(project_id, id) FROM sessions WHERE id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("project session not found"))?;
+        self.get_project_usage_stats_by_project(&project_id).await
+    }
+
+    pub async fn get_project_usage_stats_by_project(
+        &self,
+        project_id: &str,
+    ) -> Result<shared::ProjectUsageStats> {
         let rows = sqlx::query_as::<_, PaneUsageDayRow>(
             r#"
             SELECT pus.pane_id, pus.day, pus.prompt_count, pus.input_tokens, pus.output_tokens,
                    pus.cache_read_tokens, pus.cache_creation_tokens, pus.total_cost_usd,
-                   pus.num_responses, pus.updated_at
+                   pus.cost_reported_count, pus.num_responses, pus.updated_at
             FROM pane_usage_stats pus
             JOIN sessions s ON s.id = pus.session_id
-            WHERE COALESCE(s.project_id, s.id) =
-                  (SELECT COALESCE(project_id, id) FROM sessions WHERE id = ?)
+            WHERE COALESCE(s.project_id, s.id) = ?
             "#,
         )
-        .bind(session_id)
+        .bind(project_id)
         .fetch_all(&self.pool)
         .await?;
+        Ok(aggregate_usage_rows(&rows))
+    }
 
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        // 7-day window is today plus the previous 6 days, inclusive.
-        let week_start = (chrono::Utc::now() - chrono::Duration::days(6))
-            .format("%Y-%m-%d")
-            .to_string();
-
-        use std::collections::BTreeMap;
-        let mut by_pane: BTreeMap<i64, shared::PaneUsageStats> = BTreeMap::new();
-        let mut project = shared::ProjectUsageStats::default();
-
-        for r in &rows {
-            let pane = by_pane
-                .entry(r.pane_id)
-                .or_insert_with(|| shared::PaneUsageStats {
-                    pane_id: r.pane_id as u32,
-                    ..Default::default()
-                });
-            accumulate(&mut pane.lifetime, r);
-            accumulate(&mut project.lifetime, r);
-            if r.day.as_str() >= week_start.as_str() {
-                accumulate(&mut pane.last_7d, r);
-                accumulate(&mut project.last_7d, r);
-            }
-            if r.day == today {
-                accumulate(&mut pane.today, r);
-                accumulate(&mut project.today, r);
-            }
-            if let Some(ua) = &r.updated_at {
-                // Normalize SQLite's "YYYY-MM-DD HH:MM:SS" to RFC3339 (UTC)
-                // BEFORE comparing/storing, so the max comparison stays
-                // consistent and clients can parse the timestamp.
-                let ua = sqlite_ts_to_rfc3339(ua);
-                if pane
+    pub async fn get_cluster_usage_report(
+        &self,
+        cluster_owner_user_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<ClusterUsageReport> {
+        let summaries = self
+            .list_cluster_projects(cluster_owner_user_id, None, limit, offset)
+            .await?;
+        let mut report = ClusterUsageReport {
+            cluster_owner_user_id: cluster_owner_user_id.to_string(),
+            ..Default::default()
+        };
+        for summary in summaries {
+            let usage = self.get_project_usage_stats_by_project(&summary.id).await?;
+            add_usage_counters(&mut report.lifetime, &usage.lifetime);
+            add_usage_counters(&mut report.last_7d, &usage.last_7d);
+            add_usage_counters(&mut report.today, &usage.today);
+            if usage.last_active.as_deref().is_some_and(|candidate| {
+                report
                     .last_active
                     .as_deref()
-                    .map_or(true, |cur| cur < ua.as_str())
-                {
-                    pane.last_active = Some(ua.clone());
-                }
-                if project
-                    .last_active
-                    .as_deref()
-                    .map_or(true, |cur| cur < ua.as_str())
-                {
-                    project.last_active = Some(ua);
-                }
+                    .is_none_or(|current| candidate > current)
+            }) {
+                report.last_active = usage.last_active.clone();
             }
+            report.projects.push(ClusterProjectUsage {
+                project_id: summary.id,
+                project_name: summary.project_name,
+                owner_user_id: summary.owner_user_id,
+                owner_email: summary.owner_email,
+                usage,
+            });
         }
-
-        project.panes = by_pane.into_values().collect();
-        Ok(project)
+        Ok(report)
     }
 }
 
@@ -4779,6 +5042,7 @@ pub struct UsageDelta {
     pub cache_read_tokens: i64,
     pub cache_creation_tokens: i64,
     pub total_cost_usd: f64,
+    pub cost_reported: bool,
     pub num_responses: i64,
 }
 
@@ -4802,6 +5066,71 @@ fn accumulate(c: &mut shared::UsageCounters, r: &PaneUsageDayRow) {
     c.cache_read_tokens += r.cache_read_tokens.max(0) as u64;
     c.cache_creation_tokens += r.cache_creation_tokens.max(0) as u64;
     c.cost_usd += r.total_cost_usd;
+    c.cost_usd_reported |= r.cost_reported_count > 0;
+}
+
+fn add_usage_counters(target: &mut shared::UsageCounters, source: &shared::UsageCounters) {
+    target.prompts += source.prompts;
+    target.responses += source.responses;
+    target.input_tokens += source.input_tokens;
+    target.output_tokens += source.output_tokens;
+    target.cache_read_tokens += source.cache_read_tokens;
+    target.cache_creation_tokens += source.cache_creation_tokens;
+    target.cost_usd += source.cost_usd;
+    target.cost_usd_reported |= source.cost_usd_reported;
+}
+
+fn aggregate_usage_rows(rows: &[PaneUsageDayRow]) -> shared::ProjectUsageStats {
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    // 7-day window is today plus the previous 6 days, inclusive.
+    let week_start = (chrono::Utc::now() - chrono::Duration::days(6))
+        .format("%Y-%m-%d")
+        .to_string();
+
+    use std::collections::BTreeMap;
+    let mut by_pane: BTreeMap<i64, shared::PaneUsageStats> = BTreeMap::new();
+    let mut project = shared::ProjectUsageStats::default();
+
+    for r in rows {
+        let pane = by_pane
+            .entry(r.pane_id)
+            .or_insert_with(|| shared::PaneUsageStats {
+                pane_id: r.pane_id as u32,
+                ..Default::default()
+            });
+        accumulate(&mut pane.lifetime, r);
+        accumulate(&mut project.lifetime, r);
+        if r.day.as_str() >= week_start.as_str() {
+            accumulate(&mut pane.last_7d, r);
+            accumulate(&mut project.last_7d, r);
+        }
+        if r.day == today {
+            accumulate(&mut pane.today, r);
+            accumulate(&mut project.today, r);
+        }
+        if let Some(ua) = &r.updated_at {
+            // Normalize SQLite's "YYYY-MM-DD HH:MM:SS" to RFC3339 (UTC)
+            // before comparing/storing, so clients can parse the timestamp.
+            let ua = sqlite_ts_to_rfc3339(ua);
+            if pane
+                .last_active
+                .as_deref()
+                .is_none_or(|current| current < ua.as_str())
+            {
+                pane.last_active = Some(ua.clone());
+            }
+            if project
+                .last_active
+                .as_deref()
+                .is_none_or(|current| current < ua.as_str())
+            {
+                project.last_active = Some(ua);
+            }
+        }
+    }
+
+    project.panes = by_pane.into_values().collect();
+    project
 }
 
 #[cfg(test)]
@@ -5320,6 +5649,7 @@ mod usage_stats_tests {
                 input_tokens: 100,
                 output_tokens: 50,
                 total_cost_usd: 0.02,
+                cost_reported: true,
                 num_responses: 1,
                 ..Default::default()
             },
@@ -5375,6 +5705,7 @@ mod usage_stats_tests {
         assert_eq!(p178.today.input_tokens, 100);
         assert_eq!(p178.last_7d.input_tokens, 100);
         assert!((p178.lifetime.cost_usd - 0.02).abs() < 1e-9);
+        assert!(p178.lifetime.cost_usd_reported);
 
         // Project totals sum across both panes.
         assert_eq!(stats.lifetime.input_tokens, 1110);
@@ -5415,6 +5746,75 @@ mod usage_stats_tests {
         // s-a's project must not see s-b's usage.
         let a = db.get_project_usage_stats("s-a").await.unwrap();
         assert_eq!(a.lifetime.input_tokens, 5);
+        assert!(!a.lifetime.cost_usd_reported);
+    }
+
+    #[tokio::test]
+    async fn cluster_usage_includes_member_owned_projects_without_inventing_costs() {
+        let db = temp_db().await;
+        db.create_user(&User {
+            id: "u2".to_string(),
+            email: "member-usage@example.test".to_string(),
+            password_hash: "hash".to_string(),
+            created_at: None,
+            cluster_role: "user".to_string(),
+            account_status: "active".to_string(),
+        })
+        .await
+        .unwrap();
+        db.authorize_project_registration("owner-project", "u1")
+            .await
+            .unwrap();
+        db.authorize_project_registration("member-project", "u2")
+            .await
+            .unwrap();
+        db.add_project_cluster_placement("member-project", "u1", "u2", "test")
+            .await
+            .unwrap();
+
+        db.create_session(&session("owner-session", "owner-project"))
+            .await
+            .unwrap();
+        db.create_session(&session("member-session", "member-project"))
+            .await
+            .unwrap();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        db.add_pane_usage(
+            "owner-session",
+            1,
+            &today,
+            &UsageDelta {
+                input_tokens: 10,
+                total_cost_usd: 0.0,
+                cost_reported: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        db.add_pane_usage(
+            "member-session",
+            2,
+            &today,
+            &UsageDelta {
+                input_tokens: 20,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let report = db.get_cluster_usage_report("u1", 50, 0).await.unwrap();
+        assert_eq!(report.projects.len(), 2);
+        assert_eq!(report.lifetime.input_tokens, 30);
+        assert!(report.lifetime.cost_usd_reported);
+        let member = report
+            .projects
+            .iter()
+            .find(|project| project.project_id == "member-project")
+            .unwrap();
+        assert_eq!(member.owner_user_id, "u2");
+        assert!(!member.usage.lifetime.cost_usd_reported);
     }
 }
 
@@ -6197,6 +6597,9 @@ mod cluster_administration_tests {
         db.add_project_member("owner", "project-a", "member")
             .await
             .unwrap();
+        db.add_project_cluster_placement("project-a", "host", "owner", "test")
+            .await
+            .unwrap();
         db.create_session(&Session {
             id: "session-a".to_string(),
             user_id: "owner".to_string(),
@@ -6569,6 +6972,9 @@ mod cluster_administration_tests {
         db.add_project_member("owner", "project-a", "member")
             .await
             .unwrap();
+        db.add_project_cluster_placement("project-a", "host", "owner", "test")
+            .await
+            .unwrap();
         db.create_session(&Session {
             id: "host-instance".to_string(),
             user_id: "host".to_string(),
@@ -6599,13 +7005,17 @@ mod cluster_administration_tests {
             .await
             .unwrap());
 
-        // Membership alone does not place a project in the member's cluster:
-        // the member reaches the project as a member, not as its operator.
+        // Membership alone does not place a project in the member's cluster.
+        assert!(!db
+            .project_in_user_cluster("project-a", "member")
+            .await
+            .unwrap());
+        // Explicit local registration does create the durable placement.
         assert!(db
             .authorize_project_registration("project-a", "member")
             .await
             .is_ok());
-        assert!(!db
+        assert!(db
             .project_in_user_cluster("project-a", "member")
             .await
             .unwrap());
@@ -6672,6 +7082,12 @@ mod cluster_administration_tests {
             .await
             .unwrap();
         db.authorize_project_registration("project-c", "host")
+            .await
+            .unwrap();
+        db.add_project_cluster_placement("project-a", "member", "owner", "test")
+            .await
+            .unwrap();
+        db.add_project_cluster_placement("project-b", "host", "other", "test")
             .await
             .unwrap();
         for (id, session_user, project_id) in [
@@ -6796,6 +7212,9 @@ mod cluster_administration_tests {
 
         // A hosting account's cluster default narrows the project even though
         // another account owns it.
+        db.add_project_cluster_placement("project-a", "host", "owner", "test")
+            .await
+            .unwrap();
         db.create_session(&Session {
             id: "host-instance".to_string(),
             user_id: "host".to_string(),
@@ -6842,6 +7261,9 @@ mod cluster_administration_tests {
             .contains("cannot allow launch profile"));
 
         // A project hosted in two clusters gets the intersection of both.
+        db.add_project_cluster_placement("project-a", "second", "owner", "test")
+            .await
+            .unwrap();
         db.create_session(&Session {
             id: "second-instance".to_string(),
             user_id: "second".to_string(),
@@ -6918,6 +7340,9 @@ mod cluster_administration_tests {
         db.authorize_project_registration("project-b", "other")
             .await
             .unwrap();
+        db.add_project_cluster_placement("project-a", "host", "owner", "test")
+            .await
+            .unwrap();
         db.create_session(&Session {
             id: "host-instance".to_string(),
             user_id: "host".to_string(),
@@ -6939,7 +7364,10 @@ mod cluster_administration_tests {
         assert_eq!(hosted.len(), 1);
         assert_eq!(hosted[0].id, "project-a");
         assert_eq!(hosted[0].owner_email, "owner@test");
-        assert_eq!(hosted[0].hosting_emails, vec!["host@test".to_string()]);
+        assert_eq!(
+            hosted[0].hosting_emails,
+            vec!["host@test".to_string(), "owner@test".to_string()]
+        );
 
         assert!(db
             .list_cluster_projects("other", None, 50, 0)

@@ -1010,6 +1010,13 @@
             "null"
           ]
         },
+        "cluster_owner_user_id": {
+          "description": "Explicit cluster context for shared targets. Omitted by legacy\nclients and for compatibility owner flows.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "git_remote": {
           "type": "string"
         },
