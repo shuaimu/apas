@@ -32,7 +32,7 @@ export default function ClusterInvitationPage() {
       router.replace(`/login?redirect=${encodeURIComponent(`/cluster-invitations/${token}`)}`);
       return;
     }
-    void fetch(`${API_URL}/cluster-invitations/${encodeURIComponent(token)}`, {
+    void fetch(`${API_URL}/cluster/invitation-links/${encodeURIComponent(token)}`, {
       headers: { Authorization: `Bearer ${authToken}` },
     }).then(async (response) => {
       const body = await response.json().catch(() => null);
@@ -47,7 +47,7 @@ export default function ClusterInvitationPage() {
     setJoining(true);
     setError(null);
     try {
-      const response = await fetch(`${API_URL}/cluster-invitations/${encodeURIComponent(token)}/accept`, {
+      const response = await fetch(`${API_URL}/cluster/invitation-links/${encodeURIComponent(token)}/accept`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
         body: JSON.stringify({ trust_confirmed: true }),

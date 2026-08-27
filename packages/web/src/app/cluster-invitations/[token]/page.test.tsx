@@ -58,7 +58,7 @@ describe("shared cluster invitation", () => {
     fireEvent.click(screen.getByRole("checkbox"));
     fireEvent.click(screen.getByRole("button", { name: "Join cluster" }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
-      "https://apas.mpaxos.com/cluster-invitations/invite-token/accept",
+      "https://apas.mpaxos.com/cluster/invitation-links/invite-token/accept",
       expect.objectContaining({ method: "POST", body: JSON.stringify({ trust_confirmed: true }) }),
     ));
     expect(replace).toHaveBeenCalledWith("/machines");

@@ -216,7 +216,7 @@ export default function MachinesPage() {
 
   const loadClusters = useCallback(async () => {
     try {
-      const result = await api<unknown>("/clusters");
+      const result = await api<unknown>("/cluster/contexts");
       if (!Array.isArray(result)) return;
       const next = result as ClusterReference[];
       setClusters(next);
@@ -243,10 +243,10 @@ export default function MachinesPage() {
     setClusterError(null);
     try {
       const projectPath = sharedView && selectedClusterId
-        ? `/clusters/${encodeURIComponent(selectedClusterId)}/projects?limit=200`
+        ? `/cluster/contexts/${encodeURIComponent(selectedClusterId)}/projects?limit=200`
         : "/cluster/projects?limit=200";
       const policyPath = sharedView && selectedClusterId
-        ? `/clusters/${encodeURIComponent(selectedClusterId)}/policy/default`
+        ? `/cluster/contexts/${encodeURIComponent(selectedClusterId)}/policy/default`
         : "/cluster/policy/default";
       const [projectPage, policy, launchProfiles] = await Promise.all([
         api<Page<ClusterProject>>(projectPath),
@@ -287,7 +287,7 @@ export default function MachinesPage() {
     setClusterError(null);
     try {
       const path = sharedView && selectedClusterId
-        ? `/clusters/${encodeURIComponent(selectedClusterId)}/projects/${encodeURIComponent(projectId)}`
+        ? `/cluster/contexts/${encodeURIComponent(selectedClusterId)}/projects/${encodeURIComponent(projectId)}`
         : `/cluster/projects/${encodeURIComponent(projectId)}`;
       const [detail, projectUsage] = await Promise.all([
         api<ClusterProjectDetail>(path),

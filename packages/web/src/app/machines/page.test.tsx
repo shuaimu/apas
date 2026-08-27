@@ -404,7 +404,7 @@ describe("MachinesPage cluster administration", () => {
         memberActive = false;
         return apiResponse({ success: true });
       }
-      if (url.endsWith("/clusters")) return apiResponse([
+      if (url.endsWith("/cluster/contexts")) return apiResponse([
         { owner_user_id: "me", owner_email: "me@example.com", access: "owner" },
       ]);
       if (url.includes("/cluster/projects?")) return apiResponse({ items: [], limit: 200, offset: 0 });
@@ -451,7 +451,7 @@ describe("MachinesPage cluster administration", () => {
     };
     fetchMock.mockImplementation(async (input: string | URL) => {
       const url = String(input);
-      if (url.endsWith("/clusters")) return apiResponse([
+      if (url.endsWith("/cluster/contexts")) return apiResponse([
         { owner_user_id: "me", owner_email: "me@example.com", access: "owner" },
       ]);
       if (url.includes("/cluster/projects?")) return apiResponse({ items: [], limit: 200, offset: 0 });
@@ -495,12 +495,12 @@ describe("MachinesPage cluster administration", () => {
   it("renders a shared cluster without owner-only controls or secrets", async () => {
     fetchMock.mockImplementation(async (input: string | URL) => {
       const url = String(input);
-      if (url.endsWith("/clusters")) return apiResponse([
+      if (url.endsWith("/cluster/contexts")) return apiResponse([
         { owner_user_id: "me", owner_email: "me@example.com", access: "owner" },
         { owner_user_id: "host", owner_email: "host@example.com", access: "member" },
       ]);
-      if (url.includes("/clusters/host/projects?")) return apiResponse({ items: [], limit: 200, offset: 0 });
-      if (url.endsWith("/clusters/host/policy/default")) return apiResponse({ cluster: null, deployment: policy });
+      if (url.includes("/cluster/contexts/host/projects?")) return apiResponse({ items: [], limit: 200, offset: 0 });
+      if (url.endsWith("/cluster/contexts/host/policy/default")) return apiResponse({ cluster: null, deployment: policy });
       if (url.endsWith("/cluster/launch-profiles")) return apiResponse([]);
       if (url.includes("/cluster/projects?")) return apiResponse({ items: [], limit: 200, offset: 0 });
       if (url.endsWith("/cluster/policy/default")) return apiResponse({ cluster: null, deployment: policy });

@@ -96,7 +96,7 @@ Machine messages become audience-specific DTOs. Owners retain the full managemen
 
 ### 6. Preserve compatible APIs while adding explicit cluster context
 
-Existing `/cluster/*` owner-administration routes remain aliases for the caller's owned cluster. New discovery returns the owned cluster plus accepted shared clusters, and explicit `/clusters/{cluster_owner_user_id}/*` read/provisioning routes carry cluster context. Every server handler resolves the path ID rather than trusting owner/member flags from the client.
+Existing `/cluster/*` owner-administration routes remain aliases for the caller's owned cluster. New discovery returns the owned cluster plus accepted shared clusters, and explicit `/cluster/contexts/{cluster_owner_user_id}/*` read/provisioning routes carry cluster context. Invitation inspection and acceptance use `/cluster/invitation-links/*`, leaving the public `/cluster-invitations/{token}` path exclusively to the Next.js page. Every server handler resolves the path ID rather than trusting owner/member flags from the client.
 
 Invitation acceptance uses a token-scoped route outside an owner-only cluster path so an authenticated invitee can accept without already being a member. Mutations return generic not-found/forbidden responses when revealing the target would cross an authorization boundary.
 

@@ -110,7 +110,7 @@ pub fn create_router(state: AppState) -> Router {
         // Virtual-cluster self-service: every active account administers the
         // machines it registered and the projects hosted on them.
         .route("/cluster/overview", get(cluster::overview))
-        .route("/clusters", get(cluster::list_clusters))
+        .route("/cluster/contexts", get(cluster::list_clusters))
         .route(
             "/cluster/invitations",
             get(cluster::list_invitations).post(cluster::create_invitation),
@@ -122,31 +122,31 @@ pub fn create_router(state: AppState) -> Router {
         .route("/cluster/members", get(cluster::list_members))
         .route("/cluster/members/:user_id", delete(cluster::revoke_member))
         .route(
-            "/cluster-invitations/:token",
+            "/cluster/invitation-links/:token",
             get(cluster::inspect_invitation),
         )
         .route(
-            "/cluster-invitations/:token/accept",
+            "/cluster/invitation-links/:token/accept",
             post(cluster::accept_invitation),
         )
         .route(
-            "/clusters/:cluster_owner_user_id/overview",
+            "/cluster/contexts/:cluster_owner_user_id/overview",
             get(cluster::context_overview),
         )
         .route(
-            "/clusters/:cluster_owner_user_id/projects",
+            "/cluster/contexts/:cluster_owner_user_id/projects",
             get(cluster::context_list_projects),
         )
         .route(
-            "/clusters/:cluster_owner_user_id/projects/:project_id",
+            "/cluster/contexts/:cluster_owner_user_id/projects/:project_id",
             get(cluster::context_get_project),
         )
         .route(
-            "/clusters/:cluster_owner_user_id/policy/default",
+            "/cluster/contexts/:cluster_owner_user_id/policy/default",
             get(cluster::context_get_default_policy),
         )
         .route(
-            "/clusters/:cluster_owner_user_id/usage",
+            "/cluster/contexts/:cluster_owner_user_id/usage",
             get(cluster::cluster_usage),
         )
         .route("/cluster/usage", get(cluster::own_cluster_usage))
