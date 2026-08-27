@@ -67,6 +67,27 @@ describe("CreateInstanceModal", () => {
     expect(screen.getByDisplayValue("https://github.com/foo/bar.git")).toBeTruthy();
   });
 
+  it("creates a brand-new project from an entered GitHub URL", () => {
+    const create = seed([machine("m1", "alpha")]);
+
+    render(<CreateInstanceModal open onClose={vi.fn()} />);
+    fireEvent.change(screen.getByLabelText("Clone URL"), {
+      target: { value: "https://github.com/openai/codex.git" },
+    });
+
+    expect(screen.getByDisplayValue("codex")).toBeTruthy();
+    expect(screen.getByDisplayValue("apas/codex")).toBeTruthy();
+    fireEvent.click(screen.getByText("Create & start"));
+    expect(create).toHaveBeenCalledWith(
+      "m1",
+      "github.com/openai/codex",
+      "codex",
+      "apas/codex",
+      "https://github.com/openai/codex.git",
+      undefined,
+    );
+  });
+
   it("shows an empty state and disables create when no daemons are running", () => {
     seed([]);
 

@@ -724,6 +724,7 @@ impl DaemonState {
         let server = server_url.to_string();
         let token = token.to_string();
         let id_for_task = project_id.to_string();
+        let machine_id = self.machine_info.machine_id;
         let restart_tx = restart_tx.clone();
         let handle = tokio::spawn(async move {
             // Every record this project emits carries its identity: sharing a
@@ -731,8 +732,14 @@ impl DaemonState {
             // used to separate them for free.
             let span = tracing::info_span!("project", id = %id_for_task);
             let _entered = span.enter();
-            match crate::mode::dual_pane::run_project(&server, &token, &project_path, task_shutdown)
-                .await
+            match crate::mode::dual_pane::run_project(
+                &server,
+                &token,
+                &project_path,
+                task_shutdown,
+                machine_id,
+            )
+            .await
             {
                 Ok(crate::mode::dual_pane::ProjectOutcome::Completed) => {
                     tracing::info!("project stopped");

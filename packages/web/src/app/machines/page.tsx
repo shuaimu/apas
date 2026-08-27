@@ -13,7 +13,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, Copy, FolderOpen, Play, Plus, RefreshCw, RotateCcw, Square } from "lucide-react";
+import { ArrowLeft, FolderOpen, Play, Plus, RefreshCw, RotateCcw, Square } from "lucide-react";
 import { useStore } from "@/lib/store";
 import { CreateInstanceModal } from "@/components/CreateInstanceModal";
 import { AllProvidersUsage } from "@/components/UsageLimits";
@@ -77,17 +77,18 @@ interface ClusterReference {
   access: "owner" | "member";
   accepted_at?: string | null;
 }
-interface ClusterInvitation {
-  id: string;
-  invitee_email: string;
-  expires_at: string;
-  status: "pending" | "accepted" | "expired" | "revoked";
-}
 interface ClusterMembership {
   user_id: string;
   user_email: string;
   status: string;
   accepted_at?: string | null;
+  allowed_machine_ids: string[] | null;
+  default_launch_profile?: string | null;
+}
+interface ClusterMemberDraft {
+  allMachines: boolean;
+  machineIds: string[];
+  defaultLaunchProfile: string;
 }
 interface UsageCounters {
   prompts: number;
@@ -150,13 +151,13 @@ export default function MachinesPage() {
   const [ownerUserId, setOwnerUserId] = useState("");
   const [clusters, setClusters] = useState<ClusterReference[]>([]);
   const [selectedClusterId, setSelectedClusterId] = useState("");
-  const [invitations, setInvitations] = useState<ClusterInvitation[]>([]);
   const [clusterMembers, setClusterMembers] = useState<ClusterMembership[]>([]);
+  const [memberDrafts, setMemberDrafts] = useState<Record<string, ClusterMemberDraft>>({});
   const [usage, setUsage] = useState<ClusterUsageReport | null>(null);
   const [usageWindow, setUsageWindow] = useState<"today" | "last_7d" | "lifetime">("last_7d");
-  const [inviteEmail, setInviteEmail] = useState("");
-  const [trustConfirmed, setTrustConfirmed] = useState(false);
-  const [createdInviteLink, setCreatedInviteLink] = useState("");
+  const [memberEmail, setMemberEmail] = useState("");
+  const [newMemberMachineIds, setNewMemberMachineIds] = useState<string[]>([]);
+  const [newMemberDefaultProfile, setNewMemberDefaultProfile] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
 
   const selectedCluster = clusters.find((cluster) => cluster.owner_user_id === selectedClusterId);
@@ -181,6 +182,22 @@ export default function MachinesPage() {
       ]),
     [serverVersion, visibleMachines],
   );
+  const memberProfiles = useMemo(() => {
+    const allowed = clusterPolicy?.cluster?.allowed_launch_profiles
+      ?? clusterPolicy?.deployment.allowed_launch_profiles
+      ?? [];
+    return profiles.filter((profile) => allowed.includes(profile.key));
+  }, [clusterPolicy, profiles]);
+  const activeClusterMembers = useMemo(
+    () => clusterMembers.filter((member) => member.status === "active"),
+    [clusterMembers],
+  );
+
+  useEffect(() => {
+    if (!memberProfiles.some((profile) => profile.key === newMemberDefaultProfile)) {
+      setNewMemberDefaultProfile(memberProfiles[0]?.key ?? "");
+    }
+  }, [memberProfiles, newMemberDefaultProfile]);
 
   useEffect(() => {
     const storedToken = localStorage.getItem("apas_token");
@@ -258,19 +275,23 @@ export default function MachinesPage() {
       setProfiles(launchProfiles.filter((profile) => !isRetiredLaunchProfileKey(profile.key)));
       if (sharedView) {
         setAudit([]);
-        setInvitations([]);
         setClusterMembers([]);
+        setMemberDrafts({});
         setUsage(null);
       } else {
-        const [auditPage, invitationRows, memberRows, usageReport] = await Promise.all([
+        const [auditPage, memberRows, usageReport] = await Promise.all([
           api<Page<AuditEvent>>("/cluster/audit?limit=25"),
-          api<unknown>("/cluster/invitations"),
           api<unknown>("/cluster/members"),
           api<ClusterUsageReport>("/cluster/usage?limit=200"),
         ]);
         setAudit(auditPage.items || []);
-        setInvitations(Array.isArray(invitationRows) ? invitationRows as ClusterInvitation[] : []);
-        setClusterMembers(Array.isArray(memberRows) ? memberRows as ClusterMembership[] : []);
+        const memberships = Array.isArray(memberRows) ? memberRows as ClusterMembership[] : [];
+        setClusterMembers(memberships);
+        setMemberDrafts(Object.fromEntries(memberships.map((member) => [member.user_id, {
+          allMachines: member.allowed_machine_ids == null,
+          machineIds: member.allowed_machine_ids ?? [],
+          defaultLaunchProfile: member.default_launch_profile ?? "",
+        }])));
         setUsage(usageReport?.projects ? usageReport : null);
       }
     } catch (cause) {
@@ -537,7 +558,7 @@ export default function MachinesPage() {
           <section className="rounded-lg border border-gray-200 bg-white shadow-sm dark:border-gray-800 dark:bg-gray-900">
             <div className="border-b border-gray-200 px-4 py-3 dark:border-gray-800">
               <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-300">Share this cluster</h2>
-              <p className="mt-1 text-xs text-gray-500">Invite an existing APAS account. Members can run their own public GitHub projects on eligible machines.</p>
+              <p className="mt-1 text-xs text-gray-500">Add an existing APAS account immediately, then choose the machines and default AI agent available to its new projects.</p>
             </div>
             <div className="grid gap-5 p-4 lg:grid-cols-2">
               <div>
@@ -547,50 +568,132 @@ export default function MachinesPage() {
                     event.preventDefault();
                     void (async () => {
                       try {
-                        const response = await api<{ token: string }>("/cluster/invitations", {
+                        await api("/cluster/members", {
                           method: "POST",
-                          body: JSON.stringify({ email: inviteEmail, trust_confirmed: trustConfirmed }),
+                          body: JSON.stringify({
+                            email: memberEmail,
+                            allowed_machine_ids: newMemberMachineIds,
+                            default_launch_profile: newMemberDefaultProfile,
+                          }),
                         });
-                        const link = `${window.location.origin}/cluster-invitations/${response.token}`;
-                        setCreatedInviteLink(link);
-                        setInviteEmail("");
+                        setMemberEmail("");
                         await loadCluster();
                       } catch (cause) {
-                        setClusterError(cause instanceof Error ? cause.message : "Invitation failed");
+                        setClusterError(cause instanceof Error ? cause.message : "Member could not be added");
                       }
                     })();
                   }}
                 >
-                  <input aria-label="Invitee account email" type="email" required value={inviteEmail} onChange={(event) => setInviteEmail(event.target.value)} placeholder="person@example.com" className="w-full rounded border border-gray-300 bg-transparent px-3 py-2 text-sm dark:border-gray-700" />
-                  <label className="flex items-start gap-2 text-xs text-gray-600 dark:text-gray-300">
-                    <input type="checkbox" checked={trustConfirmed} onChange={(event) => setTrustConfirmed(event.target.checked)} className="mt-0.5" />
-                    <span>{TRUST_WARNING}</span>
+                  <input aria-label="Member account email" type="email" required value={memberEmail} onChange={(event) => setMemberEmail(event.target.value)} placeholder="person@example.com" className="w-full rounded border border-gray-300 bg-transparent px-3 py-2 text-sm dark:border-gray-700" />
+                  <fieldset className="space-y-2 rounded border border-gray-200 p-3 dark:border-gray-700">
+                    <legend className="px-1 text-xs font-semibold">Machines this member can use</legend>
+                    {visibleMachines.map(({ machine }) => (
+                      <label key={machine.machineId} className="flex items-center gap-2 text-sm">
+                        <input
+                          type="checkbox"
+                          checked={newMemberMachineIds.includes(machine.machineId)}
+                          onChange={(event) => setNewMemberMachineIds((current) => event.target.checked
+                            ? [...current, machine.machineId]
+                            : current.filter((machineId) => machineId !== machine.machineId))}
+                        />
+                        {machine.hostname}
+                      </label>
+                    ))}
+                    {visibleMachines.length === 0 && <p className="text-xs text-amber-600">Connect a machine before adding a member.</p>}
+                  </fieldset>
+                  <label className="block text-xs font-semibold">
+                    Default AI agent for new projects
+                    <select
+                      aria-label="Default AI agent for new member projects"
+                      value={newMemberDefaultProfile}
+                      onChange={(event) => setNewMemberDefaultProfile(event.target.value)}
+                      className="mt-1 w-full rounded border border-gray-300 bg-transparent px-3 py-2 text-sm font-normal dark:border-gray-700"
+                    >
+                      {memberProfiles.map((profile) => <option key={profile.key} value={profile.key}>{profile.label}</option>)}
+                    </select>
                   </label>
-                  <button disabled={!trustConfirmed || !inviteEmail.trim()} className="rounded bg-blue-600 px-3 py-2 text-sm text-white disabled:opacity-50">Create invitation</button>
+                  <p className="text-xs text-amber-700 dark:text-amber-300">This member can run code on every selected machine. Add only accounts you trust.</p>
+                  <button disabled={!memberEmail.trim() || newMemberMachineIds.length === 0 || !newMemberDefaultProfile} className="rounded bg-blue-600 px-3 py-2 text-sm text-white disabled:opacity-50">Add member</button>
                 </form>
-                {createdInviteLink && (
-                  <div className="mt-3 flex items-center gap-2 rounded bg-gray-50 p-2 dark:bg-gray-800">
-                    <span className="min-w-0 flex-1 truncate font-mono text-xs">{createdInviteLink}</span>
-                    <button aria-label="Copy invitation link" onClick={() => void navigator.clipboard.writeText(createdInviteLink)} className="rounded border p-1.5"><Copy className="h-4 w-4" /></button>
-                  </div>
-                )}
-                <div className="mt-4 space-y-2">
-                  {invitations.map((invitation) => (
-                    <div key={invitation.id} className="flex items-center justify-between rounded border border-gray-200 p-2 text-sm dark:border-gray-800">
-                      <div><div>{invitation.invitee_email}</div><div className="text-xs capitalize text-gray-500">{invitation.status} · expires {new Date(invitation.expires_at).toLocaleString()}</div></div>
-                      {invitation.status === "pending" && <button onClick={() => void mutate(`/cluster/invitations/${invitation.id}`, { method: "DELETE" })} className="text-xs text-red-600">Revoke</button>}
-                    </div>
-                  ))}
-                </div>
               </div>
               <div>
                 <h3 className="mb-2 text-sm font-semibold">Cluster members</h3>
-                {clusterMembers.length === 0 ? <p className="text-sm text-gray-500">No one has joined this cluster.</p> : clusterMembers.map((member) => (
-                  <div key={member.user_id} className="flex items-center justify-between border-b border-gray-100 py-2 text-sm dark:border-gray-800">
-                    <div><div>{member.user_email}</div><div className="text-xs capitalize text-gray-500">{member.status}</div></div>
-                    {member.status === "active" && <button onClick={() => { if (window.confirm(`Revoke ${member.user_email}'s compute access?`)) void mutate(`/cluster/members/${member.user_id}`, { method: "DELETE" }); }} className="text-xs text-red-600">Revoke access</button>}
-                  </div>
-                ))}
+                {activeClusterMembers.length === 0 ? <p className="text-sm text-gray-500">No members have access to this cluster.</p> : activeClusterMembers.map((member) => {
+                  const draft = memberDrafts[member.user_id] ?? {
+                    allMachines: member.allowed_machine_ids == null,
+                    machineIds: member.allowed_machine_ids ?? [],
+                    defaultLaunchProfile: member.default_launch_profile ?? "",
+                  };
+                  return (
+                    <div key={member.user_id} className="mb-3 space-y-3 rounded border border-gray-200 p-3 text-sm dark:border-gray-700">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="font-medium">{member.user_email}</div>
+                        <button onClick={() => { if (window.confirm(`Revoke ${member.user_email}'s compute access?`)) void mutate(`/cluster/members/${member.user_id}`, { method: "DELETE" }); }} className="text-xs text-red-600">Revoke access</button>
+                      </div>
+                      <fieldset className="space-y-1.5">
+                        <legend className="text-xs font-semibold">Machine access</legend>
+                        <label className="flex items-center gap-2 text-xs">
+                          <input
+                            type="checkbox"
+                            checked={draft.allMachines}
+                            onChange={(event) => setMemberDrafts((current) => ({
+                              ...current,
+                              [member.user_id]: { ...draft, allMachines: event.target.checked },
+                            }))}
+                          />
+                          All current and future machines
+                        </label>
+                        {visibleMachines.map(({ machine }) => (
+                          <label key={machine.machineId} className="ml-4 flex items-center gap-2 text-xs">
+                            <input
+                              type="checkbox"
+                              disabled={draft.allMachines}
+                              checked={draft.allMachines || draft.machineIds.includes(machine.machineId)}
+                              onChange={(event) => setMemberDrafts((current) => ({
+                                ...current,
+                                [member.user_id]: {
+                                  ...draft,
+                                  machineIds: event.target.checked
+                                    ? [...draft.machineIds, machine.machineId]
+                                    : draft.machineIds.filter((machineId) => machineId !== machine.machineId),
+                                },
+                              }))}
+                            />
+                            {machine.hostname}
+                          </label>
+                        ))}
+                      </fieldset>
+                      <label className="block text-xs font-semibold">
+                        Agent for new projects
+                        <select
+                          aria-label={`Default AI agent for ${member.user_email}`}
+                          value={draft.defaultLaunchProfile}
+                          onChange={(event) => setMemberDrafts((current) => ({
+                            ...current,
+                            [member.user_id]: { ...draft, defaultLaunchProfile: event.target.value },
+                          }))}
+                          className="mt-1 w-full rounded border border-gray-300 bg-transparent px-2 py-1.5 text-sm font-normal dark:border-gray-700"
+                        >
+                          <option value="">Inherit cluster policy</option>
+                          {memberProfiles.map((profile) => <option key={profile.key} value={profile.key}>{profile.label}</option>)}
+                        </select>
+                      </label>
+                      <button
+                        onClick={() => void mutate(`/cluster/members/${member.user_id}`, {
+                          method: "PATCH",
+                          body: JSON.stringify({
+                            allowed_machine_ids: draft.allMachines ? null : draft.machineIds,
+                            default_launch_profile: draft.defaultLaunchProfile || null,
+                          }),
+                        })}
+                        disabled={!draft.allMachines && draft.machineIds.length === 0}
+                        className="rounded bg-gray-900 px-3 py-1.5 text-xs text-white disabled:opacity-50 dark:bg-gray-100 dark:text-gray-900"
+                      >
+                        Save access
+                      </button>
+                    </div>
+                  );
+                })}
               </div>
             </div>
           </section>
@@ -795,8 +898,6 @@ export default function MachinesPage() {
         <CreateInstanceModal
           open={createOpen}
           onClose={() => setCreateOpen(false)}
-          gitRemote="github.com/owner/repository"
-          cloneUrl="https://github.com/owner/repository"
           clusterOwnerUserId={selectedClusterId || undefined}
         />
       </div>

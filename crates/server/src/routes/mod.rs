@@ -119,8 +119,14 @@ pub fn create_router(state: AppState) -> Router {
             "/cluster/invitations/:invitation_id",
             delete(cluster::revoke_invitation),
         )
-        .route("/cluster/members", get(cluster::list_members))
-        .route("/cluster/members/:user_id", delete(cluster::revoke_member))
+        .route(
+            "/cluster/members",
+            get(cluster::list_members).post(cluster::add_member),
+        )
+        .route(
+            "/cluster/members/:user_id",
+            patch(cluster::update_member).delete(cluster::revoke_member),
+        )
         .route(
             "/cluster/invitation-links/:token",
             get(cluster::inspect_invitation),
@@ -817,6 +823,72 @@ mod cluster_authorization_tests {
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn cluster_owner_adds_member_directly_with_machine_and_agent_controls() {
+        let state = state().await;
+        let owner = uuid::Uuid::new_v4();
+        let member = uuid::Uuid::new_v4();
+        add_user(&state, &owner.to_string(), "user", "active").await;
+        add_user(&state, &member.to_string(), "user", "active").await;
+        let machine_id = uuid::Uuid::new_v4();
+        let (daemon_tx, _daemon_rx) = tokio::sync::mpsc::channel(1);
+        state.sessions.register_daemon(
+            machine_id,
+            owner,
+            daemon_tx,
+            shared::MachineInfo {
+                machine_id,
+                hostname: "member-host".to_string(),
+                os: "linux".to_string(),
+                arch: "x86_64".to_string(),
+                daemon_version: None,
+                deepseek_backend: None,
+                last_seen: None,
+            },
+            Vec::new(),
+        );
+
+        let added = cluster::add_member(
+            State(state.clone()),
+            headers(&state, &owner.to_string()),
+            Json(cluster::AddClusterMemberRequest {
+                email: format!("{}@test", member),
+                allowed_machine_ids: Some(vec![machine_id]),
+                default_launch_profile: Some("terminal:codex:official:default".to_string()),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(added.user_id, member.to_string());
+        assert_eq!(
+            added.allowed_machine_ids,
+            Some(vec![machine_id.to_string()])
+        );
+        assert_eq!(
+            added.default_launch_profile.as_deref(),
+            Some("terminal:codex:official:default")
+        );
+
+        let updated = cluster::update_member(
+            State(state.clone()),
+            headers(&state, &owner.to_string()),
+            Path(member.to_string()),
+            Json(cluster::UpdateClusterMemberRequest {
+                allowed_machine_ids: None,
+                default_launch_profile: Some("terminal:claude:official:default".to_string()),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(updated.allowed_machine_ids, None);
+        assert_eq!(
+            updated.default_launch_profile.as_deref(),
+            Some("terminal:claude:official:default")
+        );
     }
 }
 

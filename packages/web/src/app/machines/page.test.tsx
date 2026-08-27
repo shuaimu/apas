@@ -268,7 +268,7 @@ describe("MachinesPage", () => {
     const { unmount } = render(<MachinesPage />);
 
     expect(actions.listMachines).toHaveBeenCalledTimes(1);
-    expect(screen.getByText("build-host")).toBeTruthy();
+    expect(screen.getAllByText("build-host").length).toBeGreaterThan(0);
     expect(screen.getByText(/linux\/x64/)).toBeTruthy();
     expect(screen.getByText("DeepSeek Backend (Claude Runtime)")).toBeTruthy();
     expect(screen.getByText("API key configured")).toBeTruthy();
@@ -373,6 +373,32 @@ describe("MachinesPage cluster administration", () => {
     ));
   });
 
+  it("adds a cluster member directly with selected machine and agent", async () => {
+    seedMachines();
+    render(<MachinesPage />);
+
+    fireEvent.change(await screen.findByLabelText("Member account email"), {
+      target: { value: "new-member@example.com" },
+    });
+    fireEvent.click(screen.getByRole("checkbox", { name: "build-host" }));
+    await waitFor(() => expect(
+      (screen.getByLabelText("Default AI agent for new member projects") as HTMLSelectElement).value,
+    ).toBe("agent:codex:official:default"));
+    fireEvent.click(screen.getByRole("button", { name: "Add member" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "https://apas.mpaxos.com/cluster/members",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          email: "new-member@example.com",
+          allowed_machine_ids: ["machine-1"],
+          default_launch_profile: "agent:codex:official:default",
+        }),
+      }),
+    ));
+  });
+
   it("saves a cluster default policy and hides retired profiles", async () => {
     seedMachines();
     render(<MachinesPage />);
@@ -411,16 +437,12 @@ describe("MachinesPage cluster administration", () => {
       if (url.endsWith("/cluster/policy/default")) return apiResponse({ cluster: null, deployment: policy });
       if (url.endsWith("/cluster/launch-profiles")) return apiResponse([]);
       if (url.includes("/cluster/audit")) return apiResponse({ items: [], limit: 25, offset: 0 });
-      if (url.endsWith("/cluster/invitations")) return apiResponse([{
-        id: "invite-1",
-        invitee_email: "pending@example.com",
-        expires_at: "2026-09-01T00:00:00Z",
-        status: "pending",
-      }]);
       if (url.endsWith("/cluster/members")) return apiResponse(memberActive ? [{
         user_id: "member-1",
         user_email: "member@example.com",
         status: "active",
+        allowed_machine_ids: null,
+        default_launch_profile: "agent:codex:official:default",
       }] : []);
       if (url.includes("/cluster/usage")) return apiResponse({ success: true });
       return apiResponse({ success: true });
@@ -429,14 +451,13 @@ describe("MachinesPage cluster administration", () => {
     seedMachines();
     render(<MachinesPage />);
 
-    expect(await screen.findByText("pending@example.com")).toBeTruthy();
     expect(await screen.findByText("member@example.com")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Revoke access" }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       "https://apas.mpaxos.com/cluster/members/member-1",
       expect.objectContaining({ method: "DELETE" }),
     ));
-    expect(await screen.findByText("No one has joined this cluster.")).toBeTruthy();
+    expect(await screen.findByText("No members have access to this cluster.")).toBeTruthy();
     expect(screen.queryByText("member@example.com")).toBeNull();
   });
 

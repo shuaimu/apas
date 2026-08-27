@@ -128,6 +128,15 @@ describe("Sidebar project list", () => {
     ).toBe(false);
   });
 
+  it("offers GitHub project creation even when there is no existing repository group", async () => {
+    seedSidebarState({ sessions: [], machines: [makeMachine([])] });
+    render(<Sidebar />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Create project from GitHub" }));
+    expect(await screen.findByText("New project")).toBeTruthy();
+    expect(screen.getByLabelText("Clone URL")).toBeTruthy();
+  });
+
   it("deduplicates by project id and sorts active CLI and daemon projects before inactive history", () => {
     seedSidebarState({
       cliClients: [

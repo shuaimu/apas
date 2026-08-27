@@ -811,8 +811,6 @@ export function MobileCodeHome({
       <CreateInstanceModal
         open={createProjectOpen}
         onClose={() => setCreateProjectOpen(false)}
-        gitRemote="github.com/owner/repository"
-        cloneUrl="https://github.com/owner/repository"
         clusterOwnerUserId={selectedClusterOwner && selectedClusterOwner !== "owned" ? selectedClusterOwner : undefined}
       />
     </section>

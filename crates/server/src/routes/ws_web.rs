@@ -351,7 +351,20 @@ pub(crate) async fn list_accessible_machines_for_user(
             let Ok(owner_id) = Uuid::parse_str(&cluster.owner_user_id) else {
                 continue;
             };
+            let Some(membership) = state
+                .db
+                .get_cluster_membership(&cluster.owner_user_id, &user_id.to_string())
+                .await
+                .ok()
+                .flatten()
+                .filter(|membership| membership.status == "active")
+            else {
+                continue;
+            };
             for mut machine in state.sessions.get_machines_for_user(&owner_id) {
+                if !membership.allows_machine(&machine.machine.machine_id.to_string()) {
+                    continue;
+                }
                 let mut project_ids = HashSet::new();
                 for project in &machine.projects {
                     let placed = state
@@ -450,7 +463,11 @@ pub(crate) async fn has_machine_project_runtime_access(
     }
     state
         .db
-        .is_active_cluster_member(&machine_owner.to_string(), &user_id.to_string())
+        .cluster_member_can_use_machine(
+            &machine_owner.to_string(),
+            &user_id.to_string(),
+            &machine_id.to_string(),
+        )
         .await
         .unwrap_or(false)
         && state
@@ -482,11 +499,15 @@ async fn resolve_project_creation_target(
     if shared_request
         && !state
             .db
-            .is_active_cluster_member(&requested_cluster, &requester.to_string())
+            .cluster_member_can_use_machine(
+                &requested_cluster,
+                &requester.to_string(),
+                &machine_id.to_string(),
+            )
             .await
             .unwrap_or(false)
     {
-        return Err("Active shared-cluster membership is required");
+        return Err("This machine is not enabled for your cluster membership");
     }
     if shared_request
         && !state
@@ -680,6 +701,69 @@ mod machine_access_tests {
             .await
             .unwrap_err(),
             "This machine must update APAS before members can create projects"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_machine_projection_and_creation_honor_member_machine_policy() {
+        let state = test_state().await;
+        let owner = Uuid::new_v4();
+        let member = Uuid::new_v4();
+        state
+            .db
+            .create_user(&test_user(owner, "owner@example.test"))
+            .await
+            .unwrap();
+        state
+            .db
+            .create_user(&test_user(member, "member@example.test"))
+            .await
+            .unwrap();
+        join_cluster(&state, owner, member, "member@example.test").await;
+        let allowed_machine = Uuid::new_v4();
+        let blocked_machine = Uuid::new_v4();
+        for (machine_id, hostname) in [
+            (allowed_machine, "allowed-host"),
+            (blocked_machine, "blocked-host"),
+        ] {
+            let (tx, _rx) = mpsc::channel(1);
+            state.sessions.register_daemon(
+                machine_id,
+                owner,
+                tx,
+                test_machine(machine_id, hostname),
+                Vec::new(),
+            );
+        }
+        state
+            .db
+            .update_cluster_member_policy(
+                &owner.to_string(),
+                &member.to_string(),
+                Some(vec![allowed_machine.to_string()]),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let projected = list_accessible_machines_for_user(&state, &member).await;
+        assert!(projected
+            .iter()
+            .any(|entry| entry.machine.machine_id == allowed_machine));
+        assert!(!projected
+            .iter()
+            .any(|entry| entry.machine.machine_id == blocked_machine));
+        assert_eq!(
+            resolve_project_creation_target(
+                &state,
+                &member,
+                &blocked_machine,
+                Some(&owner.to_string()),
+            )
+            .await
+            .unwrap_err(),
+            "This machine is not enabled for your cluster membership"
         );
     }
 
@@ -1713,6 +1797,22 @@ mod retired_launch_authorization_tests {
     }
 }
 
+async fn has_session_runtime_access(state: &AppState, session_id: &Uuid, user_id: &Uuid) -> bool {
+    let machine_id = state
+        .sessions
+        .session_machine_id(session_id)
+        .map(|machine_id| machine_id.to_string());
+    state
+        .db
+        .check_session_runtime_access(
+            &session_id.to_string(),
+            &user_id.to_string(),
+            machine_id.as_deref(),
+        )
+        .await
+        .unwrap_or(false)
+}
+
 async fn resolve_target_session(
     state: &AppState,
     connection_id: &Uuid,
@@ -1725,11 +1825,7 @@ async fn resolve_target_session(
             .is_web_attached_to_session(&sid, connection_id)
         {
             let still_authorized = match state.sessions.get_web_user(connection_id) {
-                Some(user_id) => state
-                    .db
-                    .check_session_runtime_access(&sid.to_string(), &user_id.to_string())
-                    .await
-                    .unwrap_or(false),
+                Some(user_id) => has_session_runtime_access(state, &sid, &user_id).await,
                 None => false,
             };
             if !still_authorized {
@@ -1770,11 +1866,7 @@ async fn resolve_target_session(
         // with the same gate AttachSession uses, then auto-attach so the
         // control message isn't lost.
         if let Some(uid) = state.sessions.get_web_user(connection_id) {
-            let has_access = state
-                .db
-                .check_session_runtime_access(&sid.to_string(), &uid.to_string())
-                .await
-                .unwrap_or(false);
+            let has_access = has_session_runtime_access(state, &sid, &uid).await;
             if has_access {
                 if state
                     .active_session_operation(&sid.to_string())
@@ -1819,11 +1911,7 @@ async fn resolve_target_session(
     }
     if let Some(sid) = fallback {
         let still_authorized = match state.sessions.get_web_user(connection_id) {
-            Some(user_id) => state
-                .db
-                .check_session_runtime_access(&sid.to_string(), &user_id.to_string())
-                .await
-                .unwrap_or(false),
+            Some(user_id) => has_session_runtime_access(state, &sid, &user_id).await,
             None => false,
         };
         if !still_authorized {
@@ -5354,17 +5442,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     // Attaching subscribes the browser to a live runtime, so
                     // it requires current hosting-cluster authority in
                     // addition to durable project content access.
-                    let has_access = match state
-                        .db
-                        .check_session_runtime_access(&sid.to_string(), &uid.to_string())
-                        .await
-                    {
-                        Ok(access) => access,
-                        Err(e) => {
-                            tracing::error!("Failed to check session access: {}", e);
-                            false
-                        }
-                    };
+                    let has_access = has_session_runtime_access(&state, &sid, &uid).await;
 
                     if !has_access {
                         state

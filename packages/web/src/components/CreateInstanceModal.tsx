@@ -9,7 +9,7 @@ interface CreateInstanceModalProps {
   open: boolean;
   onClose: () => void;
   /** Canonical host/owner/repo key for the repo group. */
-  gitRemote: string;
+  gitRemote?: string;
   /** Raw cloneable origin URL captured from an existing checkout, if known. */
   cloneUrl?: string;
   /** Limit targets to one owned/shared cluster context. */
@@ -19,6 +19,22 @@ interface CreateInstanceModalProps {
 function repoBasename(gitRemote: string): string {
   const parts = gitRemote.split("/").filter(Boolean);
   return parts[parts.length - 1] || "instance";
+}
+
+function canonicalRemoteFromUrl(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  const scp = trimmed.match(/^git@([^:]+):(.+)$/i);
+  if (scp) return `${scp[1].toLowerCase()}/${scp[2].replace(/\.git$/i, "")}`;
+  try {
+    const parsed = new URL(trimmed);
+    return `${parsed.hostname.toLowerCase()}/${parsed.pathname.replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "")}`;
+  } catch {
+    return trimmed
+      .replace(/^[a-z]+:\/\//i, "")
+      .replace(/^\/+|\/+$/g, "")
+      .replace(/\.git$/i, "");
+  }
 }
 
 // Show just owner/repo for github.com; full key otherwise (mirrors the sidebar).
@@ -32,10 +48,11 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
   const machines = useStore((s) => s.machines);
   const createProjectInstance = useStore((s) => s.createProjectInstance);
 
-  const base = repoBasename(gitRemote);
+  const fixedRemote = gitRemote?.trim() ?? "";
+  const base = fixedRemote ? repoBasename(fixedRemote) : "";
   const [instanceName, setInstanceName] = useState(base);
-  const [branch, setBranch] = useState(`apas/${base}`);
-  const [url, setUrl] = useState(cloneUrl ?? `https://${gitRemote}.git`);
+  const [branch, setBranch] = useState(base ? `apas/${base}` : "");
+  const [url, setUrl] = useState(cloneUrl ?? (fixedRemote ? `https://${fixedRemote}.git` : ""));
   const [basePath, setBasePath] = useState("");
   const [machineId, setMachineId] = useState("");
   const [mounted, setMounted] = useState(false);
@@ -47,6 +64,7 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
   );
   const selectedMachine = availableMachines.find((entry) => entry.machine.machineId === machineId);
   const sharedTarget = selectedMachine?.clusterAccess === "member";
+  const submittedRemote = fixedRemote || canonicalRemoteFromUrl(url);
 
   useEffect(() => setMounted(true), []);
 
@@ -60,9 +78,10 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
   const canSubmit = useMemo(
     () => instanceName.trim().length > 0
       && url.trim().length > 0
+      && submittedRemote.length > 0
       && machineId.length > 0
       && !(sharedTarget && !selectedMachine?.sharedProvisioningAvailable),
-    [instanceName, url, machineId, selectedMachine?.sharedProvisioningAvailable, sharedTarget],
+    [instanceName, url, submittedRemote, machineId, selectedMachine?.sharedProvisioningAvailable, sharedTarget],
   );
 
   if (!open || !mounted) return null;
@@ -71,7 +90,7 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
     if (!canSubmit) return;
     const common: [string, string, string, string, string | undefined, string | undefined] = [
       machineId,
-      gitRemote,
+      submittedRemote,
       instanceName.trim(),
       branch.trim() || `apas/${instanceName.trim()}`,
       url.trim() || undefined,
@@ -85,7 +104,7 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
     if (sent) onClose();
   };
 
-  const previewPath = `${basePath.trim() || "~/apas_projects"}/${instanceName.trim() || base}`;
+  const previewPath = `${basePath.trim() || "~/apas_projects"}/${instanceName.trim() || base || "project"}`;
 
   return createPortal(
     <div
@@ -99,7 +118,7 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
         <div className="flex items-center justify-between border-b border-gray-200 p-4 dark:border-gray-700">
           <h3 className="flex items-center gap-2 text-lg font-semibold">
             <FolderGit2 className="h-5 w-5 text-emerald-500" />
-            New instance
+            {fixedRemote ? "New instance" : "New project"}
           </h3>
           <button
             onClick={onClose}
@@ -111,8 +130,11 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
 
         <div className="space-y-3 p-4">
           <p className="text-sm text-gray-500 dark:text-gray-400">
-            Clone <span className="font-medium text-gray-700 dark:text-gray-300">{repoLabel(gitRemote)}</span> into a
-            new project on a chosen machine and check out a fresh branch.
+            {fixedRemote ? (
+              <>Clone <span className="font-medium text-gray-700 dark:text-gray-300">{repoLabel(fixedRemote)}</span> into a new project on a chosen machine and check out a fresh branch.</>
+            ) : (
+              <>Clone a GitHub repository into a new project on a chosen machine.</>
+            )}
           </p>
 
           {availableMachines.length === 0 ? (
@@ -145,7 +167,7 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
                   type="text"
                   value={instanceName}
                   onChange={(e) => setInstanceName(e.target.value)}
-                  placeholder={base}
+                  placeholder={base || "my-project"}
                   className="w-full rounded border border-gray-300 bg-white px-3 py-2 text-sm dark:border-gray-600 dark:bg-gray-700"
                 />
               </Field>
@@ -155,7 +177,7 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
                   type="text"
                   value={branch}
                   onChange={(e) => setBranch(e.target.value)}
-                  placeholder={`apas/${base}`}
+                  placeholder={`apas/${base || "my-project"}`}
                   className="w-full rounded border border-gray-300 bg-white px-3 py-2 text-sm dark:border-gray-600 dark:bg-gray-700"
                 />
               </Field>
@@ -164,7 +186,16 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
                 <input
                   type="text"
                   value={url}
-                  onChange={(e) => setUrl(e.target.value)}
+                  onChange={(e) => {
+                    const nextUrl = e.target.value;
+                    setUrl(nextUrl);
+                    if (!fixedRemote) {
+                      const nextBase = repoBasename(canonicalRemoteFromUrl(nextUrl));
+                      setInstanceName(nextBase === "instance" ? "" : nextBase);
+                      setBranch(nextBase === "instance" ? "" : `apas/${nextBase}`);
+                    }
+                  }}
+                  placeholder="https://github.com/owner/repository"
                   className="w-full rounded border border-gray-300 bg-white px-3 py-2 font-mono text-xs dark:border-gray-600 dark:bg-gray-700"
                 />
               </Field>
@@ -186,7 +217,7 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
               )}
 
               <p className="text-xs text-gray-400">
-                Clones into <span className="font-mono">{sharedTarget ? `~/apas_projects/${instanceName.trim() || base}` : previewPath}</span> (auto-suffixed if it exists).
+                Clones into <span className="font-mono">{sharedTarget ? `~/apas_projects/${instanceName.trim() || base || "project"}` : previewPath}</span> (auto-suffixed if it exists).
               </p>
             </>
           )}

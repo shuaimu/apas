@@ -239,6 +239,11 @@ pub enum CliToServer {
         /// CLIs may omit this; the server falls back to session_id.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project_id: Option<Uuid>,
+        /// Stable daemon identity for a project hosted inside `apas daemon`.
+        /// Standalone and older CLIs omit it; current servers can infer a
+        /// unique legacy host but fail closed when that inference is ambiguous.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        machine_id: Option<Uuid>,
         working_dir: Option<String>,
         hostname: Option<String>,
         /// Canonical `host/owner/repo` derived from the project's `origin` git
@@ -3430,9 +3435,11 @@ mod tests {
     #[test]
     fn test_cli_to_server_session_start_serialization() {
         let session_id = Uuid::new_v4();
+        let machine_id = Uuid::new_v4();
         let msg = CliToServer::SessionStart {
             session_id,
             project_id: None,
+            machine_id: Some(machine_id),
             working_dir: Some("/home/user/project".to_string()),
             hostname: None,
             git_remote: Some("github.com/shuaimu/apas".to_string()),
@@ -3444,17 +3451,20 @@ mod tests {
         assert!(json.contains("\"type\":\"session_start\""));
         assert!(json.contains("\"git_remote_url\":\"git@github.com:shuaimu/apas.git\""));
         assert!(json.contains(&session_id.to_string()));
+        assert!(json.contains(&machine_id.to_string()));
         assert!(json.contains("\"git_remote\":\"github.com/shuaimu/apas\""));
 
         let deserialized: CliToServer = serde_json::from_str(&json).unwrap();
         match deserialized {
             CliToServer::SessionStart {
                 session_id: sid,
+                machine_id: parsed_machine_id,
                 working_dir,
                 git_remote,
                 ..
             } => {
                 assert_eq!(sid, session_id);
+                assert_eq!(parsed_machine_id, Some(machine_id));
                 assert_eq!(working_dir, Some("/home/user/project".to_string()));
                 assert_eq!(git_remote, Some("github.com/shuaimu/apas".to_string()));
             }
@@ -3469,6 +3479,7 @@ mod tests {
         let msg = CliToServer::SessionStart {
             session_id,
             project_id: None,
+            machine_id: None,
             working_dir: None,
             hostname: None,
             git_remote: None,

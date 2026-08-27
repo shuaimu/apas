@@ -480,6 +480,8 @@ impl Database {
                 invited_at DATETIME,
                 accepted_at DATETIME,
                 revoked_at DATETIME,
+                allowed_machine_ids TEXT,
+                default_launch_profile TEXT,
                 updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (cluster_owner_user_id, user_id),
                 CHECK (cluster_owner_user_id != user_id)
@@ -488,6 +490,13 @@ impl Database {
         )
         .execute(&self.pool)
         .await?;
+        let _ = sqlx::query("ALTER TABLE cluster_memberships ADD COLUMN allowed_machine_ids TEXT")
+            .execute(&self.pool)
+            .await;
+        let _ =
+            sqlx::query("ALTER TABLE cluster_memberships ADD COLUMN default_launch_profile TEXT")
+                .execute(&self.pool)
+                .await;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_cluster_memberships_user_status ON cluster_memberships(user_id, status, cluster_owner_user_id)",
         )
@@ -574,6 +583,7 @@ impl Database {
                 instance_name TEXT NOT NULL,
                 branch TEXT NOT NULL,
                 project_id TEXT NOT NULL UNIQUE,
+                default_launch_profile TEXT,
                 status TEXT NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending', 'cloned', 'completed', 'failed', 'cancelled')),
                 result_path TEXT,
@@ -585,6 +595,11 @@ impl Database {
         )
         .execute(&self.pool)
         .await?;
+        let _ = sqlx::query(
+            "ALTER TABLE project_provisioning_requests ADD COLUMN default_launch_profile TEXT",
+        )
+        .execute(&self.pool)
+        .await;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_project_provisioning_requester_created ON project_provisioning_requests(requester_user_id, created_at DESC)",
         )
@@ -4692,6 +4707,7 @@ impl Database {
         &self,
         session_id: &str,
         user_id: &str,
+        machine_id: Option<&str>,
     ) -> Result<bool> {
         if !self.check_session_access(session_id, user_id).await? {
             return Ok(false);
@@ -4707,8 +4723,17 @@ impl Database {
         if hosting_user_id == user_id {
             return Ok(true);
         }
-        self.is_active_cluster_member(&hosting_user_id, user_id)
-            .await
+        Ok(self
+            .get_cluster_membership(&hosting_user_id, user_id)
+            .await?
+            .is_some_and(|membership| {
+                membership.status == "active"
+                    && match membership.allowed_machine_ids.as_ref() {
+                        None => true,
+                        Some(_) => machine_id
+                            .is_some_and(|machine_id| membership.allows_machine(machine_id)),
+                    }
+            }))
     }
 
     pub async fn delete_session_share(&self, session_id: &str, user_id: &str) -> Result<bool> {

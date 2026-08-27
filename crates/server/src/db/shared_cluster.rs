@@ -259,7 +259,8 @@ impl Database {
         Ok(sqlx::query_as::<_, ClusterMembership>(
             r#"SELECT cm.cluster_owner_user_id, owner.email AS cluster_owner_email,
                       cm.user_id, member.email AS user_email, cm.status,
-                      cm.invited_at, cm.accepted_at, cm.revoked_at, cm.updated_at
+                      cm.invited_at, cm.accepted_at, cm.revoked_at,
+                      cm.allowed_machine_ids, cm.default_launch_profile, cm.updated_at
                FROM cluster_memberships cm
                JOIN users owner ON owner.id = cm.cluster_owner_user_id
                JOIN users member ON member.id = cm.user_id
@@ -278,7 +279,8 @@ impl Database {
         Ok(sqlx::query_as::<_, ClusterMembership>(
             r#"SELECT cm.cluster_owner_user_id, owner.email AS cluster_owner_email,
                       cm.user_id, member.email AS user_email, cm.status,
-                      cm.invited_at, cm.accepted_at, cm.revoked_at, cm.updated_at
+                      cm.invited_at, cm.accepted_at, cm.revoked_at,
+                      cm.allowed_machine_ids, cm.default_launch_profile, cm.updated_at
                FROM cluster_memberships cm
                JOIN users owner ON owner.id = cm.cluster_owner_user_id
                JOIN users member ON member.id = cm.user_id
@@ -289,6 +291,173 @@ impl Database {
         .bind(cluster_owner_user_id)
         .fetch_all(&self.pool)
         .await?)
+    }
+
+    fn membership_policy_json(
+        allowed_machine_ids: Option<Vec<String>>,
+        default_launch_profile: Option<String>,
+    ) -> Result<(Option<String>, Option<String>)> {
+        let allowed_machine_ids = allowed_machine_ids
+            .map(|machine_ids| {
+                let mut normalized = machine_ids
+                    .into_iter()
+                    .map(|machine_id| machine_id.trim().to_string())
+                    .filter(|machine_id| !machine_id.is_empty())
+                    .collect::<Vec<_>>();
+                normalized.sort();
+                normalized.dedup();
+                serde_json::to_string(&normalized)
+            })
+            .transpose()?;
+        let default_launch_profile = default_launch_profile
+            .map(|profile| profile.trim().to_string())
+            .filter(|profile| !profile.is_empty());
+        if let Some(profile) = &default_launch_profile {
+            Self::validate_launch_profiles(std::slice::from_ref(profile))?;
+        }
+        Ok((allowed_machine_ids, default_launch_profile))
+    }
+
+    /// Add an existing account immediately. Cluster sharing is an
+    /// owner-administered trust decision; no bearer link or acceptance step is
+    /// required for this path.
+    pub async fn add_cluster_member(
+        &self,
+        cluster_owner_user_id: &str,
+        member_email: &str,
+        allowed_machine_ids: Option<Vec<String>>,
+        default_launch_profile: Option<String>,
+    ) -> Result<ClusterMembership> {
+        let normalized_email = member_email.trim().to_ascii_lowercase();
+        let (allowed_machine_ids, default_launch_profile) =
+            Self::membership_policy_json(allowed_machine_ids, default_launch_profile)?;
+        let mut tx = self.pool.begin().await?;
+        let member = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, account_status FROM users WHERE lower(email) = ?",
+        )
+        .bind(&normalized_email)
+        .fetch_optional(&mut *tx)
+        .await?
+        .context("member must already have an APAS account")?;
+        anyhow::ensure!(member.1 == "active", "member account is suspended");
+        anyhow::ensure!(
+            member.0 != cluster_owner_user_id,
+            "cluster owner cannot add themselves"
+        );
+        let owner_active = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM users WHERE id = ? AND account_status = 'active'",
+        )
+        .bind(cluster_owner_user_id)
+        .fetch_one(&mut *tx)
+        .await?
+            > 0;
+        anyhow::ensure!(owner_active, "cluster owner is suspended or unavailable");
+
+        sqlx::query(
+            r#"INSERT INTO cluster_memberships
+               (cluster_owner_user_id, user_id, status, invited_at, accepted_at,
+                revoked_at, allowed_machine_ids, default_launch_profile, updated_at)
+               VALUES (?, ?, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
+                       NULL, ?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(cluster_owner_user_id, user_id) DO UPDATE SET
+                   status = 'active', accepted_at = CURRENT_TIMESTAMP,
+                   revoked_at = NULL, allowed_machine_ids = excluded.allowed_machine_ids,
+                   default_launch_profile = excluded.default_launch_profile,
+                   updated_at = CURRENT_TIMESTAMP"#,
+        )
+        .bind(cluster_owner_user_id)
+        .bind(&member.0)
+        .bind(&allowed_machine_ids)
+        .bind(&default_launch_profile)
+        .execute(&mut *tx)
+        .await?;
+        Self::insert_audit_tx(
+            &mut tx,
+            cluster_owner_user_id,
+            "cluster.member_added",
+            "cluster",
+            cluster_owner_user_id,
+            Some(serde_json::json!({
+                "user_id": member.0,
+                "email": normalized_email,
+                "allowed_machine_ids": allowed_machine_ids
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok()),
+                "default_launch_profile": default_launch_profile,
+            })),
+        )
+        .await?;
+        tx.commit().await?;
+        self.get_cluster_membership(cluster_owner_user_id, &member.0)
+            .await?
+            .context("added cluster member disappeared")
+    }
+
+    pub async fn update_cluster_member_policy(
+        &self,
+        cluster_owner_user_id: &str,
+        user_id: &str,
+        allowed_machine_ids: Option<Vec<String>>,
+        default_launch_profile: Option<String>,
+    ) -> Result<Option<ClusterMembership>> {
+        let (allowed_machine_ids, default_launch_profile) =
+            Self::membership_policy_json(allowed_machine_ids, default_launch_profile)?;
+        let mut tx = self.pool.begin().await?;
+        let changed = sqlx::query(
+            r#"UPDATE cluster_memberships
+               SET allowed_machine_ids = ?, default_launch_profile = ?,
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE cluster_owner_user_id = ? AND user_id = ? AND status = 'active'"#,
+        )
+        .bind(&allowed_machine_ids)
+        .bind(&default_launch_profile)
+        .bind(cluster_owner_user_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        if changed {
+            Self::insert_audit_tx(
+                &mut tx,
+                cluster_owner_user_id,
+                "cluster.member_policy_changed",
+                "cluster",
+                cluster_owner_user_id,
+                Some(serde_json::json!({
+                    "user_id": user_id,
+                    "allowed_machine_ids": allowed_machine_ids
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok()),
+                    "default_launch_profile": default_launch_profile,
+                })),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        if changed {
+            self.get_cluster_membership(cluster_owner_user_id, user_id)
+                .await
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn cluster_member_can_use_machine(
+        &self,
+        cluster_owner_user_id: &str,
+        user_id: &str,
+        machine_id: &str,
+    ) -> Result<bool> {
+        if cluster_owner_user_id == user_id {
+            return Ok(true);
+        }
+        Ok(self
+            .get_cluster_membership(cluster_owner_user_id, user_id)
+            .await?
+            .is_some_and(|membership| {
+                membership.status == "active" && membership.allows_machine(machine_id)
+            }))
     }
 
     pub async fn revoke_cluster_membership(
@@ -490,8 +659,14 @@ impl Database {
         sqlx::query(
             r#"INSERT OR IGNORE INTO project_provisioning_requests
                (request_id, requester_user_id, cluster_owner_user_id, machine_id,
-                request_fingerprint, git_remote, clone_url, instance_name, branch, project_id)
-               SELECT ?, requester.id, owner.id, ?, ?, ?, ?, ?, ?, ?
+                request_fingerprint, git_remote, clone_url, instance_name, branch, project_id,
+                default_launch_profile)
+               SELECT ?, requester.id, owner.id, ?, ?, ?, ?, ?, ?, ?,
+                      CASE WHEN requester.id = owner.id THEN NULL ELSE (
+                          SELECT cm.default_launch_profile FROM cluster_memberships cm
+                          WHERE cm.cluster_owner_user_id = owner.id
+                            AND cm.user_id = requester.id AND cm.status = 'active'
+                      ) END
                FROM users requester, users owner
                WHERE requester.id = ? AND requester.account_status = 'active'
                  AND owner.id = ? AND owner.account_status = 'active'
@@ -500,6 +675,13 @@ impl Database {
                          SELECT 1 FROM cluster_memberships cm
                          WHERE cm.cluster_owner_user_id = owner.id
                            AND cm.user_id = requester.id AND cm.status = 'active'
+                           AND (cm.allowed_machine_ids IS NULL OR (
+                               json_valid(cm.allowed_machine_ids)
+                               AND EXISTS (
+                                   SELECT 1 FROM json_each(cm.allowed_machine_ids)
+                                   WHERE value = ?
+                               )
+                           ))
                      )
                  )"#,
         )
@@ -513,6 +695,7 @@ impl Database {
         .bind(project_id)
         .bind(requester_user_id)
         .bind(cluster_owner_user_id)
+        .bind(machine_id)
         .execute(&self.pool)
         .await?;
 
@@ -535,7 +718,8 @@ impl Database {
         Ok(sqlx::query_as::<_, ProjectProvisioningRequest>(
             r#"SELECT request_id, requester_user_id, cluster_owner_user_id, machine_id,
                       request_fingerprint, git_remote, clone_url, instance_name, branch,
-                      project_id, status, result_path, error_message, created_at, updated_at
+                      project_id, default_launch_profile, status, result_path, error_message,
+                      created_at, updated_at
                FROM project_provisioning_requests
                WHERE request_id = ? AND requester_user_id = ?"#,
         )
@@ -554,7 +738,8 @@ impl Database {
         Ok(sqlx::query_as::<_, ProjectProvisioningRequest>(
             r#"SELECT request_id, requester_user_id, cluster_owner_user_id, machine_id,
                       request_fingerprint, git_remote, clone_url, instance_name, branch,
-                      project_id, status, result_path, error_message, created_at, updated_at
+                      project_id, default_launch_profile, status, result_path, error_message,
+                      created_at, updated_at
                FROM project_provisioning_requests WHERE request_id = ?"#,
         )
         .bind(request_id)
@@ -594,7 +779,8 @@ impl Database {
         let request = sqlx::query_as::<_, ProjectProvisioningRequest>(
             r#"SELECT request_id, requester_user_id, cluster_owner_user_id, machine_id,
                       request_fingerprint, git_remote, clone_url, instance_name, branch,
-                      project_id, status, result_path, error_message, created_at, updated_at
+                      project_id, default_launch_profile, status, result_path, error_message,
+                      created_at, updated_at
                FROM project_provisioning_requests
                WHERE request_id = ? AND requester_user_id = ?"#,
         )
@@ -621,10 +807,18 @@ impl Database {
                      SELECT 1 FROM cluster_memberships cm
                      WHERE cm.cluster_owner_user_id = owner.id
                        AND cm.user_id = requester.id AND cm.status = 'active'
+                       AND (cm.allowed_machine_ids IS NULL OR (
+                           json_valid(cm.allowed_machine_ids)
+                           AND EXISTS (
+                               SELECT 1 FROM json_each(cm.allowed_machine_ids)
+                               WHERE value = ?
+                           )
+                       ))
                  ))"#,
         )
         .bind(requester_user_id)
         .bind(&request.cluster_owner_user_id)
+        .bind(&request.machine_id)
         .fetch_one(&mut *tx)
         .await?
             > 0;
@@ -672,6 +866,28 @@ impl Database {
         .bind(requester_user_id)
         .execute(&mut *tx)
         .await?;
+        if let Some(default_launch_profile) = &request.default_launch_profile {
+            let next_version = sqlx::query_scalar::<_, i64>(
+                r#"SELECT COALESCE(MAX(version), 0) + 1 FROM (
+                       SELECT version FROM cluster_settings WHERE id = 1
+                       UNION ALL
+                       SELECT version FROM project_policy_overrides WHERE project_id = ?
+                   )"#,
+            )
+            .bind(&request.project_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"INSERT OR IGNORE INTO project_policy_overrides
+                   (project_id, team_available, allowed_launch_profiles, version, updated_at)
+                   VALUES (?, NULL, ?, ?, CURRENT_TIMESTAMP)"#,
+            )
+            .bind(&request.project_id)
+            .bind(serde_json::to_string(&vec![default_launch_profile])?)
+            .bind(next_version)
+            .execute(&mut *tx)
+            .await?;
+        }
         sqlx::query(
             r#"UPDATE project_provisioning_requests
                SET status = 'completed', error_message = NULL, updated_at = CURRENT_TIMESTAMP
@@ -690,6 +906,7 @@ impl Database {
                 "cluster_user_id": request.cluster_owner_user_id,
                 "machine_id": request.machine_id,
                 "request_id": request.request_id,
+                "default_launch_profile": request.default_launch_profile,
             })),
         )
         .await?;
@@ -723,7 +940,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::User;
+    use crate::db::{Session, User};
 
     async fn database(name: &str) -> Database {
         let dir = std::env::temp_dir().join(format!(
@@ -857,6 +1074,143 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.action == "cluster.member_revoked"));
+    }
+
+    #[tokio::test]
+    async fn direct_membership_limits_machines_and_seeds_new_project_agent_policy() {
+        let db = database("direct-member-policy").await;
+        user(&db, "owner", "owner@example.test").await;
+        user(&db, "member", "member@example.test").await;
+        let profile = "terminal:codex:official:default";
+
+        let membership = db
+            .add_cluster_member(
+                "owner",
+                " MEMBER@example.test ",
+                Some(vec!["machine-1".to_string()]),
+                Some(profile.to_string()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(membership.status, "active");
+        assert_eq!(
+            membership.allowed_machine_ids(),
+            Some(vec!["machine-1".to_string()])
+        );
+        assert_eq!(membership.default_launch_profile.as_deref(), Some(profile));
+        assert!(db
+            .cluster_member_can_use_machine("owner", "member", "machine-1")
+            .await
+            .unwrap());
+        assert!(!db
+            .cluster_member_can_use_machine("owner", "member", "machine-2")
+            .await
+            .unwrap());
+
+        assert!(db
+            .claim_project_provisioning(
+                "blocked-request",
+                "member",
+                "owner",
+                "machine-2",
+                "blocked-fingerprint",
+                "github.com/example/blocked",
+                "https://github.com/example/blocked.git",
+                "blocked",
+                "member-work",
+                "blocked-project",
+            )
+            .await
+            .is_err());
+
+        let request = db
+            .claim_project_provisioning(
+                "request",
+                "member",
+                "owner",
+                "machine-1",
+                "fingerprint",
+                "github.com/example/repo",
+                "https://github.com/example/repo.git",
+                "repo",
+                "member-work",
+                "project",
+            )
+            .await
+            .unwrap();
+        assert_eq!(request.default_launch_profile.as_deref(), Some(profile));
+        db.mark_project_provisioning_cloned("request", "project", "/managed/repo")
+            .await
+            .unwrap();
+        db.finalize_project_provisioning("request", "member")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.get_effective_project_policy("project")
+                .await
+                .unwrap()
+                .allowed_launch_profiles,
+            vec![profile.to_string()]
+        );
+        db.create_session(&Session {
+            id: "hosted-direct-session".to_string(),
+            user_id: "owner".to_string(),
+            cli_client_id: None,
+            working_dir: Some("/managed/repo".to_string()),
+            hostname: Some("shared-host".to_string()),
+            status: "active".to_string(),
+            created_at: None,
+            updated_at: None,
+            is_paused: false,
+            project_id: Some("project".to_string()),
+            git_remote: None,
+            git_remote_url: None,
+        })
+        .await
+        .unwrap();
+        assert!(!db
+            .check_session_runtime_access("hosted-direct-session", "member", None)
+            .await
+            .unwrap());
+        assert!(db
+            .check_session_runtime_access("hosted-direct-session", "member", Some("machine-1"),)
+            .await
+            .unwrap());
+        assert!(!db
+            .check_session_runtime_access("hosted-direct-session", "member", Some("machine-2"),)
+            .await
+            .unwrap());
+
+        db.update_cluster_member_policy(
+            "owner",
+            "member",
+            Some(vec!["machine-2".to_string()]),
+            Some("terminal:claude:official:default".to_string()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!db
+            .cluster_member_can_use_machine("owner", "member", "machine-1")
+            .await
+            .unwrap());
+        assert!(db
+            .cluster_member_can_use_machine("owner", "member", "machine-2")
+            .await
+            .unwrap());
+
+        sqlx::query(
+            "UPDATE cluster_memberships SET allowed_machine_ids = 'not-json' \
+             WHERE cluster_owner_user_id = 'owner' AND user_id = 'member'",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert!(!db
+            .cluster_member_can_use_machine("owner", "member", "machine-2")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -1270,7 +1624,7 @@ mod tests {
         .await
         .unwrap();
         assert!(db
-            .check_session_runtime_access("hosted-session", "member")
+            .check_session_runtime_access("hosted-session", "member", None)
             .await
             .unwrap());
         db.revoke_cluster_membership("owner", "member")
@@ -1281,7 +1635,7 @@ mod tests {
             .await
             .unwrap());
         assert!(!db
-            .check_session_runtime_access("hosted-session", "member")
+            .check_session_runtime_access("hosted-session", "member", None)
             .await
             .unwrap());
     }

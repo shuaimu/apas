@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -607,14 +607,18 @@ fn initial_terminal_transcript_cursor(restored_at_watcher_start: bool, turn_coun
 /// is the server default, and clearing here could race fresh web input before
 /// Codex has written its task_started event.
 fn observe_codex_working_state(
-    states: &mut HashMap<u32, bool>,
+    states: &mut HashMap<u32, (bool, u64)>,
     pane_id: u32,
     observed: Option<bool>,
+    connection_generation: u64,
 ) -> Option<bool> {
     let observed = observed?;
-    match states.insert(pane_id, observed) {
+    match states.insert(pane_id, (observed, connection_generation)) {
         None if observed => Some(true),
-        Some(previous) if previous != observed => Some(observed),
+        Some((previous, _)) if previous != observed => Some(observed),
+        Some((true, previous_generation)) if previous_generation != connection_generation => {
+            Some(true)
+        }
         _ => None,
     }
 }
@@ -1870,6 +1874,7 @@ pub async fn run_headless(
         token,
         working_dir,
         Arc::new(AtomicBool::new(false)),
+        None,
     )
     .await
 }
@@ -1886,8 +1891,9 @@ pub async fn run_project(
     token: &str,
     working_dir: &Path,
     shutdown: Arc<AtomicBool>,
+    machine_id: Uuid,
 ) -> Result<ProjectOutcome> {
-    run_inner(server_url, token, working_dir, shutdown).await
+    run_inner(server_url, token, working_dir, shutdown, Some(machine_id)).await
 }
 
 async fn run_inner(
@@ -1895,6 +1901,7 @@ async fn run_inner(
     token: &str,
     working_dir: &Path,
     shutdown: Arc<AtomicBool>,
+    machine_id: Option<Uuid>,
 ) -> Result<ProjectOutcome> {
     let config = crate::config::Config::load().unwrap_or_default();
     // Resolve binary paths to absolute paths at startup (while PATH is correct).
@@ -1988,6 +1995,11 @@ async fn run_inner(
 
     // Channel for sending to server
     let (server_tx, server_rx) = tokio_mpsc::channel::<CliToServer>(256);
+    // The server owns pane status in memory and clears it when this CLI
+    // disconnects. Transcript state lives in a separate watcher, so give it a
+    // reconnect generation that makes an unchanged active turn publish once
+    // after every successful session registration.
+    let server_connection_generation = Arc::new(AtomicU64::new(0));
 
     // Shutdown flag
     // Supplied by the caller so a project can be stopped from outside; a
@@ -2289,6 +2301,7 @@ async fn run_inner(
         let stop_reason_for_server = stop_reason.clone();
         let event_tx_for_server = event_tx.clone();
         let project_policy_for_server = project_policy.clone();
+        let connection_generation_for_server = server_connection_generation.clone();
         tokio::spawn(async move {
             run_server_connection(
                 &server_url,
@@ -2309,6 +2322,8 @@ async fn run_inner(
                 status_tx,
                 event_tx_for_server,
                 project_policy_for_server,
+                machine_id,
+                connection_generation_for_server,
                 reboot_handoff,
             )
             .await
@@ -2691,6 +2706,7 @@ async fn run_inner(
         let input_channels_for_turns = input_channels.clone();
         let pauses_for_turns = pane_pauses.clone();
         let stop_requests_for_turns = pane_stop_requests.clone();
+        let connection_generation_for_turns = server_connection_generation.clone();
         #[cfg(target_os = "linux")]
         let terminal_panes_for_turns = terminal_panes.clone();
         let opencode_for_turns = opencode_path.clone();
@@ -2721,7 +2737,7 @@ async fn run_inner(
             // Explicit task lifecycle is tracked independently from the turn
             // cursor so reconnect can restore an in-flight pane without
             // replaying its existing conversation.
-            let mut codex_working: HashMap<u32, bool> = HashMap::new();
+            let mut codex_working: HashMap<u32, (bool, u64)> = HashMap::new();
             // Per-pane claude transcript watch state (growth + idle tracking
             // for in-TUI session-switch detection).
             let mut claude_watch: HashMap<u32, ClaudeWatchState> = HashMap::new();
@@ -3049,9 +3065,12 @@ async fn run_inner(
                     }
                     *completed = completion_count;
 
-                    if let Some(working) =
-                        observe_codex_working_state(&mut codex_working, pane_id, provider_working)
-                    {
+                    if let Some(working) = observe_codex_working_state(
+                        &mut codex_working,
+                        pane_id,
+                        provider_working,
+                        connection_generation_for_turns.load(Ordering::SeqCst),
+                    ) {
                         let _ = server_tx_for_turns.blocking_send(CliToServer::PaneStatus {
                             session_id,
                             pane_type: PaneType::Interactive,
@@ -7808,17 +7827,22 @@ mod tests {
         let mut states = HashMap::new();
 
         assert_eq!(
-            super::observe_codex_working_state(&mut states, 293, Some(true)),
+            super::observe_codex_working_state(&mut states, 293, Some(true), 1),
             Some(true),
             "an already-active restored pane must repopulate server status"
         );
         assert_eq!(
-            super::observe_codex_working_state(&mut states, 293, Some(true)),
+            super::observe_codex_working_state(&mut states, 293, Some(true), 1),
             None,
             "unchanged transcript polls must not resend status"
         );
         assert_eq!(
-            super::observe_codex_working_state(&mut states, 293, Some(false)),
+            super::observe_codex_working_state(&mut states, 293, Some(true), 2),
+            Some(true),
+            "an unchanged active turn must repopulate status after reconnect"
+        );
+        assert_eq!(
+            super::observe_codex_working_state(&mut states, 293, Some(false), 2),
             Some(false),
             "the provider completion must clear the recovered status"
         );
@@ -7829,17 +7853,17 @@ mod tests {
         let mut states = HashMap::new();
 
         assert_eq!(
-            super::observe_codex_working_state(&mut states, 293, Some(false)),
+            super::observe_codex_working_state(&mut states, 293, Some(false), 1),
             None,
             "idle is already the server default and should stay silent"
         );
         assert_eq!(
-            super::observe_codex_working_state(&mut states, 293, None),
+            super::observe_codex_working_state(&mut states, 293, None, 1),
             None,
             "legacy transcripts without lifecycle events stay compatible"
         );
         assert_eq!(
-            super::observe_codex_working_state(&mut states, 293, Some(true)),
+            super::observe_codex_working_state(&mut states, 293, Some(true), 1),
             Some(true)
         );
     }
@@ -11614,6 +11638,8 @@ async fn run_server_connection(
     status_tx: mpsc::Sender<PaneOutput>,
     tui_event_tx: mpsc::Sender<TuiEvent>,
     project_policy: ProjectPolicyState,
+    machine_id: Option<Uuid>,
+    server_connection_generation: Arc<AtomicU64>,
     mut reboot_handoff: Option<(std::path::PathBuf, crate::pane_host::RebootHandoffMarker)>,
 ) -> Result<()> {
     use futures::{SinkExt, StreamExt};
@@ -11792,6 +11818,7 @@ async fn run_server_connection(
                     session_id,
                     // session_id is `metadata.id` from .apas, which is the project id.
                     project_id: Some(session_id),
+                    machine_id,
                     working_dir: Some(working_dir.to_string()),
                     hostname,
                     git_remote: git_remote.clone(),
@@ -11843,7 +11870,19 @@ async fn run_server_connection(
                     panes: pane_list,
                 };
                 let msg_text = serde_json::to_string(&pane_list_msg).unwrap_or_default();
-                let _ = ws_sender.send(Message::Text(msg_text.into())).await;
+                if ws_sender
+                    .send(Message::Text(msg_text.into()))
+                    .await
+                    .is_err()
+                {
+                    let _ = status_tx.send(PaneOutput {
+                        text: "[Server: Connection lost during pane reconciliation]".to_string(),
+                        pane_id: shared::PANE_ID_DEADLOOP,
+                    });
+                    tokio::time::sleep(reconnect_delay).await;
+                    continue;
+                }
+                server_connection_generation.fetch_add(1, Ordering::SeqCst);
 
                 // Reconcile pty generations before draining output queued
                 // during the outage. Same-instance reports preserve the

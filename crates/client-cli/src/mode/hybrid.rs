@@ -535,6 +535,7 @@ async fn connect_to_server(
         session_id,
         // session_id is the .apas project id in this mode (1:1).
         project_id: Some(session_id),
+        machine_id: None,
         working_dir: Some(working_dir.to_string()),
         hostname,
         git_remote,

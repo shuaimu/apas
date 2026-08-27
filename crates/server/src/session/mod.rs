@@ -302,6 +302,9 @@ pub struct SessionState {
     pub working_dir: Option<String>,
     /// Hostname of the CLI session
     pub hostname: Option<String>,
+    /// Stable daemon identity for hosted projects. Standalone and older CLIs
+    /// leave this absent.
+    pub machine_id: Option<Uuid>,
 }
 
 impl SessionManager {
@@ -753,6 +756,138 @@ impl SessionManager {
 
     pub fn set_session_project(&self, session_id: Uuid, project_id: String) {
         self.session_projects.insert(session_id, project_id);
+    }
+
+    pub fn set_session_machine(&self, session_id: Uuid, machine_id: Option<Uuid>) {
+        if let Some(mut session) = self.sessions.get_mut(&session_id) {
+            session.machine_id = machine_id;
+        }
+    }
+
+    pub fn session_machine_id(&self, session_id: &Uuid) -> Option<Uuid> {
+        let session = self.sessions.get(session_id)?;
+        if let Some(machine_id) = session.machine_id {
+            return Some(machine_id);
+        }
+        let cli_owner = session
+            .cli_client_id
+            .and_then(|cli_id| self.cli_users.get(&cli_id).map(|owner| *owner));
+        let hostname = session.hostname.as_deref().map(normalize_machine_hostname);
+        let working_dir = session.working_dir.as_deref().map(normalize_project_path);
+        drop(session);
+        let project_id = self.project_for_session(session_id);
+
+        // Mixed-version rollout fallback: an older hosted CLI cannot send the
+        // stable machine ID. Accept only one unambiguous owner/host/project
+        // match; multiple matches fail closed instead of widening access.
+        let candidates = self
+            .machine_infos
+            .iter()
+            .filter_map(|machine| {
+                let machine_id = *machine.key();
+                if cli_owner.is_some_and(|owner| self.daemon_owner(&machine_id) != Some(owner))
+                    || hostname.as_ref().is_some_and(|hostname| {
+                        normalize_machine_hostname(&machine.hostname) != hostname.as_str()
+                    })
+                {
+                    return None;
+                }
+                let matches_project =
+                    self.machine_projects
+                        .get(&machine_id)
+                        .is_some_and(|projects| {
+                            projects.iter().any(|project| {
+                                project_id.as_ref().is_some_and(|project_id| {
+                                    project.project_id == project_id.as_str()
+                                }) || working_dir.as_ref().is_some_and(|working_dir| {
+                                    normalize_project_path(&project.path) == working_dir.as_str()
+                                })
+                            })
+                        });
+                matches_project.then_some(machine_id)
+            })
+            .collect::<Vec<_>>();
+        if candidates.len() == 1 {
+            Some(candidates[0])
+        } else {
+            None
+        }
+    }
+
+    /// Apply a narrowed membership policy to already-attached live sessions.
+    /// `None` means all machines and requires no detach. An explicit policy
+    /// fails closed for older hosted CLIs that cannot identify their machine.
+    pub async fn enforce_cluster_machine_access_for_user(
+        &self,
+        cluster_owner: Uuid,
+        user_id: Uuid,
+        allowed_machine_ids: Option<&HashSet<Uuid>>,
+    ) -> usize {
+        let Some(allowed_machine_ids) = allowed_machine_ids else {
+            return 0;
+        };
+        let viewer_connections = self
+            .web_users
+            .iter()
+            .filter(|entry| *entry.value() == user_id)
+            .map(|entry| *entry.key())
+            .collect::<HashSet<_>>();
+        if viewer_connections.is_empty() {
+            return 0;
+        }
+
+        let hosted_sessions = self
+            .sessions
+            .iter()
+            .filter_map(|session| {
+                session
+                    .cli_client_id
+                    .and_then(|cli_id| self.cli_users.get(&cli_id).map(|owner| *owner))
+                    .is_some_and(|owner| owner == cluster_owner)
+                    .then_some(session.session_id)
+            })
+            .collect::<Vec<_>>();
+        let denied_sessions = hosted_sessions
+            .into_iter()
+            .filter(|session_id| {
+                !self
+                    .session_machine_id(session_id)
+                    .is_some_and(|machine_id| allowed_machine_ids.contains(&machine_id))
+            })
+            .collect::<HashSet<_>>();
+        let mut affected_sessions = Vec::new();
+        let mut affected_connections = HashSet::new();
+        for mut session in self.sessions.iter_mut() {
+            if !denied_sessions.contains(&session.session_id) {
+                continue;
+            }
+            let before = session.web_connection_ids.len();
+            session.web_connection_ids.retain(|connection_id| {
+                if viewer_connections.contains(connection_id) {
+                    affected_connections.insert(*connection_id);
+                    false
+                } else {
+                    true
+                }
+            });
+            if session.web_connection_ids.len() != before {
+                affected_sessions.push(session.session_id);
+            }
+        }
+
+        for session_id in &affected_sessions {
+            self.clear_lifecycle_for_session_user(*session_id, user_id);
+        }
+        for connection_id in affected_connections {
+            self.send_to_web(
+                &connection_id,
+                ServerToWeb::Error {
+                    message: "Machine access was removed by the cluster owner".to_string(),
+                },
+            )
+            .await;
+        }
+        affected_sessions.len()
     }
 
     pub fn set_cli_capabilities(&self, cli_id: Uuid, capabilities: Vec<String>) {
@@ -1839,6 +1974,7 @@ impl SessionManager {
             project_goal: None,
             working_dir: None,
             hostname: None,
+            machine_id: None,
         };
         self.sessions.insert(session_id, state);
         tracing::info!("Session created: {}", session_id);
@@ -1906,6 +2042,7 @@ impl SessionManager {
                 project_goal: None,
                 working_dir,
                 hostname,
+                machine_id: None,
             };
             self.sessions.insert(session_id, state);
             tracing::info!("CLI session created: {} (cli: {})", session_id, cli_id);
@@ -1995,6 +2132,7 @@ impl SessionManager {
             project_goal: None,
             working_dir: None,
             hostname: None,
+            machine_id: None,
         };
         self.sessions.insert(*session_id, state);
 
@@ -2050,6 +2188,7 @@ impl SessionManager {
             project_goal: s.project_goal.clone(),
             working_dir: s.working_dir.clone(),
             hostname: s.hostname.clone(),
+            machine_id: s.machine_id,
         })
     }
 
@@ -2707,6 +2846,42 @@ mod tests {
             }
             other => panic!("expected original session status message, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn narrowed_machine_policy_detaches_only_the_affected_cluster_member() {
+        let mgr = SessionManager::new();
+        let cluster_owner = Uuid::new_v4();
+        let member = Uuid::new_v4();
+        let cli_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let blocked_machine = Uuid::new_v4();
+        let allowed_machine = Uuid::new_v4();
+        let web_id = Uuid::new_v4();
+        let (cli_tx, _cli_rx) = mpsc::channel(2);
+        mgr.register_cli(cli_id, cluster_owner, cli_tx, None);
+        mgr.create_cli_session(session_id, cli_id, None, None);
+        mgr.set_session_machine(session_id, Some(blocked_machine));
+        let (web_tx, mut web_rx) = mpsc::channel(2);
+        mgr.register_web(web_id, web_tx);
+        mgr.set_web_user(web_id, member);
+        assert!(mgr.attach_web_to_session(&session_id, web_id, Some(cli_id)));
+
+        let allowed_machine_ids = HashSet::from([allowed_machine]);
+        assert_eq!(
+            mgr.enforce_cluster_machine_access_for_user(
+                cluster_owner,
+                member,
+                Some(&allowed_machine_ids),
+            )
+            .await,
+            1
+        );
+        assert!(!mgr.is_web_attached_to_session(&session_id, &web_id));
+        assert!(matches!(
+            web_rx.try_recv(),
+            Ok(ServerToWeb::Error { message }) if message.contains("Machine access was removed")
+        ));
     }
 
     #[tokio::test]

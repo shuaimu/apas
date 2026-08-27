@@ -1,6 +1,6 @@
 //! Virtual-cluster self-service.
 //!
-//! Every active account owns one virtual cluster and may accept invitations to
+//! Every active account owns one virtual cluster and may be added directly to
 //! other accounts' clusters. Projects are hosted according to durable cluster
 //! placements; historical session rows are not treated as authorization.
 //!
@@ -109,6 +109,55 @@ pub struct AcceptSharedClusterInvitationRequest {
     pub trust_confirmed: bool,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AddClusterMemberRequest {
+    pub email: String,
+    /// `None` is the backwards-compatible "all machines" policy. The current
+    /// web UI always sends an explicit owner-selected list.
+    pub allowed_machine_ids: Option<Vec<uuid::Uuid>>,
+    pub default_launch_profile: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateClusterMemberRequest {
+    pub allowed_machine_ids: Option<Vec<uuid::Uuid>>,
+    pub default_launch_profile: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClusterMembershipView {
+    pub cluster_owner_user_id: String,
+    pub cluster_owner_email: String,
+    pub user_id: String,
+    pub user_email: String,
+    pub status: String,
+    pub invited_at: Option<String>,
+    pub accepted_at: Option<String>,
+    pub revoked_at: Option<String>,
+    pub allowed_machine_ids: Option<Vec<String>>,
+    pub default_launch_profile: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+impl From<ClusterMembership> for ClusterMembershipView {
+    fn from(membership: ClusterMembership) -> Self {
+        let allowed_machine_ids = membership.allowed_machine_ids();
+        Self {
+            cluster_owner_user_id: membership.cluster_owner_user_id,
+            cluster_owner_email: membership.cluster_owner_email,
+            user_id: membership.user_id,
+            user_email: membership.user_email,
+            status: membership.status,
+            invited_at: membership.invited_at,
+            accepted_at: membership.accepted_at,
+            revoked_at: membership.revoked_at,
+            allowed_machine_ids,
+            default_launch_profile: membership.default_launch_profile,
+            updated_at: membership.updated_at,
+        }
+    }
+}
+
 fn require_trust_confirmation(confirmed: bool) -> Result<(), AppError> {
     if !confirmed {
         return Err(AppError::BadRequest(
@@ -116,6 +165,83 @@ fn require_trust_confirmation(confirmed: bool) -> Result<(), AppError> {
         ));
     }
     Ok(())
+}
+
+async fn validate_member_policy(
+    state: &AppState,
+    owner: &User,
+    machine_ids: Option<Vec<uuid::Uuid>>,
+    default_launch_profile: Option<String>,
+) -> Result<(Option<Vec<String>>, Option<String>), AppError> {
+    if let Some(machine_ids) = &machine_ids {
+        let owner_id = uuid::Uuid::parse_str(&owner.id)
+            .map_err(|_| AppError::BadRequest("Cluster owner identity is invalid".to_string()))?;
+        for machine_id in machine_ids {
+            if state.sessions.daemon_owner(machine_id) != Some(owner_id) {
+                return Err(AppError::BadRequest(format!(
+                    "Machine {machine_id} does not belong to this cluster"
+                )));
+            }
+        }
+    }
+
+    let default_launch_profile = default_launch_profile
+        .map(|profile| profile.trim().to_string())
+        .filter(|profile| !profile.is_empty());
+    if let Some(profile) = &default_launch_profile {
+        let supported = shared::supported_launch_profiles()
+            .into_iter()
+            .any(|candidate| candidate.key == *profile);
+        if !supported || shared::is_retired_launch_profile_key(profile) {
+            return Err(AppError::BadRequest(
+                "Choose a supported AI agent profile".to_string(),
+            ));
+        }
+        let deployment = state.db.get_deployment_default_policy().await?;
+        let cluster = state.db.get_cluster_default_policy(&owner.id).await?;
+        let cluster_allows = cluster
+            .and_then(|policy| policy.allowed_launch_profiles)
+            .is_none_or(|allowed| allowed.contains(profile));
+        if !deployment.allowed_launch_profiles.contains(profile) || !cluster_allows {
+            return Err(AppError::BadRequest(
+                "That AI agent is not allowed by the current cluster policy".to_string(),
+            ));
+        }
+    }
+
+    Ok((
+        machine_ids.map(|ids| ids.into_iter().map(|id| id.to_string()).collect()),
+        default_launch_profile,
+    ))
+}
+
+async fn refresh_member_runtime_access(state: &AppState, membership: &ClusterMembership) {
+    let (Ok(cluster_owner), Ok(member_id)) = (
+        uuid::Uuid::parse_str(&membership.cluster_owner_user_id),
+        uuid::Uuid::parse_str(&membership.user_id),
+    ) else {
+        return;
+    };
+    let allowed_machine_ids = membership.allowed_machine_ids().map(|machine_ids| {
+        machine_ids
+            .into_iter()
+            .filter_map(|machine_id| uuid::Uuid::parse_str(&machine_id).ok())
+            .collect::<std::collections::HashSet<_>>()
+    });
+    state
+        .sessions
+        .clear_shared_cluster_machine_access(&member_id);
+    state
+        .sessions
+        .enforce_cluster_machine_access_for_user(
+            cluster_owner,
+            member_id,
+            allowed_machine_ids.as_ref(),
+        )
+        .await;
+    state
+        .sessions
+        .broadcast_machines_update_for_user(&member_id);
 }
 
 pub async fn list_clusters(
@@ -227,7 +353,7 @@ pub async fn accept_invitation(
     headers: HeaderMap,
     Path(token): Path<String>,
     Json(request): Json<AcceptSharedClusterInvitationRequest>,
-) -> Result<Json<ClusterMembership>, AppError> {
+) -> Result<Json<ClusterMembershipView>, AppError> {
     require_trust_confirmation(request.trust_confirmed)?;
     let user = require_active_user(&headers, &state).await?;
     let membership = state
@@ -237,16 +363,82 @@ pub async fn accept_invitation(
         .ok_or_else(|| {
             AppError::NotFound("Invitation is invalid or no longer available".to_string())
         })?;
-    Ok(Json(membership))
+    Ok(Json(membership.into()))
+}
+
+pub async fn add_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AddClusterMemberRequest>,
+) -> Result<Json<ClusterMembershipView>, AppError> {
+    let owner = require_active_user(&headers, &state).await?;
+    require_cluster_owner(&headers, &state, &owner.id).await?;
+    let (allowed_machine_ids, default_launch_profile) = validate_member_policy(
+        &state,
+        &owner,
+        request.allowed_machine_ids,
+        request.default_launch_profile,
+    )
+    .await?;
+    let membership = state
+        .db
+        .add_cluster_member(
+            &owner.id,
+            &request.email,
+            allowed_machine_ids,
+            default_launch_profile,
+        )
+        .await
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    refresh_member_runtime_access(&state, &membership).await;
+    Ok(Json(membership.into()))
 }
 
 pub async fn list_members(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<Vec<ClusterMembership>>, AppError> {
+) -> Result<Json<Vec<ClusterMembershipView>>, AppError> {
     let owner = require_active_user(&headers, &state).await?;
     require_cluster_owner(&headers, &state, &owner.id).await?;
-    Ok(Json(state.db.list_cluster_memberships(&owner.id).await?))
+    Ok(Json(
+        state
+            .db
+            .list_cluster_memberships(&owner.id)
+            .await?
+            .into_iter()
+            .map(ClusterMembershipView::from)
+            .collect(),
+    ))
+}
+
+pub async fn update_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    Json(request): Json<UpdateClusterMemberRequest>,
+) -> Result<Json<ClusterMembershipView>, AppError> {
+    let owner = require_active_user(&headers, &state).await?;
+    require_cluster_owner(&headers, &state, &owner.id).await?;
+    let (allowed_machine_ids, default_launch_profile) = validate_member_policy(
+        &state,
+        &owner,
+        request.allowed_machine_ids,
+        request.default_launch_profile,
+    )
+    .await?;
+    let membership = state
+        .db
+        .update_cluster_member_policy(
+            &owner.id,
+            &user_id,
+            allowed_machine_ids,
+            default_launch_profile,
+        )
+        .await
+        .map_err(|error| AppError::BadRequest(error.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Active cluster member not found".to_string()))?;
+    refresh_member_runtime_access(&state, &membership).await;
+    Ok(Json(membership.into()))
 }
 
 pub async fn revoke_member(
@@ -265,6 +457,17 @@ pub async fn revoke_member(
         state
             .sessions
             .clear_shared_cluster_machine_access(&member_id);
+        if let Ok(cluster_owner) = uuid::Uuid::parse_str(&owner.id) {
+            let no_machines = std::collections::HashSet::new();
+            state
+                .sessions
+                .enforce_cluster_machine_access_for_user(
+                    cluster_owner,
+                    member_id,
+                    Some(&no_machines),
+                )
+                .await;
+        }
         state
             .sessions
             .broadcast_machines_update_for_user(&member_id);

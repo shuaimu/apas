@@ -353,6 +353,7 @@ async fn run_connection(
         let session_start = CliToServer::SessionStart {
             session_id: project.id,
             project_id: Some(project.id),
+            machine_id: None,
             working_dir: Some(working_dir.to_string_lossy().to_string()),
             hostname,
             git_remote,

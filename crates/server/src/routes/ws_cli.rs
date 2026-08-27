@@ -493,6 +493,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             Ok(CliToServer::SessionStart {
                                 session_id,
                                 project_id,
+                                machine_id,
                                 working_dir,
                                 hostname,
                                 git_remote,
@@ -584,6 +585,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 state
                                     .sessions
                                     .set_session_project(session_id, project_id.to_string());
+                                state.sessions.set_session_machine(session_id, machine_id);
 
                                 // Cache initial pane list if provided, preserving persisted labels/order
                                 if let Some(pane_list) = &panes {

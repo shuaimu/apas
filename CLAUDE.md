@@ -532,6 +532,18 @@ scopes every request through the hosting predicate. `routes/admin.rs` backs the
 deployment-wide surface and both call the same DB operations, so the two cannot
 drift.
 
+**Cluster sharing is owner-administered and immediate.** The owner adds an
+existing active APAS account directly; the ordinary web flow has no invitation
+or acceptance step. Each active membership carries either an explicit machine
+allowlist or the legacy `NULL = all current and future machines` value. Machine
+projection, runtime access, project creation, and project-provisioning
+finalization all enforce that allowlist. The membership may also name the launch
+profile applied to projects that member creates; provisioning snapshots it and
+creates a one-profile project policy override. New projects are created from the
+web by entering a GitHub clone URL and choosing one of the member's visible
+machines. Invitation tables and endpoints remain only for compatibility with
+older clients and outstanding links.
+
 **System administration is a credential, not an account.** One per deployment,
 stored in `system_admin_credential` outside the `users` table, seeded from
 `[system_admin]` in `apas-server.toml` only when no row exists — so editing the

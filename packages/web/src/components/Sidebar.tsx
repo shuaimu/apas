@@ -398,7 +398,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
 
   // Repo whose "New instance" modal is open (null = closed).
   const [newInstanceRepo, setNewInstanceRepo] = useState<
-    { gitRemote: string; cloneUrl?: string } | null
+    { gitRemote?: string; cloneUrl?: string } | null
   >(null);
 
   const handleRefresh = () => {
@@ -698,6 +698,14 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
             Projects
           </h2>
           <div className="flex items-center gap-1">
+            <button
+              onClick={() => setNewInstanceRepo({})}
+              className="rounded p-1 hover:bg-gray-200 dark:hover:bg-gray-700"
+              title="Create project from GitHub"
+              aria-label="Create project from GitHub"
+            >
+              <Plus className="h-4 w-4" />
+            </button>
             <button
               onClick={handleRefresh}
               disabled={!connected || isRefreshing}
@@ -1187,7 +1195,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
 
       {newInstanceRepo && (
         <CreateInstanceModal
-          key={newInstanceRepo.gitRemote}
+          key={newInstanceRepo.gitRemote || "new-project"}
           open
           onClose={() => setNewInstanceRepo(null)}
           gitRemote={newInstanceRepo.gitRemote}

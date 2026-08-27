@@ -199,7 +199,27 @@ pub struct ClusterMembership {
     pub invited_at: Option<String>,
     pub accepted_at: Option<String>,
     pub revoked_at: Option<String>,
+    /// JSON array. `NULL` preserves the legacy meaning of access to every
+    /// machine in the cluster; new direct memberships store an explicit list.
+    #[serde(skip_serializing)]
+    pub allowed_machine_ids: Option<String>,
+    pub default_launch_profile: Option<String>,
     pub updated_at: Option<String>,
+}
+
+impl ClusterMembership {
+    pub fn allowed_machine_ids(&self) -> Option<Vec<String>> {
+        self.allowed_machine_ids.as_deref().map(|raw| {
+            // A present but malformed policy must fail closed. Only SQL NULL
+            // carries the legacy "all machines" meaning.
+            serde_json::from_str(raw).unwrap_or_default()
+        })
+    }
+
+    pub fn allows_machine(&self, machine_id: &str) -> bool {
+        self.allowed_machine_ids()
+            .is_none_or(|allowed| allowed.iter().any(|candidate| candidate == machine_id))
+    }
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -245,6 +265,7 @@ pub struct ProjectProvisioningRequest {
     pub instance_name: String,
     pub branch: String,
     pub project_id: String,
+    pub default_launch_profile: Option<String>,
     pub status: String,
     pub result_path: Option<String>,
     pub error_message: Option<String>,
