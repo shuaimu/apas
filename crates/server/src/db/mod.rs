@@ -1334,14 +1334,39 @@ impl Database {
             raw: &str,
             supported: &std::collections::HashSet<String>,
         ) -> Option<Vec<String>> {
-            let profiles = serde_json::from_str::<Vec<String>>(raw).ok()?;
+            let (profiles, was_json) = match serde_json::from_str::<Vec<String>>(raw) {
+                Ok(profiles) => (profiles, true),
+                Err(_) => {
+                    // A short-lived deployment wrote policy as
+                    // `[terminal:...,agent:...]` rather than a JSON string
+                    // array. Accept only that tightly bounded historical
+                    // shape so it can be repaired; arbitrary malformed data
+                    // remains untouched and continues to fail over safely.
+                    let body = raw.trim().strip_prefix('[')?.strip_suffix(']')?;
+                    let profiles = if body.trim().is_empty() {
+                        Vec::new()
+                    } else {
+                        body.split(',')
+                            .map(str::trim)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    };
+                    if profiles.iter().any(|profile| {
+                        !(profile.starts_with("agent:") || profile.starts_with("terminal:"))
+                            || profile.split(':').count() < 4
+                    }) {
+                        return None;
+                    }
+                    (profiles, false)
+                }
+            };
             let mut seen = std::collections::HashSet::new();
             let normalized = profiles
                 .iter()
                 .filter_map(|profile| canonical_profile(profile, supported))
                 .filter(|profile| seen.insert(profile.clone()))
                 .collect::<Vec<_>>();
-            (normalized != profiles).then_some(normalized)
+            (!was_json || normalized != profiles).then_some(normalized)
         }
 
         let supported = shared::supported_launch_profiles()
@@ -6336,16 +6361,9 @@ mod cluster_administration_tests {
         sqlx::query(
             "UPDATE cluster_settings SET allowed_launch_profiles = ?, version = 4 WHERE id = 1",
         )
-        .bind(
-            serde_json::to_string(&vec![
-                legacy_claude,
-                claude,
-                legacy_fable,
-                retired_minimax,
-                codex,
-            ])
-            .unwrap(),
-        )
+        .bind(format!(
+            "[{legacy_claude},{claude},{legacy_fable},{retired_minimax},{codex}]"
+        ))
         .execute(&db.pool)
         .await
         .unwrap();
@@ -6434,6 +6452,7 @@ mod cluster_administration_tests {
             serde_json::from_str::<Vec<String>>(&cluster_json).unwrap(),
             vec![claude.to_string(), codex.to_string()]
         );
+        assert!(serde_json::from_str::<Vec<String>>(&cluster_json).is_ok());
         assert_eq!(cluster_version, 9);
 
         let (account_json, account_version) = sqlx::query_as::<_, (String, i64)>(
