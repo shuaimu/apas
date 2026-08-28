@@ -397,6 +397,62 @@ describe("TabbedView zero-pane projects", () => {
     expect(screen.queryByText("Waiting for activity...")).toBeNull();
   });
 
+  it("fails closed while the selected project's policy is absent or stale", () => {
+    seedZeroPaneTabbedView();
+    act(() => useStore.setState({
+      projectPolicies: {
+        "different-session": {
+          teamAvailable: true,
+          allowedLaunchProfiles: ["terminal:claude:official:default"],
+          version: 1,
+          projectSuspended: false,
+          noncompliantPaneIds: [],
+        },
+      },
+    }));
+
+    render(<TabbedView />);
+
+    expect(screen.queryByRole("button", { name: "Overview" })).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Overview" })).toBeNull();
+    expect(screen.getByTitle("New tab")).toBeTruthy();
+  });
+
+  it("requires an enabled authoritative policy even when real panes exist", () => {
+    seedToolbarTabbedView();
+    act(() => useStore.setState({ projectPolicies: {} }));
+    const { rerender } = render(<TabbedView />);
+    expect(screen.queryByRole("button", { name: "Overview" })).toBeNull();
+
+    act(() => useStore.setState({
+      projectPolicies: {
+        [TOOLBAR_SESSION_ID]: {
+          teamAvailable: false,
+          allowedLaunchProfiles: ["terminal:claude:official:default"],
+          version: 1,
+          projectSuspended: false,
+          noncompliantPaneIds: [],
+        },
+      },
+    }));
+    rerender(<TabbedView />);
+    expect(screen.queryByRole("button", { name: "Overview" })).toBeNull();
+
+    act(() => useStore.setState({
+      projectPolicies: {
+        [TOOLBAR_SESSION_ID]: {
+          teamAvailable: true,
+          allowedLaunchProfiles: ["terminal:claude:official:default"],
+          version: 1,
+          projectSuspended: false,
+          noncompliantPaneIds: [],
+        },
+      },
+    }));
+    rerender(<TabbedView />);
+    expect(screen.getByRole("button", { name: "Overview" })).toBeTruthy();
+  });
+
   it("keeps the fallback and hides project controls when no session is selected", () => {
     render(<TabbedView />);
 

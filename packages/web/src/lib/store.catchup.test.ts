@@ -8,6 +8,7 @@
 // invariants.
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
+  handleServerMessage,
   useStore,
   type Message,
   type SessionCacheEntry,
@@ -86,6 +87,14 @@ function dispatch(payload: Record<string, unknown>) {
   ws.onmessage?.(new MessageEvent("message", { data: JSON.stringify(payload) }));
 }
 
+function confirmAttachment(sessionId: string, hasActiveCli = true) {
+  handleServerMessage({
+    type: "session_attached",
+    session_id: sessionId,
+    has_active_cli: hasActiveCli,
+  }, useStore.setState, useStore.getState);
+}
+
 beforeEach(() => {
   // connect() bails when no token is present in localStorage; tests that
   // exercise the WS-onmessage path call connect() and need a token to
@@ -93,6 +102,8 @@ beforeEach(() => {
   localStorage.setItem("apas_token", "test-token");
   useStore.setState({
     sessionId: null,
+    pendingSessionAttachment: null,
+    pendingPaneSelection: null,
     ws: null,
     isAuthenticated: false,
     connected: false,
@@ -307,6 +318,9 @@ describe("attachSession + catchup query", () => {
 
     useStore.getState().attachSession(SID_B, false);
 
+    expect(parseSent(sent).some((m) => m.type === "get_session_messages")).toBe(false);
+    confirmAttachment(SID_B);
+
     const messages = parseSent(sent);
     const attach = messages.find((m) => m.type === "attach_session");
     const catchup = messages.find((m) => m.type === "get_session_messages");
@@ -334,6 +348,7 @@ describe("attachSession + catchup query", () => {
     });
 
     useStore.getState().attachSession(SID_B, false);
+    confirmAttachment(SID_B);
 
     const catchup = parseSent(sent).find((m) => m.type === "get_session_messages");
     expect(catchup?.after_created_at).toBe("2026-05-25T18:00:00Z");
@@ -351,6 +366,7 @@ describe("attachSession + catchup query", () => {
     });
 
     useStore.getState().attachSession(SID_B, false);
+    confirmAttachment(SID_B);
 
     const sentMsgs = parseSent(sent);
     expect(sentMsgs.some((m) => m.type === "attach_session")).toBe(true);
@@ -373,6 +389,8 @@ describe("snapshot-on-leave carries the catchup watermark", () => {
     });
 
     useStore.getState().attachSession(SID_B, false);
+    expect(useStore.getState().sessionCache.get(SID_A)).toBeUndefined();
+    confirmAttachment(SID_B);
 
     const snapshot = useStore.getState().sessionCache.get(SID_A);
     expect(snapshot).toBeDefined();

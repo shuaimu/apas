@@ -57,6 +57,15 @@ function seedTabbedView({
       hasMoreMessages: false,
       isLoadingMore: false,
       teamRecords: [],
+      projectPolicies: {
+        [SESSION_ID]: {
+          teamAvailable: true,
+          allowedLaunchProfiles: ["terminal:claude:official:default"],
+          version: 1,
+          projectSuspended: false,
+          noncompliantPaneIds: [],
+        },
+      },
       loadPaneMessagesIfNeeded: vi.fn(),
       loadMoreMessages: vi.fn(),
       stopBot,

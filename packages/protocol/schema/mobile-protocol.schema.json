@@ -2264,6 +2264,32 @@
           ]
         },
         {
+          "description": "Correlated rejection for one requested session attachment.",
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/$defs/SessionAttachmentRejectionReason"
+            },
+            "session_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "type": {
+              "type": "string",
+              "const": "session_attachment_rejected"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "reason",
+            "message"
+          ]
+        },
+        {
           "description": "Output from Claude",
           "type": "object",
           "properties": {
@@ -3204,6 +3230,16 @@
             "type"
           ]
         }
+      ]
+    },
+    "SessionAttachmentRejectionReason": {
+      "description": "Why a requested session attachment was rejected. The session id carried\nalongside this value lets clients reconcile concurrent foreground and\nbackground attachment attempts without treating a global error as the\nresult of whichever navigation happens to be visible.",
+      "type": "string",
+      "enum": [
+        "project_access_required",
+        "host_machine_access_required",
+        "project_unavailable",
+        "session_not_found"
       ]
     },
     "SessionInfo": {

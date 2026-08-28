@@ -544,6 +544,44 @@ web by entering a GitHub clone URL and choosing one of the member's visible
 machines. Invitation tables and endpoints remain only for compatibility with
 older clients and outstanding links.
 
+### Project shares and cluster shares are independent
+
+A **project share** grants conversations and other durable content for that
+project. When the selected session is hosted by the canonical project owner,
+the same explicit project role also grants live, project-scoped runtime use.
+It never grants machine inventory, project provisioning, provider
+configuration, cluster administration, or access to another project.
+
+A **cluster share** grants compute only on the membership's machine allowlist
+and applies its configured default launch profile to projects that member
+creates there. It never grants conversation or policy visibility for a project
+the member neither owns nor explicitly belongs to.
+
+The two grants compose for third-party hosting. If a session's host is neither
+the caller nor the canonical project owner, the caller needs both ordinary
+project access and active membership in the hosting cluster with permission for
+that session's exact machine. Revoking the cluster or machine grant stops later
+attachments and runtime mutations without deleting the project role or its
+persisted history.
+
+| Caller authority | Project content | Owner-hosted runtime | Third-party-hosted runtime | Shared machines / provisioning |
+| --- | --- | --- | --- | --- |
+| Project owner or explicit project user | Yes | Yes, for that project only | Only with host-cluster membership and exact-machine permission | No |
+| Cluster member only | No | No | No; project access is also required | Allowed machines only |
+| Project user plus matching host-cluster grant | Yes | Yes, from the project role | Yes, on the permitted machine | Allowed machines only |
+
+Resolve this per selected session and on every attach or runtime mutation; a
+project can have owner-hosted and third-party-hosted placements with different
+answers. `Database::check_session_runtime_access` is the common predicate.
+Content-only reads continue to use ordinary project access.
+
+Web navigation is also authorization-transactional. `attach_session` keeps the
+requested session pending; only a matching `session_attached` may change the
+active or persisted workspace, restore its cache, or request catch-up. Expected
+denials use `session_attachment_rejected` with the requested session and a safe
+project-access, host-machine-access, unavailable-project, or missing-session
+reason. Background and out-of-order results never become foreground navigation.
+
 **System administration is a credential, not an account.** One per deployment,
 stored in `system_admin_credential` outside the `users` table, seeded from
 `[system_admin]` in `apas-server.toml` only when no row exists — so editing the

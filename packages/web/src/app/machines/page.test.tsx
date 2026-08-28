@@ -377,6 +377,11 @@ describe("MachinesPage cluster administration", () => {
     seedMachines();
     render(<MachinesPage />);
 
+    expect(await screen.findByText("Share machine access")).toBeTruthy();
+    expect(screen.getByText(/choose the machines it can run on/i)).toBeTruthy();
+    expect(screen.getByText(/default AI agent for projects it creates here/i)).toBeTruthy();
+    expect(screen.getByText(/does not share any existing or unrelated project/i)).toBeTruthy();
+    expect(screen.getByText(/selected hosting machine/i)).toBeTruthy();
     fireEvent.change(await screen.findByLabelText("Member account email"), {
       target: { value: "new-member@example.com" },
     });

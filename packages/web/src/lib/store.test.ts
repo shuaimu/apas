@@ -6,10 +6,13 @@ describe('useStore', () => {
     // connect() bails when no token is in localStorage, so the WS-touching
     // tests below rely on having one pre-seeded.
     localStorage.setItem('apas_token', 'test-token');
+    localStorage.removeItem('apas_session_id');
     // Reset store state before each test
     useStore.setState({
       connected: false,
       sessionId: null,
+      pendingSessionAttachment: null,
+      pendingPaneSelection: null,
       ws: null,
       cliClients: [],
       cliLifecycleInventories: {},
@@ -19,6 +22,11 @@ describe('useStore', () => {
       workingPanesBySession: new Map(),
       paneStatuses: {},
       messages: [],
+      sessionCache: new Map(),
+      unreadSessions: new Set(),
+      sessionLastCreatedAt: new Map(),
+      paneLastCreatedAt: new Map(),
+      reconnectWatermarks: new Map(),
       machines: [],
       projectFlags: {},
       projectPolicies: {},
@@ -67,6 +75,232 @@ describe('useStore', () => {
   });
 
   describe('session attachment confirmations', () => {
+    function attachmentWs() {
+      const sent: Array<Record<string, unknown>> = [];
+      const ws = {
+        readyState: WebSocket.OPEN,
+        send: vi.fn((raw: string) => sent.push(JSON.parse(raw))),
+        close: vi.fn(),
+      } as unknown as WebSocket;
+      return { ws, sent };
+    }
+
+    it('keeps the current project and persisted selection until exact confirmation', () => {
+      const { ws, sent } = attachmentWs();
+      const currentMessage: Message = {
+        id: 'current-message',
+        role: 'assistant',
+        content: 'authorized current project',
+        timestamp: new Date(),
+      };
+      localStorage.setItem('apas_session_id', 'current-session');
+      useStore.setState({
+        ws,
+        sessionId: 'current-session',
+        messages: [currentMessage],
+      });
+
+      useStore.getState().attachSession('target-session');
+
+      expect(useStore.getState()).toMatchObject({
+        sessionId: 'current-session',
+        messages: [currentMessage],
+        pendingSessionAttachment: {
+          sessionId: 'target-session',
+          forceReload: false,
+          requestedFromSessionId: 'current-session',
+        },
+      });
+      expect(localStorage.getItem('apas_session_id')).toBe('current-session');
+      expect(sent).toEqual([{
+        type: 'attach_session',
+        session_id: 'target-session',
+      }]);
+    });
+
+    it('commits cache restoration and catch-up only after matching confirmation', () => {
+      const { ws, sent } = attachmentWs();
+      const cachedMessage: Message = {
+        id: 'cached-message',
+        role: 'assistant',
+        content: 'authorized cached project',
+        timestamp: new Date(),
+      };
+      useStore.setState({
+        ws,
+        sessionId: 'current-session',
+        messages: [],
+        sessionCache: new Map([['target-session', {
+          messages: [cachedMessage],
+          paneMessages: {},
+          paneHasMore: {},
+          paneConfigs: [],
+          paneModes: {},
+          hasMoreMessages: false,
+          isDualPane: false,
+          answeredQuestions: new Map(),
+          cachedAt: Date.now(),
+          lastCreatedAt: '2026-08-28T12:00:00Z',
+        }]]),
+        sessionLastCreatedAt: new Map([['target-session', '2026-08-28T12:00:00Z']]),
+      });
+
+      useStore.getState().attachSession('target-session');
+      expect(useStore.getState().messages).toEqual([]);
+      expect(sent.some((message) => message.type === 'get_session_messages')).toBe(false);
+
+      handleServerMessage({
+        type: 'session_attached',
+        session_id: 'target-session',
+        has_active_cli: true,
+      }, useStore.setState, useStore.getState);
+
+      expect(useStore.getState()).toMatchObject({
+        sessionId: 'target-session',
+        messages: [cachedMessage],
+        pendingSessionAttachment: null,
+        isAttached: true,
+      });
+      expect(localStorage.getItem('apas_session_id')).toBe('target-session');
+      expect(sent).toContainEqual({
+        type: 'get_session_messages',
+        session_id: 'target-session',
+        after_created_at: '2026-08-28T12:00:00Z',
+      });
+    });
+
+    it('ignores out-of-order success and rejection from stale or background requests', () => {
+      const { ws } = attachmentWs();
+      useStore.setState({ ws, sessionId: 'current-session', isAttached: true });
+
+      useStore.getState().attachSession('older-target');
+      useStore.getState().attachSession('newer-target');
+      handleServerMessage({
+        type: 'session_attached',
+        session_id: 'older-target',
+        has_active_cli: false,
+      }, useStore.setState, useStore.getState);
+      handleServerMessage({
+        type: 'session_attachment_rejected',
+        session_id: 'older-target',
+        reason: 'host_machine_access_required',
+        message: 'stale denial',
+      }, useStore.setState, useStore.getState);
+
+      expect(useStore.getState()).toMatchObject({
+        sessionId: 'current-session',
+        pendingSessionAttachment: { sessionId: 'newer-target' },
+        isAttached: true,
+      });
+      expect(useStore.getState().toasts).toEqual([]);
+
+      handleServerMessage({
+        type: 'session_attached',
+        session_id: 'newer-target',
+        has_active_cli: false,
+      }, useStore.setState, useStore.getState);
+      expect(useStore.getState()).toMatchObject({
+        sessionId: 'newer-target',
+        pendingSessionAttachment: null,
+        isAttached: false,
+      });
+    });
+
+    it('rolls back a correlated denial with one actionable error and no follow-on request', () => {
+      const { ws, sent } = attachmentWs();
+      const currentMessage: Message = {
+        id: 'current-message',
+        role: 'assistant',
+        content: 'keep me',
+        timestamp: new Date(),
+      };
+      localStorage.setItem('apas_session_id', 'current-session');
+      useStore.setState({
+        ws,
+        sessionId: 'current-session',
+        messages: [currentMessage],
+        pendingPaneSelection: { sessionId: 'denied-session', paneId: 4 },
+      });
+      useStore.getState().attachSession('denied-session');
+
+      const rejection = {
+        type: 'session_attachment_rejected',
+        session_id: 'denied-session',
+        reason: 'host_machine_access_required',
+        message: 'This project also requires access to its hosting machine.',
+      };
+      handleServerMessage(rejection, useStore.setState, useStore.getState);
+      handleServerMessage(rejection, useStore.setState, useStore.getState);
+
+      expect(useStore.getState()).toMatchObject({
+        sessionId: 'current-session',
+        messages: [currentMessage],
+        pendingSessionAttachment: null,
+        pendingPaneSelection: null,
+      });
+      expect(localStorage.getItem('apas_session_id')).toBe('current-session');
+      expect(useStore.getState().toasts).toHaveLength(1);
+      expect(useStore.getState().toasts[0]).toMatchObject({
+        kind: 'error',
+        message: rejection.message,
+      });
+      expect(sent).toEqual([{
+        type: 'attach_session',
+        session_id: 'denied-session',
+      }]);
+    });
+
+    it('marks a current runtime detached and purges it only when project access was revoked', () => {
+      const { ws } = attachmentWs();
+      const currentMessage: Message = {
+        id: 'current-message',
+        role: 'assistant',
+        content: 'authorized project history',
+        timestamp: new Date(),
+      };
+      useStore.setState({
+        ws,
+        sessionId: 'current-session',
+        isAttached: true,
+        messages: [currentMessage],
+        sessions: [{
+          id: 'current-session',
+          projectId: 'current-project',
+          status: 'active',
+        }],
+      });
+
+      useStore.getState().attachSession('current-session');
+      handleServerMessage({
+        type: 'session_attachment_rejected',
+        session_id: 'current-session',
+        reason: 'host_machine_access_required',
+        message: 'Hosting machine permission is required.',
+      }, useStore.setState, useStore.getState);
+      expect(useStore.getState()).toMatchObject({
+        sessionId: 'current-session',
+        isAttached: false,
+        messages: [currentMessage],
+      });
+
+      useStore.setState({ isAttached: true });
+      useStore.getState().attachSession('current-session');
+      handleServerMessage({
+        type: 'session_attachment_rejected',
+        session_id: 'current-session',
+        reason: 'project_access_required',
+        message: 'Project access was revoked.',
+      }, useStore.setState, useStore.getState);
+      expect(useStore.getState()).toMatchObject({
+        sessionId: null,
+        cliClientId: null,
+        isAttached: false,
+        messages: [],
+        paneMessages: {},
+      });
+      expect(useStore.getState().sessions).toEqual([]);
+    });
+
     it('does not let a background session disable the current project', () => {
       useStore.setState({ sessionId: 'current-session', isAttached: true });
 
@@ -345,6 +579,12 @@ describe('useStore', () => {
 
       useStore.getState().attachSession('current-session');
 
+      expect(useStore.getState().paneStatuses).toEqual({ '7': 'Working...' });
+      handleServerMessage({
+        type: 'session_attached',
+        session_id: 'current-session',
+        has_active_cli: true,
+      }, useStore.setState, useStore.getState);
       expect(useStore.getState().paneStatuses).toEqual({});
       expect(useStore.getState().interactiveStatus).toBeNull();
       expect(useStore.getState().deadloopStatus).toBeNull();
@@ -630,7 +870,7 @@ describe('useStore', () => {
   });
 
   describe('attachSession', () => {
-    it('should clear messages when attaching to session', async () => {
+    it('clears messages only after attachment is confirmed', async () => {
       const message: Message = {
         id: '1',
         role: 'user',
@@ -644,6 +884,12 @@ describe('useStore', () => {
 
       useStore.getState().attachSession('test-session-id');
 
+      expect(useStore.getState().messages).toHaveLength(1);
+      handleServerMessage({
+        type: 'session_attached',
+        session_id: 'test-session-id',
+        has_active_cli: false,
+      }, useStore.setState, useStore.getState);
       expect(useStore.getState().messages).toHaveLength(0);
     });
   });

@@ -1003,7 +1003,12 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                   ) : (
                     <div>
                       <p className="text-sm text-gray-600 dark:text-gray-400 mb-4">
-                        Share this link with someone to give them access. The link expires in 24 hours.
+                        This link shares only this project: its history and owner-hosted runtimes.
+                        It does not grant cluster, machine, or unrelated-project access. If an
+                        instance is hosted in another cluster, that cluster owner must separately
+                        grant access to the selected hosting machine; their cluster policy chooses
+                        the default AI agent for projects the user creates there. The link expires
+                        in 24 hours.
                       </p>
 
                       <div className="mb-4">
@@ -1063,7 +1068,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                   ) : (
                     <div className="space-y-2">
                       <p className="text-sm text-gray-600 dark:text-gray-400 mb-1">
-                        Users with access to this session:
+                        Users with access to this project only:
                       </p>
                       <p className="text-xs text-gray-500 mb-3">
                         Your role: {roleLabel(shareUsers.viewerRole)}
@@ -1090,7 +1095,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                       {/* Shared users */}
                       {shareUsers.shares.length === 0 ? (
                         <div className="text-center py-4 text-gray-500 text-sm">
-                          No users have been invited yet
+                          This project has not been shared yet
                         </div>
                       ) : (
                         shareUsers.shares.map((user) => {

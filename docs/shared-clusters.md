@@ -13,33 +13,30 @@ SSH, askpass, and credential-helper configuration, but it does **not** sandbox
 the resulting project runtime from the owner's files, processes, environment,
 network, or credentials.
 
-Both the invitation creator and recipient must explicitly acknowledge this
-warning. Revoking membership stops new provisioning and shared runtime
-mutations immediately, including on WebSocket connections that were already
-open. It does not delete project data, remove the checkout, or revoke the
-former member's normal ownership/content access to projects they created.
+The cluster owner chooses this access directly; there is no invitation or
+acceptance step in the current web flow. Revoking membership stops new
+provisioning and shared runtime mutations immediately, including on WebSocket
+connections that were already open. It does not delete project data, remove
+the checkout, or revoke the former member's normal ownership/content access to
+projects they created.
 
 ## Prerequisites and workflow
 
-The recipient must already have an active APAS account. A shared-cluster
-invitation never creates an account; deployment account provisioning remains a
+The member must already have an active APAS account. Cluster sharing never
+creates an account; deployment account provisioning remains a
 system-administrator operation.
 
-1. The cluster owner opens **Machines**, stays in **My cluster**, enters the
-   recipient's APAS email under **Cluster sharing**, confirms the trust warning,
-   and creates the invitation.
-2. The owner copies the one-time invitation link to the addressed user. Creating
-   another invitation for the same pending recipient replaces the pending link;
-   old and expired links cannot be accepted.
-3. The recipient signs in as the addressed account, opens the link, confirms
-   the warning, and joins the cluster.
-4. The recipient selects the shared cluster on desktop or mobile and creates a
+1. The cluster owner opens **Machines**, stays in **My cluster**, and enters the
+   member's APAS email under **Share machine access**.
+2. The owner selects exactly which machines the member may use and the default
+   AI agent applied to projects that member creates, then adds the member.
+3. The member selects the shared cluster on desktop or mobile and creates a
    project from an exact public GitHub HTTPS URL such as
    `https://github.com/owner/repository`. Private repositories, other Git hosts,
    embedded credentials, SSH/file URLs, alternate ports, query strings, and
    fragments are rejected. Shared checkouts always live below the daemon
    owner's managed `~/apas_projects` directory.
-5. The recipient owns the new project. The cluster owner sees it in hosted
+4. The member owns the new project. The cluster owner sees it in hosted
    project inventory and may manage its members, owner, lifecycle, runtime,
    and policy.
 
@@ -50,12 +47,33 @@ credential-aware clone mode.
 
 ## Roles and visibility
 
+Project access and cluster access are separate grants:
+
+- **Project access** exposes one project's conversations and durable content.
+  It also permits live use of that project's owner-hosted sessions, but exposes
+  no machine list, provisioning surface, cluster controls, or unrelated
+  project.
+- **Cluster access** exposes only the machines selected by the cluster owner
+  and lets the member create projects there under the configured default AI
+  agent. It exposes no existing project unless that account separately owns or
+  belongs to the project.
+- A project session hosted by a third party requires both grants: project
+  access plus active membership in the hosting cluster with permission for the
+  exact machine. Either grant can be revoked independently.
+
+| Grant held by a user | Project conversations | Owner-hosted project runtime | Third-party-hosted project runtime | Machine use / new projects |
+| --- | --- | --- | --- | --- |
+| Project access only | That project only | Yes, that project only | No | No |
+| Cluster access only | No | No | No | Selected machines only |
+| Both project and matching host-cluster access | That project only | Yes | Yes, on the selected machine | Selected machines only |
+
 | Capability | Cluster owner | Active cluster member |
 | --- | --- | --- |
 | See machines | Full owned-machine view | Safe metadata for shared machines |
 | See projects | Every project placed in the cluster | Only projects they own or belong to |
 | Create project | Existing trusted clone flow | Public GitHub HTTPS only |
-| Project runtime and conversation | Accessible projects | Accessible projects while membership is active |
+| Project conversation | Accessible projects | Only projects they own or belong to; independent of cluster membership |
+| Project runtime | Accessible projects hosted here | Owner-hosted project shares work directly; third-party hosting also requires the matching machine grant |
 | Hosted-project members, owner, lifecycle, policy | Manage | No cluster-operator control |
 | Invitations and cluster members | Manage | No |
 | Reboot daemon or configure providers | Manage | No |
@@ -102,7 +120,7 @@ Roll out in this order:
    owner and canonical-session host accounts, and compare effective policy for
    multi-host projects.
 3. Upgrade and reconnect daemons. Confirm eligible machines advertise shared
-   provisioning before enabling invitations for users.
+   provisioning before adding cluster members.
 4. Deploy the web UI and verify owner inventory, redacted member inventory,
    a public-repository clone, revocation, usage totals, and audit events.
 

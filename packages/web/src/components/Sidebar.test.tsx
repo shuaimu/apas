@@ -371,7 +371,12 @@ describe("Sidebar project list", () => {
 
     render(<Sidebar />);
     fireEvent.click(screen.getByTitle("Manage project access"));
+    expect(await screen.findByText(/shares only this project/i)).toBeTruthy();
+    expect(screen.getByText(/does not grant cluster, machine, or unrelated-project access/i)).toBeTruthy();
+    expect(screen.getByText(/selected hosting machine/i)).toBeTruthy();
+    expect(screen.getByText(/default AI agent/i)).toBeTruthy();
     fireEvent.click(await screen.findByText("Manage Access"));
+    expect(await screen.findByText("Users with access to this project only:")).toBeTruthy();
     fireEvent.click(await screen.findByTitle("Transfer ownership"));
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));

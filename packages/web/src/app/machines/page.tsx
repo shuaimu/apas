@@ -557,8 +557,13 @@ export default function MachinesPage() {
         {!sharedView && (
           <section className="rounded-lg border border-gray-200 bg-white shadow-sm dark:border-gray-800 dark:bg-gray-900">
             <div className="border-b border-gray-200 px-4 py-3 dark:border-gray-800">
-              <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-300">Share this cluster</h2>
-              <p className="mt-1 text-xs text-gray-500">Add an existing APAS account immediately, then choose the machines and default AI agent available to its new projects.</p>
+              <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-300">Share machine access</h2>
+              <p className="mt-1 text-xs text-gray-500">
+                Add an existing APAS account immediately, choose the machines it can run on, and
+                choose the default AI agent for projects it creates here. This does not share any
+                existing or unrelated project; project owners share those separately. A user of a
+                shared project hosted here also needs access to its selected hosting machine.
+              </p>
             </div>
             <div className="grid gap-5 p-4 lg:grid-cols-2">
               <div>

@@ -969,6 +969,42 @@ mod mobile_websocket_load_tests {
         .expect("timed out waiting for CLI message")
     }
 
+    async fn assert_no_rejected_session_replay(socket: &mut ClientSocket, session_id: uuid::Uuid) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(150);
+        while let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) {
+            let Ok(Some(Ok(frame))) = tokio::time::timeout(remaining, socket.next()).await else {
+                break;
+            };
+            let Message::Text(text) = frame else { continue };
+            let message = serde_json::from_str::<shared::ServerToWeb>(&text).unwrap();
+            let leaks_rejected_session = match message {
+                shared::ServerToWeb::SessionStarted {
+                    session_id: target, ..
+                }
+                | shared::ServerToWeb::SessionAttached {
+                    session_id: target, ..
+                }
+                | shared::ServerToWeb::PaneList {
+                    session_id: target, ..
+                }
+                | shared::ServerToWeb::ProjectPolicyChanged {
+                    session_id: target, ..
+                }
+                | shared::ServerToWeb::ProjectUsageStats {
+                    session_id: target, ..
+                }
+                | shared::ServerToWeb::SessionMessages {
+                    session_id: target, ..
+                } => target == session_id,
+                _ => false,
+            };
+            assert!(
+                !leaks_rejected_session,
+                "attachment rejection leaked follow-up state: {message:?}"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn bounded_mobile_websocket_connections_authenticate_concurrently() {
         const CONNECTIONS: usize = 128;
@@ -1157,6 +1193,199 @@ mod mobile_websocket_load_tests {
             )
         })
         .await;
+
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attachment_results_are_correlated_and_denials_replay_no_project_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "apas-attachment-authorization-e2e-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("apas.db");
+        let db = crate::db::Database::new(&db_path.to_string_lossy())
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+
+        let owner_id = uuid::Uuid::new_v4();
+        let member_id = uuid::Uuid::new_v4();
+        let third_party_host_id = uuid::Uuid::new_v4();
+        let unrelated_owner_id = uuid::Uuid::new_v4();
+        for (id, email) in [
+            (owner_id, "attach-owner@example.test"),
+            (member_id, "attach-member@example.test"),
+            (third_party_host_id, "attach-host@example.test"),
+            (unrelated_owner_id, "attach-unrelated@example.test"),
+        ] {
+            db.create_user(&crate::db::User {
+                id: id.to_string(),
+                email: email.to_string(),
+                password_hash: "unused".to_string(),
+                created_at: None,
+                cluster_role: "user".to_string(),
+                account_status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        }
+
+        let project_id = "attachment-shared-project";
+        db.authorize_project_registration(project_id, &owner_id.to_string())
+            .await
+            .unwrap();
+        db.add_project_member(&owner_id.to_string(), project_id, &member_id.to_string())
+            .await
+            .unwrap();
+        let unrelated_project_id = "attachment-unrelated-project";
+        db.authorize_project_registration(unrelated_project_id, &unrelated_owner_id.to_string())
+            .await
+            .unwrap();
+
+        let owner_hosted_session = uuid::Uuid::new_v4();
+        let third_party_hosted_session = uuid::Uuid::new_v4();
+        let unrelated_session = uuid::Uuid::new_v4();
+        for (session_id, hosting_user_id, target_project_id) in [
+            (owner_hosted_session, owner_id, project_id),
+            (third_party_hosted_session, third_party_host_id, project_id),
+            (unrelated_session, unrelated_owner_id, unrelated_project_id),
+        ] {
+            db.create_session(&crate::db::Session {
+                id: session_id.to_string(),
+                user_id: hosting_user_id.to_string(),
+                cli_client_id: None,
+                working_dir: Some("/workspace/project".to_string()),
+                hostname: Some("builder".to_string()),
+                status: "active".to_string(),
+                created_at: None,
+                updated_at: None,
+                is_paused: false,
+                project_id: Some(target_project_id.to_string()),
+                git_remote: None,
+                git_remote_url: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        db.create_mobile_device_session(
+            "attachment-device",
+            &member_id.to_string(),
+            "attachment-installation",
+            "ios",
+            None,
+            "e2e-test",
+            "unused-refresh-hash",
+            &(chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+        )
+        .await
+        .unwrap();
+        let mut config = crate::config::Config::default();
+        config.database.path = db_path.to_string_lossy().into_owned();
+        config.auth.jwt_secret = "attachment-test-secret".to_string();
+        let state = AppState::new(db, config);
+        let (access_token, _) = auth::generate_mobile_access_token(
+            &member_id.to_string(),
+            "attachment-device",
+            &state.config.auth,
+        )
+        .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = create_router(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let url = format!("ws://{address}/ws/web");
+        let mut client = connect_client(&url, access_token, Some(shared::ClientKind::Mobile)).await;
+
+        send_client(
+            &mut client,
+            shared::WebToServer::AttachSession {
+                session_id: owner_hosted_session,
+            },
+        )
+        .await;
+        receive_server(&mut client, |message| {
+            matches!(
+                message,
+                shared::ServerToWeb::SessionAttached { session_id, .. }
+                    if *session_id == owner_hosted_session
+            )
+        })
+        .await;
+
+        send_client(
+            &mut client,
+            shared::WebToServer::AttachSession {
+                session_id: third_party_hosted_session,
+            },
+        )
+        .await;
+        let rejected = receive_server(&mut client, |message| {
+            matches!(
+                message,
+                shared::ServerToWeb::SessionAttachmentRejected { session_id, .. }
+                    if *session_id == third_party_hosted_session
+            )
+        })
+        .await;
+        assert!(matches!(
+            rejected,
+            shared::ServerToWeb::SessionAttachmentRejected {
+                reason: shared::SessionAttachmentRejectionReason::HostMachineAccessRequired,
+                ..
+            }
+        ));
+        assert_no_rejected_session_replay(&mut client, third_party_hosted_session).await;
+
+        send_client(
+            &mut client,
+            shared::WebToServer::AttachSession {
+                session_id: unrelated_session,
+            },
+        )
+        .await;
+        assert!(matches!(
+            receive_server(&mut client, |message| {
+                matches!(
+                    message,
+                    shared::ServerToWeb::SessionAttachmentRejected { session_id, .. }
+                        if *session_id == unrelated_session
+                )
+            })
+            .await,
+            shared::ServerToWeb::SessionAttachmentRejected {
+                reason: shared::SessionAttachmentRejectionReason::ProjectAccessRequired,
+                ..
+            }
+        ));
+
+        let missing_session = uuid::Uuid::new_v4();
+        send_client(
+            &mut client,
+            shared::WebToServer::AttachSession {
+                session_id: missing_session,
+            },
+        )
+        .await;
+        assert!(matches!(
+            receive_server(&mut client, |message| {
+                matches!(
+                    message,
+                    shared::ServerToWeb::SessionAttachmentRejected { session_id, .. }
+                        if *session_id == missing_session
+                )
+            })
+            .await,
+            shared::ServerToWeb::SessionAttachmentRejected {
+                reason: shared::SessionAttachmentRejectionReason::SessionNotFound,
+                ..
+            }
+        ));
 
         server.abort();
     }

@@ -118,6 +118,13 @@ export type ServerToWeb =
       [k: string]: unknown;
     }
   | {
+      message: string;
+      reason: SessionAttachmentRejectionReason;
+      session_id: string;
+      type: "session_attachment_rejected";
+      [k: string]: unknown;
+    }
+  | {
       content: string;
       /**
        * Type of output content
@@ -430,6 +437,14 @@ export type PaneType = "deadloop" | "interactive";
  * Session status
  */
 export type SessionStatus = "pending" | "connected" | "disconnected" | "ended";
+/**
+ * Why a requested session attachment was rejected. The session id carried
+ * alongside this value lets clients reconcile concurrent foreground and
+ * background attachment attempts without treating a global error as the
+ * result of whichever navigation happens to be visible.
+ */
+export type SessionAttachmentRejectionReason =
+  "project_access_required" | "host_machine_access_required" | "project_unavailable" | "session_not_found";
 /**
  * CLI client status
  */

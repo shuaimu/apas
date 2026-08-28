@@ -4845,17 +4845,39 @@ impl Database {
         if !self.check_session_access(session_id, user_id).await? {
             return Ok(false);
         }
-        let hosting_user_id =
-            sqlx::query_scalar::<_, String>("SELECT user_id FROM sessions WHERE id = ?")
-                .bind(session_id)
-                .fetch_optional(&self.pool)
-                .await?;
-        let Some(hosting_user_id) = hosting_user_id else {
+        let runtime = sqlx::query_as::<_, (String, String, String)>(
+            r#"
+            SELECT s.user_id, p.id, p.owner_user_id
+            FROM sessions s
+            JOIN projects p ON p.id = COALESCE(s.project_id, s.id)
+            WHERE s.id = ?
+            "#,
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((hosting_user_id, project_id, project_owner_user_id)) = runtime else {
             return Ok(false);
         };
         if hosting_user_id == user_id {
             return Ok(true);
         }
+
+        // A project share is a project-scoped compute grant when the runtime
+        // is hosted by that project's owner. It must not silently become a
+        // cluster membership: the user still cannot discover machines,
+        // provision other projects, or open unrelated projects.
+        if hosting_user_id == project_owner_user_id {
+            return Ok(self
+                .get_project_role_for_user(&project_id, user_id)
+                .await?
+                .is_some());
+        }
+
+        // A project hosted in somebody else's cluster keeps that operator's
+        // trust boundary. Project ownership/membership supplies content
+        // access, but live use additionally needs current permission for the
+        // exact hosting machine.
         Ok(self
             .get_cluster_membership(&hosting_user_id, user_id)
             .await?

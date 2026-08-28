@@ -1214,6 +1214,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_share_grants_only_owner_hosted_runtime_access() {
+        let db = database("project-share-runtime-scope").await;
+        for (id, email) in [
+            ("owner", "owner@example.test"),
+            ("member", "member@example.test"),
+            ("host", "host@example.test"),
+            ("cluster-only", "cluster-only@example.test"),
+        ] {
+            user(&db, id, email).await;
+        }
+        db.authorize_project_registration("project", "owner")
+            .await
+            .unwrap();
+        db.add_project_member("owner", "project", "member")
+            .await
+            .unwrap();
+        for (session_id, session_user, hostname) in [
+            ("owner-instance", "owner", "owner-host"),
+            ("third-party-instance", "host", "shared-host"),
+        ] {
+            db.add_project_cluster_placement("project", session_user, session_user, "test")
+                .await
+                .unwrap();
+            db.create_session(&Session {
+                id: session_id.to_string(),
+                user_id: session_user.to_string(),
+                cli_client_id: None,
+                working_dir: Some(format!("/work/{session_id}")),
+                hostname: Some(hostname.to_string()),
+                status: "active".to_string(),
+                created_at: None,
+                updated_at: None,
+                is_paused: false,
+                project_id: Some("project".to_string()),
+                git_remote: None,
+                git_remote_url: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        assert!(db
+            .check_session_runtime_access("owner-instance", "member", Some("owner-machine"))
+            .await
+            .unwrap());
+        assert!(!db
+            .check_session_runtime_access("third-party-instance", "member", Some("shared-machine"),)
+            .await
+            .unwrap());
+
+        db.add_cluster_member(
+            "host",
+            "member@example.test",
+            Some(vec!["shared-machine".to_string()]),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .check_session_runtime_access("third-party-instance", "member", Some("shared-machine"),)
+            .await
+            .unwrap());
+        assert!(!db
+            .check_session_runtime_access("third-party-instance", "member", Some("other-machine"),)
+            .await
+            .unwrap());
+
+        db.add_cluster_member(
+            "host",
+            "cluster-only@example.test",
+            Some(vec!["shared-machine".to_string()]),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!db
+            .check_session_access("third-party-instance", "cluster-only")
+            .await
+            .unwrap());
+        assert!(!db
+            .check_session_runtime_access(
+                "third-party-instance",
+                "cluster-only",
+                Some("shared-machine"),
+            )
+            .await
+            .unwrap());
+
+        db.revoke_cluster_membership("host", "member")
+            .await
+            .unwrap();
+        assert!(db
+            .check_session_access("third-party-instance", "member")
+            .await
+            .unwrap());
+        assert!(!db
+            .check_session_runtime_access("third-party-instance", "member", Some("shared-machine"),)
+            .await
+            .unwrap());
+        assert!(db
+            .check_session_runtime_access("owner-instance", "member", Some("owner-machine"))
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn owner_transfer_reclassifies_each_runtime_host() {
+        let db = database("project-share-owner-transfer").await;
+        for (id, email) in [
+            ("owner", "owner@example.test"),
+            ("member", "member@example.test"),
+            ("reader", "reader@example.test"),
+        ] {
+            user(&db, id, email).await;
+        }
+        db.authorize_project_registration("project", "owner")
+            .await
+            .unwrap();
+        db.add_project_member("owner", "project", "member")
+            .await
+            .unwrap();
+        db.add_project_member("owner", "project", "reader")
+            .await
+            .unwrap();
+        db.create_session(&Session {
+            id: "owner-instance".to_string(),
+            user_id: "owner".to_string(),
+            cli_client_id: None,
+            working_dir: Some("/work/project".to_string()),
+            hostname: Some("owner-host".to_string()),
+            status: "active".to_string(),
+            created_at: None,
+            updated_at: None,
+            is_paused: false,
+            project_id: Some("project".to_string()),
+            git_remote: None,
+            git_remote_url: None,
+        })
+        .await
+        .unwrap();
+
+        assert!(db
+            .check_session_runtime_access("owner-instance", "reader", Some("owner-machine"))
+            .await
+            .unwrap());
+        db.transfer_project_ownership_by_owner("owner", "project", "member")
+            .await
+            .unwrap();
+        assert!(!db
+            .check_session_runtime_access("owner-instance", "reader", Some("owner-machine"))
+            .await
+            .unwrap());
+        assert!(db
+            .check_session_runtime_access("owner-instance", "owner", Some("owner-machine"))
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
     async fn unavailable_invitees_and_expired_tokens_fail_closed() {
         let db = database("membership-failures").await;
         user(&db, "owner", "owner@example.test").await;

@@ -9,8 +9,8 @@ use base64::Engine as _;
 use futures::{SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
 use shared::{
-    MessageInfo, ServerToCli, ServerToDaemon, ServerToWeb, SessionInfo, SessionStatus,
-    TerminalLifecycle, WebToServer,
+    MessageInfo, ServerToCli, ServerToDaemon, ServerToWeb, SessionAttachmentRejectionReason,
+    SessionInfo, SessionStatus, TerminalLifecycle, WebToServer,
 };
 use std::collections::HashSet;
 use std::time::Duration;
@@ -1813,6 +1813,26 @@ async fn has_session_runtime_access(state: &AppState, session_id: &Uuid, user_id
         )
         .await
         .unwrap_or(false)
+}
+
+async fn reject_session_attachment(
+    state: &AppState,
+    connection_id: &Uuid,
+    session_id: Uuid,
+    reason: SessionAttachmentRejectionReason,
+    message: &str,
+) {
+    state
+        .sessions
+        .send_to_web(
+            connection_id,
+            ServerToWeb::SessionAttachmentRejected {
+                session_id,
+                reason,
+                message: message.to_string(),
+            },
+        )
+        .await;
 }
 
 async fn resolve_target_session(
@@ -5441,36 +5461,80 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         continue;
                     };
 
-                    // Attaching subscribes the browser to a live runtime, so
-                    // it requires current hosting-cluster authority in
-                    // addition to durable project content access.
-                    let has_access = has_session_runtime_access(&state, &sid, &uid).await;
-
-                    if !has_access {
-                        state
-                            .sessions
-                            .send_to_web(
+                    // Resolve content access separately from runtime access so
+                    // the client can explain whether the missing permission is
+                    // the project share or the third-party hosting machine.
+                    match state.db.get_session(&sid.to_string()).await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            reject_session_attachment(
+                                &state,
                                 &connection_id,
-                                ServerToWeb::Error {
-                                    message: "Access denied".to_string(),
-                                },
+                                sid,
+                                SessionAttachmentRejectionReason::SessionNotFound,
+                                "Project session not found",
                             )
                             .await;
+                            continue;
+                        }
+                        Err(err) => {
+                            tracing::warn!(%err, session_id = %sid, "failed to resolve web attachment");
+                            reject_session_attachment(
+                                &state,
+                                &connection_id,
+                                sid,
+                                SessionAttachmentRejectionReason::ProjectUnavailable,
+                                "Project is unavailable",
+                            )
+                            .await;
+                            continue;
+                        }
+                    }
+
+                    let has_project_access = state
+                        .db
+                        .check_session_access(&sid.to_string(), &uid.to_string())
+                        .await
+                        .unwrap_or(false);
+                    if !has_project_access {
+                        reject_session_attachment(
+                            &state,
+                            &connection_id,
+                            sid,
+                            SessionAttachmentRejectionReason::ProjectAccessRequired,
+                            "You do not have access to this project",
+                        )
+                        .await;
+                        continue;
+                    }
+
+                    // Attaching subscribes the browser to a live runtime. An
+                    // explicit project share is sufficient for an owner-hosted
+                    // session; third-party hosting additionally requires
+                    // membership in that host cluster and machine access.
+                    if !has_session_runtime_access(&state, &sid, &uid).await {
+                        reject_session_attachment(
+                            &state,
+                            &connection_id,
+                            sid,
+                            SessionAttachmentRejectionReason::HostMachineAccessRequired,
+                            "This project is shared with you, but access to its hosting machine is required",
+                        )
+                        .await;
                         continue;
                     }
 
                     let Ok((_project_id, _project_guard)) =
                         state.active_session_operation(&sid.to_string()).await
                     else {
-                        state
-                            .sessions
-                            .send_to_web(
-                                &connection_id,
-                                ServerToWeb::Error {
-                                    message: "Project is unavailable".to_string(),
-                                },
-                            )
-                            .await;
+                        reject_session_attachment(
+                            &state,
+                            &connection_id,
+                            sid,
+                            SessionAttachmentRejectionReason::ProjectUnavailable,
+                            "Project is unavailable",
+                        )
+                        .await;
                         continue;
                     };
 
@@ -5723,15 +5787,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                         tracing::info!("Web client attached to CLI session {}", sid);
                     } else {
-                        state
-                            .sessions
-                            .send_to_web(
-                                &connection_id,
-                                ServerToWeb::Error {
-                                    message: "Session not found".to_string(),
-                                },
-                            )
-                            .await;
+                        reject_session_attachment(
+                            &state,
+                            &connection_id,
+                            sid,
+                            SessionAttachmentRejectionReason::SessionNotFound,
+                            "Project session not found",
+                        )
+                        .await;
                     }
                 }
                 Ok(WebToServer::ListSessions) => {

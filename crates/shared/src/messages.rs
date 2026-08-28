@@ -1564,6 +1564,19 @@ pub enum MutationKind {
     Interrupt,
 }
 
+/// Why a requested session attachment was rejected. The session id carried
+/// alongside this value lets clients reconcile concurrent foreground and
+/// background attachment attempts without treating a global error as the
+/// result of whichever navigation happens to be visible.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionAttachmentRejectionReason {
+    ProjectAccessRequired,
+    HostMachineAccessRequired,
+    ProjectUnavailable,
+    SessionNotFound,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToWeb {
@@ -1649,6 +1662,13 @@ pub enum ServerToWeb {
     SessionAttached {
         session_id: Uuid,
         has_active_cli: bool,
+    },
+
+    /// Correlated rejection for one requested session attachment.
+    SessionAttachmentRejected {
+        session_id: Uuid,
+        reason: SessionAttachmentRejectionReason,
+        message: String,
     },
 
     /// Output from Claude
@@ -3744,6 +3764,33 @@ mod tests {
                 assert_eq!(message, "Something went wrong");
             }
             _ => panic!("Expected Error variant"),
+        }
+    }
+
+    #[test]
+    fn session_attachment_rejection_is_correlated_and_typed() {
+        let session_id = Uuid::new_v4();
+        let message = ServerToWeb::SessionAttachmentRejected {
+            session_id,
+            reason: SessionAttachmentRejectionReason::HostMachineAccessRequired,
+            message: "This project is shared with you, but this hosting machine is not".to_string(),
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("\"type\":\"session_attachment_rejected\""));
+        assert!(json.contains("\"reason\":\"host_machine_access_required\""));
+        match serde_json::from_str::<ServerToWeb>(&json).unwrap() {
+            ServerToWeb::SessionAttachmentRejected {
+                session_id: parsed_session_id,
+                reason,
+                ..
+            } => {
+                assert_eq!(parsed_session_id, session_id);
+                assert_eq!(
+                    reason,
+                    SessionAttachmentRejectionReason::HostMachineAccessRequired
+                );
+            }
+            other => panic!("unexpected message: {other:?}"),
         }
     }
 

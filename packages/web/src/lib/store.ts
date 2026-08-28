@@ -729,6 +729,18 @@ interface AppState {
   clearMessages: () => void;
   startSession: (cliClientId?: string) => void;
   attachSession: (sessionId: string, forceReload?: boolean) => void;
+  pendingSessionAttachment: {
+    sessionId: string;
+    forceReload: boolean;
+    requestedFromSessionId: string | null;
+  } | null;
+  /** Commit a server-confirmed attachment. Kept separate from the request so
+   * cached/persisted navigation cannot move ahead of authorization. */
+  commitSessionAttachment: (
+    sessionId: string,
+    hasActiveClient: boolean,
+    forceReload?: boolean,
+  ) => void;
   /** A pane to open once its session is attached, for entry points that name an
    *  agent rather than a project. The tab preference is keyed by CLI client,
    *  which a caller cannot know before attaching, so the intent is carried here
@@ -1153,6 +1165,8 @@ export const useStore = create<AppState>((set, get) => ({
       connected: false,
       ws: null,
       sessionId: null,
+      pendingSessionAttachment: null,
+      pendingPaneSelection: null,
       teamRecordsBySession: new Map(),
       teamRecords: [],
       serverVersion: null,
@@ -1347,6 +1361,8 @@ export const useStore = create<AppState>((set, get) => ({
       connected: false,
       ws: null,
       sessionId: null,
+      pendingSessionAttachment: null,
+      pendingPaneSelection: null,
       teamRecords: [],
       serverVersion: null,
       cliClients: [],
@@ -1372,6 +1388,8 @@ export const useStore = create<AppState>((set, get) => ({
     set({
       messages: [],
       sessionId: null,
+      pendingSessionAttachment: null,
+      pendingPaneSelection: null,
       teamRecords: [],
       paneMessages: {},
       paneHasMore: {},
@@ -1395,6 +1413,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   pendingPaneSelection: null,
+  pendingSessionAttachment: null,
 
   openSessionPane: (sessionId: string, paneId: number) => {
     set({ pendingPaneSelection: { sessionId, paneId } });
@@ -1411,12 +1430,28 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
 
+    set({
+      pendingSessionAttachment: {
+        sessionId,
+        forceReload,
+        requestedFromSessionId: currentSessionId,
+      },
+    });
+    ws.send(JSON.stringify({
+      type: "attach_session",
+      session_id: sessionId,
+    }));
+  },
+
+  commitSessionAttachment: (sessionId: string, hasActiveClient: boolean, forceReload = false) => {
+    const state = get();
+    const { sessionId: currentSessionId } = state;
+
     localStorage.setItem("apas_session_id", sessionId);
 
     const isSameSession = currentSessionId === sessionId;
 
     const { cliClients, sessions } = state;
-    const hasActiveClient = cliClients.some(c => c.activeSession === sessionId);
 
     let newCliClientId: string | null = null;
     const activeClient = cliClients.find(c => c.activeSession === sessionId);
@@ -1555,11 +1590,6 @@ export const useStore = create<AppState>((set, get) => ({
       }));
     }
 
-    ws.send(JSON.stringify({
-      type: "attach_session",
-      session_id: sessionId
-    }));
-
     // If we restored from cache, the live attach reply gets dedupe-skipped
     // ("live state wins") and the gap that landed while this tab was a
     // background session stays empty. Catchup fills it lazily — at most
@@ -1607,6 +1637,10 @@ export const useStore = create<AppState>((set, get) => ({
       const activeRemoved = Boolean(
         state.sessionId && removedSessionIds.has(state.sessionId),
       );
+      const pendingRemoved = Boolean(
+        state.pendingSessionAttachment &&
+        removedSessionIds.has(state.pendingSessionAttachment.sessionId),
+      );
       if (activeRemoved && typeof window !== "undefined") {
         localStorage.removeItem("apas_session_id");
         localStorage.removeItem("apas_cli_client_id");
@@ -1621,6 +1655,12 @@ export const useStore = create<AppState>((set, get) => ({
         cliLifecycleInventories,
         cliLifecycleOperations,
         cliLifecycleLatestBySession,
+        ...(pendingRemoved
+          ? {
+              pendingSessionAttachment: null,
+              pendingPaneSelection: null,
+            }
+          : {}),
         ...(activeRemoved
           ? {
               sessionId: null,
@@ -3663,44 +3703,38 @@ export function handleServerMessage(
         // Prefer the in-memory sessionId (what this tab is currently viewing)
         // over localStorage — otherwise a reconnect could hijack this tab to a
         // session another browser tab wrote to localStorage.
+        const pendingAttachment = get().pendingSessionAttachment;
         const currentSessionId = get().sessionId;
         const sessionToRestore =
-          currentSessionId || localStorage.getItem("apas_session_id");
+          pendingAttachment?.sessionId ||
+          currentSessionId ||
+          localStorage.getItem("apas_session_id");
         if (sessionToRestore) {
-          // Register the currently-viewed session's attachment IMMEDIATELY —
-          // before the 500ms attachSession below, the staggered background
-          // fan-out, and the IDB-hydration fan-out. Otherwise a control action
-          // (pause/interrupt from "Stop team") fired right after a reconnect
-          // can land before this session is attached and get dropped. The
-          // server auto-attaches on access as a backstop, but ordering the
-          // current session first avoids the round-trip and wrong-session
-          // routing. An extra attach_session is idempotent server-side.
-          const wsNow = get().ws;
-          if (wsNow && wsNow.readyState === WebSocket.OPEN) {
-            wsNow.send(JSON.stringify({ type: "attach_session", session_id: sessionToRestore }));
-          }
+          // Request the current (or still-pending) project first. The active
+          // view and localStorage remain unchanged until the server confirms
+          // this exact session, which prevents a denied/stale project from
+          // flashing cached content during reconnect.
           storeDebugLog("Restoring session:", sessionToRestore);
+          get().attachSession(
+            sessionToRestore,
+            pendingAttachment?.forceReload ?? false,
+          );
           setTimeout(() => {
-            // forceReload=false: keep the cached paneMessages visible across
-            // the reconnect (e.g. phone unlock killed the WS). Without this,
-            // mobile users see the tab render normally for ~0.5s, then flash
-            // blank for ~0.5s, then repopulate from the server snapshot —
-            // exactly the "looks fine, then suddenly reloads" symptom.
-            get().attachSession(sessionToRestore, false);
-            // Reconnect catchup: fill the gap that landed while the WS was
-            // down. AttachSession alone won't do it — the session_messages
-            // initial-load reply is ignored when the local panes already
-            // have messages ("live state wins" dedupe rule). The catchup
-            // reply is flagged so the handler appends instead of skipping.
-            requestCatchupIfNeeded(get, sessionToRestore);
-            // Retransmit any sends the user typed during the silently-stale
-            // WS window. Duplicate-arrival is fine: the user_input ack
-            // dedupes against the optimistic placeholder via content+recency.
-            flushPendingSends(set, get);
-            // Same idea for unacked AskUserQuestion answers.
-            flushPendingAnswers(set, get);
-            // Same idea for unacked pane-label renames.
-            flushPendingLabels(set, get);
+            // Retry only while the same request is unresolved. This preserves
+            // the old fast reconnect behavior without allowing a late retry
+            // to supersede a newer user selection.
+            const pending = get().pendingSessionAttachment;
+            const wsNow = get().ws;
+            if (
+              pending?.sessionId === sessionToRestore &&
+              wsNow &&
+              wsNow.readyState === WebSocket.OPEN
+            ) {
+              wsNow.send(JSON.stringify({
+                type: "attach_session",
+                session_id: sessionToRestore,
+              }));
+            }
           }, 500);
         }
         // Subscribe to every other session we have a cached snapshot for
@@ -3924,10 +3958,19 @@ export function handleServerMessage(
 
     case "session_started": {
       const newSessionId = data.session_id as string;
-      const existing = get().sessionId;
+      const { sessionId: existing, pendingSessionAttachment } = get();
+      if (pendingSessionAttachment) {
+        // AttachSession success is a two-frame sequence. SessionStarted is
+        // intentionally not the navigation commit: only the following,
+        // correlated SessionAttached proves that authorization succeeded.
+        storeDebugLog(
+          "Deferring session_started until attachment confirmation:",
+          newSessionId,
+        );
+        break;
+      }
       // Only adopt the session if we don't already have one — otherwise this
-      // is a stale response for a previous attach the user has since navigated
-      // away from.
+      // is a newly-created session or a stale response for an old request.
       if (!existing || existing === newSessionId) {
         set({ sessionId: newSessionId });
         storeDebugLog("Session started:", newSessionId);
@@ -3950,8 +3993,22 @@ export function handleServerMessage(
     case "session_attached": {
       const hasActiveCli = data.has_active_cli as boolean;
       const attachedSessionId = data.session_id as string | undefined;
-      const currentSessionId = get().sessionId;
       storeDebugLog("Session attached, has active CLI:", hasActiveCli, attachedSessionId);
+      const pending = get().pendingSessionAttachment;
+      if (attachedSessionId && pending?.sessionId === attachedSessionId) {
+        set({ pendingSessionAttachment: null });
+        get().commitSessionAttachment(
+          attachedSessionId,
+          hasActiveCli,
+          pending.forceReload,
+        );
+        // Mutations queued through a disconnected transport are safe to replay
+        // only after the server has re-authorized and attached this session.
+        flushPendingSends(set, get);
+        flushPendingAnswers(set, get);
+        flushPendingLabels(set, get);
+      }
+      const currentSessionId = get().sessionId;
       // Reconnect subscribes this socket to cached background sessions too.
       // Their confirmations can arrive after the current project's reply, so
       // never let a background (often inactive) session disable the current
@@ -3972,6 +4029,81 @@ export function handleServerMessage(
           workingPanesBySession,
         };
       });
+      break;
+    }
+
+    case "session_attachment_rejected": {
+      const rejectedSessionId = data.session_id as string | undefined;
+      if (!rejectedSessionId) break;
+      const pending = get().pendingSessionAttachment;
+      // A rejection can arrive after the user selected another project, or
+      // from a background cache subscription. It must not roll back or toast
+      // over the newer foreground intent.
+      if (pending?.sessionId !== rejectedSessionId) {
+        storeDebugLog("Ignoring stale/background attachment rejection:", rejectedSessionId);
+        break;
+      }
+      const reason = data.reason as string | undefined;
+      const activeSessionWasRejected = get().sessionId === rejectedSessionId;
+      set((state) => ({
+        pendingSessionAttachment: null,
+        ...(activeSessionWasRejected ? { isAttached: false } : {}),
+        ...(state.pendingPaneSelection?.sessionId === rejectedSessionId
+          ? { pendingPaneSelection: null }
+          : {}),
+      }));
+      // A reconnect can be the first authoritative signal that previously
+      // cached project access was revoked. In that case there is no confirmed
+      // workspace to retain: purge it just as project_access_changed does.
+      if (activeSessionWasRejected && reason === "project_access_required") {
+        const rejectedProject = get().sessions.find(
+          (session) => session.id === rejectedSessionId,
+        );
+        if (rejectedProject) {
+          get().forgetProject(rejectedProject.projectId ?? rejectedProject.id);
+        } else {
+          localStorage.removeItem("apas_session_id");
+          localStorage.removeItem("apas_cli_client_id");
+          void deleteSnapshotIdb(rejectedSessionId);
+          set((state) => {
+            const sessionCache = new Map(state.sessionCache);
+            sessionCache.delete(rejectedSessionId);
+            return {
+              sessionId: null,
+              cliClientId: null,
+              isAttached: false,
+              messages: [],
+              paneMessages: {},
+              paneHasMore: {},
+              paneStatuses: {},
+              paneModes: {},
+              pausedPanes: [],
+              paneConfigs: [],
+              teamRecords: [],
+              deadloopMessages: [],
+              interactiveMessages: [],
+              isDualPane: false,
+              isDeadloopPaused: false,
+              interactiveStatus: null,
+              deadloopStatus: null,
+              sessionCache,
+            };
+          });
+        }
+      }
+      const fallback = reason === "host_machine_access_required"
+        ? "This project is shared with you, but access to its hosting machine is required."
+        : reason === "project_access_required"
+          ? "You do not have access to this project."
+          : reason === "session_not_found"
+            ? "Project session not found."
+            : "Project is unavailable.";
+      get().showToast(
+        typeof data.message === "string" && data.message.trim()
+          ? data.message
+          : fallback,
+        "error",
+      );
       break;
     }
 

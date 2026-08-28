@@ -438,8 +438,10 @@ export function TabbedView({
   const sessions = useStore((s) => s.sessions);
   const machines = useStore((s) => s.machines);
   const isLaunchProfileAllowed = useIsLaunchProfileAllowed();
-  const showOverview = sessionId == null
-    || projectPolicies[sessionId]?.teamAvailable !== false;
+  // Overview is a policy-gated team surface. Missing/loading policy must fail
+  // closed so stale state from a previously selected project cannot reveal it.
+  const showOverview = sessionId != null
+    && projectPolicies[sessionId]?.teamAvailable === true;
 
   const sendMessageToPane = useStore((s) => s.sendMessageToPane);
   const loadMoreMessages = useStore((s) => s.loadMoreMessages);
