@@ -42,10 +42,13 @@ describe("CreateInstanceModal", () => {
       />,
     );
 
-    // Raw URL prefilled; instance name + branch defaulted from the repo.
+    // The raw URL is the only project metadata the user can edit.
     expect(screen.getByDisplayValue("git@github.com:shuaimu/apas.git")).toBeTruthy();
-    expect(screen.getByDisplayValue("apas")).toBeTruthy();
-    expect(screen.getByDisplayValue("apas/apas")).toBeTruthy();
+    expect(screen.queryByLabelText("Instance name")).toBeNull();
+    expect(screen.queryByLabelText("New branch")).toBeNull();
+    expect(screen.queryByLabelText("Projects root (optional)")).toBeNull();
+    expect(screen.getByText("~/apas_projects/apas")).toBeTruthy();
+    expect(screen.getByText("apas/apas")).toBeTruthy();
 
     fireEvent.click(screen.getByText("Create & start"));
 
@@ -75,8 +78,8 @@ describe("CreateInstanceModal", () => {
       target: { value: "https://github.com/openai/codex.git" },
     });
 
-    expect(screen.getByDisplayValue("codex")).toBeTruthy();
-    expect(screen.getByDisplayValue("apas/codex")).toBeTruthy();
+    expect(screen.getByText("~/apas_projects/codex")).toBeTruthy();
+    expect(screen.getByText("apas/codex")).toBeTruthy();
     fireEvent.click(screen.getByText("Create & start"));
     expect(create).toHaveBeenCalledWith(
       "m1",

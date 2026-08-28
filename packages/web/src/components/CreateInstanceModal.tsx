@@ -49,11 +49,7 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
   const createProjectInstance = useStore((s) => s.createProjectInstance);
 
   const fixedRemote = gitRemote?.trim() ?? "";
-  const base = fixedRemote ? repoBasename(fixedRemote) : "";
-  const [instanceName, setInstanceName] = useState(base);
-  const [branch, setBranch] = useState(base ? `apas/${base}` : "");
   const [url, setUrl] = useState(cloneUrl ?? (fixedRemote ? `https://${fixedRemote}.git` : ""));
-  const [basePath, setBasePath] = useState("");
   const [machineId, setMachineId] = useState("");
   const [mounted, setMounted] = useState(false);
   const availableMachines = useMemo(
@@ -65,6 +61,8 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
   const selectedMachine = availableMachines.find((entry) => entry.machine.machineId === machineId);
   const sharedTarget = selectedMachine?.clusterAccess === "member";
   const submittedRemote = fixedRemote || canonicalRemoteFromUrl(url);
+  const instanceName = submittedRemote ? repoBasename(submittedRemote) : "";
+  const branch = instanceName ? `apas/${instanceName}` : "";
 
   useEffect(() => setMounted(true), []);
 
@@ -91,10 +89,10 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
     const common: [string, string, string, string, string | undefined, string | undefined] = [
       machineId,
       submittedRemote,
-      instanceName.trim(),
-      branch.trim() || `apas/${instanceName.trim()}`,
+      instanceName,
+      branch,
       url.trim() || undefined,
-      sharedTarget ? undefined : basePath.trim() || undefined,
+      undefined,
     ];
     const sent = selectedMachine?.clusterOwnerUserId
       ? createProjectInstance(...common, selectedMachine.clusterOwnerUserId)
@@ -103,8 +101,6 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
     // (e.g. the socket is reconnecting); the store shows an error toast.
     if (sent) onClose();
   };
-
-  const previewPath = `${basePath.trim() || "~/apas_projects"}/${instanceName.trim() || base || "project"}`;
 
   return createPortal(
     <div
@@ -133,7 +129,7 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
             {fixedRemote ? (
               <>Clone <span className="font-medium text-gray-700 dark:text-gray-300">{repoLabel(fixedRemote)}</span> into a new project on a chosen machine and check out a fresh branch.</>
             ) : (
-              <>Clone a GitHub repository into a new project on a chosen machine.</>
+              <>Clone a GitHub repository into a new project on a chosen machine. The project and branch names are derived automatically.</>
             )}
           </p>
 
@@ -162,39 +158,11 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
                 </select>
               </Field>
 
-              <Field label="Instance name">
-                <input
-                  type="text"
-                  value={instanceName}
-                  onChange={(e) => setInstanceName(e.target.value)}
-                  placeholder={base || "my-project"}
-                  className="w-full rounded border border-gray-300 bg-white px-3 py-2 text-sm dark:border-gray-600 dark:bg-gray-700"
-                />
-              </Field>
-
-              <Field label="New branch">
-                <input
-                  type="text"
-                  value={branch}
-                  onChange={(e) => setBranch(e.target.value)}
-                  placeholder={`apas/${base || "my-project"}`}
-                  className="w-full rounded border border-gray-300 bg-white px-3 py-2 text-sm dark:border-gray-600 dark:bg-gray-700"
-                />
-              </Field>
-
               <Field label="Clone URL">
                 <input
                   type="text"
                   value={url}
-                  onChange={(e) => {
-                    const nextUrl = e.target.value;
-                    setUrl(nextUrl);
-                    if (!fixedRemote) {
-                      const nextBase = repoBasename(canonicalRemoteFromUrl(nextUrl));
-                      setInstanceName(nextBase === "instance" ? "" : nextBase);
-                      setBranch(nextBase === "instance" ? "" : `apas/${nextBase}`);
-                    }
-                  }}
+                  onChange={(e) => setUrl(e.target.value)}
                   placeholder="https://github.com/owner/repository"
                   className="w-full rounded border border-gray-300 bg-white px-3 py-2 font-mono text-xs dark:border-gray-600 dark:bg-gray-700"
                 />
@@ -204,21 +172,13 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
                 <div className="rounded border border-amber-300 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-200">
                   Shared machines accept only public <span className="font-mono">https://github.com/owner/repository</span> URLs. The checkout uses the owner&apos;s managed projects directory and cannot use private credentials.
                 </div>
-              ) : (
-                <Field label="Projects root (optional)">
-                  <input
-                    type="text"
-                    value={basePath}
-                    onChange={(e) => setBasePath(e.target.value)}
-                    placeholder="~/apas_projects"
-                    className="w-full rounded border border-gray-300 bg-white px-3 py-2 font-mono text-xs dark:border-gray-600 dark:bg-gray-700"
-                  />
-                </Field>
-              )}
+              ) : null}
 
-              <p className="text-xs text-gray-400">
-                Clones into <span className="font-mono">{sharedTarget ? `~/apas_projects/${instanceName.trim() || base || "project"}` : previewPath}</span> (auto-suffixed if it exists).
-              </p>
+              {instanceName && (
+                <p className="text-xs text-gray-400">
+                  Creates <span className="font-mono">~/apas_projects/{instanceName}</span> on branch <span className="font-mono">{branch}</span> (auto-suffixed if either exists).
+                </p>
+              )}
             </>
           )}
         </div>

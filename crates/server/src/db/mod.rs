@@ -4456,9 +4456,13 @@ impl Database {
     }
 
     pub async fn get_sessions_for_user(&self, user_id: &str) -> Result<Vec<Session>> {
-        // An account's own list is its durably placed cluster inventory.
-        // Projects it merely belongs to arrive through the shared list, which
-        // excludes placements so the web's union cannot double-list one.
+        // An account's primary list includes projects it owns anywhere and its
+        // durably placed cluster inventory. Ownership must be checked
+        // independently from placement: a member-created project is owned by
+        // the member while it remains placed only in the shared cluster that
+        // hosts it. Projects the account merely belongs to arrive through the
+        // shared list, which excludes placements so the web's union cannot
+        // double-list one.
         let sessions = sqlx::query_as::<_, Session>(
             r#"
             SELECT s.id, p.owner_user_id AS user_id, s.cli_client_id, s.working_dir,
@@ -4468,14 +4472,16 @@ impl Database {
                    s.git_remote, s.git_remote_url
             FROM sessions s
             JOIN projects p ON p.id = COALESCE(s.project_id, s.id)
-            WHERE EXISTS (
-                SELECT 1 FROM project_cluster_placements pcp
-                WHERE pcp.project_id = p.id AND pcp.cluster_owner_user_id = ?
-            )
+            WHERE p.owner_user_id = ?
+               OR EXISTS (
+                    SELECT 1 FROM project_cluster_placements pcp
+                    WHERE pcp.project_id = p.id AND pcp.cluster_owner_user_id = ?
+               )
             ORDER BY s.created_at DESC
             LIMIT 50
             "#,
         )
+        .bind(user_id)
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
@@ -7298,7 +7304,7 @@ mod cluster_administration_tests {
     }
 
     #[tokio::test]
-    async fn session_listings_stay_within_each_accounts_cluster() {
+    async fn session_listings_include_owned_and_hosted_projects() {
         let db = database("cluster-session-list").await;
         db.run_migrations().await.unwrap();
         for (id, email) in [
@@ -7325,10 +7331,21 @@ mod cluster_administration_tests {
         db.authorize_project_registration("project-c", "host")
             .await
             .unwrap();
+        // Model shared provisioning: the member owns the project, but only
+        // the host cluster has a placement for it.
+        sqlx::query(
+            "INSERT INTO projects (id, owner_user_id, lifecycle_status) VALUES ('project-d', 'owner', 'active')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
         db.add_project_cluster_placement("project-a", "member", "owner", "test")
             .await
             .unwrap();
         db.add_project_cluster_placement("project-b", "host", "other", "test")
+            .await
+            .unwrap();
+        db.add_project_cluster_placement("project-d", "host", "owner", "shared_provisioning")
             .await
             .unwrap();
         for (id, session_user, project_id) in [
@@ -7337,6 +7354,7 @@ mod cluster_administration_tests {
             ("session-host-foreign", "host", "project-b"),
             ("session-other", "other", "project-b"),
             ("session-host-own", "host", "project-c"),
+            ("session-owner-remote", "host", "project-d"),
         ] {
             db.create_session(&Session {
                 id: id.to_string(),
@@ -7366,13 +7384,31 @@ mod cluster_administration_tests {
             .into_iter()
             .map(|s| s.id)
             .collect();
-        assert_eq!(host_ids.len(), 3);
+        assert_eq!(host_ids.len(), 4);
         assert!(host_ids.contains(&"session-host-foreign".to_string()));
         assert!(host_ids.contains(&"session-other".to_string()));
         assert!(host_ids.contains(&"session-host-own".to_string()));
+        assert!(host_ids.contains(&"session-owner-remote".to_string()));
         assert!(!host_ids.contains(&"session-owner".to_string()));
         assert!(db
             .get_shared_sessions_for_user("host")
+            .await
+            .unwrap()
+            .is_empty());
+
+        // A project owner keeps the project in their primary list even when
+        // it is placed only in somebody else's shared cluster. This is the
+        // member-created project shape used by web provisioning.
+        let owner_ids: Vec<String> = db
+            .get_sessions_for_user("owner")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert!(owner_ids.contains(&"session-owner-remote".to_string()));
+        assert!(db
+            .get_shared_sessions_for_user("owner")
             .await
             .unwrap()
             .is_empty());
