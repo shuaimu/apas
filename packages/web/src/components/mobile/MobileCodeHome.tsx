@@ -495,6 +495,14 @@ export function MobileCodeHome({
           >
             <Plus className="h-4 w-4" /> New task
           </button>
+          <button
+            type="button"
+            aria-label="Create project from GitHub"
+            onClick={() => setCreateProjectOpen(true)}
+            className="inline-flex min-h-10 items-center gap-1.5 rounded-xl border border-emerald-500 bg-white px-3.5 text-sm font-bold text-emerald-700 shadow-sm hover:bg-emerald-50 dark:bg-[#1b1b21] dark:text-emerald-300 dark:hover:bg-emerald-950/40"
+          >
+            <Plus className="h-4 w-4" /> New project
+          </button>
         </div>
       </div>
 
@@ -542,9 +550,6 @@ export function MobileCodeHome({
                   Shared projects run on the owner&apos;s machines. The owner can access files, processes, terminal output, and credentials exposed to them.
                 </div>
               )}
-              <button type="button" onClick={() => setCreateProjectOpen(true)} disabled={selectedClusterAccess === "member" && !visibleMachines.some((entry) => entry.shared_provisioning_available)} className="flex w-full items-center justify-center gap-1.5 rounded-xl bg-[#6d5efc] px-3 py-2.5 text-sm font-bold text-white disabled:opacity-50">
-                <Plus className="h-4 w-4" /> Create project from GitHub
-              </button>
               {visibleMachines.map((entry) => {
                 const hostname = entry.machine.hostname || "Unknown machine";
                 const connected = machineConnected(entry);

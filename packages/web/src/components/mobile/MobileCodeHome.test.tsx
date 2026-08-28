@@ -73,6 +73,7 @@ describe("MobileCodeHome", () => {
     expect(screen.getByRole("heading", { name: "Coding sessions" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Account" })).toBeTruthy();
     expect(screen.getByRole("button", { name: /New task/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Create project from GitHub/ })).toBeTruthy();
     expect(screen.getByRole("button", { name: "All projects" }).getAttribute("aria-pressed")).toBe("true");
     expect(screen.getByRole("button", { name: "Idle sessions" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Usage limited" })).toBeNull();

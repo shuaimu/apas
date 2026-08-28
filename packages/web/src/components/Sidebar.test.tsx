@@ -133,7 +133,7 @@ describe("Sidebar project list", () => {
     render(<Sidebar />);
 
     fireEvent.click(screen.getByRole("button", { name: "Create project from GitHub" }));
-    expect(await screen.findByText("New project")).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: "New project" })).toBeTruthy();
     expect(screen.getByLabelText("Clone URL")).toBeTruthy();
   });
 
