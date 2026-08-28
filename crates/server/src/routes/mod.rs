@@ -544,7 +544,7 @@ mod cluster_authorization_tests {
             Path("project-a".to_string()),
             Json(admin::UpdatePolicyRequest {
                 team_available: Some(true),
-                allowed_launch_profiles: Some(vec!["agent:codex:official:default".to_string()]),
+                allowed_launch_profiles: Some(vec!["terminal:codex:official:default".to_string()]),
             }),
         )
         .await
@@ -561,7 +561,7 @@ mod cluster_authorization_tests {
             Path("project-a".to_string()),
             Json(admin::UpdatePolicyRequest {
                 team_available: Some(true),
-                allowed_launch_profiles: Some(vec!["agent:codex:official:default".to_string()]),
+                allowed_launch_profiles: Some(vec!["terminal:codex:official:default".to_string()]),
             }),
         )
         .await

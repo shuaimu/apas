@@ -2391,7 +2391,7 @@ pub fn tab_type_allowed(disallowed: &[String], kind: PaneKind, provider: Provide
 
 /// A stable, cluster-governed launch capability. Unlike the legacy tab-type
 /// key, this identifies the frontend/backend/model combination as well as the
-/// pane kind, so administrators can allow Claude Official without also
+/// pane kind, so administrators can allow Claude Terminal without also
 /// allowing every Anthropic-compatible backend.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct LaunchProfile {
@@ -2448,65 +2448,10 @@ fn launch_profile(
 }
 
 /// Canonical registry used by migration defaults, server validation, CLI
-/// enforcement, and the web admin policy editor.
+/// enforcement, and the web admin policy editor. Structured agent panes are a
+/// decode/resume compatibility path only and must never be advertised here.
 pub fn supported_launch_profiles() -> Vec<LaunchProfile> {
     vec![
-        launch_profile(
-            "agent:claude:official:default",
-            "Claude / Official",
-            PaneKind::Agent,
-            Provider::Claude,
-            "official",
-            None,
-        ),
-        launch_profile(
-            "agent:claude:official:claude-fable-5",
-            "Claude / Fable",
-            PaneKind::Agent,
-            Provider::Claude,
-            "official",
-            Some("claude-fable-5"),
-        ),
-        launch_profile(
-            "agent:claude:deepseek:deepseek-v4-pro",
-            "Claude / DeepSeek Pro",
-            PaneKind::Agent,
-            Provider::Claude,
-            "deepseek",
-            Some(DEEPSEEK_PRO_MODEL),
-        ),
-        launch_profile(
-            "agent:claude:deepseek:deepseek-v4-flash",
-            "Claude / DeepSeek Flash",
-            PaneKind::Agent,
-            Provider::Claude,
-            "deepseek",
-            Some(DEEPSEEK_FLASH_MODEL),
-        ),
-        launch_profile(
-            "agent:codex:official:default",
-            "Codex / Official",
-            PaneKind::Agent,
-            Provider::Codex,
-            "official",
-            None,
-        ),
-        launch_profile(
-            "agent:opencode:official:default",
-            "OpenCode / Official",
-            PaneKind::Agent,
-            Provider::Opencode,
-            "official",
-            None,
-        ),
-        launch_profile(
-            "agent:cursor-agent:official:default",
-            "Cursor / Official",
-            PaneKind::Agent,
-            Provider::CursorAgent,
-            "official",
-            None,
-        ),
         launch_profile(
             "terminal:claude:official:default",
             "Claude Terminal",
@@ -2533,7 +2478,7 @@ pub fn supported_launch_profiles() -> Vec<LaunchProfile> {
         ),
         launch_profile(
             "terminal:claude:deepseek:deepseek-v4-pro",
-            "Claude / DeepSeek Pro Terminal",
+            "DeepSeek Pro Terminal",
             PaneKind::Terminal,
             Provider::Claude,
             "deepseek",
@@ -2541,7 +2486,7 @@ pub fn supported_launch_profiles() -> Vec<LaunchProfile> {
         ),
         launch_profile(
             "terminal:claude:deepseek:deepseek-v4-flash",
-            "Claude / DeepSeek Flash Terminal",
+            "DeepSeek Flash Terminal",
             PaneKind::Terminal,
             Provider::Claude,
             "deepseek",
@@ -4477,8 +4422,31 @@ mod tests {
     }
 
     #[test]
-    fn supported_profiles_and_default_policy_exclude_retired_backends() {
+    fn supported_profiles_and_default_policy_offer_only_terminal_backends() {
         let profiles = supported_launch_profiles();
+        assert_eq!(profiles.len(), 5);
+        assert!(profiles
+            .iter()
+            .all(|profile| profile.kind == PaneKind::Terminal));
+        assert_eq!(
+            profiles
+                .iter()
+                .map(|profile| (profile.key.as_str(), profile.label.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("terminal:claude:official:default", "Claude Terminal"),
+                ("terminal:codex:official:default", "Codex Terminal"),
+                ("terminal:opencode:official:default", "OpenCode Terminal"),
+                (
+                    "terminal:claude:deepseek:deepseek-v4-pro",
+                    "DeepSeek Pro Terminal",
+                ),
+                (
+                    "terminal:claude:deepseek:deepseek-v4-flash",
+                    "DeepSeek Flash Terminal",
+                ),
+            ]
+        );
         assert!(profiles.iter().all(|profile| {
             !is_retired_provider(profile.provider)
                 && !is_retired_backend(&profile.backend)
@@ -4491,12 +4459,6 @@ mod tests {
             .iter()
             .all(|key| !is_retired_launch_profile_key(key)));
         for expected in [
-            "agent:claude:official:default",
-            "agent:claude:deepseek:deepseek-v4-pro",
-            "agent:claude:deepseek:deepseek-v4-flash",
-            "agent:codex:official:default",
-            "agent:opencode:official:default",
-            "agent:cursor-agent:official:default",
             "terminal:claude:official:default",
             "terminal:codex:official:default",
             "terminal:opencode:official:default",
@@ -4507,6 +4469,10 @@ mod tests {
                 .allowed_launch_profiles
                 .contains(&expected.to_string()));
         }
+        assert!(policy
+            .allowed_launch_profiles
+            .iter()
+            .all(|key| key.starts_with("terminal:")));
     }
 
     #[test]

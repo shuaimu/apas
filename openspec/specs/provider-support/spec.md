@@ -6,18 +6,24 @@ Defines which model providers and API backends APAS actively supports, how retir
 
 ## Requirements
 
-### Requirement: The supported provider catalog excludes MiniMax and GLM
-APAS SHALL NOT advertise MiniMax or GLM as a supported provider, API backend, model, launch profile, managed-team choice, machine capability, or usage source. All other currently supported choices, including Claude, Codex, DeepSeek, OpenCode, Cursor Agent, and supported terminal profiles, SHALL remain available according to project policy.
+### Requirement: The supported launch catalog is terminal-only
+APAS SHALL advertise exactly the supported Claude, Codex, and OpenCode terminal profiles plus the supported DeepSeek Pro and Flash terminal profiles. Structured `agent:*` profiles, Cursor Agent, Fable, MiniMax, GLM, and unknown profiles SHALL NOT be offered for new work.
 
 #### Scenario: User opens a launch surface
-- **WHEN** a user opens any pane, team-member, model, provider, or backend selection surface
-- **THEN** no MiniMax or GLM option is presented
-- **AND** the remaining supported choices continue to be presented when allowed by effective project policy
+- **WHEN** a user opens a new-pane, shared-member default, or policy launch surface
+- **THEN** only Claude Terminal, Codex Terminal, OpenCode Terminal, DeepSeek Pro Terminal, and DeepSeek Flash Terminal are presented when allowed by effective project policy
+- **AND** no structured agent profile is presented
 
 #### Scenario: Administrator reviews supported launch profiles
 - **WHEN** a cluster administrator reads the supported-profile catalog or edits launch policy
-- **THEN** the catalog contains no MiniMax or GLM profile key
-- **AND** no retired profile can be newly selected
+- **THEN** every catalog key begins with `terminal:`
+- **AND** the catalog contains exactly the five supported terminal profiles
+
+#### Scenario: Persisted structured-agent policy is upgraded
+- **WHEN** stored deployment, cluster, project, member-default, or provisioning policy contains a structured-agent launch profile
+- **THEN** Claude, Codex, OpenCode, and supported DeepSeek profiles are mapped to their terminal equivalents
+- **AND** Fable, Cursor Agent, retired, and unknown profiles are removed
+- **AND** policy ordering, explicit empty allowlists, and version monotonicity are preserved
 
 ### Requirement: Retired provider launches fail closed at every boundary
 The server and project host SHALL independently reject any pane creation, restart, resume, model switch, backend switch, team start, or team-member addition that identifies MiniMax or GLM through a provider value, backend value, model name, or retired launch-profile key. The system SHALL NOT silently map a retired configuration to another provider.
@@ -97,7 +103,7 @@ The release SHALL include compatibility and regression coverage proving that ret
 #### Scenario: Removal verification runs
 - **WHEN** the complete Rust and web verification suites run against the upgraded code
 - **THEN** tests cover retired-value rejection, policy normalization, legacy-state loading, credential inertness, and absence from user-facing catalogs
-- **AND** the existing Claude, Codex, DeepSeek, OpenCode, Cursor Agent, and terminal launch tests continue to pass
+- **AND** the supported Claude, Codex, DeepSeek, and OpenCode terminal launch tests continue to pass
 
 ### Requirement: OpenCode is available as a policy-controlled terminal provider
 APAS SHALL offer OpenCode as a user-created terminal provider on supported launch surfaces when `terminal:opencode:official:default` is permitted by the effective project policy. The project host SHALL run the configured OpenCode interactive CLI with a non-blocking permission mode, SHALL deliver a fresh launch instruction using OpenCode's supported initial-prompt interface, and SHALL use OpenCode's continuation interface when restoring the pane.
@@ -118,7 +124,7 @@ APAS SHALL offer OpenCode as a user-created terminal provider on supported launc
 - **AND** other panes in the project remain available
 
 ### Requirement: Retained headless OpenCode panes use native OpenCode event semantics
-For persisted legacy or managed panes that still use the structured agent path, APAS SHALL invoke OpenCode with its supported non-interactive JSON interface and SHALL translate OpenCode text, tool-use, completion, usage, and error events into the shared pane message model. APAS SHALL NOT pass an APAS UUID as though it were an OpenCode-generated session identifier.
+For persisted legacy panes that still use the structured agent path, APAS SHALL invoke OpenCode with its supported non-interactive JSON interface and SHALL translate OpenCode text, tool-use, completion, usage, and error events into the shared pane message model. APAS SHALL NOT pass an APAS UUID as though it were an OpenCode-generated session identifier.
 
 #### Scenario: Headless OpenCode emits text and completion events
 - **WHEN** a retained structured OpenCode pane emits native JSON text followed by a final completion event

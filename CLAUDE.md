@@ -932,11 +932,12 @@ message, because `ws_cli` reads usage only from `extra.usage` on that variant;
 
 ## Terminal panes (`kind: "terminal"`)
 
-New user-created Claude, Codex, and OpenCode work uses `kind: "terminal"`. The structured
-`kind: "agent"` path is retained for managed team roles and historical panes:
-the CLI runs the provider headlessly and parses stream-json into structured
-events. Missing `kind` still deserializes as `agent` so old `.apas` files remain
-readable; that compatibility default is not a creation default.
+New user-created Claude, Codex, OpenCode, and DeepSeek work uses
+`kind: "terminal"`. The structured `kind: "agent"` path is retained only for
+historical panes: the CLI runs the provider headlessly and parses stream-json
+into structured events. Missing `kind` still deserializes as `agent` so old
+`.apas` files remain readable; that compatibility default is not a creation
+default, and no `agent:*` profile appears in the supported launch catalogue.
 
 A **terminal pane** instead allocates a pty (`portable-pty`), execs the
 provider's *real interactive TUI*, and streams the raw bytes
@@ -945,8 +946,9 @@ sync with a provider's output format — the point is to reuse the CLI as it
 ships.
 
 Only `claude`, `codex`, and `opencode` can host one
-(`terminal_pane::terminal_binary_for`); DeepSeek and Cursor Agent have
-unverified pty behaviour. OpenCode launches with `--auto`; a fresh mobile task
+(`terminal_pane::terminal_binary_for`). DeepSeek uses the Claude terminal with
+the supported Anthropic-compatible backend environment; Cursor Agent has no
+supported launch profile. OpenCode launches with `--auto`; a fresh mobile task
 uses `--prompt <instruction>`, while restoration uses `--continue`.
 
 APAS does not install OpenCode, choose its model provider, or authenticate it.
@@ -958,9 +960,10 @@ explicit cluster/project allowlists remain opt-in and must add
 
 The desktop tab bar, mobile browser pane picker, native mobile task launcher,
 server authorization, and CLI local add-tab path all enforce this boundary.
-Existing agent panes can still run, receive messages, switch models and reboot;
-creating another one is rejected. Nothing creates one any more — managed team
-roles were the last thing that did, and they are gone with team mode.
+Existing agent panes can still run, receive messages, and reboot; creating or
+switching one to another structured-agent profile is rejected. Nothing creates
+one any more — managed team roles were the last thing that did, and they are
+gone with team mode.
 
 **What terminal panes do not get directly.** Fine-grained tool status and plan
 review are built on stream-json events, so a terminal pane has neither. Coarse

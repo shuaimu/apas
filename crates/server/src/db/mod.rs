@@ -19,9 +19,12 @@ pub struct Database {
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-struct RetiredProfileMigration {
-    cluster_default_changed: bool,
+struct LaunchProfileMigration {
+    deployment_default_changed: bool,
+    changed_cluster_user_ids: Vec<String>,
     changed_project_ids: Vec<String>,
+    changed_membership_defaults: u64,
+    changed_provisioning_defaults: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -671,13 +674,17 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        let retirement = self.normalize_retired_provider_profiles().await?;
-        if retirement.cluster_default_changed || !retirement.changed_project_ids.is_empty() {
+        let profile_migration = self.normalize_launch_profiles().await?;
+        if profile_migration != LaunchProfileMigration::default() {
             tracing::info!(
-                cluster_default_changed = retirement.cluster_default_changed,
-                changed_project_count = retirement.changed_project_ids.len(),
-                changed_project_ids = ?retirement.changed_project_ids,
-                "removed retired provider profiles from persisted launch policy"
+                deployment_default_changed = profile_migration.deployment_default_changed,
+                changed_cluster_count = profile_migration.changed_cluster_user_ids.len(),
+                changed_cluster_user_ids = ?profile_migration.changed_cluster_user_ids,
+                changed_project_count = profile_migration.changed_project_ids.len(),
+                changed_project_ids = ?profile_migration.changed_project_ids,
+                changed_membership_defaults = profile_migration.changed_membership_defaults,
+                changed_provisioning_defaults = profile_migration.changed_provisioning_defaults,
+                "normalized persisted launch policy to supported terminal profiles"
             );
         }
 
@@ -1302,26 +1309,52 @@ impl Database {
         Ok(true)
     }
 
-    /// Remove decode-only provider profiles from persisted policy without
-    /// changing the meaning or order of any remaining entry. Each changed row
-    /// receives a distinct cluster-monotonic version; already-clean rows are
-    /// untouched, which makes the migration idempotent.
-    async fn normalize_retired_provider_profiles(&self) -> Result<RetiredProfileMigration> {
-        fn filtered_profiles(raw: &str) -> Option<Vec<String>> {
-            let profiles = serde_json::from_str::<Vec<String>>(raw).ok()?;
-            let filtered = profiles
-                .iter()
-                .filter(|profile| !shared::is_retired_launch_profile_key(profile))
-                .cloned()
-                .collect::<Vec<_>>();
-            (filtered != profiles).then_some(filtered)
+    /// Normalize persisted policy to the launch profiles that can still be
+    /// created. A legacy structured-agent profile is mapped to its equivalent
+    /// terminal profile when one exists; profiles without a terminal runtime
+    /// are removed. Order is retained and duplicates introduced by mapping are
+    /// collapsed. Each changed policy row receives a distinct
+    /// cluster-monotonic version, and already-clean state is untouched.
+    async fn normalize_launch_profiles(&self) -> Result<LaunchProfileMigration> {
+        fn canonical_profile(
+            raw: &str,
+            supported: &std::collections::HashSet<String>,
+        ) -> Option<String> {
+            let profile = raw.trim();
+            if supported.contains(profile) {
+                return Some(profile.to_string());
+            }
+            let terminal = profile
+                .strip_prefix("agent:")
+                .map(|suffix| format!("terminal:{suffix}"));
+            terminal.filter(|profile| supported.contains(profile))
         }
 
+        fn normalized_profiles(
+            raw: &str,
+            supported: &std::collections::HashSet<String>,
+        ) -> Option<Vec<String>> {
+            let profiles = serde_json::from_str::<Vec<String>>(raw).ok()?;
+            let mut seen = std::collections::HashSet::new();
+            let normalized = profiles
+                .iter()
+                .filter_map(|profile| canonical_profile(profile, supported))
+                .filter(|profile| seen.insert(profile.clone()))
+                .collect::<Vec<_>>();
+            (normalized != profiles).then_some(normalized)
+        }
+
+        let supported = shared::supported_launch_profiles()
+            .into_iter()
+            .map(|profile| profile.key)
+            .collect::<std::collections::HashSet<_>>();
         let mut tx = self.pool.begin().await?;
         let mut next_version = sqlx::query_scalar::<_, i64>(
             r#"
             SELECT COALESCE(MAX(version), 0) FROM (
                 SELECT version FROM cluster_settings WHERE id = 1
+                UNION ALL
+                SELECT version FROM cluster_default_policies
                 UNION ALL
                 SELECT version FROM project_policy_overrides
             )
@@ -1329,23 +1362,46 @@ impl Database {
         )
         .fetch_one(&mut *tx)
         .await?;
-        let mut result = RetiredProfileMigration::default();
+        let mut result = LaunchProfileMigration::default();
 
         let cluster =
             sqlx::query("SELECT allowed_launch_profiles FROM cluster_settings WHERE id = 1")
                 .fetch_one(&mut *tx)
                 .await?;
         let cluster_raw: String = cluster.get("allowed_launch_profiles");
-        if let Some(filtered) = filtered_profiles(&cluster_raw) {
+        if let Some(normalized) = normalized_profiles(&cluster_raw, &supported) {
             next_version += 1;
             sqlx::query(
                 "UPDATE cluster_settings SET allowed_launch_profiles = ?, version = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1",
             )
-            .bind(serde_json::to_string(&filtered)?)
+            .bind(serde_json::to_string(&normalized)?)
             .bind(next_version)
             .execute(&mut *tx)
             .await?;
-            result.cluster_default_changed = true;
+            result.deployment_default_changed = true;
+        }
+
+        let cluster_defaults = sqlx::query(
+            "SELECT user_id, allowed_launch_profiles FROM cluster_default_policies WHERE allowed_launch_profiles IS NOT NULL ORDER BY user_id",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        for row in cluster_defaults {
+            let user_id: String = row.get("user_id");
+            let raw: String = row.get("allowed_launch_profiles");
+            let Some(normalized) = normalized_profiles(&raw, &supported) else {
+                continue;
+            };
+            next_version += 1;
+            sqlx::query(
+                "UPDATE cluster_default_policies SET allowed_launch_profiles = ?, version = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+            )
+            .bind(serde_json::to_string(&normalized)?)
+            .bind(next_version)
+            .bind(&user_id)
+            .execute(&mut *tx)
+            .await?;
+            result.changed_cluster_user_ids.push(user_id);
         }
 
         let overrides = sqlx::query(
@@ -1356,19 +1412,65 @@ impl Database {
         for row in overrides {
             let project_id: String = row.get("project_id");
             let raw: String = row.get("allowed_launch_profiles");
-            let Some(filtered) = filtered_profiles(&raw) else {
+            let Some(normalized) = normalized_profiles(&raw, &supported) else {
                 continue;
             };
             next_version += 1;
             sqlx::query(
                 "UPDATE project_policy_overrides SET allowed_launch_profiles = ?, version = ?, updated_at = CURRENT_TIMESTAMP WHERE project_id = ?",
             )
-            .bind(serde_json::to_string(&filtered)?)
+            .bind(serde_json::to_string(&normalized)?)
             .bind(next_version)
             .bind(&project_id)
             .execute(&mut *tx)
             .await?;
             result.changed_project_ids.push(project_id);
+        }
+
+        let memberships = sqlx::query(
+            "SELECT cluster_owner_user_id, user_id, default_launch_profile FROM cluster_memberships WHERE default_launch_profile IS NOT NULL ORDER BY cluster_owner_user_id, user_id",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        for row in memberships {
+            let owner_id: String = row.get("cluster_owner_user_id");
+            let user_id: String = row.get("user_id");
+            let old: String = row.get("default_launch_profile");
+            let normalized = canonical_profile(&old, &supported);
+            if normalized.as_deref() == Some(old.as_str()) {
+                continue;
+            }
+            sqlx::query(
+                "UPDATE cluster_memberships SET default_launch_profile = ?, updated_at = CURRENT_TIMESTAMP WHERE cluster_owner_user_id = ? AND user_id = ?",
+            )
+            .bind(normalized)
+            .bind(owner_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+            result.changed_membership_defaults += 1;
+        }
+
+        let provisioning = sqlx::query(
+            "SELECT request_id, default_launch_profile FROM project_provisioning_requests WHERE default_launch_profile IS NOT NULL ORDER BY request_id",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        for row in provisioning {
+            let request_id: String = row.get("request_id");
+            let old: String = row.get("default_launch_profile");
+            let normalized = canonical_profile(&old, &supported);
+            if normalized.as_deref() == Some(old.as_str()) {
+                continue;
+            }
+            sqlx::query(
+                "UPDATE project_provisioning_requests SET default_launch_profile = ?, updated_at = CURRENT_TIMESTAMP WHERE request_id = ?",
+            )
+            .bind(normalized)
+            .bind(request_id)
+            .execute(&mut *tx)
+            .await?;
+            result.changed_provisioning_defaults += 1;
         }
 
         tx.commit().await?;
@@ -6143,15 +6245,15 @@ mod cluster_administration_tests {
             .set_deployment_default_policy(
                 "admin",
                 true,
-                vec!["agent:codex:official:default".to_string()],
+                vec!["terminal:codex:official:default".to_string()],
             )
             .await
             .unwrap();
         assert!(defaults.version > initial.version);
         let inherited = db.get_effective_project_policy("project-a").await.unwrap();
         assert!(inherited.team_available);
-        assert!(inherited.allows(shared::PaneKind::Agent, shared::Provider::Codex, None));
-        assert!(!inherited.allows(shared::PaneKind::Agent, shared::Provider::Claude, None));
+        assert!(inherited.allows(shared::PaneKind::Terminal, shared::Provider::Codex, None));
+        assert!(!inherited.allows(shared::PaneKind::Terminal, shared::Provider::Claude, None));
 
         // A project created after the migration inherits server defaults;
         // its ordinary `.apas` snapshot must not become an implicit override.
@@ -6168,7 +6270,7 @@ mod cluster_administration_tests {
                 "admin",
                 "project-a",
                 Some(false),
-                Some(vec!["agent:claude:official:default".to_string()]),
+                Some(vec!["terminal:claude:official:default".to_string()]),
             )
             .await
             .unwrap_err()
@@ -6180,13 +6282,13 @@ mod cluster_administration_tests {
                 "admin",
                 "project-a",
                 Some(false),
-                Some(vec!["agent:codex:official:default".to_string()]),
+                Some(vec!["terminal:codex:official:default".to_string()]),
             )
             .await
             .unwrap();
         assert!(overridden.version > inherited.version);
         assert!(!overridden.team_available);
-        assert!(overridden.allows(shared::PaneKind::Agent, shared::Provider::Codex, None));
+        assert!(overridden.allows(shared::PaneKind::Terminal, shared::Provider::Codex, None));
 
         let after_legacy = db
             .import_legacy_project_policy("project-a", true, &[])
@@ -6203,26 +6305,64 @@ mod cluster_administration_tests {
     }
 
     #[tokio::test]
-    async fn retired_profile_migration_is_ordered_versioned_and_idempotent() {
-        let db = database("retired-policy").await;
+    async fn launch_profile_migration_maps_agents_drops_unsupported_and_is_idempotent() {
+        let db = database("terminal-only-policy").await;
         db.run_migrations().await.unwrap();
         db.create_user(&user("admin", "admin@test", "admin"))
             .await
             .unwrap();
-        for project_id in ["clean", "mixed", "retired-only"] {
+        db.create_user(&user("member", "member@test", "user"))
+            .await
+            .unwrap();
+        for project_id in ["clean", "mixed", "unsupported-only"] {
             db.authorize_project_registration(project_id, "admin")
                 .await
                 .unwrap();
         }
 
         let retired_minimax = "agent:claude:minimax:minimax-m2.7";
-        let retired_glm = "agent:claude:glm:glm-5.1";
-        let claude = "agent:claude:official:default";
-        let codex = "agent:codex:official:default";
+        let legacy_claude = "agent:claude:official:default";
+        let legacy_codex = "agent:codex:official:default";
+        let legacy_opencode = "agent:opencode:official:default";
+        let legacy_deepseek_pro = "agent:claude:deepseek:deepseek-v4-pro";
+        let legacy_deepseek_flash = "agent:claude:deepseek:deepseek-v4-flash";
+        let legacy_fable = "agent:claude:official:claude-fable-5";
+        let legacy_cursor = "agent:cursor-agent:official:default";
+        let claude = "terminal:claude:official:default";
+        let codex = "terminal:codex:official:default";
+        let opencode = "terminal:opencode:official:default";
+        let deepseek_pro = "terminal:claude:deepseek:deepseek-v4-pro";
+        let deepseek_flash = "terminal:claude:deepseek:deepseek-v4-flash";
         sqlx::query(
             "UPDATE cluster_settings SET allowed_launch_profiles = ?, version = 4 WHERE id = 1",
         )
-        .bind(serde_json::to_string(&vec![claude, retired_minimax, codex]).unwrap())
+        .bind(
+            serde_json::to_string(&vec![
+                legacy_claude,
+                claude,
+                legacy_fable,
+                retired_minimax,
+                codex,
+            ])
+            .unwrap(),
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO cluster_default_policies (user_id, allowed_launch_profiles, version) VALUES (?, ?, ?)",
+        )
+        .bind("admin")
+        .bind(
+            serde_json::to_string(&vec![
+                legacy_codex,
+                codex,
+                legacy_cursor,
+                legacy_opencode,
+            ])
+            .unwrap(),
+        )
+        .bind(8_i64)
         .execute(&db.pool)
         .await
         .unwrap();
@@ -6230,10 +6370,17 @@ mod cluster_administration_tests {
             ("clean", vec![codex], 6_i64),
             (
                 "mixed",
-                vec![retired_glm, claude, retired_minimax, codex],
+                vec![
+                    retired_minimax,
+                    legacy_claude,
+                    claude,
+                    legacy_fable,
+                    legacy_deepseek_pro,
+                    legacy_deepseek_flash,
+                ],
                 7,
             ),
-            ("retired-only", vec![retired_minimax, retired_glm], 5),
+            ("unsupported-only", vec![legacy_fable, legacy_cursor], 5),
         ] {
             sqlx::query(
                 "INSERT INTO project_policy_overrides (project_id, allowed_launch_profiles, version) VALUES (?, ?, ?)",
@@ -6245,13 +6392,37 @@ mod cluster_administration_tests {
             .await
             .unwrap();
         }
+        sqlx::query(
+            "INSERT INTO cluster_memberships (cluster_owner_user_id, user_id, status, default_launch_profile) VALUES ('admin', 'member', 'active', ?)",
+        )
+        .bind(legacy_codex)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO project_provisioning_requests
+               (request_id, requester_user_id, cluster_owner_user_id, machine_id,
+                request_fingerprint, git_remote, clone_url, instance_name, branch,
+                project_id, default_launch_profile)
+               VALUES ('request-a', 'member', 'admin', 'machine-a', 'fingerprint-a',
+                       'https://github.com/example/repo.git',
+                       'https://github.com/example/repo.git', 'repo', 'apas/repo',
+                       'provisioned-project', ?)"#,
+        )
+        .bind(legacy_fable)
+        .execute(&db.pool)
+        .await
+        .unwrap();
 
-        let changed = db.normalize_retired_provider_profiles().await.unwrap();
-        assert!(changed.cluster_default_changed);
+        let changed = db.normalize_launch_profiles().await.unwrap();
+        assert!(changed.deployment_default_changed);
+        assert_eq!(changed.changed_cluster_user_ids, vec!["admin".to_string()]);
         assert_eq!(
             changed.changed_project_ids,
-            vec!["mixed".to_string(), "retired-only".to_string()]
+            vec!["mixed".to_string(), "unsupported-only".to_string()]
         );
+        assert_eq!(changed.changed_membership_defaults, 1);
+        assert_eq!(changed.changed_provisioning_defaults, 1);
 
         let (cluster_json, cluster_version) = sqlx::query_as::<_, (String, i64)>(
             "SELECT allowed_launch_profiles, version FROM cluster_settings WHERE id = 1",
@@ -6263,7 +6434,19 @@ mod cluster_administration_tests {
             serde_json::from_str::<Vec<String>>(&cluster_json).unwrap(),
             vec![claude.to_string(), codex.to_string()]
         );
-        assert_eq!(cluster_version, 8);
+        assert_eq!(cluster_version, 9);
+
+        let (account_json, account_version) = sqlx::query_as::<_, (String, i64)>(
+            "SELECT allowed_launch_profiles, version FROM cluster_default_policies WHERE user_id = 'admin'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&account_json).unwrap(),
+            vec![codex.to_string(), opencode.to_string()]
+        );
+        assert_eq!(account_version, 10);
 
         let rows = sqlx::query(
             "SELECT project_id, allowed_launch_profiles, version FROM project_policy_overrides ORDER BY project_id",
@@ -6289,21 +6472,35 @@ mod cluster_administration_tests {
             stored[1],
             (
                 "mixed".to_string(),
-                vec![claude.to_string(), codex.to_string()],
-                9
+                vec![
+                    claude.to_string(),
+                    deepseek_pro.to_string(),
+                    deepseek_flash.to_string(),
+                ],
+                11,
             )
         );
-        assert_eq!(stored[2], ("retired-only".to_string(), vec![], 10));
+        assert_eq!(stored[2], ("unsupported-only".to_string(), vec![], 12));
 
-        let second = db.normalize_retired_provider_profiles().await.unwrap();
-        assert_eq!(second, RetiredProfileMigration::default());
-        let versions = sqlx::query_scalar::<_, i64>(
-            "SELECT SUM(version) FROM cluster_settings UNION ALL SELECT SUM(version) FROM project_policy_overrides",
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT default_launch_profile FROM cluster_memberships WHERE cluster_owner_user_id = 'admin' AND user_id = 'member'",
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+            codex
+        );
+        assert!(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT default_launch_profile FROM project_provisioning_requests WHERE request_id = 'request-a'",
         )
-        .fetch_all(&db.pool)
+        .fetch_one(&db.pool)
         .await
-        .unwrap();
-        assert_eq!(versions, vec![8, 25]);
+        .unwrap()
+        .is_none());
+
+        let second = db.normalize_launch_profiles().await.unwrap();
+        assert_eq!(second, LaunchProfileMigration::default());
     }
 
     #[tokio::test]
@@ -6350,12 +6547,12 @@ mod cluster_administration_tests {
         let fresh = db.get_deployment_default_policy().await.unwrap();
         assert!(fresh
             .allowed_launch_profiles
-            .contains(&"agent:claude:deepseek:deepseek-v4-pro".to_string()));
+            .contains(&"terminal:claude:deepseek:deepseek-v4-pro".to_string()));
         assert!(fresh
             .allowed_launch_profiles
-            .contains(&"agent:claude:deepseek:deepseek-v4-flash".to_string()));
+            .contains(&"terminal:claude:deepseek:deepseek-v4-flash".to_string()));
 
-        let pro_only = vec!["agent:claude:deepseek:deepseek-v4-pro".to_string()];
+        let pro_only = vec!["terminal:claude:deepseek:deepseek-v4-pro".to_string()];
         sqlx::query(
             "UPDATE cluster_settings SET allowed_launch_profiles = ?, version = 9 WHERE id = 1",
         )
@@ -7217,8 +7414,8 @@ mod cluster_administration_tests {
             "owner",
             true,
             vec![
-                "agent:claude:official:default".to_string(),
-                "agent:codex:official:default".to_string(),
+                "terminal:claude:official:default".to_string(),
+                "terminal:codex:official:default".to_string(),
             ],
         )
         .await
@@ -7260,7 +7457,7 @@ mod cluster_administration_tests {
             "host",
             "host",
             Some(false),
-            Some(vec!["agent:codex:official:default".to_string()]),
+            Some(vec!["terminal:codex:official:default".to_string()]),
         )
         .await
         .unwrap();
@@ -7268,7 +7465,7 @@ mod cluster_administration_tests {
         assert!(!narrowed.team_available);
         assert_eq!(
             narrowed.allowed_launch_profiles,
-            vec!["agent:codex:official:default".to_string()]
+            vec!["terminal:codex:official:default".to_string()]
         );
         assert!(narrowed.version > baseline.version);
 
@@ -7278,7 +7475,7 @@ mod cluster_administration_tests {
                 "host",
                 "host",
                 Some(true),
-                Some(vec!["agent:opencode:official:default".to_string()]),
+                Some(vec!["terminal:opencode:official:default".to_string()]),
             )
             .await
             .unwrap_err()
@@ -7309,7 +7506,7 @@ mod cluster_administration_tests {
             "second",
             "second",
             None,
-            Some(vec!["agent:claude:official:default".to_string()]),
+            Some(vec!["terminal:claude:official:default".to_string()]),
         )
         .await
         .unwrap();
@@ -7322,7 +7519,7 @@ mod cluster_administration_tests {
                 "owner",
                 "project-a",
                 Some(true),
-                Some(vec!["agent:codex:official:default".to_string()]),
+                Some(vec!["terminal:codex:official:default".to_string()]),
             )
             .await
             .unwrap_err()

@@ -1282,8 +1282,8 @@ mod tests {
             "owner",
             true,
             vec![
-                "agent:claude:official:default".to_string(),
-                "agent:codex:official:default".to_string(),
+                "terminal:claude:official:default".to_string(),
+                "terminal:codex:official:default".to_string(),
             ],
         )
         .await
@@ -1292,7 +1292,7 @@ mod tests {
             "host",
             "host",
             Some(false),
-            Some(vec!["agent:codex:official:default".to_string()]),
+            Some(vec!["terminal:codex:official:default".to_string()]),
         )
         .await
         .unwrap();
@@ -1344,7 +1344,7 @@ mod tests {
         assert!(!migrated_policy.team_available);
         assert_eq!(
             migrated_policy.allowed_launch_profiles,
-            vec!["agent:codex:official:default".to_string()]
+            vec!["terminal:codex:official:default".to_string()]
         );
 
         sqlx::query(
@@ -1397,8 +1397,8 @@ mod tests {
             "owner",
             true,
             vec![
-                "agent:claude:official:default".to_string(),
-                "agent:codex:official:default".to_string(),
+                "terminal:claude:official:default".to_string(),
+                "terminal:codex:official:default".to_string(),
             ],
         )
         .await
@@ -1407,7 +1407,7 @@ mod tests {
             "host",
             "host",
             Some(false),
-            Some(vec!["agent:codex:official:default".to_string()]),
+            Some(vec!["terminal:codex:official:default".to_string()]),
         )
         .await
         .unwrap();
@@ -1415,7 +1415,7 @@ mod tests {
         assert!(!policy.team_available);
         assert_eq!(
             policy.allowed_launch_profiles,
-            vec!["agent:codex:official:default".to_string()]
+            vec!["terminal:codex:official:default".to_string()]
         );
     }
 

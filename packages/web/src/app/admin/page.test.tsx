@@ -9,7 +9,7 @@ const fetchMock = vi.fn();
 
 const policy = {
   team_available: true,
-  allowed_launch_profiles: ["agent:codex:official:default"],
+  allowed_launch_profiles: ["terminal:codex:official:default"],
   version: 6,
   project_suspended: false,
 };
@@ -43,7 +43,7 @@ function installApiFixtures({ bootstrapPending = false } = {}) {
     }
     if (url.endsWith("/admin/launch-profiles")) {
       return response([
-        { key: "agent:codex:official:default", label: "Codex / Official" },
+        { key: "terminal:codex:official:default", label: "Codex Terminal" },
         { key: "agent:claude:glm:glm-5.1", label: "Legacy GLM" },
       ]);
     }
@@ -193,7 +193,7 @@ describe("SystemAdminPage", () => {
 
     expect(await screen.findByText("Accounts")).toBeTruthy();
     expect(screen.getByText("Deployment default policy")).toBeTruthy();
-    expect(screen.getByText("Codex / Official")).toBeTruthy();
+    expect(screen.getByText("Codex Terminal")).toBeTruthy();
     expect(screen.queryByText("Legacy GLM")).toBeNull();
     expect(fetchMock).toHaveBeenCalledWith(
       "https://apas.mpaxos.com/admin/stats",

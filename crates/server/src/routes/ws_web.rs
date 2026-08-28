@@ -1309,10 +1309,9 @@ async fn authorize_profile_launch(
     false
 }
 
-/// Authorize creation of a brand-new pane. Structured agent panes remain
-/// available to managed team roles and existing legacy panes can still be
-/// resumed/rebooted through `authorize_profile_launch`, but ordinary new work
-/// must use the terminal path.
+/// Authorize creation of a brand-new pane. Structured agent panes are a
+/// historical resume/reboot path only; all new work must use a supported
+/// terminal profile.
 async fn authorize_new_pane_launch(
     state: &AppState,
     connection_id: &Uuid,
@@ -1322,11 +1321,11 @@ async fn authorize_new_pane_launch(
     model: Option<&str>,
     managed: bool,
 ) -> bool {
-    if !managed && kind == shared::PaneKind::Agent {
+    if kind == shared::PaneKind::Agent {
         send_policy_error(
             state,
             connection_id,
-            "Conversation-only panes are retired. Create a Claude, Codex, or OpenCode terminal pane instead.",
+            "Conversation-only panes are retired. Create a supported terminal pane instead.",
         )
         .await;
         return false;
@@ -1622,7 +1621,7 @@ mod retired_launch_authorization_tests {
     }
 
     #[tokio::test]
-    async fn retained_profile_remains_authorized() {
+    async fn supported_terminal_profile_remains_authorized() {
         let (state, connection_id, session_id, mut web_rx, _cli_rx, _cli_id) = policy_state().await;
 
         assert!(
@@ -1630,7 +1629,7 @@ mod retired_launch_authorization_tests {
                 &state,
                 &connection_id,
                 &session_id,
-                shared::PaneKind::Agent,
+                shared::PaneKind::Terminal,
                 shared::Provider::Codex,
                 None,
                 false,
@@ -1650,7 +1649,7 @@ mod retired_launch_authorization_tests {
                     &state,
                     &connection_id,
                     &session_id,
-                    shared::PaneKind::Agent,
+                    shared::PaneKind::Terminal,
                     shared::Provider::Claude,
                     Some(model),
                     false,
@@ -1665,7 +1664,7 @@ mod retired_launch_authorization_tests {
                 &state,
                 &connection_id,
                 &session_id,
-                shared::PaneKind::Agent,
+                shared::PaneKind::Terminal,
                 shared::Provider::Claude,
                 Some("deepseek-chat"),
                 false,
@@ -1679,27 +1678,30 @@ mod retired_launch_authorization_tests {
     }
 
     #[tokio::test]
-    async fn new_unmanaged_conversation_only_pane_is_rejected() {
+    async fn new_conversation_only_pane_is_rejected_regardless_of_legacy_managed_flag() {
         let (state, connection_id, session_id, mut web_rx, mut cli_rx, _cli_id) =
             policy_state().await;
 
-        assert!(
-            !authorize_new_pane_launch(
-                &state,
-                &connection_id,
-                &session_id,
-                shared::PaneKind::Agent,
-                shared::Provider::Claude,
-                None,
-                false,
-            )
-            .await
-        );
+        for managed in [false, true] {
+            assert!(
+                !authorize_new_pane_launch(
+                    &state,
+                    &connection_id,
+                    &session_id,
+                    shared::PaneKind::Agent,
+                    shared::Provider::Claude,
+                    None,
+                    managed,
+                )
+                .await
+            );
 
-        let ServerToWeb::Error { message } = web_rx.try_recv().expect("explicit web error") else {
-            panic!("expected retirement error")
-        };
-        assert!(message.contains("Conversation-only panes are retired"));
+            let ServerToWeb::Error { message } = web_rx.try_recv().expect("explicit web error")
+            else {
+                panic!("expected retirement error")
+            };
+            assert!(message.contains("Conversation-only panes are retired"));
+        }
         assert!(cli_rx.try_recv().is_err());
     }
 

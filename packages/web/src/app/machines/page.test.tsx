@@ -15,7 +15,7 @@ const fetchMock = vi.fn();
 
 const policy = {
   team_available: false,
-  allowed_launch_profiles: ["agent:codex:official:default"],
+  allowed_launch_profiles: ["terminal:codex:official:default"],
   version: 3,
   project_suspended: false,
 };
@@ -75,7 +75,7 @@ function installClusterApi({ projectDenied = false } = {}) {
         cluster: null,
         deployment: {
           team_available: true,
-          allowed_launch_profiles: ["agent:codex:official:default"],
+          allowed_launch_profiles: ["terminal:codex:official:default"],
           version: 3,
           project_suspended: false,
         },
@@ -83,7 +83,7 @@ function installClusterApi({ projectDenied = false } = {}) {
     }
     if (url.endsWith("/cluster/launch-profiles")) {
       return apiResponse([
-        { key: "agent:codex:official:default", label: "Codex / Official" },
+        { key: "terminal:codex:official:default", label: "Codex Terminal" },
         { key: "agent:claude:glm:glm-5.1", label: "Legacy GLM" },
       ]);
     }
@@ -383,7 +383,7 @@ describe("MachinesPage cluster administration", () => {
     fireEvent.click(screen.getByRole("checkbox", { name: "build-host" }));
     await waitFor(() => expect(
       (screen.getByLabelText("Default AI agent for new member projects") as HTMLSelectElement).value,
-    ).toBe("agent:codex:official:default"));
+    ).toBe("terminal:codex:official:default"));
     fireEvent.click(screen.getByRole("button", { name: "Add member" }));
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
@@ -393,7 +393,7 @@ describe("MachinesPage cluster administration", () => {
         body: JSON.stringify({
           email: "new-member@example.com",
           allowed_machine_ids: ["machine-1"],
-          default_launch_profile: "agent:codex:official:default",
+          default_launch_profile: "terminal:codex:official:default",
         }),
       }),
     ));
@@ -404,7 +404,7 @@ describe("MachinesPage cluster administration", () => {
     render(<MachinesPage />);
 
     expect(await screen.findByText("Cluster default policy")).toBeTruthy();
-    expect(screen.getAllByText("Codex / Official").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Codex Terminal").length).toBeGreaterThan(0);
     expect(screen.queryByText("Legacy GLM")).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Save cluster policy" }));
@@ -442,7 +442,7 @@ describe("MachinesPage cluster administration", () => {
         user_email: "member@example.com",
         status: "active",
         allowed_machine_ids: null,
-        default_launch_profile: "agent:codex:official:default",
+        default_launch_profile: "terminal:codex:official:default",
       }] : []);
       if (url.includes("/cluster/usage")) return apiResponse({ success: true });
       return apiResponse({ success: true });

@@ -3051,7 +3051,7 @@ mod tests {
 
         let policy = shared::EffectiveProjectPolicy {
             team_available: false,
-            allowed_launch_profiles: vec!["agent:codex:official:default".to_string()],
+            allowed_launch_profiles: vec!["terminal:codex:official:default".to_string()],
             version: 42,
             project_suspended: false,
         };
