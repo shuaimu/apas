@@ -879,6 +879,14 @@ otherwise have had to volunteer.
   because it can select a sibling pane in the same cwd. Other platforms fall
   back to the newest user rollout whose `session_meta.cwd` matches, but that
   ambiguous fallback is not persisted as pane identity.
+
+  Codex's rollout files, authentication and configuration stay in the user's
+  ordinary `CODEX_HOME`, which can be shared by the cluster. Its WAL-mode
+  SQLite runtime state cannot: APAS sets `CODEX_SQLITE_HOME` on every Codex
+  pane to the private host-local `/var/tmp/apas-codex-sqlite-<uid>` directory.
+  The launcher creates or tightens that directory to `0700` and rejects a
+  symlink, non-directory or path owned by another user. Never move this path
+  back under the NFS-mounted home; different hosts may run Codex concurrently.
 - **opencode** — OpenCode owns its `ses_*` identifiers, so APAS asks
   `opencode session list --format json` for the newest session whose directory
   exactly matches the pane cwd, then reads it with `opencode export <id>`.

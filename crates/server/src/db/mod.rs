@@ -4456,13 +4456,10 @@ impl Database {
     }
 
     pub async fn get_sessions_for_user(&self, user_id: &str) -> Result<Vec<Session>> {
-        // An account's primary list includes projects it owns anywhere and its
-        // durably placed cluster inventory. Ownership must be checked
-        // independently from placement: a member-created project is owned by
-        // the member while it remains placed only in the shared cluster that
-        // hosts it. Projects the account merely belongs to arrive through the
-        // shared list, which excludes placements so the web's union cannot
-        // double-list one.
+        // The primary list is ownership-scoped. Hosting a project in an
+        // account's cluster grants cluster-management authority, but it does
+        // not make that account the project owner or a project user. Hosted
+        // inventory is exposed through the cluster administration routes.
         let sessions = sqlx::query_as::<_, Session>(
             r#"
             SELECT s.id, p.owner_user_id AS user_id, s.cli_client_id, s.working_dir,
@@ -4473,15 +4470,10 @@ impl Database {
             FROM sessions s
             JOIN projects p ON p.id = COALESCE(s.project_id, s.id)
             WHERE p.owner_user_id = ?
-               OR EXISTS (
-                    SELECT 1 FROM project_cluster_placements pcp
-                    WHERE pcp.project_id = p.id AND pcp.cluster_owner_user_id = ?
-               )
             ORDER BY s.created_at DESC
             LIMIT 50
             "#,
         )
-        .bind(user_id)
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
@@ -4703,9 +4695,10 @@ impl Database {
         user_id: &str,
     ) -> Result<Vec<(Session, String, String)>> {
         // Compatibility shape for the web session list, sourced from canonical
-        // project membership rather than per-session role rows. Projects the
-        // account already hosts are excluded: get_sessions_for_user returns
-        // those, and the web unions the two lists.
+        // project membership rather than per-session role rows. Placement in
+        // the viewer's cluster does not change the viewer's project role: an
+        // explicit member remains a project user, while a host that is neither
+        // owner nor member does not receive the project in this list.
         let rows = sqlx::query(
             r#"
             SELECT s.id, p.owner_user_id AS user_id, s.cli_client_id, s.working_dir, s.hostname, s.status, s.created_at, s.updated_at, COALESCE(s.is_paused, 0) as is_paused, COALESCE(s.project_id, s.id) as project_id, s.git_remote, s.git_remote_url, u.email, 'user' AS role
@@ -4715,15 +4708,10 @@ impl Database {
             INNER JOIN users u ON p.owner_user_id = u.id
             WHERE pm.user_id = ?
               AND p.owner_user_id <> ?
-              AND NOT EXISTS (
-                  SELECT 1 FROM project_cluster_placements pcp
-                  WHERE pcp.project_id = p.id AND pcp.cluster_owner_user_id = ?
-              )
             ORDER BY s.created_at DESC
             LIMIT 50
             "#,
         )
-        .bind(user_id)
         .bind(user_id)
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -7326,7 +7314,7 @@ mod cluster_administration_tests {
     }
 
     #[tokio::test]
-    async fn session_listings_include_owned_and_hosted_projects() {
+    async fn session_listings_include_only_owned_or_joined_projects() {
         let db = database("cluster-session-list").await;
         db.run_migrations().await.unwrap();
         for (id, email) in [
@@ -7396,9 +7384,9 @@ mod cluster_administration_tests {
             .unwrap();
         }
 
-        // The host sees its own project and every session of the foreign
-        // project it hosts — the whole project runs on its machines — but no
-        // project that exists only in another account's cluster.
+        // Hosting a foreign project supplies cluster-management authority, not
+        // project ownership or membership. The host's ordinary project list
+        // therefore contains only its own project.
         let host_ids: Vec<String> = db
             .get_sessions_for_user("host")
             .await
@@ -7406,12 +7394,8 @@ mod cluster_administration_tests {
             .into_iter()
             .map(|s| s.id)
             .collect();
-        assert_eq!(host_ids.len(), 4);
-        assert!(host_ids.contains(&"session-host-foreign".to_string()));
-        assert!(host_ids.contains(&"session-other".to_string()));
+        assert_eq!(host_ids.len(), 1);
         assert!(host_ids.contains(&"session-host-own".to_string()));
-        assert!(host_ids.contains(&"session-owner-remote".to_string()));
-        assert!(!host_ids.contains(&"session-owner".to_string()));
         assert!(db
             .get_shared_sessions_for_user("host")
             .await
@@ -7435,9 +7419,8 @@ mod cluster_administration_tests {
             .unwrap()
             .is_empty());
 
-        // A member that ran the project on its own machine hosts it, so the
-        // project moves from its shared list to its own list. The union the
-        // web renders is unchanged either way.
+        // Placement does not promote a project member to owner. Even when the
+        // member's cluster hosts the project, it remains in their shared list.
         let member_ids: Vec<String> = db
             .get_sessions_for_user("member")
             .await
@@ -7445,12 +7428,15 @@ mod cluster_administration_tests {
             .into_iter()
             .map(|s| s.id)
             .collect();
-        assert_eq!(member_ids.len(), 2);
-        assert!(db
+        assert!(member_ids.is_empty());
+        let member_shared_ids: Vec<String> = db
             .get_shared_sessions_for_user("member")
             .await
             .unwrap()
-            .is_empty());
+            .into_iter()
+            .map(|(s, _, _)| s.id)
+            .collect();
+        assert_eq!(member_shared_ids.len(), 2);
 
         // A member that never ran it keeps reaching it through membership
         // alone, and does not host it.

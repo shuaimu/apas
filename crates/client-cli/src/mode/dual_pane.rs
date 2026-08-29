@@ -13,7 +13,7 @@ use shared::{
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -783,6 +783,92 @@ const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com/anthropic";
 // `deepseek_default_model_matches_web_provider_options` test guards drift.
 const DEEPSEEK_DEFAULT_MODEL: &str = shared::DEEPSEEK_DEFAULT_MODEL;
 const DEEPSEEK_PRO_RUNTIME_MODEL: &str = "deepseek-v4-pro[1m]";
+const CODEX_SQLITE_HOME_ENV: &str = "CODEX_SQLITE_HOME";
+const CODEX_SQLITE_HOME_ROOT: &str = "/var/tmp";
+
+fn codex_sqlite_home_path(root: &Path, uid: u32) -> PathBuf {
+    root.join(format!("apas-codex-sqlite-{uid}"))
+}
+
+fn ensure_private_codex_sqlite_home(path: &Path, uid: u32) -> Result<(), String> {
+    use std::fs::{DirBuilder, Permissions};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata.uid() != uid {
+                return Err(format!(
+                    "Refusing insecure Codex SQLite directory {}",
+                    path.display()
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = DirBuilder::new();
+            builder.mode(0o700);
+            if let Err(error) = builder.create(path) {
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(format!(
+                        "Failed to create host-local Codex SQLite directory {}: {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        Err(error) => {
+            return Err(format!(
+                "Failed to inspect host-local Codex SQLite directory {}: {error}",
+                path.display()
+            ));
+        }
+    }
+
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "Failed to inspect host-local Codex SQLite directory {}: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata.uid() != uid {
+        return Err(format!(
+            "Refusing insecure Codex SQLite directory {}",
+            path.display()
+        ));
+    }
+    std::fs::set_permissions(path, Permissions::from_mode(0o700)).map_err(|error| {
+        format!(
+            "Failed to protect host-local Codex SQLite directory {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Prepare a persistent, host-local home for Codex's SQLite runtime state.
+///
+/// User homes on the APAS cluster are shared over NFS. Codex keeps its
+/// resumable runtime index in WAL-mode SQLite databases, whose `-shm` state
+/// cannot coordinate writers on different hosts. The rollout files remain in
+/// the ordinary shared `CODEX_HOME`; only SQLite moves here.
+fn prepare_codex_sqlite_home() -> Result<PathBuf, String> {
+    let uid = unsafe { libc::getuid() };
+    let path = codex_sqlite_home_path(Path::new(CODEX_SQLITE_HOME_ROOT), uid);
+    ensure_private_codex_sqlite_home(&path, uid)?;
+    Ok(path)
+}
+
+fn append_codex_sqlite_home_env(
+    provider: &Provider,
+    sqlite_home: &Path,
+    env: &mut Vec<(String, String)>,
+) {
+    if matches!(provider, Provider::Codex) {
+        env.push((
+            CODEX_SQLITE_HOME_ENV.to_string(),
+            sqlite_home.to_string_lossy().into_owned(),
+        ));
+    }
+}
 
 fn selected_deepseek_model(
     provider: &Provider,
@@ -1177,7 +1263,12 @@ fn build_pane_env_overrides(
     model: Option<&str>,
 ) -> Result<Vec<(String, String)>, String> {
     let deepseek_runtime = load_deepseek_backend_runtime_config();
-    build_pane_env_overrides_from_keys(provider, model, deepseek_runtime.api_key)
+    let mut env = build_pane_env_overrides_from_keys(provider, model, deepseek_runtime.api_key)?;
+    if matches!(provider, Provider::Codex) {
+        let sqlite_home = prepare_codex_sqlite_home()?;
+        append_codex_sqlite_home_env(provider, &sqlite_home, &mut env);
+    }
+    Ok(env)
 }
 
 fn format_spawn_error(
@@ -5363,23 +5454,23 @@ fn parse_agent_output(
 #[allow(deprecated)]
 mod tests {
     use super::{
-        active_usage_providers, announce_and_persist_panes,
+        active_usage_providers, announce_and_persist_panes, append_codex_sqlite_home_env,
         auto_cancel_pending_questions_for_new_input, boot_restore_try_resume_first,
         build_agent_args, build_agent_switch_respawn_event, build_deadloop_agent_args,
         build_pane_env_overrides_from_keys, build_pane_list, build_pane_reboot_events,
-        build_user_envelope_line, canonicalize_requested_model, convert_opencode_to_claude,
-        deadloop_wait_plan, evaluate_deadloop_watchdog, is_codex_stale_session_error,
-        manual_create_pr_worktree_path, model_switch_can_use_fast_path, normalize_codex_effort,
-        normalize_effort_level, reconcile_terminal_questions_for_pane,
-        remember_verified_codex_session, reset_deadloop_codex_stale_session,
-        resolve_pane_binary_path, resolve_terminal_binary, restored_pane_mode_and_pause,
-        retired_launch_rejection_output, route_web_input_to_pane, run_deadloop_session_inner,
-        save_pane_configs, should_recover_deadloop_stale_session, start_bot_preserved_fields,
-        stop_retired_panes, terminal_state_reports, truncate_str_at_char_boundary,
-        update_project_operations, DeadloopWatchdogDecision, DeadloopWatchdogState, InputChannels,
-        PaneInputRouteResult, PaneMeta, PaneMetas, PanePauses, PaneStopRequests,
-        PendingAskQuestion, ASK_USER_QUESTION_AUTO_CANCEL_STATUS, DEEPSEEK_DEFAULT_MODEL,
-        DEEPSEEK_PRO_RUNTIME_MODEL,
+        build_user_envelope_line, canonicalize_requested_model, codex_sqlite_home_path,
+        convert_opencode_to_claude, deadloop_wait_plan, ensure_private_codex_sqlite_home,
+        evaluate_deadloop_watchdog, is_codex_stale_session_error, manual_create_pr_worktree_path,
+        model_switch_can_use_fast_path, normalize_codex_effort, normalize_effort_level,
+        reconcile_terminal_questions_for_pane, remember_verified_codex_session,
+        reset_deadloop_codex_stale_session, resolve_pane_binary_path, resolve_terminal_binary,
+        restored_pane_mode_and_pause, retired_launch_rejection_output, route_web_input_to_pane,
+        run_deadloop_session_inner, save_pane_configs, should_recover_deadloop_stale_session,
+        start_bot_preserved_fields, stop_retired_panes, terminal_state_reports,
+        truncate_str_at_char_boundary, update_project_operations, DeadloopWatchdogDecision,
+        DeadloopWatchdogState, InputChannels, PaneInputRouteResult, PaneMeta, PaneMetas,
+        PanePauses, PaneStopRequests, PendingAskQuestion, ASK_USER_QUESTION_AUTO_CANCEL_STATUS,
+        CODEX_SQLITE_HOME_ENV, DEEPSEEK_DEFAULT_MODEL, DEEPSEEK_PRO_RUNTIME_MODEL,
     };
     use crate::conversation::{TurnAnswer, TurnQuestion, TurnRecord};
     use crate::project::{get_or_create_project, save_project};
@@ -6930,6 +7021,52 @@ mod tests {
         );
 
         assert!(!args.iter().any(|arg| arg == "--model"));
+    }
+
+    #[test]
+    fn codex_sqlite_home_is_uid_scoped_and_only_injected_for_codex() {
+        let path = codex_sqlite_home_path(std::path::Path::new("/var/tmp"), 3000);
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/var/tmp/apas-codex-sqlite-3000")
+        );
+
+        let mut codex_env = Vec::new();
+        append_codex_sqlite_home_env(&Provider::Codex, &path, &mut codex_env);
+        assert_eq!(
+            codex_env,
+            vec![(
+                CODEX_SQLITE_HOME_ENV.to_string(),
+                path.to_string_lossy().into_owned()
+            )]
+        );
+
+        let mut claude_env = Vec::new();
+        append_codex_sqlite_home_env(&Provider::Claude, &path, &mut claude_env);
+        assert!(claude_env.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_sqlite_home_directory_is_private_and_rejects_symlinks() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let uid = unsafe { libc::getuid() };
+        let path = codex_sqlite_home_path(root.path(), uid);
+        ensure_private_codex_sqlite_home(&path, uid).unwrap();
+
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.uid(), uid);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = root.path().join("unsafe-link");
+        symlink(&target, &link).unwrap();
+        let error = ensure_private_codex_sqlite_home(&link, uid).unwrap_err();
+        assert!(error.contains("Refusing insecure"), "{error}");
     }
 
     #[test]
