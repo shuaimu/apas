@@ -27,7 +27,9 @@ function rebootControlNames(): string[] {
   return screen
     .getAllByRole("button")
     .map((button) => button.getAttribute("aria-label") ?? "")
-    .filter((name) => name.toLowerCase().includes("daemon"))
+    // Compare the per-machine controls. Desktop's My Cluster page also owns
+    // the fleet-wide action, which has no corresponding mobile-home control.
+    .filter((name) => name.toLowerCase().includes("daemon on "))
     .sort();
 }
 

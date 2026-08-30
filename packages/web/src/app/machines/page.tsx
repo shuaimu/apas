@@ -132,6 +132,7 @@ export default function MachinesPage() {
     setMachineDeepseekConfig,
     pendingInstances,
     rebootDaemon,
+    rebootDaemons,
     serverVersion,
     userId,
     userEmail,
@@ -147,6 +148,7 @@ export default function MachinesPage() {
   const [clusterError, setClusterError] = useState<string | null>(null);
   const [rebootTarget, setRebootTarget] =
     useState<{ id: string; hostname: string; behind: boolean } | null>(null);
+  const [rebootAllOpen, setRebootAllOpen] = useState(false);
   const [memberUserId, setMemberUserId] = useState("");
   const [ownerUserId, setOwnerUserId] = useState("");
   const [clusters, setClusters] = useState<ClusterReference[]>([]);
@@ -181,6 +183,15 @@ export default function MachinesPage() {
         ...visibleMachines.map(({ machine }) => machine.daemonVersion),
       ]),
     [serverVersion, visibleMachines],
+  );
+  const rebootableMachines = useMemo(
+    () => visibleMachines.filter((entry) => entry.clusterAccess !== "member"),
+    [visibleMachines],
+  );
+  const behindDaemonCount = useMemo(
+    () => rebootableMachines.filter(({ machine }) =>
+      isMachineBehind(machine.daemonVersion, latestVersion)).length,
+    [latestVersion, rebootableMachines],
   );
   const memberProfiles = useMemo(() => {
     const allowed = clusterPolicy?.cluster?.allowed_launch_profiles
@@ -338,8 +349,8 @@ export default function MachinesPage() {
   return (
     <main className="min-h-screen bg-gray-50 p-4 dark:bg-gray-950 md:p-6">
       <div className="mx-auto max-w-6xl space-y-4">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center justify-end gap-2">
             <Link href="/" className="inline-flex items-center gap-1 rounded border border-gray-300 px-2 py-1 text-sm hover:bg-gray-100 dark:border-gray-700 dark:hover:bg-gray-800">
               <ArrowLeft className="h-4 w-4" /> Back
             </Link>
@@ -368,6 +379,15 @@ export default function MachinesPage() {
                   </option>
                 ))}
               </select>
+            )}
+            {!sharedView && rebootableMachines.length > 0 && (
+              <button
+                aria-label="Reboot all daemons"
+                onClick={() => setRebootAllOpen(true)}
+                className="inline-flex items-center gap-1 rounded border border-indigo-300 px-3 py-1.5 text-sm text-indigo-700 hover:bg-indigo-50 dark:border-indigo-700 dark:text-indigo-300 dark:hover:bg-indigo-950/40"
+              >
+                <RotateCcw className="h-4 w-4" /> Reboot all daemons
+              </button>
             )}
             <button aria-label="Refresh machines" onClick={() => { listMachines(); void loadClusters(); void loadCluster(); }} className="inline-flex items-center gap-1 rounded border border-gray-300 px-3 py-1.5 text-sm hover:bg-gray-100 dark:border-gray-700 dark:hover:bg-gray-800">
               <RefreshCw className="h-4 w-4" /> Refresh
@@ -542,6 +562,52 @@ export default function MachinesPage() {
                   className="inline-flex items-center gap-1 rounded bg-indigo-600 px-3 py-1.5 text-sm text-white hover:bg-indigo-700"
                 >
                   <RotateCcw className="h-4 w-4" /> {rebootLabelFor(rebootTarget.behind)}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {rebootAllOpen && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+            onClick={() => setRebootAllOpen(false)}
+          >
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label="Reboot all daemons"
+              className="w-full max-w-md rounded-lg border border-gray-200 bg-white p-4 shadow-xl dark:border-gray-800 dark:bg-gray-900"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <h2 className="text-base font-semibold">Reboot all daemons?</h2>
+              <p className="mt-2 text-sm text-gray-600 dark:text-gray-300">
+                This requests a reboot on all {rebootableMachines.length} machines in your cluster.
+                {behindDaemonCount > 0
+                  ? ` ${behindDaemonCount} ${behindDaemonCount === 1 ? "daemon is" : "daemons are"} behind and will update first.`
+                  : " Each daemon updates first if a newer version is available."}
+                {" "}
+                Projects briefly reconnect after their daemon resumes; persistent terminal agents
+                continue running during the handoff.
+              </p>
+              <p className="mt-2 break-words text-xs text-gray-500">
+                {rebootableMachines.map(({ machine }) => machine.hostname).join(", ")}
+              </p>
+              <div className="mt-4 flex justify-end gap-2">
+                <button
+                  onClick={() => setRebootAllOpen(false)}
+                  className="rounded border border-gray-300 px-3 py-1.5 text-sm hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-gray-800"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => {
+                    rebootDaemons(rebootableMachines.map(({ machine }) => machine.machineId));
+                    setRebootAllOpen(false);
+                  }}
+                  className="inline-flex items-center gap-1 rounded bg-indigo-600 px-3 py-1.5 text-sm text-white hover:bg-indigo-700"
+                >
+                  <RotateCcw className="h-4 w-4" /> Reboot all daemons
                 </button>
               </div>
             </div>

@@ -854,6 +854,9 @@ interface AppState {
   rebootCli: () => string | null;
   /// Reboot the daemon on a machine, targeted by machine id.
   rebootDaemon: (machineId: string) => void;
+  /// Reboot every supplied machine daemon through the same per-machine,
+  /// server-authorized route, with one aggregate notification.
+  rebootDaemons: (machineIds: string[]) => void;
   requestPaneDiff: (paneId: number) => void;
   paneDiffs: Record<number, PaneDiff>;
   createPanePr: (paneId: number) => void;
@@ -2815,17 +2818,40 @@ export const useStore = create<AppState>((set, get) => ({
   /// authorizes the machine against the ones this account can reach and
   /// reports an offline daemon rather than silently dropping the request.
   rebootDaemon: (machineId: string) => {
-    const { ws, showToast } = get();
     if (!machineId) return;
+    get().rebootDaemons([machineId]);
+  },
+
+  rebootDaemons: (machineIds: string[]) => {
+    const { ws, showToast } = get();
+    const uniqueMachineIds = [...new Set(machineIds.filter(Boolean))];
+    if (uniqueMachineIds.length === 0) return;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      showToast("Not connected — reboot the daemon manually on the machine", "error");
+      showToast(
+        uniqueMachineIds.length === 1
+          ? "Not connected — reboot the daemon manually on the machine"
+          : "Not connected — reboot the daemons manually on the machines",
+        "error",
+      );
       return;
     }
     try {
-      ws.send(JSON.stringify({ type: "reboot_daemon", machine_id: machineId }));
-      showToast("Daemon reboot requested", "info");
+      for (const machineId of uniqueMachineIds) {
+        ws.send(JSON.stringify({ type: "reboot_daemon", machine_id: machineId }));
+      }
+      showToast(
+        uniqueMachineIds.length === 1
+          ? "Daemon reboot requested"
+          : `Reboot requested for ${uniqueMachineIds.length} daemons`,
+        "info",
+      );
     } catch {
-      showToast("The reboot request could not be sent", "error");
+      showToast(
+        uniqueMachineIds.length === 1
+          ? "The reboot request could not be sent"
+          : "One or more reboot requests could not be sent",
+        "error",
+      );
     }
   },
 

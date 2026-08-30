@@ -1,4 +1,5 @@
 use anyhow::Result;
+#[cfg(not(test))]
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -140,24 +141,27 @@ impl Default for LocalConfig {
 /// test wrote one last wins for every other thread, however carefully each
 /// test locks its own writes.
 ///
-/// That raced. `project::tests` seed a temp `XDG_CONFIG_HOME` and assert on
-/// files under it; `mode::dual_pane` tests concurrently call
-/// `get_or_create_project`, which registers into `config_dir()/projects.json`
-/// -- resolving, for those few milliseconds, to the project tests' directory.
-/// The `!preferred_path.exists()` assertions then failed at random.
+/// That raced. Registry tests and `mode::dual_pane` tests concurrently call
+/// `get_or_create_project`; sharing environment overrides made their writes
+/// land in one another's registries, and a missing override could reach the
+/// user's real registry.
 ///
 /// A thread-local override removes the shared state instead of locking around
 /// it: each test thread resolves its own directory, with no lock and no
-/// required ordering between tests. Tests that exercise env-based resolution
-/// (`project::tests`) simply install no override and keep the real path.
+/// required ordering between tests. A process-wide temporary default also
+/// ensures a test that forgets to opt into a fresh directory cannot touch the
+/// user's real config.
 #[cfg(test)]
 pub(crate) mod test_config {
     use std::cell::RefCell;
     use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
 
     thread_local! {
         static OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
     }
+
+    static DEFAULT: OnceLock<tempfile::TempDir> = OnceLock::new();
 
     /// Redirects `Config::config_dir()` on this thread for as long as it is
     /// held, then restores whatever was there before -- so nesting is safe and
@@ -194,33 +198,46 @@ pub(crate) mod test_config {
     pub(super) fn current() -> Option<PathBuf> {
         OVERRIDE.with(|slot| slot.borrow().clone())
     }
+
+    /// Keep every otherwise-unisolated unit test out of the user's real APAS
+    /// config directory. Individual tests can still install a thread-local
+    /// override when they need a fresh, empty registry.
+    pub(super) fn default_dir() -> PathBuf {
+        DEFAULT
+            .get_or_init(|| tempfile::tempdir().expect("default test config dir"))
+            .path()
+            .to_path_buf()
+    }
 }
 
 impl Config {
     pub fn config_dir() -> Result<PathBuf> {
         // Tests isolate themselves per-thread; env vars can't, see `test_config`.
         #[cfg(test)]
-        if let Some(dir) = test_config::current() {
+        {
+            let dir = test_config::current().unwrap_or_else(test_config::default_dir);
             std::fs::create_dir_all(&dir)?;
             return Ok(dir);
         }
-        // Escape hatch. Without it every code path that touches
-        // `get_or_create_project` writes into the real `~/.config/apas/` --
-        // including tests, which registered one entry per temp dir and left
-        // dozens of dead paths the daemon then tried to spawn projects for.
-        // Also useful operationally: two daemons on one host, or a throwaway
-        // config for testing, without touching the user's real state.
-        if let Some(dir) = std::env::var_os("APAS_CONFIG_DIR") {
-            let dir = PathBuf::from(dir);
-            std::fs::create_dir_all(&dir)?;
-            return Ok(dir);
-        }
-        let proj_dirs = ProjectDirs::from("com", "apas", "apas")
-            .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?;
+        #[cfg(not(test))]
+        {
+            // Escape hatch. Without it every code path that touches
+            // `get_or_create_project` writes into the real `~/.config/apas/` --
+            // including ad-hoc development commands. Also useful operationally:
+            // two daemons on one host, or a throwaway config for testing,
+            // without touching the user's real state.
+            if let Some(dir) = std::env::var_os("APAS_CONFIG_DIR") {
+                let dir = PathBuf::from(dir);
+                std::fs::create_dir_all(&dir)?;
+                return Ok(dir);
+            }
+            let proj_dirs = ProjectDirs::from("com", "apas", "apas")
+                .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?;
 
-        let config_dir = proj_dirs.config_dir();
-        std::fs::create_dir_all(config_dir)?;
-        Ok(config_dir.to_path_buf())
+            let config_dir = proj_dirs.config_dir();
+            std::fs::create_dir_all(config_dir)?;
+            Ok(config_dir.to_path_buf())
+        }
     }
 
     pub fn config_path() -> Result<PathBuf> {

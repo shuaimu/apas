@@ -246,6 +246,22 @@ struct ProjectEntry {
     last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ResumeProject {
+    project_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ResumeManifestEntry {
+    Detailed(ResumeProject),
+    /// Compatibility with manifests written by versions before paths were
+    /// included. Those can still resume when the registry is healthy.
+    LegacyProjectId(String),
+}
+
 /// Projects that were running when this instance replaced itself.
 ///
 /// Under the process-per-project model an upgrade left projects alone: they
@@ -262,23 +278,23 @@ fn resume_manifest_path() -> Option<std::path::PathBuf> {
     Some(dir.join("resume.json"))
 }
 
-fn write_resume_manifest(project_ids: &[String]) {
+fn write_resume_manifest(projects: &[ResumeProject]) {
     let Some(path) = resume_manifest_path() else {
         return;
     };
-    write_resume_manifest_at(&path, project_ids);
+    write_resume_manifest_at(&path, projects);
 }
 
 /// The manifest logic, given its path. Split out so it is testable without
 /// mutating process-wide environment variables — several test modules already
 /// move `XDG_RUNTIME_DIR` under their own locks, and adding another writer
 /// makes them race rather than serialise.
-fn write_resume_manifest_at(path: &std::path::Path, project_ids: &[String]) {
-    if project_ids.is_empty() {
+fn write_resume_manifest_at(path: &std::path::Path, projects: &[ResumeProject]) {
+    if projects.is_empty() {
         let _ = std::fs::remove_file(path);
         return;
     }
-    match serde_json::to_vec(project_ids) {
+    match serde_json::to_vec(projects) {
         Ok(bytes) => {
             if let Err(err) = std::fs::write(path, bytes) {
                 // Losing this costs a restart of the projects, not the
@@ -292,19 +308,29 @@ fn write_resume_manifest_at(path: &std::path::Path, project_ids: &[String]) {
 
 /// Read and clear the manifest. Cleared on read so a crash during resume does
 /// not leave the instance trying the same start on every boot.
-fn take_resume_manifest() -> Vec<String> {
+fn take_resume_manifest() -> Vec<ResumeProject> {
     match resume_manifest_path() {
         Some(path) => take_resume_manifest_at(&path),
         None => Vec::new(),
     }
 }
 
-fn take_resume_manifest_at(path: &std::path::Path) -> Vec<String> {
+fn take_resume_manifest_at(path: &std::path::Path) -> Vec<ResumeProject> {
     let Ok(bytes) = std::fs::read(path) else {
         return Vec::new();
     };
     let _ = std::fs::remove_file(path);
-    serde_json::from_slice(&bytes).unwrap_or_default()
+    serde_json::from_slice::<Vec<ResumeManifestEntry>>(&bytes)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| match entry {
+            ResumeManifestEntry::Detailed(project) => project,
+            ResumeManifestEntry::LegacyProjectId(project_id) => ResumeProject {
+                project_id,
+                path: None,
+            },
+        })
+        .collect()
 }
 
 /// Re-exec into the installed binary when it is newer than the running one.
@@ -331,7 +357,7 @@ fn take_resume_manifest_at(path: &std::path::Path) -> Vec<String> {
 ///
 /// Returns only on failure — on success the process image is gone.
 #[cfg(unix)]
-fn exec_into_newer_binary(version: &str, running: &[String]) -> std::io::Error {
+fn exec_into_newer_binary(version: &str, running: &[ResumeProject]) -> std::io::Error {
     use std::os::unix::process::CommandExt;
     // `exec` runs no destructors, so this is the last moment the replacement
     // can be told what was running.
@@ -346,26 +372,6 @@ fn exec_into_newer_binary(version: &str, running: &[String]) -> std::io::Error {
     std::process::Command::new(exe).args(args).exec()
 }
 
-/// What a requested daemon restart should do before replacing itself.
-///
-/// Separated from the replacement so the decision is testable: the `exec` that
-/// follows never returns, which makes it the one part that cannot be asserted
-/// on directly.
-#[derive(Debug, PartialEq)]
-enum RestartPlan {
-    /// A newer version is available; install it, then replace.
-    UpdateThenReplace(String),
-    /// Already current; replace with the same binary.
-    ReplaceInPlace,
-}
-
-fn plan_daemon_restart(available: Option<String>) -> RestartPlan {
-    match available {
-        Some(newer) => RestartPlan::UpdateThenReplace(newer),
-        None => RestartPlan::ReplaceInPlace,
-    }
-}
-
 /// Apply a requested restart. Returns only on failure — success replaces this
 /// process image.
 ///
@@ -373,26 +379,21 @@ fn plan_daemon_restart(available: Option<String>) -> RestartPlan {
 /// update leaves a working daemon rather than a machine with none. That is
 /// the same discipline `prepare_cli_restart` uses for project CLIs.
 #[cfg(unix)]
-fn perform_requested_restart(running: &[String]) -> anyhow::Error {
-    match plan_daemon_restart(crate::update::check_for_update_available()) {
-        RestartPlan::UpdateThenReplace(newer) => {
-            tracing::info!(%newer, "daemon restart requested: preparing update before replacing");
-            match crate::update::prepare_cli_restart() {
-                Ok(_) => {}
-                Err(err) => {
-                    // Nothing has been replaced, so the machine keeps the
-                    // daemon it had.
-                    tracing::error!(%err, "daemon restart: update failed; staying on the current daemon");
-                    return err;
-                }
-            }
-            anyhow::Error::from(exec_into_newer_binary(&newer, running))
+fn perform_requested_restart(running: &[ResumeProject]) -> anyhow::Error {
+    tracing::info!("daemon restart requested: preparing replacement");
+    let executable = match crate::update::prepare_cli_restart() {
+        Ok(executable) => executable,
+        Err(err) => {
+            // Nothing has been replaced, so the machine keeps the daemon it
+            // had. The updater lock also ensures a peer cannot be midway
+            // through replacing the shared executable when validation runs.
+            tracing::error!(%err, "daemon restart: update failed; staying on the current daemon");
+            return err;
         }
-        RestartPlan::ReplaceInPlace => {
-            tracing::info!("daemon restart requested: already current, replacing in place");
-            anyhow::Error::from(exec_into_newer_binary(env!("APAS_VERSION"), running))
-        }
-    }
+    };
+    let version = crate::update::binary_version(&executable)
+        .unwrap_or_else(|| env!("APAS_VERSION").to_string());
+    anyhow::Error::from(exec_into_newer_binary(&version, running))
 }
 
 #[derive(Debug)]
@@ -422,6 +423,14 @@ struct DaemonState {
     running: HashMap<String, RunningProject>,
 }
 
+fn should_forget_project(
+    seen_in_registry: bool,
+    has_running_task: bool,
+    has_legacy_session: bool,
+) -> bool {
+    !seen_in_registry && !has_running_task && !has_legacy_session
+}
+
 impl DaemonState {
     fn new(machine_info: MachineInfo) -> Self {
         Self {
@@ -437,7 +446,10 @@ impl DaemonState {
             Ok(projects) => projects,
             Err(err) => {
                 tracing::warn!("Failed to read project registry: {}", err);
-                Vec::new()
+                // A failed read says nothing about which projects disappeared.
+                // Retain the last known inventory; treating an NFS/JSON error
+                // as an empty registry erased the only paths a restart had.
+                return;
             }
         };
         let mut seen = HashSet::new();
@@ -471,7 +483,11 @@ impl DaemonState {
             .projects
             .keys()
             .filter(|project_id| {
-                !seen.contains(*project_id) && !self.sessions.contains_key(*project_id)
+                should_forget_project(
+                    seen.contains(*project_id),
+                    self.running.contains_key(*project_id),
+                    self.sessions.contains_key(*project_id),
+                )
             })
             .cloned()
             .collect();
@@ -565,6 +581,71 @@ impl DaemonState {
             .filter(|(_, project)| !project.handle.is_finished())
             .map(|(id, _)| id.clone())
             .collect()
+    }
+
+    /// Record both identity and path so a replacement does not need the
+    /// shared registry in order to find what this exact process was running.
+    fn running_projects_for_resume(&self) -> Vec<ResumeProject> {
+        self.running
+            .iter()
+            .filter(|(_, running)| !running.handle.is_finished())
+            .filter_map(|(project_id, _)| {
+                self.projects.get(project_id).map(|project| ResumeProject {
+                    project_id: project_id.clone(),
+                    path: Some(project.path.clone()),
+                })
+            })
+            .collect()
+    }
+
+    /// Rehydrate a project path from the handoff manifest when the shared
+    /// registry is unavailable or has lost the entry. The `.apas` file is the
+    /// project-local authority, so require its id to match before adopting it.
+    fn restore_project_from_resume(&mut self, project: &ResumeProject) -> Result<()> {
+        if self.projects.contains_key(&project.project_id) {
+            return Ok(());
+        }
+        let path = project.path.as_ref().with_context(|| {
+            format!(
+                "project {} is absent from the registry and its legacy resume record has no path",
+                project.project_id
+            )
+        })?;
+        let metadata_path = crate::project::get_apas_path(path);
+        let raw = std::fs::read_to_string(&metadata_path)
+            .with_context(|| format!("read resume metadata {}", metadata_path.display()))?;
+        let mut metadata: crate::project::ProjectMetadata = serde_json::from_str(&raw)
+            .with_context(|| format!("parse resume metadata {}", metadata_path.display()))?;
+        metadata.migrate_legacy();
+        if metadata.id.to_string() != project.project_id {
+            anyhow::bail!(
+                "resume metadata {} belongs to {}, expected {}",
+                metadata_path.display(),
+                metadata.id,
+                project.project_id
+            );
+        }
+
+        // Repair the discovery index when possible, but do not make a healthy
+        // project depend on that shared write: the in-memory entry is enough
+        // to resume it and later heartbeats can retry registration.
+        if let Err(err) = crate::project::register_project(path, &metadata) {
+            tracing::warn!(
+                project_id = %project.project_id,
+                path = %path.display(),
+                %err,
+                "could not repair project registry from resume metadata"
+            );
+        }
+        self.projects.insert(
+            project.project_id.clone(),
+            ProjectEntry {
+                name: metadata.name,
+                path: path.clone(),
+                last_error: None,
+            },
+        );
+        Ok(())
     }
 
     fn reconcile_running_claims(&mut self) {
@@ -1134,7 +1215,12 @@ pub async fn run(
     // Pane hosts are separate processes and survived the `exec`, so a prompt
     // resume lands inside their adoption grace and the terminal agents carry
     // straight on.
-    for project_id in take_resume_manifest() {
+    for project in take_resume_manifest() {
+        let project_id = project.project_id.clone();
+        if let Err(err) = state.restore_project_from_resume(&project) {
+            tracing::warn!(project_id, %err, "could not restore project path after replacement");
+            continue;
+        }
         if let Err(err) = state.start_project(&project_id, server_url, token, &restart_tx) {
             tracing::warn!(project_id, %err, "could not resume project after replacement");
         } else {
@@ -1466,7 +1552,9 @@ async fn run_connection(
                                 // replacing it disturbs nothing that is running.
                                 #[cfg(unix)]
                                 {
-                                    let err = perform_requested_restart(&state.running_project_ids());
+                                    let err = perform_requested_restart(
+                                        &state.running_projects_for_resume(),
+                                    );
                                     tracing::error!(
                                         %err,
                                         "requested daemon restart failed; continuing on the current daemon"
@@ -1723,7 +1811,10 @@ mod containment_tests {
 
 #[cfg(test)]
 mod resume_tests {
-    use super::{take_resume_manifest_at, write_resume_manifest_at};
+    use super::{
+        should_forget_project, take_resume_manifest_at, write_resume_manifest_at, ResumeProject,
+    };
+    use std::path::PathBuf;
 
     /// Under the process-per-project model an upgrade left projects alone —
     /// they were in their own tmux sessions and `exec` never touched them.
@@ -1734,10 +1825,21 @@ mod resume_tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("resume.json");
 
-        write_resume_manifest_at(&path, &["alpha".to_string(), "beta".to_string()]);
+        let projects = vec![
+            ResumeProject {
+                project_id: "alpha".to_string(),
+                path: Some(PathBuf::from("/projects/alpha")),
+            },
+            ResumeProject {
+                project_id: "beta".to_string(),
+                path: Some(PathBuf::from("/projects/beta")),
+            },
+        ];
+        write_resume_manifest_at(&path, &projects);
         assert_eq!(
             take_resume_manifest_at(&path),
-            vec!["alpha".to_string(), "beta".to_string()]
+            projects,
+            "paths survive so resume does not depend on the shared registry"
         );
 
         // Cleared on read: a crash during resume must not leave the instance
@@ -1750,28 +1852,36 @@ mod resume_tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("resume.json");
 
-        write_resume_manifest_at(&path, &["alpha".to_string()]);
+        write_resume_manifest_at(
+            &path,
+            &[ResumeProject {
+                project_id: "alpha".to_string(),
+                path: Some(PathBuf::from("/projects/alpha")),
+            }],
+        );
         write_resume_manifest_at(&path, &[]);
         assert!(take_resume_manifest_at(&path).is_empty());
     }
-}
 
-#[cfg(test)]
-mod restart_tests {
-    use super::{plan_daemon_restart, RestartPlan};
-
-    /// A requested restart is worth requesting because it picks up an update.
-    /// Restarting the same binary is the fallback, not the purpose.
     #[test]
-    fn a_requested_restart_updates_when_an_update_is_available() {
+    fn legacy_id_only_manifest_remains_readable() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("resume.json");
+        std::fs::write(&path, br#"["alpha"]"#).expect("write legacy manifest");
+
         assert_eq!(
-            plan_daemon_restart(Some("26.08.99".to_string())),
-            RestartPlan::UpdateThenReplace("26.08.99".to_string()),
+            take_resume_manifest_at(&path),
+            vec![ResumeProject {
+                project_id: "alpha".to_string(),
+                path: None,
+            }]
         );
     }
 
     #[test]
-    fn an_up_to_date_daemon_replaces_itself_in_place() {
-        assert_eq!(plan_daemon_restart(None), RestartPlan::ReplaceInPlace);
+    fn a_running_project_survives_a_missing_registry_entry() {
+        assert!(!should_forget_project(false, true, false));
+        assert!(!should_forget_project(false, false, true));
+        assert!(should_forget_project(false, false, false));
     }
 }

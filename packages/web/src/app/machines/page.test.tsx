@@ -154,6 +154,7 @@ function seedMachines(machines: MachineWithProjects[] = [machineEntry()]) {
     stopMachineProjectCli: vi.fn(),
     setMachineDeepseekConfig: vi.fn(),
     rebootDaemon: vi.fn(),
+    rebootDaemons: vi.fn(),
   };
 
   window.localStorage.setItem("apas_token", "test-token");
@@ -258,6 +259,25 @@ describe("MachinesPage daemon restart", () => {
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
 
     expect(actions.rebootDaemon).not.toHaveBeenCalled();
+  });
+
+  it("confirms once and requests every daemon in My Cluster", () => {
+    const actions = seedMachines([
+      machineAt("machine-a", "zoo-005", "26.08.74"),
+      machineAt("machine-b", "zoo-006", "26.08.70"),
+    ]);
+
+    render(<MachinesPage />);
+    fireEvent.click(screen.getByRole("button", { name: "Reboot all daemons" }));
+    expect(actions.rebootDaemons).not.toHaveBeenCalled();
+
+    const dialog = screen.getByRole("dialog", { name: "Reboot all daemons" });
+    expect(dialog.textContent).toContain("all 2 machines");
+    expect(dialog.textContent).toContain("1 daemon is behind");
+    expect(dialog.textContent).toContain("zoo-005, zoo-006");
+    fireEvent.click(screen.getAllByRole("button", { name: "Reboot all daemons" })[1]);
+
+    expect(actions.rebootDaemons).toHaveBeenCalledWith(["machine-a", "machine-b"]);
   });
 });
 
@@ -547,5 +567,6 @@ describe("MachinesPage cluster administration", () => {
     expect(screen.queryByText("Cluster default policy")).toBeNull();
     expect(screen.queryByText("Cluster activity")).toBeNull();
     expect(screen.queryByRole("button", { name: /Restart daemon on host-box/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reboot all daemons" })).toBeNull();
   });
 });

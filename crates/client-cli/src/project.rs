@@ -1,6 +1,9 @@
 use anyhow::Result;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use shared::PaneConfig;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
@@ -257,64 +260,113 @@ impl ProjectMetadata {
 
 pub fn project_registry_path() -> Result<PathBuf> {
     let path = crate::config::Config::config_dir()?.join(USER_PROJECTS_FILE);
-    maybe_migrate_legacy_project_registry(&path);
+    with_project_registry_lock(&path, true, || {
+        maybe_migrate_legacy_project_registry(&path);
+        Ok(())
+    })?;
     Ok(path)
 }
 
 pub fn list_registered_projects() -> Result<Vec<RegisteredProject>> {
     let path = project_registry_path()?;
-    let registry = read_existing_project_registry(&path)?;
-    Ok(registry.projects)
+    with_project_registry_lock(&path, false, || {
+        let registry = read_existing_project_registry(&path)?;
+        Ok(registry.projects)
+    })
 }
 
 pub fn register_project(dir: &Path, metadata: &ProjectMetadata) -> Result<()> {
     let path = project_registry_path()?;
-    let mut registry = match read_existing_project_registry(&path) {
-        Ok(registry) => registry,
-        Err(err) => {
-            tracing::warn!(
-                "Project registry at {:?} is unreadable ({}), recreating it",
-                path,
-                err
-            );
-            ProjectRegistry::default()
-        }
-    };
-    let normalized_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    let dir_str = normalized_dir.to_string_lossy().to_string();
-    let project_id = metadata.id.to_string();
+    register_project_at_registry_path(&path, dir, metadata)
+}
 
-    // De-duplicate by project id and by path.
-    registry
-        .projects
-        .retain(|entry| entry.project_id != project_id && entry.path != dir_str);
+fn register_project_at_registry_path(
+    path: &Path,
+    dir: &Path,
+    metadata: &ProjectMetadata,
+) -> Result<()> {
+    with_project_registry_lock(&path, true, || {
+        // Never turn a transient/partial NFS read into a one-project registry.
+        // The caller can keep running and retry; destroying the other entries
+        // makes the next daemon restart unable to find or resume them.
+        let mut registry = read_existing_project_registry(&path)?;
+        let normalized_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let dir_str = normalized_dir.to_string_lossy().to_string();
+        let project_id = metadata.id.to_string();
 
-    registry.projects.push(RegisteredProject {
-        project_id,
-        name: metadata.name.clone(),
-        path: dir_str,
-    });
-    registry.projects.sort_by(|a, b| a.path.cmp(&b.path));
+        // De-duplicate by project id and by path.
+        registry
+            .projects
+            .retain(|entry| entry.project_id != project_id && entry.path != dir_str);
 
-    write_project_registry(&path, &registry)
+        registry.projects.push(RegisteredProject {
+            project_id,
+            name: metadata.name.clone(),
+            path: dir_str,
+        });
+        registry.projects.sort_by(|a, b| a.path.cmp(&b.path));
+
+        write_project_registry(&path, &registry)
+    })
 }
 
 /// Remove exactly one project/path pair from the local registry. This is used
 /// by marker-bound provisioning cleanup before the checkout is deleted.
 pub fn unregister_project(dir: &Path, project_id: Uuid) -> Result<bool> {
     let path = project_registry_path()?;
-    let mut registry = read_existing_project_registry(&path)?;
-    let normalized_dir = normalize_project_path(dir);
-    let before = registry.projects.len();
-    registry.projects.retain(|entry| {
-        !(entry.project_id == project_id.to_string()
-            && normalize_project_path(Path::new(&entry.path)) == normalized_dir)
-    });
-    if registry.projects.len() == before {
-        return Ok(false);
+    with_project_registry_lock(&path, true, || {
+        let mut registry = read_existing_project_registry(&path)?;
+        let normalized_dir = normalize_project_path(dir);
+        let before = registry.projects.len();
+        registry.projects.retain(|entry| {
+            !(entry.project_id == project_id.to_string()
+                && normalize_project_path(Path::new(&entry.path)) == normalized_dir)
+        });
+        if registry.projects.len() == before {
+            return Ok(false);
+        }
+        write_project_registry(&path, &registry)?;
+        Ok(true)
+    })
+}
+
+fn project_registry_lock_path(path: &Path) -> PathBuf {
+    path.with_extension("json.lock")
+}
+
+/// Run one registry operation while holding an advisory lock on shared NFS.
+///
+/// Linux implements `flock` on NFS using whole-file POSIX locks, so every APAS
+/// process on every host participates in the same critical section. The lock
+/// file is permanent; replacing `projects.json` by rename therefore cannot
+/// accidentally move the inode that carries the lock out from under a waiter.
+fn with_project_registry_lock<T>(
+    path: &Path,
+    exclusive: bool,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
-    write_project_registry(&path, &registry)?;
-    Ok(true)
+    let lock_path = project_registry_lock_path(path);
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    if exclusive {
+        FileExt::lock_exclusive(&lock_file)?;
+    } else {
+        FileExt::lock_shared(&lock_file)?;
+    }
+
+    let result = operation();
+    let unlock_result = FileExt::unlock(&lock_file);
+    match (result, unlock_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(err.into()),
+    }
 }
 
 fn read_project_registry(path: &Path) -> Result<ProjectRegistry> {
@@ -433,19 +485,31 @@ fn maybe_migrate_legacy_project_registry(preferred_path: &Path) {
 
 fn write_project_registry(path: &Path, registry: &ProjectRegistry) -> Result<()> {
     let content = serde_json::to_string_pretty(registry)?;
-    // PID in the tmp filename so concurrent apas processes (the daemon
-    // + per-project CLIs + spawned --headless workers, which often boot
-    // near-simultaneously) don't share a staging path. Previously they
-    // all wrote `projects.json.tmp` and raced — the late renamer hit
-    // ENOENT because an earlier process's rename had consumed the tmp.
+    // A UUID remains unique across hosts. A PID alone is host-local, so two
+    // NFS clients can otherwise stage to the same path and one rename consumes
+    // the other's file (the ENOENT loop seen during the 2026-08-30 incident).
     let tmp_path = project_registry_tmp_path(path);
-    std::fs::write(&tmp_path, content)?;
-    std::fs::rename(tmp_path, path)?;
-    Ok(())
+    let result = (|| -> Result<()> {
+        let mut tmp = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)?;
+        tmp.write_all(content.as_bytes())?;
+        tmp.sync_all()?;
+        std::fs::rename(&tmp_path, path)?;
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
 }
 
 fn project_registry_tmp_path(path: &Path) -> PathBuf {
-    path.with_extension(format!("json.{}.tmp", std::process::id()))
+    path.with_extension(format!("json.{}.tmp", Uuid::new_v4()))
 }
 
 fn normalize_project_path(path: &Path) -> PathBuf {
@@ -469,8 +533,11 @@ fn find_registered_project_by_path_in_registry(
 
 fn find_registered_project_by_path(dir: &Path) -> Option<RegisteredProject> {
     let path = project_registry_path().ok()?;
-    let registry = read_existing_project_registry(&path).ok()?;
-    find_registered_project_by_path_in_registry(&registry, dir)
+    with_project_registry_lock(&path, false, || {
+        let registry = read_existing_project_registry(&path)?;
+        Ok(find_registered_project_by_path_in_registry(&registry, dir))
+    })
+    .ok()?
 }
 
 /// Get or create the .apas metadata file for a directory
@@ -610,8 +677,8 @@ pub fn is_project(dir: &Path) -> bool {
 /// Environment isolation shared by every test that touches the project
 /// registry. It lives outside `mod tests` because `main.rs` needs it too, and
 /// a second copy of the lock would not serialise against this one — which is
-/// the whole point, since these tests mutate `HOME` and `XDG_CONFIG_HOME`
-/// process-wide.
+/// the whole point, since these tests mutate `HOME` process-wide to exercise
+/// legacy-registry migration.
 #[cfg(test)]
 pub(crate) mod test_support {
 
@@ -639,18 +706,16 @@ pub(crate) mod test_support {
 
     pub(crate) fn with_isolated_config<T>(test: impl FnOnce() -> T) -> T {
         let guard = env_lock();
-        let xdg_config_home = tempfile::tempdir().expect("temp xdg config home");
+        let config = crate::config::test_config::isolated_config_dir();
         let home = tempfile::tempdir().expect("temp home");
-        let old_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
         let old_home = std::env::var_os("HOME");
 
-        std::env::set_var("XDG_CONFIG_HOME", xdg_config_home.path());
         std::env::set_var("HOME", home.path());
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test));
 
-        restore_env_var("XDG_CONFIG_HOME", old_xdg_config_home);
         restore_env_var("HOME", old_home);
+        drop(config);
 
         // Release before resuming: unwinding through the guard is what poisoned
         // the lock for every test that came after.
@@ -783,16 +848,19 @@ mod tests {
     }
 
     #[test]
-    fn project_registry_tmp_path_includes_process_id() {
+    fn project_registry_tmp_path_is_unique_across_hosts() {
         let path = unique_temp_dir("tmp-path").join(USER_PROJECTS_FILE);
-        let tmp_path = project_registry_tmp_path(&path);
-        let expected_name = format!("projects.json.{}.tmp", std::process::id());
+        let first = project_registry_tmp_path(&path);
+        let second = project_registry_tmp_path(&path);
+        let first_name = first
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("utf-8 temp filename");
 
-        assert_eq!(
-            tmp_path.file_name().and_then(|name| name.to_str()),
-            Some(expected_name.as_str())
-        );
-        assert_ne!(tmp_path, path.with_extension("json.tmp"));
+        assert!(first_name.starts_with("projects.json."));
+        assert!(first_name.ends_with(".tmp"));
+        assert_ne!(first, second, "a UUID, unlike a PID, is cross-host unique");
+        assert_ne!(first, path.with_extension("json.tmp"));
     }
 
     #[test]
@@ -801,7 +869,6 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let path = dir.join(USER_PROJECTS_FILE);
         let shared_tmp_path = path.with_extension("json.tmp");
-        let pid_tmp_path = project_registry_tmp_path(&path);
         let expected_project = RegisteredProject {
             project_id: Uuid::new_v4().to_string(),
             name: Some("demo".to_string()),
@@ -817,9 +884,15 @@ mod tests {
             !shared_tmp_path.exists(),
             "shared projects.json.tmp should not remain"
         );
+        let temporary_entries: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read registry dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with("projects.json.") && name.ends_with(".tmp"))
+            .collect();
         assert!(
-            !pid_tmp_path.exists(),
-            "pid-scoped temp file should be renamed away"
+            temporary_entries.is_empty(),
+            "unique staging files should be renamed away: {temporary_entries:?}"
         );
 
         let content = std::fs::read_to_string(&path).expect("read registry");
@@ -1002,6 +1075,53 @@ mod tests {
                 .projects
                 .iter()
                 .any(|project| project.path == z_path));
+        });
+    }
+
+    #[test]
+    fn register_project_never_replaces_an_unreadable_registry() {
+        with_isolated_config(|| {
+            let registry_path = preferred_registry_path();
+            std::fs::create_dir_all(registry_path.parent().expect("registry parent"))
+                .expect("create registry parent");
+            let corrupt = b"{not valid json";
+            std::fs::write(&registry_path, corrupt).expect("write corrupt registry");
+
+            let project_dir = tempfile::tempdir().expect("temp project");
+            let metadata = ProjectMetadata::with_name("must-not-replace".to_string());
+            assert!(
+                register_project(project_dir.path(), &metadata).is_err(),
+                "a corrupt shared index must be preserved for recovery"
+            );
+            assert_eq!(
+                std::fs::read(&registry_path).expect("read preserved registry"),
+                corrupt
+            );
+        });
+    }
+
+    #[test]
+    fn concurrent_registry_updates_keep_every_project() {
+        with_isolated_config(|| {
+            let projects_root = tempfile::tempdir().expect("temp projects root");
+            let registry_path = preferred_registry_path();
+            let mut workers = Vec::new();
+            for index in 0..16 {
+                let dir = projects_root.path().join(format!("project-{index:02}"));
+                std::fs::create_dir_all(&dir).expect("create project dir");
+                let metadata = ProjectMetadata::with_name(format!("project-{index:02}"));
+                let registry_path = registry_path.clone();
+                workers.push(std::thread::spawn(move || {
+                    register_project_at_registry_path(&registry_path, &dir, &metadata)
+                        .expect("register concurrently");
+                }));
+            }
+            for worker in workers {
+                worker.join().expect("registry worker");
+            }
+
+            let registered = list_registered_projects().expect("read registry");
+            assert_eq!(registered.len(), 16, "no read/modify/write update was lost");
         });
     }
 

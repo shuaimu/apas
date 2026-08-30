@@ -1,8 +1,10 @@
 //! Auto-update functionality for the APAS CLI
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use std::env;
 use std::fs;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -44,6 +46,36 @@ fn source_dir() -> PathBuf {
     dir
 }
 
+fn update_lock_path() -> PathBuf {
+    source_dir().with_file_name("update.lock")
+}
+
+/// Serialize the shared source checkout, Cargo target, and installed binary
+/// across every daemon using this NFS home. The lock file is permanent so its
+/// inode remains stable while binaries and Git files are atomically replaced.
+fn with_update_lock<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    with_update_lock_at(&update_lock_path(), operation)
+}
+
+fn with_update_lock_at<T>(path: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    FileExt::lock_exclusive(&lock_file)?;
+    let result = operation();
+    let unlock_result = FileExt::unlock(&lock_file);
+    match (result, unlock_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(err.into()),
+    }
+}
+
 /// Parse version string (YY.MM.COMMIT) into comparable tuple
 fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
     // Format: YY.MM.COMMIT (e.g., 26.01.42)
@@ -55,6 +87,13 @@ fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
     let mm: u64 = parts[1].parse().ok()?;
     let commit: u64 = parts[2].parse().ok()?;
     Some((yy, mm, commit))
+}
+
+fn version_at_least(candidate: &str, required: &str) -> bool {
+    matches!(
+        (parse_version(candidate), parse_version(required)),
+        (Some(candidate), Some(required)) if candidate >= required
+    )
 }
 
 /// Get the path to the current executable as reported by the OS.
@@ -625,39 +664,55 @@ fn restart_self() {
 /// writing a handoff marker or setting shutdown; failure therefore leaves the
 /// existing process fully operational.
 pub fn prepare_cli_restart() -> Result<PathBuf> {
-    if let Some(newer) = check_for_update_available() {
-        if pending_update_needs_rebuild() {
-            eprintln!(
-                "[Restart] Newer git version detected ({} > {}), preparing update while panes stay attached...",
-                newer, CURRENT_VERSION
-            );
-            let binary = pull_and_build()?;
-            install_binary(&binary)?;
-        } else {
-            eprintln!(
-                "[Restart] Version {} only changes web/docs; validating the current binary",
-                newer
-            );
+    let executable = with_update_lock(|| {
+        if let Some(newer) = check_for_update_available() {
+            let installed = resolve_preferred_apas_executable();
+            let installed_version = binary_version(&installed);
+            if installed_version
+                .as_deref()
+                .is_some_and(|version| version_at_least(version, &newer))
+            {
+                // Another host completed this shared-NFS update while this
+                // daemon waited for the lock. Reuse it instead of rebuilding
+                // and replacing the same binary again.
+                eprintln!(
+                    "[Restart] Shared install already provides version {}; reusing it",
+                    installed_version.as_deref().unwrap_or(&newer)
+                );
+            } else if pending_update_needs_rebuild() {
+                eprintln!(
+                    "[Restart] Newer git version detected ({} > {}), preparing update while panes stay attached...",
+                    newer, CURRENT_VERSION
+                );
+                let binary = pull_and_build()?;
+                install_binary(&binary)?;
+            } else {
+                eprintln!(
+                    "[Restart] Version {} only changes web/docs; validating the current binary",
+                    newer
+                );
+            }
         }
-    }
 
-    let executable = resolve_preferred_apas_executable();
-    let metadata = fs::metadata(&executable).with_context(|| {
-        format!(
-            "prepared executable {} is unavailable",
-            executable.display()
-        )
+        let executable = resolve_preferred_apas_executable();
+        let metadata = fs::metadata(&executable).with_context(|| {
+            format!(
+                "prepared executable {} is unavailable",
+                executable.display()
+            )
+        })?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            anyhow::bail!("prepared executable {} is invalid", executable.display());
+        }
+        let status = Command::new(&executable)
+            .arg("--version")
+            .status()
+            .with_context(|| format!("validate prepared executable {}", executable.display()))?;
+        if !status.success() {
+            anyhow::bail!("prepared executable failed its version probe");
+        }
+        Ok(executable)
     })?;
-    if !metadata.is_file() || metadata.len() == 0 {
-        anyhow::bail!("prepared executable {} is invalid", executable.display());
-    }
-    let status = Command::new(&executable)
-        .arg("--version")
-        .status()
-        .with_context(|| format!("validate prepared executable {}", executable.display()))?;
-    if !status.success() {
-        anyhow::bail!("prepared executable failed its version probe");
-    }
     *prepared_restart_slot()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(executable.clone());
@@ -775,7 +830,49 @@ mod tests {
     }
 
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
     use tempfile::tempdir;
+
+    #[test]
+    fn version_at_least_requires_parseable_ordered_versions() {
+        assert!(version_at_least("26.08.119", "26.08.119"));
+        assert!(version_at_least("26.09.1", "26.08.119"));
+        assert!(!version_at_least("26.08.118", "26.08.119"));
+        assert!(!version_at_least("development", "26.08.119"));
+    }
+
+    #[test]
+    fn update_lock_serializes_concurrent_preparations() {
+        let dir = tempfile::tempdir().expect("temp update lock dir");
+        let lock_path = dir.path().join("update.lock");
+        let barrier = Arc::new(Barrier::new(8));
+        let active = Arc::new(AtomicUsize::new(0));
+        let entries = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::new();
+
+        for _ in 0..8 {
+            let lock_path = lock_path.clone();
+            let barrier = Arc::clone(&barrier);
+            let active = Arc::clone(&active);
+            let entries = Arc::clone(&entries);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                with_update_lock_at(&lock_path, || {
+                    assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
+                    entries.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    assert_eq!(active.fetch_sub(1, Ordering::SeqCst), 1);
+                    Ok(())
+                })
+                .expect("serialized update lock");
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("update worker");
+        }
+        assert_eq!(entries.load(Ordering::SeqCst), 8);
+    }
 
     fn touch(path: &Path) {
         fs::write(path, b"apas").unwrap();

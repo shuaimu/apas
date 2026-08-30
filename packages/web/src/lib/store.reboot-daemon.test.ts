@@ -50,4 +50,20 @@ describe("rebootDaemon", () => {
       useStore.getState().toasts.some((toast) => toast.kind === "error"),
     ).toBe(true);
   });
+
+  it("fans a fleet reboot through the authorized per-machine message", async () => {
+    const ws = await connected();
+    ws.send.mockClear();
+
+    useStore.getState().rebootDaemons(["machine-b", "machine-c", "machine-b", ""]);
+
+    expect(ws.send).toHaveBeenCalledTimes(2);
+    expect(ws.send.mock.calls.map(([raw]) => JSON.parse(String(raw)))).toEqual([
+      { type: "reboot_daemon", machine_id: "machine-b" },
+      { type: "reboot_daemon", machine_id: "machine-c" },
+    ]);
+    expect(useStore.getState().toasts.at(-1)?.message).toBe(
+      "Reboot requested for 2 daemons",
+    );
+  });
 });

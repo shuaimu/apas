@@ -82,6 +82,9 @@ portable-pty = "0.9"
 # sequences and ANSI escapes, so the frames can't be typed as JSON strings.
 base64 = "0.22"
 tempfile = "3"
+# The project registry lives on shared NFS. Advisory locks serialize its
+# cross-host read/modify/write cycle so one daemon cannot erase a peer's entry.
+fs2 = "0.4"
 
 # MCP server (`apas mcp-server`) — the typed front door panes use instead of
 # hand-assembling `.apas-team.jsonl` tags in bash. Official Rust SDK; verified
