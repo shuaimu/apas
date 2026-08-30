@@ -63,6 +63,31 @@ describe("usage limit availability", () => {
     expect(paneUsageLimit({ cliClientId: "cli-1" }, pane, usage, NOW)).toBeNull();
   });
 
+  it("applies a Fable-scoped limit only to Fable panes", () => {
+    const limited = {
+      window: "weekly",
+      resetsAt: "2026-08-23T13:00:00Z",
+      model: "Fable",
+    };
+    const usage = new Map<string, UsageLimitsByProvider>([
+      ["cli-1", { claude: { sevenDay: { utilization: 0.86 }, usageLimited: limited } }],
+    ]);
+
+    expect(paneUsageLimit(
+      { cliClientId: "cli-1" },
+      claudePane({ model: "claude-opus-4-6" }),
+      usage,
+      NOW,
+    )).toBeNull();
+    expect(paneUsageLimit(
+      { cliClientId: "cli-1" },
+      claudePane({ model: "claude-fable-5" }),
+      usage,
+      NOW,
+    )).toEqual(limited);
+    expect(usageLimitedLabel(limited)).toBe("Fable weekly usage limited");
+  });
+
   it("uses the pane snapshot when detailed account usage is private or absent", () => {
     const pane = claudePane({
       usage_limited: {

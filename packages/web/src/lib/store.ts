@@ -153,6 +153,8 @@ export interface UsageLimits {
 export interface UsageLimitedStatus {
   window: string;
   resetsAt?: string;
+  /** Provider model family this block applies to; absent means account-wide. */
+  model?: string;
 }
 
 export type Provider = "claude" | "codex" | "minimax" | "glm" | "deepseek" | "opencode" | "cursor-agent";
@@ -5489,27 +5491,31 @@ export function handleServerMessage(
           };
         };
 
+        const toUsageLimited = (raw: unknown): UsageLimitedStatus | undefined => {
+          if (!raw || typeof raw !== "object") return undefined;
+          const limited = raw as Record<string, unknown>;
+          if (typeof limited.window !== "string" || !limited.window.trim()) return undefined;
+          const resetRaw =
+            limited.resets_at ??
+            limited.reset_at ??
+            limited.resetsAt ??
+            limited.resetAt;
+          return {
+            window: limited.window,
+            resetsAt: typeof resetRaw === "string" ? resetRaw : undefined,
+            model: typeof limited.model === "string" && limited.model.trim()
+              ? limited.model
+              : undefined,
+          };
+        };
+
         const parsedLimits: UsageLimits = {
           fiveHour: toWindow(limits.five_hour ?? limits.fiveHour),
           sevenDay: toWindow(limits.seven_day ?? limits.sevenDay),
           fetchedAt:
             (typeof limits.fetched_at === "string" ? limits.fetched_at : undefined) ??
             (typeof limits.fetchedAt === "string" ? limits.fetchedAt : undefined),
-          usageLimited: (() => {
-            const raw = limits.usage_limited ?? limits.usageLimited;
-            if (!raw || typeof raw !== "object") return undefined;
-            const limited = raw as Record<string, unknown>;
-            if (typeof limited.window !== "string" || !limited.window.trim()) return undefined;
-            const resetRaw =
-              limited.resets_at ??
-              limited.reset_at ??
-              limited.resetsAt ??
-              limited.resetAt;
-            return {
-              window: limited.window,
-              resetsAt: typeof resetRaw === "string" ? resetRaw : undefined,
-            };
-          })(),
+          usageLimited: toUsageLimited(limits.usage_limited ?? limits.usageLimited),
         };
         set((state) => {
           const newMap = new Map(state.usageLimits);

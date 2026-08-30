@@ -2857,6 +2857,33 @@ pub struct UsageLimited {
         alias = "resetsAt"
     )]
     pub resets_at: Option<String>,
+    /// Model family this limit applies to. Absent means the provider account
+    /// is blocked generally. Anthropic currently uses display names such as
+    /// "Fable" for model-scoped weekly limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+impl UsageLimited {
+    /// Whether this provider-confirmed block applies to a pane's configured
+    /// model. A scoped limit must never make a default/other-model pane look
+    /// unavailable merely because both use the same provider account.
+    pub fn applies_to_model(&self, pane_model: Option<&str>) -> bool {
+        let Some(scope) = self
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return true;
+        };
+        let Some(pane_model) = pane_model.map(str::trim).filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        let scope = scope.to_ascii_lowercase();
+        let pane_model = pane_model.to_ascii_lowercase();
+        pane_model == scope || pane_model.contains(&scope) || scope.contains(&pane_model)
+    }
 }
 
 /// Usage limits from the provider API/logs

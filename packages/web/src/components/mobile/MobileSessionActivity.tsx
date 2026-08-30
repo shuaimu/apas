@@ -139,11 +139,20 @@ function eventLabel(message: Message): string | null {
   return output.type.replaceAll("_", " ");
 }
 
+function isRoutineSystemUpdate(message: Message): boolean {
+  // Provider result envelopes only carry end-of-turn bookkeeping such as
+  // subtype, cost, and duration. They are useful to accounting/debug views,
+  // but rendering one as "Session update" after every Claude turn adds no
+  // conversational information on mobile.
+  return message.role === "system" && message.outputType?.type === "system";
+}
+
 function eventTitle(message: Message): string {
   const output = message.outputType;
   if (output?.type === "approval_request") return `${output.tool} requires permission`;
   if (output?.type === "tool_use") return output.tool === "AskUserQuestion" ? "Agent question" : `Using ${output.tool}`;
   if (output?.type === "tool_result") return `${output.tool} ${output.success ? "finished" : "failed"}`;
+  if (output?.type === "error") return message.content.trim().split("\n")[0] || "Session error";
   if (message.role === "user") return message.content.trim() || "Instruction sent";
   if (message.role === "system") return "Session update";
   return message.content.trim().split("\n")[0] || "Agent activity";
@@ -374,10 +383,16 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   }, [renameTarget, renameTargetExists]);
 
   const activity = useMemo(() => {
-    const items: ActivityItem[] = messages.map((message) => ({ key: `0:${message.id}`, message, paneId: MAIN_PANE_ID }));
+    const items: ActivityItem[] = messages
+      .filter((message) => !isRoutineSystemUpdate(message))
+      .map((message) => ({ key: `0:${message.id}`, message, paneId: MAIN_PANE_ID }));
     for (const [rawPaneId, paneActivity] of Object.entries(paneMessages)) {
       const paneId = Number(rawPaneId);
-      for (const message of paneActivity) items.push({ key: `${paneId}:${message.id}`, message, paneId });
+      for (const message of paneActivity) {
+        if (!isRoutineSystemUpdate(message)) {
+          items.push({ key: `${paneId}:${message.id}`, message, paneId });
+        }
+      }
     }
     items.sort((left, right) => left.message.timestamp.getTime() - right.message.timestamp.getTime());
     return items;

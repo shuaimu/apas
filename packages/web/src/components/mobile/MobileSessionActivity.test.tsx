@@ -190,6 +190,32 @@ describe("MobileSessionActivity", () => {
     await waitFor(() => expect(screen.getByPlaceholderText("Steer this session and pane")).toBeTruthy());
   });
 
+  it("hides routine result bookkeeping but keeps real system errors", () => {
+    seedStore({
+      paneMessages: {
+        "3": [
+          message({
+            id: "result-metadata",
+            role: "system",
+            content: "success - Cost: $0.0123, Duration: 4567ms",
+            outputType: { type: "system" },
+          }),
+          message({
+            id: "system-error",
+            role: "system",
+            content: "Claude could not continue because the session expired.",
+            outputType: { type: "error" },
+          }),
+        ],
+      },
+    });
+    renderActivity();
+
+    expect(screen.queryByText("Session update")).toBeNull();
+    expect(screen.queryByText(/Cost: \$0\.0123/)).toBeNull();
+    expect(screen.getByText("Claude could not continue because the session expired.")).toBeTruthy();
+  });
+
   it("shows the selected pane's live working state above the composer", () => {
     seedStore({ paneStatuses: { "3": "Editing src/session.ts…" } });
     renderActivity();

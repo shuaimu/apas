@@ -698,12 +698,15 @@ mod tests {
         // A project with working, idle, and human-blocked panes: the case the
         // old binary flag could not express without calling the pending pane
         // working too.
+        let mut fable_pane = test_pane(6, "Fable one");
+        fable_pane.model = Some("claude-fable-5".to_string());
         state.sessions.set_session_panes(
             &session_id,
             vec![
                 test_pane(3, "Busy one"),
                 test_pane(4, "Idle one"),
                 test_pane(5, "Needs answer"),
+                fable_pane,
             ],
         );
         state.sessions.set_pane_status(
@@ -731,6 +734,7 @@ mod tests {
                 usage_limited: Some(shared::UsageLimited {
                     window: "weekly".to_string(),
                     resets_at: Some("2026-08-23T13:00:00Z".to_string()),
+                    model: None,
                 }),
             },
         );
@@ -751,7 +755,7 @@ mod tests {
         assert!(response.sessions[0].session.is_working);
         // Per pane, so an idle agent inside a working project is findable.
         let panes = &response.sessions[0].session.panes;
-        assert_eq!(panes.len(), 3, "every pane state is reported");
+        assert_eq!(panes.len(), 4, "every pane state is reported");
         let busy = panes.iter().find(|pane| pane.pane_id == 3).unwrap();
         let idle = panes.iter().find(|pane| pane.pane_id == 4).unwrap();
         let pending = panes.iter().find(|pane| pane.pane_id == 5).unwrap();
@@ -775,6 +779,46 @@ mod tests {
                 .map(|limited| limited.window.as_str()),
             Some("weekly"),
             "provider availability is reported separately from pane work"
+        );
+        state.sessions.update_usage_limits(
+            cli_id,
+            shared::Provider::Claude,
+            shared::UsageLimits {
+                five_hour: None,
+                seven_day: Some(shared::UsageLimitWindow {
+                    utilization: 0.86,
+                    resets_at: Some("2026-08-30T13:00:00Z".to_string()),
+                }),
+                fetched_at: Some("2026-08-29T20:00:00Z".to_string()),
+                usage_limited: Some(shared::UsageLimited {
+                    window: "weekly".to_string(),
+                    resets_at: Some("2026-08-30T13:00:00Z".to_string()),
+                    model: Some("Fable".to_string()),
+                }),
+            },
+        );
+        let scoped = accessible_sessions(&state, &owner_id).await.unwrap();
+        let scoped_panes = &scoped
+            .iter()
+            .find(|summary| summary.session.id == session_id)
+            .unwrap()
+            .session
+            .panes;
+        assert!(scoped_panes
+            .iter()
+            .find(|pane| pane.pane_id == 4)
+            .unwrap()
+            .usage_limited
+            .is_none());
+        assert_eq!(
+            scoped_panes
+                .iter()
+                .find(|pane| pane.pane_id == 6)
+                .unwrap()
+                .usage_limited
+                .as_ref()
+                .and_then(|limited| limited.model.as_deref()),
+            Some("Fable")
         );
         // The two views agree, because they read the same statuses.
         assert!(panes.iter().any(|pane| pane.is_working));

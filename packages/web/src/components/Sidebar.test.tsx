@@ -557,6 +557,41 @@ describe("Sidebar project list", () => {
     expect(idleRow.compareDocumentPosition(limitedRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
+  it("does not apply a Fable-scoped limit to an ordinary Claude pane", () => {
+    seedSidebarState({
+      sessions: [makeSession({
+        id: "session-a",
+        cliClientId: "cli-a",
+        workingDir: "/repo/mako-cloud",
+        hostname: "zoo-005",
+        isActive: true,
+        panes: [
+          { pane_id: 305, label: "Claude 3", kind: "terminal", provider: "claude", is_working: false },
+          { pane_id: 306, label: "Fable", kind: "terminal", provider: "claude", model: "claude-fable-5", is_working: false },
+        ],
+      })],
+      usageLimits: new Map([[
+        "cli-a",
+        {
+          claude: {
+            sevenDay: { utilization: 0.86 },
+            usageLimited: {
+              window: "weekly",
+              resetsAt: "2099-08-30T13:00:00Z",
+              model: "Fable",
+            },
+          },
+        },
+      ]]),
+    });
+
+    render(<Sidebar />);
+    fireEvent.click(screen.getByRole("button", { name: "Idle sessions" }));
+
+    expect(screen.getByRole("button", { name: "Open Claude 3 in mako-cloud" }).textContent).toContain("Idle");
+    expect(screen.getByRole("button", { name: "Open Fable in mako-cloud" }).textContent).toContain("Fable weekly usage limited");
+  });
+
   it("shows pending answers ahead of idle and usage-limited agents", () => {
     seedSidebarState({
       sessions: [makeSession({

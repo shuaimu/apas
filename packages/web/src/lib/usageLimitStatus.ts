@@ -35,6 +35,28 @@ export function activeUsageLimit(
   return limited;
 }
 
+function usageLimitAppliesToPane(
+  limited: UsageLimitedStatus,
+  pane: SessionPaneSummary,
+): boolean {
+  const scope = limited.model?.trim().toLowerCase();
+  if (!scope) return true;
+  const paneModel = pane.model?.trim().toLowerCase();
+  if (!paneModel) return false;
+  return paneModel === scope
+    || paneModel.includes(scope)
+    || scope.includes(paneModel);
+}
+
+function activePaneUsageLimit(
+  limits: UsageLimits | undefined,
+  pane: SessionPaneSummary,
+  nowMs: number,
+): UsageLimitedStatus | null {
+  const limited = activeUsageLimit(limits, nowMs);
+  return limited && usageLimitAppliesToPane(limited, pane) ? limited : null;
+}
+
 /**
  * Resolve one pane's provider availability without conflating it with work.
  * A live per-client usage payload wins over the session-list snapshot; shared
@@ -51,22 +73,26 @@ export function paneUsageLimit(
     ? usageLimits.get(session.cliClientId)?.[provider]
     : undefined;
 
-  if (liveLimits) return activeUsageLimit(liveLimits, nowMs);
+  if (liveLimits) return activePaneUsageLimit(liveLimits, pane, nowMs);
 
-  return activeUsageLimit(
+  return activePaneUsageLimit(
     pane.usage_limited
       ? { usageLimited: {
           window: pane.usage_limited.window,
           resetsAt: pane.usage_limited.resetsAt
             ?? pane.usage_limited.resets_at,
+          model: pane.usage_limited.model,
         } }
       : undefined,
+    pane,
     nowMs,
   );
 }
 
 export function usageLimitedLabel(status: UsageLimitedStatus): string {
   const window = status.window.trim();
+  const model = status.model?.trim();
+  if (model) return window ? `${model} ${window} usage limited` : `${model} usage limited`;
   if (!window) return "Usage limited";
   return `${window[0].toUpperCase()}${window.slice(1)} usage limited`;
 }

@@ -216,6 +216,22 @@ struct ClaudeUsageLimit {
     resets_at: Option<String>,
     #[serde(default)]
     is_active: bool,
+    #[serde(default)]
+    scope: Option<ClaudeUsageLimitScope>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeUsageLimitScope {
+    #[serde(default)]
+    model: Option<ClaudeUsageLimitModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeUsageLimitModel {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -235,6 +251,17 @@ fn claude_limit_window(limit: &ClaudeUsageLimit) -> String {
     }
 }
 
+fn claude_limit_model(limit: &ClaudeUsageLimit) -> Option<String> {
+    let model = limit.scope.as_ref()?.model.as_ref()?;
+    model
+        .display_name
+        .as_deref()
+        .or(model.id.as_deref())
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+}
+
 fn map_claude_usage_response(api_response: UsageApiResponse, now: DateTime<Utc>) -> UsageLimits {
     let extra_usage_available = api_response
         .extra_usage
@@ -245,16 +272,33 @@ fn map_claude_usage_response(api_response: UsageApiResponse, now: DateTime<Utc>)
         .as_ref()
         .is_some_and(|extra| extra.spend_limit_reached);
 
-    let active_limit = api_response
+    let active_limits: Vec<&ClaudeUsageLimit> = api_response
         .limits
         .iter()
         .filter(|limit| limit.is_active && limit.percent >= 100.0)
-        .max_by(|left, right| left.resets_at.cmp(&right.resets_at));
+        .collect();
+    // A general account block takes precedence. Otherwise preserve a model
+    // scope instead of promoting (for example) Fable exhaustion into a block
+    // on every Claude model. Unknown non-model scopes are deliberately not
+    // presented as account-wide availability.
+    let active_limit = active_limits
+        .iter()
+        .copied()
+        .filter(|limit| limit.scope.is_none())
+        .max_by(|left, right| left.resets_at.cmp(&right.resets_at))
+        .or_else(|| {
+            active_limits
+                .iter()
+                .copied()
+                .filter(|limit| claude_limit_model(limit).is_some())
+                .max_by(|left, right| left.resets_at.cmp(&right.resets_at))
+        });
 
     let usage_limited = if spend_limit_reached {
         Some(UsageLimited {
             window: "monthly spend".to_string(),
             resets_at: None,
+            model: None,
         })
     } else if extra_usage_available {
         None
@@ -262,6 +306,7 @@ fn map_claude_usage_response(api_response: UsageApiResponse, now: DateTime<Utc>)
         Some(UsageLimited {
             window: claude_limit_window(limit),
             resets_at: limit.resets_at.clone(),
+            model: claude_limit_model(limit),
         })
     } else if api_response.limits.is_empty()
         && api_response
@@ -278,6 +323,7 @@ fn map_claude_usage_response(api_response: UsageApiResponse, now: DateTime<Utc>)
             .map(|window| UsageLimited {
                 window: "weekly".to_string(),
                 resets_at: window.resets_at.clone(),
+                model: None,
             })
             .or_else(|| {
                 api_response
@@ -287,6 +333,7 @@ fn map_claude_usage_response(api_response: UsageApiResponse, now: DateTime<Utc>)
                     .map(|window| UsageLimited {
                         window: "5-hour".to_string(),
                         resets_at: window.resets_at.clone(),
+                        model: None,
                     })
             })
     } else {
@@ -600,6 +647,7 @@ async fn fetch_codex_usage_limits_remote() -> Result<UsageLimits> {
             .map(|window| UsageLimited {
                 window: "5-hour".to_string(),
                 resets_at: map_codex_window(window, &now).resets_at,
+                model: None,
             }),
         rate_limit
             .secondary_window
@@ -608,6 +656,7 @@ async fn fetch_codex_usage_limits_remote() -> Result<UsageLimits> {
             .map(|window| UsageLimited {
                 window: "weekly".to_string(),
                 resets_at: map_codex_window(window, &now).resets_at,
+                model: None,
             }),
     ]
     .into_iter()
@@ -685,9 +734,95 @@ mod tests {
             Some(UsageLimited {
                 window: "weekly".to_string(),
                 resets_at: Some("2026-08-23T13:00:00Z".to_string()),
+                model: None,
             })
         );
         assert_eq!(mapped.seven_day.map(|window| window.utilization), Some(1.0));
+    }
+
+    #[test]
+    fn claude_model_scoped_limit_does_not_block_other_models() {
+        let response: UsageApiResponse = serde_json::from_value(serde_json::json!({
+            "five_hour": { "utilization": 0.0, "resets_at": null },
+            "seven_day": {
+                "utilization": 86.0,
+                "resets_at": "2026-08-30T13:00:00Z"
+            },
+            "limits": [
+                {
+                    "kind": "weekly_all",
+                    "group": "weekly",
+                    "percent": 86.0,
+                    "resets_at": "2026-08-30T13:00:00Z",
+                    "scope": null,
+                    "is_active": false
+                },
+                {
+                    "kind": "weekly_scoped",
+                    "group": "weekly",
+                    "percent": 100.0,
+                    "resets_at": "2026-08-30T13:00:00Z",
+                    "scope": {
+                        "model": { "id": null, "display_name": "Fable" },
+                        "surface": null
+                    },
+                    "is_active": true
+                }
+            ],
+            "extra_usage": {
+                "is_enabled": false,
+                "spend_limit_reached": false
+            }
+        }))
+        .expect("Claude usage response parses");
+
+        let mapped = map_claude_usage_response(response, Utc::now());
+        let limited = mapped.usage_limited.expect("Fable is actively limited");
+        assert_eq!(limited.window, "weekly");
+        assert_eq!(limited.model.as_deref(), Some("Fable"));
+        assert!(limited.applies_to_model(Some("claude-fable-5")));
+        assert!(!limited.applies_to_model(Some("claude-opus-4-6")));
+        assert!(!limited.applies_to_model(None));
+        assert_eq!(
+            mapped.seven_day.map(|window| window.utilization),
+            Some(0.86)
+        );
+    }
+
+    #[test]
+    fn claude_account_wide_limit_takes_precedence_over_a_model_scope() {
+        let response: UsageApiResponse = serde_json::from_value(serde_json::json!({
+            "five_hour": null,
+            "seven_day": null,
+            "limits": [
+                {
+                    "kind": "weekly_all",
+                    "group": "weekly",
+                    "percent": 100.0,
+                    "resets_at": "2026-08-30T12:00:00Z",
+                    "scope": null,
+                    "is_active": true
+                },
+                {
+                    "kind": "weekly_scoped",
+                    "group": "weekly",
+                    "percent": 100.0,
+                    "resets_at": "2026-08-31T12:00:00Z",
+                    "scope": { "model": { "display_name": "Fable" } },
+                    "is_active": true
+                }
+            ],
+            "extra_usage": {
+                "is_enabled": false,
+                "spend_limit_reached": false
+            }
+        }))
+        .expect("Claude usage response parses");
+
+        let mapped = map_claude_usage_response(response, Utc::now());
+        let limited = mapped.usage_limited.expect("the account is limited");
+        assert_eq!(limited.model, None);
+        assert!(limited.applies_to_model(Some("claude-opus-4-6")));
     }
 
     #[test]
@@ -736,6 +871,7 @@ mod tests {
             Some(UsageLimited {
                 window: "monthly spend".to_string(),
                 resets_at: None,
+                model: None,
             })
         );
     }

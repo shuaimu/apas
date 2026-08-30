@@ -1159,7 +1159,11 @@ pub(crate) fn pane_summaries(
             let usage_limited = cli_client_id
                 .zip(usage_provider)
                 .and_then(|(cli_id, provider)| state.sessions.get_usage_limits(&cli_id, provider))
-                .and_then(|limits| limits.usage_limited);
+                .and_then(|limits| {
+                    limits
+                        .usage_limited
+                        .filter(|limited| limited.applies_to_model(pane.model.as_deref()))
+                });
 
             shared::MobilePaneSummary {
                 pane_id: pane.pane_id,

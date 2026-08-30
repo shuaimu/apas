@@ -1539,6 +1539,30 @@ describe('DeepSeek machine config', () => {
     });
   });
 
+  it('preserves the provider model scope on usage-limited availability', () => {
+    useStore.setState({ usageLimits: new Map() });
+
+    handleServerMessage({
+      type: 'usage_limits',
+      cli_client_id: 'cli-1',
+      provider: 'claude',
+      limits: {
+        seven_day: { utilization: 0.86, resets_at: '2026-08-30T13:00:00Z' },
+        usage_limited: {
+          window: 'weekly',
+          resets_at: '2026-08-30T13:00:00Z',
+          model: 'Fable',
+        },
+      },
+    }, useStore.setState, useStore.getState);
+
+    expect(useStore.getState().usageLimits.get('cli-1')?.claude?.usageLimited).toEqual({
+      window: 'weekly',
+      resetsAt: '2026-08-30T13:00:00Z',
+      model: 'Fable',
+    });
+  });
+
   it('ignores retired usage messages from a mixed-version server', async () => {
     useStore.getState().connect();
     await new Promise(resolve => setTimeout(resolve, 10));
