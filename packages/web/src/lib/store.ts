@@ -155,6 +155,11 @@ export interface UsageLimitedStatus {
   resetsAt?: string;
   /** Provider model family this block applies to; absent means account-wide. */
   model?: string;
+  /**
+   * Account-wide utilization for the same window. This is enriched from a
+   * live usage payload for display; privacy-preserving pane snapshots omit it.
+   */
+  allModelsUtilization?: number;
 }
 
 export type Provider = "claude" | "codex" | "minimax" | "glm" | "deepseek" | "opencode" | "cursor-agent";

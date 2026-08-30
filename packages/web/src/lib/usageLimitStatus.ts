@@ -28,11 +28,35 @@ export function activeUsageLimit(
 ): UsageLimitedStatus | null {
   const limited = limits?.usageLimited;
   if (!limited) return null;
-  if (!limited.resetsAt) return limited;
+  if (!limited.resetsAt) return enrichScopedUsageLimit(limited, limits);
 
   const resetMs = Date.parse(limited.resetsAt);
   if (Number.isFinite(resetMs) && resetMs <= nowMs) return null;
-  return limited;
+  return enrichScopedUsageLimit(limited, limits);
+}
+
+function utilizationForLimitWindow(
+  status: UsageLimitedStatus,
+  limits: UsageLimits,
+): number | undefined {
+  const window = status.window.trim().toLowerCase();
+  if (window.includes("week") || window.includes("7")) {
+    return limits.sevenDay?.utilization;
+  }
+  if (window.includes("hour") || window.includes("5")) {
+    return limits.fiveHour?.utilization;
+  }
+  return undefined;
+}
+
+function enrichScopedUsageLimit(
+  status: UsageLimitedStatus,
+  limits: UsageLimits,
+): UsageLimitedStatus {
+  if (!status.model?.trim()) return status;
+  const allModelsUtilization = utilizationForLimitWindow(status, limits);
+  if (!Number.isFinite(allModelsUtilization)) return status;
+  return { ...status, allModelsUtilization };
 }
 
 function usageLimitAppliesToPane(
@@ -92,9 +116,33 @@ export function paneUsageLimit(
 export function usageLimitedLabel(status: UsageLimitedStatus): string {
   const window = status.window.trim();
   const model = status.model?.trim();
-  if (model) return window ? `${model} ${window} usage limited` : `${model} usage limited`;
+  if (model) {
+    const scopedLabel = window
+      ? `${model} ${window} usage limited`
+      : `${model} usage limited`;
+    if (Number.isFinite(status.allModelsUtilization)) {
+      return `${scopedLabel}; all models at ${formatUsagePercent(status.allModelsUtilization!)}%`;
+    }
+    return scopedLabel;
+  }
   if (!window) return "Usage limited";
   return `${window[0].toUpperCase()}${window.slice(1)} usage limited`;
+}
+
+/** Keep high-but-incomplete usage from rounding up to a misleading 100%. */
+export function formatUsagePercent(utilization: number): string {
+  if (!Number.isFinite(utilization)) return "0";
+
+  const rawPercent = Math.max(0, utilization * 100);
+  const displayPercent = utilization < 1.0
+    ? Math.min(rawPercent, 99.9)
+    : rawPercent;
+
+  if (displayPercent >= 100) return displayPercent.toFixed(0);
+  if (displayPercent >= 99) {
+    return displayPercent.toFixed(1).replace(/\.0$/, "");
+  }
+  return displayPercent.toFixed(0);
 }
 
 export function usageLimitResetLabel(

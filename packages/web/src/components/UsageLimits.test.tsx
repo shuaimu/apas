@@ -223,6 +223,24 @@ describe("UsageLimitsDisplay", () => {
     expect(container.textContent).toContain("Weekly usage limited");
     expect(container.textContent).toContain("Resets in");
   });
+
+  it("shows overall usage beside a model-scoped limit", () => {
+    const { container } = renderUsage(
+      {
+        sevenDay: { utilization: 0.86 },
+        usageLimited: {
+          window: "weekly",
+          resetsAt: "2026-06-23T15:00:00Z",
+          model: "Fable",
+        },
+      },
+      true,
+    );
+
+    expect(container.textContent).toContain(
+      "Fable weekly usage limited; all models at 86%",
+    );
+  });
 });
 
 describe("AllProvidersUsage", () => {

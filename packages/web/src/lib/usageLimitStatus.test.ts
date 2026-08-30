@@ -84,8 +84,14 @@ describe("usage limit availability", () => {
       claudePane({ model: "claude-fable-5" }),
       usage,
       NOW,
-    )).toEqual(limited);
-    expect(usageLimitedLabel(limited)).toBe("Fable weekly usage limited");
+    )).toEqual({ ...limited, allModelsUtilization: 0.86 });
+    expect(usageLimitedLabel({ ...limited, allModelsUtilization: 0.86 }))
+      .toBe("Fable weekly usage limited; all models at 86%");
+  });
+
+  it("keeps the scoped label concise when account utilization is unavailable", () => {
+    expect(usageLimitedLabel({ window: "weekly", model: "Fable" }))
+      .toBe("Fable weekly usage limited");
   });
 
   it("uses the pane snapshot when detailed account usage is private or absent", () => {

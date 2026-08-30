@@ -316,7 +316,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
             <span aria-hidden="true" className="shrink-0 text-gray-400 dark:text-gray-600">/</span>
             <span className="min-w-0 truncate font-semibold text-indigo-600 dark:text-indigo-400">{paneRowLabel(pane)}</span>
           </span>
-          <span className={`shrink-0 rounded-full px-2 py-0.5 text-[0.65rem] font-semibold ${
+          <span className={`shrink-0 rounded-full px-2 py-0.5 text-right text-[0.65rem] font-semibold leading-tight ${
             awaitingAnswer
               ? "bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-200"
               : usageLimit

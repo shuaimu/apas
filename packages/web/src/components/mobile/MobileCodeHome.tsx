@@ -442,7 +442,7 @@ export function MobileCodeHome({
             <span aria-hidden="true" className="shrink-0 text-[#aaaab6] dark:text-[#686873]">/</span>
             <span className="min-w-0 truncate font-bold text-[#6d5efc]">{paneRowLabel(pane)}</span>
           </span>
-          <span className={`shrink-0 rounded-full px-2.5 py-1 text-[0.7rem] font-bold ${
+          <span className={`max-w-[58%] shrink-0 rounded-full px-2.5 py-1 text-right text-[0.7rem] font-bold leading-tight ${
             awaitingAnswer
               ? "bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-200"
               : usageLimit

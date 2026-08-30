@@ -589,7 +589,8 @@ describe("Sidebar project list", () => {
     fireEvent.click(screen.getByRole("button", { name: "Idle sessions" }));
 
     expect(screen.getByRole("button", { name: "Open Claude 3 in mako-cloud" }).textContent).toContain("Idle");
-    expect(screen.getByRole("button", { name: "Open Fable in mako-cloud" }).textContent).toContain("Fable weekly usage limited");
+    expect(screen.getByRole("button", { name: "Open Fable in mako-cloud" }).textContent)
+      .toContain("Fable weekly usage limited; all models at 86%");
   });
 
   it("shows pending answers ahead of idle and usage-limited agents", () => {
