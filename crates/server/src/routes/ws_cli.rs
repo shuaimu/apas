@@ -1512,6 +1512,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 else {
                                     continue;
                                 };
+                                // A web pane reboot is represented internally by the CLI as a
+                                // close followed by an add. Hide that implementation detail so
+                                // the pane neither flashes out of the UI nor loses its position.
+                                panes = state
+                                    .sessions
+                                    .reconcile_pane_reboots(&session_id, panes);
                                 // Cache pane list and forward to attached web clients
                                 tracing::info!("CLI {} sent pane list for session {}: {} panes", cli_id, session_id, panes.len());
                                 // Preserve web-side custom labels and order from cache or persisted file

@@ -4448,10 +4448,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         continue;
                     }
                     tracing::info!("Rebooting pane {} for session {}", pane_id, sid);
-                    state
+                    let preserve_roster_slot = state.sessions.begin_pane_reboot(&sid, pane_id);
+                    let sent = state
                         .sessions
                         .route_to_cli(&sid, reboot_pane_cli_message(sid, pane_id))
                         .await;
+                    if preserve_roster_slot && !sent {
+                        state.sessions.cancel_pane_reboot(&sid, pane_id);
+                    }
                 }
                 Ok(WebToServer::AddPane {
                     session_id: msg_sid,
@@ -4548,6 +4552,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             sid,
                             cleanup_action,
                         );
+                        state.sessions.cancel_pane_reboot(&sid, pane_id);
                         state
                             .sessions
                             .route_to_cli(

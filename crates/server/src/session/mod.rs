@@ -141,6 +141,11 @@ pub struct SessionManager {
     lifecycle_request_order: Mutex<VecDeque<Uuid>>,
     /// Latest connected-CLI preservation inventory per session.
     lifecycle_inventories: DashMap<Uuid, shared::CliLifecycleInventory>,
+    /// A pane reboot is implemented by the CLI as a close followed by an add.
+    /// Keep the logical pane (and its web-defined position) present while that
+    /// short replacement is in flight so clients never observe the internal
+    /// close as a real removal.
+    pending_pane_reboots: DashMap<(Uuid, u32), PendingPaneReboot>,
     /// Raw pty presentation and lifecycle per (session, pane) for
     /// `PaneKind::Terminal` panes. In memory only and deliberately never
     /// persisted: these are ANSI byte streams, not chat records, and writing
@@ -160,6 +165,14 @@ struct PendingTerminalTranscriptEcho {
     registered_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct PendingPaneReboot {
+    pane: PaneConfig,
+    original_index: usize,
+    registered_at: Instant,
+}
+
+const PENDING_PANE_REBOOT_TTL: Duration = Duration::from_secs(30);
 const TERMINAL_TRANSCRIPT_ECHO_TTL: Duration = Duration::from_secs(120);
 const MAX_PENDING_TERMINAL_TRANSCRIPT_ECHOES: usize = 64;
 
@@ -337,6 +350,7 @@ impl SessionManager {
             lifecycle_requests: DashMap::new(),
             lifecycle_request_order: Mutex::new(VecDeque::new()),
             lifecycle_inventories: DashMap::new(),
+            pending_pane_reboots: DashMap::new(),
             terminal_states: DashMap::new(),
         }
     }
@@ -1571,6 +1585,8 @@ impl SessionManager {
             self.session_projects.remove(session_id);
             self.recent_input_ids.remove(session_id);
         }
+        self.pending_pane_reboots
+            .retain(|(session_id, _), _| !session_set.contains(session_id));
         self.pending_terminal_transcript_echoes
             .retain(|(session_id, _), _| !session_set.contains(session_id));
         let terminal_keys = self
@@ -2261,6 +2277,105 @@ impl SessionManager {
             .unwrap_or_default()
     }
 
+    /// Snapshot an existing pane before asking the CLI to reboot it. The CLI
+    /// currently realizes reboot as two events (close, then add), so this lets
+    /// the server distinguish that transient close from an intentional remove.
+    pub fn begin_pane_reboot(&self, session_id: &Uuid, pane_id: u32) -> bool {
+        let Some((original_index, pane)) = self.sessions.get(session_id).and_then(|session| {
+            session
+                .panes
+                .iter()
+                .enumerate()
+                .find(|(_, pane)| pane.pane_id == pane_id)
+                .map(|(index, pane)| (index, pane.clone()))
+        }) else {
+            return false;
+        };
+        self.pending_pane_reboots.insert(
+            (*session_id, pane_id),
+            PendingPaneReboot {
+                pane,
+                original_index,
+                registered_at: Instant::now(),
+            },
+        );
+        true
+    }
+
+    /// Stop treating an absent pane as a reboot transition, for example when
+    /// the reboot command could not be routed or the user explicitly removes
+    /// the pane before the replacement arrives.
+    pub fn cancel_pane_reboot(&self, session_id: &Uuid, pane_id: u32) {
+        self.pending_pane_reboots.remove(&(*session_id, pane_id));
+    }
+
+    /// Reconcile a raw CLI pane list with any web-initiated reboots in flight.
+    /// Missing rebooting panes are represented by their snapshot; replacement
+    /// panes are moved back into the same slot and finish the transition.
+    pub fn reconcile_pane_reboots(
+        &self,
+        session_id: &Uuid,
+        mut panes: Vec<PaneConfig>,
+    ) -> Vec<PaneConfig> {
+        let existing_order = self
+            .sessions
+            .get(session_id)
+            .map(|session| {
+                session
+                    .panes
+                    .iter()
+                    .map(|pane| pane.pane_id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let now = Instant::now();
+        let mut pending = self
+            .pending_pane_reboots
+            .iter()
+            .filter(|entry| entry.key().0 == *session_id)
+            .map(|entry| (*entry.key(), entry.value().clone()))
+            .collect::<Vec<_>>();
+        pending.sort_by_key(|(_, reboot)| reboot.original_index);
+
+        let mut restored = Vec::with_capacity(pending.len());
+        let mut completed = Vec::new();
+        for (key, reboot) in pending {
+            if now.duration_since(reboot.registered_at) > PENDING_PANE_REBOOT_TTL {
+                self.pending_pane_reboots.remove(&key);
+                continue;
+            }
+            let pane = if let Some(position) = panes
+                .iter()
+                .position(|pane| pane.pane_id == reboot.pane.pane_id)
+            {
+                completed.push(key);
+                panes.remove(position)
+            } else {
+                reboot.pane
+            };
+            restored.push((reboot.original_index, pane));
+        }
+
+        for (original_index, pane) in restored {
+            panes.insert(original_index.min(panes.len()), pane);
+        }
+        for key in completed {
+            self.pending_pane_reboots.remove(&key);
+        }
+
+        // The CLI's rebuilt list can use a different order from the web's
+        // cached custom order. Reapply the whole known order, not just the
+        // rebooted pane's numeric index, and append genuinely new panes.
+        let mut reordered = Vec::with_capacity(panes.len());
+        for pane_id in existing_order {
+            if let Some(position) = panes.iter().position(|pane| pane.pane_id == pane_id) {
+                reordered.push(panes.remove(position));
+            }
+        }
+        reordered.extend(panes);
+        reordered
+    }
+
     /// Cache the latest pane status so it can be replayed when a web client
     /// re-attaches. `None` status clears the cache entry (pane is idle).
     pub fn set_pane_status(
@@ -2574,6 +2689,99 @@ mod tests {
         let mut statuses = mgr.get_pane_statuses(session_id);
         statuses.sort_by_key(|(_, pane_id, _)| *pane_id);
         statuses
+    }
+
+    fn test_pane_config(pane_id: u32) -> PaneConfig {
+        PaneConfig {
+            pane_id,
+            provider: Provider::Claude,
+            mode: shared::PaneMode::Interactive,
+            kind: shared::PaneKind::Terminal,
+            session_id: Uuid::new_v4(),
+            is_paused: false,
+            stop_requested: false,
+            prompt: None,
+            min_iteration_interval_minutes: None,
+            label: Some(format!("Pane {pane_id}")),
+            model: None,
+            effort: None,
+            worktree_path: None,
+            role: None,
+            goal: None,
+            backstory: None,
+            plan_review_mode: shared::PlanReviewMode::default(),
+            manual_mode: false,
+            managed: false,
+        }
+    }
+
+    #[test]
+    fn pane_reboot_never_removes_or_reorders_the_logical_pane() {
+        let mgr = SessionManager::new();
+        let sid = Uuid::new_v4();
+        mgr.create_session(sid, Uuid::new_v4(), Uuid::new_v4());
+        let original = vec![
+            test_pane_config(30),
+            test_pane_config(10),
+            test_pane_config(20),
+        ];
+        let old_runtime_session = original[1].session_id;
+        mgr.set_session_panes(&sid, original);
+
+        assert!(mgr.begin_pane_reboot(&sid, 10));
+        let during_close =
+            mgr.reconcile_pane_reboots(&sid, vec![test_pane_config(20), test_pane_config(30)]);
+        assert_eq!(
+            during_close
+                .iter()
+                .map(|pane| pane.pane_id)
+                .collect::<Vec<_>>(),
+            vec![30, 10, 20],
+            "the transient close must keep the pane in its custom-order slot"
+        );
+        assert_eq!(during_close[1].session_id, old_runtime_session);
+        mgr.set_session_panes(&sid, during_close);
+
+        let mut replacement = test_pane_config(10);
+        replacement.label = None;
+        let replacement_runtime_session = replacement.session_id;
+        let after_add = mgr.reconcile_pane_reboots(
+            &sid,
+            vec![replacement, test_pane_config(20), test_pane_config(30)],
+        );
+        assert_eq!(
+            after_add
+                .iter()
+                .map(|pane| pane.pane_id)
+                .collect::<Vec<_>>(),
+            vec![30, 10, 20],
+            "the replacement must return to the original slot"
+        );
+        assert_eq!(
+            after_add[1].session_id, replacement_runtime_session,
+            "the restored entry must use the replacement runtime configuration"
+        );
+        assert_ne!(after_add[1].session_id, old_runtime_session);
+        assert!(
+            !mgr.pending_pane_reboots.contains_key(&(sid, 10)),
+            "observing the replacement completes the reboot transition"
+        );
+    }
+
+    #[test]
+    fn cancelling_pane_reboot_allows_an_intentional_remove() {
+        let mgr = SessionManager::new();
+        let sid = Uuid::new_v4();
+        mgr.create_session(sid, Uuid::new_v4(), Uuid::new_v4());
+        mgr.set_session_panes(&sid, vec![test_pane_config(1), test_pane_config(2)]);
+
+        assert!(mgr.begin_pane_reboot(&sid, 1));
+        mgr.cancel_pane_reboot(&sid, 1);
+        let panes = mgr.reconcile_pane_reboots(&sid, vec![test_pane_config(2)]);
+        assert_eq!(
+            panes.iter().map(|pane| pane.pane_id).collect::<Vec<_>>(),
+            vec![2]
+        );
     }
 
     #[test]

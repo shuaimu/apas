@@ -16,6 +16,7 @@ import { Settings, Wifi, WifiOff, LogOut, Menu, X, RefreshCw, Trash2 } from "luc
 const MIN_SIDEBAR_WIDTH = 180;
 const MAX_SIDEBAR_WIDTH = 400;
 const DEFAULT_SIDEBAR_WIDTH = 256;
+const GLOBAL_SIDEBAR_WIDTH_KEY = "apas_layout_global_sidebar_width";
 const REPO_URL = "https://github.com/shuaimu/apas";
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://apas.mpaxos.com";
 const WEB_UI_VERSION = process.env.NEXT_PUBLIC_WEB_UI_VERSION || "00.00.0";
@@ -40,6 +41,39 @@ function getProjectLayout(cliClientId: string | null | undefined, key: string, d
 function setProjectLayout(cliClientId: string | null | undefined, key: string, value: string): void {
   if (typeof window === 'undefined') return;
   localStorage.setItem(getProjectLayoutKey(cliClientId, key), value);
+}
+
+function parseSidebarWidth(value: string | null): number | null {
+  if (value === null) return null;
+  const width = Number.parseInt(value, 10);
+  return Number.isNaN(width) || width < MIN_SIDEBAR_WIDTH || width > MAX_SIDEBAR_WIDTH
+    ? null
+    : width;
+}
+
+function getGlobalSidebarWidth(cliClientId: string | null | undefined): number {
+  if (typeof window === "undefined") return DEFAULT_SIDEBAR_WIDTH;
+  const globalWidth = parseSidebarWidth(localStorage.getItem(GLOBAL_SIDEBAR_WIDTH_KEY));
+  if (globalWidth !== null) return globalWidth;
+
+  // One-time migration: older versions stored the width per project. Seed the
+  // global preference from the project open during the upgrade, then every
+  // subsequent project reads the same key.
+  if (cliClientId) {
+    const legacyWidth = parseSidebarWidth(
+      localStorage.getItem(getProjectLayoutKey(cliClientId, "sidebar_width")),
+    );
+    if (legacyWidth !== null) {
+      localStorage.setItem(GLOBAL_SIDEBAR_WIDTH_KEY, legacyWidth.toString());
+      return legacyWidth;
+    }
+  }
+  return DEFAULT_SIDEBAR_WIDTH;
+}
+
+function setGlobalSidebarWidth(width: number): void {
+  if (typeof window === "undefined") return;
+  localStorage.setItem(GLOBAL_SIDEBAR_WIDTH_KEY, width.toString());
 }
 
 function useMobileViewport(): boolean {
@@ -75,19 +109,21 @@ export default function Home() {
   const [mobileHomeView, setMobileHomeView] = useState<MobileHomeView>("all");
   const reconnectConnectAttemptedRef = useRef(false);
 
-  // Sidebar width state - per-project
+  // Sidebar width is one browser-wide desktop preference.
   const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
 
   // Sidebar collapsed state - per-project
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
-  // Load layout when cliClientId changes
+  // Load the global width. Depending on cliClientId only supports the one-time
+  // migration when the selected project arrives after the dashboard mounts;
+  // once the global key exists, switching projects always resolves identically.
   useEffect(() => {
-    const savedWidth = getProjectLayout(cliClientId, "sidebar_width", DEFAULT_SIDEBAR_WIDTH.toString());
-    const width = parseInt(savedWidth, 10);
-    if (!isNaN(width) && width >= MIN_SIDEBAR_WIDTH && width <= MAX_SIDEBAR_WIDTH) {
-      setSidebarWidth(width);
-    }
+    setSidebarWidth(getGlobalSidebarWidth(cliClientId));
+  }, [cliClientId]);
+
+  // Collapsed state remains project-specific.
+  useEffect(() => {
     const savedCollapsed = getProjectLayout(cliClientId, "sidebar_collapsed", "false");
     setSidebarCollapsed(savedCollapsed === "true");
   }, [cliClientId]);
@@ -100,8 +136,8 @@ export default function Home() {
   }, []);
 
   const handleSidebarResizeEnd = useCallback(() => {
-    setProjectLayout(cliClientId, "sidebar_width", sidebarWidth.toString());
-  }, [sidebarWidth, cliClientId]);
+    setGlobalSidebarWidth(sidebarWidth);
+  }, [sidebarWidth]);
 
   const toggleSidebarCollapsed = useCallback(() => {
     setSidebarCollapsed(prev => {

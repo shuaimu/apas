@@ -486,8 +486,18 @@ describe("Home sidebar layout persistence", () => {
     });
   });
 
-  it("hydrates project sidebar width before falling back to global layout", async () => {
+  it("uses global sidebar width even when a project has a legacy width", async () => {
     localStorage.setItem("apas_layout_global_sidebar_width", "288");
+    localStorage.setItem("apas_layout_project-a_sidebar_width", "340");
+
+    await renderHome("project-a");
+
+    await waitFor(() => {
+      expect(sidebarWidth()).toBe("288");
+    });
+  });
+
+  it("migrates a legacy project width once into the global preference", async () => {
     localStorage.setItem("apas_layout_project-a_sidebar_width", "340");
 
     await renderHome("project-a");
@@ -495,6 +505,7 @@ describe("Home sidebar layout persistence", () => {
     await waitFor(() => {
       expect(sidebarWidth()).toBe("340");
     });
+    expect(localStorage.getItem("apas_layout_global_sidebar_width")).toBe("340");
   });
 
   it("clamps rendered ResizeHandle drags and persists width on resize end", async () => {
@@ -514,7 +525,8 @@ describe("Home sidebar layout persistence", () => {
     });
     fireEvent.mouseUp(document);
 
-    expect(localStorage.getItem("apas_layout_project-a_sidebar_width")).toBe("400");
+    expect(localStorage.getItem("apas_layout_global_sidebar_width")).toBe("400");
+    expect(localStorage.getItem("apas_layout_project-a_sidebar_width")).toBe("250");
 
     fireEvent.mouseDown(handle, { clientX: 500 });
     fireEvent.mouseMove(document, { clientX: 0 });
@@ -523,7 +535,46 @@ describe("Home sidebar layout persistence", () => {
     });
     fireEvent.mouseUp(document);
 
-    expect(localStorage.getItem("apas_layout_project-a_sidebar_width")).toBe("180");
+    expect(localStorage.getItem("apas_layout_global_sidebar_width")).toBe("180");
+    expect(localStorage.getItem("apas_layout_project-a_sidebar_width")).toBe("250");
+  });
+
+  it("keeps the resized width when switching projects", async () => {
+    localStorage.setItem("apas_layout_global_sidebar_width", "250");
+    localStorage.setItem("apas_layout_project-b_sidebar_width", "190");
+    setDesktopWidth();
+    seedAuthenticatedState("project-a");
+    const view = render(<Home />);
+    await screen.findByTestId("sidebar");
+
+    const handle = screen.getByTitle("Drag to resize");
+    fireEvent.mouseDown(handle, { clientX: 100 });
+    fireEvent.mouseMove(document, { clientX: 180 });
+    await waitFor(() => {
+      expect(sidebarWidth()).toBe("330");
+    });
+    fireEvent.mouseUp(document);
+    expect(localStorage.getItem("apas_layout_global_sidebar_width")).toBe("330");
+
+    act(() => {
+      useStore.setState({
+        cliClientId: "project-b",
+        cliClients: [
+          makeCliClient({
+            id: "project-b",
+            activeSession: "session-b",
+            version: "1.2.3",
+          }),
+        ],
+        sessionId: "session-b",
+      });
+    });
+    view.rerender(<Home />);
+
+    await waitFor(() => {
+      expect(sidebarWidth()).toBe("330");
+    });
+    expect(localStorage.getItem("apas_layout_project-b_sidebar_width")).toBe("190");
   });
 
   it("persists project sidebar collapse without disturbing other layout keys", async () => {
