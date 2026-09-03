@@ -77,6 +77,14 @@ vi.mock("@/components/Sidebar", () => ({
   ),
 }));
 
+vi.mock("@/components/SidebarRail", () => ({
+  SidebarRail: ({ onExpand }: { onExpand: () => void }) => (
+    <nav data-testid="sidebar-rail">
+      <button onClick={onExpand} title="Expand sidebar">Expand sidebar</button>
+    </nav>
+  ),
+}));
+
 vi.mock("@/components/tabs/TabbedView", () => ({
   TabbedView: () => <div data-testid="tabbed-view" />,
 }));

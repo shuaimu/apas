@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { createPortal } from "react-dom";
 import { TabbedView } from "@/components/tabs/TabbedView";
 import { Sidebar } from "@/components/Sidebar";
+import { SidebarRail } from "@/components/SidebarRail";
 import { ResizeHandle } from "@/components/ResizeHandle";
 import { MobileCodeHome, type MobileHomeView } from "@/components/mobile/MobileCodeHome";
 import { MobileSessionActivity } from "@/components/mobile/MobileSessionActivity";
@@ -328,20 +329,8 @@ export default function Home() {
         </>
       )}
 
-      {/* Collapsed sidebar expand button - only on desktop */}
-      {sidebarCollapsed && (
-        <div className="hidden md:flex flex-col items-center py-2 px-1 border-r border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800">
-          <button
-            onClick={toggleSidebarCollapsed}
-            className="p-2 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-lg"
-            title="Expand sidebar"
-          >
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 5l7 7-7 7M5 5l7 7-7 7" />
-            </svg>
-          </button>
-        </div>
-      )}
+      {/* Collapsed sidebar: a Slack-style icon rail of projects, desktop only */}
+      {sidebarCollapsed && <SidebarRail onExpand={toggleSidebarCollapsed} />}
 
       {/* Main content */}
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
