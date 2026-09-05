@@ -16,7 +16,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -24,6 +24,19 @@ use uuid::Uuid;
 
 pub const HOST_PROTOCOL_VERSION: u32 = 1;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+/// Where a pane-host keeps its own log, relative to the APAS runtime
+/// directory. A host's stderr is the tmux pane it runs in, which vanishes with
+/// the process, and its runtime directory is removed when it exits cleanly —
+/// so a host that died had nowhere to leave a trace. This directory is
+/// host-local and volatile like the runtime root, and outlives the host.
+const HOST_LOG_DIR: &str = "pane-host-logs";
+const HOST_LOG_ROTATE_BYTES: u64 = 1024 * 1024;
+const HOST_LOG_RETAIN: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+/// Host-local root for the executable copy a pane-host runs from. `/var/tmp`
+/// persists across reboots and is not shared over NFS, the same reasoning as
+/// the Codex SQLite home in `dual_pane`.
+const HOST_LOCAL_BIN_ROOT: &str = "/var/tmp";
+const HOST_LOCAL_BIN_RETAIN: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const OUTPUT_RING_MAX_BYTES: usize = 512 * 1024;
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
@@ -210,6 +223,205 @@ pub fn runtime_paths(project_id: Uuid, pane_id: u32, runtime_id: Uuid) -> Result
         socket: dir.join("c.sock"),
         dir,
     })
+}
+
+/// Log file for the host running `runtime_dir`, keyed the way the runtime
+/// directory is (`<project>/<pane>-<runtime>`), so the log of a dead host can
+/// be found from the descriptor the controller still holds.
+pub fn host_log_path(runtime_dir: &Path) -> Result<PathBuf> {
+    host_log_path_in(&crate::config::Config::runtime_dir()?, runtime_dir)
+}
+
+fn host_log_path_in(root: &Path, runtime_dir: &Path) -> Result<PathBuf> {
+    let pane_dir = runtime_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("pane-host runtime directory has no name")?;
+    let project_dir = runtime_dir
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .context("pane-host runtime directory has no project parent")?;
+    Ok(root
+        .join(HOST_LOG_DIR)
+        .join(sanitize(project_dir))
+        .join(format!("{}.log", sanitize(pane_dir))))
+}
+
+/// Open the host's log for appending. Rotated once past
+/// `HOST_LOG_ROTATE_BYTES`, and logs of hosts long gone are pruned so a busy
+/// machine does not accumulate them forever. Bounded and best-effort: a host
+/// must never fail to start because its log could not be opened.
+pub fn open_host_log(runtime_dir: &Path) -> Result<File> {
+    let path = host_log_path(runtime_dir)?;
+    let dir = path.parent().context("pane-host log path has no parent")?;
+    ensure_private_dir(dir)?;
+    prune_stale_files(dir, None, HOST_LOG_RETAIN);
+    if fs::metadata(&path).is_ok_and(|metadata| metadata.len() >= HOST_LOG_ROTATE_BYTES) {
+        let _ = fs::rename(&path, path.with_extension("log.1"));
+    }
+    let mut options = OpenOptions::new();
+    options.append(true).create(true).mode(0o600);
+    let file = options.open(&path)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+/// Remove regular files in `dir` (other than `keep`) not modified within
+/// `retain`. Used for old host logs and superseded executable copies; both are
+/// safe to unlink while in use, because both live on local filesystems.
+fn prune_stale_files(dir: &Path, keep: Option<&Path>, retain: Duration) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if keep == Some(path.as_path()) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .is_some_and(|age| age > retain);
+        if stale {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+static HOST_LOG_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// Make a host's death explain itself. A pane-host has no signal handling of
+/// its own, so SIGHUP from tmux, a SIGTERM from a person, or a SIGBUS from an
+/// executable that changed underneath it all ended the process with nothing
+/// written anywhere. This writes one line naming the signal to the host log,
+/// then restores the default disposition and re-raises, so the process still
+/// dies exactly as it would have. Everything the handler does is
+/// async-signal-safe: `write`, `signal`, `raise`. Panics are hooked here too,
+/// through tracing, so they reach the same file.
+pub fn install_host_diagnostics(log: &File) {
+    use std::os::fd::AsRawFd;
+    HOST_LOG_FD.store(log.as_raw_fd(), Ordering::SeqCst);
+    for signal in [
+        libc::SIGHUP,
+        libc::SIGTERM,
+        libc::SIGINT,
+        libc::SIGBUS,
+        libc::SIGSEGV,
+        libc::SIGABRT,
+        libc::SIGILL,
+        libc::SIGFPE,
+    ] {
+        unsafe {
+            let handler: extern "C" fn(libc::c_int) = fatal_signal_handler;
+            libc::signal(signal, handler as usize as libc::sighandler_t);
+        }
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!(%info, "pane-host panicked");
+        previous(info);
+    }));
+}
+
+extern "C" fn fatal_signal_handler(signal: libc::c_int) {
+    let message: &[u8] = match signal {
+        libc::SIGHUP => b"pane-host: fatal signal SIGHUP (tmux session or controlling terminal went away)\n",
+        libc::SIGTERM => b"pane-host: fatal signal SIGTERM\n",
+        libc::SIGINT => b"pane-host: fatal signal SIGINT\n",
+        libc::SIGBUS => b"pane-host: fatal signal SIGBUS (a mapped file such as the executable changed underneath the process)\n",
+        libc::SIGSEGV => b"pane-host: fatal signal SIGSEGV\n",
+        libc::SIGABRT => b"pane-host: fatal signal SIGABRT\n",
+        libc::SIGILL => b"pane-host: fatal signal SIGILL\n",
+        libc::SIGFPE => b"pane-host: fatal signal SIGFPE\n",
+        _ => b"pane-host: fatal signal\n",
+    };
+    let fd = HOST_LOG_FD.load(Ordering::SeqCst);
+    if fd >= 0 {
+        unsafe {
+            libc::write(fd, message.as_ptr() as *const libc::c_void, message.len());
+        }
+    }
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
+}
+
+/// The executable a pane-host runs from.
+///
+/// The installed `apas` lives on a home directory this cluster shares over
+/// NFS, and every install replaces it. A process on a local filesystem keeps
+/// its unlinked executable alive for as long as it runs; a process whose
+/// executable was unlinked on an NFS server has nothing to fault code pages
+/// back in from, and dies with SIGBUS the first time memory pressure evicts
+/// one. A pane-host sits idle for days, so it is the process most exposed to
+/// that. It therefore runs from a host-local copy no later install touches.
+/// Copies are keyed by content, so every host launched from one install shares
+/// one copy, and superseded copies are pruned once nothing is likely to be
+/// running from them. Any failure falls back to the shared path: a host that
+/// launches from NFS is still better than one that does not launch.
+pub fn host_local_executable(source: &Path) -> Result<PathBuf> {
+    host_local_executable_in(Path::new(HOST_LOCAL_BIN_ROOT), source)
+}
+
+fn host_local_executable_in(root: &Path, source: &Path) -> Result<PathBuf> {
+    let uid = unsafe { libc::getuid() };
+    let dir = root.join(format!("apas-bin-{uid}"));
+    ensure_private_dir(&dir)?;
+    if fs::symlink_metadata(&dir)?.file_type().is_symlink() {
+        bail!("refusing symlinked executable directory {}", dir.display());
+    }
+    let bytes = fs::read(source).with_context(|| format!("read {}", source.display()))?;
+    let target = dir.join(format!("apas-{}", content_fingerprint(&bytes)));
+    if fs::symlink_metadata(&target).is_ok_and(|metadata| {
+        metadata.is_file()
+            && metadata.uid() == uid
+            && metadata.len() == bytes.len() as u64
+            && metadata.mode() & 0o100 != 0
+    }) {
+        return Ok(target);
+    }
+    // Write beside the target and rename into place, so a concurrent launch
+    // never sees a half-written executable.
+    let tmp = dir.join(format!(".apas-{}.partial", Uuid::new_v4().simple()));
+    {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true).mode(0o700);
+        let mut file = options.open(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700))?;
+    fs::rename(&tmp, &target)?;
+    // Prove the copy runs here. `/var/tmp` mounted `noexec` would otherwise
+    // make every host launch fail, which is worse than the hazard avoided.
+    let runs = Command::new(&target)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !runs {
+        let _ = fs::remove_file(&target);
+        bail!("host-local executable copy {} does not run", target.display());
+    }
+    prune_stale_files(&dir, Some(&target), HOST_LOCAL_BIN_RETAIN);
+    Ok(target)
+}
+
+/// Content identity for an executable copy. `DefaultHasher::new()` is keyed
+/// with fixed constants, so the same bytes hash the same across processes and
+/// daemon restarts, which is what lets copies be shared and pruned by name.
+fn content_fingerprint(bytes: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    format!("{:016x}-{}", hasher.finish(), bytes.len())
 }
 
 pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
@@ -404,7 +616,19 @@ pub fn launch_host(
     };
     write_descriptor(&paths.descriptor, &descriptor)?;
 
-    let executable = crate::update::resolve_preferred_apas_executable();
+    let installed = crate::update::resolve_preferred_apas_executable();
+    let executable = match host_local_executable(&installed) {
+        Ok(local) => local,
+        Err(error) => {
+            tracing::warn!(
+                pane_id,
+                %error,
+                installed = %installed.display(),
+                "pane-host will run from the shared install path"
+            );
+            installed
+        }
+    };
     let output = Command::new("tmux")
         .arg("-L")
         .arg(tmux_socket_name(project_id))
@@ -661,6 +885,11 @@ impl HostedProcess {
                     .ok()
                     .and_then(|mut child| child.wait().ok())
                     .map(|status| format!("exited with status {status:?}"));
+                tracing::info!(
+                    pid = ?process.provider_pid,
+                    status = status.as_deref().unwrap_or("unknown"),
+                    "hosted provider exited"
+                );
                 if let Ok(mut lifecycle) = process.lifecycle.lock() {
                     *lifecycle = (TerminalLifecycle::Exited, status);
                 }
@@ -672,6 +901,7 @@ impl HostedProcess {
         if self.shutting_down.swap(true, Ordering::SeqCst) {
             return;
         }
+        tracing::info!(pid = ?self.provider_pid, "hosted provider shutdown");
         if let Some(group) = self.process_group_id {
             unsafe { libc::kill(-group, libc::SIGTERM) };
             thread::sleep(Duration::from_millis(500));
@@ -1012,6 +1242,16 @@ fn run_host_with_grace(
     }
     verify_private_file(&descriptor.credential_path)?;
     let credential = fs::read_to_string(&descriptor.credential_path)?;
+    tracing::info!(
+        pid = std::process::id(),
+        pane_id = descriptor.pane_id,
+        project_id = %descriptor.project_id,
+        runtime_id = %descriptor.runtime_id,
+        session = %descriptor.session_name,
+        executable = ?std::env::current_exe().ok(),
+        adoption_grace_seconds = adoption_grace.as_secs(),
+        "pane-host started"
+    );
     let _ = fs::remove_file(&descriptor.socket_path);
     let listener = UnixListener::bind(&descriptor.socket_path)?;
     fs::set_permissions(&descriptor.socket_path, fs::Permissions::from_mode(0o600))?;
@@ -1070,9 +1310,13 @@ fn run_host_with_grace(
                 }
                 thread::sleep(Duration::from_millis(50));
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                tracing::error!(pane_id = descriptor.pane_id, %error, "pane-host listener failed");
+                return Err(error.into());
+            }
         }
     }
+    tracing::info!(pane_id = descriptor.pane_id, "pane-host exiting");
     if let Some(process) = process {
         process.shutdown();
     }
@@ -1125,6 +1369,59 @@ pub fn read_credential(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_log_path_mirrors_the_runtime_directory_identity() {
+        let root = Path::new("/run/user/3000/apas");
+        let runtime_dir = Path::new("/run/user/3000/apas/ph/f150d041ed63/920-57b6c68f1661");
+        let path = host_log_path_in(root, runtime_dir).unwrap();
+        assert_eq!(
+            path,
+            Path::new("/run/user/3000/apas/pane-host-logs/f150d041ed63/920-57b6c68f1661.log")
+        );
+        assert!(host_log_path_in(root, Path::new("/")).is_err());
+    }
+
+    #[test]
+    fn host_local_executable_copy_is_private_shared_by_content_and_pruned() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("apas");
+        fs::write(&source, "#!/bin/sh\necho apas 0.0\n").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let copy = host_local_executable_in(root.path(), &source).unwrap();
+        assert!(copy.starts_with(root.path().join(format!("apas-bin-{}", unsafe { libc::getuid() }))));
+        let metadata = fs::metadata(&copy).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o700);
+        assert_eq!(fs::read(&copy).unwrap(), fs::read(&source).unwrap());
+
+        // Same content, same copy: nothing is rewritten.
+        let first_ino = metadata.ino();
+        let again = host_local_executable_in(root.path(), &source).unwrap();
+        assert_eq!(again, copy);
+        assert_eq!(fs::metadata(&again).unwrap().ino(), first_ino);
+
+        // A new install is a new copy, and the old one stays until it ages
+        // out — a host may still be running from it.
+        fs::write(&source, "#!/bin/sh\necho apas 0.1\n").unwrap();
+        let newer = host_local_executable_in(root.path(), &source).unwrap();
+        assert_ne!(newer, copy);
+        assert!(copy.exists());
+        prune_stale_files(copy.parent().unwrap(), Some(&newer), Duration::ZERO);
+        assert!(!copy.exists(), "superseded copy should be pruned once stale");
+        assert!(newer.exists(), "the copy in use is never pruned");
+
+        // A copy that cannot run here is not offered.
+        fs::write(&source, "not an executable\n").unwrap();
+        assert!(host_local_executable_in(root.path(), &source).is_err());
+    }
+
+    #[test]
+    fn content_fingerprint_is_stable_and_content_sensitive() {
+        assert_eq!(content_fingerprint(b"abc"), content_fingerprint(b"abc"));
+        assert_ne!(content_fingerprint(b"abc"), content_fingerprint(b"abd"));
+        assert!(content_fingerprint(b"abc").ends_with("-3"));
+    }
 
     fn test_runtime(
         root: &tempfile::TempDir,

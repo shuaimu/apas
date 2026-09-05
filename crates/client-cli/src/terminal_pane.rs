@@ -206,7 +206,26 @@ pub struct HostedTerminalHandle {
     lifecycle: Arc<Mutex<(TerminalLifecycle, Option<String>)>>,
     runtime: Arc<Mutex<shared::TerminalRuntimeReconciliation>>,
     shutting_down: Arc<AtomicBool>,
+    /// Whether the host's tmux session still exists, consulted when its
+    /// socket closes without an exit frame. A field so a test can stand in
+    /// for tmux.
+    host_probe: HostLivenessProbe,
 }
+
+#[cfg(unix)]
+type HostLivenessProbe =
+    Arc<dyn Fn(&crate::pane_host::RuntimeDescriptor) -> bool + Send + Sync>;
+
+#[cfg(unix)]
+fn tmux_host_probe() -> HostLivenessProbe {
+    Arc::new(crate::pane_host::runtime_is_live)
+}
+
+/// How long a freshly launched host gets to answer `Create` with `Adopted`.
+/// The host spawns the provider before it answers, and a provider binary read
+/// from NFS on a loaded machine has taken longer than the 5s this used to be.
+#[cfg(unix)]
+const HOST_LAUNCH_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[cfg(unix)]
 impl HostedTerminalHandle {
@@ -224,31 +243,53 @@ impl HostedTerminalHandle {
         server_tx: tokio_mpsc::Sender<CliToServer>,
     ) -> Result<Self> {
         let (descriptor, credential, _paths) = crate::pane_host::launch_host(session_id, pane_id)?;
-        let mut stream = crate::pane_host::connect_with_retry(
-            &descriptor.socket_path,
-            std::time::Duration::from_secs(5),
-        )?;
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
-        crate::pane_host::write_frame(
-            &mut stream,
-            &crate::pane_host::ControllerToHost::Create {
-                protocol_version: crate::pane_host::HOST_PROTOCOL_VERSION,
-                credential,
-                project_id: session_id,
-                pane_id,
-                runtime_id: descriptor.runtime_id,
-                controller_id: Uuid::new_v4(),
-                controller_generation: descriptor.controller_generation,
-                provider: *provider,
-                binary_path: binary_path.to_string(),
-                cwd: cwd.to_string(),
-                env: env.to_vec(),
-                conversation_id,
-                resume,
-                initial_prompt: initial_prompt.map(ToString::to_string),
-            },
-        )?;
-        Self::finish_attach(stream, descriptor, session_id, server_tx, false)
+        let handshake = (|| -> Result<Self> {
+            let mut stream = crate::pane_host::connect_with_retry(
+                &descriptor.socket_path,
+                std::time::Duration::from_secs(15),
+            )?;
+            stream.set_read_timeout(Some(HOST_LAUNCH_HANDSHAKE_TIMEOUT))?;
+            crate::pane_host::write_frame(
+                &mut stream,
+                &crate::pane_host::ControllerToHost::Create {
+                    protocol_version: crate::pane_host::HOST_PROTOCOL_VERSION,
+                    credential: credential.clone(),
+                    project_id: session_id,
+                    pane_id,
+                    runtime_id: descriptor.runtime_id,
+                    controller_id: Uuid::new_v4(),
+                    controller_generation: descriptor.controller_generation,
+                    provider: *provider,
+                    binary_path: binary_path.to_string(),
+                    cwd: cwd.to_string(),
+                    env: env.to_vec(),
+                    conversation_id,
+                    resume,
+                    initial_prompt: initial_prompt.map(ToString::to_string),
+                },
+            )?;
+            Self::finish_attach(stream, descriptor.clone(), session_id, server_tx, false)
+        })();
+        match handshake {
+            Ok(handle) => Ok(handle),
+            Err(error) => {
+                // The tmux session already exists and the host inside it may
+                // be about to spawn — or have spawned — the provider. Leaving
+                // it there while the caller falls back to a direct PTY starts
+                // a second agent on the same conversation, which is exactly
+                // what happened when a host answered after the old 5s window.
+                tracing::warn!(
+                    pane_id,
+                    %error,
+                    session = %descriptor.session_name,
+                    "pane-host launch handshake failed; tearing the host down"
+                );
+                if let Err(cleanup) = crate::pane_host::terminate_tmux_host(&descriptor) {
+                    tracing::warn!(pane_id, %cleanup, "failed to tear down pane-host after launch failure");
+                }
+                Err(error)
+            }
+        }
     }
 
     fn adopt_existing(
@@ -371,6 +412,7 @@ impl HostedTerminalHandle {
             lifecycle: lifecycle_state,
             runtime: runtime_state,
             shutting_down: Arc::new(AtomicBool::new(false)),
+            host_probe: tmux_host_probe(),
         };
         handle.start_reader(session_id, reader, server_tx);
         tracing::info!(
@@ -398,6 +440,8 @@ impl HostedTerminalHandle {
         let lifecycle = self.lifecycle.clone();
         let runtime = self.runtime.clone();
         let shutting_down = self.shutting_down.clone();
+        let descriptor = self.descriptor.clone();
+        let host_probe = self.host_probe.clone();
         let initial_runtime = runtime
             .lock()
             .map(|value| value.clone())
@@ -464,35 +508,79 @@ impl HostedTerminalHandle {
                     Ok(crate::pane_host::HostToController::Adopted { .. }) => continue,
                     Err(error) => {
                         if !shutting_down.load(Ordering::Relaxed) {
-                            tracing::info!(pane_id, %error, "pane-host controller detached");
-                            let status =
-                                Some(format!("pane-host controller disconnected: {error}"));
-                            let should_report = lifecycle
+                            // The socket closed without an `Exited` frame.
+                            // Either the transport hiccupped and the host is
+                            // still there to re-adopt, or the host process
+                            // itself died — which nothing else reports, since
+                            // the tmux pane carrying its stderr went with it.
+                            // Supervision tells the two apart: a host lives in
+                            // its own tmux session, so no session, no host.
+                            let already_exited = lifecycle
                                 .lock()
-                                .map(|mut state| {
-                                    if state.0 == TerminalLifecycle::Exited {
-                                        false
-                                    } else {
-                                        *state = (TerminalLifecycle::Disconnected, status.clone());
-                                        true
-                                    }
-                                })
-                                .unwrap_or(true);
-                            if should_report {
-                                let metadata = runtime.lock().map(|value| value.clone()).ok();
-                                // The host socket is already gone, so waiting
-                                // for the server channel cannot backpressure
-                                // the host. Retaining this state in the channel
-                                // also makes a reconnect report the pane as
-                                // disconnected rather than silently leaving
-                                // its last Running/idle view.
-                                let _ = server_tx.blocking_send(CliToServer::TerminalState {
+                                .map(|state| state.0 == TerminalLifecycle::Exited)
+                                .unwrap_or(false);
+                            if already_exited {
+                                break;
+                            }
+                            let host_alive = host_probe(&descriptor);
+                            let (next, status) = if host_alive {
+                                tracing::info!(
+                                    pane_id,
+                                    %error,
+                                    session = %descriptor.session_name,
+                                    "pane-host controller detached; host still alive"
+                                );
+                                (
+                                    TerminalLifecycle::Disconnected,
+                                    format!("pane-host controller disconnected: {error}"),
+                                )
+                            } else {
+                                let log = descriptor
+                                    .socket_path
+                                    .parent()
+                                    .and_then(|dir| crate::pane_host::host_log_path(dir).ok());
+                                tracing::warn!(
+                                    pane_id,
+                                    %error,
+                                    session = %descriptor.session_name,
+                                    runtime_id = %descriptor.runtime_id,
+                                    log = ?log,
+                                    "pane-host process is gone; reporting the pane exited"
+                                );
+                                (
+                                    TerminalLifecycle::Exited,
+                                    format!(
+                                        "pane-host process ended unexpectedly (tmux session {} is gone); reboot the pane to resume the conversation{}",
+                                        descriptor.session_name,
+                                        log.map(|path| format!("; its log is {}", path.display()))
+                                            .unwrap_or_default()
+                                    ),
+                                )
+                            };
+                            if let Ok(mut state) = lifecycle.lock() {
+                                *state = (next, Some(status.clone()));
+                            }
+                            let metadata = runtime.lock().map(|value| value.clone()).ok();
+                            // The host socket is already gone, so waiting
+                            // for the server channel cannot backpressure
+                            // the host. Retaining this state in the channel
+                            // also makes a reconnect report the pane as
+                            // disconnected or exited rather than silently
+                            // leaving its last Running/idle view.
+                            let _ = server_tx.blocking_send(CliToServer::TerminalState {
+                                session_id,
+                                pane_id,
+                                instance_id: Some(instance_id),
+                                lifecycle: next,
+                                status: Some(status.clone()),
+                                runtime: metadata,
+                            });
+                            if next == TerminalLifecycle::Exited {
+                                let _ = server_tx.blocking_send(CliToServer::TerminalExited {
                                     session_id,
                                     pane_id,
                                     instance_id: Some(instance_id),
-                                    lifecycle: TerminalLifecycle::Disconnected,
-                                    status,
-                                    runtime: metadata,
+                                    status: Some(status),
                                 });
                             }
                         }
@@ -1340,6 +1428,93 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn hosted_controller_loss_with_a_dead_host_is_reported_as_exited() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (controller, peer) = UnixStream::pair().unwrap();
+            let reader = controller.try_clone().unwrap();
+            let session_id = Uuid::new_v4();
+            let instance_id = Uuid::new_v4();
+            let runtime_id = Uuid::new_v4();
+            let descriptor = crate::pane_host::RuntimeDescriptor {
+                protocol_version: crate::pane_host::HOST_PROTOCOL_VERSION,
+                project_id: session_id,
+                pane_id: 920,
+                runtime_id,
+                instance_id,
+                owner_uid: unsafe { libc::getuid() },
+                controller_generation: 1,
+                controller_id: Some(Uuid::new_v4()),
+                session_name: "ph_920_dead".to_string(),
+                socket_path: root.path().join("c.sock"),
+                credential_path: root.path().join("credential"),
+                created_at_unix_ms: 1,
+            };
+            let lifecycle = Arc::new(Mutex::new((TerminalLifecycle::Running, None)));
+            let handle = HostedTerminalHandle {
+                pane_id: 920,
+                instance_id,
+                process_group_id: None,
+                descriptor,
+                stream: Arc::new(Mutex::new(controller)),
+                lifecycle: lifecycle.clone(),
+                runtime: Arc::new(Mutex::new(shared::TerminalRuntimeReconciliation {
+                    runtime_id: Some(runtime_id),
+                    ..Default::default()
+                })),
+                shutting_down: Arc::new(AtomicBool::new(false)),
+                // Supervision says the host's tmux session no longer exists.
+                host_probe: Arc::new(|_| false),
+            };
+            let (tx, mut rx) = tokio_mpsc::channel(4);
+            handle.start_reader(session_id, reader, tx);
+            drop(peer);
+
+            let mut exited_state = None;
+            let mut exited_event = None;
+            for _ in 0..3 {
+                let message = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("hosted reader did not report the dead host")
+                    .expect("terminal state channel closed");
+                match message {
+                    CliToServer::TerminalState {
+                        lifecycle: TerminalLifecycle::Exited,
+                        status,
+                        ..
+                    } => exited_state = status,
+                    CliToServer::TerminalExited { pane_id, status, .. } => {
+                        exited_event = Some((pane_id, status))
+                    }
+                    _ => {}
+                }
+            }
+
+            let status = exited_state.expect("dead host was not reported as exited");
+            assert!(status.contains("ph_920_dead"), "status names the tmux session: {status}");
+            assert!(status.contains("reboot the pane"), "status says what to do: {status}");
+            let (pane_id, event_status) = exited_event.expect("no TerminalExited for the dead host");
+            assert_eq!(pane_id, 920);
+            assert_eq!(event_status.as_deref(), Some(status.as_str()));
+            assert!(lifecycle
+                .lock()
+                .is_ok_and(|state| state.0 == TerminalLifecycle::Exited));
+            assert!(matches!(
+                handle.state_message(session_id),
+                CliToServer::TerminalState {
+                    lifecycle: TerminalLifecycle::Exited,
+                    ..
+                }
+            ));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn hosted_controller_disconnect_is_retained_and_reported() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1379,6 +1554,7 @@ mod tests {
                     ..Default::default()
                 })),
                 shutting_down: Arc::new(AtomicBool::new(false)),
+                host_probe: Arc::new(|_| true),
             };
             let (tx, mut rx) = tokio_mpsc::channel(4);
             handle.start_reader(session_id, reader, tx);

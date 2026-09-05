@@ -1108,6 +1108,25 @@ Pane-host state is host-local, volatile, and outside the project directory:
 
 - Root: `${XDG_RUNTIME_DIR}/apas/ph`, or `/tmp/apas-<uid>/apas/ph` when
   `XDG_RUNTIME_DIR` is unavailable.
+- Logs: `${XDG_RUNTIME_DIR}/apas/pane-host-logs/<project>/<pane>-<runtime>.log`,
+  0600, info level, rotated once at 1 MiB and pruned after 14 days. A host's
+  stderr is the tmux pane it runs in, which vanishes with the process, and its
+  runtime directory is removed when it exits cleanly — so before this a host
+  that died left no trace anywhere. The log records start (pid, identity,
+  executable), adoption and detach, lease expiry, the provider's exit status,
+  panics, and **the fatal signal that killed it** (a handler writes one line
+  naming the signal, then restores the default disposition and re-raises).
+  The `TerminalState` the CLI reports for a dead host names this file.
+- Executable: a host runs from a content-addressed copy under
+  `/var/tmp/apas-bin-<uid>/`, not from `~/.local/bin/apas`. Home is NFS and
+  every install replaces that file. A process on a local filesystem keeps its
+  unlinked executable alive; a process whose executable was unlinked on the
+  NFS server has nothing to fault code pages back in from and dies with
+  SIGBUS the first time memory pressure evicts one. A host sits idle for days
+  and is the process most exposed to that — the Codex pane in `apas` died
+  this way on 2026-09-02, eight minutes after a deploy, with no log anywhere.
+  Copies are shared by content, pruned a week after being superseded, and
+  verified to run before use; any failure falls back to the shared path.
 - Project/runtime directories are `0700`; `runtime.json`, `credential`, the
   Unix socket, and reboot `handoff.json` are `0600`.
 - `runtime.json` contains identity, protocol, tmux session, and socket paths,
@@ -1115,6 +1134,24 @@ Pane-host state is host-local, volatile, and outside the project directory:
   separate owner-only file and is never sent to providers or the server.
 - Raw detached output remains only in the pane-host's bounded in-memory ring;
   it is not written to `.apas`, SQLite, JSONL, or a spool file.
+
+**A host that is gone is reported as exited, not disconnected.** When the
+controller's socket to a host closes without an `Exited` frame, the CLI asks
+tmux whether the host's session still exists. If it does, the pane is
+`disconnected` (the host is alive and re-adoptable, and the web keeps its
+retained view). If it does not, the host process itself died, and the CLI
+reports `exited` with a status naming the tmux session and the log file, so
+the web offers a reboot instead of implying a transport outage that will heal.
+Before this, a dead host looked exactly like a CLI reconnect in progress, and
+stayed that way forever.
+
+**A launch whose handshake fails tears its host down.** The host spawns the
+provider *before* answering `Create` with `Adopted`, and the controller used
+to give it 5s and then fall back to a direct PTY — leaving the tmux session it
+had already started to go on and spawn its own provider. That put two agents
+on one conversation. The handshake now waits 30s, and on any failure after the
+tmux session exists the controller kills that session and removes its runtime
+directory before falling back.
 
 Unexpected controller loss keeps the provider alive for 600 seconds by
 default; an authenticated reboot handoff gets 900 seconds. Configure the
@@ -1137,8 +1174,15 @@ Operational inspection must not print `credential` contents. Safe checks are:
 apas config path
 find "${XDG_RUNTIME_DIR:-/tmp/apas-$(id -u)}/apas/ph" -name runtime.json -type f -print
 tmux -L "apas-<full-project-uuid>" list-sessions
-journalctl --user --since '15 minutes ago' | grep -E 'pane-host|lifecycle'
+ls "${XDG_RUNTIME_DIR:-/tmp/apas-$(id -u)}/apas/pane-host-logs/<project>/"
+journalctl --user --since '15 minutes ago' | grep -E 'pane-host|lifecycle|tmux-spawn'
 ```
+
+The `tmux-spawn-<uuid>.scope` records in the user journal are systemd's view
+of each tmux pane: `Started … launched by process <pid>` when a host starts,
+and a `Consumed … CPU time, … memory peak` line the second every process in
+it is gone. That second line, with no `Stopping`/`Stopped` before it, is how a
+host that died on its own was dated when it had left no log.
 
 Use the web Machines/Admin project stop action for cleanup; the daemon can
 enumerate and terminate pane hosts even when the project CLI is absent. If

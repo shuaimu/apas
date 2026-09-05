@@ -198,6 +198,28 @@ enum ConfigAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // A pane-host's stderr is the tmux pane it runs in, which vanishes with
+    // the process. It also logs to a host-local file that outlives it (see
+    // `pane_host::open_host_log`), at info level so the lifecycle — start,
+    // adoption, lease expiry, provider exit, fatal signal — is on record when
+    // a dead host has to be explained after the fact.
+    let host_log = match &cli.command {
+        Some(Commands::PaneHost { runtime_dir }) => match pane_host::open_host_log(runtime_dir) {
+            Ok(log) => Some(log),
+            Err(error) => {
+                eprintln!("pane-host: running without a log file: {error}");
+                None
+            }
+        },
+        _ => None,
+    };
+    let default_filter = if host_log.is_some() { "apas=info" } else { "apas=warn" };
+    if let Some(log) = &host_log {
+        pane_host::install_host_diagnostics(log);
+    }
+
     // Every project used to have its own tmux session and its own stderr file,
     // which separated their records for free. Projects now share this process,
     // so each carries a `project` span and the records must show it — without
@@ -206,14 +228,17 @@ async fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "apas=warn".into()),
+                .unwrap_or_else(|_| default_filter.into()),
         )
         // The default `Full` format prints the enclosing span and its fields,
         // which is what carries the project id onto every record.
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(host_log.map(|log| {
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(log))
+        }))
         .init();
-
-    let cli = Cli::parse();
 
     // Snapshot the exec path while it's still a clean, real on-disk
     // path. Later, when the binary gets replaced atomically (NFS
@@ -289,7 +314,11 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             Commands::PaneHost { runtime_dir } => {
-                return pane_host::run_host(runtime_dir);
+                let result = pane_host::run_host(runtime_dir);
+                if let Err(error) = &result {
+                    tracing::error!(%error, "pane-host failed");
+                }
+                return result;
             }
             Commands::Daemon { roots } => {
                 let state_path = config::Config::daemon_state_path()?;
