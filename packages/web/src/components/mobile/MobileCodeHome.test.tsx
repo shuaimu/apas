@@ -71,9 +71,18 @@ describe("MobileCodeHome", () => {
     renderHome();
 
     expect(screen.getByRole("heading", { name: "Coding sessions" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Account" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: /New task/ })).toBeTruthy();
-    expect(screen.getByRole("button", { name: /Create project from GitHub/ })).toBeTruthy();
+    const options = screen.getByRole("button", { name: "More options" });
+    expect(options.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByRole("menu", { name: "Session options" })).toBeNull();
+    fireEvent.click(options);
+    expect(options.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByRole("menuitem", { name: "Account" })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: "New task" })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: /Create project from GitHub/ })).toBeTruthy();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("menu", { name: "Session options" })).toBeNull();
+    expect(options.getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).toBe(options);
     expect(screen.getByRole("button", { name: "All projects" }).getAttribute("aria-pressed")).toBe("true");
     expect(screen.getByRole("button", { name: "Idle sessions" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Usage limited" })).toBeNull();
@@ -222,7 +231,8 @@ describe("MobileCodeHome", () => {
   it("opens cards and maps New task to an honest running-project chooser", () => {
     const props = renderHome();
 
-    fireEvent.click(screen.getByRole("button", { name: /New task/ }));
+    fireEvent.click(screen.getByRole("button", { name: "More options" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "New task" }));
     const dialog = screen.getByRole("dialog", { name: "Start coding work" });
     expect(dialog).toBeTruthy();
     expect(screen.getByText(/use its \+ control/)).toBeTruthy();
@@ -717,7 +727,8 @@ describe("MobileCodeHome", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Machines" }));
     expect(await screen.findByText(/Shared projects run on the owner/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: /Reboot the daemon on owner-host/ })).toBeNull();
-    expect(screen.getByRole("button", { name: /Create project from GitHub/ })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "More options" }));
+    expect(screen.getByRole("menuitem", { name: /Create project from GitHub/ })).toBeTruthy();
   });
 
   it("retains the selected shared cluster after mobile navigation remounts the home", async () => {
@@ -766,7 +777,8 @@ describe("MobileCodeHome", () => {
   it("keeps Account and machine management reachable without permanent bars", () => {
     const props = renderHome({ legacySessions: [] });
 
-    fireEvent.click(screen.getByRole("button", { name: "Account" }));
+    fireEvent.click(screen.getByRole("button", { name: "More options" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Account" }));
     expect(props.onAccount).toHaveBeenCalledTimes(1);
 
     fireEvent.click(screen.getByRole("button", { name: "Start a task" }));

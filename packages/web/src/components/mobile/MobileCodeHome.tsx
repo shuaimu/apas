@@ -1,7 +1,16 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { AlertTriangle, ChevronRight, Plus, RotateCcw, WifiOff, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  AlertTriangle,
+  ChevronRight,
+  MoreHorizontal,
+  Plus,
+  RotateCcw,
+  UserRound,
+  WifiOff,
+  X,
+} from "lucide-react";
 import type {
   MachineWithProjects,
   SessionInfo,
@@ -259,6 +268,9 @@ export function MobileCodeHome({
   );
   const [newTaskOpen, setNewTaskOpen] = useState(false);
   const [createProjectOpen, setCreateProjectOpen] = useState(false);
+  const [actionsOpen, setActionsOpen] = useState(false);
+  const actionsButtonRef = useRef<HTMLButtonElement>(null);
+  const firstActionRef = useRef<HTMLButtonElement>(null);
   const [selectedClusterOwner, setSelectedClusterOwner] = useState(() =>
     typeof window === "undefined" ? "" : localStorage.getItem(MOBILE_CLUSTER_STORAGE_KEY) || "",
   );
@@ -289,6 +301,18 @@ export function MobileCodeHome({
     const timer = window.setInterval(() => setAvailabilityNow(Date.now()), 60_000);
     return () => window.clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    if (!actionsOpen) return;
+    firstActionRef.current?.focus();
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setActionsOpen(false);
+      actionsButtonRef.current?.focus();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [actionsOpen]);
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
     if (!active || !token) return;
@@ -480,29 +504,73 @@ export function MobileCodeHome({
           <h1 className="text-[1.35rem] font-extrabold tracking-tight">Coding sessions</h1>
           <p className="mt-0.5 text-sm text-[#686873] dark:text-[#aaaab6]">Active work and recent outcomes</p>
         </div>
-        <div className="flex shrink-0 flex-col items-end gap-1">
+        <div className="relative shrink-0">
           <button
+            ref={actionsButtonRef}
             type="button"
-            onClick={onAccount}
-            className="min-h-9 px-1 text-sm font-bold text-[#6d5efc] hover:text-[#5547dc]"
+            aria-label="More options"
+            aria-haspopup="menu"
+            aria-expanded={actionsOpen}
+            aria-controls="mobile-session-actions"
+            onClick={() => setActionsOpen((open) => !open)}
+            className="relative z-30 inline-flex h-11 w-11 items-center justify-center rounded-xl border border-[#dddde5] bg-white text-[#4c4c56] shadow-sm hover:bg-[#efeff5] dark:border-[#303039] dark:bg-[#1b1b21] dark:text-[#d7d7df] dark:hover:bg-[#25252d]"
           >
-            Account
+            <MoreHorizontal className="h-5 w-5" />
           </button>
-          <button
-            type="button"
-            onClick={() => setNewTaskOpen(true)}
-            className="inline-flex min-h-10 items-center gap-1.5 rounded-xl bg-[#6d5efc] px-3.5 text-sm font-bold text-white shadow-sm hover:bg-[#5547dc]"
-          >
-            <Plus className="h-4 w-4" /> New task
-          </button>
-          <button
-            type="button"
-            aria-label="Create project from GitHub"
-            onClick={() => setCreateProjectOpen(true)}
-            className="inline-flex min-h-10 items-center gap-1.5 rounded-xl border border-emerald-500 bg-white px-3.5 text-sm font-bold text-emerald-700 shadow-sm hover:bg-emerald-50 dark:bg-[#1b1b21] dark:text-emerald-300 dark:hover:bg-emerald-950/40"
-          >
-            <Plus className="h-4 w-4" /> New project
-          </button>
+          {actionsOpen && (
+            <>
+              <div
+                aria-hidden="true"
+                className="fixed inset-0 z-20"
+                onClick={() => setActionsOpen(false)}
+              />
+              <div
+                id="mobile-session-actions"
+                role="menu"
+                aria-label="Session options"
+                className="absolute right-0 top-12 z-30 w-48 overflow-hidden rounded-xl border border-[#dddde5] bg-white p-1.5 shadow-xl dark:border-[#303039] dark:bg-[#1b1b21]"
+              >
+                <button
+                  ref={firstActionRef}
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setActionsOpen(false);
+                    onAccount();
+                  }}
+                  className="flex min-h-11 w-full items-center gap-3 rounded-lg px-3 text-left text-sm font-semibold hover:bg-[#efeff5] dark:hover:bg-[#25252d]"
+                >
+                  <UserRound className="h-4 w-4 text-[#686873] dark:text-[#aaaab6]" />
+                  Account
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setActionsOpen(false);
+                    setNewTaskOpen(true);
+                  }}
+                  className="flex min-h-11 w-full items-center gap-3 rounded-lg px-3 text-left text-sm font-semibold hover:bg-[#efeff5] dark:hover:bg-[#25252d]"
+                >
+                  <Plus className="h-4 w-4 text-[#6d5efc]" />
+                  New task
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  aria-label="Create project from GitHub"
+                  onClick={() => {
+                    setActionsOpen(false);
+                    setCreateProjectOpen(true);
+                  }}
+                  className="flex min-h-11 w-full items-center gap-3 rounded-lg px-3 text-left text-sm font-semibold hover:bg-[#efeff5] dark:hover:bg-[#25252d]"
+                >
+                  <Plus className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+                  New project
+                </button>
+              </div>
+            </>
+          )}
         </div>
       </div>
 
