@@ -1064,6 +1064,14 @@ cumulative snapshots that cover missed frames and replacement UUIDs reset
 xterm before replay. Snapshot/live lifecycle is authoritative for the
 disconnected, unknown, and exited banners, including empty snapshots.
 
+Claude's fullscreen TUI captures the mouse and owns text selection, then sends
+the selected text to its terminal through OSC 52. The web terminal loads
+`@xterm/addon-clipboard` with a write-only browser provider so that copy reaches
+the user's clipboard without allowing a provider process to read it. Clipboard
+reads receive an empty reply. The terminal also leaves paste shortcuts to the
+browser and leaves copy shortcuts there when xterm owns a selection; Ctrl+C
+without a selection still reaches the provider as an interrupt.
+
 **Rolling deployment.** Deploy the server first, then web, then CLI. New fields
 are optional/defaulted, so a new server accepts legacy output and exit frames,
 and a new web treats a legacy snapshot as `unknown`. Metadata-less output is

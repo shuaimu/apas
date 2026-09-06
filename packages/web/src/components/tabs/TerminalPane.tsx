@@ -2,6 +2,7 @@
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
+import { ClipboardAddon } from "@xterm/addon-clipboard";
 import { FitAddon } from "@xterm/addon-fit";
 import { useStore } from "@/lib/store";
 import {
@@ -16,6 +17,10 @@ import {
 } from "@/lib/terminalReconciler";
 import { SOLARIZED as SZ, readStoredTheme, themeIsDark } from "@/lib/theme";
 import { useTheme } from "@/lib/useTheme";
+import {
+  handleTerminalClipboardKey,
+  WriteOnlyTerminalClipboardProvider,
+} from "@/lib/terminalClipboard";
 import "@xterm/xterm/css/xterm.css";
 
 /**
@@ -252,7 +257,12 @@ export function TerminalPane({ paneId }: { paneId: number }) {
       theme: currentTerminalTheme(),
     });
     const fit = new FitAddon();
+    const clipboard = new ClipboardAddon(
+      undefined,
+      new WriteOnlyTerminalClipboardProvider(),
+    );
     term.loadAddon(fit);
+    term.loadAddon(clipboard);
     term.open(container);
     termRef.current = term;
     fitRef.current = fit;
@@ -289,6 +299,9 @@ export function TerminalPane({ paneId }: { paneId: number }) {
     });
 
     const onData = term.onData((data) => sendTerminalInput(paneId, data));
+    term.attachCustomKeyEventHandler((event) =>
+      handleTerminalClipboardKey(event, term.hasSelection()),
+    );
 
     const observer = new ResizeObserver(() => applyFit());
     observer.observe(container);
