@@ -1,34 +1,63 @@
 # APAS - Autonomous Programming Agent System
 
-APAS runs an autonomous programming team around your project. A Manager pane talks with the human and keeps `project_goal.md` current, a Tech Lead turns that goal into structured work in `team-todo.md`, and worker/reviewer panes implement changes in branches and open PRs for human review.
+APAS runs coding agents against your projects, from a browser or a phone.
+
+A project is any directory with an `.apas` file. The work happens in **panes**,
+each hosting one agent. You create a pane, talk to it, reboot it, and close it.
+There is no orchestration layer above that: a pane does what you ask it to, and
+nothing dispatches work between panes on its own.
+
+The CLI owns the panes and worktrees on your machine, a server brokers project
+and session state, and the web UI gives you the pane tabs, the conversation and
+terminal views, the project overview, and the diff and pull-request handoffs.
+
+> **Managed team mode was removed.** Four coordinating roles (Manager, Tech
+> Lead, Developer, Reviewer) used to pass work to each other through
+> `project_goal.md`, `team-todo.md`, and `.apas-team.jsonl`. If you find a
+> reference to those files, to a team role, to the TODO queue, or to
+> `apas mcp-server` in an old checkout or an old doc, it is stale. Some `.apas`
+> files still carry `team_enabled` or `managed: true`; both are ignored and load
+> as ordinary panes.
 
 ## Features
 
-- **Team Mode**: Coordinate Manager, Tech Lead, Reviewer, and worker panes from one project
-- **Shared Project State**: Keep goals in `project_goal.md` and work queues in `team-todo.md`
-- **PR-Based Review**: Workers publish diffs, wait for Reviewer approval, then open pull requests while the Tech Lead tracks PR state and routes comments
-- **Web Dashboard**: Use the Overview to inspect panes, manage TODOs, and observe work in real time
-- **Customizable Prompts**: Define role prompts and workflow behavior in the `.apas` config file
-- **Auto-Updates**: CLI automatically checks for updates on startup
+- **Terminal panes**: each pane runs a provider's real interactive TUI on a pty
+  and streams it to the browser, so you get the CLI exactly as it ships
+- **Claude, Codex, and OpenCode**, plus Claude against a DeepSeek backend
+- **Read it as a conversation**: a per-pane toggle swaps the live terminal for a
+  structured transcript, recovered from the provider's own session files
+- **Drive it from a phone**: type into the conversation view and answer an
+  agent's questions there, which is the practical way to work when an xterm is
+  not
+- **Isolated worktrees**: give a pane its own git branch and review its diff
+- **Your own cluster**: register machines, start and stop projects, and share
+  compute with collaborators
+- **Live updates**: pane state, diffs, and terminal output stream over WebSockets
 
 ## Installation
 
-### Quick Install
+### Quick install
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/shuaimu/apas/master/install.sh | bash
 ```
 
-This will clone and build from source, installing to `~/.local/bin/`. Requires Rust (will install via rustup if not present).
+This clones and builds from source into `~/.local/bin/`, installing Rust via
+rustup if it is missing.
 
-### Manual Build
+The CLI ships as a **static musl** binary so that a self-update never leaves it
+depending on the build machine's glibc. Building it the way it ships needs the
+musl target and a musl C compiler:
 
 ```bash
-git clone https://github.com/shuaimu/apas.git
-cd apas
-cargo build --release -p apas
-cp target/release/apas ~/.local/bin/
+rustup target add x86_64-unknown-linux-musl   # aarch64-… on ARM
+sudo apt-get install -y musl-tools
+
+cargo build --release --target x86_64-unknown-linux-musl -p apas
 ```
+
+If the musl toolchain is missing, both `install.sh` and the self-updater fall
+back to a glibc build, so an update can never brick the binary.
 
 ### Update
 
@@ -36,161 +65,314 @@ cp target/release/apas ~/.local/bin/
 apas update
 ```
 
-This rebuilds from the latest source. The CLI also checks for updates every 24 hours and notifies you if a new version is available.
+A launch also checks for a newer version and installs it before starting.
 
-## Usage
+A **daemon**, though, is replaced only when you ask. It now hosts every project
+on the machine as a supervised task, so replacing it means stopping all of them
+and starting them again. Use **Reboot to update** on the Machines page, which
+applies any pending update first and then restarts. Each machine shows the
+version its daemon reports, so a host that has fallen behind is visible rather
+than silent.
 
-### Basic Usage
-
-Navigate to your project directory and run:
+## Getting started
 
 ```bash
-# setup ws service or your service
+# 1. Point the CLI at a server and sign in.
 apas config set server wss://apas.mpaxos.com
+apas login
 
-# start apas
+# 2. Register a project. This exits immediately; it does not start anything.
+cd /path/to/your/project
 apas
+
+# 3. Open the web UI, find the project on the Machines page, and start it.
+#    Then add a pane and talk to it.
 ```
 
-This will:
-1. Create a `.apas` file in your project if it doesn't exist
-2. Connect to the APAS server for web monitoring
-3. Start the local CLI session and expose the project in the web Overview
-4. Leave team launch under your control: use the Overview **Team setup** card to pick provider/model choices and click **Start team**
+Running `apas` in a directory **registers the project and exits**. It does not
+open a terminal UI, and it does not start the project. A host runs **one APAS
+instance per user**, and projects are started from the web. Running `apas` in a
+directory that is not yet a project creates and registers it.
 
-### Team Mode
+`apas --attach` opens a local terminal UI for a project already running on the
+host. It is the fallback for when the web is unreachable and shows little beyond
+pane names.
 
-The Overview is the main control surface for team-mode projects:
+### Accounts
 
-1. Open the **Team setup** card.
-2. Pick the provider/model for each managed role: Manager, Tech Lead, Developer, and Reviewer.
-3. Click **Start team** to launch the selected managed panes.
-4. Describe the project goal in the Manager pane, or ask the Manager to scan the repo and draft one. The Manager keeps `project_goal.md` in sync.
-5. Let the Tech Lead read `project_goal.md` and `team-todo.md`, propose Global TODOs, and dispatch approved work to worker panes.
-6. Approve or reject proposed Global TODOs from the Overview TODO panel.
-7. Review and merge worker PRs on GitHub. Workers wait for Reviewer approval before opening PRs; after a PR opens, the Tech Lead tracks merge or close state and routes PR comments back to the owning worker.
+Registration needs either an **invitation**, which an administrator issues and
+which works with any address, or an email address in a domain the deployment
+has opened for self-signup. The signup page states which applies.
 
-#### Tech Lead autonomy
+## Key concepts
 
-The Overview includes opt-in Tech Lead autonomy toggles backed by `.apas`.
-Both default to manual control: `auto_approve_todos: false` and
-`auto_merge_prs: false`. The Tech Lead re-reads these flags each loop.
-`auto_approve_todos` lets it approve its own proposed Global TODOs;
-`auto_merge_prs` remains gated by Reviewer approval, mergeability, and
-green/non-stale CI state. Leaving both off is safest; enabling either
-trades review latency for more autonomous execution.
+### Panes
 
-### Configuration
+A pane hosts one agent. `PaneConfig.kind` decides how, and is independent of
+`provider` (which binary) and `mode` (how autonomous).
 
-The `.apas` file in your project directory contains:
+New panes are **terminal panes** (`kind: "terminal"`). APAS allocates a pty,
+execs the provider's real interactive TUI, and streams the raw bytes to xterm.js
+in the browser. Nothing is parsed, so nothing has to keep pace with a provider's
+output format.
+
+`kind: "agent"` is the older structured path, where the CLI runs the provider
+headlessly and parses its stream-JSON. It is kept only for panes that already
+exist. Nothing creates one any more.
+
+Only Claude, Codex, and OpenCode can host a terminal pane. DeepSeek runs the
+Claude binary against an Anthropic-compatible endpoint. APAS does not install or
+authenticate these tools; install and log into them on each host first.
+
+### Terminal panes have history
+
+An agent pane is observed directly, because the CLI parses its output. A
+terminal pane has nothing structured to parse, so APAS reads the transcript each
+provider already writes:
+
+- **Claude** reports its own transcript through a `SessionStart` hook, so the
+  pane is never guessing which conversation it is in.
+- **Codex** is located by the terminal's process group, so several panes can
+  share one directory without sharing history.
+- **OpenCode** is asked for its session list and export.
+
+That transcript is what gives a terminal pane its conversation view, its token
+counts, and its working/idle state. Questions an agent asks appear there and can
+be answered there, and typed messages go straight into the live pty.
+
+### Pane hosts
+
+On Unix hosts, each terminal pane is owned by a hidden `apas pane-host` process
+in its own tmux session, and the project CLI is only its authenticated
+controller. This takes the provider's lifetime out of the CLI's hands: a
+transport reconnect leaves everything running, and a CLI reboot re-adopts the
+same live terminals afterward.
+
+### Projects run inside one instance
+
+A host runs one `apas` process per user, with the projects running inside it as
+supervised tasks, plus one pane host per terminal pane. Stopping a project sets
+a flag it observes rather than aborting it, and a project that panics unwinds
+its own task without taking the others down.
+
+### Clusters and administration
+
+These are two separate jobs with two separate surfaces.
+
+**Your virtual cluster** is `/machines`, available to every account with no role
+check. It is derived, not stored: the machines your client registered, plus the
+projects hosted on them. A project is hosted in your cluster if you own it or if
+one of its sessions was created under it, so a project someone else owns but
+runs on your machine is yours to administer. You can share that cluster with
+another account, scoped to specific machines.
+
+**System administration** is `/admin`. It is a credential, not an account: one
+per deployment, stored outside the users table, with its own login. No UI can
+grant it, and its token authorizes nothing else.
+
+Belonging to a project is deliberately not the same as hosting it. Content
+access is owner, member, or host; administration is host only.
+
+## Configuration
+
+### CLI config
+
+`~/.config/apas/config.toml`:
+
+```toml
+[remote]
+server = "wss://apas.mpaxos.com"
+token = "your-token"
+
+[local]
+claude_path = "claude"
+codex_path = "codex"
+opencode_path = "opencode"
+```
+
+Set values with `apas config set KEY VALUE`. Useful keys include `server`,
+`claude_path`, `codex_path`, `opencode_path`, `deepseek_api_base_url`,
+`deepseek_api_key`, `daemon_roots`, and the pane-host grace periods
+`pane_host_adoption_grace_seconds` and `pane_host_reboot_grace_seconds`.
+
+### Project file
+
+Each project directory gets an `.apas` file holding its identity and its
+restored panes:
 
 ```json
 {
-  "id": "uuid-of-your-project",
+  "id": "uuid",
   "name": "project-name",
-  "created_at": "timestamp",
-  "auto_approve_todos": false,
-  "auto_merge_prs": false,
-  "prompt": "Your custom prompt here (optional)"
+  "created_at": "2026-01-01T00:00:00Z",
+  "disallowed_tab_types": [],
+  "panes": [
+    {
+      "pane_id": 555,
+      "label": "Claude 2",
+      "kind": "terminal",
+      "provider": "claude",
+      "mode": "interactive"
+    },
+    {
+      "pane_id": 920,
+      "label": "Codex 2",
+      "kind": "terminal",
+      "provider": "codex",
+      "mode": "interactive"
+    }
+  ]
 }
 ```
 
-If no custom `prompt` is specified, APAS uses the built-in team-mode prompts for the default Manager, Tech Lead, Reviewer, and Developer panes. You can customize pane roles, goals, backstories, prompts, and Tech Lead autonomy flags in `.apas` as your workflow matures.
+A new project has **no panes**; you open what you want. A missing `kind` still
+loads as `agent` so that files written before terminal panes existed keep
+working.
 
-### CLI Options
+`disallowed_tab_types` restricts which tab types users may create, where a tab
+type is a pane kind plus a provider (`terminal:claude`, `terminal:codex`,
+`terminal:opencode`). It is stored as a deny list, so an empty value means
+everything is allowed and a provider added later is permitted until an owner
+says otherwise. The CLI enforces it by re-reading `.apas` on every request,
+because the web only hides menu entries.
+
+`auto_approve_todos` and `auto_merge_prs` may still appear in older files. They
+were read by the team loop and now do nothing.
+
+## CLI reference
 
 ```bash
-apas --help              # Show help
-apas --version           # Show version
-apas update              # Check for updates
+apas                     # Register the project in this directory, then exit
+apas --attach            # Open the local terminal UI for a running project
+apas --offline           # Run without a server
+apas -d /path/to/dir     # Act on another directory
+apas --headless          # Run one project without a TUI (debugging)
+
+apas login               # Sign in to the server
+apas whoami              # Show login status
+apas logout              # Sign out
+
 apas config show         # Show configuration
-apas config set KEY VAL  # Set configuration value
-apas --offline           # Run in offline mode (no server)
-apas -d /path/to/dir     # Specify working directory
+apas config set KEY VAL  # Set a configuration value
+apas update              # Check for updates and install
+apas daemon              # Run the per-machine daemon
+apas worktree            # Manage per-pane isolated git worktrees
 ```
-
-Pane work summaries are available on desktop, responsive mobile web, and the
-native app when the isolated CLI feature is enabled. See
-[docs/pane-work-summaries.md](docs/pane-work-summaries.md) for scope, privacy,
-retention, enablement, and rollback guidance.
-
-Trusted collaborators can also create and run their own public-GitHub projects
-on a cluster shared by another account. See
-[docs/shared-clusters.md](docs/shared-clusters.md) for the trust boundary, role
-matrix, usage semantics, rollout order, and rollback restriction.
 
 ## Architecture
 
 ```
-+------------------+     +--------------+     +-----------------+
-|   Claude Code    | <-- |  APAS CLI    | --> |  APAS Server   |
-| (runs locally)   |     | (Rust)       |     | (Rust/Axum)    |
-+------------------+     +--------------+     +-----------------+
-                                                      |
-                                                      v
-                                              +-----------------+
-                                              |   Web UI        |
-                                              | (Next.js)       |
-                                              +-----------------+
+┌─────────────────────┐    WebSocket     ┌─────────────────┐    WebSocket    ┌─────────────────────┐
+│ CLI client          │ ◄───────────────►│ apas-server     │◄───────────────►│ Web frontend        │
+│ (apas binary)       │                  │                 │                 │ (Next.js)           │
+└─────────────────────┘                  └─────────────────┘                 └─────────────────────┘
+        │                                         │
+        │                                         ▼
+        │                                ┌─────────────────┐
+        │                                │ SQLite + JSONL  │
+        │                                └─────────────────┘
+        ▼
+┌─────────────────────┐
+│ Pane hosts (tmux)   │
+│ Claude/Codex/…      │
+│ pty + worktrees     │
+└─────────────────────┘
 ```
 
-- **APAS CLI**: Owns local panes, role prompts, isolated worktrees,
-  and the team-mode files `project_goal.md`, `team-todo.md`, and
-  `.apas-team.jsonl`.
-- **APAS Server**: Routes project/session state, pane events, TODO
-  updates, and PR/status records between CLI clients and web clients.
-- **Web UI**: Provides the Overview team controls for starting roles,
-  approving TODOs, reviewing suggested workers, and tracking worker PR
-  handoffs and status.
+- **APAS CLI** owns local panes, pane identity, isolated worktrees, and the
+  `.apas` file, and supervises the pane hosts that hold the pty for each
+  terminal pane.
+- **APAS server** brokers project, session, and machine state between CLI and
+  web clients, and keeps a bounded in-memory buffer of terminal output per pane.
+  Terminal bytes are deliberately never persisted.
+- **Web UI** provides the pane tabs, terminal and conversation views, diffs, the
+  project overview, and the cluster and administration surfaces.
 
 ## Development
 
-### Project Structure
+### Project structure
 
 ```
 apas/
 ├── crates/
-│   ├── client-cli/    # APAS CLI: panes, role prompts, worktrees, team files
+│   ├── client-cli/           # The apas binary
 │   │   └── src/
-│   │       ├── role.rs             # Built-in Manager/Tech Lead/worker prompts
-│   │       ├── team_todo.rs        # team-todo.md parsing and state changes
-│   │       └── mode/dual_pane.rs   # Pane spawning, Start team, team loop wiring
-│   ├── server/        # Rust/Axum server for project/session state and routing
-│   └── shared/        # Shared wire types and messages
+│   │       ├── main.rs               # Entry point and config commands
+│   │       ├── project.rs            # .apas project metadata
+│   │       ├── pane_identity.rs      # Role/goal/backstory as a system prompt
+│   │       ├── terminal_pane.rs      # pty host for terminal panes
+│   │       ├── pane_host.rs          # Persistent per-pane host process
+│   │       ├── claude_session_hook.rs# Which transcript a Claude pane writes
+│   │       ├── worktree.rs           # Isolated worktree create/diff/cleanup
+│   │       └── mode/dual_pane.rs     # Pane runtime: panes, deadloops, watchers
+│   ├── server/               # Rust/Axum WebSocket + HTTP server
+│   │   └── src/routes/               # ws_cli, ws_web, ws_daemon, auth, admin, cluster
+│   └── shared/               # Wire types shared by CLI and server
 ├── packages/
-│   └── web/           # Next.js web dashboard
-│       └── src/
-│           ├── components/overview/ # Team setup, TODOs, suggestions, PR views
-│           └── lib/store.ts         # Websocket store and Overview actions
-└── install.sh         # Installation script
+│   ├── web/                  # Next.js web UI
+│   ├── mobile/               # Mobile companion app
+│   ├── protocol/             # Shared protocol definitions
+│   └── terminal-web/         # Terminal rendering support
+├── docs/                     # Design and operations notes
+├── deploy/                   # nginx config and deployment assets
+└── install.sh
 ```
 
 ### Building
 
 ```bash
-# Build everything
-cargo build
-
-# Build CLI only
-cargo build -p apas
-
-# Build server only
-cargo build -p apas-server
+cargo build                  # Everything
+cargo build -p apas          # CLI only
+cargo build -p apas-server   # Server only
 ```
 
-### Running Locally
+### Running locally
 
 ```bash
-# Start server
-cargo run -p apas-server
+# Terminal 1: server
+RUST_LOG=info cargo run -p apas-server
 
-# Start CLI (in another terminal)
+# Terminal 2: web UI
+cd packages/web && npm install && npm run dev
+
+# Terminal 3: register a project
 cargo run -p apas
-
-# Start web UI (in another terminal)
-cd packages/web
-npm run dev
 ```
+
+### Tests
+
+```bash
+cargo test                                  # Rust
+cd packages/web && npm test                 # Web
+```
+
+If Rust tests fail with `pool timed out while waiting for an open connection`,
+the temp directory is out of space. The suite builds SQLite databases under
+`TMPDIR`; point it somewhere with room:
+
+```bash
+TMPDIR=/var/tmp cargo test -p apas-server
+```
+
+## Further reading
+
+**[CLAUDE.md](CLAUDE.md) is the canonical contributor and agent runbook**, with
+the architecture, deployment procedure, and the reasoning behind decisions that
+are easy to undo by accident. Read it before changing anything here.
+
+- [docs/shared-clusters.md](docs/shared-clusters.md) — sharing compute: the
+  trust boundary, role matrix, and rollout order
+- [docs/cluster-administration.md](docs/cluster-administration.md) — cluster and
+  deployment administration
+- [docs/pane-work-summaries.md](docs/pane-work-summaries.md) — scope, privacy,
+  retention, and rollback for pane work summaries
+- [docs/one-instance-per-host.md](docs/one-instance-per-host.md) — why a host
+  runs a single instance
+- [docs/mobile-development-and-operations.md](docs/mobile-development-and-operations.md)
+  and [docs/mobile-threat-model.md](docs/mobile-threat-model.md) — the mobile app
+
+`docs/team-mode.md` and `docs/todo-driven-workflow.md` describe the removed
+managed team mode and are kept only as history.
 
 ## License
 
