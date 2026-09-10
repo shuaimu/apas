@@ -81,6 +81,30 @@ fn normalize_email(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
 }
 
+#[derive(Debug, Serialize)]
+pub struct RegistrationPolicyResponse {
+    /// Domains that may register with no invitation. Empty means the
+    /// deployment is invitation-only.
+    pub self_signup_email_domains: Vec<String>,
+    pub min_password_length: usize,
+}
+
+/// What the signup page needs to tell a visitor who may register.
+///
+/// Deliberately served rather than hardcoded in the web bundle: the allowlist
+/// is a config value an operator can widen with a restart and no rebuild, so a
+/// copy compiled into the page would start lying the moment it changed. This
+/// is public on purpose — it is the posted admission policy, and anyone can
+/// discover it by attempting to register anyway.
+pub async fn registration_policy(
+    State(state): State<AppState>,
+) -> Json<RegistrationPolicyResponse> {
+    Json(RegistrationPolicyResponse {
+        self_signup_email_domains: state.config.auth.self_signup_domains(),
+        min_password_length: MIN_PASSWORD_LEN,
+    })
+}
+
 pub async fn register(
     State(state): State<AppState>,
     Json(req): Json<RegisterRequest>,

@@ -19,7 +19,15 @@ function RegisterForm() {
   const [loading, setLoading] = useState(false);
   const [deviceCode, setDeviceCode] = useState<string | null>(null);
   const [cliAuthorized, setCliAuthorized] = useState(false);
+  // Who may register, read from the server rather than compiled in. The
+  // allowlist is a config value an operator can widen with a restart and no
+  // rebuild, so a copy baked into this bundle would start lying the moment it
+  // changed. Undefined means "not loaded yet or unreachable", and the page
+  // simply shows no claim rather than a wrong one.
+  const [signupDomains, setSignupDomains] = useState<string[] | undefined>(undefined);
+  const [minPasswordLength, setMinPasswordLength] = useState(8);
   const login = useStore((s) => s.login);
+  const invitationCode = searchParams.get("invitation");
 
   useEffect(() => {
     // Check for device code in URL (from CLI login)
@@ -28,6 +36,26 @@ function RegisterForm() {
       setDeviceCode(code);
     }
   }, [searchParams]);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${API_URL}/auth/registration-policy`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((policy) => {
+        if (cancelled || !policy) return;
+        if (Array.isArray(policy.self_signup_email_domains)) {
+          setSignupDomains(policy.self_signup_email_domains);
+        }
+        if (typeof policy.min_password_length === "number") {
+          setMinPasswordLength(policy.min_password_length);
+        }
+      })
+      // An older server has no such endpoint. Say nothing rather than guess.
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -38,8 +66,8 @@ function RegisterForm() {
       return;
     }
 
-    if (password.length < 6) {
-      setError("Password must be at least 6 characters");
+    if (password.length < minPasswordLength) {
+      setError(`Password must be at least ${minPasswordLength} characters`);
       return;
     }
 
@@ -52,13 +80,16 @@ function RegisterForm() {
         body: JSON.stringify({
           email,
           password,
-          invitation_code: searchParams.get("invitation") || undefined,
+          invitation_code: invitationCode || undefined,
         }),
       });
 
       if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.message || "Registration failed");
+        // The API reports failures as `error`; reading only `message` meant
+        // every rejection reached the user as a bare "Registration failed",
+        // including the one that tells them which addresses may sign up.
+        const data = await res.json().catch(() => null);
+        throw new Error(data?.error || data?.message || "Registration failed");
       }
 
       const { token, user_id, user_email, account_status } = await res.json();
@@ -111,6 +142,28 @@ function RegisterForm() {
    * account"; dropping the redirect here stranded them on the dashboard after
    * signing up, with the invite unredeemed.
    */
+  // Human-readable "@a, @b or @c".
+  const domainList = (domains: string[]) => {
+    const tagged = domains.map((domain) => `@${domain}`);
+    if (tagged.length <= 1) return tagged.join("");
+    return `${tagged.slice(0, -1).join(", ")} or ${tagged[tagged.length - 1]}`;
+  };
+
+  // Only judge an address once it looks finished, so the hint does not accuse
+  // someone of a wrong domain while they are still typing it.
+  const typedDomain = email.includes("@")
+    ? email.trim().toLowerCase().split("@").pop() ?? ""
+    : "";
+  const domainLooksComplete = typedDomain.includes(".") && !typedDomain.endsWith(".");
+  const domainAccepted =
+    signupDomains !== undefined && signupDomains.includes(typedDomain);
+  const showDomainWarning =
+    signupDomains !== undefined &&
+    signupDomains.length > 0 &&
+    !invitationCode &&
+    domainLooksComplete &&
+    !domainAccepted;
+
   const crossLinkHref = (base: string) => {
     const params = new URLSearchParams();
     if (deviceCode) params.set("code", deviceCode);
@@ -158,6 +211,37 @@ function RegisterForm() {
               </p>
             </div>
           )}
+
+          {/* Who may sign up. Shown before the form is touched, because the
+              alternative is letting someone fill it in and only then learning
+              their address is not eligible. */}
+          {invitationCode ? (
+            <div className="mt-4 p-3 bg-emerald-50 dark:bg-emerald-900/30 rounded-lg text-left">
+              <p className="text-sm text-emerald-700 dark:text-emerald-300">
+                You are signing up with an invitation, so any email address
+                works. It must match the address the invitation was sent to.
+              </p>
+            </div>
+          ) : signupDomains !== undefined && signupDomains.length > 0 ? (
+            <div className="mt-4 p-3 bg-amber-50 dark:bg-amber-900/30 border border-amber-200 dark:border-amber-800 rounded-lg text-left">
+              <p className="text-sm text-amber-800 dark:text-amber-200">
+                Open registration is currently limited to{" "}
+                <span className="font-semibold">{domainList(signupDomains)}</span>{" "}
+                email addresses.
+              </p>
+              <p className="text-xs text-amber-700 dark:text-amber-300 mt-1">
+                Using a different address? Ask an administrator for an
+                invitation link, which works with any email.
+              </p>
+            </div>
+          ) : signupDomains !== undefined && signupDomains.length === 0 ? (
+            <div className="mt-4 p-3 bg-amber-50 dark:bg-amber-900/30 border border-amber-200 dark:border-amber-800 rounded-lg text-left">
+              <p className="text-sm text-amber-800 dark:text-amber-200">
+                Signing up requires an invitation. Ask an administrator for an
+                invitation link.
+              </p>
+            </div>
+          ) : null}
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-6">
@@ -181,8 +265,23 @@ function RegisterForm() {
               onChange={(e) => setEmail(e.target.value)}
               required
               className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-              placeholder="you@example.com"
+              placeholder={
+                signupDomains && signupDomains.length > 0
+                  ? `you@${signupDomains[0]}`
+                  : "you@example.com"
+              }
+              aria-describedby="email-domain-hint"
             />
+            {showDomainWarning && (
+              <p
+                id="email-domain-hint"
+                className="mt-1 text-xs text-amber-700 dark:text-amber-300"
+              >
+                {`@${typedDomain}`} addresses cannot sign up directly. Use a{" "}
+                {domainList(signupDomains ?? [])} address, or an invitation
+                link.
+              </p>
+            )}
           </div>
 
           <div>

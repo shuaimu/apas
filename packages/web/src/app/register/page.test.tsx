@@ -11,14 +11,20 @@ type LinkProps = AnchorHTMLAttributes<HTMLAnchorElement> & {
 const navigation = vi.hoisted(() => {
   const state = {
     code: null as string | null,
+    invitation: null as string | null,
     push: vi.fn(),
     searchParams: {
       get: vi.fn(),
     },
   };
-  state.searchParams.get.mockImplementation((key: string) =>
-    key === "code" ? state.code : null,
-  );
+  // One implementation for the whole file, reading mutable fields. A test that
+  // swapped this out instead would leak its query string into every test after
+  // it, because beforeEach clears calls but not implementations.
+  state.searchParams.get.mockImplementation((key: string) => {
+    if (key === "code") return state.code;
+    if (key === "invitation") return state.invitation;
+    return null;
+  });
   return state;
 });
 
@@ -105,6 +111,28 @@ function mockRegisterSuccess(overrides: Record<string, unknown> = {}) {
   );
 }
 
+/// The page asks the server who may register, on mount, before any submit.
+/// Queue that answer first so each test's own queued response still lines up
+/// with the register call it is about.
+function mockRegistrationPolicy(
+  domains: string[] = ["cs.stonybrook.edu", "stonybrook.edu"],
+  minPasswordLength = 8,
+) {
+  fetchMock.mockResolvedValueOnce(
+    jsonResponse({
+      self_signup_email_domains: domains,
+      min_password_length: minPasswordLength,
+    }),
+  );
+}
+
+function registerCalls() {
+  return fetchMock.mock.calls.filter(
+    (call) => typeof call[0] === "string" && call[0].includes("/auth/register") &&
+      !call[0].includes("registration-policy"),
+  );
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((res) => {
@@ -116,11 +144,13 @@ function deferred<T>() {
 describe("RegisterPage", () => {
   beforeEach(() => {
     navigation.code = null;
+    navigation.invitation = null;
     navigation.push.mockReset();
     navigation.searchParams.get.mockClear();
     store.login.mockReset();
     fetchMock.mockReset();
     globalThis.fetch = fetchMock as unknown as typeof fetch;
+    mockRegistrationPolicy();
     vi.useRealTimers();
   });
 
@@ -137,7 +167,7 @@ describe("RegisterPage", () => {
     submitForm();
 
     expect(await screen.findByText("Passwords do not match")).toBeTruthy();
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(registerCalls()).toHaveLength(0);
     expect(store.login).not.toHaveBeenCalled();
     expect(navigation.push).not.toHaveBeenCalled();
   });
@@ -147,10 +177,101 @@ describe("RegisterPage", () => {
     fillRegisterForm({ password: "short", confirmPassword: "short" });
     submitForm();
 
-    expect(await screen.findByText("Password must be at least 6 characters")).toBeTruthy();
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(
+      await screen.findByText("Password must be at least 8 characters"),
+    ).toBeTruthy();
+    expect(registerCalls()).toHaveLength(0);
     expect(store.login).not.toHaveBeenCalled();
     expect(navigation.push).not.toHaveBeenCalled();
+  });
+
+  it("tells a visitor which domains may sign up, reading them from the server", async () => {
+    render(<RegisterPage />);
+
+    expect(
+      await screen.findByText(/Open registration is currently limited to/),
+    ).toBeTruthy();
+    expect(
+      screen.getByText("@cs.stonybrook.edu or @stonybrook.edu"),
+    ).toBeTruthy();
+    // The way in for everyone else has to be stated too, or an ineligible
+    // visitor is simply told no.
+    expect(screen.getByText(/Ask an administrator for an invitation/)).toBeTruthy();
+  });
+
+  it("says an invitation is required when the deployment lists no domains", async () => {
+    fetchMock.mockReset();
+    mockRegistrationPolicy([]);
+    render(<RegisterPage />);
+
+    expect(
+      await screen.findByText(/Signing up requires an invitation/),
+    ).toBeTruthy();
+    expect(screen.queryByText(/currently limited to/)).toBeNull();
+  });
+
+  it("warns as soon as an ineligible domain is typed, and not before", async () => {
+    render(<RegisterPage />);
+    await screen.findByText(/Open registration is currently limited to/);
+
+    // Mid-typing: no accusation while the domain is still incomplete.
+    fireEvent.change(emailInput(), { target: { value: "someone@gmail" } });
+    expect(screen.queryByText(/cannot sign up directly/)).toBeNull();
+
+    fireEvent.change(emailInput(), { target: { value: "someone@gmail.com" } });
+    expect(
+      await screen.findByText(/@gmail\.com addresses cannot sign up directly/),
+    ).toBeTruthy();
+
+    // An accepted domain clears it.
+    fireEvent.change(emailInput(), {
+      target: { value: "someone@cs.stonybrook.edu" },
+    });
+    await waitFor(() => {
+      expect(screen.queryByText(/cannot sign up directly/)).toBeNull();
+    });
+  });
+
+  it("does not warn about the domain when an invitation is present", async () => {
+    navigation.invitation = "invite-code-abc";
+    render(<RegisterPage />);
+
+    expect(
+      await screen.findByText(/You are signing up with an invitation/),
+    ).toBeTruthy();
+    fireEvent.change(emailInput(), { target: { value: "someone@gmail.com" } });
+    expect(screen.queryByText(/cannot sign up directly/)).toBeNull();
+    expect(screen.queryByText(/currently limited to/)).toBeNull();
+  });
+
+  it("shows the server's reason for refusing, not a generic failure", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ error: "A cluster invitation is required" }, false),
+    );
+
+    render(<RegisterPage />);
+    fillRegisterForm({ email: "someone@gmail.com" });
+    fireEvent.click(submitButton());
+
+    // The API reports failures as `error`; the page used to read only
+    // `message`, so every rejection surfaced as "Registration failed".
+    expect(
+      await screen.findByText("A cluster invitation is required"),
+    ).toBeTruthy();
+    expect(screen.queryByText("Registration failed")).toBeNull();
+  });
+
+  it("says nothing about domains when the server is too old to report a policy", async () => {
+    fetchMock.mockReset();
+    fetchMock.mockRejectedValueOnce(new Error("404"));
+    render(<RegisterPage />);
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Email")).toBeTruthy();
+    });
+    // No claim is better than a wrong claim.
+    expect(screen.queryByText(/currently limited to/)).toBeNull();
+    expect(screen.queryByText(/Signing up requires an invitation/)).toBeNull();
   });
 
   it("stores returned auth data and redirects after successful registration", async () => {

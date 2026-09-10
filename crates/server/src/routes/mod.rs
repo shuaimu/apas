@@ -35,6 +35,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/health", get(health::health_check))
         // Auth routes
         .route("/auth/register", post(auth::register))
+        .route("/auth/registration-policy", get(auth::registration_policy))
         .route("/auth/login", post(auth::login))
         .route("/auth/me", get(auth::me))
         .route("/auth/mobile/login", post(mobile_auth::login))
