@@ -48,6 +48,22 @@ async fn async_main() -> Result<()> {
     db.run_migrations().await?;
     routes::seed_system_admin(&db, &config.system_admin).await?;
 
+    // Say the registration policy out loud at boot. This deployment spent a
+    // month unable to create any account because a blank bootstrap password
+    // left it with no administrator to issue invitations, and nothing said so
+    // after the one warning at startup.
+    let self_signup_domains = config.auth.self_signup_domains();
+    if self_signup_domains.is_empty() {
+        tracing::info!(
+            "Registration is invitation-only; set [auth] self_signup_email_domains to let listed domains sign up directly"
+        );
+    } else {
+        tracing::info!(
+            domains = %self_signup_domains.join(", "),
+            "Registration is open to these email domains without an invitation"
+        );
+    }
+
     // Create app state
     let state = AppState::new(db, config.clone());
     project_lifecycle::recover_interrupted_deletions(&state).await?;

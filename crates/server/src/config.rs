@@ -213,6 +213,53 @@ pub struct AuthConfig {
     pub mobile_access_expiry_minutes: u64,
     #[serde(default = "default_mobile_refresh_expiry_days")]
     pub mobile_refresh_expiry_days: u64,
+    /// Email domains whose owners may create an account without an
+    /// invitation, e.g. `["cs.stonybrook.edu"]`.
+    ///
+    /// The allowlist **is** the switch, deliberately: there is no separate
+    /// "open registration" boolean that could be turned on while this is
+    /// empty and admit the entire internet. Empty (the default) means the
+    /// deployment stays invitation-only, exactly as it behaved before this
+    /// setting existed, so an older config file keeps its current policy.
+    /// Invitations keep working either way, and remain the way to admit
+    /// someone whose address is outside these domains.
+    #[serde(default)]
+    pub self_signup_email_domains: Vec<String>,
+}
+
+impl AuthConfig {
+    /// The allowlist, normalized: lowercased, and tolerant of entries written
+    /// as `@example.edu` or `.example.edu`.
+    pub fn self_signup_domains(&self) -> Vec<String> {
+        self.self_signup_email_domains
+            .iter()
+            .map(|domain| {
+                domain
+                    .trim()
+                    .trim_start_matches('@')
+                    .trim_start_matches('.')
+                    .to_ascii_lowercase()
+            })
+            .filter(|domain| !domain.is_empty())
+            .collect()
+    }
+
+    /// Whether `email` may register with no invitation.
+    ///
+    /// Exact domain match only. A subdomain is not covered by its parent, so
+    /// `mail.example.edu` has to be listed in its own right — wildcarding
+    /// here would silently widen who can sign up, which is the one mistake
+    /// this setting exists to prevent.
+    pub fn self_signup_allows(&self, email: &str) -> bool {
+        let Some((local, domain)) = email.trim().rsplit_once('@') else {
+            return false;
+        };
+        if local.trim().is_empty() {
+            return false;
+        }
+        let domain = domain.trim().to_ascii_lowercase();
+        !domain.is_empty() && self.self_signup_domains().contains(&domain)
+    }
 }
 
 fn default_mobile_access_expiry_minutes() -> u64 {
@@ -282,6 +329,7 @@ impl Default for Config {
                 token_expiry_hours: 876000, // ~100 years (never expire)
                 mobile_access_expiry_minutes: default_mobile_access_expiry_minutes(),
                 mobile_refresh_expiry_days: default_mobile_refresh_expiry_days(),
+                self_signup_email_domains: Vec::new(),
             },
             smtp: SmtpConfig::default(),
             mobile: MobileConfig::default(),
@@ -320,5 +368,94 @@ impl Config {
         let content = std::fs::read_to_string(path)?;
         let config: Config = toml::from_str(&content)?;
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn auth_with(domains: &[&str]) -> AuthConfig {
+        AuthConfig {
+            self_signup_email_domains: domains.iter().map(|d| d.to_string()).collect(),
+            ..Config::default().auth
+        }
+    }
+
+    #[test]
+    fn an_empty_allowlist_keeps_the_deployment_invitation_only() {
+        let auth = auth_with(&[]);
+        assert!(!auth.self_signup_allows("anyone@example.edu"));
+        // The shipped default must not admit anyone, so a config file written
+        // before this setting existed keeps the policy it had.
+        assert!(Config::default()
+            .auth
+            .self_signup_email_domains
+            .is_empty());
+        assert!(!Config::default().auth.self_signup_allows("anyone@example.edu"));
+    }
+
+    #[test]
+    fn listed_domains_may_sign_up_and_others_may_not() {
+        let auth = auth_with(&["cs.stonybrook.edu"]);
+        assert!(auth.self_signup_allows("student@cs.stonybrook.edu"));
+        assert!(!auth.self_signup_allows("someone@gmail.com"));
+    }
+
+    #[test]
+    fn domain_matching_ignores_case_and_surrounding_whitespace() {
+        let auth = auth_with(&["  CS.Stonybrook.EDU  "]);
+        assert!(auth.self_signup_allows("Student@CS.STONYBROOK.EDU"));
+        assert!(auth.self_signup_allows("  student@cs.stonybrook.edu  "));
+    }
+
+    #[test]
+    fn entries_may_be_written_with_a_leading_at_or_dot() {
+        assert!(auth_with(&["@cs.stonybrook.edu"]).self_signup_allows("a@cs.stonybrook.edu"));
+        assert!(auth_with(&[".cs.stonybrook.edu"]).self_signup_allows("a@cs.stonybrook.edu"));
+    }
+
+    #[test]
+    fn a_parent_domain_does_not_admit_its_subdomains() {
+        let auth = auth_with(&["stonybrook.edu"]);
+        assert!(auth.self_signup_allows("a@stonybrook.edu"));
+        // Exact match only: listing the parent must not quietly admit every
+        // subdomain, nor a lookalike that merely ends with it.
+        assert!(!auth.self_signup_allows("a@cs.stonybrook.edu"));
+        assert!(!auth.self_signup_allows("a@evilstonybrook.edu"));
+        assert!(!auth.self_signup_allows("a@stonybrook.edu.attacker.com"));
+    }
+
+    #[test]
+    fn malformed_addresses_are_never_allowed() {
+        let auth = auth_with(&["cs.stonybrook.edu"]);
+        for address in [
+            "",
+            "  ",
+            "cs.stonybrook.edu",
+            "@cs.stonybrook.edu",
+            "  @cs.stonybrook.edu",
+            "a@",
+            "a@ ",
+        ] {
+            assert!(!auth.self_signup_allows(address), "must reject {address:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_last_at_separates_the_domain() {
+        let auth = auth_with(&["cs.stonybrook.edu"]);
+        // An address whose local part contains "@" must be judged by its real
+        // domain, never by text embedded to the left of it.
+        assert!(!auth.self_signup_allows("\"a@cs.stonybrook.edu\"@gmail.com"));
+        assert!(auth.self_signup_allows("\"a@gmail.com\"@cs.stonybrook.edu"));
+    }
+
+    #[test]
+    fn blank_entries_do_not_widen_the_allowlist() {
+        let auth = auth_with(&["", "   ", "@", "."]);
+        assert!(auth.self_signup_domains().is_empty());
+        assert!(!auth.self_signup_allows("a@example.edu"));
+        assert!(!auth.self_signup_allows("a@"));
     }
 }

@@ -68,43 +68,84 @@ pub struct Claims {
     pub credential_version: Option<i64>,
 }
 
+/// Minimum length for any password a person chooses here.
+///
+/// One constant for registration and reset, so the two cannot drift. It
+/// applies only to newly chosen passwords; nobody's existing password is
+/// invalidated by it.
+pub const MIN_PASSWORD_LEN: usize = 8;
+
+/// Accounts are stored with the address trimmed and lowercased, so every
+/// comparison against stored accounts has to use the same form.
+fn normalize_email(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
+}
+
 pub async fn register(
     State(state): State<AppState>,
     Json(req): Json<RegisterRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
-    // Check if user already exists
-    if state.db.get_user_by_email(&req.email).await?.is_some() {
+    let email = normalize_email(&req.email);
+    if email.is_empty() || !email.contains('@') {
+        return Err(AppError::BadRequest("A valid email is required".to_string()));
+    }
+
+    // Two ways in, and an account is created only through one of them.
+    //
+    // An invitation admits exactly the address it names, from any domain, and
+    // is what the system administrator issues. Self-signup admits an address
+    // whose domain the deployment has listed in `[auth]
+    // self_signup_email_domains`; with that list empty, which is the default,
+    // this branch refuses everyone and the deployment stays invitation-only.
+    let invitation = match req
+        .invitation_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+    {
+        Some(code) => {
+            let invitation = state
+                .db
+                .get_cluster_invitation(code)
+                .await?
+                .ok_or_else(|| AppError::AuthError("Invalid cluster invitation".to_string()))?;
+            if invitation.redeemed_at.is_some()
+                || !invitation.email.eq_ignore_ascii_case(&email)
+                || chrono::DateTime::parse_from_rfc3339(&invitation.expires_at)
+                    .map(|expires| expires.with_timezone(&Utc) <= Utc::now())
+                    .unwrap_or(true)
+            {
+                return Err(AppError::AuthError(
+                    "Invalid or expired cluster invitation".to_string(),
+                ));
+            }
+            Some(invitation)
+        }
+        None => {
+            if !state.config.auth.self_signup_allows(&email) {
+                return Err(AppError::AuthError(
+                    "A cluster invitation is required".to_string(),
+                ));
+            }
+            None
+        }
+    };
+
+    // Only past the gate above, so an unauthenticated stranger cannot use
+    // this endpoint to discover which addresses already hold accounts. The
+    // check itself compares in the stored form: it used to compare the raw
+    // request field while creating the account from the normalized one, so
+    // "Foo@x.edu" got past it when "foo@x.edu" already existed, and the
+    // insert then failed on the UNIQUE constraint as an opaque 500.
+    if state.db.get_user_by_email(&email).await?.is_some() {
         return Err(AppError::BadRequest("Email already registered".to_string()));
     }
 
-    let email = req.email.trim().to_ascii_lowercase();
-    // Registration always requires an invitation. The old bootstrap-by-email
-    // exemption is gone: the first account of a deployment is invited by the
-    // system administrator, who signs in with the configured credential
-    // rather than by registering an account whose address matched a config
-    // value.
-    let invitation = {
-        let code = req
-            .invitation_code
-            .as_deref()
-            .ok_or_else(|| AppError::AuthError("A cluster invitation is required".to_string()))?;
-        let invitation = state
-            .db
-            .get_cluster_invitation(code)
-            .await?
-            .ok_or_else(|| AppError::AuthError("Invalid cluster invitation".to_string()))?;
-        if invitation.redeemed_at.is_some()
-            || !invitation.email.eq_ignore_ascii_case(&email)
-            || chrono::DateTime::parse_from_rfc3339(&invitation.expires_at)
-                .map(|expires| expires.with_timezone(&Utc) <= Utc::now())
-                .unwrap_or(true)
-        {
-            return Err(AppError::AuthError(
-                "Invalid or expired cluster invitation".to_string(),
-            ));
-        }
-        invitation
-    };
+    if req.password.chars().count() < MIN_PASSWORD_LEN {
+        return Err(AppError::BadRequest(format!(
+            "Password must be at least {MIN_PASSWORD_LEN} characters"
+        )));
+    }
 
     // Hash password
     let salt = SaltString::generate(&mut OsRng);
@@ -124,14 +165,31 @@ pub async fn register(
         cluster_role: "user".to_string(),
         account_status: "active".to_string(),
     };
-    if !state
-        .db
-        .create_user_redeeming_cluster_invitation(&user, &invitation.code)
-        .await?
-    {
-        return Err(AppError::AuthError(
-            "Cluster invitation was already redeemed or expired".to_string(),
-        ));
+    match &invitation {
+        Some(invitation) => {
+            if !state
+                .db
+                .create_user_redeeming_cluster_invitation(&user, &invitation.code)
+                .await?
+            {
+                return Err(AppError::AuthError(
+                    "Cluster invitation was already redeemed or expired".to_string(),
+                ));
+            }
+        }
+        None => {
+            // The duplicate check above races with a concurrent signup for
+            // the same address. The UNIQUE constraint on `users.email` is
+            // what actually decides it; report the loser as a duplicate
+            // rather than as an internal error.
+            if let Err(error) = state.db.create_user(&user).await {
+                if error.to_string().contains("UNIQUE") {
+                    return Err(AppError::BadRequest("Email already registered".to_string()));
+                }
+                return Err(error.into());
+            }
+            tracing::info!(email = %user.email, "Account created by self-signup");
+        }
     }
 
     // Generate token
@@ -579,10 +637,10 @@ pub async fn reset_password(
     drop(reset_state); // Release the lock before making DB calls
 
     // Validate password length
-    if req.password.len() < 6 {
-        return Err(AppError::BadRequest(
-            "Password must be at least 6 characters".to_string(),
-        ));
+    if req.password.chars().count() < MIN_PASSWORD_LEN {
+        return Err(AppError::BadRequest(format!(
+            "Password must be at least {MIN_PASSWORD_LEN} characters"
+        )));
     }
 
     // Hash new password
