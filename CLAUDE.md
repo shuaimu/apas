@@ -407,7 +407,12 @@ journalctl -u nginx -f
 # Configure the system administrator BEFORE deploying the server. Without it,
 # /admin cannot be entered at all, and this deploy removes every account's
 # deployment-wide authority. Keep apas-server.toml mode 0600.
-ssh root@apas.mpaxos.com "grep -q '^\[system_admin\]' /opt/apas/apas-server.toml || echo 'MISSING [system_admin] BLOCK'"
+#
+# Check the credential ROW, not the config block: the block being present
+# proves nothing, since a present block with an empty bootstrap_password is
+# exactly how this deployment lost account creation for a month.
+ssh root@apas.mpaxos.com "test \"\$(sqlite3 /opt/apas/data/apas.db 'select count(*) from system_admin_credential;')\" != 0 \
+  || echo 'NO SYSTEM ADMIN CREDENTIAL: /admin is unenterable and nobody can be invited'"
 
 # Build locally
 # cargo build -p apas-server --release
@@ -589,9 +594,42 @@ config later cannot revert a rotation. Its token carries `sub =
 "system-admin"`, `token_kind = "system_admin"`, and the credential version;
 rotating the password bumps that version and invalidates every outstanding
 token. An account token is rejected by `/admin/*` and this token is rejected
-everywhere else. No UI can grant it, and `bootstrap_admin_email` is gone —
-registration now always requires an invitation, which the system administrator
-issues.
+everywhere else. No UI can grant it, and `bootstrap_admin_email` is gone.
+
+**An empty `bootstrap_password` is silent and total.** Seeding is skipped when
+the value is blank, and the only report is one `WARN` at startup. With no
+credential nobody can enter `/admin`; `/admin/users/invitations` is the sole
+code path that creates a registerable invitation, so nobody can be invited
+either. This deployment shipped that way and could not create a single account
+between 2026-08-08 and 2026-09-09. **Checking that the `[system_admin]` block
+exists is not enough** — the block was present the whole time with an empty
+password. Verify the credential row instead, which is the thing that actually
+decides:
+
+```bash
+ssh root@apas.mpaxos.com "sqlite3 /opt/apas/data/apas.db \
+  'select count(*) from system_admin_credential;'"   # 0 means /admin is unenterable
+```
+
+**Two ways to get an account, and only two.** An **invitation** admits exactly
+the address it names, from any domain, and is issued by the system
+administrator. **Self-signup** admits an address whose domain the deployment
+lists in `[auth] self_signup_email_domains`:
+
+```toml
+[auth]
+self_signup_email_domains = ["cs.stonybrook.edu", "stonybrook.edu"]
+```
+
+The allowlist **is** the switch. There is deliberately no separate
+`open_registration` boolean, because one could be set while the list is empty
+and admit the entire internet; empty or absent means invitation-only, which is
+both the default and what every config file written before this setting already
+says. Matching is **exact** — a parent domain does not admit its subdomains, so
+`mail.stonybrook.edu` must be listed in its own right. Widening is a config
+edit plus a restart, never a rebuild, and the server names the live policy at
+boot (`Registration is open to these email domains…`, or
+`Registration is invitation-only…`), so the state is never silent again.
 
 **The `/admin` login must stay inline on the page.** nginx proxies the whole
 `/admin/` prefix to `apas-server`, so a Next.js route at `/admin/login` would
