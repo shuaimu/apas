@@ -1,8 +1,17 @@
 # APAS - Autonomous Programming Agent System
 
-> Canonical contributor/agent runbook. Keep architecture, local development,
-> and workflow guidance here. `agent.md` is a generated pointer to this file;
-> `claude.md` and `AGENTS.md` are deployment-only notes.
+> Canonical contributor/agent runbook, and the only one. Keep architecture,
+> local development, deployment, and workflow guidance here. `AGENTS.md` is a
+> **symlink** to this file so Codex-style agents read the same bytes; verify it
+> with `python3 scripts/check_agent_runbooks.py`.
+>
+> There used to be a hand-written `claude.md` holding a second copy of the
+> deployment procedure, plus an `agent.md` pointing at it and an `AGENTS.md`
+> generated from it. Both copies drifted — the duplicate lost the nginx rules,
+> the rolling order, and the system-administrator pre-check — and worse,
+> `claude.md` and `CLAUDE.md` differ only in case, so a clone on macOS or
+> Windows could not hold both and silently overwrote this file with the 3 KB
+> note. Do not reintroduce a second runbook under any casing.
 
 APAS runs coding agents against a project, from a browser or a phone. The CLI
 owns local panes and worktrees, the server brokers project/session state, and
@@ -466,6 +475,21 @@ selected `/opt/apas/backups/web-<timestamp>/web.tgz` under `/opt/apas`, run
 `npm ci` and the versioned build from that restored tree, then restart and
 repeat every smoke check above. This emergency rollback restores the previous
 vulnerable dependency graph; follow it with a corrected patched deployment.
+
+## Versioning
+
+Versions are computed at build time as `YY.MM.N`, where `YY.MM` is the current
+year and month and `N` is `git rev-list --count --since="<YYYY-MM-01 00:00:00>"
+HEAD`.
+
+- The web version is resolved in `packages/web/next.config.ts`.
+- CLI and server versions are resolved in their crates' `build.rs`.
+- `packages/web/.apas-version` is dead. Nothing reads it, the deploy rsync
+  excludes it, and it should not be created or maintained.
+
+A build in a directory without `.git` cannot count commits, which is exactly
+the case for `/opt/apas/web` on the server. Pass `NEXT_PUBLIC_WEB_UI_VERSION`
+explicitly there, as the deploy commands above do.
 
 ## Key Concepts
 
