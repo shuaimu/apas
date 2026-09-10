@@ -140,6 +140,24 @@ That transcript is what gives a terminal pane its conversation view, its token
 counts, and its working/idle state. Questions an agent asks appear there and can
 be answered there, and typed messages go straight into the live pty.
 
+### Worktrees and diff review
+
+A pane can be given its own git worktree and branch, under
+`.apas-worktrees/pane-<id>/`, so it works in isolation. When it has one, a
+**Diff** control appears in its header showing the unified diff against the
+project's main branch, split into per-file sections and refreshed as the pane's
+HEAD moves. From there you can **merge and close** the pane, or **discard** it
+along with its branch. Closing a pane that owns a worktree offers the same
+choice: leave the branch alone, merge it, or discard everything.
+
+Diffs are computed from git, so they work for any pane with a worktree,
+terminal panes included.
+
+**Plan review** is the older per-pane policy that holds an agent's tool calls
+until you approve them, set from the pane's role modal. It is built on the
+structured event stream, so it applies only to legacy `agent` panes; a terminal
+pane runs the provider's own permission prompts instead.
+
 ### Pane hosts
 
 On Unix hosts, each terminal pane is owned by a hidden `apas pane-host` process
@@ -370,9 +388,6 @@ are easy to undo by accident. Read it before changing anything here.
   runs a single instance
 - [docs/mobile-development-and-operations.md](docs/mobile-development-and-operations.md)
   and [docs/mobile-threat-model.md](docs/mobile-threat-model.md) — the mobile app
-
-`docs/team-mode.md` and `docs/todo-driven-workflow.md` describe the removed
-managed team mode and are kept only as history.
 
 ## License
 
