@@ -888,7 +888,7 @@ fn is_apas_daemon_process(pid: u32) -> bool {
     has_apas_binary && has_daemon_arg
 }
 
-const CONFIG_KEYS: &str = "server, token, claude_path, codex_path, opencode_path, cursor_agent_path, deepseek_api_base_url, deepseek_api_key, pane_host_adoption_grace_seconds, pane_host_reboot_grace_seconds, daemon_machine_id, daemon_roots, summary_enabled, summary_adapter, summary_model, summary_timeout_seconds, summary_max_input_bytes, summary_allow_cross_provider";
+const CONFIG_KEYS: &str = "server, token, claude_path, codex_path, opencode_path, pi_path, cursor_agent_path, deepseek_api_base_url, deepseek_api_key, pane_host_adoption_grace_seconds, pane_host_reboot_grace_seconds, daemon_machine_id, daemon_roots, summary_enabled, summary_adapter, summary_model, summary_timeout_seconds, summary_max_input_bytes, summary_allow_cross_provider";
 
 fn set_config_value(config: &mut config::Config, key: &str, value: String) -> Result<()> {
     match key {
@@ -897,6 +897,7 @@ fn set_config_value(config: &mut config::Config, key: &str, value: String) -> Re
         "claude_path" => config.local.claude_path = value,
         "codex_path" => config.local.codex_path = value,
         "opencode_path" => config.local.opencode_path = value,
+        "pi_path" => config.local.pi_path = value,
         "cursor_agent_path" => config.local.cursor_agent_path = value,
         "deepseek_api_base_url" => {
             config.local.deepseek_api_base_url = if value.trim().is_empty() {
@@ -1286,6 +1287,7 @@ fn get_config_value(config: &config::Config, key: &str) -> Result<String> {
         "claude_path" => config.local.claude_path.clone(),
         "codex_path" => config.local.codex_path.clone(),
         "opencode_path" => config.local.opencode_path.clone(),
+        "pi_path" => config.local.pi_path.clone(),
         "cursor_agent_path" => config.local.cursor_agent_path.clone(),
         "deepseek_api_base_url" => config
             .local
@@ -1346,6 +1348,7 @@ async fn handle_config_command(action: ConfigAction) -> Result<()> {
             println!("claude_path: {}", config.local.claude_path);
             println!("codex_path: {}", config.local.codex_path);
             println!("opencode_path: {}", config.local.opencode_path);
+            println!("pi_path: {}", config.local.pi_path);
             println!("cursor_agent_path: {}", config.local.cursor_agent_path);
             println!(
                 "deepseek_api_base_url: {}",

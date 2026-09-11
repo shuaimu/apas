@@ -67,6 +67,13 @@ export const PROVIDER_MODEL_GROUPS: ProviderModelGroup[] = [
     ],
   },
   {
+    id: "pi",
+    label: "Pi",
+    iconProvider: "pi",
+    toneClass: "text-purple-500",
+    options: [{ value: "pi/official", label: "Pi", provider: "pi" }],
+  },
+  {
     id: "cursor-agent",
     label: "Cursor",
     iconProvider: "cursor-agent",
@@ -162,6 +169,7 @@ export function providerModelValue(
   }
   if (provider === "codex") return "codex/official";
   if (provider === "opencode") return "opencode/official";
+  if (provider === "pi") return "pi/official";
   if (provider === "cursor-agent") return "cursor-agent/official";
   if (provider === "deepseek") {
     if (!model || canonicalDeepseekModel(model) === DEEPSEEK_PRO_MODEL) {

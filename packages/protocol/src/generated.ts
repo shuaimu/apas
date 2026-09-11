@@ -30,7 +30,7 @@ export type PaneMode = "deadloop" | "interactive";
 /**
  * Provider for a pane
  */
-export type Provider = ("codex" | "deepseek" | "opencode" | "cursor-agent") | "claude" | "minimax" | "glm";
+export type Provider = ("codex" | "deepseek" | "opencode" | "cursor-agent") | "claude" | "minimax" | "glm" | "pi";
 export type CodeEventKind =
   | "instruction"
   | "agent_status"
@@ -255,7 +255,7 @@ export type ServerToWeb =
       /**
        * Provider for a pane
        */
-      provider?: ("codex" | "deepseek" | "opencode" | "cursor-agent") | "claude" | "minimax" | "glm";
+      provider?: ("codex" | "deepseek" | "opencode" | "cursor-agent") | "claude" | "minimax" | "glm" | "pi";
       type: "usage_limits";
       [k: string]: unknown;
     }
@@ -1217,6 +1217,12 @@ export interface MobilePaneSummary {
  * is not blocking requests and this field stays absent.
  */
 export interface UsageLimited {
+  /**
+   * Model family this limit applies to. Absent means the provider account
+   * is blocked generally. Anthropic currently uses display names such as
+   * "Fable" for model-scoped weekly limits.
+   */
+  model?: string | null;
   /**
    * When the provider expects work to become available again.
    */

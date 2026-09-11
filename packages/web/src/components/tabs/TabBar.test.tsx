@@ -186,6 +186,7 @@ describe("TabBar coordinator close controls", () => {
     expect(screen.getByText("Claude / DeepSeek Flash")).toBeTruthy();
     expect(screen.getByText("Codex")).toBeTruthy();
     expect(screen.getByText("OpenCode")).toBeTruthy();
+    expect(screen.getByText("Pi")).toBeTruthy();
     expect(screen.queryByText("Cursor")).toBeNull();
     expect(screen.queryByText("DeepSeek")).toBeNull();
 
@@ -444,6 +445,7 @@ describe("TabBar add-tab worktree controls", () => {
     expect(screen.getByText("Claude")).toBeTruthy();
     expect(screen.getByText("Codex")).toBeTruthy();
     expect(screen.getByText("OpenCode")).toBeTruthy();
+    expect(screen.getByText("Pi")).toBeTruthy();
     for (const label of ["MiniMax", "GLM", "DeepSeek", "Cursor"]) {
       expect(screen.queryByText(label)).toBeNull();
     }

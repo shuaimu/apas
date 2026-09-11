@@ -16,6 +16,13 @@ pub const MOBILE_TASK_LAUNCH_CAPABILITY: &str = "mobile_task_launch_v2";
 /// server/web deployment cannot route an OpenCode pane to an older CLI that
 /// would persist the pane but fail to launch it.
 pub const OPENCODE_TERMINAL_CAPABILITY: &str = "terminal_opencode_v1";
+/// The connected CLI can host Pi's interactive TUI, pin each pane to an exact
+/// Pi session identity, and mirror its session transcript.
+///
+/// Kept separate from the generic mobile-launch capability so a rolling
+/// server/web deployment cannot route a Pi pane to an older CLI that would
+/// persist the pane but fail to launch it.
+pub const PI_TERMINAL_CAPABILITY: &str = "terminal_pi_v1";
 /// The CLI understands correlated, transport-only reconnect requests.
 pub const CLI_LIFECYCLE_CAPABILITY: &str = "cli_lifecycle_v1";
 /// The CLI can keep supported terminal providers alive outside the replaceable
@@ -2307,6 +2314,9 @@ pub enum Provider {
     Glm,
     Deepseek,
     Opencode,
+    /// Pi coding agent (`pi`): terminal-only in APAS. See
+    /// `terminal_pane::terminal_binary_for`.
+    Pi,
     #[serde(rename = "cursor-agent")]
     CursorAgent,
 }
@@ -2383,13 +2393,14 @@ pub fn tab_type_key(kind: PaneKind, provider: Provider) -> String {
 /// are never advertised, and DeepSeek is offered as a Claude model because it
 /// uses the Anthropic-compatible bridge.
 ///
-/// Terminal panes exist only for claude, codex, and opencode — see
+/// Terminal panes exist only for claude, codex, opencode, and pi — see
 /// `terminal_pane::terminal_binary_for`, which this must stay in step with.
 pub fn all_tab_types() -> Vec<String> {
     vec![
         tab_type_key(PaneKind::Terminal, Provider::Claude),
         tab_type_key(PaneKind::Terminal, Provider::Codex),
         tab_type_key(PaneKind::Terminal, Provider::Opencode),
+        tab_type_key(PaneKind::Terminal, Provider::Pi),
     ]
 }
 
@@ -2497,6 +2508,14 @@ pub fn supported_launch_profiles() -> Vec<LaunchProfile> {
             None,
         ),
         launch_profile(
+            "terminal:pi:official:default",
+            "Pi Terminal",
+            PaneKind::Terminal,
+            Provider::Pi,
+            "official",
+            None,
+        ),
+        launch_profile(
             "terminal:claude:deepseek:deepseek-v4-pro",
             "DeepSeek Pro Terminal",
             PaneKind::Terminal,
@@ -2589,6 +2608,7 @@ pub fn launch_profile_key(kind: PaneKind, provider: Provider, model: Option<&str
         Provider::Claude | Provider::Deepseek => "claude",
         Provider::Codex => "codex",
         Provider::Opencode => "opencode",
+        Provider::Pi => "pi",
         Provider::CursorAgent => "cursor-agent",
         Provider::Minimax | Provider::Glm => "unsupported",
     };
@@ -4412,6 +4432,7 @@ mod tests {
                 "terminal:claude".to_string(),
                 "terminal:codex".to_string(),
                 "terminal:opencode".to_string(),
+                "terminal:pi".to_string(),
             ]
         );
     }
@@ -4498,7 +4519,7 @@ mod tests {
     #[test]
     fn supported_profiles_and_default_policy_offer_only_terminal_backends() {
         let profiles = supported_launch_profiles();
-        assert_eq!(profiles.len(), 5);
+        assert_eq!(profiles.len(), 6);
         assert!(profiles
             .iter()
             .all(|profile| profile.kind == PaneKind::Terminal));
@@ -4511,6 +4532,7 @@ mod tests {
                 ("terminal:claude:official:default", "Claude Terminal"),
                 ("terminal:codex:official:default", "Codex Terminal"),
                 ("terminal:opencode:official:default", "OpenCode Terminal"),
+                ("terminal:pi:official:default", "Pi Terminal"),
                 (
                     "terminal:claude:deepseek:deepseek-v4-pro",
                     "DeepSeek Pro Terminal",
@@ -4536,6 +4558,7 @@ mod tests {
             "terminal:claude:official:default",
             "terminal:codex:official:default",
             "terminal:opencode:official:default",
+            "terminal:pi:official:default",
             "terminal:claude:deepseek:deepseek-v4-pro",
             "terminal:claude:deepseek:deepseek-v4-flash",
         ] {

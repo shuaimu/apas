@@ -131,6 +131,14 @@ function ProviderIcon({
       </svg>
     );
   }
+  if (provider === "pi") {
+    // Pi logo — the Greek letter the terminal harness is named for.
+    return (
+      <span className={`${className} text-center font-bold leading-none`} aria-label="Pi">
+        π
+      </span>
+    );
+  }
   if (provider === "cursor-agent") {
     // Cursor logo — upward arrow/cursor silhouette
     return (
@@ -383,9 +391,11 @@ export function TabBar({
                       ? "text-sky-500"
                       : tab.provider === "opencode"
                         ? "text-orange-500"
-                        : isUnsupported
-                          ? "text-red-500"
-                            : "text-blue-500"
+                        : tab.provider === "pi"
+                          ? "text-purple-500"
+                          : isUnsupported
+                            ? "text-red-500"
+                              : "text-blue-500"
                 }`}
                 title={
                   tab.provider === "codex"
@@ -394,9 +404,11 @@ export function TabBar({
                       ? "Cursor"
                       : tab.provider === "opencode"
                         ? "OpenCode"
-                        : isUnsupported
-                          ? "Unsupported provider"
-                            : "Claude"
+                        : tab.provider === "pi"
+                          ? "Pi"
+                          : isUnsupported
+                            ? "Unsupported provider"
+                              : "Claude"
                 }
               >
                 <ProviderIcon provider={tab.provider} model={tab.model} label={tab.label} />
@@ -648,6 +660,7 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
               { provider: "claude", label: "Claude / DeepSeek Flash", model: DEEPSEEK_FLASH_MODEL },
               { provider: "codex", label: "Codex" },
               { provider: "opencode", label: "OpenCode" },
+              { provider: "pi", label: "Pi" },
             ]
               .filter((entry) => isAllowed("terminal", entry.provider, entry.model))
               .map((entry) => (

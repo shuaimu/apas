@@ -30,6 +30,7 @@ describe("tab type keys", () => {
       "terminal:claude",
       "terminal:codex",
       "terminal:opencode",
+      "terminal:pi",
     ]);
   });
 });

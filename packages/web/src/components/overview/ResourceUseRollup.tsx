@@ -15,6 +15,7 @@ const PROVIDER_LABELS: Record<SupportedProvider, string> = {
   codex: "Codex",
   deepseek: "DeepSeek",
   opencode: "OpenCode",
+  pi: "Pi",
   "cursor-agent": "Cursor",
 };
 

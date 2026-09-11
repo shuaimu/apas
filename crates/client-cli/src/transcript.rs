@@ -34,6 +34,12 @@
 //!   its UUID at creation. The newest session whose exported `directory`
 //!   exactly matches the pane cwd is selected, then exported by ID. This has
 //!   the same shared-cwd ambiguity as Codex but never crosses directories.
+//! * **pi** — `--session-id <uuid>` pins the id at spawn, and the file name
+//!   carries it: `~/.pi/agent/sessions/--<cwd slug>--/<timestamp>_<uuid>.jsonl`.
+//!   The file is found by the exact id anywhere under the sessions root, so
+//!   sibling panes and provider subprocesses sharing a directory can never be
+//!   mistaken for this pane. The file appears only once the session's first
+//!   assistant message exists; before that the pane simply has no history.
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -299,6 +305,7 @@ pub fn parse_claude(raw: &str) -> Vec<TurnRecord> {
             model: msg.get("model").and_then(Value::as_str).map(str::to_string),
             input_tokens: tok("input_tokens"),
             output_tokens: tok("output_tokens"),
+            cost_usd: None,
             completes_work,
             question,
             answer,
@@ -373,6 +380,7 @@ pub fn parse_codex(raw: &str) -> Vec<TurnRecord> {
             model: None,
             input_tokens: None,
             output_tokens: None,
+            cost_usd: None,
             completes_work: false,
             // Codex and OpenCode have their own approval interfaces; only
             // the claude parser recognises questions.
@@ -473,6 +481,7 @@ pub fn parse_opencode(raw: &str) -> Vec<TurnRecord> {
             model: model.map(str::to_string),
             input_tokens: token("input"),
             output_tokens: token("output"),
+            cost_usd: None,
             completes_work,
             // Codex and OpenCode have their own approval interfaces; only
             // the claude parser recognises questions.
@@ -549,6 +558,222 @@ pub fn read_opencode_turns(
         );
     }
     let mut turns = parse_opencode(&String::from_utf8_lossy(&output.stdout));
+    for turn in &mut turns {
+        turn.pane_id = pane_id;
+    }
+    Ok(turns)
+}
+
+/// Root holding Pi's per-directory session buckets.
+///
+/// Pi's own environment overrides are honored so a host that relocates its
+/// agent directory does not leave every Pi pane with no recoverable history.
+fn pi_sessions_root(home: &Path) -> PathBuf {
+    if let Some(dir) = std::env::var_os("PI_CODING_AGENT_SESSION_DIR") {
+        return PathBuf::from(dir);
+    }
+    std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".pi").join("agent"))
+        .join("sessions")
+}
+
+/// The exact Pi session file carrying this pane's pinned identity.
+///
+/// The id names the file (`<timestamp>_<uuid>.jsonl`) wherever Pi wrote it, so
+/// the lookup is by suffix under the sessions root rather than by directory
+/// slug: a pane whose provider moved into a worktree keeps its own history, and
+/// a sibling pane or provider subprocess sharing a directory is never adopted.
+/// Returns `None` until Pi writes its first assistant message.
+pub fn find_pi_session_file(home: &Path, session_id: Uuid) -> Option<PathBuf> {
+    let suffix = format!("_{session_id}.jsonl");
+    let mut stack = vec![pi_sessions_root(home)];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(&suffix))
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+// Pi records a question only through extension tooling (the oh-my-pi package's
+// `ask`). Upstream Pi has no built-in structured question, and driving an
+// unverified picker with blind keystrokes would answer on the human's behalf,
+// so Pi questions are out of scope for now — matching OpenCode. The pane still
+// shows the assistant's own text, and tool calls never become turns.
+
+/// Pull the text out of a Pi content field: a bare string or an array of typed
+/// blocks. Thinking, tool-call, image, and tool-result blocks are not
+/// conversation.
+fn pi_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+fn pi_timestamp(entry: &Value, message: &Value) -> String {
+    entry
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .filter(|ts| !ts.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| millis_timestamp(message.get("timestamp").and_then(Value::as_i64)))
+}
+
+/// Turns from a Pi session file, oldest first.
+///
+/// Pi sessions are trees: `/tree`, `/branch`, and `/fork` append entries whose
+/// `parentId` points back into the history, so file order alone would fold
+/// abandoned branches into the conversation. The active branch is the parent
+/// chain of the last entry carrying an id, which is the current leaf.
+///
+/// Only `message` entries with a real user or assistant role become turns. Pi
+/// also persists thinking blocks, tool results, shell executions, extension
+/// state (`custom` / `custom_message` — what the oh-my-pi orchestrator writes),
+/// compaction and branch summaries, labels, and model/thinking bookkeeping;
+/// none of that is conversation.
+pub fn parse_pi(raw: &str) -> Vec<TurnRecord> {
+    let entries: Vec<Value> = raw
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect();
+
+    let mut active: HashSet<&str> = HashSet::new();
+    let mut cursor = entries
+        .iter()
+        .rev()
+        .find_map(|entry| entry.get("id").and_then(Value::as_str));
+    while let Some(id) = cursor {
+        if !active.insert(id) {
+            break;
+        }
+        cursor = entries
+            .iter()
+            .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id))
+            .and_then(|entry| entry.get("parentId").and_then(Value::as_str));
+    }
+
+    let mut out: Vec<TurnRecord> = Vec::new();
+    for entry in &entries {
+        if entry.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let Some(id) = entry.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !active.contains(id) {
+            continue;
+        }
+        let message = entry.get("message").unwrap_or(&Value::Null);
+        let content = message.get("content").unwrap_or(&Value::Null);
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match role {
+            "user" => {
+                let text = pi_text(content);
+                if text.trim().is_empty() {
+                    continue;
+                }
+                out.push(TurnRecord {
+                    ts: pi_timestamp(entry, message),
+                    pane_id: 0,
+                    role: "user".to_string(),
+                    text,
+                    model: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cost_usd: None,
+                    completes_work: false,
+                    question: None,
+                    answer: None,
+                });
+            }
+            "assistant" => {
+                let text = pi_text(content);
+                // `stop` and other terminal reasons end the turn; `toolUse`
+                // continues into a tool call and `deferred`/`pending` mean the
+                // response is not finished yet.
+                let completes_work = message
+                    .get("stopReason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reason| {
+                        !matches!(reason, "toolUse" | "tool_use" | "pending" | "deferred")
+                    });
+                if text.trim().is_empty() {
+                    // Tool-call-only messages are not conversation, but a
+                    // terminal one still has to mark the turn complete.
+                    if completes_work {
+                        if let Some(turn) = out.iter_mut().rev().find(|turn| turn.is_assistant()) {
+                            turn.completes_work = true;
+                        }
+                    }
+                    continue;
+                }
+                let usage = message.get("usage");
+                let token = |key: &str| {
+                    usage
+                        .and_then(|usage| usage.get(key))
+                        .and_then(Value::as_u64)
+                };
+                let cost_usd = usage
+                    .and_then(|usage| usage.get("cost"))
+                    .and_then(|cost| cost.get("total"))
+                    .and_then(Value::as_f64);
+                out.push(TurnRecord {
+                    ts: pi_timestamp(entry, message),
+                    pane_id: 0,
+                    role: "assistant".to_string(),
+                    text,
+                    model: message
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    input_tokens: token("input"),
+                    output_tokens: token("output"),
+                    cost_usd,
+                    completes_work,
+                    question: None,
+                    answer: None,
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Read a Pi session file and stamp every turn with the pane it belongs to.
+pub fn read_pi_turns(path: &Path, pane_id: u32) -> Result<Vec<TurnRecord>> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    };
+    let mut turns = parse_pi(&raw);
     for turn in &mut turns {
         turn.pane_id = pane_id;
     }
@@ -1565,5 +1790,224 @@ mod tests {
         let last_growth = std::fs::metadata(&pinned).unwrap().modified().unwrap();
         let excluded: HashSet<String> = HashSet::new();
         assert!(find_claude_switch_candidate(&pinned, last_growth, &excluded,).is_none());
+    }
+
+    // --- pi ---------------------------------------------------------------
+
+    fn pi_message(id: &str, parent: Option<&str>, message: serde_json::Value) -> String {
+        let parent = parent
+            .map(|parent| format!("\"{parent}\""))
+            .unwrap_or_else(|| "null".to_string());
+        format!(
+            r#"{{"type":"message","id":"{id}","parentId":{parent},"timestamp":"2024-12-03T14:00:00.000Z","message":{}}}"#,
+            serde_json::to_string(&message).unwrap()
+        )
+    }
+
+    fn pi_user(id: &str, parent: Option<&str>, text: &str) -> String {
+        pi_message(
+            id,
+            parent,
+            serde_json::json!({ "role": "user", "content": text }),
+        )
+    }
+
+    fn pi_assistant(
+        id: &str,
+        parent: Option<&str>,
+        text: &str,
+        stop_reason: &str,
+        usage: Option<serde_json::Value>,
+    ) -> String {
+        let mut message = serde_json::json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-5",
+            "stopReason": stop_reason,
+        });
+        if let Some(usage) = usage {
+            message["usage"] = usage;
+        }
+        pi_message(id, parent, message)
+    }
+
+    fn pi_session(lines: &[String]) -> String {
+        let mut out = vec![
+            r#"{"type":"session","version":3,"id":"22222222-3333-4444-8555-666666666666","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/wanted"}"#.to_string(),
+        ];
+        out.extend_from_slice(lines);
+        out.join("\n")
+    }
+
+    #[test]
+    fn pi_reads_only_the_active_branch_of_a_session_tree() {
+        // `/tree` appends entries whose parentId points back into history, so
+        // file order alone would fold an abandoned branch into the conversation.
+        let raw = pi_session(&[
+            pi_user("u1", None, "Hello"),
+            pi_assistant("a1", Some("u1"), "First answer", "stop", None),
+            pi_user("u2", Some("a1"), "Branch seed"),
+            pi_assistant("a2", Some("u2"), "Abandoned reply", "stop", None),
+            pi_user("u3", Some("u2"), "Kept follow-up"),
+            pi_assistant("a3", Some("u3"), "Kept reply", "stop", None),
+        ]);
+
+        let turns = parse_pi(&raw);
+        let texts: Vec<&str> = turns.iter().map(|turn| turn.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "Hello",
+                "First answer",
+                "Branch seed",
+                "Kept follow-up",
+                "Kept reply"
+            ]
+        );
+        assert!(!texts.contains(&"Abandoned reply"));
+    }
+
+    #[test]
+    fn pi_extension_and_bookkeeping_entries_never_become_turns() {
+        // The oh-my-pi orchestrator persists `custom` / `custom_message`
+        // entries; rendering those as conversation is the failure this guards.
+        let raw = pi_session(&[
+            r#"{"type":"model_change","id":"m1","parentId":null,"timestamp":"t","provider":"openai","modelId":"gpt-4o"}"#.to_string(),
+            pi_user("u1", Some("m1"), "Do the thing"),
+            r#"{"type":"custom","id":"c1","parentId":"u1","timestamp":"t","customType":"oh-my-pi","data":{"mode":"orchestrator"}}"#.to_string(),
+            r#"{"type":"custom_message","id":"c2","parentId":"c1","timestamp":"t","customType":"oh-my-pi","content":"Injected context","display":true}"#.to_string(),
+            pi_assistant("a1", Some("c2"), "Working on it", "toolUse", None),
+            pi_message(
+                "t1",
+                Some("a1"),
+                serde_json::json!({
+                    "role": "toolResult",
+                    "toolCallId": "call_1",
+                    "toolName": "bash",
+                    "content": [{"type": "text", "text": "some output"}],
+                    "isError": false,
+                }),
+            ),
+            r#"{"type":"compaction","id":"k1","parentId":"t1","timestamp":"t","summary":"Earlier work","firstKeptEntryId":"u1","tokensBefore":1000}"#.to_string(),
+            r#"{"type":"branch_summary","id":"b1","parentId":"k1","timestamp":"t","fromId":null,"summary":"Another branch"}"#.to_string(),
+            r#"{"type":"label","id":"l1","parentId":"b1","timestamp":"t","targetId":"u1","label":"checkpoint"}"#.to_string(),
+            r#"{"type":"session_info","id":"s1","parentId":"l1","timestamp":"t","name":"Refactor"}"#.to_string(),
+            pi_assistant("a2", Some("s1"), "Done", "stop", None),
+        ]);
+
+        let turns = parse_pi(&raw);
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[1].text, "Working on it");
+        assert_eq!(turns[2].text, "Done");
+        assert!(turns.iter().all(|turn| turn.question.is_none()));
+        assert!(turns.iter().all(|turn| turn.answer.is_none()));
+    }
+
+    #[test]
+    fn pi_completion_and_billing_follow_the_recorded_stop_reason() {
+        let raw = pi_session(&[
+            pi_user("u1", None, "Run it"),
+            pi_assistant(
+                "a1",
+                Some("u1"),
+                "Starting",
+                "toolUse",
+                Some(serde_json::json!({
+                    "input": 120,
+                    "output": 15,
+                    "totalTokens": 135,
+                    "cost": {"total": 0.0021},
+                })),
+            ),
+            pi_assistant(
+                "a2",
+                Some("a1"),
+                "Finished",
+                "stop",
+                Some(serde_json::json!({
+                    "input": 200,
+                    "output": 30,
+                    "totalTokens": 230,
+                    "cost": {"total": 0.0042},
+                })),
+            ),
+        ]);
+
+        let turns = parse_pi(&raw);
+        let working = &turns[1];
+        assert!(!working.completes_work, "a tool-use preamble is not idle");
+        assert_eq!(working.input_tokens, Some(120));
+        assert_eq!(working.output_tokens, Some(15));
+        assert_eq!(working.cost_usd, Some(0.0021));
+        assert_eq!(working.model.as_deref(), Some("claude-sonnet-4-5"));
+        let done = &turns[2];
+        assert!(done.completes_work);
+        assert_eq!(done.cost_usd, Some(0.0042));
+    }
+
+    #[test]
+    fn pi_tool_only_completion_carries_to_the_previous_assistant_turn() {
+        // A tool-call-only message has no text, so it is not a turn — but a
+        // terminal reason on it still has to leave the pane idle.
+        let raw = pi_session(&[
+            pi_user("u1", None, "Check the logs"),
+            pi_assistant("a1", Some("u1"), "On it", "toolUse", None),
+            pi_assistant("a2", Some("a1"), "", "stop", None),
+        ]);
+
+        let turns = parse_pi(&raw);
+        assert_eq!(turns.len(), 2);
+        assert!(turns[1].completes_work);
+    }
+
+    #[test]
+    fn pi_session_file_is_found_by_exact_id_in_any_bucket() {
+        let home = tempfile::tempdir().unwrap();
+        let wanted = Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap();
+        let other = Uuid::new_v4();
+        let dir = home.path().join(".pi/agent/sessions/--wanted--");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("2024-12-03T14-00-00-000Z_{other}.jsonl")),
+            "{}\n",
+        )
+        .unwrap();
+        let expected = dir.join(format!("2024-12-03T14-00-00-000Z_{wanted}.jsonl"));
+        std::fs::write(&expected, "{}\n").unwrap();
+
+        assert_eq!(find_pi_session_file(home.path(), wanted), Some(expected));
+        assert_eq!(find_pi_session_file(home.path(), Uuid::new_v4()), None);
+    }
+
+    #[test]
+    fn pi_reads_the_exact_session_shape_written_by_a_real_pi_release() {
+        // Captured from pi 0.85.1 driven against a local mock provider: array
+        // user content, a tool-use assistant record, a tool result, and a
+        // model/thinking bookkeeping pair. This is the format that must keep
+        // parsing across pi releases.
+        let raw = r#"{"type":"session","version":3,"id":"22222222-3333-4444-8555-666666666666","timestamp":"2026-09-11T04:46:53.559Z","cwd":"/tmp/work"}
+{"type":"model_change","id":"1ccfefe7","parentId":null,"timestamp":"2026-09-11T04:46:53.610Z","provider":"mock","modelId":"mock-1"}
+{"type":"thinking_level_change","id":"ff11e651","parentId":"1ccfefe7","timestamp":"2026-09-11T04:46:53.610Z","thinkingLevel":"off"}
+{"type":"message","id":"b064a4be","parentId":"ff11e651","timestamp":"2026-09-11T04:46:53.635Z","message":{"role":"user","content":[{"type":"text","text":"Use the tool"}],"timestamp":1789102013634}}
+{"type":"message","id":"754a126b","parentId":"b064a4be","timestamp":"2026-09-11T04:46:53.697Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_mock","name":"bash","arguments":{"command":"echo hi"}}],"api":"openai-completions","provider":"mock","model":"mock-1","usage":{"input":12,"output":7,"cacheRead":0,"cacheWrite":0,"reasoning":0,"totalTokens":19,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"toolUse","timestamp":1789102013652,"responseId":"chatcmpl-mock","rawStopReason":"tool_calls"}}
+{"type":"message","id":"0430658b","parentId":"754a126b","timestamp":"2026-09-11T04:46:53.715Z","message":{"role":"toolResult","toolCallId":"call_mock","toolName":"bash","content":[{"type":"text","text":"hi\n"}],"isError":false,"timestamp":1789102013715}}
+{"type":"message","id":"61f5ef91","parentId":"0430658b","timestamp":"2026-09-11T04:46:53.722Z","message":{"role":"assistant","content":[{"type":"text","text":"The tool said hi."}],"api":"openai-completions","provider":"mock","model":"mock-1","usage":{"input":12,"output":7,"cacheRead":0,"cacheWrite":0,"reasoning":0,"totalTokens":19,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":1789102013716,"responseId":"chatcmpl-mock","rawStopReason":"stop"}}"#;
+
+        let turns = parse_pi(raw);
+        assert_eq!(
+            turns.len(),
+            2,
+            "tool-only and tool-result records are not turns"
+        );
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].text, "Use the tool");
+        assert!(turns[1].completes_work);
+        assert_eq!(turns[1].text, "The tool said hi.");
+        assert_eq!(turns[1].model.as_deref(), Some("mock-1"));
+        assert_eq!(turns[1].input_tokens, Some(12));
+        assert_eq!(turns[1].output_tokens, Some(7));
+        assert_eq!(turns[1].cost_usd, Some(0.0));
     }
 }

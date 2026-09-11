@@ -155,6 +155,7 @@ fn mobile_launch_capability_error(
     provider: shared::Provider,
     supports_mobile_launch: bool,
     supports_opencode_terminal: bool,
+    supports_pi_terminal: bool,
 ) -> Option<&'static str> {
     if !supports_mobile_launch {
         return Some("The project CLI must be updated and reconnected before mobile task launch");
@@ -163,6 +164,9 @@ fn mobile_launch_capability_error(
         return Some(
             "The project CLI must be updated and reconnected before launching an OpenCode task",
         );
+    }
+    if provider == shared::Provider::Pi && !supports_pi_terminal {
+        return Some("The project CLI must be updated and reconnected before launching a Pi task");
     }
     None
 }
@@ -385,10 +389,14 @@ pub async fn launch_task(
     let supports_opencode_terminal = state
         .sessions
         .session_supports_capability(&session_id, shared::OPENCODE_TERMINAL_CAPABILITY);
+    let supports_pi_terminal = state
+        .sessions
+        .session_supports_capability(&session_id, shared::PI_TERMINAL_CAPABILITY);
     if let Some(message) = mobile_launch_capability_error(
         profile.provider,
         supports_mobile_launch,
         supports_opencode_terminal,
+        supports_pi_terminal,
     ) {
         state
             .db
@@ -595,6 +603,7 @@ mod tests {
                 "terminal:claude:official:default",
                 "terminal:codex:official:default",
                 "terminal:opencode:official:default",
+                "terminal:pi:official:default",
                 "terminal:claude:deepseek:deepseek-v4-pro",
                 "terminal:claude:deepseek:deepseek-v4-flash",
             ]
@@ -606,14 +615,34 @@ mod tests {
 
     #[test]
     fn mobile_opencode_launch_requires_its_provider_capability() {
-        let error = mobile_launch_capability_error(shared::Provider::Opencode, true, false)
+        let error = mobile_launch_capability_error(shared::Provider::Opencode, true, false, true)
             .expect("older CLI must be rejected");
         assert!(error.contains("OpenCode"));
         assert!(error.contains("updated and reconnected"));
 
-        assert!(mobile_launch_capability_error(shared::Provider::Opencode, true, true).is_none());
-        assert!(mobile_launch_capability_error(shared::Provider::Claude, true, false).is_none());
-        assert!(mobile_launch_capability_error(shared::Provider::Codex, true, false).is_none());
+        assert!(
+            mobile_launch_capability_error(shared::Provider::Opencode, true, true, true).is_none()
+        );
+        assert!(
+            mobile_launch_capability_error(shared::Provider::Claude, true, false, false).is_none()
+        );
+        assert!(
+            mobile_launch_capability_error(shared::Provider::Codex, true, false, false).is_none()
+        );
+    }
+
+    #[test]
+    fn mobile_pi_launch_requires_its_provider_capability() {
+        let error = mobile_launch_capability_error(shared::Provider::Pi, true, true, false)
+            .expect("older CLI must be rejected");
+        assert!(error.contains("Pi"));
+        assert!(error.contains("updated and reconnected"));
+
+        assert!(mobile_launch_capability_error(shared::Provider::Pi, true, false, true).is_none());
+        // An OpenCode-capable CLI that predates Pi must still accept OpenCode.
+        assert!(
+            mobile_launch_capability_error(shared::Provider::Opencode, true, true, false).is_none()
+        );
     }
 
     #[tokio::test]

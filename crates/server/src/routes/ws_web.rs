@@ -1316,6 +1316,45 @@ async fn authorize_profile_launch(
 /// Authorize creation of a brand-new pane. Structured agent panes are a
 /// historical resume/reboot path only; all new work must use a supported
 /// terminal profile.
+/// A provider-specific terminal capability a project CLI must advertise before
+/// it can host that provider's interactive TUI, with the error to show when it
+/// does not. Kept in one place so pane creation and provider switching cannot
+/// drift apart.
+fn required_terminal_capability(
+    provider: shared::Provider,
+) -> Option<(&'static str, &'static str)> {
+    match provider {
+        shared::Provider::Opencode => Some((
+            shared::OPENCODE_TERMINAL_CAPABILITY,
+            "The project CLI must be updated and reconnected before creating an OpenCode terminal pane.",
+        )),
+        shared::Provider::Pi => Some((
+            shared::PI_TERMINAL_CAPABILITY,
+            "The project CLI must be updated and reconnected before creating a Pi terminal pane.",
+        )),
+        _ => None,
+    }
+}
+
+async fn requires_capable_terminal_cli(
+    state: &AppState,
+    connection_id: &Uuid,
+    session_id: &Uuid,
+    provider: shared::Provider,
+) -> bool {
+    let Some((capability, message)) = required_terminal_capability(provider) else {
+        return true;
+    };
+    if state
+        .sessions
+        .session_supports_capability(session_id, capability)
+    {
+        return true;
+    }
+    send_policy_error(state, connection_id, message).await;
+    false
+}
+
 async fn authorize_new_pane_launch(
     state: &AppState,
     connection_id: &Uuid,
@@ -1335,17 +1374,8 @@ async fn authorize_new_pane_launch(
         return false;
     }
     if kind == shared::PaneKind::Terminal
-        && provider == shared::Provider::Opencode
-        && !state
-            .sessions
-            .session_supports_capability(session_id, shared::OPENCODE_TERMINAL_CAPABILITY)
+        && !requires_capable_terminal_cli(state, connection_id, session_id, provider).await
     {
-        send_policy_error(
-            state,
-            connection_id,
-            "The project CLI must be updated and reconnected before creating an OpenCode terminal pane.",
-        )
-        .await;
         return false;
     }
     authorize_profile_launch(
@@ -1777,6 +1807,87 @@ mod retired_launch_authorization_tests {
             .await
         );
         assert!(web_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn pi_terminal_requires_a_capable_cli() {
+        let (state, connection_id, session_id, mut web_rx, mut cli_rx, _cli_id) =
+            policy_state().await;
+
+        assert!(
+            !authorize_new_pane_launch(
+                &state,
+                &connection_id,
+                &session_id,
+                shared::PaneKind::Terminal,
+                shared::Provider::Pi,
+                None,
+                false,
+            )
+            .await
+        );
+
+        let ServerToWeb::Error { message } = web_rx.try_recv().expect("explicit web error") else {
+            panic!("expected compatibility error")
+        };
+        assert!(message.contains("updated and reconnected"));
+        assert!(cli_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn pi_terminal_is_authorized_for_a_capable_cli() {
+        let (state, connection_id, session_id, mut web_rx, _cli_rx, cli_id) = policy_state().await;
+        state.sessions.set_cli_capabilities(
+            cli_id,
+            vec![
+                shared::PROJECT_POLICY_CAPABILITY.to_string(),
+                shared::PI_TERMINAL_CAPABILITY.to_string(),
+            ],
+        );
+
+        assert!(
+            authorize_new_pane_launch(
+                &state,
+                &connection_id,
+                &session_id,
+                shared::PaneKind::Terminal,
+                shared::Provider::Pi,
+                None,
+                false,
+            )
+            .await
+        );
+        assert!(web_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn opencode_capability_does_not_authorize_pi() {
+        // A CLI that predates Pi but can host OpenCode must not receive Pi.
+        let (state, connection_id, session_id, mut web_rx, _cli_rx, cli_id) = policy_state().await;
+        state.sessions.set_cli_capabilities(
+            cli_id,
+            vec![
+                shared::PROJECT_POLICY_CAPABILITY.to_string(),
+                shared::OPENCODE_TERMINAL_CAPABILITY.to_string(),
+            ],
+        );
+
+        assert!(
+            !authorize_new_pane_launch(
+                &state,
+                &connection_id,
+                &session_id,
+                shared::PaneKind::Terminal,
+                shared::Provider::Pi,
+                None,
+                false,
+            )
+            .await
+        );
+        let ServerToWeb::Error { message } = web_rx.try_recv().expect("explicit web error") else {
+            panic!("expected compatibility error")
+        };
+        assert!(message.contains("Pi terminal"));
     }
 
     #[tokio::test]
@@ -5246,6 +5357,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             continue;
                         };
                         let desired_provider = provider.unwrap_or(existing.provider);
+                        if provider.is_some()
+                            && existing.kind == shared::PaneKind::Terminal
+                            && !requires_capable_terminal_cli(
+                                &state,
+                                &connection_id,
+                                &sid,
+                                desired_provider,
+                            )
+                            .await
+                        {
+                            continue;
+                        }
                         if !authorize_profile_launch(
                             &state,
                             &connection_id,

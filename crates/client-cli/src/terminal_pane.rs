@@ -667,18 +667,35 @@ const DEFAULT_ROWS: u16 = 24;
 
 /// Which binaries a terminal pane may host.
 ///
-/// Deliberately not every [`Provider`]: Claude, Codex, and OpenCode have
-/// documented interactive TUIs, non-interactive permission modes, and resume
-/// flows that APAS can safely drive through a bare pty. Returning `None`
-/// here makes the caller reject the pane rather than spawn something that
-/// paints garbage into xterm.js.
+/// Deliberately not every [`Provider`]: Claude, Codex, OpenCode, and Pi have
+/// documented interactive TUIs and resume flows that APAS can safely drive
+/// through a bare pty. Returning `None` here makes the caller reject the pane
+/// rather than spawn something that paints garbage into xterm.js.
 pub fn terminal_binary_for(provider: &Provider) -> Option<&'static str> {
     #[allow(deprecated)]
     match provider {
         Provider::Claude => Some("claude"),
         Provider::Codex => Some("codex"),
         Provider::Opencode => Some("opencode"),
+        Provider::Pi => Some("pi"),
         Provider::Minimax | Provider::Glm | Provider::Deepseek | Provider::CursorAgent => None,
+    }
+}
+
+/// Pi's exact-session arguments.
+///
+/// A retained session file is opened by absolute path, which Pi accepts
+/// without a project-fork prompt. When no file has been written yet — Pi
+/// persists a session only once its first assistant message exists — the
+/// pane's pinned identity is reused and Pi creates that exact session again.
+/// Directory recency is deliberately never used: sibling panes and provider
+/// subprocesses can share a working directory.
+fn pi_session_args(conversation_id: Uuid) -> Vec<String> {
+    match dirs::home_dir()
+        .and_then(|home| crate::transcript::find_pi_session_file(&home, conversation_id))
+    {
+        Some(path) => vec!["--session".to_string(), path.display().to_string()],
+        None => vec!["--session-id".to_string(), conversation_id.to_string()],
     }
 }
 
@@ -692,7 +709,8 @@ pub fn terminal_binary_for(provider: &Provider) -> Option<&'static str> {
 /// that UUID has been found in a real local user rollout; older APAS versions
 /// stored a random pane UUID here, and passing that would replace a usable
 /// picker with a failed resume. OpenCode's `--continue` selects the newest
-/// session for the pane's working directory.
+/// session for the pane's working directory. Pi's retained session file is
+/// opened by exact path, falling back to its pinned identity.
 fn resume_args_for(
     provider: &Provider,
     conversation_id: Uuid,
@@ -708,6 +726,7 @@ fn resume_args_for(
             args
         }
         Provider::Opencode => vec!["--continue".to_string()],
+        Provider::Pi => pi_session_args(conversation_id),
         _ => Vec::new(),
     }
 }
@@ -723,6 +742,11 @@ fn resume_args_for(
 /// Verified present on the *interactive* forms of all hostable binaries, not
 /// just their headless modes. That matters because an unrecognised flag does
 /// not degrade; it fails the spawn outright.
+///
+/// Pi is hostable without an entry here because it has no permission prompts
+/// at all. It is deliberately not given `--approve`: that flag trusts
+/// repository-controlled settings and extensions, which is the host's
+/// decision, not APAS's.
 fn permission_bypass_flag_for(provider: &Provider) -> Option<&'static str> {
     match provider {
         Provider::Claude => Some("--dangerously-skip-permissions"),
@@ -771,10 +795,10 @@ pub(crate) fn terminal_args_for(
         args.push(flag.to_string());
     }
     if !resume {
-        // Pin Claude before the positional prompt. Besides preserving the
-        // long-standing command shape, this keeps the prompt last so it
-        // cannot accidentally absorb a following option-like token.
-        if matches!(provider, Provider::Claude) {
+        // Pin Claude and Pi before the positional prompt. Besides preserving
+        // the long-standing Claude command shape, this keeps the prompt last
+        // so it cannot accidentally absorb a following option-like token.
+        if matches!(provider, Provider::Claude | Provider::Pi) {
             args.push("--session-id".to_string());
             args.push(conversation_id.to_string());
         }
@@ -1143,6 +1167,7 @@ mod tests {
         assert_eq!(terminal_binary_for(&Provider::Claude), Some("claude"));
         assert_eq!(terminal_binary_for(&Provider::Codex), Some("codex"));
         assert_eq!(terminal_binary_for(&Provider::Opencode), Some("opencode"));
+        assert_eq!(terminal_binary_for(&Provider::Pi), Some("pi"));
         for p in [
             Provider::Minimax,
             Provider::Glm,
@@ -1162,7 +1187,8 @@ mod tests {
     fn every_terminal_host_launches_without_permission_prompts() {
         // A terminal pane is driven from a browser; an approval prompt there
         // just blocks until someone notices the tab. Any provider we are
-        // willing to host must therefore have a bypass flag.
+        // willing to host must therefore either have a bypass flag or, like
+        // Pi, have no permission prompts at all.
         for p in [Provider::Claude, Provider::Codex, Provider::Opencode] {
             assert!(
                 terminal_binary_for(&p).is_some(),
@@ -1173,6 +1199,12 @@ mod tests {
                 "{p:?} is hostable but would stop to ask for permission"
             );
         }
+        assert!(terminal_binary_for(&Provider::Pi).is_some());
+        assert_eq!(
+            permission_bypass_flag_for(&Provider::Pi),
+            None,
+            "Pi must not be given --approve: that trusts repo-controlled extensions"
+        );
     }
 
     #[test]
@@ -1244,6 +1276,42 @@ mod tests {
                 None,
             ),
             vec!["--continue", "--auto"]
+        );
+    }
+
+    #[test]
+    fn pi_pins_exact_identity_and_never_passes_a_trust_bypass() {
+        let conversation_id = Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap();
+        assert_eq!(
+            terminal_args_for(
+                &Provider::Pi,
+                conversation_id,
+                false,
+                Some("fix the test"),
+                None,
+            ),
+            vec![
+                "--session-id".to_string(),
+                conversation_id.to_string(),
+                "fix the test".to_string(),
+            ]
+        );
+        // No retained session file on this host: resume reuses the pinned
+        // identity instead of selecting a session by directory recency.
+        assert_eq!(
+            terminal_args_for(
+                &Provider::Pi,
+                conversation_id,
+                true,
+                Some("must not replay"),
+                None,
+            ),
+            vec!["--session-id".to_string(), conversation_id.to_string()]
+        );
+        assert_eq!(
+            permission_bypass_flag_for(&Provider::Pi),
+            None,
+            "Pi has no permission prompts, and --approve would trust repo extensions"
         );
     }
 

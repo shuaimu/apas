@@ -317,6 +317,7 @@ const PROVIDER_OPTIONS = [
   { value: "codex", label: "Codex" },
   { value: "cursor-agent", label: "Cursor" },
   { value: "opencode", label: "OpenCode" },
+  { value: "pi", label: "Pi" },
   { value: "deepseek", label: "DeepSeek" },
 ] as const;
 type ProviderOption = (typeof PROVIDER_OPTIONS)[number]["value"];
@@ -734,11 +735,13 @@ export function TabbedView({
         ? "Cursor"
         : provider === "opencode"
           ? "OpenCode"
-          : deepseekModel === DEEPSEEK_FLASH_MODEL
-            ? "DeepSeek Flash"
-            : deepseekModel === DEEPSEEK_PRO_MODEL
-              ? "DeepSeek Pro"
-              : isDeepseek ? "DeepSeek" : "Claude";
+          : provider === "pi"
+            ? "Pi"
+            : deepseekModel === DEEPSEEK_FLASH_MODEL
+              ? "DeepSeek Flash"
+              : deepseekModel === DEEPSEEK_PRO_MODEL
+                ? "DeepSeek Pro"
+                : isDeepseek ? "DeepSeek" : "Claude";
     const label = `${basePrefix} ${effectiveTabs.length + 1}`;
     const result = addPane(provider, "interactive", label, undefined, model, isolatedWorktree, undefined, false, kind);
     if (result.success) {

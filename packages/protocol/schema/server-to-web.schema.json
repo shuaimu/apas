@@ -2529,6 +2529,11 @@
           "type": "string",
           "const": "glm",
           "deprecated": true
+        },
+        {
+          "description": "Pi coding agent (`pi`): terminal-only in APAS. See\n`terminal_pane::terminal_binary_for`.",
+          "type": "string",
+          "const": "pi"
         }
       ]
     },
@@ -2788,6 +2793,13 @@
       "description": "A provider-confirmed usage limit that is currently preventing work.\n\nThis is deliberately separate from utilization: included usage may reach\n100% while paid extra usage remains available, in which case the provider\nis not blocking requests and this field stays absent.",
       "type": "object",
       "properties": {
+        "model": {
+          "description": "Model family this limit applies to. Absent means the provider account\nis blocked generally. Anthropic currently uses display names such as\n\"Fable\" for model-scoped weekly limits.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "resets_at": {
           "description": "When the provider expects work to become available again.",
           "type": [

@@ -62,6 +62,14 @@ describe("providerOptions", () => {
     expect(providerModelValue("deepseek", "deepseek-chat")).toBe("unsupported");
   });
 
+  it("exposes Pi as its own official terminal backend", () => {
+    expect(findProviderModelOption("pi/official")).toEqual(
+      expect.objectContaining({ label: "Pi", provider: "pi" }),
+    );
+    expect(providerModelValue("pi", null)).toBe("pi/official");
+    expect(providerModelValue("pi", "default")).toBe("pi/official");
+  });
+
   it("excludes retired providers and classifies historical values as unsupported", () => {
     expect(PROVIDER_MODEL_OPTIONS.some((option) =>
       /minimax|glm/i.test(`${option.provider} ${option.model ?? ""} ${option.label}`)

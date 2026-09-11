@@ -42,6 +42,11 @@ pub struct TurnRecord {
     pub input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
+    /// Provider-reported USD cost for this turn, when the transcript carries
+    /// one. Pi records real per-turn cost; providers that only report tokens
+    /// leave this absent rather than fabricating a number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
     /// True only when the provider transcript confirms that this response is
     /// finished. Assistant text can arrive before tool calls, so the presence
     /// of an assistant turn alone is not an idle boundary.
@@ -101,6 +106,7 @@ mod tests {
             model: None,
             input_tokens: None,
             output_tokens: None,
+            cost_usd: None,
             completes_work: false,
             question: None,
             answer: None,

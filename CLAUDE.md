@@ -954,12 +954,26 @@ otherwise have had to volunteer.
   exactly matches the pane cwd, then reads it with `opencode export <id>`.
   Like Codex, two panes sharing a cwd are inherently ambiguous; sessions from
   another directory are never selected.
+- **pi** — `--session-id <uuid>` pins the pane's identity at spawn, and Pi names
+  the session file after it:
+  `~/.pi/agent/sessions/--<cwd slug>--/<timestamp>_<uuid>.jsonl`. APAS finds
+  that exact id anywhere under the sessions root (honoring
+  `PI_CODING_AGENT_DIR` and `PI_CODING_AGENT_SESSION_DIR`), so sibling panes
+  and provider subprocesses sharing a cwd are never adopted. Pi writes the file
+  only once the session's first assistant message exists; before that the pane
+  simply has no history. In-TUI `/new` and `/resume` switches are deliberately
+  not followed: nothing distinguishes a deliberate switch from an oh-my-pi
+  subagent's session, and pinned identity is exact.
 
 Parsing keeps only real conversation. claude transcripts also carry `mode`,
 `ai-title`, `last-prompt` bookkeeping; codex carries `developer` messages (the
 harness's own injected context), `reasoning`, and tool calls; OpenCode exports
-typed reasoning/tool/synthetic parts. None of those are turns, and rendering
-them would be noise. Tool-use-only turns with no text are skipped rather than
+typed reasoning/tool/synthetic parts; pi sessions are trees whose `custom` and
+`custom_message` extension entries (what the oh-my-pi package writes),
+thinking, tool results, shell executions, and compaction/branch summaries are
+not turns. None of those are turns, and rendering them would be noise. For pi,
+only the active parent chain is read, so an abandoned `/tree` branch never
+reappears in history. Tool-use-only turns with no text are skipped rather than
 recorded blank. In-progress OpenCode assistant messages are held until their
 completion timestamp arrives so APAS never advances its cursor over a partial
 reply.
@@ -1004,6 +1018,13 @@ provider usage limit: it names the action the human can take now. Merely routing
 answer bytes does not clear it; the matching transcript `tool_result` is the
 proof that moves the pane back to Working until the resumed turn completes.
 
+This whole path is Claude-specific today. Pi's `ask` tool comes from the oh-my-pi
+extension, and no Pi picker has been driven against a real TUI, so APAS does not
+publish Pi tool calls as answerable cards or write blind keystrokes for them;
+answering happens in the terminal view. OpenCode has no question interface
+either. Adding a provider means verifying its picker contract first, not
+assuming the Claude arrow-key one.
+
 **The conversation view is writable, and that is the point on mobile.** An
 xterm TUI on a phone is close to unusable — no modifier keys, tiny hit targets,
 scrolling that fights the page — so the conversation view plus its text box is
@@ -1036,11 +1057,13 @@ Each turn is then dressed as the stream message an agent pane would have sent
 cheap: no new wire message, no new storage path, no new renderer, and no server
 or web change at all. A turn carrying token counts emits a second `Result`
 message, because `ws_cli` reads usage only from `extra.usage` on that variant;
-`total_cost_usd` stays 0 because the transcript reports tokens, not price.
+Pi reports real per-turn cost in its session file and that number is used,
+while providers that report only tokens keep `total_cost_usd` at 0 rather than
+inventing a price.
 
 ## Terminal panes (`kind: "terminal"`)
 
-New user-created Claude, Codex, OpenCode, and DeepSeek work uses
+New user-created Claude, Codex, OpenCode, Pi, and DeepSeek work uses
 `kind: "terminal"`. The structured `kind: "agent"` path is retained only for
 historical panes: the CLI runs the provider headlessly and parses stream-json
 into structured events. Missing `kind` still deserializes as `agent` so old
@@ -1053,18 +1076,36 @@ to xterm.js in the browser. Nothing is parsed, so nothing has to be kept in
 sync with a provider's output format — the point is to reuse the CLI as it
 ships.
 
-Only `claude`, `codex`, and `opencode` can host one
+Only `claude`, `codex`, `opencode`, and `pi` can host one
 (`terminal_pane::terminal_binary_for`). DeepSeek uses the Claude terminal with
 the supported Anthropic-compatible backend environment; Cursor Agent has no
 supported launch profile. OpenCode launches with `--auto`; a fresh mobile task
-uses `--prompt <instruction>`, while restoration uses `--continue`.
+uses `--prompt <instruction>`, while restoration uses `--continue`. Pi launches
+with the pane's id pinned as `--session-id <uuid>` and its initial instruction
+positional; restoration opens the exact retained session file with `--session
+<path>` and falls back to `--session-id` when Pi has not written it yet. APAS
+deliberately passes no trust flag for Pi: it has no permission prompts at all,
+and `--approve` would trust repository-controlled settings and extensions on
+the host's behalf. Pi is therefore the one hostable provider with no
+permission-bypass argument.
 
-APAS does not install OpenCode, choose its model provider, or authenticate it.
-Install and authenticate OpenCode on every intended project host before enabling
-the profile. The default executable is `opencode`; override a nonstandard
-installation with `apas config set opencode_path /path/to/opencode`. Existing
-explicit cluster/project allowlists remain opt-in and must add
-`terminal:opencode:official:default` through the normal policy controls.
+APAS does not install OpenCode or Pi, choose their model provider, or
+authenticate them. Install and authenticate them on every intended project host
+before enabling the profile. The default executables are `opencode` and `pi`;
+override nonstandard installations with `apas config set opencode_path ...` and
+`apas config set pi_path ...`. Existing explicit cluster/project allowlists
+remain opt-in and must add `terminal:opencode:official:default` or
+`terminal:pi:official:default` through the normal policy controls.
+
+The oh-my-pi orchestration package is a **Pi extension, not an APAS provider**:
+it peer-depends on Pi and declares `pi.extensions` in its package. Install it
+into Pi globally (`pi install npm:oh-my-pi`) so APAS panes never hit Pi's
+project-trust prompt, or install it project-locally and answer `/trust` in the
+terminal view; APAS never does that on the user's behalf. Use the `/oh-my-pi`
+slash command inside a Pi pane to diagnose an install: the package's published
+`oh-my-pi` bin is broken (it imports `../src/*.ts` files the tarball does not
+ship). Pi extension entries are excluded from conversation recovery, and APAS
+never adopts a subagent session as the pane's own.
 
 The desktop tab bar, mobile browser pane picker, native mobile task launcher,
 server authorization, and CLI local add-tab path all enforce this boundary.
@@ -1146,21 +1187,23 @@ running state.
 Native mobile launch advertises `mobile_task_launch_v2`. The version bump is
 intentional: v2 creates a terminal pane and passes the first instruction as a
 provider-native CLI prompt; a v1 CLI would otherwise accept the pane and drop
-that instruction. OpenCode additionally requires `terminal_opencode_v1`, so a
-rolling server/web deployment refuses to route it to an older v2 CLI that can
-launch Claude/Codex but not OpenCode. The server asks the user to
-update/reconnect instead of pretending an older launch succeeded.
+that instruction. OpenCode additionally requires `terminal_opencode_v1`, and Pi
+`terminal_pi_v1`, so a rolling server/web deployment refuses to route either to
+an older v2 CLI that can launch Claude/Codex but not that provider. The server
+asks the user to update/reconnect instead of pretending an older launch
+succeeded.
 
-Roll out OpenCode support in this order: server first, web second, then upgrade
-and reconnect project CLIs so they advertise `terminal_opencode_v1`. Install and
-authenticate OpenCode and opt the intended policies into its profile only after
-the host CLI has reconnected.
+Roll out OpenCode and Pi support in this order: server first, web second, then
+upgrade and reconnect project CLIs so they advertise `terminal_opencode_v1` and
+`terminal_pi_v1`. Install and authenticate the provider and opt the intended
+policies into its profile only after the host CLI has reconnected.
 
 ### Persistent pane hosts and CLI lifecycle
 
-On supported Unix project hosts, each new Claude, Codex, or OpenCode terminal
-pane is owned by a hidden `apas pane-host` process in its own project-scoped
-tmux session. The replaceable project CLI is only its authenticated controller.
+On supported Unix project hosts, each new Claude, Codex, OpenCode, or Pi
+terminal pane is owned by a hidden `apas pane-host` process in its own
+project-scoped tmux session. The replaceable project CLI is only its
+authenticated controller.
 This removes the CLI process from the provider's lifetime: a transport-only
 `Reconnect Server` leaves the CLI, pane hosts, PTYs, queues, and structured
 turns untouched, while `Reboot CLI` prepares the update first and then adopts

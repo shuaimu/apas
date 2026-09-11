@@ -23,7 +23,7 @@ terminal views, the project overview, and the diff and pull-request handoffs.
 
 - **Terminal panes**: each pane runs a provider's real interactive TUI on a pty
   and streams it to the browser, so you get the CLI exactly as it ships
-- **Claude, Codex, and OpenCode**, plus Claude against a DeepSeek backend
+- **Claude, Codex, OpenCode, and Pi**, plus Claude against a DeepSeek backend
 - **Read it as a conversation**: a per-pane toggle swaps the live terminal for a
   structured transcript, recovered from the provider's own session files
 - **Drive it from a phone**: type into the conversation view and answer an
@@ -120,9 +120,10 @@ output format.
 headlessly and parses its stream-JSON. It is kept only for panes that already
 exist. Nothing creates one any more.
 
-Only Claude, Codex, and OpenCode can host a terminal pane. DeepSeek runs the
-Claude binary against an Anthropic-compatible endpoint. APAS does not install or
-authenticate these tools; install and log into them on each host first.
+Only Claude, Codex, OpenCode, and Pi can host a terminal pane. DeepSeek runs
+the Claude binary against an Anthropic-compatible endpoint. APAS does not
+install or authenticate these tools; install and log into them on each host
+first.
 
 ### Terminal panes have history
 
@@ -135,10 +136,37 @@ provider already writes:
 - **Codex** is located by the terminal's process group, so several panes can
   share one directory without sharing history.
 - **OpenCode** is asked for its session list and export.
+- **Pi** pins its exact session id at launch and is read back from that session
+  file, so sibling panes and subagents sharing a directory never mix.
 
 That transcript is what gives a terminal pane its conversation view, its token
-counts, and its working/idle state. Questions an agent asks appear there and can
-be answered there, and typed messages go straight into the live pty.
+counts, and its working/idle state. Questions a Claude agent asks appear there
+and can be answered there, and typed messages go straight into the live pty. Pi
+questions stay in the terminal view: its `ask` tool comes from the oh-my-pi
+extension and its picker has not been verified, so APAS does not write answers
+into it blindly.
+
+### Pi and oh-my-pi
+
+Install and authenticate Pi on the host (`npm install -g
+@earendil-works/pi-coding-agent`, or the installer at
+[pi.dev](https://pi.dev)). Override a nonstandard installation with
+`apas config set pi_path /path/to/pi`, then allow `terminal:pi:official:default`
+through cluster or project policy.
+
+The [oh-my-pi](https://github.com/can1357/oh-my-pi) orchestration layer is a Pi
+package, not a separate agent. Install it into Pi **globally**:
+
+```bash
+pi install npm:oh-my-pi
+```
+
+A global install means APAS panes never hit Pi's project-trust prompt. If you
+install it project-locally (`-l`), answer `/trust` once in the pane's terminal
+view; APAS deliberately never trusts repository-controlled extensions on your
+behalf. Run `/oh-my-pi doctor` inside a Pi pane to diagnose an install — the
+package's published shell launcher is broken (it imports TypeScript sources the
+tarball does not ship), so the slash command is the supported entry point.
 
 ### Worktrees and diff review
 
@@ -206,10 +234,11 @@ token = "your-token"
 claude_path = "claude"
 codex_path = "codex"
 opencode_path = "opencode"
+pi_path = "pi"
 ```
 
 Set values with `apas config set KEY VALUE`. Useful keys include `server`,
-`claude_path`, `codex_path`, `opencode_path`, `deepseek_api_base_url`,
+`claude_path`, `codex_path`, `opencode_path`, `pi_path`, `deepseek_api_base_url`,
 `deepseek_api_key`, `daemon_roots`, and the pane-host grace periods
 `pane_host_adoption_grace_seconds` and `pane_host_reboot_grace_seconds`.
 
@@ -249,10 +278,10 @@ working.
 
 `disallowed_tab_types` restricts which tab types users may create, where a tab
 type is a pane kind plus a provider (`terminal:claude`, `terminal:codex`,
-`terminal:opencode`). It is stored as a deny list, so an empty value means
-everything is allowed and a provider added later is permitted until an owner
-says otherwise. The CLI enforces it by re-reading `.apas` on every request,
-because the web only hides menu entries.
+`terminal:opencode`, `terminal:pi`). It is stored as a deny list, so an empty
+value means everything is allowed and a provider added later is permitted until
+an owner says otherwise. The CLI enforces it by re-reading `.apas` on every
+request, because the web only hides menu entries.
 
 `auto_approve_todos` and `auto_merge_prs` may still appear in older files. They
 were read by the team loop and now do nothing.

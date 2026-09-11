@@ -601,9 +601,9 @@ fn conversation_turn_to_stream_messages(
     };
 
     if turn.has_usage() {
-        // `subtype: "success"` is what marks the turn complete for accounting;
-        // cost is left at 0 because a self-reporting agent has no idea what it
-        // was billed, and inventing a number would corrupt the roll-up.
+        // `subtype: "success"` is what marks the turn complete for accounting.
+        // Cost comes from the transcript only when the provider recorded one
+        // (Pi does); inventing a number would corrupt the roll-up.
         let usage = serde_json::json!({
             "usage": {
                 "input_tokens": turn.input_tokens.unwrap_or(0),
@@ -617,7 +617,7 @@ fn conversation_turn_to_stream_messages(
             message: shared::ClaudeStreamMessage::Result {
                 subtype: "success".to_string(),
                 result: String::new(),
-                total_cost_usd: 0.0,
+                total_cost_usd: turn.cost_usd.unwrap_or(0.0),
                 duration_ms: 0,
                 session_id: sid,
                 is_error: false,
@@ -782,6 +782,7 @@ fn resolve_pane_binary_path(
     claude_path: &str,
     codex_path: &str,
     opencode_path: &str,
+    pi_path: &str,
     cursor_agent_path: &str,
 ) -> String {
     if shared::is_retired_launch(provider, model) {
@@ -791,6 +792,7 @@ fn resolve_pane_binary_path(
         Provider::Claude | Provider::Deepseek => claude_path.to_string(),
         Provider::Codex => codex_path.to_string(),
         Provider::Opencode => opencode_path.to_string(),
+        Provider::Pi => pi_path.to_string(),
         Provider::CursorAgent => cursor_agent_path.to_string(),
         #[allow(deprecated)]
         Provider::Minimax | Provider::Glm => String::new(),
@@ -809,6 +811,7 @@ fn provider_display_name(provider: &Provider, model: Option<&str>) -> &'static s
         Provider::Minimax | Provider::Glm => "Unsupported provider",
         Provider::Deepseek => "DeepSeek",
         Provider::Opencode => "OpenCode",
+        Provider::Pi => "Pi",
         Provider::CursorAgent => "Cursor",
     }
 }
@@ -822,6 +825,7 @@ fn provider_config_key(provider: &Provider, model: Option<&str>) -> &'static str
         Provider::Codex => "codex_path",
         Provider::Deepseek => "claude_path",
         Provider::Opencode => "opencode_path",
+        Provider::Pi => "pi_path",
         Provider::CursorAgent => "cursor_agent_path",
         #[allow(deprecated)]
         Provider::Minimax | Provider::Glm => "unsupported_provider",
@@ -2050,6 +2054,7 @@ async fn run_inner(
     let claude_path = resolve_binary_path(&config.local.claude_path);
     let codex_path = resolve_binary_path(&config.local.codex_path);
     let opencode_path = resolve_binary_path(&config.local.opencode_path);
+    let pi_path = resolve_binary_path(&config.local.pi_path);
     let cursor_agent_path = resolve_binary_path(&config.local.cursor_agent_path);
 
     // Load or create project metadata
@@ -2353,6 +2358,7 @@ async fn run_inner(
             &claude_path,
             &codex_path,
             &opencode_path,
+            &pi_path,
             &cursor_agent_path,
         );
         if let Err(err) = spawn_terminal_pane(
@@ -2535,6 +2541,7 @@ async fn run_inner(
             &claude_path,
             &codex_path,
             &opencode_path,
+            &pi_path,
             &cursor_agent_path,
         );
         let (
@@ -2635,6 +2642,7 @@ async fn run_inner(
             &claude_path,
             &codex_path,
             &opencode_path,
+            &pi_path,
             &cursor_agent_path,
         );
         let (
@@ -2717,6 +2725,7 @@ async fn run_inner(
         let claude_path_event = claude_path.clone();
         let codex_path_event = codex_path.clone();
         let opencode_path_event = opencode_path.clone();
+        let pi_path_event = pi_path.clone();
         let cursor_agent_path_event = cursor_agent_path.clone();
         let pane_sessions_event = pane_sessions.clone();
         let pane_pauses_event = pane_pauses.clone();
@@ -2739,6 +2748,7 @@ async fn run_inner(
                 &claude_path_event,
                 &codex_path_event,
                 &opencode_path_event,
+                &pi_path_event,
                 &cursor_agent_path_event,
                 &working_dir_event,
                 command_tx,
@@ -3129,6 +3139,23 @@ async fn run_inner(
                                 continue;
                             };
                             (format!("claude:{}", path.display()), turns, None)
+                        }
+                        Provider::Pi => {
+                            let Some(home) = home.as_deref() else {
+                                continue;
+                            };
+                            // Exact pinned identity: the id names the session
+                            // file wherever Pi wrote it. No directory-recency
+                            // fallback, because a sibling pane or an oh-my-pi
+                            // subprocess can share the working directory.
+                            let Some(path) = crate::transcript::find_pi_session_file(home, conv_id)
+                            else {
+                                continue;
+                            };
+                            let Ok(turns) = crate::transcript::read_pi_turns(&path, pane_id) else {
+                                continue;
+                            };
+                            (format!("pi:{}", path.display()), turns, None)
                         }
                         _ => continue,
                     };
@@ -3541,6 +3568,7 @@ fn handle_tui_events(
     claude_path: &str,
     codex_path: &str,
     opencode_path: &str,
+    pi_path: &str,
     cursor_agent_path: &str,
     working_dir: &str,
     command_tx: mpsc::Sender<TuiCommand>,
@@ -3690,6 +3718,7 @@ fn handle_tui_events(
                     claude_path,
                     codex_path,
                     opencode_path,
+                    pi_path,
                     cursor_agent_path,
                 );
 
@@ -4229,6 +4258,7 @@ fn handle_tui_events(
                     claude_path,
                     codex_path,
                     opencode_path,
+                    pi_path,
                     cursor_agent_path,
                 );
                 {
@@ -4709,6 +4739,7 @@ fn handle_tui_events(
                     claude_path,
                     codex_path,
                     opencode_path,
+                    pi_path,
                     cursor_agent_path,
                 );
                 {
@@ -4925,6 +4956,7 @@ fn active_usage_providers(pane_metas: &PaneMetas) -> (bool, bool, bool) {
             Provider::Minimax | Provider::Glm => {}
             Provider::Deepseek => has_deepseek = true,
             Provider::Opencode => {}
+            Provider::Pi => {}
             Provider::CursorAgent => {}
         }
         if has_claude && has_codex && has_deepseek {
@@ -5094,6 +5126,7 @@ fn build_agent_args(
         }
         #[allow(deprecated)]
         Provider::Minimax | Provider::Glm => (Vec::new(), false),
+        Provider::Pi => (Vec::new(), false),
         Provider::Opencode => {
             // OpenCode generates its own `ses_*` identifiers, so the APAS
             // UUID cannot be passed to --session. Resume the newest session
@@ -5525,6 +5558,7 @@ fn parse_agent_output(
             Err(_) => None,
         },
         Provider::Opencode => convert_opencode_to_claude(line, session_id_str),
+        Provider::Pi => None,
         Provider::CursorAgent => {
             // cursor-agent --output-format stream-json emits Claude-compatible events
             serde_json::from_str::<ClaudeStreamMessage>(line).ok()
@@ -7352,9 +7386,24 @@ mod tests {
             "claude",
             "codex",
             "opencode",
+            "pi",
             "cursor-agent",
         );
         assert_eq!(path, "claude");
+    }
+
+    #[test]
+    fn resolve_pane_binary_path_uses_configured_pi_binary() {
+        let path = resolve_pane_binary_path(
+            Provider::Pi,
+            None,
+            "claude",
+            "codex",
+            "opencode",
+            "/opt/pi/bin/pi",
+            "cursor-agent",
+        );
+        assert_eq!(path, "/opt/pi/bin/pi");
     }
 
     #[test]
@@ -8019,6 +8068,7 @@ mod tests {
             model: None,
             input_tokens: None,
             output_tokens: None,
+            cost_usd: None,
             completes_work: false,
             question: Some(TurnQuestion {
                 tool_use_id: "question-7".to_string(),
@@ -8061,6 +8111,7 @@ mod tests {
             model: None,
             input_tokens: None,
             output_tokens: None,
+            cost_usd: None,
             completes_work: false,
             question: None,
             answer: Some(TurnAnswer {
@@ -8131,6 +8182,7 @@ mod tests {
             model: Some("claude-opus-5".to_string()),
             input_tokens: None,
             output_tokens: None,
+            cost_usd: None,
             completes_work: false,
             question: None,
             answer: None,
@@ -11948,6 +12000,7 @@ async fn run_server_connection(
                     shared::PROJECT_POLICY_CAPABILITY.to_string(),
                     shared::MOBILE_TASK_LAUNCH_CAPABILITY.to_string(),
                     shared::OPENCODE_TERMINAL_CAPABILITY.to_string(),
+                    shared::PI_TERMINAL_CAPABILITY.to_string(),
                     shared::CLI_LIFECYCLE_CAPABILITY.to_string(),
                 ];
                 if summary_runner.is_some() {
