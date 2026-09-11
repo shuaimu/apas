@@ -63,6 +63,56 @@ fn resolve_binary_path(name: &str) -> String {
     name.to_string()
 }
 
+/// The provider binary a background lookup should invoke.
+///
+/// The startup snapshot is preferred — the daemon resolves providers once
+/// while the login-shell PATH is known to be correct — but a global npm/bun
+/// upgrade routinely replaces the install under it. A snapshot that no longer
+/// names a file would otherwise stop transcript capture silently while the
+/// running pane kept working, and would never recover without restarting the
+/// project. When the snapshot is gone, ask PATH again for the configured value
+/// so a reinstalled provider is picked up on the next poll.
+fn live_provider_binary(cached: &str, configured: &str) -> String {
+    if Path::new(cached).is_file() {
+        return cached.to_string();
+    }
+    let refreshed = resolve_binary_path(configured);
+    if Path::new(&refreshed).is_file() {
+        refreshed
+    } else {
+        cached.to_string()
+    }
+}
+
+/// Report a transcript-discovery failure once per distinct error per pane.
+///
+/// The watcher polls every three seconds. Logging every failure would flood
+/// the log, but swallowing them entirely is how a provider whose binary was
+/// replaced went unnoticed: the conversation view simply stayed stale with no
+/// signal anywhere. A changed error re-logs immediately, and a success clears
+/// the entry so a renewed failure is reported again.
+fn note_transcript_discovery_error(
+    seen: &mut HashMap<u32, String>,
+    pane_id: u32,
+    provider: &str,
+    error: &anyhow::Error,
+) {
+    let signature = format!("{error:#}");
+    if seen
+        .get(&pane_id)
+        .is_some_and(|previous| previous == &signature)
+    {
+        return;
+    }
+    tracing::warn!(
+        pane_id,
+        provider,
+        error = %signature,
+        "terminal transcript discovery failed; the conversation view stays stale until it recovers"
+    );
+    seen.insert(pane_id, signature);
+}
+
 fn is_deepseek_model(model: Option<&str>) -> bool {
     model
         .map(|m| {
@@ -2801,6 +2851,7 @@ async fn run_inner(
         #[cfg(target_os = "linux")]
         let terminal_panes_for_turns = terminal_panes.clone();
         let opencode_for_turns = opencode_path.clone();
+        let configured_opencode_for_turns = config.local.opencode_path.clone();
         // Only panes restored above should suppress their existing history.
         // A pane created after this snapshot must capture from turn zero even
         // if it manages to finish its first turn before the watcher's first
@@ -2832,6 +2883,9 @@ async fn run_inner(
             // Per-pane claude transcript watch state (growth + idle tracking
             // for in-TUI session-switch detection).
             let mut claude_watch: HashMap<u32, ClaudeWatchState> = HashMap::new();
+            // Per-pane last OpenCode discovery error, so a broken or replaced
+            // provider binary is reported once instead of every poll.
+            let mut transcript_discovery_errors: HashMap<u32, String> = HashMap::new();
             while !shutdown_for_turns.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_secs(3));
 
@@ -2935,23 +2989,53 @@ async fn run_inner(
                             )
                         }
                         Provider::Opencode => {
-                            let Ok(Some(opencode_session_id)) =
-                                crate::transcript::find_opencode_session(
-                                    &opencode_for_turns,
-                                    &transcript_cwd,
-                                )
-                            else {
-                                continue;
-                            };
-                            let Ok(turns) = crate::transcript::read_opencode_turns(
+                            // Resolve on every poll: a provider upgrade can
+                            // replace the binary under the startup snapshot,
+                            // and capture must resume without a project
+                            // restart once it is back.
+                            let opencode_binary = live_provider_binary(
                                 &opencode_for_turns,
+                                &configured_opencode_for_turns,
+                            );
+                            let opencode_session_id = match crate::transcript::find_opencode_session(
+                                &opencode_binary,
+                                &transcript_cwd,
+                            ) {
+                                Ok(Some(id)) => id,
+                                Ok(None) => {
+                                    transcript_discovery_errors.remove(&pane_id);
+                                    continue;
+                                }
+                                Err(error) => {
+                                    note_transcript_discovery_error(
+                                        &mut transcript_discovery_errors,
+                                        pane_id,
+                                        "opencode",
+                                        &error,
+                                    );
+                                    continue;
+                                }
+                            };
+                            match crate::transcript::read_opencode_turns(
+                                &opencode_binary,
                                 &transcript_cwd,
                                 &opencode_session_id,
                                 pane_id,
-                            ) else {
-                                continue;
-                            };
-                            (format!("opencode:{opencode_session_id}"), turns, None)
+                            ) {
+                                Ok(turns) => {
+                                    transcript_discovery_errors.remove(&pane_id);
+                                    (format!("opencode:{opencode_session_id}"), turns, None)
+                                }
+                                Err(error) => {
+                                    note_transcript_discovery_error(
+                                        &mut transcript_discovery_errors,
+                                        pane_id,
+                                        "opencode",
+                                        &error,
+                                    );
+                                    continue;
+                                }
+                            }
                         }
                         Provider::Claude => {
                             let Some(home) = home.as_deref() else {
@@ -5460,17 +5544,18 @@ mod tests {
         build_pane_env_overrides_from_keys, build_pane_list, build_pane_reboot_events,
         build_user_envelope_line, canonicalize_requested_model, codex_sqlite_home_path,
         convert_opencode_to_claude, deadloop_wait_plan, ensure_private_codex_sqlite_home,
-        evaluate_deadloop_watchdog, is_codex_stale_session_error, manual_create_pr_worktree_path,
-        model_switch_can_use_fast_path, normalize_codex_effort, normalize_effort_level,
-        reconcile_terminal_questions_for_pane, remember_verified_codex_session,
-        reset_deadloop_codex_stale_session, resolve_pane_binary_path, resolve_terminal_binary,
-        restored_pane_mode_and_pause, retired_launch_rejection_output, route_web_input_to_pane,
-        run_deadloop_session_inner, save_pane_configs, should_recover_deadloop_stale_session,
-        start_bot_preserved_fields, stop_retired_panes, terminal_state_reports,
-        truncate_str_at_char_boundary, update_project_operations, DeadloopWatchdogDecision,
-        DeadloopWatchdogState, InputChannels, PaneInputRouteResult, PaneMeta, PaneMetas,
-        PanePauses, PaneStopRequests, PendingAskQuestion, ASK_USER_QUESTION_AUTO_CANCEL_STATUS,
-        CODEX_SQLITE_HOME_ENV, DEEPSEEK_DEFAULT_MODEL, DEEPSEEK_PRO_RUNTIME_MODEL,
+        evaluate_deadloop_watchdog, is_codex_stale_session_error, live_provider_binary,
+        manual_create_pr_worktree_path, model_switch_can_use_fast_path, normalize_codex_effort,
+        normalize_effort_level, reconcile_terminal_questions_for_pane,
+        remember_verified_codex_session, reset_deadloop_codex_stale_session,
+        resolve_pane_binary_path, resolve_terminal_binary, restored_pane_mode_and_pause,
+        retired_launch_rejection_output, route_web_input_to_pane, run_deadloop_session_inner,
+        save_pane_configs, should_recover_deadloop_stale_session, start_bot_preserved_fields,
+        stop_retired_panes, terminal_state_reports, truncate_str_at_char_boundary,
+        update_project_operations, DeadloopWatchdogDecision, DeadloopWatchdogState, InputChannels,
+        PaneInputRouteResult, PaneMeta, PaneMetas, PanePauses, PaneStopRequests,
+        PendingAskQuestion, ASK_USER_QUESTION_AUTO_CANCEL_STATUS, CODEX_SQLITE_HOME_ENV,
+        DEEPSEEK_DEFAULT_MODEL, DEEPSEEK_PRO_RUNTIME_MODEL,
     };
     use crate::conversation::{TurnAnswer, TurnQuestion, TurnRecord};
     use crate::project::{get_or_create_project, save_project};
@@ -7270,6 +7355,38 @@ mod tests {
             "cursor-agent",
         );
         assert_eq!(path, "claude");
+    }
+
+    #[test]
+    fn live_provider_binary_recovers_a_replaced_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let intact = dir.path().join("cached-opencode");
+        std::fs::write(&intact, b"#!/bin/sh\n").unwrap();
+        // An intact startup snapshot wins, even when the configured value
+        // differs, because a bare name may not resolve with this PATH.
+        assert_eq!(
+            live_provider_binary(intact.to_str().unwrap(), "definitely-missing"),
+            intact.to_str().unwrap()
+        );
+
+        // A snapshot left dangling by a replaced global install is re-resolved
+        // from the configured value so capture resumes without a restart.
+        let reinstalled = dir.path().join("reinstalled-opencode");
+        std::fs::write(&reinstalled, b"#!/bin/sh\n").unwrap();
+        assert_eq!(
+            live_provider_binary(
+                "/definitely/missing/opencode",
+                reinstalled.to_str().unwrap()
+            ),
+            reinstalled.to_str().unwrap()
+        );
+
+        // Neither exists: the snapshot is returned so the caller reports the
+        // real invocation error rather than a misleading resolution failure.
+        assert_eq!(
+            live_provider_binary("/definitely/missing/opencode", "also-missing"),
+            "/definitely/missing/opencode"
+        );
     }
 
     #[test]
