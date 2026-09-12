@@ -178,7 +178,19 @@ function currentTerminalTheme() {
  * Must be loaded with `ssr: false` — xterm.js touches `document` at import
  * time and Next would fail to prerender it.
  */
-export function TerminalPane({ paneId }: { paneId: number }) {
+export function TerminalPane({
+  paneId,
+  visible = true,
+}: {
+  paneId: number;
+  /**
+   * Whether this pane is the one on screen. Tabs are hidden with
+   * `display: none` rather than unmounted, and the browser blurs whatever
+   * had focus inside a hidden subtree, so the terminal needs telling when it
+   * comes back. Defaults to true for callers that mount and unmount instead.
+   */
+  visible?: boolean;
+}) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -318,6 +330,25 @@ export function TerminalPane({ paneId }: { paneId: number }) {
       fitRef.current = null;
     };
   }, [paneId, sendTerminalInput, applyFit]);
+
+  // Restore focus when this pane becomes the visible one.
+  //
+  // Visited tabs stay mounted and are merely hidden, which is deliberate:
+  // unmounting would tear down the xterm instance and force a re-attach,
+  // losing scrollback. But hiding a subtree blurs whatever had focus inside
+  // it, and the mount effect above runs once per pane — so returning to a
+  // tab you had already opened left focus on the document body and typing
+  // went nowhere. The same applied to the terminal/conversation toggle,
+  // which hides the terminal the same way.
+  const wasVisibleRef = useRef(visible);
+  useEffect(() => {
+    const wasVisible = wasVisibleRef.current;
+    wasVisibleRef.current = visible;
+    // Only on the edge. Focusing on every render would fight the user
+    // clicking into the composer, a dialog, or the tab bar itself.
+    if (!visible || wasVisible) return;
+    termRef.current?.focus();
+  }, [visible]);
 
   // (Re)attach whenever the socket comes up. The pty kept running on the
   // CLI across a dropped browser connection, so replaying the server's

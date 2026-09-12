@@ -57,17 +57,28 @@ function TerminalPaneWithViews({
   paneId,
   messages,
   mode,
+  isActive,
 }: {
   sessionId: string | null;
   paneId: number;
   messages: Message[];
   mode: TerminalViewMode;
+  /** Whether this pane's tab is the one on screen. */
+  isActive: boolean;
 }) {
   return (
     <>
       {/* Hidden rather than unmounted — see the call site. */}
       <div className={mode === "terminal" ? "flex-1 flex flex-col min-h-0" : "hidden"}>
-        <TerminalPane key={`terminal-${sessionId}-${paneId}`} paneId={paneId} />
+        {/* The terminal is on screen only when its tab is active *and* the
+            toggle is showing the terminal rather than the transcript. Both
+            hide it the same way, so both must clear this flag or focus is
+            left on the document body. */}
+        <TerminalPane
+          key={`terminal-${sessionId}-${paneId}`}
+          paneId={paneId}
+          visible={isActive && mode === "terminal"}
+        />
       </div>
       {mode === "conversation" && (
         <>
@@ -1367,6 +1378,7 @@ export function TabbedView({
                   paneId={tab.pane_id}
                   messages={msgs}
                   mode={terminalViewModeForPane(tab.pane_id)}
+                  isActive={isActive}
                 />
               ) : (
                 <>
