@@ -624,8 +624,7 @@ describe("MobileSessionActivity", () => {
           teamAvailable: true,
           allowedLaunchProfiles: [
             "terminal:codex:official:default",
-            "terminal:claude:deepseek:deepseek-v4-pro",
-            "terminal:claude:deepseek:deepseek-v4-flash",
+            "terminal:claude:deepseek:deepseek-flash",
           ],
           version: 2,
           projectSuspended: false,
@@ -636,13 +635,13 @@ describe("MobileSessionActivity", () => {
     renderActivity();
     fireEvent.click(screen.getByRole("button", { name: "Create pane" }));
 
-    fireEvent.click(screen.getByRole("button", { name: /DeepSeek Pro terminal/ }));
+    fireEvent.click(screen.getByRole("button", { name: /DeepSeek 4\.1 Flash terminal/ }));
     expect(actions.addPane).toHaveBeenCalledWith(
       "claude",
       "interactive",
-      "DeepSeek Pro terminal 2",
+      "DeepSeek 4.1 Flash terminal 2",
       undefined,
-      "deepseek-v4-pro",
+      "deepseek-flash",
       false,
       undefined,
       false,

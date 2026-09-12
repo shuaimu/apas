@@ -1677,7 +1677,11 @@ mod retired_launch_authorization_tests {
     async fn deepseek_variants_are_authorized_exactly_and_unknown_ids_are_rejected() {
         let (state, connection_id, session_id, mut web_rx, _cli_rx, _cli_id) = policy_state().await;
 
-        for model in [shared::DEEPSEEK_PRO_MODEL, shared::DEEPSEEK_FLASH_MODEL] {
+        // The supported model, and the legacy id that canonicalizes to it.
+        for model in [
+            shared::DEEPSEEK_FLASH_MODEL,
+            shared::DEEPSEEK_LEGACY_FLASH_MODEL,
+        ] {
             assert!(
                 authorize_profile_launch(
                     &state,
@@ -1692,6 +1696,22 @@ mod retired_launch_authorization_tests {
             );
         }
         assert!(web_rx.try_recv().is_err());
+
+        // The withdrawn model is refused like any other unsupported id, so a
+        // stale client cannot launch a pane on it.
+        assert!(
+            !authorize_profile_launch(
+                &state,
+                &connection_id,
+                &session_id,
+                shared::PaneKind::Terminal,
+                shared::Provider::Claude,
+                Some(shared::DEEPSEEK_RETIRED_PRO_MODEL),
+                false,
+            )
+            .await
+        );
+        assert!(web_rx.try_recv().is_ok(), "a refusal must be reported");
 
         assert!(
             !authorize_profile_launch(

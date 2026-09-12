@@ -836,7 +836,6 @@ const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com/anthropic";
 // Keep in sync with packages/web/src/lib/providerOptions.ts; the
 // `deepseek_default_model_matches_web_provider_options` test guards drift.
 const DEEPSEEK_DEFAULT_MODEL: &str = shared::DEEPSEEK_DEFAULT_MODEL;
-const DEEPSEEK_PRO_RUNTIME_MODEL: &str = "deepseek-v4-pro[1m]";
 const CODEX_SQLITE_HOME_ENV: &str = "CODEX_SQLITE_HOME";
 const CODEX_SQLITE_HOME_ROOT: &str = "/var/tmp";
 
@@ -934,9 +933,13 @@ fn selected_deepseek_model(
             return Ok(Some(canonical));
         }
         if matches!(provider, Provider::Deepseek) || is_deepseek_model(Some(model)) {
+            let hint = if shared::is_retired_deepseek_model(model) {
+                " That model has been withdrawn; reboot the pane on the supported one."
+            } else {
+                ""
+            };
             return Err(format!(
-                "Unsupported DeepSeek model '{model}'. Supported models are {} and {}.",
-                shared::DEEPSEEK_PRO_MODEL,
+                "Unsupported DeepSeek model '{model}'. The supported model is {}.{hint}",
                 shared::DEEPSEEK_FLASH_MODEL,
             ));
         }
@@ -1278,11 +1281,10 @@ fn build_pane_env_overrides_from_keys(
     let missing_key_message = "DeepSeek backend is not configured (missing deepseek_api_key). Update it on the Machines page or run: apas config set deepseek_api_key <key>.".to_string();
     let api_key = api_key.ok_or(missing_key_message)?;
 
-    let primary_runtime_model = if primary_model == shared::DEEPSEEK_PRO_MODEL {
-        DEEPSEEK_PRO_RUNTIME_MODEL
-    } else {
-        shared::DEEPSEEK_FLASH_MODEL
-    };
+    // One model, so every slot Claude Code can reach for resolves to it —
+    // otherwise a subagent or a "sonnet"/"opus" selection would name a model
+    // this deployment no longer offers.
+    let primary_runtime_model = primary_model;
     let env = vec![
         ("ANTHROPIC_BASE_URL".to_string(), api_base_url),
         // Keep both names for compatibility across Claude CLI versions/wrappers.
@@ -1294,11 +1296,11 @@ fn build_pane_env_overrides_from_keys(
         ),
         (
             "ANTHROPIC_DEFAULT_SONNET_MODEL".to_string(),
-            DEEPSEEK_PRO_RUNTIME_MODEL.to_string(),
+            shared::DEEPSEEK_FLASH_MODEL.to_string(),
         ),
         (
             "ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(),
-            DEEPSEEK_PRO_RUNTIME_MODEL.to_string(),
+            shared::DEEPSEEK_FLASH_MODEL.to_string(),
         ),
         (
             "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
@@ -5589,7 +5591,7 @@ mod tests {
         update_project_operations, DeadloopWatchdogDecision, DeadloopWatchdogState, InputChannels,
         PaneInputRouteResult, PaneMeta, PaneMetas, PanePauses, PaneStopRequests,
         PendingAskQuestion, ASK_USER_QUESTION_AUTO_CANCEL_STATUS, CODEX_SQLITE_HOME_ENV,
-        DEEPSEEK_DEFAULT_MODEL, DEEPSEEK_PRO_RUNTIME_MODEL,
+        DEEPSEEK_DEFAULT_MODEL,
     };
     use crate::conversation::{TurnAnswer, TurnQuestion, TurnRecord};
     use crate::project::{get_or_create_project, save_project};
@@ -5721,14 +5723,19 @@ mod tests {
         let web_default =
             extract_ts_string_const(WEB_PROVIDER_OPTIONS_TS, "DEEPSEEK_DEFAULT_MODEL")
                 .expect("web providerOptions.ts exports DEEPSEEK_DEFAULT_MODEL");
-        let web_pro = extract_ts_string_const(WEB_PROVIDER_OPTIONS_TS, "DEEPSEEK_PRO_MODEL")
-            .expect("web providerOptions.ts exports DEEPSEEK_PRO_MODEL");
         let web_flash = extract_ts_string_const(WEB_PROVIDER_OPTIONS_TS, "DEEPSEEK_FLASH_MODEL")
             .expect("web providerOptions.ts exports DEEPSEEK_FLASH_MODEL");
+        let web_legacy_flash =
+            extract_ts_string_const(WEB_PROVIDER_OPTIONS_TS, "DEEPSEEK_LEGACY_FLASH_MODEL")
+                .expect("web providerOptions.ts exports DEEPSEEK_LEGACY_FLASH_MODEL");
+        let web_retired_pro =
+            extract_ts_string_const(WEB_PROVIDER_OPTIONS_TS, "DEEPSEEK_RETIRED_PRO_MODEL")
+                .expect("web providerOptions.ts exports DEEPSEEK_RETIRED_PRO_MODEL");
 
         assert_eq!(DEEPSEEK_DEFAULT_MODEL, web_default);
-        assert_eq!(shared::DEEPSEEK_PRO_MODEL, web_pro);
         assert_eq!(shared::DEEPSEEK_FLASH_MODEL, web_flash);
+        assert_eq!(shared::DEEPSEEK_LEGACY_FLASH_MODEL, web_legacy_flash);
+        assert_eq!(shared::DEEPSEEK_RETIRED_PRO_MODEL, web_retired_pro);
     }
 
     #[test]
@@ -6451,10 +6458,13 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_pro_flash_switch_cannot_use_live_model_path() {
+    fn deepseek_backend_switch_cannot_use_live_model_path() {
+        // Moving on or off the DeepSeek backend changes the pane's whole
+        // environment, so it cannot be done by telling a live Claude to switch
+        // model — both directions must respawn.
         assert!(!model_switch_can_use_fast_path(
             Provider::Claude,
-            Some(shared::DEEPSEEK_PRO_MODEL),
+            None,
             Provider::Claude,
             Some(shared::DEEPSEEK_FLASH_MODEL),
         ));
@@ -6462,7 +6472,14 @@ mod tests {
             Provider::Claude,
             Some(shared::DEEPSEEK_FLASH_MODEL),
             Provider::Claude,
-            Some(shared::DEEPSEEK_PRO_MODEL),
+            None,
+        ));
+        // A withdrawn DeepSeek model is likewise not a live switch away.
+        assert!(!model_switch_can_use_fast_path(
+            Provider::Claude,
+            Some(shared::DEEPSEEK_RETIRED_PRO_MODEL),
+            Provider::Claude,
+            Some(shared::DEEPSEEK_FLASH_MODEL),
         ));
         assert!(model_switch_can_use_fast_path(
             Provider::Claude,
@@ -7133,7 +7150,7 @@ mod tests {
             &Provider::Claude,
             &session_id,
             FULL_PROMPT,
-            Some("deepseek-v4-pro"),
+            Some(shared::DEEPSEEK_FLASH_MODEL),
             None,
             true,
             false,
@@ -7196,45 +7213,7 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_pro_env_pins_primary_and_routes_small_work_to_flash() {
-        let env = build_pane_env_overrides_from_keys(
-            &Provider::Deepseek,
-            None,
-            Some("sk-deepseek".to_string()),
-        )
-        .unwrap();
-        let get = |key: &str| {
-            env.iter()
-                .find_map(|(k, v)| (k == key).then_some(v.as_str()))
-        };
-
-        assert_eq!(
-            get("ANTHROPIC_BASE_URL"),
-            Some("https://api.deepseek.com/anthropic")
-        );
-        assert_eq!(get("ANTHROPIC_API_KEY"), Some("sk-deepseek"));
-        assert_eq!(get("ANTHROPIC_AUTH_TOKEN"), Some("sk-deepseek"));
-        assert_eq!(get("ANTHROPIC_MODEL"), Some(DEEPSEEK_PRO_RUNTIME_MODEL));
-        assert_eq!(
-            get("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-            Some(DEEPSEEK_PRO_RUNTIME_MODEL)
-        );
-        assert_eq!(
-            get("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-            Some(DEEPSEEK_PRO_RUNTIME_MODEL)
-        );
-        assert_eq!(
-            get("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-            Some(shared::DEEPSEEK_FLASH_MODEL)
-        );
-        assert_eq!(
-            get("CLAUDE_CODE_SUBAGENT_MODEL"),
-            Some(shared::DEEPSEEK_FLASH_MODEL)
-        );
-    }
-
-    #[test]
-    fn deepseek_flash_env_pins_flash_primary_with_shared_credentials() {
+    fn deepseek_env_points_every_model_slot_at_the_one_supported_model() {
         let env = build_pane_env_overrides_from_keys(
             &Provider::Claude,
             Some(shared::DEEPSEEK_FLASH_MODEL),
@@ -7251,23 +7230,55 @@ mod tests {
             Some("https://api.deepseek.com/anthropic")
         );
         assert_eq!(get("ANTHROPIC_API_KEY"), Some("sk-deepseek"));
-        assert_eq!(get("ANTHROPIC_MODEL"), Some(shared::DEEPSEEK_FLASH_MODEL));
-        assert_eq!(
-            get("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-            Some(DEEPSEEK_PRO_RUNTIME_MODEL)
+        assert_eq!(get("ANTHROPIC_AUTH_TOKEN"), Some("sk-deepseek"));
+
+        // Every slot Claude Code can reach for resolves to the single model
+        // APAS offers. Leaving any of them on the withdrawn one would send a
+        // subagent, or a "sonnet"/"opus" selection, to a model this deployment
+        // no longer supports.
+        for slot in [
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "CLAUDE_CODE_SUBAGENT_MODEL",
+        ] {
+            assert_eq!(get(slot), Some(shared::DEEPSEEK_FLASH_MODEL), "slot {slot}");
+        }
+        assert!(
+            !env.iter().any(|(_, v)| v.contains("deepseek-v4-pro")),
+            "no slot may name the withdrawn model"
         );
+    }
+
+    #[test]
+    fn deepseek_env_accepts_the_legacy_flash_id_and_canonicalizes_it() {
+        // `.apas` files written before DeepSeek dropped the version from the
+        // flash id still carry the old one; those panes must keep working.
+        let env = build_pane_env_overrides_from_keys(
+            &Provider::Claude,
+            Some(shared::DEEPSEEK_LEGACY_FLASH_MODEL),
+            Some("sk-deepseek".to_string()),
+        )
+        .unwrap();
         assert_eq!(
-            get("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-            Some(DEEPSEEK_PRO_RUNTIME_MODEL)
-        );
-        assert_eq!(
-            get("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+            env.iter()
+                .find_map(|(k, v)| (k == "ANTHROPIC_MODEL").then_some(v.as_str())),
             Some(shared::DEEPSEEK_FLASH_MODEL)
         );
-        assert_eq!(
-            get("CLAUDE_CODE_SUBAGENT_MODEL"),
-            Some(shared::DEEPSEEK_FLASH_MODEL)
-        );
+    }
+
+    #[test]
+    fn deepseek_env_rejects_the_withdrawn_model_and_says_what_to_do() {
+        let error = build_pane_env_overrides_from_keys(
+            &Provider::Claude,
+            Some(shared::DEEPSEEK_RETIRED_PRO_MODEL),
+            Some("sk-deepseek".to_string()),
+        )
+        .unwrap_err();
+        assert!(error.contains(shared::DEEPSEEK_RETIRED_PRO_MODEL), "{error}");
+        assert!(error.contains(shared::DEEPSEEK_FLASH_MODEL), "{error}");
+        assert!(error.contains("withdrawn"), "{error}");
     }
 
     #[test]

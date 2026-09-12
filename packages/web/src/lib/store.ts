@@ -339,17 +339,32 @@ export function launchProfileKey(
   return `${kind}:${frontend}:${backend}:${normalized}`;
 }
 
+/**
+ * Profile keys that named the same capability under an older model id.
+ * Mirrors `shared::renamed_launch_profile_key`.
+ *
+ * The server rewrites stored policy on startup, so this only matters while a
+ * policy written before that migration is still in hand — but without it the
+ * capability silently vanishes from the menu, which is worse than the cost of
+ * checking.
+ */
+export function launchProfileKeyAliases(key: string): string[] {
+  const normalized = key.toLowerCase();
+  if (normalized.endsWith(":deepseek:deepseek-flash")) {
+    return [normalized, normalized.replace(/deepseek-flash$/, "deepseek-v4-flash")];
+  }
+  return [normalized];
+}
+
 function policyAllowsLaunch(
   policy: EffectiveProjectPolicy | undefined,
   kind: PaneKind,
   provider: Provider,
   model?: string | null,
 ): boolean {
-  return !!policy
-    && !policy.projectSuspended
-    && policy.allowedLaunchProfiles.some(
-      (key) => key.toLowerCase() === launchProfileKey(kind, provider, model).toLowerCase(),
-    );
+  if (!policy || policy.projectSuspended) return false;
+  const accepted = new Set(launchProfileKeyAliases(launchProfileKey(kind, provider, model)));
+  return policy.allowedLaunchProfiles.some((key) => accepted.has(key.toLowerCase()));
 }
 
 /** How a pane hosts its agent. Mirrors `shared::PaneKind`.

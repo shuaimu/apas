@@ -1,8 +1,13 @@
 // Keep in sync with crates/client-cli/src/mode/dual_pane.rs; the apas
 // cargo test `deepseek_default_model_matches_web_provider_options` guards drift.
-export const DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-pro";
-export const DEEPSEEK_PRO_MODEL = "deepseek-v4-pro";
-export const DEEPSEEK_FLASH_MODEL = "deepseek-v4-flash";
+export const DEEPSEEK_FLASH_MODEL = "deepseek-flash";
+// Spelled out rather than aliased to DEEPSEEK_FLASH_MODEL: the cargo drift
+// guard reads these as string literals out of this file.
+export const DEEPSEEK_DEFAULT_MODEL = "deepseek-flash";
+/** The id flash shipped under before DeepSeek dropped the version from it. */
+export const DEEPSEEK_LEGACY_FLASH_MODEL = "deepseek-v4-flash";
+/** DeepSeek Pro, withdrawn from APAS. Panes on it read as unsupported. */
+export const DEEPSEEK_RETIRED_PRO_MODEL = "deepseek-v4-pro";
 export const CLAUDE_FABLE_MODEL = "claude-fable-5";
 
 export interface ProviderModelOption {
@@ -37,14 +42,8 @@ export const PROVIDER_MODEL_GROUPS: ProviderModelGroup[] = [
         model: CLAUDE_FABLE_MODEL,
       },
       {
-        value: "claude/deepseek",
-        label: "DeepSeek Pro",
-        provider: "claude",
-        model: DEEPSEEK_DEFAULT_MODEL,
-      },
-      {
         value: "claude/deepseek-flash",
-        label: "DeepSeek Flash",
+        label: "DeepSeek 4.1 Flash",
         provider: "claude",
         model: DEEPSEEK_FLASH_MODEL,
       },
@@ -120,7 +119,10 @@ export function isRetiredProviderModel(
   return normalizedModel.includes("minimax")
     || normalizedModel.startsWith("m2")
     || normalizedModel.startsWith("glm")
-    || normalizedModel.includes("glm-");
+    || normalizedModel.includes("glm-")
+    // DeepSeek Pro was withdrawn; keep the model matched by its exact id so
+    // the surviving flash ids are untouched.
+    || normalizedModel === DEEPSEEK_RETIRED_PRO_MODEL;
 }
 
 export function isRetiredLaunchProfileKey(key: string): boolean {
@@ -143,8 +145,11 @@ export function isDeepseekModel(model?: string | null): boolean {
 
 export function canonicalDeepseekModel(model?: string | null): string | null {
   const normalized = model?.trim().toLowerCase();
-  if (normalized === DEEPSEEK_PRO_MODEL) return DEEPSEEK_PRO_MODEL;
+  // The legacy id names the same offering, so it carries forward. The
+  // withdrawn model deliberately does not: canonicalizing it to flash would
+  // silently move a pane onto a different model with different cost.
   if (normalized === DEEPSEEK_FLASH_MODEL) return DEEPSEEK_FLASH_MODEL;
+  if (normalized === DEEPSEEK_LEGACY_FLASH_MODEL) return DEEPSEEK_FLASH_MODEL;
   return null;
 }
 
@@ -163,7 +168,6 @@ export function providerModelValue(
     if (isFableModel(model)) return "claude/fable";
     const deepseekModel = canonicalDeepseekModel(model);
     if (deepseekModel === DEEPSEEK_FLASH_MODEL) return "claude/deepseek-flash";
-    if (deepseekModel === DEEPSEEK_PRO_MODEL) return "claude/deepseek";
     if (isDeepseekModel(model)) return UNSUPPORTED_PROVIDER_MODEL_OPTION.value;
     return "claude/official";
   }
@@ -172,10 +176,9 @@ export function providerModelValue(
   if (provider === "pi") return "pi/official";
   if (provider === "cursor-agent") return "cursor-agent/official";
   if (provider === "deepseek") {
-    if (!model || canonicalDeepseekModel(model) === DEEPSEEK_PRO_MODEL) {
-      return "claude/deepseek";
-    }
-    if (canonicalDeepseekModel(model) === DEEPSEEK_FLASH_MODEL) {
+    // A bare DeepSeek pane means "whatever DeepSeek APAS offers", which is now
+    // exactly one model.
+    if (!model || canonicalDeepseekModel(model) === DEEPSEEK_FLASH_MODEL) {
       return "claude/deepseek-flash";
     }
     return UNSUPPORTED_PROVIDER_MODEL_OPTION.value;

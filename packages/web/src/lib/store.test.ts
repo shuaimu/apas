@@ -1397,22 +1397,35 @@ describe('retired provider web guards', () => {
 });
 
 describe('DeepSeek launch profiles', () => {
-  it('keeps direct-provider default and canonical variants aligned with Rust policy keys', () => {
+  it('keeps the direct-provider default aligned with the one Rust policy key', () => {
+    // Must match shared::launch_profile_key; a cargo test reads this file's
+    // sibling constants to guard the two from drifting.
     expect(launchProfileKey('agent', 'deepseek', null))
-      .toBe('agent:claude:deepseek:deepseek-v4-pro');
+      .toBe('agent:claude:deepseek:deepseek-flash');
+    expect(launchProfileKey('agent', 'claude', 'DeepSeek-Flash'))
+      .toBe('agent:claude:deepseek:deepseek-flash');
+    // The legacy id canonicalizes forward to the same key, so an allowlist or
+    // pane written before the rename still resolves.
     expect(launchProfileKey('agent', 'claude', 'DeepSeek-V4-Flash'))
-      .toBe('agent:claude:deepseek:deepseek-v4-flash');
+      .toBe('agent:claude:deepseek:deepseek-flash');
     expect(launchProfileKey('agent', 'claude', 'deepseek-chat'))
       .toBe('agent:claude:deepseek:deepseek-chat');
   });
 
   it('derives terminal DeepSeek profiles from the claude frontend', () => {
-    expect(launchProfileKey('terminal', 'claude', 'deepseek-v4-pro'))
-      .toBe('terminal:claude:deepseek:deepseek-v4-pro');
+    expect(launchProfileKey('terminal', 'claude', 'deepseek-flash'))
+      .toBe('terminal:claude:deepseek:deepseek-flash');
     expect(launchProfileKey('terminal', 'claude', 'DeepSeek-V4-Flash'))
-      .toBe('terminal:claude:deepseek:deepseek-v4-flash');
+      .toBe('terminal:claude:deepseek:deepseek-flash');
     expect(launchProfileKey('terminal', 'claude', undefined))
       .toBe('terminal:claude:official:default');
+  });
+
+  it('routes the withdrawn Pro model to the retired key, never to Flash', () => {
+    expect(launchProfileKey('terminal', 'claude', 'deepseek-v4-pro'))
+      .toBe('unsupported:retired');
+    expect(launchProfileKey('agent', 'deepseek', 'deepseek-v4-pro'))
+      .toBe('unsupported:retired');
   });
 });
 

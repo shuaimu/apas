@@ -1,4 +1,4 @@
-import { launchProfileKey, useStore } from "@/lib/store";
+import { launchProfileKey, launchProfileKeyAliases, useStore } from "@/lib/store";
 import type { PaneKind, Provider } from "@/lib/store";
 
 /**
@@ -118,7 +118,11 @@ export function useIsLaunchProfileAllowed(): (
     // the submit path remains fail-closed and reports incompatibility.
     if (!policy) return true;
     if (policy.projectSuspended) return false;
-    const key = launchProfileKey(kind, provider as Provider, model).toLowerCase();
-    return policy.allowedLaunchProfiles.some((allowed) => allowed.toLowerCase() === key);
+    // Same alias set the store's own check uses, so a policy the server has
+    // not migrated yet does not quietly drop the capability from this menu.
+    const accepted = new Set(
+      launchProfileKeyAliases(launchProfileKey(kind, provider as Provider, model)),
+    );
+    return policy.allowedLaunchProfiles.some((allowed) => accepted.has(allowed.toLowerCase()));
   };
 }

@@ -182,24 +182,21 @@ describe("TabBar coordinator close controls", () => {
     fireEvent.click(screen.getByTitle("New tab"));
 
     expect(screen.getByText("Claude")).toBeTruthy();
-    expect(screen.getByText("Claude / DeepSeek Pro")).toBeTruthy();
-    expect(screen.getByText("Claude / DeepSeek Flash")).toBeTruthy();
+    expect(screen.getByText("Claude / DeepSeek 4.1 Flash")).toBeTruthy();
     expect(screen.getByText("Codex")).toBeTruthy();
     expect(screen.getByText("OpenCode")).toBeTruthy();
     expect(screen.getByText("Pi")).toBeTruthy();
     expect(screen.queryByText("Cursor")).toBeNull();
     expect(screen.queryByText("DeepSeek")).toBeNull();
+    // The withdrawn variant is not offered for new tabs under any label.
+    expect(screen.queryByText(/DeepSeek Pro/)).toBeNull();
 
     fireEvent.click(screen.getByText("Claude"));
     expect(onAddTab).toHaveBeenCalledWith("claude", undefined, undefined, "terminal");
 
     fireEvent.click(screen.getByTitle("New tab"));
-    fireEvent.click(screen.getByText("Claude / DeepSeek Pro"));
-    expect(onAddTab).toHaveBeenCalledWith("claude", "deepseek-v4-pro", undefined, "terminal");
-
-    fireEvent.click(screen.getByTitle("New tab"));
-    fireEvent.click(screen.getByText("Claude / DeepSeek Flash"));
-    expect(onAddTab).toHaveBeenCalledWith("claude", "deepseek-v4-flash", undefined, "terminal");
+    fireEvent.click(screen.getByText("Claude / DeepSeek 4.1 Flash"));
+    expect(onAddTab).toHaveBeenCalledWith("claude", "deepseek-flash", undefined, "terminal");
   });
 
   it("keeps full-process reboot behind the desktop lifecycle menu", () => {
@@ -451,14 +448,15 @@ describe("TabBar add-tab worktree controls", () => {
     }
   });
 
-  it("filters DeepSeek terminal variants through their own launch profiles", () => {
+  it("filters the DeepSeek terminal profile through launch-profile policy", () => {
     const onAddTab = vi.fn();
     act(() => useStore.setState({
       sessionId: "tabbar-session",
       projectPolicies: {
         "tabbar-session": {
           teamAvailable: false,
-          allowedLaunchProfiles: ["terminal:claude:official:default", "terminal:claude:deepseek:deepseek-v4-pro"],
+          // Claude only: the DeepSeek profile is absent, so it must not appear.
+          allowedLaunchProfiles: ["terminal:claude:official:default"],
           version: 2,
           projectSuspended: false,
           noncompliantPaneIds: [],
@@ -469,9 +467,29 @@ describe("TabBar add-tab worktree controls", () => {
     openNewTabMenu();
 
     expect(screen.getByText("Claude")).toBeTruthy();
-    expect(screen.getByText("Claude / DeepSeek Pro")).toBeTruthy();
-    expect(screen.queryByText("Claude / DeepSeek Flash")).toBeNull();
+    expect(screen.queryByText("Claude / DeepSeek 4.1 Flash")).toBeNull();
     expect(screen.queryByText("Codex")).toBeNull();
+  });
+
+  it("offers DeepSeek from a policy still holding the pre-rename profile key", () => {
+    act(() => useStore.setState({
+      sessionId: "tabbar-session",
+      projectPolicies: {
+        "tabbar-session": {
+          teamAvailable: false,
+          // What a stored policy looks like before the server migrates it.
+          allowedLaunchProfiles: ["terminal:claude:deepseek:deepseek-v4-flash"],
+          version: 2,
+          projectSuspended: false,
+          noncompliantPaneIds: [],
+        },
+      },
+    }));
+    renderTabBar({ onAddTab: vi.fn() });
+    openNewTabMenu();
+
+    expect(screen.getByText("Claude / DeepSeek 4.1 Flash")).toBeTruthy();
+    expect(screen.queryByText("Claude")).toBeNull();
   });
 
   it("marks a historical retired tab unsupported without branding it", () => {

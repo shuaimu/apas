@@ -604,8 +604,7 @@ mod tests {
                 "terminal:codex:official:default",
                 "terminal:opencode:official:default",
                 "terminal:pi:official:default",
-                "terminal:claude:deepseek:deepseek-v4-pro",
-                "terminal:claude:deepseek:deepseek-v4-flash",
+                "terminal:claude:deepseek:deepseek-flash",
             ]
         );
         assert!(profiles

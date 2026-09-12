@@ -16,7 +16,6 @@ import { useIsLaunchProfileAllowed } from "@/lib/tabTypes";
 import {
   canonicalDeepseekModel,
   DEEPSEEK_FLASH_MODEL,
-  DEEPSEEK_PRO_MODEL,
   isRetiredProviderModel,
 } from "@/lib/providerOptions";
 import { resolveMachineProjectTarget } from "@/lib/machineProjectTarget";
@@ -748,11 +747,9 @@ export function TabbedView({
           ? "OpenCode"
           : provider === "pi"
             ? "Pi"
-            : deepseekModel === DEEPSEEK_FLASH_MODEL
-              ? "DeepSeek Flash"
-              : deepseekModel === DEEPSEEK_PRO_MODEL
-                ? "DeepSeek Pro"
-                : isDeepseek ? "DeepSeek" : "Claude";
+            : isDeepseek || deepseekModel === DEEPSEEK_FLASH_MODEL
+              ? "DeepSeek"
+              : "Claude";
     const label = `${basePrefix} ${effectiveTabs.length + 1}`;
     const result = addPane(provider, "interactive", label, undefined, model, isolatedWorktree, undefined, false, kind);
     if (result.success) {

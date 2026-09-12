@@ -2435,25 +2435,47 @@ pub struct LaunchProfile {
     pub model: Option<String>,
 }
 
-/// Canonical model identities for Claude Code running through DeepSeek's
-/// Anthropic-compatible endpoint. Pane state and policy keys use these base
-/// IDs; runtime-only selectors such as `[1m]` must not leak into either.
-pub const DEEPSEEK_PRO_MODEL: &str = "deepseek-v4-pro";
-pub const DEEPSEEK_FLASH_MODEL: &str = "deepseek-v4-flash";
-pub const DEEPSEEK_DEFAULT_MODEL: &str = DEEPSEEK_PRO_MODEL;
+/// Canonical model identity for Claude Code running through DeepSeek's
+/// Anthropic-compatible endpoint. Pane state and policy keys use this base ID;
+/// runtime-only selectors such as `[1m]` must not leak into either.
+///
+/// DeepSeek's own catalogue is the authority on what this may be. As of
+/// 2026-09-11 `GET https://api.deepseek.com/models` lists exactly
+/// `deepseek-flash` and `deepseek-v4-pro`, and passing anything else is
+/// rejected with a message naming that set. The flash id is deliberately
+/// unversioned upstream, so it tracks the current flash release.
+pub const DEEPSEEK_FLASH_MODEL: &str = "deepseek-flash";
+pub const DEEPSEEK_DEFAULT_MODEL: &str = DEEPSEEK_FLASH_MODEL;
+
+/// The id flash shipped under before DeepSeek dropped the version from it.
+/// Still accepted by the API, and still sitting in `.apas` files and stored
+/// policy here, so it canonicalizes forward rather than being retired — it
+/// names the same offering.
+pub const DEEPSEEK_LEGACY_FLASH_MODEL: &str = "deepseek-v4-flash";
+
+/// DeepSeek Pro, withdrawn from APAS. The model still exists upstream; APAS
+/// simply no longer offers it, so an existing pane on it reads as an
+/// unsupported provider rather than silently becoming a different model with
+/// different cost and behaviour.
+pub const DEEPSEEK_RETIRED_PRO_MODEL: &str = "deepseek-v4-pro";
 
 /// Whether a model is one of the DeepSeek identities APAS explicitly supports.
 pub fn is_supported_deepseek_model(model: &str) -> bool {
     canonical_deepseek_model(model).is_some()
 }
 
+/// Whether a model is a DeepSeek identity APAS used to offer and no longer does.
+pub fn is_retired_deepseek_model(model: &str) -> bool {
+    model.trim().eq_ignore_ascii_case(DEEPSEEK_RETIRED_PRO_MODEL)
+}
+
 /// Resolve a supported, possibly differently-cased DeepSeek identity to the
 /// exact value APAS persists and places in policy keys.
 pub fn canonical_deepseek_model(model: &str) -> Option<&'static str> {
     let normalized = model.trim();
-    if normalized.eq_ignore_ascii_case(DEEPSEEK_PRO_MODEL) {
-        Some(DEEPSEEK_PRO_MODEL)
-    } else if normalized.eq_ignore_ascii_case(DEEPSEEK_FLASH_MODEL) {
+    if normalized.eq_ignore_ascii_case(DEEPSEEK_FLASH_MODEL)
+        || normalized.eq_ignore_ascii_case(DEEPSEEK_LEGACY_FLASH_MODEL)
+    {
         Some(DEEPSEEK_FLASH_MODEL)
     } else {
         None
@@ -2516,22 +2538,30 @@ pub fn supported_launch_profiles() -> Vec<LaunchProfile> {
             None,
         ),
         launch_profile(
-            "terminal:claude:deepseek:deepseek-v4-pro",
-            "DeepSeek Pro Terminal",
-            PaneKind::Terminal,
-            Provider::Claude,
-            "deepseek",
-            Some(DEEPSEEK_PRO_MODEL),
-        ),
-        launch_profile(
-            "terminal:claude:deepseek:deepseek-v4-flash",
-            "DeepSeek Flash Terminal",
+            "terminal:claude:deepseek:deepseek-flash",
+            "DeepSeek 4.1 Flash Terminal",
             PaneKind::Terminal,
             Provider::Claude,
             "deepseek",
             Some(DEEPSEEK_FLASH_MODEL),
         ),
     ]
+}
+
+/// Profile keys that named the same capability under an older model id.
+///
+/// Stored allowlists are filtered against the supported set, and anything
+/// unrecognized is dropped — so renaming flash's key without this would
+/// silently strip DeepSeek from every cluster and project that had explicitly
+/// allowed it. Retired capabilities are deliberately absent: DeepSeek Pro
+/// *should* be dropped.
+pub fn renamed_launch_profile_key(key: &str) -> Option<&'static str> {
+    match key.trim() {
+        "terminal:claude:deepseek:deepseek-v4-flash" | "agent:claude:deepseek:deepseek-v4-flash" => {
+            Some("terminal:claude:deepseek:deepseek-flash")
+        }
+        _ => None,
+    }
 }
 
 fn normalized_model(model: Option<&str>) -> String {
@@ -2681,7 +2711,7 @@ pub struct PaneConfig {
     #[serde(default)]
     pub label: Option<String>, // User-facing label like "Deadloop" or "Interactive"
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>, // Optional model/backend override (e.g., "o3", "deepseek-v4-pro")
+    pub model: Option<String>, // Optional model/backend override (e.g., "o3", "deepseek-flash")
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>, // Optional Claude thinking effort override (e.g., "high", "max", "ultracode").
     // `ultracode` is apas-only: it spawns claude with `--effort xhigh` and prepends
@@ -4519,7 +4549,7 @@ mod tests {
     #[test]
     fn supported_profiles_and_default_policy_offer_only_terminal_backends() {
         let profiles = supported_launch_profiles();
-        assert_eq!(profiles.len(), 6);
+        assert_eq!(profiles.len(), 5);
         assert!(profiles
             .iter()
             .all(|profile| profile.kind == PaneKind::Terminal));
@@ -4534,12 +4564,8 @@ mod tests {
                 ("terminal:opencode:official:default", "OpenCode Terminal"),
                 ("terminal:pi:official:default", "Pi Terminal"),
                 (
-                    "terminal:claude:deepseek:deepseek-v4-pro",
-                    "DeepSeek Pro Terminal",
-                ),
-                (
-                    "terminal:claude:deepseek:deepseek-v4-flash",
-                    "DeepSeek Flash Terminal",
+                    "terminal:claude:deepseek:deepseek-flash",
+                    "DeepSeek 4.1 Flash Terminal",
                 ),
             ]
         );
@@ -4559,13 +4585,16 @@ mod tests {
             "terminal:codex:official:default",
             "terminal:opencode:official:default",
             "terminal:pi:official:default",
-            "terminal:claude:deepseek:deepseek-v4-pro",
-            "terminal:claude:deepseek:deepseek-v4-flash",
+            "terminal:claude:deepseek:deepseek-flash",
         ] {
             assert!(policy
                 .allowed_launch_profiles
                 .contains(&expected.to_string()));
         }
+        assert!(!policy
+            .allowed_launch_profiles
+            .iter()
+            .any(|key| key.contains("deepseek-v4-pro")));
         assert!(policy
             .allowed_launch_profiles
             .iter()
@@ -4589,47 +4618,12 @@ mod tests {
 
     #[test]
     #[allow(deprecated)]
-    fn deepseek_profiles_are_independent_and_direct_default_is_pro() {
+    fn deepseek_resolves_to_one_model_and_pro_is_retired() {
+        // Flash is the whole DeepSeek offering now, so the bare provider and
+        // the explicit model must land on the same key.
         assert_eq!(
-            launch_profile_key(PaneKind::Agent, Provider::Deepseek, None),
-            "agent:claude:deepseek:deepseek-v4-pro"
-        );
-
-        let pro_only = EffectiveProjectPolicy {
-            team_available: false,
-            allowed_launch_profiles: vec!["agent:claude:deepseek:deepseek-v4-pro".to_string()],
-            version: 1,
-            project_suspended: false,
-        };
-        assert!(pro_only.allows(PaneKind::Agent, Provider::Deepseek, None));
-        assert!(pro_only.allows(PaneKind::Agent, Provider::Claude, Some(DEEPSEEK_PRO_MODEL)));
-        assert!(!pro_only.allows(
-            PaneKind::Agent,
-            Provider::Claude,
-            Some(DEEPSEEK_FLASH_MODEL)
-        ));
-
-        let flash_only = EffectiveProjectPolicy {
-            allowed_launch_profiles: vec!["agent:claude:deepseek:deepseek-v4-flash".to_string()],
-            ..pro_only
-        };
-        assert!(flash_only.allows(
-            PaneKind::Agent,
-            Provider::Claude,
-            Some(DEEPSEEK_FLASH_MODEL)
-        ));
-        assert!(!flash_only.allows(PaneKind::Agent, Provider::Claude, Some(DEEPSEEK_PRO_MODEL)));
-    }
-
-    #[test]
-    fn deepseek_terminal_profiles_derive_and_authorize_independently() {
-        assert_eq!(
-            launch_profile_key(
-                PaneKind::Terminal,
-                Provider::Claude,
-                Some(DEEPSEEK_PRO_MODEL)
-            ),
-            "terminal:claude:deepseek:deepseek-v4-pro"
+            launch_profile_key(PaneKind::Terminal, Provider::Deepseek, None),
+            "terminal:claude:deepseek:deepseek-flash"
         );
         assert_eq!(
             launch_profile_key(
@@ -4637,30 +4631,97 @@ mod tests {
                 Provider::Claude,
                 Some(DEEPSEEK_FLASH_MODEL)
             ),
-            "terminal:claude:deepseek:deepseek-v4-flash"
+            "terminal:claude:deepseek:deepseek-flash"
         );
 
-        let policy = EffectiveProjectPolicy {
+        // The id flash shipped under before DeepSeek dropped the version
+        // canonicalizes forward: it names the same offering, and `.apas` files
+        // and stored policy still carry it.
+        assert_eq!(
+            canonical_deepseek_model(DEEPSEEK_LEGACY_FLASH_MODEL),
+            Some(DEEPSEEK_FLASH_MODEL)
+        );
+        assert_eq!(
+            launch_profile_key(
+                PaneKind::Terminal,
+                Provider::Claude,
+                Some(DEEPSEEK_LEGACY_FLASH_MODEL)
+            ),
+            "terminal:claude:deepseek:deepseek-flash"
+        );
+
+        // Pro is withdrawn. It must not canonicalize to flash: that would
+        // silently move a pane onto a different model with different cost.
+        assert_eq!(canonical_deepseek_model(DEEPSEEK_RETIRED_PRO_MODEL), None);
+        assert!(!is_supported_deepseek_model(DEEPSEEK_RETIRED_PRO_MODEL));
+        assert!(is_retired_deepseek_model(DEEPSEEK_RETIRED_PRO_MODEL));
+        assert!(!is_retired_deepseek_model(DEEPSEEK_FLASH_MODEL));
+
+        // Exactly one DeepSeek profile is offered.
+        let deepseek_profiles = supported_launch_profiles()
+            .into_iter()
+            .filter(|profile| profile.backend == "deepseek")
+            .collect::<Vec<_>>();
+        assert_eq!(deepseek_profiles.len(), 1);
+        assert_eq!(deepseek_profiles[0].key, "terminal:claude:deepseek:deepseek-flash");
+        assert_eq!(deepseek_profiles[0].model.as_deref(), Some(DEEPSEEK_FLASH_MODEL));
+        assert!(!supported_launch_profiles()
+            .iter()
+            .any(|profile| profile.key.contains("deepseek-v4-pro")));
+    }
+
+    #[test]
+    fn deepseek_allowlists_authorize_flash_and_never_retired_pro() {
+        let flash_only = EffectiveProjectPolicy {
             team_available: false,
             allowed_launch_profiles: vec![
-                "terminal:claude:official:default".to_string(),
-                "terminal:claude:deepseek:deepseek-v4-pro".to_string(),
+                "terminal:claude:deepseek:deepseek-flash".to_string()
             ],
             version: 1,
             project_suspended: false,
         };
-        assert!(policy.allows(PaneKind::Terminal, Provider::Claude, None));
-        assert!(policy.allows(
-            PaneKind::Terminal,
-            Provider::Claude,
-            Some(DEEPSEEK_PRO_MODEL)
-        ));
-        assert!(!policy.allows(
+        assert!(flash_only.allows(
             PaneKind::Terminal,
             Provider::Claude,
             Some(DEEPSEEK_FLASH_MODEL)
         ));
-        assert!(!policy.allows(PaneKind::Agent, Provider::Claude, Some(DEEPSEEK_PRO_MODEL)));
+        assert!(flash_only.allows(PaneKind::Terminal, Provider::Deepseek, None));
+        // A withdrawn model is not authorized by the surviving profile.
+        assert!(!flash_only.allows(
+            PaneKind::Terminal,
+            Provider::Claude,
+            Some(DEEPSEEK_RETIRED_PRO_MODEL)
+        ));
+        // Nor does the DeepSeek profile leak into the agent kind.
+        assert!(!flash_only.allows(
+            PaneKind::Agent,
+            Provider::Claude,
+            Some(DEEPSEEK_FLASH_MODEL)
+        ));
+    }
+
+    #[test]
+    fn the_renamed_flash_key_survives_and_the_retired_one_does_not() {
+        // An allowlist naming flash under its old id keeps DeepSeek; the
+        // migration filters against the supported set, so without this mapping
+        // the capability would be dropped from every policy that had it.
+        for legacy in [
+            "terminal:claude:deepseek:deepseek-v4-flash",
+            "agent:claude:deepseek:deepseek-v4-flash",
+        ] {
+            assert_eq!(
+                renamed_launch_profile_key(legacy),
+                Some("terminal:claude:deepseek:deepseek-flash"),
+                "{legacy} must carry forward"
+            );
+        }
+        // Pro is meant to be dropped, so it deliberately has no mapping.
+        for retired in [
+            "terminal:claude:deepseek:deepseek-v4-pro",
+            "agent:claude:deepseek:deepseek-v4-pro",
+        ] {
+            assert_eq!(renamed_launch_profile_key(retired), None);
+        }
     }
 }
 

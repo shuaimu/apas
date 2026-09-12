@@ -40,7 +40,6 @@ import { MobileTerminalKeyBar } from "./MobileTerminalKeyBar";
 import {
   canonicalDeepseekModel,
   DEEPSEEK_FLASH_MODEL,
-  DEEPSEEK_PRO_MODEL,
 } from "@/lib/providerOptions";
 import {
   paneKey,
@@ -209,10 +208,8 @@ function parseLaunchProfile(key: string): LaunchOption | null {
   const model = rawModel && rawModel !== "default" ? rawModel : undefined;
   const deepseekModel = canonicalDeepseekModel(model);
   const providerLabel = deepseekModel === DEEPSEEK_FLASH_MODEL
-    ? "DeepSeek Flash"
-    : deepseekModel === DEEPSEEK_PRO_MODEL
-      ? "DeepSeek Pro"
-      : provider === "cursor-agent"
+    ? "DeepSeek 4.1 Flash"
+    : provider === "cursor-agent"
         ? "Cursor"
         : provider === "opencode"
           ? "OpenCode"

@@ -13,7 +13,6 @@ import { useIsLaunchProfileAllowed } from "@/lib/tabTypes";
 import { paneIsAwaitingAnswerStatus, paneIsWorkingStatus } from "@/lib/paneStatus";
 import {
   DEEPSEEK_FLASH_MODEL,
-  DEEPSEEK_PRO_MODEL,
   isDeepseekModel,
   isRetiredProviderModel,
 } from "@/lib/providerOptions";
@@ -656,8 +655,7 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
             </div>
             {[
               { provider: "claude", label: "Claude" },
-              { provider: "claude", label: "Claude / DeepSeek Pro", model: DEEPSEEK_PRO_MODEL },
-              { provider: "claude", label: "Claude / DeepSeek Flash", model: DEEPSEEK_FLASH_MODEL },
+              { provider: "claude", label: "Claude / DeepSeek 4.1 Flash", model: DEEPSEEK_FLASH_MODEL },
               { provider: "codex", label: "Codex" },
               { provider: "opencode", label: "OpenCode" },
               { provider: "pi", label: "Pi" },

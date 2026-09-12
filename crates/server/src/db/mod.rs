@@ -1324,6 +1324,15 @@ impl Database {
             if supported.contains(profile) {
                 return Some(profile.to_string());
             }
+            // A capability that kept its meaning but changed its model id, such
+            // as DeepSeek flash losing its version. Without this the key falls
+            // through to the filter below and is dropped, silently stripping
+            // the capability from every allowlist that had named it.
+            if let Some(renamed) = shared::renamed_launch_profile_key(profile) {
+                if supported.contains(renamed) {
+                    return Some(renamed.to_string());
+                }
+            }
             let terminal = profile
                 .strip_prefix("agent:")
                 .map(|suffix| format!("terminal:{suffix}"));
@@ -6372,8 +6381,10 @@ mod cluster_administration_tests {
         let claude = "terminal:claude:official:default";
         let codex = "terminal:codex:official:default";
         let opencode = "terminal:opencode:official:default";
-        let deepseek_pro = "terminal:claude:deepseek:deepseek-v4-pro";
-        let deepseek_flash = "terminal:claude:deepseek:deepseek-v4-flash";
+        // Pro is withdrawn, so it has no supported key and must be dropped.
+        // Flash kept its meaning and changed its id, so both the legacy agent
+        // and terminal spellings must arrive at the renamed key.
+        let deepseek_flash = "terminal:claude:deepseek:deepseek-flash";
         sqlx::query(
             "UPDATE cluster_settings SET allowed_launch_profiles = ?, version = 4 WHERE id = 1",
         )
@@ -6507,11 +6518,7 @@ mod cluster_administration_tests {
             stored[1],
             (
                 "mixed".to_string(),
-                vec![
-                    claude.to_string(),
-                    deepseek_pro.to_string(),
-                    deepseek_flash.to_string(),
-                ],
+                vec![claude.to_string(), deepseek_flash.to_string()],
                 11,
             )
         );
@@ -6575,18 +6582,63 @@ mod cluster_administration_tests {
     }
 
     #[tokio::test]
-    async fn deepseek_flash_is_seeded_fresh_without_widening_persisted_policy() {
+    async fn deepseek_seeds_only_flash_and_carries_a_legacy_allowlist_forward() {
         let db = database("deepseek-flash-policy-defaults").await;
         db.run_migrations().await.unwrap();
 
+        // A fresh deployment offers exactly one DeepSeek profile.
         let fresh = db.get_deployment_default_policy().await.unwrap();
         assert!(fresh
             .allowed_launch_profiles
-            .contains(&"terminal:claude:deepseek:deepseek-v4-pro".to_string()));
-        assert!(fresh
+            .contains(&"terminal:claude:deepseek:deepseek-flash".to_string()));
+        assert!(!fresh
             .allowed_launch_profiles
-            .contains(&"terminal:claude:deepseek:deepseek-v4-flash".to_string()));
+            .iter()
+            .any(|key| key.contains("deepseek-v4-pro")));
 
+        // An allowlist written before the rename keeps DeepSeek: the key is
+        // carried forward rather than filtered out as unrecognized, which
+        // would have silently removed the capability. The withdrawn Pro key
+        // in the same list is dropped, which is the point of withdrawing it.
+        let legacy = vec![
+            "terminal:claude:official:default".to_string(),
+            "terminal:claude:deepseek:deepseek-v4-pro".to_string(),
+            "terminal:claude:deepseek:deepseek-v4-flash".to_string(),
+        ];
+        sqlx::query(
+            "UPDATE cluster_settings SET allowed_launch_profiles = ?, version = 9 WHERE id = 1",
+        )
+        .bind(serde_json::to_string(&legacy).unwrap())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        db.run_migrations().await.unwrap();
+        let persisted = db.get_deployment_default_policy().await.unwrap();
+        assert_eq!(
+            persisted.allowed_launch_profiles,
+            vec![
+                "terminal:claude:official:default".to_string(),
+                "terminal:claude:deepseek:deepseek-flash".to_string(),
+            ]
+        );
+
+        // Rewriting the policy bumps its version; a second pass must not.
+        let settled = persisted.version;
+        db.run_migrations().await.unwrap();
+        let again = db.get_deployment_default_policy().await.unwrap();
+        assert_eq!(again.allowed_launch_profiles, persisted.allowed_launch_profiles);
+        assert_eq!(again.version, settled, "migration must be idempotent");
+    }
+
+    #[tokio::test]
+    async fn a_policy_naming_only_the_withdrawn_model_is_emptied_not_widened() {
+        let db = database("deepseek-pro-only-policy").await;
+        db.run_migrations().await.unwrap();
+
+        // Nothing substitutes Flash for Pro. An operator who allowed only the
+        // withdrawn model is left allowing nothing, which is visible, rather
+        // than silently granted a model they never chose.
         let pro_only = vec!["terminal:claude:deepseek:deepseek-v4-pro".to_string()];
         sqlx::query(
             "UPDATE cluster_settings SET allowed_launch_profiles = ?, version = 9 WHERE id = 1",
@@ -6598,8 +6650,7 @@ mod cluster_administration_tests {
 
         db.run_migrations().await.unwrap();
         let persisted = db.get_deployment_default_policy().await.unwrap();
-        assert_eq!(persisted.allowed_launch_profiles, pro_only);
-        assert_eq!(persisted.version, 9);
+        assert!(persisted.allowed_launch_profiles.is_empty());
     }
 
     #[tokio::test]
