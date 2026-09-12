@@ -399,16 +399,53 @@ fn host_local_executable_in(root: &Path, source: &Path) -> Result<PathBuf> {
     fs::rename(&tmp, &target)?;
     // Prove the copy runs here. `/var/tmp` mounted `noexec` would otherwise
     // make every host launch fail, which is worse than the hazard avoided.
-    let runs = Command::new(&target)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
+    //
+    // Retried, because this races with process creation anywhere else in the
+    // daemon. Our write fd is `O_CLOEXEC`, but a `fork` in another thread
+    // between the write and this exec leaves the child holding it until the
+    // child execs — and a file open for writing cannot be executed, so the
+    // kernel answers `ETXTBSY`. That window is microseconds and never
+    // reproduced alone, only under a loaded process; a host that gave up here
+    // would silently fall back to the NFS path this copy exists to avoid.
+    let mut last_error = None;
+    let mut runs = false;
+    for attempt in 0..5 {
+        if attempt > 0 {
+            thread::sleep(Duration::from_millis(20 * attempt));
+        }
+        match Command::new(&target)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(status) if status.success() => {
+                runs = true;
+                break;
+            }
+            // A non-zero exit is a real answer, not contention: this binary
+            // does not run here, and retrying cannot change that.
+            Ok(status) => {
+                last_error = Some(format!("exited with {status}"));
+                break;
+            }
+            Err(error) if error.kind() == ErrorKind::ExecutableFileBusy => {
+                last_error = Some(error.to_string());
+            }
+            Err(error) => {
+                last_error = Some(error.to_string());
+                break;
+            }
+        }
+    }
     if !runs {
         let _ = fs::remove_file(&target);
-        bail!("host-local executable copy {} does not run", target.display());
+        bail!(
+            "host-local executable copy {} does not run: {}",
+            target.display(),
+            last_error.unwrap_or_else(|| "unknown error".to_string())
+        );
     }
     prune_stale_files(&dir, Some(&target), HOST_LOCAL_BIN_RETAIN);
     Ok(target)
