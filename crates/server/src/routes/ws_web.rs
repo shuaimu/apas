@@ -1332,6 +1332,10 @@ fn required_terminal_capability(
             shared::PI_TERMINAL_CAPABILITY,
             "The project CLI must be updated and reconnected before creating a Pi terminal pane.",
         )),
+        shared::Provider::Omp => Some((
+            shared::OMP_TERMINAL_CAPABILITY,
+            "The project CLI must be updated and reconnected before creating an OMP terminal pane.",
+        )),
         _ => None,
     }
 }

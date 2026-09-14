@@ -33,6 +33,7 @@ export const ALL_TAB_TYPES: TabTypeOption[] = (
     { kind: "terminal", provider: "codex", label: "Codex" },
     { kind: "terminal", provider: "opencode", label: "OpenCode" },
     { kind: "terminal", provider: "pi", label: "Pi" },
+    { kind: "terminal", provider: "omp", label: "OMP" },
   ] as Omit<TabTypeOption, "key">[]
 ).map((t) => ({ ...t, key: tabTypeKey(t.kind, t.provider) }));
 

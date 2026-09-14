@@ -610,6 +610,71 @@ pub fn find_pi_session_file(home: &Path, session_id: Uuid) -> Option<PathBuf> {
     None
 }
 
+/// Root holding OMP's session buckets.
+///
+/// OMP is Pi-derived and reads the same `PI_CODING_AGENT_*` overrides, but its
+/// own default lives under `.omp`, so a host that relocated its Pi directory
+/// does not silently redirect OMP too unless it set the shared override.
+fn omp_sessions_root(home: &Path) -> PathBuf {
+    if let Some(dir) = std::env::var_os("PI_CODING_AGENT_SESSION_DIR") {
+        return PathBuf::from(dir);
+    }
+    std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".omp").join("agent"))
+        .join("sessions")
+}
+
+/// The private session directory a pane's OMP process writes into.
+///
+/// OMP has no `--session-id`, so a pane cannot pin an exact identity the way a
+/// Pi pane does. `--session-dir` is stronger in practice: the pane owns the
+/// directory outright, so a sibling pane or a provider subprocess sharing a
+/// working directory can never select this pane's session, and `--continue`
+/// inside it is unambiguous without consulting recency across panes.
+///
+/// Verified against omp 18.1.20: a run writes one flat `<ts>_<uuid>.jsonl`
+/// here, `--continue` appends to that same file rather than starting a new
+/// one, and the shared default store is left untouched.
+pub fn omp_session_dir(home: &Path, conversation_id: Uuid) -> PathBuf {
+    omp_sessions_root(home).join(format!("apas-{conversation_id}"))
+}
+
+/// The session file OMP wrote for this pane, if it has written one yet.
+///
+/// The pane owns its directory, so the newest `.jsonl` in it is unambiguous —
+/// unlike Pi, where directory recency could pick up a sibling and the lookup
+/// has to go by pinned id. OMP names files `<timestamp>_<uuid>.jsonl`, and a
+/// resumed session keeps appending to the file it started, so there is
+/// normally exactly one.
+pub fn find_omp_session_file(home: &Path, conversation_id: Uuid) -> Option<PathBuf> {
+    let dir = omp_session_dir(home, conversation_id);
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(&dir).ok()?.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(modified) = entry.metadata().ok().and_then(|meta| meta.modified().ok()) else {
+            continue;
+        };
+        if newest
+            .as_ref()
+            .is_none_or(|(newest, _)| modified > *newest)
+        {
+            newest = Some((modified, path));
+        }
+    }
+    newest.map(|(_, path)| path)
+}
+
+/// OMP writes the same session records Pi does — `message` entries in an
+/// `id`/`parentId` tree, with `custom` extension entries alongside — so the Pi
+/// reader applies unchanged. Verified against a real omp 18.1.20 session.
+pub fn read_omp_turns(path: &Path, pane_id: u32) -> Result<Vec<TurnRecord>> {
+    read_pi_turns(path, pane_id)
+}
+
 // Pi records a question only through extension tooling (the oh-my-pi package's
 // `ask`). Upstream Pi has no built-in structured question, and driving an
 // unverified picker with blind keystrokes would answer on the human's behalf,
@@ -1793,6 +1858,55 @@ mod tests {
     }
 
     // --- pi ---------------------------------------------------------------
+
+    /// A real omp 18.1.20 session, trimmed. Two turns written across a
+    /// `--continue` boundary, so the parent chain crosses the resume and the
+    /// `custom` session_exit record sits between them.
+    const OMP_REAL_SESSION: &str = concat!(
+        r#"{"type":"session","version":3,"id":"01a09e12-5973-77d9-aa66-861b4273e940","timestamp":"2026-09-14T03:59:57.811Z","cwd":"/tmp/work"}"#, "\n",
+        r#"{"type":"message","id":"49dfb5bf","parentId":"e9131629","timestamp":"2026-09-14T03:59:59.252Z","message":{"role":"user","content":[{"type":"text","text":"Remember the word: ALBATROSS. Reply OK."}],"timestamp":1789358399252}}"#, "\n",
+        r#"{"type":"message","id":"8be2a596","parentId":"49dfb5bf","timestamp":"2026-09-14T04:00:17.992Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":""},{"type":"text","text":"OK"}],"model":"muse-spark-1.3-contributor","usage":{"input":17820,"output":19,"totalTokens":17839},"completedAt":1789358417992,"timestamp":1789358417992}}"#, "\n",
+        r#"{"type":"custom","customType":"session_exit","data":{"reason":"dispose","kind":"normal"},"id":"97a25f4a","parentId":"8be2a596","timestamp":"2026-09-14T04:00:18.027Z"}"#, "\n",
+        r#"{"type":"message","id":"76ed4686","parentId":"97a25f4a","timestamp":"2026-09-14T04:00:28.836Z","message":{"role":"user","content":[{"type":"text","text":"What word did I ask you to remember? One word."}],"timestamp":1789358428836}}"#, "\n",
+        r#"{"type":"message","id":"1863543b","parentId":"76ed4686","timestamp":"2026-09-14T04:00:31.986Z","message":{"role":"assistant","content":[{"type":"text","text":"ALBATROSS"}],"model":"muse-spark-1.3-contributor","usage":{"input":18010,"output":7,"totalTokens":18017},"completedAt":1789358431986,"timestamp":1789358431986}}"#, "\n",
+    );
+
+    #[test]
+    fn omp_sessions_parse_with_the_pi_reader() {
+        // OMP is Pi-derived and writes the same records, which is why it needs
+        // no reader of its own. This asserts that against a real capture
+        // rather than an assumption: if OMP ever diverges, this fails instead
+        // of the conversation view silently going empty.
+        let turns = parse_pi(OMP_REAL_SESSION);
+        let roles: Vec<&str> = turns.iter().map(|t| t.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "user", "assistant"]);
+        assert_eq!(turns[0].text, "Remember the word: ALBATROSS. Reply OK.");
+        assert_eq!(turns[3].text, "ALBATROSS");
+
+        // The second exchange is only reachable through the `custom`
+        // session_exit record that `--continue` wrote between them, so this
+        // also pins that a resumed OMP pane keeps its earlier history.
+        assert!(
+            turns.len() == 4,
+            "the parent chain must survive the --continue boundary"
+        );
+
+        // Empty thinking blocks are not turns, and usage rides the assistant.
+        assert!(turns.iter().all(|t| !t.text.trim().is_empty()));
+        assert!(turns[1].model.as_deref() == Some("muse-spark-1.3-contributor"));
+    }
+
+    #[test]
+    fn omp_session_directories_are_private_to_one_pane() {
+        let home = std::path::Path::new("/home/someone");
+        let a = Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap();
+        let b = Uuid::parse_str("11111111-2222-4333-8444-666666666666").unwrap();
+        assert_ne!(omp_session_dir(home, a), omp_session_dir(home, b));
+        // Under OMP's own store, not Pi's, so relocating one never silently
+        // redirects the other.
+        assert!(omp_session_dir(home, a).starts_with("/home/someone/.omp/agent/sessions"));
+        assert!(omp_session_dir(home, a).ends_with(format!("apas-{a}")));
+    }
 
     fn pi_message(id: &str, parent: Option<&str>, message: serde_json::Value) -> String {
         let parent = parent

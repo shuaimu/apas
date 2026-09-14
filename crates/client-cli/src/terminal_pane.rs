@@ -678,6 +678,7 @@ pub fn terminal_binary_for(provider: &Provider) -> Option<&'static str> {
         Provider::Codex => Some("codex"),
         Provider::Opencode => Some("opencode"),
         Provider::Pi => Some("pi"),
+        Provider::Omp => Some("omp"),
         Provider::Minimax | Provider::Glm | Provider::Deepseek | Provider::CursorAgent => None,
     }
 }
@@ -690,6 +691,23 @@ pub fn terminal_binary_for(provider: &Provider) -> Option<&'static str> {
 /// pane's pinned identity is reused and Pi creates that exact session again.
 /// Directory recency is deliberately never used: sibling panes and provider
 /// subprocesses can share a working directory.
+/// OMP's private per-pane session directory arguments.
+///
+/// Passed on every launch, fresh or resumed, because the directory *is* the
+/// pane's identity: OMP has no `--session-id`, so without this a sibling pane
+/// in the same working directory would share, and `--continue` would resume,
+/// whichever session was written most recently by any of them.
+fn omp_session_args(conversation_id: Uuid) -> Vec<String> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    let dir = crate::transcript::omp_session_dir(&home, conversation_id);
+    // OMP creates the directory itself; creating it here too keeps the
+    // transcript watcher from logging a missing path before the first turn.
+    let _ = std::fs::create_dir_all(&dir);
+    vec!["--session-dir".to_string(), dir.display().to_string()]
+}
+
 fn pi_session_args(conversation_id: Uuid) -> Vec<String> {
     match dirs::home_dir()
         .and_then(|home| crate::transcript::find_pi_session_file(&home, conversation_id))
@@ -727,6 +745,9 @@ fn resume_args_for(
         }
         Provider::Opencode => vec!["--continue".to_string()],
         Provider::Pi => pi_session_args(conversation_id),
+        // The session directory is added for every OMP launch below, so
+        // resuming only has to say which session inside it to pick up.
+        Provider::Omp => vec!["--continue".to_string()],
         _ => Vec::new(),
     }
 }
@@ -754,6 +775,9 @@ fn permission_bypass_flag_for(provider: &Provider) -> Option<&'static str> {
         // Official OpenCode auto mode approves requests that are not
         // explicitly denied by the user's own permission configuration.
         Provider::Opencode => Some("--auto"),
+        // OMP, unlike Pi, does have approval prompts, so it needs the same
+        // treatment as the others: a browser-driven pane cannot answer one.
+        Provider::Omp => Some("--auto-approve"),
         _ => None,
     }
 }
@@ -776,6 +800,11 @@ pub(crate) fn terminal_args_for(
             args.push("--settings".to_string());
             args.push(settings.display().to_string());
         }
+    }
+    // Ahead of `--continue`, so the directory is already selected when OMP
+    // resolves which session that refers to.
+    if matches!(provider, Provider::Omp) {
+        args.extend(omp_session_args(conversation_id));
     }
     if resume {
         let verified_codex_session_id = if matches!(provider, Provider::Codex) {
@@ -1189,7 +1218,12 @@ mod tests {
         // just blocks until someone notices the tab. Any provider we are
         // willing to host must therefore either have a bypass flag or, like
         // Pi, have no permission prompts at all.
-        for p in [Provider::Claude, Provider::Codex, Provider::Opencode] {
+        for p in [
+            Provider::Claude,
+            Provider::Codex,
+            Provider::Opencode,
+            Provider::Omp,
+        ] {
             assert!(
                 terminal_binary_for(&p).is_some(),
                 "{p:?} should be hostable"
@@ -1276,6 +1310,61 @@ mod tests {
                 None,
             ),
             vec!["--continue", "--auto"]
+        );
+    }
+
+    #[test]
+    fn omp_owns_a_private_session_directory_and_bypasses_approvals() {
+        let conversation_id = Uuid::parse_str("11111111-2222-4333-8444-666666666666").unwrap();
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let dir = crate::transcript::omp_session_dir(&home, conversation_id)
+            .display()
+            .to_string();
+
+        // Fresh launch: the directory is selected before anything else, and
+        // the prompt stays last so it cannot absorb a following token.
+        assert_eq!(
+            terminal_args_for(
+                &Provider::Omp,
+                conversation_id,
+                false,
+                Some("fix the test"),
+                None,
+            ),
+            vec![
+                "--session-dir".to_string(),
+                dir.clone(),
+                "--auto-approve".to_string(),
+                "fix the test".to_string(),
+            ]
+        );
+
+        // Resume: same directory, plus --continue. The directory must come
+        // first, or --continue would resolve against the default store and
+        // could pick up another pane's session.
+        let resumed = terminal_args_for(&Provider::Omp, conversation_id, true, Some("ignored"), None);
+        assert_eq!(
+            resumed,
+            vec![
+                "--session-dir".to_string(),
+                dir.clone(),
+                "--continue".to_string(),
+                "--auto-approve".to_string(),
+            ]
+        );
+        assert!(
+            !resumed.iter().any(|arg| arg == "ignored"),
+            "a resumed pane must not replay its original prompt"
+        );
+
+        // Two panes never share a directory, which is what replaces the
+        // `--session-id` pinning Pi needs.
+        let other = Uuid::parse_str("11111111-2222-4333-8444-777777777777").unwrap();
+        assert_ne!(
+            crate::transcript::omp_session_dir(&home, other),
+            crate::transcript::omp_session_dir(&home, conversation_id)
         );
     }
 

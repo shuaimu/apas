@@ -79,6 +79,8 @@ pub struct LocalConfig {
     pub opencode_path: String,
     #[serde(default = "default_pi_path")]
     pub pi_path: String,
+    #[serde(default = "default_omp_path")]
+    pub omp_path: String,
     #[serde(default = "default_cursor_agent_path")]
     pub cursor_agent_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,6 +109,10 @@ fn default_opencode_path() -> String {
     "opencode".to_string()
 }
 
+fn default_omp_path() -> String {
+    "omp".to_string()
+}
+
 fn default_pi_path() -> String {
     "pi".to_string()
 }
@@ -130,6 +136,7 @@ impl Default for LocalConfig {
             codex_path: default_codex_path(),
             opencode_path: default_opencode_path(),
             pi_path: default_pi_path(),
+            omp_path: default_omp_path(),
             cursor_agent_path: default_cursor_agent_path(),
             deepseek_api_base_url: None,
             deepseek_api_key: None,

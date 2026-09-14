@@ -203,7 +203,7 @@ function parseLaunchProfile(key: string): LaunchOption | null {
   const provider = (
     backend === "deepseek" && rawKind !== "terminal" ? "deepseek" : frontend
   ) as Provider;
-  if (!["claude", "codex", "deepseek", "opencode", "pi", "cursor-agent"].includes(provider)) return null;
+  if (!["claude", "codex", "deepseek", "opencode", "pi", "omp", "cursor-agent"].includes(provider)) return null;
   const rawModel = modelParts.join(":");
   const model = rawModel && rawModel !== "default" ? rawModel : undefined;
   const deepseekModel = canonicalDeepseekModel(model);
@@ -215,6 +215,8 @@ function parseLaunchProfile(key: string): LaunchOption | null {
           ? "OpenCode"
           : provider === "pi"
             ? "Pi"
+          : provider === "omp"
+            ? "OMP"
             : provider.charAt(0).toUpperCase() + provider.slice(1);
   return {
     key,

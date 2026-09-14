@@ -16,6 +16,7 @@ const PROVIDER_LABELS: Record<SupportedProvider, string> = {
   deepseek: "DeepSeek",
   opencode: "OpenCode",
   pi: "Pi",
+  omp: "OMP",
   "cursor-agent": "Cursor",
 };
 

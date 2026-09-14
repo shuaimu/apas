@@ -791,6 +791,7 @@ fn resolve_pane_binary_path(
     codex_path: &str,
     opencode_path: &str,
     pi_path: &str,
+    omp_path: &str,
     cursor_agent_path: &str,
 ) -> String {
     if shared::is_retired_launch(provider, model) {
@@ -801,6 +802,7 @@ fn resolve_pane_binary_path(
         Provider::Codex => codex_path.to_string(),
         Provider::Opencode => opencode_path.to_string(),
         Provider::Pi => pi_path.to_string(),
+        Provider::Omp => omp_path.to_string(),
         Provider::CursorAgent => cursor_agent_path.to_string(),
         #[allow(deprecated)]
         Provider::Minimax | Provider::Glm => String::new(),
@@ -820,6 +822,7 @@ fn provider_display_name(provider: &Provider, model: Option<&str>) -> &'static s
         Provider::Deepseek => "DeepSeek",
         Provider::Opencode => "OpenCode",
         Provider::Pi => "Pi",
+        Provider::Omp => "OMP",
         Provider::CursorAgent => "Cursor",
     }
 }
@@ -834,6 +837,7 @@ fn provider_config_key(provider: &Provider, model: Option<&str>) -> &'static str
         Provider::Deepseek => "claude_path",
         Provider::Opencode => "opencode_path",
         Provider::Pi => "pi_path",
+        Provider::Omp => "omp_path",
         Provider::CursorAgent => "cursor_agent_path",
         #[allow(deprecated)]
         Provider::Minimax | Provider::Glm => "unsupported_provider",
@@ -2065,6 +2069,7 @@ async fn run_inner(
     let codex_path = resolve_binary_path(&config.local.codex_path);
     let opencode_path = resolve_binary_path(&config.local.opencode_path);
     let pi_path = resolve_binary_path(&config.local.pi_path);
+    let omp_path = resolve_binary_path(&config.local.omp_path);
     let cursor_agent_path = resolve_binary_path(&config.local.cursor_agent_path);
 
     // Load or create project metadata
@@ -2369,6 +2374,7 @@ async fn run_inner(
             &codex_path,
             &opencode_path,
             &pi_path,
+            &omp_path,
             &cursor_agent_path,
         );
         if let Err(err) = spawn_terminal_pane(
@@ -2552,6 +2558,7 @@ async fn run_inner(
             &codex_path,
             &opencode_path,
             &pi_path,
+            &omp_path,
             &cursor_agent_path,
         );
         let (
@@ -2653,6 +2660,7 @@ async fn run_inner(
             &codex_path,
             &opencode_path,
             &pi_path,
+            &omp_path,
             &cursor_agent_path,
         );
         let (
@@ -2736,6 +2744,7 @@ async fn run_inner(
         let codex_path_event = codex_path.clone();
         let opencode_path_event = opencode_path.clone();
         let pi_path_event = pi_path.clone();
+        let omp_path_event = omp_path.clone();
         let cursor_agent_path_event = cursor_agent_path.clone();
         let pane_sessions_event = pane_sessions.clone();
         let pane_pauses_event = pane_pauses.clone();
@@ -2759,6 +2768,7 @@ async fn run_inner(
                 &codex_path_event,
                 &opencode_path_event,
                 &pi_path_event,
+                &omp_path_event,
                 &cursor_agent_path_event,
                 &working_dir_event,
                 command_tx,
@@ -3166,6 +3176,26 @@ async fn run_inner(
                                 continue;
                             };
                             (format!("pi:{}", path.display()), turns, None)
+                        }
+                        Provider::Omp => {
+                            let Some(home) = home.as_deref() else {
+                                continue;
+                            };
+                            // The pane owns its session directory, so the
+                            // newest file in it is unambiguous. OMP has no
+                            // `--session-id` to pin, but it cannot reach
+                            // another pane's directory either, which is the
+                            // property that actually matters here.
+                            let Some(path) =
+                                crate::transcript::find_omp_session_file(home, conv_id)
+                            else {
+                                continue;
+                            };
+                            let Ok(turns) = crate::transcript::read_omp_turns(&path, pane_id)
+                            else {
+                                continue;
+                            };
+                            (format!("omp:{}", path.display()), turns, None)
                         }
                         _ => continue,
                     };
@@ -3579,6 +3609,7 @@ fn handle_tui_events(
     codex_path: &str,
     opencode_path: &str,
     pi_path: &str,
+    omp_path: &str,
     cursor_agent_path: &str,
     working_dir: &str,
     command_tx: mpsc::Sender<TuiCommand>,
@@ -3741,6 +3772,7 @@ fn handle_tui_events(
                     codex_path,
                     opencode_path,
                     pi_path,
+                    omp_path,
                     cursor_agent_path,
                 );
 
@@ -4281,6 +4313,7 @@ fn handle_tui_events(
                     codex_path,
                     opencode_path,
                     pi_path,
+                    omp_path,
                     cursor_agent_path,
                 );
                 {
@@ -4762,6 +4795,7 @@ fn handle_tui_events(
                     codex_path,
                     opencode_path,
                     pi_path,
+                    omp_path,
                     cursor_agent_path,
                 );
                 {
@@ -4979,6 +5013,7 @@ fn active_usage_providers(pane_metas: &PaneMetas) -> (bool, bool, bool) {
             Provider::Deepseek => has_deepseek = true,
             Provider::Opencode => {}
             Provider::Pi => {}
+            Provider::Omp => {}
             Provider::CursorAgent => {}
         }
         if has_claude && has_codex && has_deepseek {
@@ -5148,7 +5183,7 @@ fn build_agent_args(
         }
         #[allow(deprecated)]
         Provider::Minimax | Provider::Glm => (Vec::new(), false),
-        Provider::Pi => (Vec::new(), false),
+        Provider::Pi | Provider::Omp => (Vec::new(), false),
         Provider::Opencode => {
             // OpenCode generates its own `ses_*` identifiers, so the APAS
             // UUID cannot be passed to --session. Resume the newest session
@@ -5580,7 +5615,7 @@ fn parse_agent_output(
             Err(_) => None,
         },
         Provider::Opencode => convert_opencode_to_claude(line, session_id_str),
-        Provider::Pi => None,
+        Provider::Pi | Provider::Omp => None,
         Provider::CursorAgent => {
             // cursor-agent --output-format stream-json emits Claude-compatible events
             serde_json::from_str::<ClaudeStreamMessage>(line).ok()
@@ -7418,6 +7453,7 @@ mod tests {
             "codex",
             "opencode",
             "pi",
+            "omp",
             "cursor-agent",
         );
         assert_eq!(path, "claude");
@@ -7432,6 +7468,7 @@ mod tests {
             "codex",
             "opencode",
             "/opt/pi/bin/pi",
+            "omp",
             "cursor-agent",
         );
         assert_eq!(path, "/opt/pi/bin/pi");
@@ -12040,6 +12077,7 @@ async fn run_server_connection(
                     shared::MOBILE_TASK_LAUNCH_CAPABILITY.to_string(),
                     shared::OPENCODE_TERMINAL_CAPABILITY.to_string(),
                     shared::PI_TERMINAL_CAPABILITY.to_string(),
+                    shared::OMP_TERMINAL_CAPABILITY.to_string(),
                     shared::CLI_LIFECYCLE_CAPABILITY.to_string(),
                 ];
                 if summary_runner.is_some() {

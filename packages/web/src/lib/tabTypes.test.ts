@@ -31,6 +31,7 @@ describe("tab type keys", () => {
       "terminal:codex",
       "terminal:opencode",
       "terminal:pi",
+      "terminal:omp",
     ]);
   });
 });

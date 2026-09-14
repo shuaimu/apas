@@ -81,6 +81,17 @@ describe("providerOptions", () => {
     expect(providerModelValue("pi", "default")).toBe("pi/official");
   });
 
+  it("exposes OMP as a backend of its own, separate from Pi", () => {
+    // OMP is Pi-derived but a different binary with its own store, so it must
+    // never collapse into the Pi option.
+    expect(findProviderModelOption("omp/official")).toEqual(
+      expect.objectContaining({ label: "OMP", provider: "omp" }),
+    );
+    expect(providerModelValue("omp", null)).toBe("omp/official");
+    expect(providerModelValue("omp", "default")).toBe("omp/official");
+    expect(providerModelValue("omp", null)).not.toBe(providerModelValue("pi", null));
+  });
+
   it("excludes retired providers and classifies historical values as unsupported", () => {
     expect(PROVIDER_MODEL_OPTIONS.some((option) =>
       /minimax|glm/i.test(`${option.provider} ${option.model ?? ""} ${option.label}`)

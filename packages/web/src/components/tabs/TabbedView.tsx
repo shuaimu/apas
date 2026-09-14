@@ -328,6 +328,7 @@ const PROVIDER_OPTIONS = [
   { value: "cursor-agent", label: "Cursor" },
   { value: "opencode", label: "OpenCode" },
   { value: "pi", label: "Pi" },
+  { value: "omp", label: "OMP" },
   { value: "deepseek", label: "DeepSeek" },
 ] as const;
 type ProviderOption = (typeof PROVIDER_OPTIONS)[number]["value"];

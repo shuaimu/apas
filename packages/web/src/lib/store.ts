@@ -162,7 +162,7 @@ export interface UsageLimitedStatus {
   allModelsUtilization?: number;
 }
 
-export type Provider = "claude" | "codex" | "minimax" | "glm" | "deepseek" | "opencode" | "pi" | "cursor-agent";
+export type Provider = "claude" | "codex" | "minimax" | "glm" | "deepseek" | "opencode" | "pi" | "omp" | "cursor-agent";
 
 export type SupportedProvider = Exclude<Provider, "minimax" | "glm">;
 
@@ -483,6 +483,7 @@ function normalizeProvider(raw: unknown): Provider | null {
     if (normalized === "deepseek" || normalized === "deep_seek" || normalized === "deep-seek") return "deepseek";
     if (normalized === "opencode") return "opencode";
     if (normalized === "pi") return "pi";
+    if (normalized === "omp" || normalized === "oh-my-pi") return "omp";
     if (normalized === "cursor-agent" || normalized === "cursor_agent" || normalized === "cursor") return "cursor-agent";
   }
   return null;

@@ -23,6 +23,13 @@ pub const OPENCODE_TERMINAL_CAPABILITY: &str = "terminal_opencode_v1";
 /// server/web deployment cannot route a Pi pane to an older CLI that would
 /// persist the pane but fail to launch it.
 pub const PI_TERMINAL_CAPABILITY: &str = "terminal_pi_v1";
+/// The connected CLI can host OMP's interactive TUI, give each pane its own
+/// session directory, and mirror the session transcript written there.
+///
+/// Kept separate from the generic mobile-launch capability so a rolling
+/// server/web deployment cannot route an OMP pane to an older CLI that would
+/// persist the pane but fail to launch it.
+pub const OMP_TERMINAL_CAPABILITY: &str = "terminal_omp_v1";
 /// The CLI understands correlated, transport-only reconnect requests.
 pub const CLI_LIFECYCLE_CAPABILITY: &str = "cli_lifecycle_v1";
 /// The CLI can keep supported terminal providers alive outside the replaceable
@@ -2317,6 +2324,10 @@ pub enum Provider {
     /// Pi coding agent (`pi`): terminal-only in APAS. See
     /// `terminal_pane::terminal_binary_for`.
     Pi,
+    /// Oh My Pi (`omp`): a standalone Pi-derived agent, terminal-only in APAS.
+    /// Unlike Pi it has no `--session-id`, so a pane is pinned by giving it a
+    /// private `--session-dir` instead; see `terminal_pane::omp_session_args`.
+    Omp,
     #[serde(rename = "cursor-agent")]
     CursorAgent,
 }
@@ -2401,6 +2412,7 @@ pub fn all_tab_types() -> Vec<String> {
         tab_type_key(PaneKind::Terminal, Provider::Codex),
         tab_type_key(PaneKind::Terminal, Provider::Opencode),
         tab_type_key(PaneKind::Terminal, Provider::Pi),
+        tab_type_key(PaneKind::Terminal, Provider::Omp),
     ]
 }
 
@@ -2538,6 +2550,14 @@ pub fn supported_launch_profiles() -> Vec<LaunchProfile> {
             None,
         ),
         launch_profile(
+            "terminal:omp:official:default",
+            "OMP Terminal",
+            PaneKind::Terminal,
+            Provider::Omp,
+            "official",
+            None,
+        ),
+        launch_profile(
             "terminal:claude:deepseek:deepseek-flash",
             "DeepSeek 4.1 Flash Terminal",
             PaneKind::Terminal,
@@ -2639,6 +2659,7 @@ pub fn launch_profile_key(kind: PaneKind, provider: Provider, model: Option<&str
         Provider::Codex => "codex",
         Provider::Opencode => "opencode",
         Provider::Pi => "pi",
+        Provider::Omp => "omp",
         Provider::CursorAgent => "cursor-agent",
         Provider::Minimax | Provider::Glm => "unsupported",
     };
@@ -4463,6 +4484,7 @@ mod tests {
                 "terminal:codex".to_string(),
                 "terminal:opencode".to_string(),
                 "terminal:pi".to_string(),
+                "terminal:omp".to_string(),
             ]
         );
     }
@@ -4549,7 +4571,7 @@ mod tests {
     #[test]
     fn supported_profiles_and_default_policy_offer_only_terminal_backends() {
         let profiles = supported_launch_profiles();
-        assert_eq!(profiles.len(), 5);
+        assert_eq!(profiles.len(), 6);
         assert!(profiles
             .iter()
             .all(|profile| profile.kind == PaneKind::Terminal));
@@ -4563,6 +4585,7 @@ mod tests {
                 ("terminal:codex:official:default", "Codex Terminal"),
                 ("terminal:opencode:official:default", "OpenCode Terminal"),
                 ("terminal:pi:official:default", "Pi Terminal"),
+                ("terminal:omp:official:default", "OMP Terminal"),
                 (
                     "terminal:claude:deepseek:deepseek-flash",
                     "DeepSeek 4.1 Flash Terminal",
@@ -4585,6 +4608,7 @@ mod tests {
             "terminal:codex:official:default",
             "terminal:opencode:official:default",
             "terminal:pi:official:default",
+            "terminal:omp:official:default",
             "terminal:claude:deepseek:deepseek-flash",
         ] {
             assert!(policy

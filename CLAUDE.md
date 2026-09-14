@@ -954,6 +954,12 @@ otherwise have had to volunteer.
   exactly matches the pane cwd, then reads it with `opencode export <id>`.
   Like Codex, two panes sharing a cwd are inherently ambiguous; sessions from
   another directory are never selected.
+- **omp** — no `--session-id` exists, so the pane is pinned by its own
+  `--session-dir` instead (see "Terminal panes" below). The newest `.jsonl` in
+  that directory is unambiguous because nothing else writes there. OMP records
+  are Pi's, so `read_omp_turns` delegates to the Pi reader; a test parses a real
+  omp capture so a future divergence fails loudly instead of emptying the
+  conversation view.
 - **pi** — `--session-id <uuid>` pins the pane's identity at spawn, and Pi names
   the session file after it:
   `~/.pi/agent/sessions/--<cwd slug>--/<timestamp>_<uuid>.jsonl`. APAS finds
@@ -1063,7 +1069,7 @@ inventing a price.
 
 ## Terminal panes (`kind: "terminal"`)
 
-New user-created Claude, Codex, OpenCode, Pi, and DeepSeek work uses
+New user-created Claude, Codex, OpenCode, Pi, OMP, and DeepSeek work uses
 `kind: "terminal"`. The structured `kind: "agent"` path is retained only for
 historical panes: the CLI runs the provider headlessly and parses stream-json
 into structured events. Missing `kind` still deserializes as `agent` so old
@@ -1076,7 +1082,7 @@ to xterm.js in the browser. Nothing is parsed, so nothing has to be kept in
 sync with a provider's output format — the point is to reuse the CLI as it
 ships.
 
-Only `claude`, `codex`, `opencode`, and `pi` can host one
+Only `claude`, `codex`, `opencode`, `pi`, and `omp` can host one
 (`terminal_pane::terminal_binary_for`). DeepSeek uses the Claude terminal with
 the supported Anthropic-compatible backend environment; Cursor Agent has no
 supported launch profile. OpenCode launches with `--auto`; a fresh mobile task
@@ -1089,23 +1095,45 @@ and `--approve` would trust repository-controlled settings and extensions on
 the host's behalf. Pi is therefore the one hostable provider with no
 permission-bypass argument.
 
-APAS does not install OpenCode or Pi, choose their model provider, or
-authenticate them. Install and authenticate them on every intended project host
-before enabling the profile. The default executables are `opencode` and `pi`;
-override nonstandard installations with `apas config set opencode_path ...` and
-`apas config set pi_path ...`. Existing explicit cluster/project allowlists
-remain opt-in and must add `terminal:opencode:official:default` or
-`terminal:pi:official:default` through the normal policy controls.
+**OMP pins a pane by directory, not by id.** `omp` has no `--session-id`, so a
+pane cannot pin an exact identity the way Pi does. It accepts `--session-dir`,
+which is stronger: the pane owns a private directory under
+`~/.omp/agent/sessions/apas-<conversation id>/`, so a sibling pane or a
+provider subprocess sharing a working directory can never select this pane's
+session, and `--continue` inside it is unambiguous without consulting recency.
+The directory is passed on **every** launch and must precede `--continue`, or
+that flag resolves against the shared default store. Unlike Pi, OMP does have
+approval prompts, so it is launched with `--auto-approve` like the others.
+Verified against omp 18.1.20: a run writes one flat `<ts>_<uuid>.jsonl` there,
+`--continue` appends to that same file, and the default store stays untouched.
 
-The oh-my-pi orchestration package is a **Pi extension, not an APAS provider**:
-it peer-depends on Pi and declares `pi.extensions` in its package. Install it
-into Pi globally (`pi install npm:oh-my-pi`) so APAS panes never hit Pi's
+APAS does not install OpenCode, Pi, or OMP, choose their model provider, or
+authenticate them. Install and authenticate them on every intended project host
+before enabling the profile. The default executables are `opencode`, `pi`, and
+`omp`; override nonstandard installations with `apas config set
+opencode_path ...`, `apas config set pi_path ...`, and `apas config set
+omp_path ...`. Existing explicit cluster/project allowlists remain opt-in and
+must add `terminal:opencode:official:default`, `terminal:pi:official:default`,
+or `terminal:omp:official:default` through the normal policy controls.
+
+**Two different things share the oh-my-pi name; do not conflate them.**
+
+The npm package `oh-my-pi` is a **Pi extension, not an APAS provider**: it
+peer-depends on Pi and declares `pi.extensions` in its package. Install it into
+Pi globally (`pi install npm:oh-my-pi`) so APAS panes never hit Pi's
 project-trust prompt, or install it project-locally and answer `/trust` in the
-terminal view; APAS never does that on the user's behalf. Use the `/oh-my-pi`
-slash command inside a Pi pane to diagnose an install: the package's published
+terminal view; APAS never does that on the user's behalf. Its published
 `oh-my-pi` bin is broken (it imports `../src/*.ts` files the tarball does not
-ship). Pi extension entries are excluded from conversation recovery, and APAS
-never adopts a subagent session as the pane's own.
+ship), so the `/oh-my-pi` slash command inside a Pi pane is the supported way to
+diagnose an install. Pi extension entries are excluded from conversation
+recovery, and APAS never adopts a subagent session as the pane's own.
+
+`omp` (<https://github.com/can1357/oh-my-pi>) is a **standalone agent and its
+own APAS provider**, `Provider::Omp`. It is Pi-derived — same session record
+shape, same `PI_CODING_AGENT_*` overrides — but it is a separate binary with
+its own store under `~/.omp`, role-based model selection (`--smol`/`--slow`/
+`--plan`), subagents, and an ACP mode. Installing it does nothing to a Pi pane,
+and installing the npm extension does nothing to an OMP pane.
 
 The desktop tab bar, mobile browser pane picker, native mobile task launcher,
 server authorization, and CLI local add-tab path all enforce this boundary.
@@ -1187,16 +1215,18 @@ running state.
 Native mobile launch advertises `mobile_task_launch_v2`. The version bump is
 intentional: v2 creates a terminal pane and passes the first instruction as a
 provider-native CLI prompt; a v1 CLI would otherwise accept the pane and drop
-that instruction. OpenCode additionally requires `terminal_opencode_v1`, and Pi
-`terminal_pi_v1`, so a rolling server/web deployment refuses to route either to
-an older v2 CLI that can launch Claude/Codex but not that provider. The server
+that instruction. OpenCode additionally requires `terminal_opencode_v1`, Pi
+`terminal_pi_v1`, and OMP `terminal_omp_v1`, so a rolling server/web deployment
+refuses to route any of them to an older v2 CLI that can launch Claude/Codex but
+not that provider. The server
 asks the user to update/reconnect instead of pretending an older launch
 succeeded.
 
-Roll out OpenCode and Pi support in this order: server first, web second, then
-upgrade and reconnect project CLIs so they advertise `terminal_opencode_v1` and
-`terminal_pi_v1`. Install and authenticate the provider and opt the intended
-policies into its profile only after the host CLI has reconnected.
+Roll out OpenCode, Pi, and OMP support in this order: server first, web second,
+then upgrade and reconnect project CLIs so they advertise
+`terminal_opencode_v1`, `terminal_pi_v1`, and `terminal_omp_v1`. Install and
+authenticate the provider and opt the intended policies into its profile only
+after the host CLI has reconnected.
 
 ### Persistent pane hosts and CLI lifecycle
 

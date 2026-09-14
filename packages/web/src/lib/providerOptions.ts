@@ -73,6 +73,13 @@ export const PROVIDER_MODEL_GROUPS: ProviderModelGroup[] = [
     options: [{ value: "pi/official", label: "Pi", provider: "pi" }],
   },
   {
+    id: "omp",
+    label: "OMP",
+    iconProvider: "omp",
+    toneClass: "text-fuchsia-500",
+    options: [{ value: "omp/official", label: "OMP", provider: "omp" }],
+  },
+  {
     id: "cursor-agent",
     label: "Cursor",
     iconProvider: "cursor-agent",
@@ -174,6 +181,7 @@ export function providerModelValue(
   if (provider === "codex") return "codex/official";
   if (provider === "opencode") return "opencode/official";
   if (provider === "pi") return "pi/official";
+  if (provider === "omp") return "omp/official";
   if (provider === "cursor-agent") return "cursor-agent/official";
   if (provider === "deepseek") {
     // A bare DeepSeek pane means "whatever DeepSeek APAS offers", which is now

@@ -130,6 +130,14 @@ function ProviderIcon({
       </svg>
     );
   }
+  if (provider === "omp") {
+    // OMP is Pi-derived; the doubled pi marks the fork without a new glyph.
+    return (
+      <span className={`${className} text-center font-bold leading-none`} aria-label="OMP">
+        ππ
+      </span>
+    );
+  }
   if (provider === "pi") {
     // Pi logo — the Greek letter the terminal harness is named for.
     return (
@@ -659,6 +667,7 @@ function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: stri
               { provider: "codex", label: "Codex" },
               { provider: "opencode", label: "OpenCode" },
               { provider: "pi", label: "Pi" },
+              { provider: "omp", label: "OMP" },
             ]
               .filter((entry) => isAllowed("terminal", entry.provider, entry.model))
               .map((entry) => (
