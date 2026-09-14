@@ -1355,6 +1355,24 @@ async fn requires_capable_terminal_cli(
     false
 }
 
+/// Allocate a server-assigned pane id that is not already in use in the
+/// session. Pane ids 1 and 2 are reserved for legacy deadloop/interactive;
+/// user panes live in 3..=1002. Returns `None` when the range is exhausted.
+///
+/// Ids used to be drawn blindly from the same range, so a new pane could be
+/// assigned an in-use id. The project host then discarded the creation in its
+/// idempotent-duplicate guard and the tab never appeared, with no error
+/// surfaced anywhere — the pane simply vanished between the click and the tab.
+fn allocate_pane_id(used: &HashSet<u32>) -> Option<u32> {
+    for _ in 0..100 {
+        let candidate = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
+        if !used.contains(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 async fn authorize_new_pane_launch(
     state: &AppState,
     connection_id: &Uuid,
@@ -1931,6 +1949,34 @@ mod retired_launch_authorization_tests {
             cli_rx.try_recv().is_err(),
             "an incompatible CLI must not receive the reboot command"
         );
+    }
+}
+
+#[cfg(test)]
+mod pane_id_allocation_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_session_allocates_inside_the_user_range() {
+        for _ in 0..50 {
+            let id = allocate_pane_id(&HashSet::new()).expect("empty range has room");
+            assert!((3..=1002).contains(&id), "reserved ids stay reserved: {id}");
+        }
+    }
+
+    #[test]
+    fn allocation_never_reuses_an_in_use_id() {
+        let used: HashSet<u32> = [3, 226, 676, 1002].into_iter().collect();
+        for _ in 0..100 {
+            let id = allocate_pane_id(&used).expect("range has room");
+            assert!(!used.contains(&id), "collided with an in-use pane: {id}");
+        }
+    }
+
+    #[test]
+    fn exhausted_range_reports_none_instead_of_reusing() {
+        let used: HashSet<u32> = (3..=1002).collect();
+        assert_eq!(allocate_pane_id(&used), None);
     }
 }
 
@@ -4619,8 +4665,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         {
                             continue;
                         }
-                        // Generate a unique pane_id starting from 3 (1 and 2 are reserved for legacy deadloop/interactive)
-                        let pane_id = 3 + (uuid::Uuid::new_v4().as_u128() % 1000) as u32;
+                        // Generate a pane id no pane in this session is using
+                        // (1 and 2 are reserved for legacy deadloop/interactive).
+                        let occupied: HashSet<u32> = state
+                            .sessions
+                            .get_session_panes(&sid)
+                            .iter()
+                            .map(|pane| pane.pane_id)
+                            .collect();
+                        let Some(pane_id) = allocate_pane_id(&occupied) else {
+                            send_policy_error(
+                                &state,
+                                &connection_id,
+                                "Could not allocate a pane id because the session is full; close a pane and retry.",
+                            )
+                            .await;
+                            continue;
+                        };
                         let pane_config = shared::PaneConfig {
                             pane_id,
                             provider,
@@ -4648,7 +4709,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             sid,
                             isolated_worktree,
                         );
-                        state
+                        let routed = state
                             .sessions
                             .route_to_cli(
                                 &sid,
@@ -4660,6 +4721,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 },
                             )
                             .await;
+                        // A creation the host never receives must not fail
+                        // silently: without this the click produces no tab,
+                        // no error, and no log on the requesting client.
+                        if !routed {
+                            send_policy_error(
+                                &state,
+                                &connection_id,
+                                "The project host is unreachable; the pane was not created. Reconnect and retry.",
+                            )
+                            .await;
+                        }
                         // Also broadcast PaneList to web clients
                         // (CLI will send back updated pane config)
                     }

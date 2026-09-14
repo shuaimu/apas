@@ -184,6 +184,14 @@ fn launch_allowed_by_server_policy(
         .is_some_and(|policy| policy.allows(kind, provider, model))
 }
 
+/// Whether an AddPane for an already-known pane id is a harmless retry or a
+/// collision. A retransmit carries the same session id as the pane we already
+/// applied; anything else means the id is shared by two different panes and
+/// must stay with the running one.
+fn is_idempotent_add_pane_retry(existing_session: Option<Uuid>, incoming_session: Uuid) -> bool {
+    existing_session.is_some_and(|session_id| session_id == incoming_session)
+}
+
 /// Whether an **existing** pane may be brought back — resumed, rebooted, or
 /// started.
 ///
@@ -3590,8 +3598,20 @@ fn handle_tui_events(
                 // web: ordinary new work opens Claude's real terminal TUI.
                 // Queue the canonical configured event so policy enforcement,
                 // pty registration, announcements, and persistence stay in
-                // one implementation.
-                let pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
+                // one implementation. The id skips in-use panes the same way
+                // the server does, so a fast double-tap cannot clobber a live
+                // pane's entry in pane_metas.
+                let pane_id = {
+                    let metas = pane_metas.lock().unwrap();
+                    let mut pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
+                    for _ in 0..100 {
+                        if !metas.contains_key(&pane_id) {
+                            break;
+                        }
+                        pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
+                    }
+                    pane_id
+                };
                 let _ = event_tx.send(TuiEvent::AddTabWithConfig {
                     pane_id,
                     label: format!("Claude {}", pane_id),
@@ -5580,9 +5600,9 @@ mod tests {
         build_pane_env_overrides_from_keys, build_pane_list, build_pane_reboot_events,
         build_user_envelope_line, canonicalize_requested_model, codex_sqlite_home_path,
         convert_opencode_to_claude, deadloop_wait_plan, ensure_private_codex_sqlite_home,
-        evaluate_deadloop_watchdog, is_codex_stale_session_error, live_provider_binary,
-        manual_create_pr_worktree_path, model_switch_can_use_fast_path, normalize_codex_effort,
-        normalize_effort_level, reconcile_terminal_questions_for_pane,
+        evaluate_deadloop_watchdog, is_codex_stale_session_error, is_idempotent_add_pane_retry,
+        live_provider_binary, manual_create_pr_worktree_path, model_switch_can_use_fast_path,
+        normalize_codex_effort, normalize_effort_level, reconcile_terminal_questions_for_pane,
         remember_verified_codex_session, reset_deadloop_codex_stale_session,
         resolve_pane_binary_path, resolve_terminal_binary, restored_pane_mode_and_pause,
         retired_launch_rejection_output, route_web_input_to_pane, run_deadloop_session_inner,
@@ -7447,6 +7467,14 @@ mod tests {
             live_provider_binary("/definitely/missing/opencode", "also-missing"),
             "/definitely/missing/opencode"
         );
+    }
+
+    #[test]
+    fn add_pane_retry_matching_requires_the_same_session() {
+        let session = Uuid::new_v4();
+        assert!(is_idempotent_add_pane_retry(Some(session), session));
+        assert!(!is_idempotent_add_pane_retry(Some(session), Uuid::new_v4()));
+        assert!(!is_idempotent_add_pane_retry(None, session));
     }
 
     #[test]
@@ -12990,10 +13018,35 @@ async fn run_server_connection(
                                                     .lock()
                                                     .is_ok_and(|metas| metas.contains_key(&pane_config.pane_id))
                                                 {
-                                                    tracing::info!(
-                                                        pane_id = pane_config.pane_id,
-                                                        "Ignoring idempotent duplicate AddPane",
-                                                    );
+                                                    // A retransmit carries the same session id as the
+                                                    // pane we already applied — safe to ignore. A
+                                                    // different session id means the id collided with
+                                                    // a live pane (older servers assign ids blindly);
+                                                    // ignoring still protects the running pane, but
+                                                    // loudly, so the vanished tab is diagnosable
+                                                    // instead of silent.
+                                                    let same_conversation = pane_sessions
+                                                        .lock()
+                                                        .ok()
+                                                        .and_then(|sessions| {
+                                                            sessions.get(&pane_config.pane_id).copied()
+                                                        });
+                                                    if is_idempotent_add_pane_retry(
+                                                        same_conversation,
+                                                        pane_config.session_id,
+                                                    ) {
+                                                        tracing::info!(
+                                                            pane_id = pane_config.pane_id,
+                                                            "Ignoring idempotent duplicate AddPane",
+                                                        );
+                                                    } else {
+                                                        tracing::warn!(
+                                                            pane_id = pane_config.pane_id,
+                                                            incoming_session_id =
+                                                                %pane_config.session_id,
+                                                            "AddPane arrived for an in-use pane id with a different session; ignoring to protect the running pane",
+                                                        );
+                                                    }
                                                     continue;
                                                 }
                                                 let label = pane_config.label.clone().unwrap_or_else(|| format!("Tab {}", pane_config.pane_id));
