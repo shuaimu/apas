@@ -598,6 +598,27 @@ impl DaemonState {
             .collect()
     }
 
+    /// The resume list for a restart that one project asked for, which must
+    /// name that project even though its task has already ended.
+    ///
+    /// `running_projects_for_resume` deliberately skips finished tasks so a
+    /// project that genuinely stopped is not resurrected. A project requests a
+    /// CLI replacement by ending its own task, so taken literally that rule
+    /// drops exactly the project the user acted on: they press "Reboot CLI"
+    /// and it is the one thing that does not come back.
+    fn resume_projects_after_requested_restart(&self, project_id: &str) -> Vec<ResumeProject> {
+        let mut resume = self.running_projects_for_resume();
+        if !resume.iter().any(|entry| entry.project_id == project_id) {
+            if let Some(project) = self.projects.get(project_id) {
+                resume.push(ResumeProject {
+                    project_id: project_id.to_string(),
+                    path: Some(project.path.clone()),
+                });
+            }
+        }
+        resume
+    }
+
     /// Rehydrate a project path from the handoff manifest when the shared
     /// registry is unavailable or has lost the entry. The `.apas` file is the
     /// project-local authority, so require its id to match before adopting it.
@@ -1365,9 +1386,40 @@ async fn run_connection(
 
         tokio::select! {
             Some(project_id) = restart_rx.recv() => {
-                // Stop it properly before starting a fresh one: the task has
-                // already finished, but its entry and pane hosts have not been
-                // cleaned up.
+                // A pane's "Reboot CLI" asked for the CLI to be replaced.
+                // Projects run inside this process now, so the CLI *is* the
+                // daemon and there is no smaller unit whose replacement
+                // changes the running version. Restarting only this project's
+                // task left the freshly installed binary sitting on disk with
+                // the old code still serving: the update was prepared and then
+                // never applied, which is why this button could never finish
+                // an update while the machine-addressed one could.
+                //
+                // So do what `ServerToDaemon::RebootDaemon` does. The resume
+                // manifest brings every project back, and pane hosts are
+                // separate processes that `exec` does not touch, so terminal
+                // agents are adopted rather than restarted.
+                //
+                // The honest cost: one project's button now restarts every
+                // project on the host. That is what replacing the CLI means
+                // once the projects live inside it.
+                #[cfg(unix)]
+                {
+                    // Returns only on failure, and every fallible step runs
+                    // while this daemon is still serving, so a failed update
+                    // leaves the host a working daemon rather than none.
+                    let err = perform_requested_restart(
+                        &state.resume_projects_after_requested_restart(&project_id),
+                    );
+                    tracing::error!(
+                        project_id,
+                        %err,
+                        "requested CLI restart failed; restarting just this project instead"
+                    );
+                }
+                // Reached only when the replacement failed, or on a platform
+                // that cannot `exec`. Restarting the one project still clears
+                // whatever made the user ask, so it beats doing nothing.
                 state.stop_running_project(&project_id).await;
                 if let Err(err) = state.start_project(&project_id, server_url, token, restart_tx) {
                     tracing::warn!(project_id, %err, "could not restart project");
@@ -1806,6 +1858,131 @@ mod containment_tests {
 
         assert!(doomed.await.is_err(), "the panic surfaces to the joiner");
         assert_eq!(survivor.await.unwrap(), "still here");
+    }
+}
+
+#[cfg(test)]
+mod requested_restart_tests {
+    use super::{DaemonState, ProjectEntry, RunningProject};
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    fn machine() -> shared::MachineInfo {
+        shared::MachineInfo {
+            machine_id: uuid::Uuid::nil(),
+            hostname: "test-host".to_string(),
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            daemon_version: None,
+            deepseek_backend: None,
+            last_seen: None,
+        }
+    }
+
+    fn entry(state: &mut DaemonState, project_id: &str, handle: tokio::task::JoinHandle<()>) {
+        state.projects.insert(
+            project_id.to_string(),
+            ProjectEntry {
+                name: None,
+                path: PathBuf::from(format!("/projects/{project_id}")),
+                last_error: None,
+            },
+        );
+        state.running.insert(
+            project_id.to_string(),
+            RunningProject {
+                shutdown: Arc::new(AtomicBool::new(false)),
+                handle,
+            },
+        );
+    }
+
+    async fn finished_task() -> tokio::task::JoinHandle<()> {
+        let handle = tokio::spawn(async {});
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        handle
+    }
+
+    fn long_running_task() -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        })
+    }
+
+    /// The project that asked for the reboot is the one the resume manifest
+    /// would otherwise drop.
+    ///
+    /// A project requests a CLI replacement by ending its own task, so by the
+    /// time the instance acts the task is finished — and finished tasks are
+    /// deliberately excluded from the manifest. Without special handling the
+    /// user presses "Reboot CLI" and it is the one project that never returns.
+    #[tokio::test]
+    async fn the_project_that_asked_to_restart_is_still_resumed() {
+        let mut state = DaemonState::new(machine());
+        entry(&mut state, "requester", finished_task().await);
+        entry(&mut state, "bystander", long_running_task());
+
+        let resume = state.resume_projects_after_requested_restart("requester");
+        let ids: Vec<&str> = resume.iter().map(|p| p.project_id.as_str()).collect();
+
+        assert!(
+            ids.contains(&"requester"),
+            "the project that asked for the restart must be resumed: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"bystander"),
+            "replacing the instance restarts every project on the host: {ids:?}"
+        );
+        assert_eq!(resume.len(), 2, "no project is listed twice: {ids:?}");
+        assert_eq!(
+            resume
+                .iter()
+                .find(|p| p.project_id == "requester")
+                .and_then(|p| p.path.clone()),
+            Some(PathBuf::from("/projects/requester")),
+            "a resumed project carries the path needed to start it again"
+        );
+    }
+
+    /// A project still running when it asks must not be listed twice, or the
+    /// replacement would start it once per entry.
+    #[tokio::test]
+    async fn a_still_running_requester_is_not_duplicated() {
+        let mut state = DaemonState::new(machine());
+        entry(&mut state, "requester", long_running_task());
+
+        let resume = state.resume_projects_after_requested_restart("requester");
+        assert_eq!(resume.len(), 1, "one entry per project");
+        assert_eq!(resume[0].project_id, "requester");
+    }
+
+    /// A request naming a project this instance does not know must not invent
+    /// one: the replacement would have no path to start it from.
+    #[tokio::test]
+    async fn an_unknown_project_is_not_invented() {
+        let state = DaemonState::new(machine());
+        assert!(state
+            .resume_projects_after_requested_restart("never-heard-of-it")
+            .is_empty());
+    }
+
+    /// A project that stopped on its own is still excluded. The special case
+    /// is scoped to the requester, not a blanket "resume everything".
+    #[tokio::test]
+    async fn an_unrelated_finished_project_is_still_not_resumed() {
+        let mut state = DaemonState::new(machine());
+        entry(&mut state, "requester", long_running_task());
+        entry(&mut state, "stopped-on-its-own", finished_task().await);
+
+        let resume = state.resume_projects_after_requested_restart("requester");
+        let ids: Vec<&str> = resume.iter().map(|p| p.project_id.as_str()).collect();
+        assert_eq!(ids, vec!["requester"], "only the requester is special-cased");
     }
 }
 

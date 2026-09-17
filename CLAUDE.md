@@ -1239,6 +1239,21 @@ This removes the CLI process from the provider's lifetime: a transport-only
 turns untouched, while `Reboot CLI` prepares the update first and then adopts
 the same hosted terminal processes after `exec`.
 
+**`Reboot CLI` replaces the whole instance, because the CLI *is* the daemon.**
+Projects run inside one process, so there is no smaller unit whose replacement
+changes the running version. The project-scoped button and the Machines page's
+`Reboot to update` therefore perform the same act, and one project's button
+restarts every project on the host — the resume manifest brings them all back,
+and pane hosts are separate processes `exec` never touches, so terminal agents
+are adopted rather than restarted. For a while it did not: a project's request
+restarted only that project's task, so `prepare_cli_restart` installed the new
+binary and the old code kept serving. The update looked prepared and never
+applied, and the machine stayed on its old version until someone used the
+Machines page. The project that asks is also special-cased into the resume
+manifest, since it ends its own task to make the request and finished tasks are
+otherwise excluded — the one project the user acted on was exactly the one that
+would not have come back.
+
 The feature is advertised only when Unix sockets, tmux, the installed
 `apas pane-host` subcommand, and secure runtime storage all validate. Otherwise
 terminal panes keep using the direct PTY implementation and the lifecycle menu
