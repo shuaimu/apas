@@ -87,6 +87,7 @@ function seedZeroPaneTabbedView(
       }],
       messages: [],
       paneConfigs: [],
+      paneListReceived: true,
       paneMessages: {},
       paneHasMore: {},
       paneStatuses: {},
@@ -131,6 +132,7 @@ describe("deriveInitialActiveTabId", () => {
     managerTabId: null,
     overviewAvailable: true,
     paneConfigsLength: 2,
+    paneListReceived: true,
     savedActiveTab: "",
     tabIds: [10, 20],
   };
@@ -395,6 +397,51 @@ describe("TabbedView zero-pane projects", () => {
     expect(screen.queryByRole("heading", { name: "Overview" })).toBeNull();
     expect(screen.getByTitle("New tab")).toBeTruthy();
     expect(screen.queryByText("Waiting for activity...")).toBeNull();
+  });
+
+  it("explains an empty project and points at the control that fixes it", () => {
+    // Overview is gated on a policy field that no longer decides anything, so
+    // on a real deployment this is what a project with no panes actually shows.
+    seedZeroPaneTabbedView(["terminal:claude:official:default"], false);
+
+    render(<TabbedView />);
+
+    expect(screen.getByText("No pane is open")).toBeTruthy();
+    expect(screen.getByText(/Create a pane/)).toBeTruthy();
+    // The tip is useless unless the thing it names is on screen.
+    expect(screen.getByTitle("New tab")).toBeTruthy();
+  });
+
+  it("does not resurrect a closed pane from its leftover messages", () => {
+    seedZeroPaneTabbedView(["terminal:claude:official:default"], false);
+    // What survives a close: the pane's message bucket, and a selection still
+    // naming it. Both used to be unioned back into a synthesized tab — and as
+    // the only tab it had no close button, so it could not be dismissed again.
+    act(() => {
+      useStore.setState({
+        paneMessages: { "912": [] },
+        paneStatuses: { "912": "Working…" },
+      });
+    });
+
+    const { container } = render(<TabbedView />);
+
+    expect(screen.getByText("No pane is open")).toBeTruthy();
+    expect(screen.queryByText(/Tab 912/)).toBeNull();
+    expect(container.querySelector('[data-pane-id="912"]')).toBeNull();
+  });
+
+  it("still synthesizes a legacy view when no roster has arrived", () => {
+    seedZeroPaneTabbedView(["terminal:claude:official:default"], false);
+    act(() => {
+      useStore.setState({ paneListReceived: false });
+    });
+
+    render(<TabbedView />);
+
+    // Silence is not an empty project. Claiming otherwise would flash the tip
+    // on every load before the CLI reports in.
+    expect(screen.queryByText("No pane is open")).toBeNull();
   });
 
   it("fails closed while the selected project's policy is absent or stale", () => {

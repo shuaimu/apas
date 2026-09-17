@@ -216,6 +216,8 @@ export function deriveInitialActiveTabId(args: {
   managerTabId: number | null;
   overviewAvailable: boolean;
   paneConfigsLength: number;
+  /** Whether an authoritative pane roster has arrived for this project. */
+  paneListReceived: boolean;
   savedActiveTab: string;
   tabIds: number[];
 }): number | null {
@@ -240,9 +242,14 @@ export function deriveInitialActiveTabId(args: {
   }
   // Same project, pane_list is synthesized (no authoritative panes yet)
   // -> keep current selection to avoid jumps from transient data.
+  //
+  // Only while the roster is genuinely unknown. Once one has arrived and is
+  // empty, holding the previous selection pins the workspace to a pane that
+  // no longer exists — the one the user just closed.
   if (
     !args.clientChanged &&
     args.activeTabId != null &&
+    !args.paneListReceived &&
     args.paneConfigsLength === 0
   ) {
     return args.activeTabId;
@@ -436,6 +443,9 @@ export function TabbedView({
   const negotiatedCapabilities = useStore((s) => s.negotiatedCapabilities);
   const messages = useStore((s) => s.messages);
   const paneConfigs = useStore((s) => s.paneConfigs);
+  // Distinguishes "the roster is empty" from "no roster has arrived";
+  // see the field's doc comment in the store.
+  const paneListReceived = useStore((s) => s.paneListReceived);
   const paneMessages = useStore((s) => s.paneMessages);
   const paneHasMore = useStore((s) => s.paneHasMore);
   const paneStatuses = useStore((s) => s.paneStatuses);
@@ -533,6 +543,12 @@ export function TabbedView({
     // PaneList on every Start/Stop/Finalize transition, so configs are
     // never meaningfully behind; hints are only used below when no
     // PaneList has arrived at all.
+    // An authoritative roster is the answer even when it is empty: a project
+    // with no panes is a real state, and synthesizing here would rebuild the
+    // pane the user just closed out of its leftover messages — as the only
+    // tab, one whose close button used to be hidden, so it could not be
+    // closed again.
+    if (paneListReceived) return paneConfigs;
     if (paneConfigs.length > 0) return paneConfigs;
     if (isDualPane && Object.keys(paneMessages).length > 0) {
       return synthesizeConfigs(
@@ -558,6 +574,7 @@ export function TabbedView({
     return [];
   }, [
     paneConfigs,
+    paneListReceived,
     paneModes,
     isDualPane,
     paneMessages,
@@ -629,13 +646,14 @@ export function TabbedView({
       managerTabId,
       overviewAvailable: showOverview,
       paneConfigsLength: paneConfigs.length,
+      paneListReceived,
       savedActiveTab: saved,
       tabIds: ids,
     });
     if (activeTabId !== nextActiveTabId) {
       setActiveTabId(nextActiveTabId);
     }
-  }, [activeTabId, cliClientId, managerTabId, paneConfigs.length, showOverview, tabIds]);
+  }, [activeTabId, cliClientId, managerTabId, paneConfigs.length, paneListReceived, showOverview, tabIds]);
 
   // Lazy-load: when activeTabId changes (initial pick or user click),
   // fetch that pane's messages if we haven't already. Server's attach
@@ -699,6 +717,28 @@ export function TabbedView({
     [cliClientId],
   );
 
+  /**
+   * Move the selection off a pane being closed.
+   *
+   * Closing the last pane leaves nothing to select, and leaving the selection
+   * on the dead pane is not harmless: it is what fed the pane id back into tab
+   * synthesis and pinned the active-tab derivation to a pane that no longer
+   * exists. Clear the persisted choice too, or a reload restores it.
+   */
+  const selectAfterClosing = useCallback(
+    (paneId: number) => {
+      if (paneId !== activeTabId) return;
+      const remaining = effectiveTabs.filter((t) => t.pane_id !== paneId);
+      if (remaining.length > 0) {
+        handleSelectTab(remaining[0].pane_id);
+        return;
+      }
+      setActiveTabId(showOverview ? OVERVIEW_PANE_ID : null);
+      setProjectLayout(cliClientId, "active_tab", "");
+    },
+    [activeTabId, cliClientId, effectiveTabs, handleSelectTab, showOverview],
+  );
+
   const handleCloseTab = useCallback(
     (paneId: number) => {
       const pane = effectiveTabs.find((t) => t.pane_id === paneId);
@@ -710,15 +750,11 @@ export function TabbedView({
       }
       if (!confirm("Close this tab?")) return;
       removePane(paneId);
-      // If closing active tab, switch to another
-      if (paneId === activeTabId && effectiveTabs.length > 1) {
-        const remaining = effectiveTabs.filter((t) => t.pane_id !== paneId);
-        if (remaining.length > 0) {
-          handleSelectTab(remaining[0].pane_id);
-        }
-      }
+      selectAfterClosing(paneId);
     },
-    [removePane, activeTabId, effectiveTabs, handleSelectTab],
+    // `effectiveTabs` is read above to find the pane's worktree; leaving it out
+    // would let a stale closure miss one and skip the cleanup dialog.
+    [effectiveTabs, removePane, selectAfterClosing],
   );
 
   const handleConfirmCleanup = useCallback(
@@ -727,14 +763,9 @@ export function TabbedView({
       const { paneId } = cleanupDialog;
       removePane(paneId, action);
       setCleanupDialog(null);
-      if (paneId === activeTabId && effectiveTabs.length > 1) {
-        const remaining = effectiveTabs.filter((t) => t.pane_id !== paneId);
-        if (remaining.length > 0) {
-          handleSelectTab(remaining[0].pane_id);
-        }
-      }
+      selectAfterClosing(paneId);
     },
-    [cleanupDialog, removePane, activeTabId, effectiveTabs, handleSelectTab],
+    [cleanupDialog, removePane, selectAfterClosing],
   );
 
   const handleAddTab = useCallback((provider: string = "claude", model?: string, isolatedWorktree?: boolean, kind: PaneKind = "terminal") => {
@@ -1315,6 +1346,25 @@ export function TabbedView({
           onResumePane={resumePane}
           onRemovePane={handleCloseTab}
         />
+      ) : paneListReceived && effectiveTabs.length === 0 ? (
+        // The project really has no panes: either it is new, or the user
+        // just closed the last one. Distinct from the case below, where no
+        // roster has arrived and the legacy single-pane view is still the
+        // right guess.
+        //
+        // Deliberately no create button here. The tab bar's "+" is already
+        // rendered above with the project's launch policy applied, and a
+        // second entry point would have to duplicate that filtering — the
+        // same reason the zero-pane design rejected one for new projects.
+        <div className="flex-1 flex items-center justify-center text-gray-400">
+          <div className="text-center px-6">
+            <p className="text-lg">No pane is open</p>
+            <p className="text-sm mt-1">
+              Create a pane with <span className="font-semibold">+</span> in the
+              tab bar above to start work.
+            </p>
+          </div>
+        </div>
       ) : effectiveTabs.length === 0 ? (
         // Single-pane fallback (no pane system / synthesizing from
         // legacy messages list). Just one MessagePane, no toggling.

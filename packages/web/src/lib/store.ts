@@ -234,6 +234,8 @@ export interface SessionCacheEntry {
   paneMessages: Record<string, Message[]>;
   paneHasMore: Record<string, boolean>;
   paneConfigs: PaneConfig[];
+  /** Absent in snapshots written before this existed; read as "not received". */
+  paneListReceived?: boolean;
   paneModes: Record<string, PaneType>;
   hasMoreMessages: boolean;
   isDualPane: boolean;
@@ -625,6 +627,18 @@ interface AppState {
   // Dynamic pane state
   isDualPane: boolean;
   paneConfigs: PaneConfig[];
+  /**
+   * Whether an authoritative pane roster has arrived for the current session.
+   *
+   * `paneConfigs.length === 0` cannot answer this on its own, and the two
+   * cases need opposite handling: before a roster arrives the UI falls back to
+   * synthesizing tabs from message history, whereas a roster that arrived and
+   * is empty means the project genuinely has no panes and must show the
+   * empty state. Conflating them made closing the last pane resurrect a ghost
+   * tab from old messages — and, being the only tab, one that could not be
+   * closed again.
+   */
+  paneListReceived: boolean;
   paneMessages: Record<string, Message[]>;
   paneHasMore: Record<string, boolean>;
   paneStatuses: Record<string, string | null>;
@@ -1098,6 +1112,7 @@ export const useStore = create<AppState>((set, get) => ({
   isLoadingMore: false,
   isDualPane: false,
   paneConfigs: [],
+  paneListReceived: false,
   paneMessages: {},
   paneHasMore: {},
   paneStatuses: {},
@@ -1424,6 +1439,7 @@ export const useStore = create<AppState>((set, get) => ({
       paneModes: {},
       pausedPanes: [],
       paneConfigs: [],
+      paneListReceived: false,
       answeredQuestions: new Map(),
       deadloopMessages: [],
       interactiveMessages: [],
@@ -1510,6 +1526,7 @@ export const useStore = create<AppState>((set, get) => ({
           paneMessages: state.paneMessages,
           paneHasMore: state.paneHasMore,
           paneConfigs: state.paneConfigs,
+          paneListReceived: state.paneListReceived,
           paneModes: state.paneModes,
           hasMoreMessages: state.hasMoreMessages,
           isDualPane: state.isDualPane,
@@ -1559,6 +1576,7 @@ export const useStore = create<AppState>((set, get) => ({
           paneMessages: cached.paneMessages,
           paneHasMore: cached.paneHasMore,
           paneConfigs: cached.paneConfigs,
+          paneListReceived: cached.paneListReceived === true,
           paneModes: cached.paneModes,
           hasMoreMessages: cached.hasMoreMessages,
           isDualPane: cached.isDualPane,
@@ -1589,6 +1607,7 @@ export const useStore = create<AppState>((set, get) => ({
           paneModes: {},
           pausedPanes: [],
           paneConfigs: [],
+          paneListReceived: false,
           answeredQuestions: new Map(),
           deadloopMessages: [],
           interactiveMessages: [],
@@ -1700,6 +1719,7 @@ export const useStore = create<AppState>((set, get) => ({
               paneModes: {},
               pausedPanes: [],
               paneConfigs: [],
+              paneListReceived: false,
               teamRecords: [],
               deadloopMessages: [],
               interactiveMessages: [],
@@ -1866,6 +1886,7 @@ export const useStore = create<AppState>((set, get) => ({
       paneModes: {},
       pausedPanes: [],
       paneConfigs: [],
+      paneListReceived: false,
       answeredQuestions: new Map(),
       deadloopMessages: [],
       interactiveMessages: [],
@@ -2990,12 +3011,14 @@ if (typeof window !== "undefined") {
             messages: cached.messages,
             paneMessages: cached.paneMessages,
             paneHasMore: cached.paneHasMore,
-            paneConfigs:
-              state.paneConfigs.length > 0
-                ? state.paneConfigs
-                : cached.paneConfigs,
-            paneModes:
-              Object.keys(state.paneModes).length > 0
+            paneConfigs: state.paneListReceived
+              ? state.paneConfigs
+              : cached.paneConfigs,
+            paneListReceived:
+              state.paneListReceived || cached.paneListReceived === true,
+            paneModes: state.paneListReceived
+              ? state.paneModes
+              : Object.keys(state.paneModes).length > 0
                 ? state.paneModes
                 : cached.paneModes,
             hasMoreMessages: cached.hasMoreMessages,
@@ -3069,6 +3092,7 @@ if (typeof window !== "undefined") {
         paneMessages: cur.paneMessages,
         paneHasMore: cur.paneHasMore,
         paneConfigs: cur.paneConfigs,
+        paneListReceived: cur.paneListReceived,
         paneModes: cur.paneModes,
         hasMoreMessages: cur.hasMoreMessages,
         isDualPane: cur.isDualPane,
@@ -4129,6 +4153,7 @@ export function handleServerMessage(
               paneModes: {},
               pausedPanes: [],
               paneConfigs: [],
+              paneListReceived: false,
               teamRecords: [],
               deadloopMessages: [],
               interactiveMessages: [],
@@ -4518,9 +4543,30 @@ export function handleServerMessage(
           const kept = pendingByPane.get(pane.pane_id);
           return kept ? { ...pane, label: kept } : pane;
         });
+        // Forget panes the roster no longer lists. Tab synthesis unions the
+        // keys of these records, so a closed pane left behind here comes back
+        // as a ghost tab; pane ids are also reused, so a later pane would
+        // otherwise inherit a dead one's messages and status. Only keys absent
+        // from the roster are dropped — surviving panes keep their buckets
+        // untouched, since this handler fires on every start/stop transition.
+        const liveKeys = new Set(merged.map((pane) => paneKey(pane.pane_id)));
+        const keepLiveKeys = <T,>(record: Record<string, T>): Record<string, T> => {
+          const kept = Object.fromEntries(
+            Object.entries(record).filter(([key]) => liveKeys.has(key)),
+          );
+          // Preserve identity when nothing was dropped, so subscribers that
+          // compare by reference do not re-render on every roster broadcast.
+          return Object.keys(kept).length === Object.keys(record).length ? record : kept;
+        };
+
         const patch: Partial<AppState> = {
           paneConfigs: merged,
+          // An empty roster is a real answer, not the absence of one.
+          paneListReceived: true,
           paneModes,
+          paneMessages: keepLiveKeys(state.paneMessages),
+          paneHasMore: keepLiveKeys(state.paneHasMore),
+          paneStatuses: keepLiveKeys(state.paneStatuses),
           pausedPanes: pausedPaneIds,
           isDeadloopPaused: pausedPaneIds.includes(PANE_ID_DEADLOOP),
         };

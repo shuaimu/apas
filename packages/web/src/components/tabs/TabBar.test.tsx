@@ -138,17 +138,38 @@ describe("TabBar coordinator close controls", () => {
     Element.prototype.scrollIntoView = vi.fn();
   });
 
-  it("hides close buttons for managed coordinators while leaving unmanaged role-like tabs closable", () => {
+  it("lets every tab be closed, including a managed coordinator from a legacy project", () => {
     const { container, onCloseTab } = renderTabBar();
 
-    expect(closeButton(container, 10)).toBeNull();
-    expect(closeButton(container, 11)).toBeNull();
+    // Managed Manager/Tech Lead panes used to have no close button. Team mode
+    // is gone and nothing creates a managed pane any more, so that exemption
+    // could only strand a pane carried over in an old `.apas`.
+    expect(closeButton(container, 10)).toBeTruthy();
+    expect(closeButton(container, 11)).toBeTruthy();
     expect(closeButton(container, 12)).toBeTruthy();
     expect(closeButton(container, 13)).toBeTruthy();
 
-    fireEvent.click(closeButton(container, 12) as Element);
+    fireEvent.click(closeButton(container, 10) as Element);
+    expect(onCloseTab).toHaveBeenCalledWith(10);
 
+    fireEvent.click(closeButton(container, 12) as Element);
     expect(onCloseTab).toHaveBeenCalledWith(12);
+  });
+
+  it("offers a close button on the last remaining tab", () => {
+    // Closing the last pane leaves a project with none, which is a real state
+    // the workspace explains and the "+" reverses. While this was hidden, a
+    // tab that reappeared alone could never be dismissed.
+    const { container, onCloseTab } = renderTabBar({
+      tabs: [pane({ pane_id: 7, label: "Only pane", role: "developer" })],
+      activeTabId: 7,
+    });
+
+    const only = closeButton(container, 7);
+    expect(only).toBeTruthy();
+
+    fireEvent.click(only as Element);
+    expect(onCloseTab).toHaveBeenCalledWith(7);
   });
 
   it("uses a static amber marker for a pane awaiting an answer", () => {
@@ -163,15 +184,15 @@ describe("TabBar coordinator close controls", () => {
     expect(tab.querySelector(".animate-pulse")).toBeNull();
   });
 
-  it("keeps context-menu close hidden only for managed coordinators", () => {
+  it("offers context-menu close on every tab, coordinators included", () => {
     const { container, onCloseTab } = renderTabBar();
 
     fireEvent.contextMenu(tabButton(container, 10));
-    expect(screen.queryByText("Close")).toBeNull();
+    fireEvent.click(screen.getByText("Close"));
+    expect(onCloseTab).toHaveBeenCalledWith(10);
 
     fireEvent.contextMenu(tabButton(container, 13));
     fireEvent.click(screen.getByText("Close"));
-
     expect(onCloseTab).toHaveBeenCalledWith(13);
   });
 
