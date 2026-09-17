@@ -587,9 +587,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     .set_session_project(session_id, project_id.to_string());
                                 state.sessions.set_session_machine(session_id, machine_id);
 
-                                // Cache initial pane list if provided, preserving persisted labels/order
+                                // Cache initial pane list if provided, preserving persisted labels/order.
+                                // `None` means the CLI did not supply one; `Some([])` is a project
+                                // that genuinely has no panes, and discarding it left the server
+                                // serving the roster from before the last pane was closed.
                                 if let Some(pane_list) = &panes {
-                                    if !pane_list.is_empty() {
+                                    {
                                         let mut normalized_panes = pane_list.clone();
                                         // Recover custom labels/order from persisted file
                                         if let Ok(stored) = state.storage.load_pane_list(&session_id).await {

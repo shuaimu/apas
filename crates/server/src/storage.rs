@@ -356,13 +356,30 @@ impl FileStorage {
 
     /// Load persisted pane configurations for a session
     pub async fn load_pane_list(&self, session_id: &Uuid) -> Result<Vec<shared::PaneConfig>> {
+        Ok(self.load_pane_roster(session_id).await?.unwrap_or_default())
+    }
+
+    /// The stored roster, distinguishing "never saved" from "saved and empty".
+    ///
+    /// `load_pane_list` flattens both to an empty vec, which is right for
+    /// callers that only want whatever panes exist (label recovery, work
+    /// summaries). It is wrong for anyone deciding what to tell a web client:
+    /// a project with no panes is a legitimate state — a new project starts
+    /// that way, and closing the last pane returns to it — so "no roster on
+    /// disk" and "a roster of zero panes" have to be answerable apart.
+    /// Conflating them is what made the server fall through to inferring
+    /// panes from old messages and resurrect panes the user had closed.
+    pub async fn load_pane_roster(
+        &self,
+        session_id: &Uuid,
+    ) -> Result<Option<Vec<shared::PaneConfig>>> {
         let file_path = self.panes_file(session_id);
         if !file_path.exists() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         let data = fs::read(file_path).await?;
         let panes = serde_json::from_slice::<Vec<shared::PaneConfig>>(&data)?;
-        Ok(panes)
+        Ok(Some(panes))
     }
 
     /// Read the durable summary cache. A malformed document fails closed so
@@ -2392,6 +2409,96 @@ mod pane_work_summary_storage_tests {
             .await
             .unwrap();
         assert_eq!(recovered.summaries[0].status, PaneWorkSummaryStatus::Queued);
+    }
+}
+
+#[cfg(test)]
+mod pane_roster_tests {
+    use super::FileStorage;
+    use uuid::Uuid;
+
+    fn pane(pane_id: u32) -> shared::PaneConfig {
+        shared::PaneConfig {
+            pane_id,
+            provider: shared::Provider::Claude,
+            mode: shared::PaneMode::Interactive,
+            kind: shared::PaneKind::Terminal,
+            session_id: Uuid::new_v4(),
+            is_paused: false,
+            stop_requested: false,
+            prompt: None,
+            min_iteration_interval_minutes: None,
+            label: None,
+            model: None,
+            effort: None,
+            worktree_path: None,
+            role: None,
+            goal: None,
+            backstory: None,
+            plan_review_mode: shared::PlanReviewMode::default(),
+            manual_mode: false,
+            managed: false,
+        }
+    }
+
+    /// "Never saved" and "saved and empty" must be answerable apart.
+    ///
+    /// Both used to arrive as an empty vec, so attaching to a project whose
+    /// last pane had been closed looked exactly like a legacy session with no
+    /// roster at all. The server then inferred panes from old messages and
+    /// handed back panes the user had just closed.
+    #[tokio::test]
+    async fn an_unsaved_roster_is_unknown_and_an_empty_one_is_known() {
+        let base = std::env::temp_dir().join(format!("apas-roster-{}", Uuid::new_v4()));
+        let storage = FileStorage::new(&base);
+        let session_id = Uuid::new_v4();
+
+        assert!(
+            storage.load_pane_roster(&session_id).await.unwrap().is_none(),
+            "a session with no panes file has an unknown roster"
+        );
+
+        storage.save_pane_list(&session_id, &[]).await.unwrap();
+        assert_eq!(
+            storage
+                .load_pane_roster(&session_id)
+                .await
+                .unwrap()
+                .map(|panes| panes.len()),
+            Some(0),
+            "a project with no panes is a known, empty roster"
+        );
+
+        storage
+            .save_pane_list(&session_id, &[pane(7)])
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .load_pane_roster(&session_id)
+                .await
+                .unwrap()
+                .map(|panes| panes.len()),
+            Some(1),
+        );
+
+        // Closing the last pane returns to a known-empty roster rather than to
+        // "unknown", which is what lets the web be told the truth.
+        storage.save_pane_list(&session_id, &[]).await.unwrap();
+        assert_eq!(
+            storage
+                .load_pane_roster(&session_id)
+                .await
+                .unwrap()
+                .map(|panes| panes.len()),
+            Some(0),
+        );
+
+        // The flattening accessor keeps its old shape for callers that only
+        // want whatever panes exist.
+        assert!(storage.load_pane_list(&session_id).await.unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 

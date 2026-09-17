@@ -2257,6 +2257,13 @@ impl SessionManager {
             session
                 .pane_idle_since
                 .retain(|pane_id, _| pane_ids.contains(pane_id));
+            // Drop status for panes that are gone. A closed pane's cached
+            // "Working…" otherwise outlives it, so a project whose last pane
+            // was closed keeps reporting work in project lists, waiting-agent
+            // lists and pane summaries with no pane to attribute it to.
+            session
+                .pane_statuses
+                .retain(|pane_id, _| pane_ids.contains(pane_id));
             for pane in &panes {
                 if !session.pane_statuses.contains_key(&pane.pane_id) {
                     session
@@ -2640,6 +2647,65 @@ impl SessionManager {
             .iter()
             .map(|entry| (entry.key().0, entry.key().1.clone(), entry.value().clone()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod pane_roster_pruning_tests {
+    use super::*;
+
+    fn pane(pane_id: u32) -> PaneConfig {
+        PaneConfig {
+            pane_id,
+            provider: shared::Provider::Claude,
+            mode: shared::PaneMode::Interactive,
+            kind: shared::PaneKind::Terminal,
+            session_id: Uuid::new_v4(),
+            is_paused: false,
+            stop_requested: false,
+            prompt: None,
+            min_iteration_interval_minutes: None,
+            label: None,
+            model: None,
+            effort: None,
+            worktree_path: None,
+            role: None,
+            goal: None,
+            backstory: None,
+            plan_review_mode: shared::PlanReviewMode::default(),
+            manual_mode: false,
+            managed: false,
+        }
+    }
+
+    /// A closed pane must not leave its status behind.
+    ///
+    /// Status is what project lists, waiting-agent lists and pane summaries
+    /// read to decide a pane is working. Left behind, a project whose last
+    /// pane was closed keeps reporting work with no pane to attribute it to.
+    #[test]
+    fn closing_panes_drops_their_cached_status() {
+        let manager = SessionManager::new();
+        let session_id = Uuid::new_v4();
+        manager.create_session(session_id, Uuid::new_v4(), Uuid::new_v4());
+        manager.set_session_panes(&session_id, vec![pane(7), pane(9)]);
+
+        manager.set_pane_status(&session_id, PaneType::default(), 7, Some("Working…".into()));
+        manager.set_pane_status(&session_id, PaneType::default(), 9, Some("Working…".into()));
+        assert_eq!(manager.get_pane_statuses(&session_id).len(), 2);
+
+        // Close pane 7; pane 9 keeps its status.
+        manager.set_session_panes(&session_id, vec![pane(9)]);
+        let statuses = manager.get_pane_statuses(&session_id);
+        assert_eq!(statuses.len(), 1, "the closed pane's status is dropped");
+        assert_eq!(statuses[0].1, 9, "the surviving pane keeps its own");
+
+        // Close the last one: nothing is left claiming to be working.
+        manager.set_session_panes(&session_id, vec![]);
+        assert!(
+            manager.get_pane_statuses(&session_id).is_empty(),
+            "a project with no panes reports no pane work"
+        );
     }
 }
 

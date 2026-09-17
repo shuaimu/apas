@@ -202,6 +202,45 @@ mod transit_truncation_tests {
     }
 }
 
+/// What pane roster to report to a web client on attach.
+///
+/// `None` means genuinely unknown — a legacy session predating pane
+/// persistence — and only then may the caller infer panes from message
+/// history. `Some(panes)` means known, and it may legitimately be **empty**:
+/// a new project starts with no panes and closing the last pane returns to
+/// that state.
+///
+/// The distinction is the whole point. While "no roster stored" and "a roster
+/// of zero panes" both arrived as an empty vec, attaching to a zero-pane
+/// project fell through to inference and resurrected panes from old messages,
+/// and an empty roster was suppressed rather than sent — so a web client that
+/// reloaded kept showing panes the user had already closed, with nothing to
+/// correct it.
+async fn resolve_pane_roster(
+    state: &AppState,
+    session_id: &Uuid,
+) -> Option<Vec<shared::PaneConfig>> {
+    let cached = state.sessions.get_session_panes(session_id);
+    if !cached.is_empty() {
+        return Some(cached);
+    }
+    match state.storage.load_pane_roster(session_id).await {
+        Ok(Some(stored)) => {
+            state.sessions.set_session_panes(session_id, stored.clone());
+            Some(stored)
+        }
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(
+                %session_id,
+                %error,
+                "failed to load pane roster metadata; treating it as unknown"
+            );
+            None
+        }
+    }
+}
+
 fn infer_panes_from_messages(
     session_id: Uuid,
     messages: &[MessageInfo],
@@ -5890,32 +5929,25 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                         // Restore pane list for inactive sessions:
                         // 1) in-memory cache, 2) persisted pane metadata, 3) inferred from messages.
-                        let mut panes_to_send = state.sessions.get_session_panes(&sid);
-                        if panes_to_send.is_empty() {
-                            match state.storage.load_pane_list(&sid).await {
-                                Ok(stored_panes) if !stored_panes.is_empty() => {
-                                    state.sessions.set_session_panes(&sid, stored_panes.clone());
-                                    panes_to_send = stored_panes;
+                        // Inference runs only when the roster is unknown; a
+                        // known-empty roster is the truth and must be sent.
+                        let (panes_to_send, roster_known) =
+                            match resolve_pane_roster(&state, &sid).await {
+                                Some(panes) => (panes, true),
+                                None => {
+                                    let inferred = infer_panes_from_messages(sid, &messages);
+                                    if !inferred.is_empty() {
+                                        state
+                                            .sessions
+                                            .set_session_panes(&sid, inferred.clone());
+                                    }
+                                    (inferred, false)
                                 }
-                                Ok(_) => {}
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "Failed to load pane list metadata for session {}: {}",
-                                        sid,
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                        if panes_to_send.is_empty() {
-                            panes_to_send = infer_panes_from_messages(sid, &messages);
-                            if !panes_to_send.is_empty() {
-                                state
-                                    .sessions
-                                    .set_session_panes(&sid, panes_to_send.clone());
-                            }
-                        }
-                        if !panes_to_send.is_empty() {
+                            };
+                        // Silence still means "nothing is known" for a legacy
+                        // session with no roster and nothing to infer, so the
+                        // web keeps synthesizing from messages as before.
+                        if roster_known || !panes_to_send.is_empty() {
                             state
                                 .sessions
                                 .send_to_web(
@@ -6244,28 +6276,21 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 stored_messages.into_iter().map(to_message_info).collect();
 
                             if is_initial_load {
-                                let mut panes_to_send = state.sessions.get_session_panes(&sid);
-                                if panes_to_send.is_empty() {
-                                    if let Ok(stored_panes) =
-                                        state.storage.load_pane_list(&sid).await
-                                    {
-                                        if !stored_panes.is_empty() {
-                                            state
-                                                .sessions
-                                                .set_session_panes(&sid, stored_panes.clone());
-                                            panes_to_send = stored_panes;
+                                let (panes_to_send, roster_known) =
+                                    match resolve_pane_roster(&state, &sid).await {
+                                        Some(panes) => (panes, true),
+                                        None => {
+                                            let inferred =
+                                                infer_panes_from_messages(sid, &messages);
+                                            if !inferred.is_empty() {
+                                                state
+                                                    .sessions
+                                                    .set_session_panes(&sid, inferred.clone());
+                                            }
+                                            (inferred, false)
                                         }
-                                    }
-                                }
-                                if panes_to_send.is_empty() {
-                                    panes_to_send = infer_panes_from_messages(sid, &messages);
-                                    if !panes_to_send.is_empty() {
-                                        state
-                                            .sessions
-                                            .set_session_panes(&sid, panes_to_send.clone());
-                                    }
-                                }
-                                if !panes_to_send.is_empty() {
+                                    };
+                                if roster_known || !panes_to_send.is_empty() {
                                     state
                                         .sessions
                                         .send_to_web(
