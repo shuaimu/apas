@@ -3411,14 +3411,31 @@ async fn run_inner(
     // caller is the thing that knows how to report one project stopping.
     let stopped_because = stop_reason.lock().ok().and_then(|mut slot| slot.take());
 
-    // An intentional project CLI stop owns terminal cleanup. Full CLI reboot
-    // execs before this path, leaving host-backed providers available for the
-    // replacement controller; ordinary stop reaches here and shuts them down.
-    if let Ok(mut terminals) = terminal_panes.lock() {
-        for handle in terminals.values() {
-            handle.shutdown();
+    // An intentional project CLI stop owns terminal cleanup; a reboot must not
+    // touch it.
+    //
+    // This used to be safe by accident: a full CLI reboot exec'd inside this
+    // process and never reached here. Projects now return to the daemon, which
+    // execs afterwards, so the loop runs first — and it would kill the very
+    // pane hosts the reboot promises to adopt. `detach_for_reboot` only asks a
+    // host to release its controller; it does not mark the handle
+    // shutting-down, so `shutdown()` still runs `terminate_tmux_host`, which
+    // kills the session *and* deletes the runtime directory. Adoption after
+    // the exec would then find no descriptor, silently spawn fresh providers,
+    // and still report the panes as live-adopted — with the in-flight turn
+    // gone.
+    //
+    // Leaving them is safe in every exit: the replacement adopts them within
+    // the reboot grace, a failed exec falls back to restarting the project
+    // which adopts them too, and an orphan self-terminates when its lease
+    // expires.
+    if !reboot_requested.load(Ordering::SeqCst) {
+        if let Ok(mut terminals) = terminal_panes.lock() {
+            for handle in terminals.values() {
+                handle.shutdown();
+            }
+            terminals.clear();
         }
-        terminals.clear();
     }
 
     // Kill every pane's agent and everything it spawned. Without the group

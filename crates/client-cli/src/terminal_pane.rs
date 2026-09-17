@@ -1583,6 +1583,66 @@ mod tests {
         });
     }
 
+    /// Detaching a host for a reboot does not protect it from a later
+    /// `shutdown()`.
+    ///
+    /// `detach_for_reboot` only asks the host to release its controller so the
+    /// replacement can adopt it; it deliberately does not mark the handle
+    /// shutting-down, because the handle is still the live controller until
+    /// the process is replaced. The consequence is sharp: anything that walks
+    /// the pane map calling `shutdown()` afterwards runs `terminate_tmux_host`,
+    /// killing the session and deleting the runtime directory, so adoption
+    /// after the exec finds nothing and silently starts fresh providers while
+    /// still reporting the panes as live-adopted.
+    ///
+    /// That is why project teardown skips terminal cleanup when a reboot was
+    /// requested. This test fails if detaching ever starts implying shutdown,
+    /// which would make that guard look redundant and invite its removal.
+    #[cfg(unix)]
+    #[test]
+    fn detaching_for_reboot_leaves_the_handle_live() {
+        let root = tempfile::tempdir().unwrap();
+        let (controller, _peer) = UnixStream::pair().unwrap();
+        let session_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+        let handle = HostedTerminalHandle {
+            pane_id: 920,
+            instance_id,
+            process_group_id: None,
+            descriptor: crate::pane_host::RuntimeDescriptor {
+                protocol_version: crate::pane_host::HOST_PROTOCOL_VERSION,
+                project_id: session_id,
+                pane_id: 920,
+                runtime_id,
+                instance_id,
+                owner_uid: unsafe { libc::getuid() },
+                controller_generation: 1,
+                controller_id: Some(Uuid::new_v4()),
+                session_name: "ph_920_reboot".to_string(),
+                socket_path: root.path().join("c.sock"),
+                credential_path: root.path().join("credential"),
+                created_at_unix_ms: 1,
+            },
+            stream: Arc::new(Mutex::new(controller)),
+            lifecycle: Arc::new(Mutex::new((TerminalLifecycle::Running, None))),
+            runtime: Arc::new(Mutex::new(shared::TerminalRuntimeReconciliation {
+                runtime_id: Some(runtime_id),
+                ..Default::default()
+            })),
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            host_probe: Arc::new(|_| true),
+        };
+
+        handle.detach_for_reboot().expect("detach is written to the host");
+
+        assert!(
+            !handle.shutting_down.load(Ordering::SeqCst),
+            "detaching must leave the handle live, so a reboot's teardown has \
+             to skip terminal cleanup rather than rely on this flag"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn hosted_controller_loss_with_a_dead_host_is_reported_as_exited() {
