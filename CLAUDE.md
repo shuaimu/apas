@@ -237,6 +237,28 @@ representable at all. It is now gated on the legacy `deadloop_claude_session_id`
 / `interactive_claude_session_id` fields actually being present, which is what
 distinguishes a pre-`panes` file from a new project.
 
+**Zero panes is a state, not an absence, and saying so takes three pieces.**
+A project starts with none and returns to none when the last pane is closed,
+which the UI allows. The trap is that "the roster is empty" and "no roster has
+arrived" look identical everywhere unless they are deliberately kept apart:
+
+- `Storage::load_pane_roster` answers `Option`, where `None` is a legacy
+  session that never persisted one. `load_pane_list` still flattens both for
+  callers that only want whatever panes exist.
+- The server sends `PaneList` for a *known* roster even when it is empty, and
+  infers panes from message history only when the roster is genuinely unknown.
+  Staying silent on empty left web clients showing panes the user had closed;
+  inferring on empty fabricated them back.
+- The web store's `paneListReceived` is the same distinction client-side. With
+  it false the UI synthesizes tabs from messages, as it must before the CLI
+  reports; with it true an empty roster means an empty project. Closing the
+  last pane with the two conflated rebuilt that pane as a ghost tab from its
+  own leftover messages.
+
+Anything that reads `panes.is_empty()` to mean "not reported yet" reintroduces
+this. The pane-keyed records (`paneMessages`, `paneStatuses`, `paneHasMore`)
+are pruned to the roster for the same reason, and because pane ids are reused.
+
 `auto_approve_todos`, `auto_merge_prs` and `disallowed_tab_types` are
 project-level policy flags, settable by the project owner or the operator of the
 cluster hosting it. `disallowed_tab_types` restricts which tab types users may
