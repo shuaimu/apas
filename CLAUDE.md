@@ -1267,7 +1267,19 @@ changes the running version. The project-scoped button and the Machines page's
 `Reboot to update` therefore perform the same act, and one project's button
 restarts every project on the host — the resume manifest brings them all back,
 and pane hosts are separate processes `exec` never touches, so terminal agents
-are adopted rather than restarted. For a while it did not: a project's request
+are adopted rather than restarted.
+
+**That adoption depends on one guard: project teardown must skip terminal
+cleanup when `reboot_requested` is set.** `detach_for_reboot` only asks a host
+to release its controller and deliberately leaves the handle live, so a
+`shutdown()` afterwards still runs `terminate_tmux_host` — which kills the tmux
+session *and* deletes the runtime directory. Without the guard a reboot
+destroys the very hosts it is about to adopt, then finds no descriptor, starts
+fresh providers, and still reports the panes as live-adopted, losing whatever
+turn was in flight. The guard looks redundant because it once was: a reboot
+used to `exec` inside the project's own process and never reach teardown. It is
+load-bearing now that projects return to the daemon and the daemon execs
+afterwards. For a while it did not: a project's request
 restarted only that project's task, so `prepare_cli_restart` installed the new
 binary and the old code kept serving. The update looked prepared and never
 applied, and the machine stayed on its old version until someone used the
