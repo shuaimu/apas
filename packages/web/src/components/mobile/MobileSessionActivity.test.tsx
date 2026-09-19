@@ -375,6 +375,28 @@ describe("MobileSessionActivity", () => {
     expect(screen.queryByText("Instruction sent")).toBeNull();
   });
 
+  /// The message is the one thing this screen exists to show, and it was being
+  /// rendered below the 16px mobile body baseline — small enough to be hard to
+  /// read on a phone. A refactor that quietly puts it back to text-sm should
+  /// fail here rather than ship.
+  it("renders message text at the mobile body size, not smaller", () => {
+    seedStore({
+      paneMessages: {
+        "3": [message({ id: "readable", role: "assistant", content: "Readable body text" })],
+      },
+    });
+    renderActivity();
+
+    const card = screen.getByText(/Readable body text/).closest("article");
+    const messageLine = card?.querySelector("[data-message-line] p");
+    expect(messageLine).toBeTruthy();
+
+    const classes = messageLine?.className ?? "";
+    expect(classes).toContain("text-base");
+    expect(classes).not.toContain("text-sm");
+    expect(classes).not.toContain("text-xs");
+  });
+
   it("expands agent detail to a full-width panel outside the toggle button", () => {
     seedStore({
       paneMessages: {

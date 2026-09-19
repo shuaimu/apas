@@ -255,15 +255,15 @@ function MobileEventCard({
       >
         {label && (
           <div className="mb-2.5 flex items-center">
-            <span className="shrink-0 rounded-full bg-[#efeff5] px-2.5 py-1 text-[0.68rem] font-extrabold uppercase tracking-wide text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]">
+            <span className="shrink-0 rounded-full bg-[#efeff5] px-2.5 py-1 text-xs font-extrabold uppercase tracking-wide text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]">
               {label}
             </span>
           </div>
         )}
         <div data-message-line className="flex items-start gap-2">
-          <p className={`min-w-0 flex-1 whitespace-pre-wrap break-words text-sm leading-5 ${message.role === "user" ? "font-medium" : "font-semibold"} ${expanded ? "" : "line-clamp-3"}`}>
+          <p className={`min-w-0 flex-1 whitespace-pre-wrap break-words text-base leading-6 ${message.role === "user" ? "font-medium" : "font-semibold"} ${expanded ? "" : "line-clamp-3"}`}>
             {eventTitle(message)}
-            <time dateTime={message.timestamp.toISOString()} className="ml-2 inline-block whitespace-nowrap text-[0.68rem] font-normal leading-none text-[#686873] dark:text-[#aaaab6]">
+            <time dateTime={message.timestamp.toISOString()} className="ml-2 inline-block whitespace-nowrap text-xs font-normal leading-none text-[#686873] dark:text-[#aaaab6]">
               {message.timestamp.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
             </time>
           </p>
@@ -272,7 +272,7 @@ function MobileEventCard({
       </button>
 
       {expanded && message.role !== "user" && output?.type !== "approval_request" && !(output?.type === "tool_use" && output.tool === "AskUserQuestion") && (
-        <pre className="mt-3 box-border w-full min-w-0 max-w-full overflow-auto whitespace-pre-wrap break-words rounded-xl bg-[#efeff5] p-3 text-xs font-normal leading-5 text-[#45454f] dark:bg-[#111115] dark:text-[#c7c7d1]">{detail}</pre>
+        <pre className="mt-3 box-border w-full min-w-0 max-w-full overflow-auto whitespace-pre-wrap break-words rounded-xl bg-[#efeff5] p-3 text-sm font-normal leading-6 text-[#45454f] dark:bg-[#111115] dark:text-[#c7c7d1]">{detail}</pre>
       )}
 
       {output?.type === "approval_request" && (
