@@ -2387,7 +2387,11 @@ async fn handle_web_input(
     }
 }
 
-const TERMINAL_CONVERSATION_SUBMIT_DELAY: Duration = Duration::from_millis(100);
+/// Shared with the CLI's answer-keystroke pacing: both write on a person's
+/// behalf into a live TUI, and both are defeated by the same paste-burst
+/// classification. One value, so tuning it once tunes it everywhere.
+const TERMINAL_CONVERSATION_SUBMIT_DELAY: Duration =
+    Duration::from_millis(shared::TERMINAL_SUBMIT_SETTLE_MS);
 
 fn terminal_conversation_frame(text: &str) -> String {
     if text.contains('\n') {

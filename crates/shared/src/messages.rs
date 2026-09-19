@@ -36,6 +36,20 @@ pub const CLI_LIFECYCLE_CAPABILITY: &str = "cli_lifecycle_v1";
 /// project controller process and adopt them after a reboot.
 pub const PERSISTENT_TERMINAL_HOST_CAPABILITY: &str = "persistent_terminal_host_v1";
 pub const PANE_HOST_CLEANUP_ACK_CAPABILITY: &str = "pane_host_cleanup_ack_v1";
+
+/// How long to let a full-screen TUI settle before sending the key that
+/// submits what was just typed into it.
+///
+/// A terminal pane is driven by writing bytes to its pty, and a TUI classifies
+/// back-to-back bytes as a *paste*. An Enter inside a paste is text, not a
+/// submit, so anything written as one burst lands in the interface and then
+/// sits there unsubmitted. Both surfaces that write on a person's behalf pace
+/// themselves by this: typed conversation text, and the keystrokes that answer
+/// an agent's question.
+///
+/// One constant because the two paths hit the identical failure and a value
+/// this empirical should not be tuned in one place and forgotten in the other.
+pub const TERMINAL_SUBMIT_SETTLE_MS: u64 = 100;
 /// The daemon implements two-phase, marker-bound, credential-isolated shared
 /// project provisioning. Servers must never downgrade a member request when
 /// this capability is absent.

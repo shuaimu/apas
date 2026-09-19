@@ -443,7 +443,8 @@ fn question_options(input: &serde_json::Value) -> Vec<(String, Vec<String>)> {
         .unwrap_or_default()
 }
 
-/// Encode an answer as the keystrokes the provider's picker accepts.
+/// Encode an answer as the keystrokes the provider's picker accepts, split
+/// into the chunks they must be *delivered* in.
 ///
 /// Observed against Claude Code 2.1.233 by driving the real TUI on a pty: the
 /// dialog prints its own contract — "Enter to select · ↑/↓ to navigate · Esc to
@@ -453,24 +454,36 @@ fn question_options(input: &serde_json::Value) -> Vec<(String, Vec<String>)> {
 /// option's index from the default first entry can only ever land on an
 /// option the agent offered.
 ///
+/// The navigation and the Enter are separate chunks because a TUI reads
+/// back-to-back bytes as a paste, and an Enter inside a paste is text rather
+/// than a submit. Sent as one burst the selection moves and then sits there
+/// unconfirmed, so the answer looked delivered while the pane was still
+/// waiting and only a keypress in the terminal could finish it. The caller
+/// paces the chunks; see `shared::TERMINAL_SUBMIT_SETTLE_MS`, which the typed
+/// conversation path already needed for the same reason.
+///
 /// Returns `None` when a selection names an option the question never offered,
 /// rather than guessing — a wrong keystroke here answers on the human's behalf.
 fn encode_answer_keystrokes(
     options: &[(String, Vec<String>)],
     answers: &HashMap<String, String>,
-) -> Option<Vec<u8>> {
+) -> Option<Vec<Vec<u8>>> {
     const DOWN: &[u8] = b"\x1b[B";
     const CONFIRM: &[u8] = b"\r";
-    let mut keys = Vec::new();
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
     for (question, labels) in options {
         let selected = answers.get(question)?;
         let index = labels.iter().position(|label| label == selected)?;
-        for _ in 0..index {
-            keys.extend_from_slice(DOWN);
+        if index > 0 {
+            let mut navigation = Vec::with_capacity(index * DOWN.len());
+            for _ in 0..index {
+                navigation.extend_from_slice(DOWN);
+            }
+            chunks.push(navigation);
         }
-        keys.extend_from_slice(CONFIRM);
+        chunks.push(CONFIRM.to_vec());
     }
-    (!keys.is_empty()).then_some(keys)
+    (!chunks.is_empty()).then_some(chunks)
 }
 
 /// What to do with an answer aimed at a terminal pane. Kept separate from the
@@ -478,8 +491,8 @@ fn encode_answer_keystrokes(
 /// should not — are testable on their own.
 #[derive(Debug, PartialEq)]
 enum TerminalAnswerPlan {
-    /// Write these keystrokes to this pane's pty.
-    Deliver { pane_id: u32, keys: Vec<u8> },
+    /// Write these keystroke chunks to this pane's pty, pausing between them.
+    Deliver { pane_id: u32, keys: Vec<Vec<u8>> },
     /// Keystrokes already went out for this question; sending them again would
     /// type into whatever the TUI is showing now.
     AlreadyDelivered { pane_id: u32 },
@@ -8365,7 +8378,7 @@ mod tests {
             super::plan_terminal_answer(&pending_fruit_question(false), "toolu_1", &banana()),
             super::TerminalAnswerPlan::Deliver {
                 pane_id: 7,
-                keys: b"\x1b[B\r".to_vec()
+                keys: vec![b"\x1b[B".to_vec(), b"\r".to_vec()],
             },
         );
 
@@ -8410,20 +8423,47 @@ mod tests {
     /// The encoding is the TUI's own stated contract: ↑/↓ to navigate, Enter
     /// to select. Selecting the first option must therefore send no movement
     /// at all — the cursor already starts there.
+    ///
+    /// Navigation and Enter are separate chunks because the caller delivers
+    /// them with a pause between: a TUI reads back-to-back bytes as a paste,
+    /// and an Enter inside a paste is text rather than a submit.
     #[test]
     fn an_answer_encodes_as_the_arrow_keys_the_picker_accepts() {
         let mut answers = HashMap::new();
         answers.insert("Pick a fruit".to_string(), "Apple".to_string());
         assert_eq!(
             super::encode_answer_keystrokes(&fruit_options(), &answers),
-            Some(b"\r".to_vec()),
+            Some(vec![b"\r".to_vec()]),
+            "no movement, so the submit is the only chunk",
         );
 
         answers.insert("Pick a fruit".to_string(), "Cherry".to_string());
         assert_eq!(
             super::encode_answer_keystrokes(&fruit_options(), &answers),
-            Some(b"\x1b[B\x1b[B\r".to_vec()),
-            "two steps down from the default first entry",
+            Some(vec![b"\x1b[B\x1b[B".to_vec(), b"\r".to_vec()]),
+            "two steps down from the default first entry, then a separate Enter",
+        );
+    }
+
+    /// The bug this shape exists to prevent: everything in one write let the
+    /// TUI treat the answer as a paste, so the selection moved and then sat
+    /// there unsubmitted. Nothing may re-merge the submit into the keystrokes
+    /// that precede it.
+    #[test]
+    fn the_submit_is_never_in_the_same_chunk_as_the_navigation() {
+        let mut answers = HashMap::new();
+        answers.insert("Pick a fruit".to_string(), "Cherry".to_string());
+        let chunks = super::encode_answer_keystrokes(&fruit_options(), &answers).unwrap();
+
+        for chunk in &chunks {
+            assert!(
+                chunk == b"\r" || !chunk.contains(&b'\r'),
+                "a chunk carrying Enter must carry nothing else: {chunk:?}",
+            );
+        }
+        assert!(
+            chunks.len() > 1,
+            "a selection that needs movement must be delivered in stages",
         );
     }
 
@@ -8447,7 +8487,9 @@ mod tests {
     }
 
     /// A multi-question call walks the picker question by question, so the
-    /// selections are concatenated in the order the questions were asked.
+    /// selections come in the order the questions were asked — and every
+    /// submit is its own chunk, including the ones between questions. Pacing
+    /// only the final Enter would leave the earlier ones buried in a burst.
     #[test]
     fn a_multi_question_answer_is_one_sequence_in_question_order() {
         let options = vec![
@@ -8459,7 +8501,11 @@ mod tests {
         answers.insert("Second".to_string(), "x".to_string());
         assert_eq!(
             super::encode_answer_keystrokes(&options, &answers),
-            Some(b"\x1b[B\r\r".to_vec()),
+            Some(vec![
+                b"\x1b[B".to_vec(),
+                b"\r".to_vec(),
+                b"\r".to_vec(),
+            ]),
         );
     }
 
@@ -14136,10 +14182,44 @@ async fn run_server_connection(
                                                                 .ok()
                                                                 .and_then(|m| m.get(&pid).cloned());
                                                             match handle {
-                                                                Some(handle) => match handle.write_bytes(&keys) {
-                                                                    Ok(()) => {
-                                                                        if let Ok(mut questions) = terminal_questions.lock() {
-                                                                            if let Some(entry) = questions.get_mut(&tool_use_id) {
+                                                                Some(handle) => {
+                                                                    // Paced, and therefore off this loop:
+                                                                    // the chunks are seconds apart at worst
+                                                                    // for a multi-question answer, and this
+                                                                    // task also serves every other message
+                                                                    // for the project.
+                                                                    let questions = terminal_questions.clone();
+                                                                    let answered_id = tool_use_id.clone();
+                                                                    tokio::spawn(async move {
+                                                                        let settle = std::time::Duration::from_millis(
+                                                                            shared::TERMINAL_SUBMIT_SETTLE_MS,
+                                                                        );
+                                                                        for (index, chunk) in keys.iter().enumerate() {
+                                                                            if index > 0 {
+                                                                                // Let the TUI settle, or it
+                                                                                // reads the whole answer as
+                                                                                // one paste and the Enter
+                                                                                // never submits.
+                                                                                tokio::time::sleep(settle).await;
+                                                                            }
+                                                                            if let Err(e) = handle.write_bytes(chunk) {
+                                                                                tracing::warn!(
+                                                                                    pane_id = pid,
+                                                                                    tool_use_id = answered_id.as_str(),
+                                                                                    error = %e,
+                                                                                    chunk = index,
+                                                                                    "AnswerQuestion: terminal write failed; question stays pending",
+                                                                                );
+                                                                                // Left undelivered on purpose.
+                                                                                // A half-written answer is
+                                                                                // worth retrying; refusing the
+                                                                                // retry would strand it behind
+                                                                                // a keypress in the terminal.
+                                                                                return;
+                                                                            }
+                                                                        }
+                                                                        if let Ok(mut questions) = questions.lock() {
+                                                                            if let Some(entry) = questions.get_mut(&answered_id) {
                                                                                 entry.delivered = true;
                                                                             }
                                                                         }
@@ -14149,20 +14229,13 @@ async fn run_server_connection(
                                                                         // conversation view will show.
                                                                         tracing::info!(
                                                                             pane_id = pid,
-                                                                            tool_use_id = tool_use_id.as_str(),
+                                                                            tool_use_id = answered_id.as_str(),
+                                                                            chunks = keys.len(),
                                                                             "AnswerQuestion: wrote selection to the terminal",
                                                                         );
-                                                                        handled = true;
-                                                                    }
-                                                                    Err(e) => {
-                                                                        tracing::warn!(
-                                                                            pane_id = pid,
-                                                                            tool_use_id = tool_use_id.as_str(),
-                                                                            error = %e,
-                                                                            "AnswerQuestion: terminal write failed; question stays pending",
-                                                                        );
-                                                                    }
-                                                                },
+                                                                    });
+                                                                    handled = true;
+                                                                }
                                                                 None => {
                                                                     tracing::warn!(
                                                                         pane_id = pid,
