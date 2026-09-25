@@ -179,20 +179,45 @@ pub(crate) async fn handle_cli_user_input(
     // Terminal conversation input is stored and echoed by the web route as
     // soon as the text and Enter reach the pty. The transcript watcher later
     // reports that same user turn through CliToServer::UserInput. Consume its
-    // one-shot correlation before storage, broadcast, status, and accounting;
-    // raw terminal/TUI input has no expectation and continues normally.
+    // one-shot correlation to avoid a duplicate message, but tell the sender
+    // the provider actually recorded it. A PTY write alone cannot prove that.
     let effective_pane_id =
         pane_id.or_else(|| pane_type.map(|pane| PaneConfig::pane_id_from_legacy(&pane)));
-    if effective_pane_id.is_some_and(|pane_id| {
+    if let Some((pane_id, echo)) = effective_pane_id.and_then(|pane_id| {
         state
             .sessions
             .consume_terminal_transcript_echo(&session_id, pane_id, &text)
+            .map(|echo| (pane_id, echo))
     }) {
-        tracing::debug!(
-            %session_id,
-            pane_id = effective_pane_id,
-            "Consumed duplicate terminal transcript user turn"
-        );
+        state
+            .sessions
+            .route_to_web(
+                &session_id,
+                ServerToWeb::TerminalConversationRecorded {
+                    session_id,
+                    pane_id,
+                    client_msg_id: echo.client_msg_id,
+                },
+            )
+            .await;
+        set_and_broadcast_pane_status(
+            state,
+            session_id,
+            PaneType::Interactive,
+            pane_id,
+            Some("Working...".to_string()),
+        )
+        .await;
+        record_and_broadcast_usage(
+            state,
+            session_id,
+            Some(pane_id),
+            crate::db::UsageDelta {
+                prompt_count: 1,
+                ..Default::default()
+            },
+        )
+        .await;
         return;
     }
 
@@ -239,8 +264,7 @@ pub(crate) async fn handle_cli_user_input(
     if let Some(pane_id) = effective_pane_id
         .filter(|id| is_terminal_pane(&state.sessions.get_session_panes(&session_id), *id))
     {
-        // User turns harvested from a raw terminal still start the coarse
-        // working state. Web-originated turns already did this in ws_web.
+        // Start the coarse working state only when the provider records input.
         set_and_broadcast_pane_status(
             state,
             session_id,

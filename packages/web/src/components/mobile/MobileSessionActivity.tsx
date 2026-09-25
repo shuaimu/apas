@@ -29,10 +29,7 @@ import {
   type MachineProjectTarget,
 } from "@/lib/machineProjectTarget";
 import {
-  DELIVERY_GRACE_MS,
-  pruneConfirmed,
   unconfirmedDeliveries,
-  type PendingDelivery,
 } from "@/lib/terminalDelivery";
 import { MobileProjectManageSheet } from "./MobileProjectManageSheet";
 import { MobilePaneWorkSummarySheet } from "./MobilePaneWorkSummarySheet";
@@ -334,7 +331,8 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const [rebootTarget, setRebootTarget] = useState<PaneConfig | null>(null);
   const [openProjectTarget, setOpenProjectTarget] = useState<MachineProjectTarget | null>(null);
   // Messages written into the pty that the provider has not recorded back.
-  const [pendingDeliveries, setPendingDeliveries] = useState<PendingDelivery[]>([]);
+  const pendingDeliveries = useStore((state) => state.pendingTerminalDeliveries);
+  const dismissTerminalDelivery = useStore((state) => state.dismissTerminalDelivery);
   const [deliveryNow, setDeliveryNow] = useState(() => Date.now());
   const activityScrollRef = useRef<HTMLDivElement>(null);
   const restoredScrollContextRef = useRef<string | null>(null);
@@ -408,23 +406,10 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   );
   const visibleActivity = selectedActivity.slice(Math.max(0, selectedActivity.length - activityLimit));
 
-  // Turns for the selected pane, in the shape delivery confirmation reads.
-  const selectedTurns = useMemo(
-    () => selectedActivity.map((item) => ({
-      role: item.message.role,
-      content: item.message.content,
-      timestampMs: item.message.timestamp.getTime(),
-    })),
-    [selectedActivity],
+  const selectedDeliveries = useMemo(
+    () => pendingDeliveries.filter((entry) => entry.sessionId === sessionId && entry.paneId === selectedPaneId),
+    [pendingDeliveries, sessionId, selectedPaneId],
   );
-  // Drop what the provider has recorded, so the list stays bounded and a late
-  // confirmation clears the warning rather than leaving it stuck.
-  useEffect(() => {
-    setPendingDeliveries((previous) => {
-      const next = pruneConfirmed(previous, selectedTurns);
-      return next.length === previous.length ? previous : next;
-    });
-  }, [selectedTurns]);
   // Nothing else re-renders when the grace period simply elapses.
   useEffect(() => {
     if (pendingDeliveries.length === 0) return;
@@ -432,12 +417,8 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
     return () => window.clearInterval(timer);
   }, [pendingDeliveries.length]);
   const unconfirmed = useMemo(
-    () => unconfirmedDeliveries(
-      pendingDeliveries.filter((entry) => entry.paneId === selectedPaneId),
-      selectedTurns,
-      deliveryNow,
-    ),
-    [pendingDeliveries, selectedPaneId, selectedTurns, deliveryNow],
+    () => unconfirmedDeliveries(selectedDeliveries, deliveryNow),
+    [selectedDeliveries, deliveryNow],
   );
 
   const firstVisibleActivityKey = visibleActivity[0]?.key;
@@ -549,11 +530,6 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
         setActionError(result.error || "The conversation message could not be sent.");
         return;
       }
-      // Written blind into the pty; only the transcript can confirm it landed.
-      setPendingDeliveries((previous) => [
-        ...previous,
-        { paneId: selectedPaneId, text: followUp, sentAt: Date.now() },
-      ]);
       setFollowUp("");
       setActionError(null);
       return;
@@ -766,18 +742,27 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
       </div>
 
       <div className="shrink-0 border-t border-[#dedee7] bg-[#f7f7fa] p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] dark:border-[#383842] dark:bg-[#111115]">
+        {selectedDeliveries.length > 0 && unconfirmed.length === 0 && (
+          <p role="status" className="mb-1.5 text-xs text-[#686873] dark:text-[#aaaab6]">Sent to terminal. Waiting for the agent to record it.</p>
+        )}
         {unconfirmed.length > 0 && (
           <div role="status" aria-live="polite" className="mb-1.5 flex items-start gap-2 rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
             <AlertTriangle aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" />
             <span className="min-w-0 flex-1">
               {unconfirmed.length === 1
-                ? "This agent has not recorded your last message."
-                : `This agent has not recorded your last ${unconfirmed.length} messages.`}
+                ? "No confirmation that the agent recorded your last message."
+                : `No confirmation that the agent recorded ${unconfirmed.length} of your messages.`}
               {" "}
-              It may be mid-turn or waiting at a prompt, where typing does something else.
+              A terminal dialog may have consumed it, or recording may be delayed. Check the terminal before sending again.
               <button type="button" aria-label="Open raw terminal to check this message" onClick={openRawTerminal} className="ml-1 underline font-bold">
                 Open raw terminal
               </button>
+              {!followUp && <button type="button" onClick={() => {
+                const entry = unconfirmed[0];
+                setFollowUp(entry.text);
+                dismissTerminalDelivery(entry.id);
+              }} className="ml-2 underline font-bold">Restore draft</button>}
+              <button type="button" onClick={() => unconfirmed.forEach((entry) => dismissTerminalDelivery(entry.id))} className="ml-2 underline font-bold">Dismiss</button>
             </span>
           </div>
         )}

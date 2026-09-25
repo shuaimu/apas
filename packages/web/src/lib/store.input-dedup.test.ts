@@ -9,6 +9,7 @@
 // of an already-claimed send is dropped instead of appended.
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { useStore, type Message, paneKey } from "./store";
+import { loadTerminalDeliveries, saveTerminalDeliveries } from "./terminalDelivery";
 
 const SID_A = "11111111-1111-4111-8111-111111111111";
 const PANE_ID = 3;
@@ -39,6 +40,7 @@ function paneBucket(): Message[] {
 beforeEach(() => {
   localStorage.setItem("apas_token", "test-token");
   localStorage.removeItem("apas_pending_sends");
+  saveTerminalDeliveries([]);
   useStore.setState({
     sessionId: null,
     ws: null,
@@ -54,6 +56,7 @@ beforeEach(() => {
     deadloopMessages: [],
     interactiveMessages: [],
     pendingSends: [],
+    pendingTerminalDeliveries: [],
     sessionCache: new Map(),
     unreadSessions: new Set(),
     sessionLastCreatedAt: new Map(),
@@ -86,6 +89,46 @@ describe("sendMessageToPane carries client_msg_id", () => {
 });
 
 describe("terminal conversation messages", () => {
+  it("ignores forwarding echoes and confirms only the matching transcript acknowledgement", async () => {
+    useStore.getState().connect();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    useStore.setState({ sessionId: SID_A, isAttached: true, isDualPane: true });
+    const state = useStore.getState();
+    state.sendTerminalConversationMessage(PANE_ID, "repeat this");
+    state.sendTerminalConversationMessage(PANE_ID, "repeat this");
+    const [first, second] = useStore.getState().pendingTerminalDeliveries;
+    expect(first.id).not.toBe(second.id);
+    expect(loadTerminalDeliveries()).toEqual([first, second]);
+    expect(useStore.getState().pendingSends).toEqual([]); // no automatic PTY replay
+
+    dispatch({
+      type: "user_input", session_id: SID_A, pane_id: PANE_ID,
+      text: first.text, client_msg_id: first.id, created_at: new Date().toISOString(),
+    });
+    expect(paneBucket()[0].id).toBe(first.id);
+    expect(useStore.getState().pendingTerminalDeliveries).toEqual([first, second]);
+
+    const recorded = {
+      type: "terminal_conversation_recorded", session_id: SID_A,
+      pane_id: PANE_ID, client_msg_id: first.id,
+    };
+    dispatch({ ...recorded, session_id: "other-session" });
+    dispatch({ ...recorded, pane_id: PANE_ID + 1 });
+    dispatch({ ...recorded, client_msg_id: "unknown-id" });
+    expect(useStore.getState().pendingTerminalDeliveries).toEqual([first, second]);
+
+    // A background acknowledgement still clears the right send. A duplicate
+    // must not confirm a later message with identical text.
+    useStore.setState({ sessionId: "other-session" });
+    dispatch(recorded);
+    dispatch(recorded);
+    expect(useStore.getState().pendingTerminalDeliveries).toEqual([second]);
+    expect(loadTerminalDeliveries()).toEqual([second]);
+    expect(paneBucket()).toHaveLength(2);
+    state.dismissTerminalDelivery(second.id);
+    expect(loadTerminalDeliveries()).toEqual([]);
+  });
+
   it("renders optimistically and sends a dedicated persisted conversation operation", () => {
     const { ws, sent } = makeFakeWs();
     useStore.setState({ ws, sessionId: SID_A, isAttached: true, isDualPane: true });

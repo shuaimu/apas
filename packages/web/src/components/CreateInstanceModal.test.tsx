@@ -70,12 +70,17 @@ describe("CreateInstanceModal", () => {
     expect(screen.getByDisplayValue("https://github.com/foo/bar.git")).toBeTruthy();
   });
 
-  it("creates a brand-new project from an entered GitHub URL", () => {
+  it.each([
+    ["https://github.com/openai/codex.git", "https://github.com/openai/codex.git"],
+    ["github.com/openai/codex", "https://github.com/openai/codex"],
+    ["  github.com/openai/codex.git  ", "https://github.com/openai/codex.git"],
+    ["GITHUB.COM/openai/codex", "https://github.com/openai/codex"],
+  ])("creates a brand-new project from %s", (enteredUrl, cloneUrl) => {
     const create = seed([machine("m1", "alpha")]);
 
     render(<CreateInstanceModal open onClose={vi.fn()} />);
     fireEvent.change(screen.getByLabelText("Clone URL"), {
-      target: { value: "https://github.com/openai/codex.git" },
+      target: { value: enteredUrl },
     });
 
     expect(screen.getByText("~/apas_projects/codex")).toBeTruthy();
@@ -86,7 +91,7 @@ describe("CreateInstanceModal", () => {
       "github.com/openai/codex",
       "codex",
       "apas/codex",
-      "https://github.com/openai/codex.git",
+      cloneUrl,
       undefined,
     );
   });

@@ -2485,9 +2485,12 @@ async fn handle_terminal_conversation_input(
     // The provider transcript will later contain this same user turn. Arm a
     // one-shot correlation before sending Enter so the fast transcript path
     // cannot race ahead and persist/broadcast the message a second time.
-    state
-        .sessions
-        .expect_terminal_transcript_echo(sid, pane_id, text.clone());
+    state.sessions.expect_terminal_transcript_echo(
+        sid,
+        pane_id,
+        text.clone(),
+        client_msg_id.clone(),
+    );
 
     // Full-screen TUIs can classify back-to-back bytes as a paste burst.
     // Deliver Enter separately after the text has landed.
@@ -2563,28 +2566,9 @@ async fn handle_terminal_conversation_input(
             },
         )
         .await;
-    // Terminal panes are opaque PTYs, so unlike structured agent panes they
-    // cannot announce inference start themselves. Mark the accepted turn as
-    // working immediately; the CLI transcript observer clears this when the
-    // assistant response is recorded (and terminal exit also clears it).
-    crate::routes::ws_cli::set_and_broadcast_pane_status(
-        state,
-        sid,
-        shared::PaneType::Interactive,
-        pane_id,
-        Some("Working...".to_string()),
-    )
-    .await;
-    crate::routes::ws_cli::record_and_broadcast_usage(
-        state,
-        sid,
-        Some(pane_id),
-        crate::db::UsageDelta {
-            prompt_count: 1,
-            ..Default::default()
-        },
-    )
-    .await;
+    // Forwarding bytes does not prove the provider accepted a prompt: a menu
+    // can consume them. Only the transcript observer starts Working and
+    // counts a prompt, whether the input came from here or the raw terminal.
 }
 
 #[cfg(test)]
@@ -3080,18 +3064,20 @@ mod web_input_route_tests {
             "line one\nline two",
             Some("terminal-client-1"),
         );
-        assert!(matches!(
-            next_pane_status(&mut web_rx),
-            ServerToWeb::PaneStatus {
-                session_id: got_session_id,
-                pane_id: Some(9),
-                status: Some(ref status),
-                ..
-            } if got_session_id == session_id && status == "Working..."
-        ));
+        assert!(state.sessions.get_pane_statuses(&session_id).is_empty());
         assert_eq!(
-            state.sessions.get_pane_statuses(&session_id),
-            vec![(shared::PaneType::Interactive, 9, "Working...".to_string())],
+            state
+                .db
+                .get_project_usage_stats(&session_id.to_string())
+                .await
+                .unwrap()
+                .lifetime
+                .prompts,
+            0
+        );
+        assert!(
+            web_rx.try_recv().is_err(),
+            "forwarding is not transcript confirmation"
         );
         assert_eq!(
             state
@@ -3123,14 +3109,39 @@ mod web_input_route_tests {
             Some(9),
         )
         .await;
+        assert!(
+            matches!(web_rx.try_recv().unwrap(), ServerToWeb::TerminalConversationRecorded {
+            session_id: got_session, pane_id: 9, client_msg_id: Some(ref id),
+        } if got_session == session_id && id == "terminal-client-1")
+        );
         assert!(matches!(
-            web_rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
+            next_pane_status(&mut web_rx),
+            ServerToWeb::PaneStatus {
+                session_id: got_session_id,
+                pane_id: Some(9),
+                status: Some(ref status),
+                ..
+            } if got_session_id == session_id && status == "Working..."
         ));
+        assert_eq!(
+            state.sessions.get_pane_statuses(&session_id),
+            vec![(shared::PaneType::Interactive, 9, "Working...".to_string())],
+        );
+
         assert_eq!(
             state.storage.get_messages(&session_id).await.unwrap().len(),
             1,
             "provider transcript echo must not persist a duplicate"
+        );
+        assert_eq!(
+            state
+                .db
+                .get_project_usage_stats(&session_id.to_string())
+                .await
+                .unwrap()
+                .lifetime
+                .prompts,
+            1
         );
 
         handle_terminal_conversation_input(
@@ -3155,6 +3166,17 @@ mod web_input_route_tests {
         );
         assert_eq!(
             state.storage.get_messages(&session_id).await.unwrap().len(),
+            1
+        );
+
+        assert_eq!(
+            state
+                .db
+                .get_project_usage_stats(&session_id.to_string())
+                .await
+                .unwrap()
+                .lifetime
+                .prompts,
             1
         );
 

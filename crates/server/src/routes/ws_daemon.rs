@@ -287,13 +287,26 @@ async fn apply_registered_daemon_message(
                     .relay_project_instance_created(machine_id, request_id, project_id, error);
                 return;
             };
-            let Ok(Some(request)) = state
+            let request = match state
                 .db
                 .get_project_provisioning_by_request_id(&request_id_value)
                 .await
-            else {
-                tracing::warn!(%machine_id, request_id = %request_id_value, "ignored unknown provisioning result");
-                return;
+            {
+                Ok(Some(request)) => request,
+                Ok(None) => {
+                    // Owner requests also carry a browser correlation id, but
+                    // only shared-cluster requests have a provisioning row.
+                    // Relay ordinary results only to the authenticated owner
+                    // of this daemon, without finalizing any shared project.
+                    state
+                        .sessions
+                        .relay_project_instance_created(machine_id, request_id, project_id, error);
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(%machine_id, request_id = %request_id_value, %error, "could not look up provisioning result");
+                    return;
+                }
             };
             let Ok(requester_id) = Uuid::parse_str(&request.requester_user_id) else {
                 tracing::warn!(request_id = %request_id_value, "provisioning requester id is invalid");
@@ -685,6 +698,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_creation_results_reach_only_owner_with_or_without_request_id() {
+        let state = test_state().await;
+        let owner = Uuid::new_v4();
+        let member = Uuid::new_v4();
+        add_active_user(&state, owner, "owner@example.test").await;
+        add_active_user(&state, member, "member@example.test").await;
+        join_cluster(&state, owner, member, "member@example.test").await;
+
+        let machine_id = Uuid::new_v4();
+        let (daemon_tx, mut daemon_rx) = mpsc::channel(4);
+        register_daemon_session(
+            &state.sessions,
+            machine_id,
+            owner,
+            daemon_tx,
+            test_machine(machine_id, "owner-host"),
+            Vec::new(),
+        );
+        let owner_web_id = Uuid::new_v4();
+        let (owner_tx, mut owner_rx) = mpsc::channel(4);
+        state.sessions.register_web(owner_web_id, owner_tx);
+        state.sessions.set_web_user(owner_web_id, owner);
+        let member_web_id = Uuid::new_v4();
+        let (member_tx, mut member_rx) = mpsc::channel(4);
+        state.sessions.register_web(member_web_id, member_tx);
+        state.sessions.set_web_user(member_web_id, member);
+
+        for request_id in [Some(Uuid::new_v4().to_string()), None] {
+            for error in [
+                None,
+                Some("git clone failed: repository does not exist".to_string()),
+            ] {
+                let project_id = error.is_none().then(|| Uuid::new_v4().to_string());
+                apply_registered_daemon_message(
+                    &state,
+                    &machine_id,
+                    DaemonToServer::ProjectInstanceCreated {
+                        request_id: request_id.clone(),
+                        project_id: project_id.clone(),
+                        path: project_id
+                            .as_ref()
+                            .map(|_| "/projects/rational".to_string()),
+                        error: error.clone(),
+                    },
+                )
+                .await;
+
+                let ServerToWeb::ProjectInstanceCreated {
+                    machine_id: routed_machine,
+                    request_id: routed_request,
+                    project_id: routed_project,
+                    error: routed_error,
+                } = owner_rx
+                    .try_recv()
+                    .expect("owner must receive the creation result")
+                else {
+                    panic!("expected a creation result")
+                };
+                assert_eq!(routed_machine, machine_id);
+                assert_eq!(routed_request, request_id);
+                assert_eq!(routed_project, project_id);
+                assert_eq!(routed_error, error);
+                assert!(member_rx.try_recv().is_err());
+                assert!(daemon_rx.try_recv().is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn shared_provisioning_finalizes_before_start_and_routes_to_requester() {
         let state = test_state().await;
         let owner = Uuid::new_v4();
@@ -734,6 +816,29 @@ mod tests {
             )
             .await
             .unwrap();
+
+        // A shared result must still match its recorded machine and project;
+        // neither mismatch may fall through to the owner-result relay.
+        for (reported_machine, reported_project) in [
+            (Uuid::new_v4(), project_id.clone()),
+            (machine_id, Uuid::new_v4().to_string()),
+        ] {
+            apply_registered_daemon_message(
+                &state,
+                &reported_machine,
+                DaemonToServer::ProjectInstanceCreated {
+                    request_id: Some(request_id.clone()),
+                    project_id: Some(reported_project),
+                    path: Some("/managed/codex".to_string()),
+                    error: None,
+                },
+            )
+            .await;
+            assert!(web_rx.try_recv().is_err());
+            assert!(owner_web_rx.try_recv().is_err());
+            assert!(daemon_rx.try_recv().is_err());
+            assert!(state.db.get_project(&project_id).await.unwrap().is_none());
+        }
 
         apply_registered_daemon_message(
             &state,

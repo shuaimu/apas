@@ -1784,6 +1784,14 @@ pub enum ServerToWeb {
         client_msg_id: Option<String>,
     },
 
+    /// A provider transcript recorded a web-originated terminal message.
+    /// UserInput only acknowledges forwarding; it is not delivery evidence.
+    TerminalConversationRecorded {
+        session_id: Uuid,
+        pane_id: u32,
+        client_msg_id: Option<String>,
+    },
+
     /// Deadloop pause status update (legacy - use PanePaused for new code)
     DeadloopStatus { session_id: Uuid, is_paused: bool },
 

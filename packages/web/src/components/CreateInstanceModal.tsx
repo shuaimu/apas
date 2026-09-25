@@ -60,7 +60,9 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
   );
   const selectedMachine = availableMachines.find((entry) => entry.machine.machineId === machineId);
   const sharedTarget = selectedMachine?.clusterAccess === "member";
-  const submittedRemote = fixedRemote || canonicalRemoteFromUrl(url);
+  // Git treats a bare github.com path as a local directory.
+  const submittedCloneUrl = url.trim().replace(/^github\.com\//i, "https://github.com/");
+  const submittedRemote = fixedRemote || canonicalRemoteFromUrl(submittedCloneUrl);
   const instanceName = submittedRemote ? repoBasename(submittedRemote) : "";
   const branch = instanceName ? `apas/${instanceName}` : "";
 
@@ -91,7 +93,7 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
       submittedRemote,
       instanceName,
       branch,
-      url.trim() || undefined,
+      submittedCloneUrl || undefined,
       undefined,
     ];
     const sent = selectedMachine?.clusterOwnerUserId

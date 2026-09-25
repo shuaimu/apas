@@ -160,8 +160,9 @@ pub struct PendingDecision {
 }
 
 #[derive(Debug, Clone)]
-struct PendingTerminalTranscriptEcho {
+pub(crate) struct PendingTerminalTranscriptEcho {
     text: String,
+    pub client_msg_id: Option<String>,
     registered_at: Instant,
 }
 
@@ -521,7 +522,13 @@ impl SessionManager {
     /// Expect one provider-transcript copy of a terminal conversation input.
     /// Correlation is deliberately scoped by session and pane and consumed
     /// once, so two intentional identical prompts remain two prompts.
-    pub fn expect_terminal_transcript_echo(&self, session_id: Uuid, pane_id: u32, text: String) {
+    pub fn expect_terminal_transcript_echo(
+        &self,
+        session_id: Uuid,
+        pane_id: u32,
+        text: String,
+        client_msg_id: Option<String>,
+    ) {
         let now = Instant::now();
         let mut pending = self
             .pending_terminal_transcript_echoes
@@ -531,6 +538,7 @@ impl SessionManager {
             .retain(|item| now.duration_since(item.registered_at) <= TERMINAL_TRANSCRIPT_ECHO_TTL);
         pending.push_back(PendingTerminalTranscriptEcho {
             text,
+            client_msg_id,
             registered_at: now,
         });
         while pending.len() > MAX_PENDING_TERMINAL_TRANSCRIPT_ECHOES {
@@ -539,28 +547,27 @@ impl SessionManager {
     }
 
     /// Consume a matching provider-transcript user turn exactly once.
-    /// Returns false for raw-terminal/TUI input because those turns have no
+    /// Returns None for raw-terminal/TUI input because those turns have no
     /// server-originated expectation and must still be stored and broadcast.
-    pub fn consume_terminal_transcript_echo(
+    pub(crate) fn consume_terminal_transcript_echo(
         &self,
         session_id: &Uuid,
         pane_id: u32,
         text: &str,
-    ) -> bool {
+    ) -> Option<PendingTerminalTranscriptEcho> {
         let Some(mut pending) = self
             .pending_terminal_transcript_echoes
             .get_mut(&(*session_id, pane_id))
         else {
-            return false;
+            return None;
         };
         let now = Instant::now();
         pending
             .retain(|item| now.duration_since(item.registered_at) <= TERMINAL_TRANSCRIPT_ECHO_TTL);
         let Some(index) = pending.iter().position(|item| item.text == text) else {
-            return false;
+            return None;
         };
-        pending.remove(index);
-        true
+        pending.remove(index)
     }
 
     /// Cancel an expectation when the server cannot finish submitting or
@@ -2875,22 +2882,41 @@ mod tests {
         let sid = Uuid::new_v4();
         let other_sid = Uuid::new_v4();
 
-        mgr.expect_terminal_transcript_echo(sid, 9, "repeat me".to_string());
-        mgr.expect_terminal_transcript_echo(sid, 9, "repeat me".to_string());
+        mgr.expect_terminal_transcript_echo(sid, 9, "repeat me".to_string(), Some("first".into()));
+        mgr.expect_terminal_transcript_echo(sid, 9, "repeat me".to_string(), Some("second".into()));
 
-        assert!(!mgr.consume_terminal_transcript_echo(&other_sid, 9, "repeat me"));
-        assert!(!mgr.consume_terminal_transcript_echo(&sid, 10, "repeat me"));
-        assert!(!mgr.consume_terminal_transcript_echo(&sid, 9, "different"));
-        assert!(mgr.consume_terminal_transcript_echo(&sid, 9, "repeat me"));
-        assert!(
-            mgr.consume_terminal_transcript_echo(&sid, 9, "repeat me"),
-            "two accepted identical messages each own one correlation slot"
+        assert!(mgr
+            .consume_terminal_transcript_echo(&other_sid, 9, "repeat me")
+            .is_none());
+        assert!(mgr
+            .consume_terminal_transcript_echo(&sid, 10, "repeat me")
+            .is_none());
+        assert!(mgr
+            .consume_terminal_transcript_echo(&sid, 9, "different")
+            .is_none());
+        assert_eq!(
+            mgr.consume_terminal_transcript_echo(&sid, 9, "repeat me")
+                .unwrap()
+                .client_msg_id
+                .as_deref(),
+            Some("first")
         );
-        assert!(!mgr.consume_terminal_transcript_echo(&sid, 9, "repeat me"));
+        assert_eq!(
+            mgr.consume_terminal_transcript_echo(&sid, 9, "repeat me")
+                .unwrap()
+                .client_msg_id
+                .as_deref(),
+            Some("second")
+        );
+        assert!(mgr
+            .consume_terminal_transcript_echo(&sid, 9, "repeat me")
+            .is_none());
 
-        mgr.expect_terminal_transcript_echo(sid, 9, "cancelled".to_string());
+        mgr.expect_terminal_transcript_echo(sid, 9, "cancelled".to_string(), None);
         assert!(mgr.cancel_terminal_transcript_echo(&sid, 9, "cancelled"));
-        assert!(!mgr.consume_terminal_transcript_echo(&sid, 9, "cancelled"));
+        assert!(mgr
+            .consume_terminal_transcript_echo(&sid, 9, "cancelled")
+            .is_none());
     }
 
     #[test]
@@ -3267,7 +3293,7 @@ mod tests {
 
         mgr.append_terminal_output(&owner_session, 9, None, b"secret", 1);
         mgr.record_input_id(owner_session, "input".to_string(), "time".to_string());
-        mgr.expect_terminal_transcript_echo(owner_session, 9, "secret prompt".to_string());
+        mgr.expect_terminal_transcript_echo(owner_session, 9, "secret prompt".to_string(), None);
         mgr.purge_project_state("project-a", &[owner_user, member_user])
             .await;
         assert!(!mgr.is_cli_connected(&owner_cli));
@@ -3277,7 +3303,9 @@ mod tests {
         assert!(!mgr.sessions.contains_key(&member_session));
         assert!(mgr.terminal_snapshot(&owner_session, 9).is_none());
         assert!(mgr.seen_input_id(&owner_session, "input").is_none());
-        assert!(!mgr.consume_terminal_transcript_echo(&owner_session, 9, "secret prompt"));
+        assert!(mgr
+            .consume_terminal_transcript_echo(&owner_session, 9, "secret prompt")
+            .is_none());
     }
 
     #[test]

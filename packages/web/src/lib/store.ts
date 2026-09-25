@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { loadTerminalDeliveries, saveTerminalDeliveries, type PendingDelivery } from "./terminalDelivery";
 import {
   decodeBase64,
   emitTerminal,
@@ -708,6 +709,10 @@ interface AppState {
   /// lose the typed input. Replayed on every WS authenticate.
   /// Removed when the matching `user_input` arrives.
   pendingSends: PendingSend[];
+  // Provider acknowledgements, separate from the server's forwarding echoes.
+  // Persist for recovery, but never replay these PTY writes on reconnect.
+  pendingTerminalDeliveries: PendingDelivery[];
+  dismissTerminalDelivery: (id: string) => void;
 
   /// Persisted queue of AskUserQuestion answers waiting for claude to
   /// actually process them. Replayed on every WS authenticate so a
@@ -1137,6 +1142,7 @@ export const useStore = create<AppState>((set, get) => ({
   paneLoadingInitial: new Set(),
   reconnectWatermarks: new Map(),
   pendingSends: loadPendingSends(),
+  pendingTerminalDeliveries: loadTerminalDeliveries(),
   pendingAnswers: loadPendingAnswers(),
   pendingLabels: loadPendingLabels(),
   loadingMorePane: null,
@@ -1175,6 +1181,8 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   logout: () => {
+    saveTerminalDeliveries([]);
+    set({ pendingTerminalDeliveries: [] });
     localStorage.removeItem("apas_token");
     localStorage.removeItem("apas_user_id");
     localStorage.removeItem("apas_user_email");
@@ -2667,6 +2675,12 @@ export const useStore = create<AppState>((set, get) => ({
     if (!body) return { success: false, error: "Message cannot be empty" };
 
     const sendId = generateId();
+    const sentAt = Date.now();
+    const deliveries = [...get().pendingTerminalDeliveries, {
+      id: sendId, sessionId, paneId, text: body, sentAt,
+    }];
+    saveTerminalDeliveries(deliveries);
+    set({ pendingTerminalDeliveries: deliveries });
     get().addMessageToPane({
       id: `optimistic-${sendId}`,
       role: "user",
@@ -2682,6 +2696,12 @@ export const useStore = create<AppState>((set, get) => ({
       client_msg_id: sendId,
     }));
     return { success: true };
+  },
+
+  dismissTerminalDelivery: (id) => {
+    const deliveries = get().pendingTerminalDeliveries.filter((entry) => entry.id !== id);
+    saveTerminalDeliveries(deliveries);
+    set({ pendingTerminalDeliveries: deliveries });
   },
 
   /** Tell the pty the viewport size so the hosted TUI re-lays-out. */
@@ -5177,6 +5197,19 @@ export function handleServerMessage(
             : state.paneModes,
         }));
       }
+      break;
+    }
+
+    case "terminal_conversation_recorded": {
+      // Only a transcript acknowledgement can clear a delivery. Text matches
+      // and UserInput echoes cannot distinguish a prompt from a swallowed paste.
+      const deliveries = get().pendingTerminalDeliveries.filter((entry) => !(
+        entry.id === data.client_msg_id
+        && entry.sessionId === data.session_id
+        && entry.paneId === data.pane_id
+      ));
+      saveTerminalDeliveries(deliveries);
+      set({ pendingTerminalDeliveries: deliveries });
       break;
     }
 

@@ -53,7 +53,7 @@ function seedStore(overrides: Record<string, unknown> = {}) {
   const loadMoreMessages = vi.fn();
   const sendMessageToPane = vi.fn(() => ({ success: true }));
   const sendTerminalInput = vi.fn();
-  const sendTerminalConversationMessage = vi.fn(() => ({ success: true }));
+  const sendTerminalConversationMessage = vi.fn(initialStore.sendTerminalConversationMessage);
   const interruptPane = vi.fn();
   const approve = vi.fn();
   const reject = vi.fn();
@@ -75,6 +75,8 @@ function seedStore(overrides: Record<string, unknown> = {}) {
 
   act(() => {
     useStore.setState({
+      ws: { readyState: WebSocket.OPEN, send: vi.fn() } as unknown as WebSocket,
+      pendingTerminalDeliveries: [],
       sessionId: "session-a",
       sessions: [{
         id: "session-a",
@@ -748,16 +750,24 @@ describe("MobileSessionActivity", () => {
 
       // Writing to the pty succeeded; that proves nothing about what the
       // provider did with it, so nothing is claimed yet.
-      expect(screen.queryByText(/has not recorded/)).toBeNull();
+      expect(screen.queryByText(/No confirmation/)).toBeNull();
+      expect(screen.getByText(/Waiting for the agent to record it/)).toBeTruthy();
+
+      // The optimistic user message cannot confirm itself, including after
+      // navigating away from this screen and coming back.
+      cleanup();
+      renderActivity();
 
       await act(async () => {
         vi.advanceTimersByTime(11_000);
       });
 
-      expect(screen.getByText(/has not recorded your last message/)).toBeTruthy();
+      expect(screen.getByText(/No confirmation that the agent recorded your last message/)).toBeTruthy();
       expect(
         screen.getByRole("button", { name: "Open raw terminal to check this message" }),
       ).toBeTruthy();
+      fireEvent.click(screen.getByRole("button", { name: "Open raw terminal to check this message" }));
+      expect(screen.getByText("Raw terminal pane 3")).toBeTruthy();
     } finally {
       vi.useRealTimers();
     }
@@ -775,9 +785,10 @@ describe("MobileSessionActivity", () => {
       fireEvent.change(screen.getByRole("textbox"), { target: { value: "hello" } });
       fireEvent.click(screen.getByRole("button", { name: "Send conversation message" }));
 
-      // The provider records it, which is the only real confirmation.
+      // The store clears the pending id only on a transcript acknowledgement.
       act(() => {
         useStore.setState({
+          pendingTerminalDeliveries: [],
           paneMessages: {
             "3": [{
               id: "recorded",
@@ -793,10 +804,26 @@ describe("MobileSessionActivity", () => {
         vi.advanceTimersByTime(11_000);
       });
 
-      expect(screen.queryByText(/has not recorded/)).toBeNull();
+      expect(screen.queryByText(/No confirmation/)).toBeNull();
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("keeps delivery warnings scoped to the session and restores the original draft without resending", () => {
+    const entry = { id: "send-1", sessionId: "session-a", paneId: 3, text: "recover this", sentAt: Date.now() - 20_000 };
+    const actions = seedStore({
+      paneConfigs: [pane({ pane_id: 3, kind: "terminal" })],
+      pendingTerminalDeliveries: [{ ...entry, id: "other-send", sessionId: "session-b" }],
+    });
+    renderActivity();
+    expect(screen.queryByText(/No confirmation/)).toBeNull();
+    act(() => useStore.setState({ pendingTerminalDeliveries: [entry] }));
+    expect(screen.getByText(/No confirmation that the agent recorded your last message/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Restore draft" }));
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("recover this");
+    expect(actions.sendTerminalConversationMessage).not.toHaveBeenCalled();
+    expect(useStore.getState().pendingTerminalDeliveries).toEqual([]);
   });
 
   it("keeps the composer for composing, with the occasional actions behind one control", () => {

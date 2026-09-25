@@ -24,10 +24,10 @@
 //!   mints one per pane, so the path is exact:
 //!   `~/.claude/projects/<cwd with / as ->/<session-id>.jsonl`. No guessing.
 //! * **codex** — cannot be given an APAS-chosen id at creation. On Linux, APAS
-//!   identifies the pane's provider process group and follows the user rollout
-//!   that process group actually has open. This remains exact when several
-//!   codex panes share a cwd and when one of them resumes an older session. The
-//!   rollout's real id is then persisted for exact future resume. Other
+//!   identifies the pane's provider process group and its Codex app-server
+//!   child, then follows the user rollout they actually have open. This remains
+//!   exact when several codex panes share a cwd and when one resumes an older
+//!   session. The rollout's real id is then persisted for exact future resume. Other
 //!   platforms fall back to the newest user rollout whose `session_meta.cwd`
 //!   matches exactly, but never persist that ambiguous identity.
 //! * **opencode** — session IDs are generated as `ses_*`, so APAS cannot pin
@@ -1016,22 +1016,34 @@ fn select_codex_rollout(
     best.map(|(_, path)| path)
 }
 
-/// User rollout currently owned by one terminal's provider process group.
+/// User rollout currently owned by one terminal's provider process group or
+/// its directly launched Codex app-server.
 ///
-/// Codex keeps its active rollout open while the TUI is alive. Linux exposes
-/// those descriptors through `/proc/<pid>/fd`, and portable-pty puts the node
-/// launcher plus the native codex process in one process group. Restricting
-/// candidates to that group is the missing pane identity when two codex panes
-/// run in the same checkout.
+/// Codex 0.157 moves the rollout writer into an app-server child with its own
+/// process group. Inspect that child's descriptors too, while retaining the
+/// parent relationship that distinguishes panes sharing a checkout. Do not
+/// search arbitrary descendants: a tool can launch another independent Codex
+/// session, whose user rollout must not replace this pane's conversation.
 #[cfg(target_os = "linux")]
 pub fn find_codex_rollout_for_process_group(
     home: &Path,
     cwd: &Path,
     process_group_id: i32,
 ) -> Option<PathBuf> {
+    find_codex_rollout_in_proc(home, cwd, process_group_id, Path::new("/proc"))
+}
+
+#[cfg(target_os = "linux")]
+fn find_codex_rollout_in_proc(
+    home: &Path,
+    cwd: &Path,
+    process_group_id: i32,
+    proc_root: &Path,
+) -> Option<PathBuf> {
     let sessions_root = home.join(".codex").join("sessions");
     let mut candidates = HashSet::new();
-    let entries = std::fs::read_dir("/proc").ok()?;
+    let mut processes = Vec::new();
+    let entries = std::fs::read_dir(proc_root).ok()?;
     for entry in entries.filter_map(|entry| entry.ok()) {
         let Some(pid) = entry
             .file_name()
@@ -1040,23 +1052,50 @@ pub fn find_codex_rollout_for_process_group(
         else {
             continue;
         };
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
             continue;
         };
         // `comm` is parenthesized and may contain spaces. Fields after its
         // closing ')' begin with state, ppid, then pgrp (proc_pid_stat(5)).
-        let Some(group) = stat
+        let Some(mut fields) = stat
             .rfind(')')
             .and_then(|end| stat.get(end + 1..))
-            .and_then(|tail| tail.split_whitespace().nth(2))
-            .and_then(|value| value.parse::<i32>().ok())
+            .map(str::split_whitespace)
         else {
             continue;
         };
-        if group != process_group_id {
+        fields.next(); // state
+        let (Some(parent), Some(group)) = (
+            fields.next().and_then(|value| value.parse::<u32>().ok()),
+            fields.next().and_then(|value| value.parse::<i32>().ok()),
+        ) else {
             continue;
+        };
+        processes.push((pid, parent, group));
+    }
+    let group_members: HashSet<u32> = processes
+        .iter()
+        .filter_map(|(pid, _, group)| (*group == process_group_id).then_some(*pid))
+        .collect();
+    for (pid, parent, _) in processes {
+        let process_dir = proc_root.join(pid.to_string());
+        if !group_members.contains(&pid) {
+            if !group_members.contains(&parent) {
+                continue;
+            }
+            let Ok(command) = std::fs::read(process_dir.join("cmdline")) else {
+                continue;
+            };
+            let mut args = command.split(|byte| *byte == 0);
+            let executable = args.next().and_then(|arg| std::str::from_utf8(arg).ok());
+            if executable.and_then(|arg| Path::new(arg).file_name())
+                != Some(std::ffi::OsStr::new("codex"))
+                || args.next() != Some(b"app-server".as_slice())
+            {
+                continue;
+            }
         }
-        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        let Ok(fds) = std::fs::read_dir(process_dir.join("fd")) else {
             continue;
         };
         for fd in fds.filter_map(|fd| fd.ok()) {
@@ -1723,6 +1762,107 @@ mod tests {
                 .and_then(|path| path.file_name())
                 .and_then(|name| name.to_str()),
             Some("rollout-owned.jsonl")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fake_codex_process(
+        proc_root: &Path,
+        pid: u32,
+        parent: u32,
+        group: u32,
+        command: &[u8],
+        rollouts: &[PathBuf],
+    ) {
+        let dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(dir.join("fd")).unwrap();
+        // Include ')' and spaces in comm so the stat parser cannot assume
+        // whitespace-separated fields until after the final ')'.
+        std::fs::write(
+            dir.join("stat"),
+            format!("{pid} (codex ) child) S {parent} {group} 0"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("cmdline"), command).unwrap();
+        for (fd, rollout) in rollouts.iter().enumerate() {
+            std::os::unix::fs::symlink(rollout, dir.join("fd").join(fd.to_string())).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn codex_rollout_lookup_follows_its_app_server_child_in_a_separate_group() {
+        let home = tempfile::tempdir().unwrap();
+        let proc_root = home.path().join("proc");
+        let sessions = home.path().join(".codex/sessions/2026/09/25");
+        std::fs::create_dir_all(&sessions).unwrap();
+        for (name, time) in [
+            ("owned", "10:00"),
+            ("sibling", "11:00"),
+            ("nested", "12:00"),
+        ] {
+            write_rollout(
+                &sessions,
+                &format!("{name}.jsonl"),
+                "/repo",
+                &format!("2026-09-25T{time}:00Z"),
+                Some("user"),
+            );
+        }
+        let owned = sessions.join("owned.jsonl");
+        let sibling = sessions.join("sibling.jsonl");
+        let nested = sessions.join("nested.jsonl");
+        let subagent = sessions.join("subagent.jsonl");
+        std::fs::write(&subagent, r#"{"type":"session_meta","payload":{"cwd":"/repo","timestamp":"2026-09-25T13:00:00Z","source":{"subagent":{}},"agent_path":"/root/audit"}}"#).unwrap();
+
+        fake_codex_process(&proc_root, 100, 1, 100, b"/bin/codex\0resume\0", &[]);
+        fake_codex_process(
+            &proc_root,
+            101,
+            100,
+            101,
+            b"/releases/codex\0app-server\0--managed-daemon\0",
+            &[owned.clone(), subagent],
+        );
+        // Another pane's newer session is in the same directory.
+        fake_codex_process(&proc_root, 200, 1, 200, b"/bin/codex\0resume\0", &[]);
+        fake_codex_process(
+            &proc_root,
+            201,
+            200,
+            201,
+            b"/releases/codex\0app-server\0",
+            &[sibling.clone()],
+        );
+        // A tool launched another Codex; following all descendants would
+        // incorrectly select this newest user session.
+        fake_codex_process(
+            &proc_root,
+            102,
+            101,
+            102,
+            b"/bin/codex\0app-server\0",
+            &[nested.clone()],
+        );
+        fake_codex_process(&proc_root, 103, 100, 103, b"/bin/codex\0exec\0", &[nested]);
+
+        assert_eq!(
+            find_codex_rollout_in_proc(home.path(), Path::new("/repo"), 100, &proc_root),
+            Some(owned)
+        );
+        assert_eq!(
+            find_codex_rollout_in_proc(home.path(), Path::new("/repo"), 200, &proc_root),
+            Some(sibling)
+        );
+        assert!(
+            find_codex_rollout_in_proc(home.path(), Path::new("/different"), 100, &proc_root)
+                .is_none()
+        );
+
+        std::fs::remove_dir_all(proc_root.join("101")).unwrap();
+        assert!(
+            find_codex_rollout_in_proc(home.path(), Path::new("/repo"), 100, &proc_root).is_none(),
+            "never fall back to a sibling or tool's session when the app-server disappears"
         );
     }
 

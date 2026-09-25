@@ -952,8 +952,13 @@ otherwise have had to volunteer.
   pane's most recent cwd conversation and silently disconnect terminal output
   from APAS's transcript watcher.
 - **codex** — cannot be given an APAS-chosen id at creation. On Linux, APAS uses the terminal's
-  process group to find the user rollout that its codex process actually has
-  open, so multiple panes can share one cwd without sharing status or history.
+  process group and its directly launched Codex app-server child to find the
+  user rollout they have open, so multiple panes can share one cwd without
+  sharing status or history. Codex 0.157 writes through that app-server in a
+  separate process group; checking only the TUI's group left tla-rs's desktop
+  and mobile conversations empty while the terminal kept working. Only direct
+  `codex app-server` children qualify. Searching arbitrary descendants can
+  adopt a separate Codex session started by one of the agent's tools.
   The selected path is retained across brief descriptor gaps and changes when
   that process opens a newer user rollout through resume/fork. Its
   `session_meta.id` is then the first verified Codex identity APAS has for the
@@ -1036,6 +1041,20 @@ was clicked. Pending state is derived the same way — a question is open while
 its `tool_use` has no `tool_result` — which is what makes a blind write safe:
 a stale tab, a retransmit, or a question already answered in the terminal all
 send nothing.
+
+Terminal conversation sends need the same distinction. `UserInput` is the
+server's forwarding echo, and the optimistic bubble is local UI state. Neither
+proves that a provider recorded the prompt. A hidden OMP selector consumed a
+mobile prompt this way: it ignored the text and treated Enter as consent, while
+APAS displayed Working. The server now emits `TerminalConversationRecorded`
+with the original `client_msg_id` when its transcript correlation is consumed;
+only that observation starts Working and counts a prompt. The web keeps
+unconfirmed sends separately, scoped by session, pane and message id, and
+persists them for recovery across refreshes. After ten seconds it offers the
+raw terminal and draft recovery. Never automatically replay these PTY writes
+or infer receipt from matching chat text. A missing acknowledgement remains
+unconfirmed, including when a disconnect loses it. Provider menus are still
+opaque, so this does not make a blind Enter safe for answering them.
 
 **A pane blocked on that question is Pending answer, not Working or Idle.**
 The server caches one canonical pane status when `AskUserQuestion` arrives and
