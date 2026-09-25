@@ -57,6 +57,9 @@ function TerminalPaneWithViews({
   messages,
   mode,
   isActive,
+  onLoadMore,
+  isLoading,
+  hasMore,
 }: {
   sessionId: string | null;
   paneId: number;
@@ -64,6 +67,9 @@ function TerminalPaneWithViews({
   mode: TerminalViewMode;
   /** Whether this pane's tab is the one on screen. */
   isActive: boolean;
+  onLoadMore: () => void;
+  isLoading: boolean;
+  hasMore: boolean;
 }) {
   return (
     <>
@@ -85,7 +91,10 @@ function TerminalPaneWithViews({
             key={`terminal-chat-${sessionId}-${paneId}`}
             paneId={paneId}
             messages={messages}
-            isActive
+            onLoadMore={onLoadMore}
+            isLoading={isLoading}
+            hasMore={hasMore}
+            isActive={isActive}
           />
           {/* Writes go into the pty, not through MCP — a tool server can only
               answer calls, never push a turn into a live conversation. */}
@@ -1427,6 +1436,9 @@ export function TabbedView({
                   messages={msgs}
                   mode={terminalViewModeForPane(tab.pane_id)}
                   isActive={isActive}
+                  onLoadMore={() => loadMoreMessages(tab.pane_id)}
+                  isLoading={loadingMorePane === tab.pane_id}
+                  hasMore={paneHasMore[paneKey(tab.pane_id)] || false}
                 />
               ) : (
                 <>

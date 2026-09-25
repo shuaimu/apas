@@ -79,9 +79,44 @@ afterEach(() => {
   });
   localStorage.clear();
   vi.clearAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe("TabbedView terminal panes", () => {
+  it("loads older terminal conversation turns when scrolling to the top", async () => {
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      callback(0);
+      return 0;
+    });
+    seed([pane({ pane_id: 7, label: "Codex TTY", kind: "terminal" })], 7);
+    act(() => {
+      useStore.setState({
+        paneHasMore: { [paneKey(7)]: true },
+        paneMessages: {
+          [paneKey(7)]: Array.from({ length: 30 }, (_, index) => ({
+            id: `terminal-turn-${index}`,
+            role: "user" as const,
+            content: `Terminal turn ${index}`,
+            timestamp: new Date(Date.UTC(2026, 8, 25, 0, index)),
+            outputType: { type: "text" as const },
+          })),
+        },
+      });
+    });
+    render(<TabbedView />);
+    fireEvent.click(await screen.findByRole("button", { name: "Conversation" }));
+    const conversation = await screen.findByTestId("message-pane-7");
+    const loadMore = useStore.getState().loadMoreMessages;
+    expect(loadMore).not.toHaveBeenCalled();
+
+    fireEvent.scroll(conversation, { target: { scrollTop: 0 } });
+    expect(loadMore).toHaveBeenCalledExactlyOnceWith(7);
+
+    act(() => { useStore.setState({ loadingMorePane: 7 }); });
+    expect(screen.getByTestId("history-loading-7")).toBeTruthy();
+    expect(screen.getByText("Terminal turn 29")).toBeTruthy();
+  });
+
   it("places the view switch before Codex usage and keeps the terminal mounted", async () => {
     seed([
       pane({ pane_id: 7, label: "Codex TTY", kind: "terminal", provider: "codex" }),
