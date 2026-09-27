@@ -34,3 +34,11 @@ describe("terminal reconciliation", () => {
     expect(cleared.generation).toBe(1);
   });
 });
+
+it("passes checkpoint dimensions to the native renderer", () => {
+  const result = reconcileTerminal(initialTerminalState(), {
+    type: "terminal_snapshot", session_id: session, pane_id: 2, instance_id: instance,
+    seq: 20, data_b64: "YQ==", lifecycle: "running", screen: { cols: 91, rows: 37, checkpoint_seq: 20 },
+  });
+  expect([result.cols, result.rows]).toEqual([91, 37]);
+});

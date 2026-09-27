@@ -16,6 +16,8 @@ export interface TerminalReconciliationResult {
   action: "ignore" | "reset" | "snapshot" | "output" | "lifecycle";
   dataBase64?: string;
   truncated?: boolean;
+  cols?: number;
+  rows?: number;
 }
 
 export const initialTerminalState = (): TerminalReconciliationState => ({
@@ -66,6 +68,8 @@ export function reconcileTerminal(
       action: "snapshot",
       dataBase64: message.data_b64,
       truncated: message.truncated ?? false,
+      cols: message.screen?.cols,
+      rows: message.screen?.rows,
     };
   }
   if (message.type === "terminal_output") {

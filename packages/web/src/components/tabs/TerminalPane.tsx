@@ -21,6 +21,9 @@ import {
   handleTerminalClipboardKey,
   WriteOnlyTerminalClipboardProvider,
 } from "@/lib/terminalClipboard";
+import { installTerminalTouch } from "@/lib/terminalTouch";
+import { registerTerminalControls } from "@/lib/terminalControls";
+import { TerminalWriter } from "@/lib/terminalWriter";
 import "@xterm/xterm/css/xterm.css";
 
 /**
@@ -152,7 +155,10 @@ const DARK_QUERY = "(prefers-color-scheme: dark)";
  * browsers): that matches the palette the terminal shipped with.
  */
 function prefersDark(): boolean {
-  if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+  if (
+    typeof window === "undefined" ||
+    typeof window.matchMedia !== "function"
+  ) {
     return true;
   }
   return window.matchMedia(DARK_QUERY).matches;
@@ -198,16 +204,39 @@ export function TerminalPane({
   const [lifecycleView, setLifecycleView] = useState<{
     lifecycle?: TerminalLifecycle;
     status?: string;
+    limitedRecovery?: boolean;
+    recovering?: boolean;
   }>({ lifecycle: undefined });
 
+  const [fontSize, setFontSize] = useState(() => {
+    try {
+      const size = Number(localStorage.getItem("apas-terminal-font-size"));
+      if (Number.isInteger(size) && size >= 9 && size <= 24) return size;
+    } catch {}
+    return 13;
+  });
+  const [copyText, setCopyText] = useState<string | null>(null);
+  const fontSizeRef = useRef(fontSize);
+  const [copyNotice, setCopyNotice] = useState("");
+  const connectedRef = useRef(false);
+  const writerRef = useRef<TerminalWriter | null>(null);
   // Snapshot/live reconciliation state lives in a ref so reconnects do not
   // tear down the terminal (which would drop focus and scroll position).
-  const lastSizeRef = useRef<{ cols: number; rows: number }>({ cols: 0, rows: 0 });
 
   const attachTerminal = useStore((s) => s.attachTerminal);
   const sendTerminalInput = useStore((s) => s.sendTerminalInput);
   const sendTerminalResize = useStore((s) => s.sendTerminalResize);
   const connected = useStore((s) => s.connected);
+  useEffect(() => {
+    connectedRef.current = connected;
+  }, [connected]);
+  useEffect(() => {
+    fontSizeRef.current = fontSize;
+    if (termRef.current) termRef.current.options.fontSize = fontSize;
+    try {
+      localStorage.setItem("apas-terminal-font-size", String(fontSize));
+    } catch {}
+  }, [fontSize]);
   // Subscribing to the theme is what makes the *picker* reach the terminal.
   // Watching matchMedia alone only caught OS changes, so choosing Solarized
   // left the terminal on the old palette until the OS happened to flip.
@@ -241,14 +270,20 @@ export function TerminalPane({
     // size to the pty and make the TUI redraw at one column.
     if (container.clientWidth === 0 || container.clientHeight === 0) return;
     try {
-      fit.fit();
+      const size = fit.proposeDimensions();
+      if (!size) return;
+      if (!renderStateRef.current.screen)
+        writerRef.current?.resize(
+          Math.min(300, Math.max(2, size.cols)),
+          Math.min(120, Math.max(1, size.rows)),
+        );
+      sendTerminalResize(
+        paneId,
+        Math.min(300, Math.max(2, size.cols)),
+        Math.min(120, Math.max(1, size.rows)),
+      );
     } catch {
       return;
-    }
-    const { cols, rows } = term;
-    if (cols !== lastSizeRef.current.cols || rows !== lastSizeRef.current.rows) {
-      lastSizeRef.current = { cols, rows };
-      sendTerminalResize(paneId, cols, rows);
     }
   }, [paneId, sendTerminalResize]);
 
@@ -262,7 +297,7 @@ export function TerminalPane({
       cursorBlink: true,
       fontFamily:
         'ui-monospace, SFMono-Regular, Menlo, Monaco, "Cascadia Mono", "Roboto Mono", monospace',
-      fontSize: 13,
+      fontSize: fontSizeRef.current,
       // The hosted TUI owns the screen and scrolls itself; a large xterm
       // scrollback would just fight an alt-screen app.
       scrollback: 1000,
@@ -295,41 +330,126 @@ export function TerminalPane({
       }
     })();
 
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    const requestRecovery = () => {
+      if (disposed || retryTimer || !connectedRef.current) return;
+      attachTerminal(paneId);
+      retryTimer = setTimeout(() => {
+        retryTimer = undefined;
+        if (
+          renderStateRef.current.needsSnapshot ||
+          !renderStateRef.current.snapshotSeen
+        )
+          requestRecovery();
+      }, 2000);
+    };
+    const writer = new TerminalWriter(term, () => {
+      renderStateRef.current.needsSnapshot = true;
+      requestRecovery();
+    });
+    writerRef.current = writer;
+    const removeTouch = installTerminalTouch(term);
+    const removeControls = registerTerminalControls(paneId, (control) => {
+      if (control.kind === "focus") {
+        term.focus();
+        return true;
+      }
+      if (
+        !connectedRef.current ||
+        writer.restoring ||
+        !renderStateRef.current.snapshotSeen ||
+        renderStateRef.current.needsSnapshot ||
+        renderStateRef.current.lifecycle === "exited" ||
+        renderStateRef.current.lifecycle === "disconnected"
+      )
+        return false;
+      if (control.kind === "paste") term.paste(control.text);
+      if (control.kind === "key") {
+        const data = term.modes.applicationCursorKeysMode
+          ? control.data.replace(/^\x1b\[([ABCDHF])$/, "\x1bO$1")
+          : control.data;
+        term.input(data, true);
+      }
+      if (control.kind === "page") {
+        if (
+          term.buffer.active.type === "normal" &&
+          term.modes.mouseTrackingMode === "none"
+        )
+          term.scrollPages(control.direction);
+        else term.input(control.direction < 0 ? "\x1b[5~" : "\x1b[6~", true);
+      }
+      return true;
+    });
     const unsubscribe = subscribeTerminal(paneId, (event: TerminalEvent) => {
       const accepted = applyTerminalEvent(renderStateRef.current, event, {
-        write: (bytes) => term.write(bytes),
-        reset: () => term.reset(),
+        write: (bytes) => writer.write(bytes),
+        reset: () => writer.reset(),
+        resize: (cols, rows) => writer.resize(cols, rows),
       });
       // Output remains entirely outside React. Only low-frequency lifecycle
       // changes update component state to render or clear the status banner.
-      if (accepted && event.kind !== "output") {
+      if (renderStateRef.current.needsSnapshot) requestRecovery();
+      if (
+        accepted &&
+        (event.kind !== "output" || renderStateRef.current.needsSnapshot)
+      ) {
         setLifecycleView({
           lifecycle: renderStateRef.current.lifecycle,
           status: renderStateRef.current.status,
+          limitedRecovery: renderStateRef.current.limitedRecovery,
+          recovering: renderStateRef.current.needsSnapshot,
         });
       }
     });
 
-    const onData = term.onData((data) => sendTerminalInput(paneId, data));
+    const onData = term.onData((data) => {
+      if (
+        connectedRef.current &&
+        !writer.restoring &&
+        renderStateRef.current.snapshotSeen &&
+        !renderStateRef.current.needsSnapshot
+      )
+        sendTerminalInput(paneId, data);
+    });
     term.attachCustomKeyEventHandler((event) =>
       handleTerminalClipboardKey(event, term.hasSelection()),
     );
 
-    const observer = new ResizeObserver(() => applyFit());
+    const scrollFocusedCursor = () => {
+      if (
+        document.activeElement !== term.textarea ||
+        !window.matchMedia?.("(pointer: coarse)").matches
+      )
+        return;
+      const screen = term.element?.querySelector(".xterm-screen");
+      if (!screen) return;
+      const lineHeight = screen.getBoundingClientRect().height / term.rows;
+      const bottom = (term.buffer.active.cursorY + 1) * lineHeight + 4;
+      if (bottom > container.scrollTop + container.clientHeight)
+        container.scrollTop = bottom - container.clientHeight;
+    };
+    const observer = new ResizeObserver(scrollFocusedCursor);
     observer.observe(container);
-    applyFit();
-    term.focus();
+    const cursorListener = term.onCursorMove?.(scrollFocusedCursor);
+    // Fitting is an explicit action. Passive viewers keep the PTY's dimensions.
+    if (!window.matchMedia?.("(pointer: coarse)").matches) term.focus();
 
     return () => {
       disposed = true;
       observer.disconnect();
+      cursorListener?.dispose();
+      if (retryTimer) clearTimeout(retryTimer);
+      removeTouch();
+      removeControls();
+      writer.dispose();
+      writerRef.current = null;
       unsubscribe();
       onData.dispose();
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
     };
-  }, [paneId, sendTerminalInput, applyFit]);
+  }, [paneId, sendTerminalInput, attachTerminal]);
 
   // Restore focus when this pane becomes the visible one.
   //
@@ -347,7 +467,8 @@ export function TerminalPane({
     // Only on the edge. Focusing on every render would fight the user
     // clicking into the composer, a dialog, or the tab bar itself.
     if (!visible || wasVisible) return;
-    termRef.current?.focus();
+    if (!window.matchMedia?.("(pointer: coarse)").matches)
+      termRef.current?.focus();
   }, [visible]);
 
   // (Re)attach whenever the socket comes up. The pty kept running on the
@@ -358,10 +479,25 @@ export function TerminalPane({
     renderStateRef.current.snapshotSeen = false;
     renderStateRef.current.pending = [];
     attachTerminal(paneId);
-    // Re-send the size: the CLI may have restarted with a default pty.
-    lastSizeRef.current = { cols: 0, rows: 0 };
-    applyFit();
-  }, [connected, paneId, attachTerminal, applyFit]);
+  }, [connected, paneId, attachTerminal]);
+
+  // Mobile browsers can suspend a tab without closing its socket.
+  useEffect(() => {
+    const recover = () => {
+      if (
+        document.visibilityState === "visible" &&
+        connectedRef.current &&
+        visible
+      )
+        attachTerminal(paneId);
+    };
+    document.addEventListener("visibilitychange", recover);
+    window.addEventListener("pageshow", recover);
+    return () => {
+      document.removeEventListener("visibilitychange", recover);
+      window.removeEventListener("pageshow", recover);
+    };
+  }, [paneId, visible, attachTerminal]);
 
   const lifecycleBanner = terminalLifecycleBanner(
     lifecycleView.lifecycle,
@@ -374,12 +510,121 @@ export function TerminalPane({
     // runs in `media` mode here, so it follows the same signal the palette
     // above does and the two cannot disagree.
     <div className="relative flex h-full w-full flex-col bg-white dark:bg-[#0a0a0a]">
+      <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-neutral-300 px-2 py-1 text-xs dark:border-neutral-800">
+        <button
+          type="button"
+          disabled={!connected}
+          onClick={applyFit}
+          className="min-h-9 rounded px-2 hover:bg-neutral-200 dark:hover:bg-neutral-800"
+          title="Resize the shared terminal to this viewport"
+        >
+          Fit to this screen
+        </button>
+        <button
+          type="button"
+          aria-label="Decrease terminal font size"
+          onClick={() => setFontSize((size) => Math.max(9, size - 1))}
+          className="min-h-9 min-w-9"
+        >
+          A−
+        </button>
+        <span aria-label="Terminal font size">{fontSize}</span>
+        <button
+          type="button"
+          aria-label="Increase terminal font size"
+          onClick={() => setFontSize((size) => Math.min(24, size + 1))}
+          className="min-h-9 min-w-9"
+        >
+          A+
+        </button>
+        <button
+          type="button"
+          aria-label="Copy terminal text"
+          className="min-h-9 rounded px-2"
+          onClick={async () => {
+            const term = termRef.current;
+            if (!term) return;
+            const buffer = term.buffer.active;
+            const text =
+              term.getSelection() ||
+              Array.from(
+                { length: term.rows },
+                (_, row) =>
+                  buffer
+                    .getLine(buffer.viewportY + row)
+                    ?.translateToString(true) ?? "",
+              )
+                .join("\n")
+                .trimEnd();
+            try {
+              await navigator.clipboard.writeText(text);
+              setCopyNotice("Copied terminal text");
+            } catch {
+              setCopyText(text);
+            }
+          }}
+        >
+          Copy
+        </button>
+        <button
+          type="button"
+          disabled={!connected}
+          onClick={() => {
+            if (renderStateRef.current.screen)
+              renderStateRef.current.needsSnapshot = true;
+            attachTerminal(paneId);
+          }}
+          className="ml-auto min-h-9 rounded px-2"
+        >
+          Refresh screen
+        </button>
+      </div>
+      {copyNotice && (
+        <span role="status" className="sr-only">
+          {copyNotice}
+        </span>
+      )}
+      {copyText !== null && (
+        <div
+          role="dialog"
+          aria-label="Copy terminal text"
+          className="absolute inset-2 z-10 flex flex-col gap-2 rounded border bg-white p-3 dark:bg-neutral-900"
+        >
+          <p className="text-sm">Select the text to copy it.</p>
+          <textarea
+            aria-label="Terminal text to copy"
+            readOnly
+            value={copyText}
+            className="min-h-0 flex-1 select-text border p-2 font-mono text-base"
+          />
+          <button
+            type="button"
+            onClick={() => setCopyText(null)}
+            className="min-h-10"
+          >
+            Close
+          </button>
+        </div>
+      )}
+      {lifecycleView.recovering && (
+        <div role="status" className="px-3 py-1 text-xs text-amber-600">
+          Restoring terminal screen…
+        </div>
+      )}
+      {lifecycleView.limitedRecovery && (
+        <div role="status" className="px-3 py-1 text-xs text-amber-600">
+          Screen recovery is limited for this pane. Showing retained output.
+        </div>
+      )}
       {lifecycleBanner && (
         <div className="border-b border-neutral-300 bg-neutral-100 px-3 py-1.5 text-xs text-amber-700 dark:border-neutral-700 dark:bg-neutral-900 dark:text-amber-400">
           {lifecycleBanner}
         </div>
       )}
-      <div ref={containerRef} className="min-h-0 flex-1 overflow-hidden p-1" />
+      <div
+        ref={containerRef}
+        className="min-h-0 flex-1 overflow-auto overscroll-contain p-1"
+      />
     </div>
   );
 }

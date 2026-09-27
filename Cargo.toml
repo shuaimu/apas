@@ -51,3 +51,8 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Shared crate
 shared = { path = "crates/shared" }
+
+# The terminal emulator runs inside QuickJS. An unoptimized C interpreter
+# throttles PTY draining even in development and makes backpressure tests fail.
+[profile.dev.package.rquickjs-sys]
+opt-level = 3

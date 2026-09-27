@@ -199,3 +199,47 @@ describe("terminal lifecycle banners", () => {
     expect(terminalLifecycleBanner("running")).toBeNull();
   });
 });
+
+describe("parsed terminal checkpoints", () => {
+  const snapshot: TerminalEvent = { kind: "snapshot", instanceId: "pty-a", seq: 10, bytes: bytes(1), truncated: false, lifecycle: "running", screen: { cols: 80, rows: 24, checkpointSeq: 10 } };
+  it("restores dimensions before bytes and consumes a continuous checkpoint without repainting", () => {
+    const state = createTerminalRenderState();
+    const calls: unknown[] = [];
+    const sink = { reset: () => calls.push("reset"), resize: (cols: number, rows: number) => calls.push([cols, rows]), write: (data: Uint8Array) => calls.push(Array.from(data)) };
+    applyTerminalEvent(state, snapshot, sink);
+    expect(calls).toEqual(["reset", [80, 24], [1]]);
+    calls.length = 0;
+    applyTerminalEvent(state, { ...snapshot, seq: 11, screen: { cols: 80, rows: 24, checkpointSeq: 11 } }, sink);
+    expect(calls).toEqual([]);
+    expect(state.lastRenderedSeq).toBe(11);
+  });
+  it("buffers a gap, refuses stale snapshots, and resumes only after complete recovery", () => {
+    const state = createTerminalRenderState();
+    const io = harness();
+    applyTerminalEvent(state, snapshot, io.sink);
+    applyTerminalEvent(state, { kind: "output", instanceId: "pty-a", seq: 12, bytes: bytes(2) }, io.sink);
+    expect(state.needsSnapshot).toBe(true);
+    expect(io.writes).toEqual([[1]]);
+    expect(applyTerminalEvent(state, { ...snapshot, seq: 9 }, io.sink)).toBe(false);
+    applyTerminalEvent(state, { ...snapshot, seq: 13, bytes: bytes(3), screen: { cols: 80, rows: 24, checkpointSeq: 13 } }, io.sink);
+    expect(io.writes).toEqual([[1], [3]]);
+    expect(state.needsSnapshot).toBe(false);
+    expect(state.pending).toEqual([]);
+  });
+  it("never revives a replaced process from a delayed snapshot", () => {
+    const state = createTerminalRenderState();
+    const io = harness();
+    applyTerminalEvent(state, snapshot, io.sink);
+    applyTerminalEvent(state, { kind: "state", instanceId: "pty-b", lifecycle: "running" }, io.sink);
+    expect(applyTerminalEvent(state, snapshot, io.sink)).toBe(false);
+    expect(state.currentInstanceId).toBe("pty-b");
+  });
+  it("accepts an empty process's sequence-zero checkpoint after a legacy empty response", () => {
+    const state = createTerminalRenderState();
+    const io = harness();
+    applyTerminalEvent(state, { ...snapshot, bytes: bytes(), seq: 0, screen: undefined }, io.sink);
+    applyTerminalEvent(state, { ...snapshot, seq: 0, screen: { cols: 80, rows: 24, checkpointSeq: 0 } }, io.sink);
+    expect(state.screen).toEqual({ cols: 80, rows: 24, checkpointSeq: 0 });
+    expect(state.limitedRecovery).toBe(false);
+  });
+});

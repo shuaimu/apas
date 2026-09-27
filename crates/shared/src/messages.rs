@@ -36,6 +36,21 @@ pub const CLI_LIFECYCLE_CAPABILITY: &str = "cli_lifecycle_v1";
 /// project controller process and adopt them after a reboot.
 pub const PERSISTENT_TERMINAL_HOST_CAPABILITY: &str = "persistent_terminal_host_v1";
 pub const PANE_HOST_CLEANUP_ACK_CAPABILITY: &str = "pane_host_cleanup_ack_v1";
+pub const TERMINAL_CHECKPOINT_CAPABILITY: &str = "terminal_checkpoint_v1";
+
+/// Screen dimensions and the sequence at which the serialized screen starts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct TerminalScreenInfo {
+    pub cols: u16,
+    pub rows: u16,
+    pub checkpoint_seq: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct TerminalCheckpoint {
+    pub screen: TerminalScreenInfo,
+    pub data_b64: String,
+}
 
 /// How long to let a full-screen TUI settle before sending the key that
 /// submits what was just typed into it.
@@ -475,6 +490,14 @@ pub enum CliToServer {
         seq: u64,
     },
 
+    /// Parsed screen checkpoint from the process that owns the PTY. Never persisted as chat.
+    TerminalCheckpoint {
+        session_id: Uuid,
+        pane_id: u32,
+        instance_id: Uuid,
+        checkpoint: TerminalCheckpoint,
+    },
+
     /// A terminal pane's child process ended. The pty is gone; the web
     /// shows the status and offers a respawn rather than silently
     /// freezing on the last frame.
@@ -533,6 +556,8 @@ pub enum CliToServer {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToCli {
+    /// Request a fresh checkpoint without restarting or sending input to the provider.
+    TerminalSnapshotRequest { session_id: Uuid, pane_id: u32 },
     /// Registration successful
     Registered { cli_id: Uuid },
 
@@ -1947,6 +1972,9 @@ pub enum ServerToWeb {
         status: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         runtime: Option<TerminalRuntimeReconciliation>,
+        /// Present when data starts with a complete parsed screen, followed by live bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        screen: Option<TerminalScreenInfo>,
     },
 
     /// A terminal pane's child process ended.

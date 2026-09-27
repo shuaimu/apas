@@ -1515,7 +1515,10 @@ fn terminal_state_reports(
                 .ok()
                 .and_then(|panes| panes.get(&pane_id).cloned());
             match handle {
-                Some(handle) => handle.state_message(session_id),
+                Some(handle) => {
+                    let _ = handle.request_checkpoint();
+                    handle.state_message(session_id)
+                }
                 None => CliToServer::TerminalState {
                     session_id,
                     pane_id,
@@ -12136,6 +12139,7 @@ async fn run_server_connection(
 
                 // Register
                 let mut capabilities = vec![
+                    shared::TERMINAL_CHECKPOINT_CAPABILITY.to_string(),
                     shared::PROJECT_POLICY_CAPABILITY.to_string(),
                     shared::MOBILE_TASK_LAUNCH_CAPABILITY.to_string(),
                     shared::OPENCODE_TERMINAL_CAPABILITY.to_string(),
@@ -12705,6 +12709,15 @@ async fn run_server_connection(
                                                     None => {
                                                         tracing::debug!(pane_id, "terminal input for unknown pane");
                                                     }
+                                                }
+                                            }
+                                            ServerToCli::TerminalSnapshotRequest { session_id: _, pane_id } => {
+                                                let handle = terminal_panes
+                                                    .lock()
+                                                    .ok()
+                                                    .and_then(|panes| panes.get(&pane_id).cloned());
+                                                if let Some(handle) = handle {
+                                                    let _ = handle.request_checkpoint();
                                                 }
                                             }
                                             ServerToCli::TerminalResize { session_id: _, pane_id, cols, rows } => {

@@ -1,10 +1,18 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useEffect } from "react";
+import { registerTerminalControls } from "@/lib/terminalControls";
 import { paneWorkSummaryKey, useStore, type Message, type PaneConfig, type PaneWorkSummary } from "@/lib/store";
 import { MobileSessionActivity, type MobileSessionActivityProps } from "./MobileSessionActivity";
 
 vi.mock("@/components/tabs/TerminalPane", () => ({
-  TerminalPane: ({ paneId }: { paneId: number }) => <div>Raw terminal pane {paneId}</div>,
+  TerminalPane: function MockTerminalPane({ paneId }: { paneId: number }) {
+    useEffect(() => registerTerminalControls(paneId, (control) => {
+      if (control.kind === "key") useStore.getState().sendTerminalInput(paneId, control.data);
+      return true;
+    }), [paneId]);
+    return <div>Raw terminal pane {paneId}</div>;
+  },
 }));
 
 const initialStore = useStore.getInitialState();

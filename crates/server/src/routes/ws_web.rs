@@ -5170,7 +5170,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .mobile_metrics
                             .increment(MobileMetric::TerminalAttachEmpty);
                     }
-                    let (data_b64, seq, truncated, instance_id, lifecycle, status, runtime) =
+                    let (data_b64, seq, truncated, instance_id, lifecycle, status, runtime, screen) =
                         match retained_snapshot {
                             Some(snapshot) => (
                                 base64::engine::general_purpose::STANDARD.encode(&snapshot.bytes),
@@ -5180,6 +5180,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 snapshot.lifecycle,
                                 snapshot.status,
                                 snapshot.runtime,
+                                snapshot.screen,
                             ),
                             // No output yet (pane just spawned). Reply with an
                             // empty snapshot rather than staying silent so the
@@ -5191,6 +5192,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 false,
                                 None,
                                 TerminalLifecycle::Unknown,
+                                None,
                                 None,
                                 None,
                             ),
@@ -5209,9 +5211,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 lifecycle,
                                 status,
                                 runtime,
+                                screen,
                             },
                         )
                         .await;
+                    if state.sessions.session_supports_capability(
+                        &sid, shared::TERMINAL_CHECKPOINT_CAPABILITY,
+                    ) {
+                        state.sessions.route_to_cli(
+                            &sid,
+                            ServerToCli::TerminalSnapshotRequest { session_id: sid, pane_id },
+                        ).await;
+                    }
                 }
                 Ok(WebToServer::MobileTelemetry { event }) => {
                     if !is_mobile_client {

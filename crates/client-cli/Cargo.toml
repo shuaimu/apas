@@ -8,6 +8,7 @@ name = "apas"
 path = "src/main.rs"
 
 [dependencies]
+rquickjs = { version = "=0.14.0", features = ["parallel"] }
 shared = { workspace = true }
 
 # Async runtime

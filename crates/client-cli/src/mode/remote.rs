@@ -432,6 +432,7 @@ async fn run_connection(
             Ok(Message::Text(text)) => {
                 let parsed: Result<ServerToCli, _> = serde_json::from_str(&text);
                 match parsed {
+                    Ok(ServerToCli::TerminalSnapshotRequest { .. }) => {}
                     Ok(ServerToCli::SessionAssigned {
                         session_id,
                         working_dir: wd,

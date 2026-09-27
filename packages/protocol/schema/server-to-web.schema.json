@@ -611,6 +611,36 @@
       ]
     },
     {
+      "description": "A provider transcript recorded a web-originated terminal message.\nUserInput only acknowledges forwarding; it is not delivery evidence.",
+      "type": "object",
+      "properties": {
+        "client_msg_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "terminal_conversation_recorded"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id"
+      ]
+    },
+    {
       "description": "Deadloop pause status update (legacy - use PanePaused for new code)",
       "type": "object",
       "properties": {
@@ -1061,6 +1091,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/TerminalRuntimeReconciliation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "screen": {
+          "description": "Present when data starts with a complete parsed screen, followed by live bytes.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TerminalScreenInfo"
             },
             {
               "type": "null"
@@ -2534,6 +2575,11 @@
           "description": "Pi coding agent (`pi`): terminal-only in APAS. See\n`terminal_pane::terminal_binary_for`.",
           "type": "string",
           "const": "pi"
+        },
+        {
+          "description": "Oh My Pi (`omp`): a standalone Pi-derived agent, terminal-only in APAS.\nUnlike Pi it has no `--session-id`, so a pane is pinned by giving it a\nprivate `--session-dir` instead; see `terminal_pane::omp_session_args`.",
+          "type": "string",
+          "const": "omp"
         }
       ]
     },
@@ -2714,6 +2760,34 @@
           "default": false
         }
       }
+    },
+    "TerminalScreenInfo": {
+      "description": "Screen dimensions and the sequence at which the serialized screen starts.",
+      "type": "object",
+      "properties": {
+        "checkpoint_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cols": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "rows": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "cols",
+        "rows",
+        "checkpoint_seq"
+      ]
     },
     "UsageCounters": {
       "description": "Aggregated usage counters for a pane or project over one time window.\nAll token counts come from the per-turn Claude/Codex stream `result`\nusage; `prompts` counts user/loop inputs and `responses` counts completed\nturns. Fields are snake_case so the wire keys match the web store verbatim.",

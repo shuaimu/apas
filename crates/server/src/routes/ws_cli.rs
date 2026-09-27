@@ -1227,6 +1227,38 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     tracing::warn!(%error, %session_id, pane_id, "failed to enqueue plan notification");
                                 }
                             }
+                            Ok(CliToServer::TerminalCheckpoint { session_id, pane_id, instance_id, checkpoint }) => {
+                                let Ok((_project_id, _operation_guard)) = state
+                                    .active_session_operation(&session_id.to_string())
+                                    .await
+                                else {
+                                    continue;
+                                };
+                                let Ok(bytes) = base64::engine::general_purpose::STANDARD
+                                    .decode(&checkpoint.data_b64)
+                                else {
+                                    continue;
+                                };
+                                if let Some(snapshot) = state.sessions.record_terminal_checkpoint(
+                                    &session_id, pane_id, instance_id, checkpoint.screen, &bytes,
+                                ) {
+                                    state.sessions.route_to_web(
+                                        &session_id,
+                                        ServerToWeb::TerminalSnapshot {
+                                            session_id,
+                                            pane_id,
+                                            instance_id: Some(instance_id),
+                                            data_b64: checkpoint.data_b64,
+                                            seq: snapshot.seq,
+                                            truncated: false,
+                                            lifecycle: snapshot.lifecycle,
+                                            status: snapshot.status,
+                                            runtime: snapshot.runtime,
+                                            screen: snapshot.screen,
+                                        },
+                                    ).await;
+                                }
+                            }
                             Ok(CliToServer::TerminalOutput { session_id, pane_id, instance_id, data_b64, seq }) => {
                                 let Ok((_project_id, _operation_guard)) = state
                                     .active_session_operation(&session_id.to_string())
