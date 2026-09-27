@@ -120,13 +120,3 @@ describe("TerminalPane focus across tab switches", () => {
     expect(term.focus).toHaveBeenCalledTimes(1);
   });
 });
-
-it("does not resize the shared PTY on mount, reconnect, or returning to a tab", () => {
-  storeState.sendTerminalResize.mockClear();
-  const { rerender } = render(<TerminalPane paneId={19} visible />);
-  storeState.connected = false;
-  rerender(<TerminalPane paneId={19} visible={false} />);
-  storeState.connected = true;
-  rerender(<TerminalPane paneId={19} visible />);
-  expect(storeState.sendTerminalResize).not.toHaveBeenCalled();
-});

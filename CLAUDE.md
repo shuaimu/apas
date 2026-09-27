@@ -1199,85 +1199,42 @@ ANSI would both bloat the store and break the message renderer. They ride
 dedicated `Terminal*` messages, base64-encoded because a pty read splits
 both UTF-8 sequences and escape sequences:
 
-- `CliToServer::TerminalOutput` / `TerminalCheckpoint` / `TerminalExited` / `TerminalState`
+- `CliToServer::TerminalOutput` / `TerminalExited` / `TerminalState`
 - `ServerToWeb::TerminalOutput` / `TerminalSnapshot` / `TerminalExited` /
   `TerminalState`
 - `WebToServer::TerminalInput` / `TerminalResize` / `TerminalAttach`
-- `ServerToCli::TerminalInput` / `TerminalResize` / `TerminalSnapshotRequest`
+- `ServerToCli::TerminalInput` / `TerminalResize`
 
-**Recovery restores a screen, not a suffix of terminal output.** New pane hosts
-embed xterm.js 6.0.0 in a QuickJS runtime. This is the same pinned emulator as
-the web view; no Node installation or sidecar is needed on the agent machine.
-The mirror has no filesystem, network, clipboard, or provider-input interface.
-It retains 1,000 scrollback lines and both screen buffers. Its JS heap is capped
-at 64 MiB, terminal dimensions at 300 columns by 120 rows, and a checkpoint at
-16 MiB. Emulator failure falls back to raw output without stopping the provider.
-
-`terminal_screen.rs` creates ANSI checkpoints with cursor, attributes, saved
-cursors, margins, tabs, character sets, mouse encoding, and input modes. It
-also retains a bounded unfinished escape/UTF-8 sequence so the next read can
-complete it. The vendored xterm and serialization sources live under
-`crates/client-cli/src/terminal_engine/`, with their licenses. Their versions
-are pinned because `bridge.js` supplements the upstream serializer through a
-small set of internal APIs. Update them with
-`node scripts/update_terminal_engine.mjs` after reviewing the package pins.
-The cross-emulator fixtures must pass before changing those pins.
-
-A checkpoint consumes a sequence number on the same lock as output and
-resizing. Hosts emit one on request, after resizing, and after 128 KiB of new
-output. The server retains the checkpoint plus up to 256 KiB of contiguous
-output. A missing sequence or an overflowing tail invalidates the checkpoint;
-it is never advertised as a complete screen after bytes have been discarded.
-`TerminalAttach` returns retained state immediately and requests a fresh
-checkpoint from a capable CLI. A server restart therefore recovers from the
-still-running host. Direct PTYs use the same engine and recover while their
-owning CLI remains alive.
+The server keeps a bounded in-memory state entry per `(session, pane)` with
+scrollback bytes, the newest sequence, truncation, PTY instance UUID,
+lifecycle (`unknown`, `running`, `disconnected`, or `exited`), and optional
+exit status. `TerminalAttach` is answered from that entry, including when it
+has lifecycle but no bytes, so reattach paints immediately and a process that
+exited before producing output still gets an accurate banner.
 
 **PTY lifetime is not WebSocket lifetime.** A transport-only CLI disconnect
-changes running terminal entries to `disconnected` but retains their bounded
-presentation. Each PTY has a UUID. A running report for the same UUID restores
-`running`; a different UUID replaces the entry. Output, checkpoints, and exits
-from a replaced UUID are ignored. Explicit pane removal deletes the entry.
-Terminal presentation remains in memory only, never in SQLite or chat JSONL.
+changes confirmed-running terminal entries to `disconnected` but retains their
+bounded presentation. When the same APAS process reconnects, it reports every
+configured terminal before draining queued output. Each spawned PTY has a UUID:
+a running report for the same UUID restores `running` without clearing bytes,
+while a different UUID replaces the entry and starts with fresh presentation.
+Output and exit events from an older UUID are ignored. An already-`exited`
+entry and its status stay exited across later transport cleanup. Explicit pane
+removal still deletes the entry.
 
-Browser frames bypass Zustand through `terminalBus.ts`. The reconciler checks
-instance and sequence identity, requests recovery on gaps, and bounds output
-buffered during attachment. `TerminalWriter` orders asynchronous xterm writes
-with reset and resize operations. A restored screen is painted at its recorded
-dimensions before later output is applied. A viewer already holding every
-preceding frame can consume a checkpoint without repainting.
+Retention is deliberately non-durable. Terminal bytes and lifecycle remain in
+the session manager only, obey `TERMINAL_SCROLLBACK_MAX_BYTES`, and are never
+written to SQLite or `messages.jsonl`; a server restart loses them and state is
+`unknown` until the CLI reconciles again.
 
-**Phone controls operate the same running terminal.** Touch gestures scroll
-local history when mouse reporting is off, or pass wheel events through xterm
-when the application owns scrolling. This works around the touch regression
-in xterm 6.0.0 without upgrading to a prerelease. The key bar offers keyboard
-focus, Esc, Tab, arrows, control letters, page keys, and a multiline draft.
-Pasting a draft uses the terminal's bracketed-paste mode and does not press
-Enter. Drafts survive view changes; a blocked paste keeps the draft. Font size
-and copying screen text are available above the terminal. The phone viewport
-tracks the software keyboard without resizing the shared PTY.
-
-**Only an explicit "Fit to this screen" action changes PTY dimensions.** The
-last person to use it chooses the shared size. Mounting, reconnecting, rotating,
-or revealing another viewer never competes for that size. Passive viewers
-scroll their viewport as needed. The conversation view remains an optional
-provider-transcript mirror and labels that it can lag the live terminal.
-
-**Older running hosts stay alive.** `Adopted.screen_checkpoint` defaults to
-false; a new controller never sends an unsupported command to an old host.
-Those panes retain legacy replay and show a limited-recovery notice. Full
-checkpoint recovery starts when a pane is next created or explicitly restarted.
-A CLI upgrade alone cannot reconstruct mode-setting bytes an older host already
-discarded, and must not kill that provider to obtain them.
-
-Regression checks include `pane_host::tests`, `terminal_screen::tests`, server
-terminal tests, web reconciliation tests, and `terminalCheckpoint.test.ts`.
-Regenerate its synthetic fixture with
-`cargo run -p apas --example terminal_checkpoint_fixture` and write the output
-to `packages/web/src/lib/terminalCheckpoints.fixture.json` after it completes.
-`scripts/check_terminal_browser.cjs` exercises real Chromium touch input and
-restored mouse/paste modes without connecting to an APAS server. It accepts
-`APAS_PLAYWRIGHT_MODULE` and `APAS_CHROMIUM_PATH` for external browser installs.
+On the web side, frames bypass zustand entirely (`lib/terminalBus.ts`): a
+full-screen TUI repaints many times a second, and storing chunks in state
+would re-render every subscriber per frame. `TerminalPane` tracks the current
+PTY UUID and last rendered sequence locally. Same-instance snapshots at an
+already-rendered sequence update lifecycle without duplicating output;
+cumulative snapshots that cover missed frames and replacement UUIDs reset
+xterm before replay. Snapshot/live lifecycle is authoritative for the
+disconnected, unknown, and exited banners, including empty snapshots.
 
 Claude's fullscreen TUI captures the mouse and owns text selection, then sends
 the selected text to its terminal through OSC 52. The web terminal loads
@@ -1386,7 +1343,7 @@ Pane-host state is host-local, volatile, and outside the project directory:
 - `runtime.json` contains identity, protocol, tmux session, and socket paths,
   but no credential or terminal content. The random 256-bit credential is in a
   separate owner-only file and is never sent to providers or the server.
-- Detached terminal output remains only in the pane-host's bounded in-memory ring and parsed screen;
+- Raw detached output remains only in the pane-host's bounded in-memory ring;
   it is not written to `.apas`, SQLite, JSONL, or a spool file.
 
 **A host that is gone is reported as exited, not disconnected.** When the

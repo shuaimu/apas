@@ -233,8 +233,3 @@ header {
     padding-right: env(safe-area-inset-right);
   }
 }
-
-/* Avoid iOS zooming the hidden input when the terminal keyboard opens. */
-@media (pointer: coarse) {
-  .xterm .xterm-helper-textarea { font-size: 16px !important; }
-}

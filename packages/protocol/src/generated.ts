@@ -30,8 +30,7 @@ export type PaneMode = "deadloop" | "interactive";
 /**
  * Provider for a pane
  */
-export type Provider =
-  ("codex" | "deepseek" | "opencode" | "cursor-agent") | "claude" | "minimax" | "glm" | "pi" | "omp";
+export type Provider = ("codex" | "deepseek" | "opencode" | "cursor-agent") | "claude" | "minimax" | "glm" | "pi";
 export type CodeEventKind =
   | "instruction"
   | "agent_status"
@@ -221,13 +220,6 @@ export type ServerToWeb =
       [k: string]: unknown;
     }
   | {
-      client_msg_id?: string | null;
-      pane_id: number;
-      session_id: string;
-      type: "terminal_conversation_recorded";
-      [k: string]: unknown;
-    }
-  | {
       is_paused: boolean;
       session_id: string;
       type: "deadloop_status";
@@ -263,7 +255,7 @@ export type ServerToWeb =
       /**
        * Provider for a pane
        */
-      provider?: ("codex" | "deepseek" | "opencode" | "cursor-agent") | "claude" | "minimax" | "glm" | "pi" | "omp";
+      provider?: ("codex" | "deepseek" | "opencode" | "cursor-agent") | "claude" | "minimax" | "glm" | "pi";
       type: "usage_limits";
       [k: string]: unknown;
     }
@@ -358,10 +350,6 @@ export type ServerToWeb =
       lifecycle?: "unknown" | "running" | "disconnected" | "exited";
       pane_id: number;
       runtime?: TerminalRuntimeReconciliation | null;
-      /**
-       * Present when data starts with a complete parsed screen, followed by live bytes.
-       */
-      screen?: TerminalScreenInfo | null;
       seq: number;
       session_id: string;
       status?: string | null;
@@ -1751,15 +1739,6 @@ export interface TerminalRuntimeReconciliation {
   oldest_seq?: number;
   runtime_id?: string | null;
   truncated?: boolean;
-  [k: string]: unknown;
-}
-/**
- * Screen dimensions and the sequence at which the serialized screen starts.
- */
-export interface TerminalScreenInfo {
-  checkpoint_seq: number;
-  cols: number;
-  rows: number;
   [k: string]: unknown;
 }
 /**

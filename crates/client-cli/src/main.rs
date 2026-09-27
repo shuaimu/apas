@@ -24,7 +24,6 @@ mod project;
 mod summary_runner;
 mod supervisor;
 mod terminal_pane;
-mod terminal_screen;
 mod transcript;
 mod tui;
 mod update;

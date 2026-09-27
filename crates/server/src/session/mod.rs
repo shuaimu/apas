@@ -246,8 +246,6 @@ pub struct TerminalStateEntry {
     lifecycle: TerminalLifecycle,
     status: Option<String>,
     runtime: Option<shared::TerminalRuntimeReconciliation>,
-    screen: Option<shared::TerminalScreenInfo>,
-    checkpoint_bytes: usize,
 }
 
 /// Immutable terminal state returned to attach handlers and lifecycle fans.
@@ -260,7 +258,6 @@ pub struct TerminalSnapshotState {
     pub lifecycle: TerminalLifecycle,
     pub status: Option<String>,
     pub runtime: Option<shared::TerminalRuntimeReconciliation>,
-    pub screen: Option<shared::TerminalScreenInfo>,
 }
 
 impl TerminalStateEntry {
@@ -273,14 +270,11 @@ impl TerminalStateEntry {
             lifecycle: self.lifecycle,
             status: self.status.clone(),
             runtime: self.runtime.clone(),
-            screen: self.screen.clone(),
         }
     }
 
     fn replace_instance(&mut self, instance_id: Uuid) {
         self.buf.clear();
-        self.screen = None;
-        self.checkpoint_bytes = 0;
         self.seq = 0;
         self.has_output = false;
         self.truncated = false;
@@ -392,58 +386,15 @@ impl SessionManager {
             return false;
         }
 
-        if entry.screen.is_some() && seq != entry.seq.saturating_add(1) {
-            entry.buf.clear();
-            entry.screen = None;
-            entry.checkpoint_bytes = 0;
-            entry.truncated = true;
-        }
         entry.buf.extend(bytes.iter().copied());
         entry.seq = seq;
         entry.has_output = true;
-        if entry.buf.len() > entry.checkpoint_bytes + TERMINAL_SCROLLBACK_MAX_BYTES {
-            // Never advertise a clipped checkpoint as a valid screen. A fresh
-            // checkpoint is requested on attach; the host also sends them periodically.
-            entry.screen = None;
-            entry.checkpoint_bytes = 0;
+        if entry.buf.len() > TERMINAL_SCROLLBACK_MAX_BYTES {
             let overflow = entry.buf.len() - TERMINAL_SCROLLBACK_MAX_BYTES;
             entry.buf.drain(..overflow);
             entry.truncated = true;
         }
         true
-    }
-
-    pub fn record_terminal_checkpoint(
-        &self,
-        session_id: &Uuid,
-        pane_id: u32,
-        instance_id: Uuid,
-        screen: shared::TerminalScreenInfo,
-        bytes: &[u8],
-    ) -> Option<TerminalSnapshotState> {
-        if bytes.len() > 16 * 1024 * 1024
-            || !(1..=300).contains(&screen.cols)
-            || !(1..=120).contains(&screen.rows)
-        {
-            return None;
-        }
-        let mut entry = self
-            .terminal_states
-            .entry((*session_id, pane_id))
-            .or_default();
-        if entry.instance_id.is_some_and(|id| id != instance_id)
-            || (entry.has_output && screen.checkpoint_seq <= entry.seq)
-        {
-            return None;
-        }
-        entry.instance_id = Some(instance_id);
-        entry.buf = bytes.iter().copied().collect();
-        entry.checkpoint_bytes = bytes.len();
-        entry.seq = screen.checkpoint_seq;
-        entry.screen = Some(screen);
-        entry.has_output = true;
-        entry.truncated = false;
-        Some(entry.snapshot())
     }
 
     /// Apply an authoritative CLI state report. A running report for a new
@@ -3866,94 +3817,5 @@ mod tests {
         sessions.complete_project_runtime_stop(request_id, project_id, true, 0, None);
 
         assert_eq!(waiting.await.unwrap().unwrap(), 1);
-    }
-}
-
-#[cfg(test)]
-mod terminal_checkpoint_tests {
-    use super::*;
-    #[test]
-    fn checkpoint_and_tail_remain_atomic_and_a_gap_invalidates_recovery() {
-        let manager = SessionManager::new();
-        let session = Uuid::new_v4();
-        let instance = Uuid::new_v4();
-        let info = shared::TerminalScreenInfo {
-            cols: 80,
-            rows: 24,
-            checkpoint_seq: 10,
-        };
-        manager
-            .record_terminal_checkpoint(&session, 7, instance, info.clone(), b"checkpoint")
-            .unwrap();
-        assert!(manager.append_terminal_output(&session, 7, Some(instance), b"tail", 11));
-        let snapshot = manager.terminal_snapshot(&session, 7).unwrap();
-        assert_eq!(snapshot.bytes, b"checkpointtail");
-        assert_eq!(snapshot.screen, Some(info.clone()));
-        assert_eq!(snapshot.seq, 11);
-        assert!(manager
-            .record_terminal_checkpoint(&session, 7, instance, info.clone(), b"stale")
-            .is_none());
-        assert!(manager.append_terminal_output(&session, 7, Some(instance), b"gap", 13));
-        let snapshot = manager.terminal_snapshot(&session, 7).unwrap();
-        assert!(snapshot.screen.is_none());
-        assert!(snapshot.truncated);
-        assert_eq!(snapshot.bytes, b"gap");
-        let recovered = manager
-            .record_terminal_checkpoint(
-                &session,
-                7,
-                instance,
-                shared::TerminalScreenInfo {
-                    checkpoint_seq: 14,
-                    ..info
-                },
-                b"recovered",
-            )
-            .unwrap();
-        assert!(!recovered.truncated);
-        assert_eq!(recovered.bytes, b"recovered");
-    }
-    #[test]
-    fn a_large_checkpoint_is_kept_whole_and_old_processes_cannot_replace_it() {
-        let manager = SessionManager::new();
-        let session = Uuid::new_v4();
-        let instance = Uuid::new_v4();
-        let info = shared::TerminalScreenInfo {
-            cols: 120,
-            rows: 40,
-            checkpoint_seq: 30,
-        };
-        let bytes = vec![b'x'; TERMINAL_SCROLLBACK_MAX_BYTES * 2];
-        manager
-            .record_terminal_checkpoint(&session, 7, instance, info.clone(), &bytes)
-            .unwrap();
-        manager.append_terminal_output(&session, 7, Some(instance), b"tail", 31);
-        assert_eq!(
-            manager.terminal_snapshot(&session, 7).unwrap().bytes.len(),
-            bytes.len() + 4
-        );
-        assert!(manager
-            .record_terminal_checkpoint(
-                &session,
-                7,
-                Uuid::new_v4(),
-                shared::TerminalScreenInfo {
-                    checkpoint_seq: 99,
-                    ..info
-                },
-                b"other"
-            )
-            .is_none());
-        manager.append_terminal_output(
-            &session,
-            7,
-            Some(instance),
-            &vec![b'y'; TERMINAL_SCROLLBACK_MAX_BYTES],
-            32,
-        );
-        let snapshot = manager.terminal_snapshot(&session, 7).unwrap();
-        assert!(snapshot.screen.is_none());
-        assert!(snapshot.truncated);
-        assert!(snapshot.bytes.len() <= TERMINAL_SCROLLBACK_MAX_BYTES);
     }
 }

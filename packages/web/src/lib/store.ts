@@ -4248,7 +4248,6 @@ export function handleServerMessage(
           bytes: decodeBase64(b64),
           seq: (data.seq as number) ?? 0,
           truncated: Boolean(data.truncated),
-          screen: decodeTerminalScreen(data.screen),
           instanceId: typeof data.instance_id === "string" ? data.instance_id : undefined,
           lifecycle: decodeTerminalLifecycle(data.lifecycle),
           status: typeof data.status === "string" ? data.status : undefined,
@@ -5692,14 +5691,4 @@ function parseOutputType(data: Record<string, unknown> | undefined): OutputType 
     default:
       return { type: "text" };
   }
-}
-
-function decodeTerminalScreen(value: unknown): { cols: number; rows: number; checkpointSeq: number } | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const screen = value as Record<string, unknown>;
-  const { cols, rows, checkpoint_seq: checkpointSeq } = screen;
-  if (typeof cols !== "number" || !Number.isInteger(cols) || cols < 1 || cols > 300
-    || typeof rows !== "number" || !Number.isInteger(rows) || rows < 1 || rows > 120
-    || typeof checkpointSeq !== "number" || !Number.isSafeInteger(checkpointSeq) || checkpointSeq < 0) return undefined;
-  return { cols, rows, checkpointSeq };
 }

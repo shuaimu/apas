@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 pub const HOST_PROTOCOL_VERSION: u32 = 1;
-const MAX_FRAME_BYTES: usize = 24 * 1024 * 1024;
+const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// Where a pane-host keeps its own log, relative to the APAS runtime
 /// directory. A host's stderr is the tmux pane it runs in, which vanishes with
 /// the process, and its runtime directory is removed when it exits cleanly —
@@ -101,7 +101,6 @@ pub enum ControllerToHost {
         cols: u16,
         rows: u16,
     },
-    Snapshot,
     Ack {
         seq: u64,
     },
@@ -126,11 +125,6 @@ pub enum HostToController {
         current_seq: u64,
         truncated: bool,
         controller_generation: u64,
-        #[serde(default)]
-        screen_checkpoint: bool,
-    },
-    Checkpoint {
-        checkpoint: shared::TerminalCheckpoint,
     },
     Output {
         seq: u64,
@@ -780,12 +774,11 @@ pub fn reconcile_project_hosts(
     Ok(removed)
 }
 
+#[derive(Debug)]
 struct Ring {
     chunks: VecDeque<OutputChunk>,
     bytes: usize,
     truncated: bool,
-    screen: crate::terminal_screen::TerminalScreen,
-    bytes_since_checkpoint: usize,
 }
 
 impl Ring {
@@ -794,14 +787,10 @@ impl Ring {
             chunks: VecDeque::new(),
             bytes: 0,
             truncated: false,
-            screen: crate::terminal_screen::TerminalScreen::new(DEFAULT_COLS, DEFAULT_ROWS),
-            bytes_since_checkpoint: 0,
         }
     }
 
     fn push(&mut self, chunk: OutputChunk) {
-        self.screen.process(&chunk.data);
-        self.bytes_since_checkpoint += chunk.data.len();
         self.bytes += chunk.data.len();
         self.chunks.push_back(chunk);
         while self.bytes > OUTPUT_RING_MAX_BYTES {
@@ -832,8 +821,6 @@ struct HostedProcess {
     lifecycle: Mutex<(TerminalLifecycle, Option<String>)>,
     ring: Mutex<Ring>,
     next_seq: AtomicU64,
-    checkpoint_requested: AtomicBool,
-    checkpoints_enabled: AtomicBool,
     shutting_down: AtomicBool,
 }
 
@@ -902,8 +889,6 @@ impl HostedProcess {
             lifecycle: Mutex::new((TerminalLifecycle::Running, None)),
             ring: Mutex::new(Ring::new()),
             next_seq: AtomicU64::new(0),
-            checkpoint_requested: AtomicBool::new(false),
-            checkpoints_enabled: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
         });
         Self::start_reader(&process, reader);
@@ -918,8 +903,8 @@ impl HostedProcess {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(len) => {
+                        let seq = process.next_seq.fetch_add(1, Ordering::Relaxed);
                         if let Ok(mut ring) = process.ring.lock() {
-                            let seq = process.next_seq.fetch_add(1, Ordering::Relaxed);
                             ring.push(OutputChunk {
                                 seq,
                                 data: buf[..len].to_vec(),
@@ -1126,23 +1111,16 @@ fn serve_controller(
         .as_ref()
         .context("pane-host process missing")?
         .clone();
-    process_ref
-        .checkpoints_enabled
-        .store(false, Ordering::SeqCst);
     let (lifecycle, status) = process_ref
         .lifecycle
         .lock()
         .map(|value| value.clone())
         .unwrap_or((TerminalLifecycle::Unknown, None));
-    let (oldest_seq, _ring_current_seq, truncated) = process_ref
+    let (oldest_seq, current_seq, truncated) = process_ref
         .ring
         .lock()
         .map(|ring| ring.bounds())
         .unwrap_or((0, 0, false));
-    let current_seq = process_ref
-        .next_seq
-        .load(Ordering::Relaxed)
-        .saturating_sub(1);
     write_frame(
         &mut stream,
         &HostToController::Adopted {
@@ -1157,7 +1135,6 @@ fn serve_controller(
             current_seq,
             truncated,
             controller_generation,
-            screen_checkpoint: true,
         },
     )?;
 
@@ -1206,13 +1183,6 @@ fn serve_controller(
                     }
                 }
                 Ok(ControllerToHost::Resize { cols, rows }) if cols > 0 && rows > 0 => {
-                    let cols = cols.min(crate::terminal_screen::MAX_COLS);
-                    let rows = rows.min(crate::terminal_screen::MAX_ROWS);
-                    let mut ring = process_for_reader.ring.lock().unwrap();
-                    ring.screen.resize(cols, rows);
-                    process_for_reader
-                        .checkpoint_requested
-                        .store(true, Ordering::SeqCst);
                     if let Ok(master) = process_for_reader.master.lock() {
                         let _ = master.resize(PtySize {
                             rows,
@@ -1221,14 +1191,6 @@ fn serve_controller(
                             pixel_height: 0,
                         });
                     }
-                }
-                Ok(ControllerToHost::Snapshot) => {
-                    process_for_reader
-                        .checkpoints_enabled
-                        .store(true, Ordering::SeqCst);
-                    process_for_reader
-                        .checkpoint_requested
-                        .store(true, Ordering::SeqCst);
                 }
                 Ok(ControllerToHost::Ack { .. }) => {}
                 Ok(ControllerToHost::Detach { reboot: requested }) => {
@@ -1253,37 +1215,6 @@ fn serve_controller(
 
     let mut sent_state = (lifecycle, status);
     while connected.load(Ordering::Relaxed) && !shutdown.load(Ordering::Relaxed) {
-        // Serialize on the same lock as PTY reads and resizes. The checkpoint
-        // consumes a sequence number, so snapshot/live order is unambiguous.
-        // Old controllers never opt in and continue to receive raw output.
-        let checkpoint = if process_ref.checkpoints_enabled.load(Ordering::Relaxed) {
-            let mut ring = process_ref.ring.lock().unwrap();
-            if process_ref
-                .checkpoint_requested
-                .swap(false, Ordering::SeqCst)
-                || ring.bytes_since_checkpoint >= crate::terminal_screen::CHECKPOINT_INTERVAL_BYTES
-            {
-                let seq = process_ref.next_seq.load(Ordering::Relaxed);
-                if let Some(checkpoint) = ring.screen.checkpoint(seq) {
-                    process_ref.next_seq.fetch_add(1, Ordering::Relaxed);
-                    ring.chunks.clear();
-                    ring.bytes = 0;
-                    ring.bytes_since_checkpoint = 0;
-                    ring.truncated = true;
-                    Some(checkpoint)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        if let Some(checkpoint) = checkpoint {
-            last_sent = Some(checkpoint.screen.checkpoint_seq);
-            write_frame(&mut stream, &HostToController::Checkpoint { checkpoint })?;
-        }
         let chunks = process_ref
             .ring
             .lock()
@@ -1762,103 +1693,6 @@ mod tests {
         assert!(read_handoff_marker(&path).is_err());
         write_private(&path, b"not-json").unwrap();
         assert!(read_handoff_marker(&path).is_err());
-    }
-
-    #[test]
-    fn checkpoint_survives_ring_overflow_adoption_and_resize_without_restarting_provider() {
-        use base64::Engine;
-        let root = tempfile::tempdir().unwrap();
-        let (runtime_dir, descriptor, credential) = test_runtime(&root, 63);
-        let provider = root.path().join("checkpoint-provider.sh");
-        fs::write(&provider, b"#!/bin/sh\nprintf '\\033[?1049h\\033[?1002h\\033[?1006h'\nhead -c 1048576 /dev/zero | tr '\\000' 'x'\nprintf '\\033[Hcheckpoint-survived'\ntouch ready\nsleep 30\n").unwrap();
-        fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
-        let host_dir = runtime_dir.clone();
-        let host = thread::spawn(move || {
-            run_host_with_grace(host_dir, Duration::from_secs(30), Duration::from_secs(30)).unwrap()
-        });
-        let mut first =
-            connect_with_retry(&descriptor.socket_path, Duration::from_secs(5)).unwrap();
-        first
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        let HostToController::Adopted {
-            provider_pid,
-            instance_id,
-            screen_checkpoint,
-            ..
-        } = create_test_process(&mut first, &descriptor, &credential, &provider)
-        else {
-            panic!("create");
-        };
-        assert!(screen_checkpoint);
-        write_frame(&mut first, &ControllerToHost::Detach { reboot: true }).unwrap();
-        drop(first);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !root.path().join("ready").exists() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(20));
-        }
-        assert!(root.path().join("ready").exists());
-        let mut second =
-            connect_with_retry(&descriptor.socket_path, Duration::from_secs(5)).unwrap();
-        second
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        write_frame(
-            &mut second,
-            &ControllerToHost::Adopt {
-                protocol_version: HOST_PROTOCOL_VERSION,
-                credential,
-                project_id: descriptor.project_id,
-                pane_id: descriptor.pane_id,
-                runtime_id: descriptor.runtime_id,
-                controller_id: Uuid::new_v4(),
-                controller_generation: 2,
-                acknowledged_seq: None,
-            },
-        )
-        .unwrap();
-        let HostToController::Adopted {
-            provider_pid: after_pid,
-            instance_id: after_instance,
-            truncated,
-            ..
-        } = read_frame(&mut second).unwrap()
-        else {
-            panic!("adopt");
-        };
-        assert_eq!(after_pid, provider_pid);
-        assert_eq!(after_instance, instance_id);
-        assert!(truncated);
-        write_frame(&mut second, &ControllerToHost::Snapshot).unwrap();
-        let checkpoint = loop {
-            if let HostToController::Checkpoint { checkpoint } = read_frame(&mut second).unwrap() {
-                break checkpoint;
-            }
-        };
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(checkpoint.data_b64)
-            .unwrap();
-        let text = String::from_utf8(bytes).unwrap();
-        assert!(text.contains("checkpoint-survived"));
-        assert!(text.contains("\x1b[?1006h"));
-        assert!(text.contains("\x1b[?1002h"));
-        write_frame(
-            &mut second,
-            &ControllerToHost::Resize { cols: 91, rows: 37 },
-        )
-        .unwrap();
-        let resized = loop {
-            if let HostToController::Checkpoint { checkpoint } = read_frame(&mut second).unwrap() {
-                break checkpoint;
-            }
-        };
-        assert_eq!((resized.screen.cols, resized.screen.rows), (91, 37));
-        assert!(resized.screen.checkpoint_seq > checkpoint.screen.checkpoint_seq);
-        assert_eq!(unsafe { libc::kill(provider_pid.unwrap() as i32, 0) }, 0);
-        write_frame(&mut second, &ControllerToHost::Shutdown).unwrap();
-        drop(second);
-        host.join().unwrap();
-        assert!(!runtime_dir.exists());
     }
 
     #[test]

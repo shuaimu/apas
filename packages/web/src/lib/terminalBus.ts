@@ -18,7 +18,6 @@ export type TerminalEvent =
       seq: number;
       /** Older bytes were evicted, so this may start mid-escape-sequence. */
       truncated: boolean;
-      screen?: { cols: number; rows: number; checkpointSeq: number };
       instanceId?: string;
       lifecycle: TerminalLifecycle;
       status?: string;

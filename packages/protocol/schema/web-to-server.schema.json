@@ -1771,11 +1771,6 @@
           "description": "Pi coding agent (`pi`): terminal-only in APAS. See\n`terminal_pane::terminal_binary_for`.",
           "type": "string",
           "const": "pi"
-        },
-        {
-          "description": "Oh My Pi (`omp`): a standalone Pi-derived agent, terminal-only in APAS.\nUnlike Pi it has no `--session-id`, so a pane is pinned by giving it a\nprivate `--session-dir` instead; see `terminal_pane::omp_session_args`.",
-          "type": "string",
-          "const": "omp"
         }
       ]
     }

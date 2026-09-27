@@ -1,7 +1,5 @@
 "use client";
 
-import { MobileTerminalViewport } from "./MobileTerminalViewport";
-
 import dynamic from "next/dynamic";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
@@ -590,7 +588,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
 
   if (terminalPaneId !== null) {
     return (
-      <MobileTerminalViewport>
+      <section aria-label="Mobile terminal" className="flex h-full min-h-0 flex-col bg-[#0a0a0a] text-white">
         <div className="flex shrink-0 items-center justify-between border-b border-neutral-800 px-2 py-1.5">
           <button type="button" onClick={() => setTerminalPaneId(null)} className="flex items-center gap-2 rounded-lg px-2 py-2 text-sm font-bold hover:bg-neutral-800">
             <ArrowLeft className="h-5 w-5" /> Conversation
@@ -599,7 +597,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
         </div>
         <div className="flex min-h-0 flex-1 flex-col"><TerminalPane paneId={terminalPaneId} /></div>
         <MobileTerminalKeyBar paneId={terminalPaneId} connected={connected} />
-      </MobileTerminalViewport>
+      </section>
     );
   }
 
@@ -677,10 +675,6 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
         </div>
       </div>
 
-      {selectedIsTerminal && <div className="flex shrink-0 items-center gap-2 border-b border-[#dedee7] px-4 py-2 text-xs dark:border-[#383842]">
-        <span className="min-w-0 flex-1 text-[#686873] dark:text-[#aaaab6]">Recorded conversation may lag the live terminal.</span>
-        <button type="button" onClick={openRawTerminal} className="shrink-0 rounded-lg bg-[#6d5efc] px-3 py-2 font-bold text-white">Open terminal</button>
-      </div>}
       {actionError && <div className="mx-4 mt-3 flex shrink-0 items-center gap-2 rounded-xl border border-red-300 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300"><AlertTriangle className="h-4 w-4 shrink-0" /> {actionError}</div>}
 
 

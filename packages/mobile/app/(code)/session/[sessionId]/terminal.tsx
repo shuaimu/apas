@@ -59,7 +59,7 @@ export default function TerminalScreen() {
       setLifecycle(result.state.lifecycle);
       setStatus(result.state.status);
       if (result.action === "reset") inject({ type: "reset", reason: "process_restarted" });
-      if (result.action === "snapshot" && result.dataBase64 !== undefined) inject({ type: "snapshot", dataBase64: result.dataBase64, sequence: result.state.sequence, instanceId: result.state.instanceId, truncated: result.truncated ?? false, cols: result.cols, rows: result.rows });
+      if (result.action === "snapshot" && result.dataBase64 !== undefined) inject({ type: "snapshot", dataBase64: result.dataBase64, sequence: result.state.sequence, instanceId: result.state.instanceId, truncated: result.truncated ?? false });
       if (result.action === "output" && result.dataBase64 !== undefined) inject({ type: "output", dataBase64: result.dataBase64, sequence: result.state.sequence, instanceId: result.state.instanceId });
       inject({ type: "lifecycle", lifecycle: result.state.lifecycle, status: result.state.status });
       if (result.state.needsSnapshot && connection === "ready") attach();
@@ -187,7 +187,6 @@ export default function TerminalScreen() {
         <KeyButton label="↑" disabled={!inputReady} onPress={() => sendInput("\u001b[A")} />
         <KeyButton label="↓" disabled={!inputReady} onPress={() => sendInput("\u001b[B")} />
         <KeyButton label="→" disabled={!inputReady} onPress={() => sendInput("\u001b[C")} />
-        <KeyButton label="Fit to screen" disabled={!inputReady} onPress={() => inject({ type: "fit" })} />
         <KeyButton label="Paste" disabled={!inputReady} onPress={() => void requestPaste()} />
         <KeyButton label="Hide keyboard" onPress={() => Keyboard.dismiss()} />
         <KeyButton label="Focus" onPress={() => inject({ type: "focus" })} />

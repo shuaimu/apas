@@ -154,14 +154,6 @@ impl TerminalRuntimeHandle {
         }
     }
 
-    pub fn request_checkpoint(&self) -> Result<()> {
-        match self {
-            Self::Direct(handle) => handle.request_checkpoint(),
-            #[cfg(unix)]
-            Self::Hosted(handle) => handle.request_checkpoint(),
-        }
-    }
-
     pub fn state_message(&self, session_id: Uuid) -> CliToServer {
         match self {
             Self::Direct(handle) => handle.state_message(session_id),
@@ -218,7 +210,6 @@ pub struct HostedTerminalHandle {
     /// socket closes without an exit frame. A field so a test can stand in
     /// for tmux.
     host_probe: HostLivenessProbe,
-    supports_checkpoint: bool,
 }
 
 #[cfg(unix)]
@@ -388,7 +379,6 @@ impl HostedTerminalHandle {
             oldest_seq,
             current_seq,
             truncated,
-            screen_checkpoint,
             ..
         } = adopted
         else {
@@ -423,10 +413,8 @@ impl HostedTerminalHandle {
             runtime: runtime_state,
             shutting_down: Arc::new(AtomicBool::new(false)),
             host_probe: tmux_host_probe(),
-            supports_checkpoint: screen_checkpoint,
         };
         handle.start_reader(session_id, reader, server_tx);
-        let _ = handle.request_checkpoint();
         tracing::info!(
             pane_id = handle.pane_id,
             runtime_id = %runtime_id,
@@ -462,58 +450,129 @@ impl HostedTerminalHandle {
             .lock()
             .map(|value| value.clone())
             .unwrap_or((TerminalLifecycle::Unknown, None));
+        let _ = server_tx.try_send(CliToServer::TerminalState {
+            session_id,
+            pane_id,
+            instance_id: Some(instance_id),
+            lifecycle: initial_state.0,
+            status: initial_state.1,
+            runtime: Some(initial_runtime),
+        });
         thread::Builder::new()
             .name(format!("apas-hosted-term-{pane_id}"))
-            .spawn(move || {
-                let _ = server_tx.blocking_send(CliToServer::TerminalState {
-                    session_id,
-                    pane_id,
-                    instance_id: Some(instance_id),
-                    lifecycle: initial_state.0,
-                    status: initial_state.1,
-                    runtime: Some(initial_runtime),
-                });
-                loop {
-                    match crate::pane_host::read_frame::<crate::pane_host::HostToController>(
-                        &mut reader,
-                    ) {
-                        Ok(crate::pane_host::HostToController::Checkpoint { checkpoint }) => {
-                            if let Ok(mut metadata) = runtime.lock() {
-                                metadata.current_seq = checkpoint.screen.checkpoint_seq;
-                            }
-                            let _ = server_tx.blocking_send(CliToServer::TerminalCheckpoint {
-                                session_id,
-                                pane_id,
-                                instance_id,
-                                checkpoint,
-                            });
+            .spawn(move || loop {
+                match crate::pane_host::read_frame::<crate::pane_host::HostToController>(
+                    &mut reader,
+                ) {
+                    Ok(crate::pane_host::HostToController::Output { seq, data }) => {
+                        if let Ok(mut metadata) = runtime.lock() {
+                            metadata.current_seq = metadata.current_seq.max(seq);
                         }
-                        Ok(crate::pane_host::HostToController::Output { seq, data }) => {
-                            if let Ok(mut metadata) = runtime.lock() {
-                                metadata.current_seq = metadata.current_seq.max(seq);
-                            }
-                            let _ = server_tx.blocking_send(CliToServer::TerminalOutput {
+                        let _ = server_tx.blocking_send(CliToServer::TerminalOutput {
+                            session_id,
+                            pane_id,
+                            instance_id: Some(instance_id),
+                            data_b64: base64::engine::general_purpose::STANDARD.encode(data),
+                            seq,
+                        });
+                    }
+                    Ok(crate::pane_host::HostToController::State {
+                        lifecycle: next,
+                        status,
+                    }) => {
+                        if let Ok(mut state) = lifecycle.lock() {
+                            *state = (next, status.clone());
+                        }
+                        let metadata = runtime.lock().map(|value| value.clone()).ok();
+                        let _ = server_tx.blocking_send(CliToServer::TerminalState {
+                            session_id,
+                            pane_id,
+                            instance_id: Some(instance_id),
+                            lifecycle: next,
+                            status: status.clone(),
+                            runtime: metadata,
+                        });
+                        if next == TerminalLifecycle::Exited {
+                            let _ = server_tx.blocking_send(CliToServer::TerminalExited {
                                 session_id,
                                 pane_id,
                                 instance_id: Some(instance_id),
-                                data_b64: base64::engine::general_purpose::STANDARD.encode(data),
-                                seq,
+                                status,
                             });
                         }
-                        Ok(crate::pane_host::HostToController::State {
-                            lifecycle: next,
-                            status,
-                        }) => {
+                    }
+                    Ok(crate::pane_host::HostToController::Error { message }) => {
+                        tracing::warn!(pane_id, %message, "pane-host controller error");
+                        break;
+                    }
+                    Ok(crate::pane_host::HostToController::Adopted { .. }) => continue,
+                    Err(error) => {
+                        if !shutting_down.load(Ordering::Relaxed) {
+                            // The socket closed without an `Exited` frame.
+                            // Either the transport hiccupped and the host is
+                            // still there to re-adopt, or the host process
+                            // itself died — which nothing else reports, since
+                            // the tmux pane carrying its stderr went with it.
+                            // Supervision tells the two apart: a host lives in
+                            // its own tmux session, so no session, no host.
+                            let already_exited = lifecycle
+                                .lock()
+                                .map(|state| state.0 == TerminalLifecycle::Exited)
+                                .unwrap_or(false);
+                            if already_exited {
+                                break;
+                            }
+                            let host_alive = host_probe(&descriptor);
+                            let (next, status) = if host_alive {
+                                tracing::info!(
+                                    pane_id,
+                                    %error,
+                                    session = %descriptor.session_name,
+                                    "pane-host controller detached; host still alive"
+                                );
+                                (
+                                    TerminalLifecycle::Disconnected,
+                                    format!("pane-host controller disconnected: {error}"),
+                                )
+                            } else {
+                                let log = descriptor
+                                    .socket_path
+                                    .parent()
+                                    .and_then(|dir| crate::pane_host::host_log_path(dir).ok());
+                                tracing::warn!(
+                                    pane_id,
+                                    %error,
+                                    session = %descriptor.session_name,
+                                    runtime_id = %descriptor.runtime_id,
+                                    log = ?log,
+                                    "pane-host process is gone; reporting the pane exited"
+                                );
+                                (
+                                    TerminalLifecycle::Exited,
+                                    format!(
+                                        "pane-host process ended unexpectedly (tmux session {} is gone); reboot the pane to resume the conversation{}",
+                                        descriptor.session_name,
+                                        log.map(|path| format!("; its log is {}", path.display()))
+                                            .unwrap_or_default()
+                                    ),
+                                )
+                            };
                             if let Ok(mut state) = lifecycle.lock() {
-                                *state = (next, status.clone());
+                                *state = (next, Some(status.clone()));
                             }
                             let metadata = runtime.lock().map(|value| value.clone()).ok();
+                            // The host socket is already gone, so waiting
+                            // for the server channel cannot backpressure
+                            // the host. Retaining this state in the channel
+                            // also makes a reconnect report the pane as
+                            // disconnected or exited rather than silently
+                            // leaving its last Running/idle view.
                             let _ = server_tx.blocking_send(CliToServer::TerminalState {
                                 session_id,
                                 pane_id,
                                 instance_id: Some(instance_id),
                                 lifecycle: next,
-                                status: status.clone(),
+                                status: Some(status.clone()),
                                 runtime: metadata,
                             });
                             if next == TerminalLifecycle::Exited {
@@ -521,95 +580,11 @@ impl HostedTerminalHandle {
                                     session_id,
                                     pane_id,
                                     instance_id: Some(instance_id),
-                                    status,
+                                    status: Some(status),
                                 });
                             }
                         }
-                        Ok(crate::pane_host::HostToController::Error { message }) => {
-                            tracing::warn!(pane_id, %message, "pane-host controller error");
-                            break;
-                        }
-                        Ok(crate::pane_host::HostToController::Adopted { .. }) => continue,
-                        Err(error) => {
-                            if !shutting_down.load(Ordering::Relaxed) {
-                                // The socket closed without an `Exited` frame.
-                                // Either the transport hiccupped and the host is
-                                // still there to re-adopt, or the host process
-                                // itself died — which nothing else reports, since
-                                // the tmux pane carrying its stderr went with it.
-                                // Supervision tells the two apart: a host lives in
-                                // its own tmux session, so no session, no host.
-                                let already_exited = lifecycle
-                                    .lock()
-                                    .map(|state| state.0 == TerminalLifecycle::Exited)
-                                    .unwrap_or(false);
-                                if already_exited {
-                                    break;
-                                }
-                                let host_alive = host_probe(&descriptor);
-                                let (next, status) = if host_alive {
-                                    tracing::info!(
-                                        pane_id,
-                                        %error,
-                                        session = %descriptor.session_name,
-                                        "pane-host controller detached; host still alive"
-                                    );
-                                    (
-                                        TerminalLifecycle::Disconnected,
-                                        format!("pane-host controller disconnected: {error}"),
-                                    )
-                                } else {
-                                    let log = descriptor
-                                        .socket_path
-                                        .parent()
-                                        .and_then(|dir| crate::pane_host::host_log_path(dir).ok());
-                                    tracing::warn!(
-                                        pane_id,
-                                        %error,
-                                        session = %descriptor.session_name,
-                                        runtime_id = %descriptor.runtime_id,
-                                        log = ?log,
-                                        "pane-host process is gone; reporting the pane exited"
-                                    );
-                                    (
-                                        TerminalLifecycle::Exited,
-                                        format!(
-                                            "pane-host process ended unexpectedly (tmux session {} is gone); reboot the pane to resume the conversation{}",
-                                            descriptor.session_name,
-                                            log.map(|path| format!("; its log is {}", path.display()))
-                                                .unwrap_or_default()
-                                        ),
-                                    )
-                                };
-                                if let Ok(mut state) = lifecycle.lock() {
-                                    *state = (next, Some(status.clone()));
-                                }
-                                let metadata = runtime.lock().map(|value| value.clone()).ok();
-                                // The host socket is already gone, so waiting
-                                // for the server channel cannot backpressure
-                                // the host. Retaining this state in the channel
-                                // also makes a reconnect report the pane as
-                                // disconnected or exited rather than silently
-                                // leaving its last Running/idle view.
-                                let _ = server_tx.blocking_send(CliToServer::TerminalState {
-                                    session_id,
-                                    pane_id,
-                                    instance_id: Some(instance_id),
-                                    lifecycle: next,
-                                    status: Some(status.clone()),
-                                    runtime: metadata,
-                                });
-                                if next == TerminalLifecycle::Exited {
-                                    let _ = server_tx.blocking_send(CliToServer::TerminalExited {
-                                        session_id,
-                                        pane_id,
-                                        instance_id: Some(instance_id),
-                                        status: Some(status),
-                                    });
-                                }
-                            }
-                            break;
-                        }
+                        break;
                     }
                 }
             })
@@ -622,13 +597,6 @@ impl HostedTerminalHandle {
             .lock()
             .map_err(|_| anyhow::anyhow!("pane-host stream mutex poisoned"))?;
         crate::pane_host::write_frame(&mut stream, &command)
-    }
-
-    pub fn request_checkpoint(&self) -> Result<()> {
-        if self.supports_checkpoint {
-            self.write_command(crate::pane_host::ControllerToHost::Snapshot)?;
-        }
-        Ok(())
     }
 
     pub fn write_bytes(&self, data: &[u8]) -> Result<()> {
@@ -896,9 +864,6 @@ pub struct TerminalHandle {
     child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
     /// Per-pane monotonic chunk counter shared with the reader thread.
     seq: Arc<AtomicU64>,
-    screen: Arc<Mutex<crate::terminal_screen::TerminalScreen>>,
-    server_tx: tokio_mpsc::Sender<CliToServer>,
-    session_id: Uuid,
     /// Set by [`TerminalHandle::shutdown`] so the reader thread exits
     /// quietly instead of reporting the kill as an unexpected exit.
     shutting_down: Arc<AtomicBool>,
@@ -996,12 +961,6 @@ impl TerminalHandle {
             master: Arc::new(Mutex::new(pair.master)),
             child: Arc::new(Mutex::new(child)),
             seq: Arc::new(AtomicU64::new(0)),
-            screen: Arc::new(Mutex::new(crate::terminal_screen::TerminalScreen::new(
-                DEFAULT_COLS,
-                DEFAULT_ROWS,
-            ))),
-            server_tx: server_tx.clone(),
-            session_id,
             shutting_down: Arc::new(AtomicBool::new(false)),
             last_size: Arc::new(Mutex::new((DEFAULT_COLS, DEFAULT_ROWS))),
             lifecycle: Arc::new(Mutex::new((TerminalLifecycle::Running, None))),
@@ -1033,7 +992,6 @@ impl TerminalHandle {
     ) {
         let pane_id = self.pane_id;
         let seq = Arc::clone(&self.seq);
-        let screen = Arc::clone(&self.screen);
         let shutting_down = Arc::clone(&self.shutting_down);
         let child = Arc::clone(&self.child);
         let lifecycle = Arc::clone(&self.lifecycle);
@@ -1053,44 +1011,11 @@ impl TerminalHandle {
                     status: None,
                     runtime: None,
                 });
-                {
-                    let screen = screen.lock().unwrap();
-                    let checkpoint = screen.checkpoint(seq.load(Ordering::Relaxed));
-                    if checkpoint.is_some() {
-                        seq.fetch_add(1, Ordering::Relaxed);
-                    }
-                    drop(screen);
-                    if let Some(checkpoint) = checkpoint {
-                        let _ = server_tx.blocking_send(CliToServer::TerminalCheckpoint {
-                            session_id,
-                            pane_id,
-                            instance_id,
-                            checkpoint,
-                        });
-                    }
-                }
-                let mut since_checkpoint = 0usize;
                 let mut buf = vec![0u8; READ_CHUNK_BYTES];
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            let mut screen = screen.lock().unwrap();
-                            screen.process(&buf[..n]);
-                            let output_seq = seq.fetch_add(1, Ordering::Relaxed);
-                            since_checkpoint += n;
-                            let checkpoint = if since_checkpoint
-                                >= crate::terminal_screen::CHECKPOINT_INTERVAL_BYTES
-                            {
-                                let checkpoint = screen.checkpoint(seq.load(Ordering::Relaxed));
-                                if checkpoint.is_some() {
-                                    seq.fetch_add(1, Ordering::Relaxed);
-                                    since_checkpoint = 0;
-                                }
-                                checkpoint
-                            } else {
-                                None
-                            };
                             let data_b64 =
                                 base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
                             let msg = CliToServer::TerminalOutput {
@@ -1098,28 +1023,12 @@ impl TerminalHandle {
                                 pane_id,
                                 instance_id: Some(instance_id),
                                 data_b64,
-                                seq: output_seq,
+                                seq: seq.fetch_add(1, Ordering::Relaxed),
                             };
-                            drop(screen);
                             if server_tx.blocking_send(msg).is_err() {
                                 // Server channel closed — the CLI is
                                 // shutting down; nothing left to send to.
                                 return;
-                            }
-                            // A continuous checkpoint must not contain output
-                            // that the preceding frame did not already deliver.
-                            if let Some(checkpoint) = checkpoint {
-                                if server_tx
-                                    .blocking_send(CliToServer::TerminalCheckpoint {
-                                        session_id,
-                                        pane_id,
-                                        instance_id,
-                                        checkpoint,
-                                    })
-                                    .is_err()
-                                {
-                                    return;
-                                }
                             }
                         }
                         Err(e) => {
@@ -1183,8 +1092,8 @@ impl TerminalHandle {
     /// on every container mutation and a redundant `TIOCSWINSZ` makes
     /// full-screen TUIs repaint for nothing.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
-        let cols = cols.clamp(1, crate::terminal_screen::MAX_COLS);
-        let rows = rows.clamp(1, crate::terminal_screen::MAX_ROWS);
+        let cols = cols.max(1);
+        let rows = rows.max(1);
         {
             let mut last = self
                 .last_size
@@ -1195,10 +1104,6 @@ impl TerminalHandle {
             }
             *last = (cols, rows);
         }
-        let mut screen = self
-            .screen
-            .lock()
-            .map_err(|_| anyhow::anyhow!("terminal screen mutex poisoned"))?;
         let master = self
             .master
             .lock()
@@ -1211,28 +1116,6 @@ impl TerminalHandle {
                 pixel_height: 0,
             })
             .context("pty resize failed")?;
-        screen.resize(cols, rows);
-        drop(screen);
-        self.request_checkpoint()
-    }
-
-    pub fn request_checkpoint(&self) -> Result<()> {
-        let screen = self
-            .screen
-            .lock()
-            .map_err(|_| anyhow::anyhow!("terminal screen mutex poisoned"))?;
-        let checkpoint = screen
-            .checkpoint(self.seq.load(Ordering::Relaxed))
-            .ok_or_else(|| anyhow::anyhow!("terminal screen checkpoint unavailable"))?;
-        self.server_tx
-            .try_send(CliToServer::TerminalCheckpoint {
-                session_id: self.session_id,
-                pane_id: self.pane_id,
-                instance_id: self.instance_id,
-                checkpoint,
-            })
-            .map_err(|error| anyhow::anyhow!("terminal checkpoint queue: {error}"))?;
-        self.seq.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1522,75 +1405,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
-    fn periodic_direct_checkpoint_preserves_every_live_output_byte() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        let provider = root.path().join("checkpoint-provider.sh");
-        let length = crate::terminal_screen::CHECKPOINT_INTERVAL_BYTES + 8192;
-        std::fs::write(
-            &provider,
-            format!("#!/bin/sh\nhead -c {length} /dev/zero | tr '\\000' 'x'\n"),
-        )
-        .unwrap();
-        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            let (tx, mut rx) = tokio_mpsc::channel(64);
-            let handle = TerminalHandle::spawn(
-                8,
-                Uuid::new_v4(),
-                Uuid::new_v4(),
-                &Provider::Codex,
-                provider.to_str().unwrap(),
-                root.path().to_str().unwrap(),
-                &[],
-                false,
-                None,
-                tx,
-            )
-            .unwrap();
-            let mut output = Vec::new();
-            let mut last_seq = None;
-            let mut checkpoints = 0;
-            loop {
-                let message = tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
-                    .await
-                    .unwrap()
-                    .unwrap();
-                let sequence = match message {
-                    CliToServer::TerminalOutput { seq, data_b64, .. } => {
-                        output.extend(
-                            base64::engine::general_purpose::STANDARD
-                                .decode(data_b64)
-                                .unwrap(),
-                        );
-                        Some(seq)
-                    }
-                    CliToServer::TerminalCheckpoint { checkpoint, .. } => {
-                        checkpoints += 1;
-                        Some(checkpoint.screen.checkpoint_seq)
-                    }
-                    CliToServer::TerminalExited { .. } => break,
-                    _ => None,
-                };
-                if let Some(sequence) = sequence {
-                    if let Some(previous) = last_seq {
-                        assert_eq!(sequence, previous + 1);
-                    }
-                    last_seq = Some(sequence);
-                }
-            }
-            assert!(checkpoints >= 2, "initial and periodic checkpoints");
-            assert_eq!(output, vec![b'x'; length]);
-            drop(handle);
-        });
-    }
-
-    #[test]
     fn pty_streams_output_and_reports_exit() {
         // Spawning a Claude pane now writes its session-hook settings into the
         // runtime tree, so point that at a temporary directory — and take the
@@ -1670,7 +1484,6 @@ mod tests {
                         exited = true;
                         break;
                     }
-                    CliToServer::TerminalCheckpoint { .. } => {}
                     other => panic!("unexpected message: {other:?}"),
                 }
             }
@@ -1818,7 +1631,6 @@ mod tests {
                 ..Default::default()
             })),
             shutting_down: Arc::new(AtomicBool::new(false)),
-            supports_checkpoint: false,
             host_probe: Arc::new(|_| true),
         };
 
@@ -1873,7 +1685,6 @@ mod tests {
                 })),
                 shutting_down: Arc::new(AtomicBool::new(false)),
                 // Supervision says the host's tmux session no longer exists.
-                supports_checkpoint: false,
                 host_probe: Arc::new(|_| false),
             };
             let (tx, mut rx) = tokio_mpsc::channel(4);
@@ -1960,7 +1771,6 @@ mod tests {
                     ..Default::default()
                 })),
                 shutting_down: Arc::new(AtomicBool::new(false)),
-                supports_checkpoint: false,
                 host_probe: Arc::new(|_| true),
             };
             let (tx, mut rx) = tokio_mpsc::channel(4);
