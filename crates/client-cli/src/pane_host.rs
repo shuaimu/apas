@@ -32,10 +32,6 @@ const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const HOST_LOG_DIR: &str = "pane-host-logs";
 const HOST_LOG_ROTATE_BYTES: u64 = 1024 * 1024;
 const HOST_LOG_RETAIN: Duration = Duration::from_secs(14 * 24 * 60 * 60);
-/// Host-local root for the executable copy a pane-host runs from. `/var/tmp`
-/// persists across reboots and is not shared over NFS, the same reasoning as
-/// the Codex SQLite home in `dual_pane`.
-const HOST_LOCAL_BIN_ROOT: &str = "/var/tmp";
 const HOST_LOCAL_BIN_RETAIN: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const OUTPUT_RING_MAX_BYTES: usize = 512 * 1024;
 const DEFAULT_COLS: u16 = 80;
@@ -365,14 +361,13 @@ extern "C" fn fatal_signal_handler(signal: libc::c_int) {
 /// running from them. Any failure falls back to the shared path: a host that
 /// launches from NFS is still better than one that does not launch.
 pub fn host_local_executable(source: &Path) -> Result<PathBuf> {
-    host_local_executable_in(Path::new(HOST_LOCAL_BIN_ROOT), source)
+    host_local_executable_in(&crate::host_storage::pane_host_bin_dir(), source)
 }
 
-fn host_local_executable_in(root: &Path, source: &Path) -> Result<PathBuf> {
+fn host_local_executable_in(dir: &Path, source: &Path) -> Result<PathBuf> {
     let uid = unsafe { libc::getuid() };
-    let dir = root.join(format!("apas-bin-{uid}"));
-    ensure_private_dir(&dir)?;
-    if fs::symlink_metadata(&dir)?.file_type().is_symlink() {
+    ensure_private_dir(dir)?;
+    if fs::symlink_metadata(dir)?.file_type().is_symlink() {
         bail!("refusing symlinked executable directory {}", dir.display());
     }
     let bytes = fs::read(source).with_context(|| format!("read {}", source.display()))?;
@@ -1426,22 +1421,23 @@ mod tests {
         fs::write(&source, "#!/bin/sh\necho apas 0.0\n").unwrap();
         fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let copy = host_local_executable_in(root.path(), &source).unwrap();
-        assert!(copy.starts_with(root.path().join(format!("apas-bin-{}", unsafe { libc::getuid() }))));
+        let bin_dir = root.path().join("pane-host");
+        let copy = host_local_executable_in(&bin_dir, &source).unwrap();
+        assert!(copy.starts_with(&bin_dir));
         let metadata = fs::metadata(&copy).unwrap();
         assert_eq!(metadata.mode() & 0o777, 0o700);
         assert_eq!(fs::read(&copy).unwrap(), fs::read(&source).unwrap());
 
         // Same content, same copy: nothing is rewritten.
         let first_ino = metadata.ino();
-        let again = host_local_executable_in(root.path(), &source).unwrap();
+        let again = host_local_executable_in(&bin_dir, &source).unwrap();
         assert_eq!(again, copy);
         assert_eq!(fs::metadata(&again).unwrap().ino(), first_ino);
 
         // A new install is a new copy, and the old one stays until it ages
         // out — a host may still be running from it.
         fs::write(&source, "#!/bin/sh\necho apas 0.1\n").unwrap();
-        let newer = host_local_executable_in(root.path(), &source).unwrap();
+        let newer = host_local_executable_in(&bin_dir, &source).unwrap();
         assert_ne!(newer, copy);
         assert!(copy.exists());
         prune_stale_files(copy.parent().unwrap(), Some(&newer), Duration::ZERO);
@@ -1450,7 +1446,7 @@ mod tests {
 
         // A copy that cannot run here is not offered.
         fs::write(&source, "not an executable\n").unwrap();
-        assert!(host_local_executable_in(root.path(), &source).is_err());
+        assert!(host_local_executable_in(&bin_dir, &source).is_err());
     }
 
     #[test]

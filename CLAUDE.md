@@ -1157,6 +1157,49 @@ omp_path ...`. Existing explicit cluster/project allowlists remain opt-in and
 must add `terminal:opencode:official:default`, `terminal:pi:official:default`,
 or `terminal:omp:official:default` through the normal policy controls.
 
+On Linux, a newly launched **terminal** pane uses a host-local copy of a
+native Claude, Codex, or OMP executable under
+`/var/lib/apas/users/<uid>/providers/` instead of mapping the provider binary
+from the NFS-mounted home directory. The APAS pane-host executable lives under
+`/var/lib/apas/users/<uid>/pane-host/`. These directories are per-host and
+persistent, not shared through the user's home directory.
+The configured `claude_path`, `codex_path`, and `omp_path` remain the source
+installations. Update Claude and Codex through their ordinary launchers
+outside APAS; APAS picks up a changed source executable for later pane
+launches. An in-pane provider update may instead target its host-local
+executable and must not be treated as updating the shared installation.
+APAS does not copy script/package-manager launchers whose adjacent dependencies
+or update mechanisms require their installation directory.
+
+An administrator must provision this directory **on every host** before the
+CLI can use it:
+
+```bash
+sudo install -d -o root -g root -m 0755 /var/lib/apas /var/lib/apas/users
+sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0700 "/var/lib/apas/users/$(id -u)"
+```
+
+The CLI rejects symlinked, misowned, or non-private user storage. Until it is
+provisioned, it uses the existing host-local `/var/tmp/apas-providers-<uid>/`
+and `/var/tmp/apas-bin-<uid>/` directories, **not NFS**. Once provisioned,
+OMP's last verified local version migrates to the new store; the old files
+remain available to any running panes. Claude, Codex, and pane hosts copy
+fresh from their configured installations at their next launch. Use the UID
+rather than a username so a rename does not silently change binary ownership.
+
+For a **native OMP binary**, APAS checks for updates when launching a new OMP
+terminal pane and applies them to an isolated **host-local** candidate via
+OMP's own `omp update`, never to the shared configured installation. Script
+and package-manager launchers still run from their configured paths and must
+be updated with their package manager.
+Update checks for native OMP are throttled and run in the background, so the
+opening pane gets the last verified local executable without waiting on the
+network; a successful update is used by later pane launches. Existing panes
+continue running their old local image. Failed downloads or checks retain the
+last working copy. Do not replace this with `omp update` against
+`~/.local/bin/omp`: on NFS, removing an executable mapped by a live pane can
+kill it with SIGBUS.
+
 **Two different things share the oh-my-pi name; do not conflate them.**
 
 The npm package `oh-my-pi` is a **Pi extension, not an APAS provider**: it
@@ -1329,7 +1372,9 @@ Pane-host state is host-local, volatile, and outside the project directory:
   naming the signal, then restores the default disposition and re-raises).
   The `TerminalState` the CLI reports for a dead host names this file.
 - Executable: a host runs from a content-addressed copy under
-  `/var/tmp/apas-bin-<uid>/`, not from `~/.local/bin/apas`. Home is NFS and
+  `/var/lib/apas/users/<uid>/pane-host/` when provisioned, or the former
+  `/var/tmp/apas-bin-<uid>/` on hosts awaiting setup, never directly from
+  `~/.local/bin/apas` when a local copy succeeds. Home is NFS and
   every install replaces that file. A process on a local filesystem keeps its
   unlinked executable alive; a process whose executable was unlinked on the
   NFS server has nothing to fault code pages back in from and dies with

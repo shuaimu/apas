@@ -1448,11 +1448,40 @@ fn spawn_terminal_pane(
 ) -> Result<(), String> {
     terminal_binary_for(provider).ok_or_else(|| {
         format!(
-            "[{} cannot host a terminal pane; only claude, codex, and opencode are supported]",
+            "[{} cannot host a terminal pane]",
             provider_display_name(provider, model)
         )
     })?;
-    let binary_path = resolve_terminal_binary(provider, binary_path)?;
+    // OMP can keep running from the last verified local install when its
+    // configured NFS executable is temporarily unavailable. For other
+    // providers, preflight the source before copying it.
+    let source = if matches!(provider, Provider::Omp) {
+        resolve_binary_path(binary_path)
+    } else {
+        resolve_terminal_binary(provider, binary_path)?
+    };
+    let local_binary = match provider {
+        Provider::Omp => crate::omp_local::omp_binary_for_launch(Path::new(&source)),
+        Provider::Claude | Provider::Codex => crate::provider_local::cache_provider_binary(
+            if matches!(provider, Provider::Claude) {
+                "claude"
+            } else {
+                "codex"
+            },
+            Path::new(&source),
+        ),
+        _ => Ok(Path::new(&source).to_path_buf()),
+    };
+    let binary_path = match local_binary {
+        Ok(path) if matches!(provider, Provider::Omp) && path == Path::new(&source) => {
+            resolve_terminal_binary(provider, binary_path)?
+        }
+        Ok(path) => path.to_string_lossy().into_owned(),
+        Err(error) => {
+            tracing::warn!(?provider, %error, "host-local provider binary unavailable; using configured executable");
+            resolve_terminal_binary(provider, binary_path)?
+        }
+    };
     let cwd = worktree_path.unwrap_or(working_dir);
     let env = build_pane_env_overrides(provider, model)?;
 
@@ -2379,6 +2408,8 @@ async fn run_inner(
     // survive the restart, so re-exec the provider and resume its conversation
     // (claude `--resume <pane session id>` / codex `resume` / opencode
     // `--continue`).
+    // Provider snapshots can copy hundreds of MB on first use. Keep that
+    // blocking I/O and the pane-host handshake off the shared Tokio workers.
     for (pane_id, provider, model, pane_session_id, worktree) in &terminal_startups {
         let binary_path = resolve_pane_binary_path(
             *provider,
@@ -2390,20 +2421,22 @@ async fn run_inner(
             &omp_path,
             &cursor_agent_path,
         );
-        if let Err(err) = spawn_terminal_pane(
-            &terminal_panes,
-            *pane_id,
-            session_id,
-            *pane_session_id,
-            provider,
-            model.as_deref(),
-            &binary_path,
-            &working_dir_str,
-            worktree.as_deref(),
-            &server_tx,
-            true,
-            None,
-        ) {
+        if let Err(err) = tokio::task::block_in_place(|| {
+            spawn_terminal_pane(
+                &terminal_panes,
+                *pane_id,
+                session_id,
+                *pane_session_id,
+                provider,
+                model.as_deref(),
+                &binary_path,
+                &working_dir_str,
+                worktree.as_deref(),
+                &server_tx,
+                true,
+                None,
+            )
+        }) {
             tracing::error!(pane_id, %err, "failed to restore terminal pane");
         }
     }

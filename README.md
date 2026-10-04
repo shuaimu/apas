@@ -120,7 +120,7 @@ output format.
 headlessly and parses its stream-JSON. It is kept only for panes that already
 exist. Nothing creates one any more.
 
-Only Claude, Codex, OpenCode, and Pi can host a terminal pane. DeepSeek runs
+Claude, Codex, OpenCode, Pi, and OMP can host terminal panes. DeepSeek runs
 the Claude binary against an Anthropic-compatible endpoint. APAS does not
 install or authenticate these tools; install and log into them on each host
 first.
@@ -193,6 +193,26 @@ in its own tmux session, and the project CLI is only its authenticated
 controller. This takes the provider's lifetime out of the CLI's hands: a
 transport reconnect leaves everything running, and a CLI reboot re-adopts the
 same live terminals afterward.
+
+On Linux, APAS launches native Claude, Codex, and OMP terminal binaries from
+private host-local copies under `/var/lib/apas/users/<uid>/providers/`. Pane
+hosts use `/var/lib/apas/users/<uid>/pane-host/`. These persistent local paths
+prevent an update to NFS-mounted home from unmapping a live process. Provision
+each host once as an administrator:
+
+```bash
+sudo install -d -o root -g root -m 0755 /var/lib/apas /var/lib/apas/users
+sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0700 "/var/lib/apas/users/$(id -u)"
+```
+
+Until provisioned, APAS retains the existing host-local `/var/tmp` caches
+instead of falling back to NFS. When provisioned, it migrates the verified
+OMP release; old local copies remain available to running panes. Claude and
+Codex keep their upstream installers; new panes pick up source changes.
+Native OMP checks for updates in the background on new pane launches and
+upgrades a local candidate with `omp update`; later launches use the verified
+version. Script/package-manager launchers stay at their configured paths.
+Network/update failures do not stop a pane from launching.
 
 ### Projects run inside one instance
 
@@ -278,10 +298,10 @@ working.
 
 `disallowed_tab_types` restricts which tab types users may create, where a tab
 type is a pane kind plus a provider (`terminal:claude`, `terminal:codex`,
-`terminal:opencode`, `terminal:pi`). It is stored as a deny list, so an empty
-value means everything is allowed and a provider added later is permitted until
-an owner says otherwise. The CLI enforces it by re-reading `.apas` on every
-request, because the web only hides menu entries.
+`terminal:opencode`, `terminal:pi`, `terminal:omp`). It is stored as a deny
+list, so an empty value means everything is allowed and a provider added later
+is permitted until an owner says otherwise. The CLI enforces it by re-reading
+`.apas` on every request, because the web only hides menu entries.
 
 `auto_approve_todos` and `auto_merge_prs` may still appear in older files. They
 were read by the team loop and now do nothing.
